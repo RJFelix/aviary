@@ -1,0 +1,62 @@
+# Aviary tasks. `just --list` for the menu.
+
+app_dir := justfile_directory() / "app"
+build_dir := justfile_directory() / "build"
+
+[private]
+default:
+    @just --list
+
+# Build Aviary.app (release)
+build:
+    ./scripts/bundle-app.sh release
+
+# Build and launch
+run: build
+    open {{build_dir}}/Aviary.app
+
+# Build the app binary only, no bundle (fast inner loop)
+compile:
+    cd {{app_dir}} && swift build --product Aviary
+
+# Run the core test suite. Not `swift test`: a Command Line Tools toolchain ships no
+# XCTest, so the suite is an executable. See app/Sources/AviarySelfTest/Harness.swift.
+test:
+    cd {{app_dir}} && swift run AviarySelfTest
+
+# Render every screen to build/shots/ without a display server
+shots:
+    cd {{app_dir}} && swift build -c release --product Aviary
+    mkdir -p {{build_dir}}/shots
+    "{{app_dir}}/.build/release/Aviary" --snapshot {{build_dir}}/shots --width 1600 --height 1000
+    @echo "→ {{build_dir}}/shots"
+
+# Render one screen. `just shot sessions` or `just shot cockpit --bare`
+shot section *FLAGS:
+    cd {{app_dir}} && swift build -c release --product Aviary
+    mkdir -p {{build_dir}}/shots
+    "{{app_dir}}/.build/release/Aviary" --snapshot {{build_dir}}/shots --only {{section}} --width 1600 --height 1000 {{FLAGS}}
+
+# Install dependencies and build the forked harness (the execution engine)
+build-engine:
+    cd harness && npm install && npm run build
+    @echo "engine → harness/packages/coding-agent/dist/bundle/cli.js"
+
+# Regenerate the app icon from scripts/make-icon.py
+icon:
+    python3 scripts/make-icon.py {{build_dir}}/Aviary.icns
+    @echo "→ {{build_dir}}/Aviary.icns"
+
+# Everything CI would check
+check: test compile
+    @echo "ok"
+
+# Remove build output (keeps harness/node_modules)
+clean:
+    rm -rf {{build_dir}} {{app_dir}}/.build
+
+# Kill a wedged harness daemon. --force escalates to SIGKILL; nothing is lost, transcripts
+# are on disk and the next launch reaps the poisoned ownership lease.
+daemon-reset:
+    prime-agent shutdown --force || true
+    prime-agent doctor --json || true

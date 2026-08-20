@@ -17,3 +17,7 @@ build/
 .env
 .env.*
 untracked/
+
+# ── Snapshot output: contains real session titles from real work ──
+build/shots/
+docs/screens/

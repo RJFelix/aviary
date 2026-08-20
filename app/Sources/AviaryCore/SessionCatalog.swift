@@ -1,0 +1,362 @@
+import Foundation
+
+/// One row in the sessions list.
+public struct SessionSummary: Sendable, Identifiable, Hashable {
+    public var id: String
+    public var fileURL: URL
+    public var name: String?
+    public var cwd: String
+    public var gitBranch: String?
+    public var createdAt: Date
+    public var updatedAt: Date
+    public var byteSize: Int
+    public var provider: String?
+    public var model: String?
+    public var usage: Usage
+    public var childUsage: Usage
+    public var counts: Transcript.Counts
+    public var firstPrompt: String
+    public var lastAssistantText: String
+    public var status: AgentStatus?
+    public var sessionState: String?
+    public var rlmDepth: Int
+    public var parentSessionPath: String?
+    public var childCount: Int = 0
+    /// True when a daemon worker currently holds this session.
+    public var isLive: Bool = false
+    /// True when a live worker is mid-operation.
+    public var isBusy: Bool = false
+    public var liveOperation: String?
+
+    public var title: String {
+        if let n = name, !n.isEmpty { return n }
+        let p = firstPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !p.isEmpty { return String(p.prefix(120)) }
+        return "Untitled session"
+    }
+
+    public var projectName: String {
+        cwd.isEmpty ? "—" : URL(fileURLWithPath: cwd).lastPathComponent
+    }
+
+    public var totalUsage: Usage { usage }
+
+    /// Session-level "shape": is this a quick question or a long agentic run?
+    public var isSubstantial: Bool {
+        counts.assistant >= 3 || counts.toolCalls >= 3
+    }
+}
+
+/// Scans and caches the session catalog.
+///
+/// Reimplemented natively rather than shelling out to the harness's catalog process: the
+/// files are the source of truth, reading them is a few milliseconds each, and a native
+/// scan keeps the sessions list responsive while a daemon is wedged — precisely when you
+/// most want to look at what happened.
+public actor SessionCatalog {
+    /// Bump when anything about how a summary is derived changes.
+    ///
+    /// The cache keys on file size and mtime, which correctly detects a *changed
+    /// transcript* and completely misses a changed *parser*. Without this, improving how
+    /// titles are extracted silently does nothing for every session already indexed.
+    static let schemaVersion = 2
+
+    private let home: AgentHome
+    private var cache: [String: CacheEntry] = [:]
+    private let cacheFileURL: URL
+
+    private struct CacheEntry: Codable {
+        var mtime: Date
+        var size: Int
+        var summary: StoredSummary
+    }
+
+    public init(home: AgentHome) {
+        self.home = home
+        let support = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = support.appending(path: "Aviary", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        cacheFileURL = dir.appending(path: "catalog-cache-v\(Self.schemaVersion).json")
+        cache = Self.loadCache(from: cacheFileURL)
+    }
+
+    // MARK: Scan
+
+    /// Enumerate and summarize every session, newest first.
+    ///
+    /// `progress` is called on a detached task as files are processed, so a first run over
+    /// a large sessions directory can show a determinate bar instead of a spinner.
+    public func scan(progress: (@Sendable (Int, Int) -> Void)? = nil) -> [SessionSummary] {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: home.sessionsDir,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles])
+        else { return [] }
+
+        let jsonl = files.filter { $0.pathExtension == "jsonl" }
+        var out: [SessionSummary] = []
+        out.reserveCapacity(jsonl.count)
+
+        for (i, url) in jsonl.enumerated() {
+            progress?(i, jsonl.count)
+            let attrs = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            let mtime = attrs?.contentModificationDate ?? .distantPast
+            let size = attrs?.fileSize ?? 0
+            let key = url.lastPathComponent
+
+            if let hit = cache[key], hit.mtime == mtime, hit.size == size {
+                out.append(hit.summary.restore(fileURL: url))
+                continue
+            }
+            guard var s = Self.summarize(fileURL: url) else { continue }
+            s.updatedAt = mtime
+            s.byteSize = size
+            cache[key] = CacheEntry(mtime: mtime, size: size, summary: StoredSummary(s))
+            out.append(s)
+        }
+        progress?(jsonl.count, jsonl.count)
+
+        // Child (RLM) session counts come from the ledger, which is the only place the
+        // parent→child edge is recorded.
+        let tree = AgentTreeReader.read(home: home)
+        var childCounts: [String: Int] = [:]
+        for edge in tree.edges {
+            childCounts[edge.parentSessionID, default: 0] += 1
+        }
+        for i in out.indices {
+            out[i].childCount = childCounts[out[i].id] ?? 0
+        }
+
+        saveCache()
+        return out.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    /// Single-pass summary. Reads the file once and extracts only list-view fields —
+    /// notably skipping the thousands of `agent_status` entries a long session accumulates.
+    public static func summarize(fileURL: URL) -> SessionSummary? {
+        guard let data = FileManager.default.contents(atPath: fileURL.path) else { return nil }
+        let fallbackID = fileURL.deletingPathExtension().lastPathComponent
+
+        var header: SessionHeader?
+        var s = SessionSummary(
+            id: fallbackID, fileURL: fileURL, name: nil, cwd: "", gitBranch: nil,
+            createdAt: .distantPast, updatedAt: .distantPast, byteSize: data.count,
+            provider: nil, model: nil, usage: Usage(), childUsage: Usage(),
+            counts: Transcript.Counts(), firstPrompt: "", lastAssistantText: "",
+            status: nil, sessionState: nil, rlmDepth: 0, parentSessionPath: nil)
+
+        for chunk in data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true) {
+            var slice = Data(chunk)
+            if slice.last == UInt8(ascii: "\r") { slice.removeLast() }
+            guard !slice.isEmpty, let v = JSONValue.parse(slice) else { continue }
+            let type = v["type"]?.stringValue ?? ""
+            s.counts.entries += 1
+
+            switch type {
+            case "session":
+                let h = SessionHeader(json: v, fallbackID: fallbackID)
+                header = h
+                s.id = h.id
+                s.cwd = h.cwd
+                s.createdAt = h.timestamp
+                s.gitBranch = h.gitBranch
+                s.rlmDepth = h.rlmDepth
+                s.parentSessionPath = h.parentSession
+
+            case "session_info":
+                s.name = v["name"]?.stringValue ?? s.name
+
+            case "session_state":
+                s.sessionState = v.path("state.status")?.stringValue ?? s.sessionState
+
+            case "agent_status":
+                s.status = AgentStatus(
+                    summary: v.path("status.summary")?.stringValue ?? "",
+                    taskState: v.path("status.taskState")?.stringValue,
+                    basedOnMessageCount: v.path("status.basedOnMessageCount")?.intValue,
+                    timestamp: ISO8601.date(v["timestamp"]?.stringValue) ?? .distantPast)
+
+            case "child_usage_attributed":
+                s.childUsage += Usage(json: v["childUsage"])
+
+            case "model_change":
+                s.provider = v["provider"]?.stringValue ?? s.provider
+                s.model = v["modelId"]?.stringValue ?? s.model
+
+            case "git_state":
+                s.gitBranch = v.path("git.branch")?.stringValue ?? s.gitBranch
+
+            case "message", "custom_message":
+                let msg = type == "custom_message" ? v : (v["message"] ?? .null)
+                let role = type == "custom_message" ? "custom" : (msg["role"]?.stringValue ?? "")
+                switch role {
+                case "user":
+                    s.counts.user += 1
+                    if s.firstPrompt.isEmpty {
+                        // Strip hook-injected context blocks first, or every session in the
+                        // list ends up titled with the same multi-kilobyte preamble.
+                        s.firstPrompt = Self.condense(
+                            PromptText.userFacing(msg["content"]?.textContent ?? ""))
+                    }
+                case "assistant":
+                    s.counts.assistant += 1
+                    s.usage += Usage(json: msg["usage"])
+                    s.model = msg["model"]?.stringValue ?? s.model
+                    s.provider = msg["provider"]?.stringValue ?? s.provider
+                    let blocks = msg["content"]?.arrayValue ?? []
+                    for b in blocks {
+                        if b["type"]?.stringValue == "toolCall" { s.counts.toolCalls += 1 }
+                        if b["type"]?.stringValue == "text", let t = b["text"]?.stringValue,
+                           !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        {
+                            s.lastAssistantText = Self.condense(t)
+                        }
+                    }
+                case "toolResult":
+                    if msg["isError"]?.boolValue == true { s.counts.toolErrors += 1 }
+                case "bashExecution":
+                    s.counts.bash += 1
+                case "compactionSummary":
+                    s.counts.compactions += 1
+                case "custom":
+                    let ctype = (type == "custom_message"
+                        ? v["customType"]?.stringValue
+                        : msg["customType"]?.stringValue) ?? ""
+                    if ctype == "agent_message" { s.counts.agentMessages += 1 }
+                default:
+                    break
+                }
+
+            case "compaction":
+                s.counts.compactions += 1
+
+            default:
+                break
+            }
+        }
+
+        guard header != nil else { return nil }
+        if s.createdAt == .distantPast { s.createdAt = s.updatedAt }
+        return s
+    }
+
+    /// Collapse whitespace and clip, for list rows.
+    static func condense(_ s: String, limit: Int = 300) -> String {
+        let flat = s.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return flat.count > limit ? String(flat.prefix(limit)) + "…" : flat
+    }
+
+    // MARK: Delete
+
+    /// Move a session (and its artifacts) to the Trash. Never an unlink: transcripts are
+    /// the only record of work an agent did.
+    public func trash(session: SessionSummary) throws {
+        try FileManager.default.trashItem(at: session.fileURL, resultingItemURL: nil)
+        let artifacts = home.artifacts(forSession: session.id)
+        if FileManager.default.fileExists(atPath: artifacts.path) {
+            try? FileManager.default.trashItem(at: artifacts, resultingItemURL: nil)
+        }
+        cache.removeValue(forKey: session.fileURL.lastPathComponent)
+        saveCache()
+    }
+
+    public func invalidate(_ id: String) {
+        cache.removeValue(forKey: "\(id).jsonl")
+    }
+
+    public func clearCache() {
+        cache.removeAll()
+        try? FileManager.default.removeItem(at: cacheFileURL)
+    }
+
+    // MARK: Cache persistence
+
+    private static func loadCache(from url: URL) -> [String: CacheEntry] {
+        guard let d = try? Data(contentsOf: url),
+              let decoded = try? JSONDecoder().decode([String: CacheEntry].self, from: d)
+        else { return [:] }
+        return decoded
+    }
+
+    private func saveCache() {
+        guard let d = try? JSONEncoder().encode(cache) else { return }
+        try? d.write(to: cacheFileURL, options: .atomic)
+    }
+}
+
+/// Codable mirror of `SessionSummary` (which carries a URL we'd rather rebuild).
+struct StoredSummary: Codable {
+    var id: String
+    var name: String?
+    var cwd: String
+    var gitBranch: String?
+    var createdAt: Date
+    var updatedAt: Date
+    var byteSize: Int
+    var provider: String?
+    var model: String?
+    var usage: Usage
+    var childUsage: Usage
+    var firstPrompt: String
+    var lastAssistantText: String
+    var sessionState: String?
+    var rlmDepth: Int
+    var parentSessionPath: String?
+    var statusSummary: String?
+    var statusTaskState: String?
+    var statusMessageCount: Int?
+    var statusTimestamp: Date?
+    var cUser: Int
+    var cAssistant: Int
+    var cToolCalls: Int
+    var cToolErrors: Int
+    var cBash: Int
+    var cCompactions: Int
+    var cAgentMessages: Int
+    var cEntries: Int
+
+    init(_ s: SessionSummary) {
+        id = s.id; name = s.name; cwd = s.cwd; gitBranch = s.gitBranch
+        createdAt = s.createdAt; updatedAt = s.updatedAt; byteSize = s.byteSize
+        provider = s.provider; model = s.model; usage = s.usage; childUsage = s.childUsage
+        firstPrompt = s.firstPrompt; lastAssistantText = s.lastAssistantText
+        sessionState = s.sessionState; rlmDepth = s.rlmDepth
+        parentSessionPath = s.parentSessionPath
+        statusSummary = s.status?.summary
+        statusTaskState = s.status?.taskState
+        statusMessageCount = s.status?.basedOnMessageCount
+        statusTimestamp = s.status?.timestamp
+        cUser = s.counts.user; cAssistant = s.counts.assistant
+        cToolCalls = s.counts.toolCalls; cToolErrors = s.counts.toolErrors
+        cBash = s.counts.bash; cCompactions = s.counts.compactions
+        cAgentMessages = s.counts.agentMessages; cEntries = s.counts.entries
+    }
+
+    func restore(fileURL: URL) -> SessionSummary {
+        var counts = Transcript.Counts()
+        counts.user = cUser; counts.assistant = cAssistant
+        counts.toolCalls = cToolCalls; counts.toolErrors = cToolErrors
+        counts.bash = cBash; counts.compactions = cCompactions
+        counts.agentMessages = cAgentMessages; counts.entries = cEntries
+        var status: AgentStatus?
+        if let ss = statusSummary {
+            status = AgentStatus(
+                summary: ss, taskState: statusTaskState,
+                basedOnMessageCount: statusMessageCount,
+                timestamp: statusTimestamp ?? .distantPast)
+        }
+        return SessionSummary(
+            id: id, fileURL: fileURL, name: name, cwd: cwd, gitBranch: gitBranch,
+            createdAt: createdAt, updatedAt: updatedAt, byteSize: byteSize,
+            provider: provider, model: model, usage: usage, childUsage: childUsage,
+            counts: counts, firstPrompt: firstPrompt, lastAssistantText: lastAssistantText,
+            status: status, sessionState: sessionState, rlmDepth: rlmDepth,
+            parentSessionPath: parentSessionPath)
+    }
+}
