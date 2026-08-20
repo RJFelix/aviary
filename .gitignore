@@ -1,0 +1,19 @@
+# ── Node / harness build output ──
+node_modules/
+harness/**/dist/
+harness/**/*.tsbuildinfo
+
+# ── Swift build output ──
+app/.build/
+app/.swiftpm/
+build/
+*.app/
+
+# ── macOS ──
+.DS_Store
+
+# ── Local state ──
+*.local
+.env
+.env.*
+untracked/
