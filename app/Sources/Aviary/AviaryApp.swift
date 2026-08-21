@@ -16,7 +16,9 @@ struct AviaryApp: App {
         WindowGroup("Aviary") {
             RootView()
                 .environment(model)
-                .frame(minWidth: 1040, minHeight: 680)
+                // Wide enough that the three-pane screens always fit: a 280pt sidebar
+                // plus the 800pt the Sessions panes demand together.
+                .frame(minWidth: 1100, minHeight: 680)
                 .task { await model.bootstrap() }
         }
         .windowToolbarStyle(.unified(showsTitle: true))

@@ -30,19 +30,36 @@ struct SessionsView: View {
         case errors = "With errors"
     }
 
+    /// Two resizable panes in a split view, plus a fixed-width inspector column.
+    ///
+    /// Not `.inspector`: that adds a column *outside* the `HSplitView`, so the two layouts
+    /// negotiate width independently and nothing enforces that their minimums fit together.
+    /// When they don't — a 1120pt window leaves ~900pt for parts demanding 980 — the split
+    /// view overflows and clips on the left while the inspector column draws a band of
+    /// uninitialized backing store that flickers every frame.
+    ///
+    /// Not a third `HSplitView` pane either: a conditional child confuses NSSplitView's
+    /// arrangement badly enough that the whole split view stops filling its container. A
+    /// plain trailing column costs the inspector its drag handle and is correct at every
+    /// width, which is the better trade.
     var body: some View {
-        HSplitView {
-            listPane
-                .frame(minWidth: 300, idealWidth: 380, maxWidth: 560)
-            transcriptPane
-                .frame(minWidth: 420)
-        }
-        .inspector(isPresented: Binding(
-            get: { model.showInspector },
-            set: { model.showInspector = $0 }))
-        {
-            SessionInspector(selectedItem: $selectedItem)
-                .inspectorColumnWidth(min: 260, ideal: 320, max: 460)
+        HStack(spacing: 0) {
+            HSplitView {
+                listPane
+                    .frame(minWidth: 240, idealWidth: 350, maxWidth: 560)
+                transcriptPane
+                    .frame(minWidth: 320)
+            }
+            if model.showInspector {
+                Divider()
+                SessionInspector(selectedItem: $selectedItem)
+                    .frame(width: 320)
+                    // Painted here rather than inside the inspector: a ScrollView's
+                    // background covers its content, not the column, so a short inspector
+                    // left the rest of the strip as undefined pixels.
+                    .frame(maxHeight: .infinity)
+                    .background(Color(nsColor: .windowBackgroundColor))
+            }
         }
     }
 
@@ -361,7 +378,6 @@ struct SessionInspector: View {
             }
             .padding(12)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     private func itemCard(_ item: TranscriptItem) -> some View {

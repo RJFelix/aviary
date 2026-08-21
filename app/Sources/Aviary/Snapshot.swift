@@ -192,8 +192,10 @@ enum Snapshot {
     final class OffscreenWindow {
         private let window: NSWindow
         private let hosting: NSHostingView<AnyView>
+        private let size: CGSize
 
         init(width: CGFloat, height: CGFloat) {
+            size = CGSize(width: width, height: height)
             hosting = NSHostingView(rootView: AnyView(Color.clear))
             window = NSWindow(
                 contentRect: CGRect(x: 0, y: 0, width: width, height: height),
@@ -214,7 +216,11 @@ enum Snapshot {
         }
 
         func present<V: View>(_ view: V) {
-            hosting.rootView = AnyView(view)
+            // Pinned to the window's content size. Without an explicit frame the hosting
+            // view reports its content's natural size, the window grows to accommodate it,
+            // and the UI ends up laid out narrower than the frame it was captured in.
+            hosting.rootView = AnyView(
+                view.frame(width: size.width, height: size.height))
             hosting.needsLayout = true
             hosting.needsDisplay = true
         }

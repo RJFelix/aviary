@@ -144,29 +144,35 @@ struct RunPane: View {
     @State private var showLaunchDetails = false
     @State private var selectedItem: TranscriptItem?
 
+    // Fixed trailing inspector column rather than `.inspector` or a conditional split
+    // pane — see the note on SessionsView.body for why both of those misbehave.
     var body: some View {
-        VStack(spacing: 0) {
-            runHeader
-            Divider()
-            if let banner = run.errorBanner {
-                NoticeBanner(level: .danger, title: "The run could not start", message: banner)
-                    .padding(Design.gutter)
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                runHeader
+                Divider()
+                if let banner = run.errorBanner {
+                    NoticeBanner(level: .danger, title: "The run could not start", message: banner)
+                        .padding(Design.gutter)
+                }
+                TranscriptView(
+                    items: run.items,
+                    hideThinking: model.hideThinking,
+                    isStreaming: run.isStreaming,
+                    autoScroll: true,
+                    onSelect: { selectedItem = $0 })
+                Divider()
+                composer
             }
-            TranscriptView(
-                items: run.items,
-                hideThinking: model.hideThinking,
-                isStreaming: run.isStreaming,
-                autoScroll: true,
-                onSelect: { selectedItem = $0 })
-            Divider()
-            composer
-        }
-        .inspector(isPresented: Binding(
-            get: { model.showInspector },
-            set: { model.showInspector = $0 }))
-        {
-            RunInspector(run: run, selectedItem: $selectedItem)
-                .inspectorColumnWidth(min: 250, ideal: 300, max: 420)
+            .frame(minWidth: 380)
+
+            if model.showInspector {
+                Divider()
+                RunInspector(run: run, selectedItem: $selectedItem)
+                    .frame(width: 300)
+                    .frame(maxHeight: .infinity)
+                    .background(Color(nsColor: .windowBackgroundColor))
+            }
         }
     }
 
@@ -709,7 +715,6 @@ struct RunInspector: View {
             }
             .padding(12)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     private func queueItem(_ text: String, label: String, tint: Color) -> some View {
