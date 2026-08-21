@@ -200,6 +200,125 @@ func test_leavesOrdinaryPromptsAlone() {
     XCTAssertEqual(PromptText.userFacing("use <T> generics"), "use <T> generics")
 }
 
+func test_decomposesAResponsesPayload() {
+    // The shape the codex/responses routes actually send.
+    let payload = JSONValue.parse(line: """
+    {"model":"gpt-5.6-luna","instructions":"You are an agent.\\n# Project Context\\n## /repo/AGENTS.md\\nproject rules here\\n<available_skills><name>alpha</name><description>aaaa</description><name>beta</name><description>bbbbbbbb</description></available_skills>","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"tools":[{"type":"function","name":"ipython","description":"run code"}],"stream":true}
+    """)!
+    let a = WireLog.analyse(payload: payload)
+    XCTAssertEqual(a.shape, "openai-responses")
+
+    let labels = a.segments.map(\.label)
+    XCTAssertTrue(labels.contains("system prompt"), "got \(labels)")
+    XCTAssertTrue(labels.contains { $0.hasPrefix("tools") })
+    XCTAssertTrue(labels.contains { $0.hasPrefix("input") })
+
+    // Shares must account for the payload, not a subset of it.
+    let system = try? XCTUnwrap(a.segments.first { $0.kind == .systemPrompt })
+    XCTAssertNotNil(system)
+    XCTAssertTrue((system?.characters ?? 0) > 0)
+
+    // The skills catalogue is broken out per skill, largest first — the whole point.
+    let skills = a.segments.flatMap(\.flattened).first { $0.kind == .skills }
+    XCTAssertNotNil(skills)
+    XCTAssertEqual(skills?.children.count, 2)
+    XCTAssertEqual(skills?.children.first?.label, "beta")  // the larger entry sorts first
+
+    // A discovered context file is recognised as such, by basename.
+    let file = a.segments.flatMap(\.flattened).first { $0.kind == .contextFile }
+    XCTAssertEqual(file?.label, "AGENTS.md")
+}
+
+func test_decomposesAnAnthropicPayload() {
+    let payload = JSONValue.parse(line: """
+    {"model":"claude","system":"be brief","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}],"max_tokens":16}
+    """)!
+    let a = WireLog.analyse(payload: payload)
+    XCTAssertEqual(a.shape, "anthropic-messages")
+    let messages = a.segments.first { $0.kind == .message }
+    XCTAssertEqual(messages?.children.count, 2)
+}
+
+func test_treatsALeadingSystemMessageAsTheSystemPrompt() {
+    // Completions-style routes put the system prompt in messages[0].
+    let payload = JSONValue.parse(line: """
+    {"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"hi"}]}
+    """)!
+    let a = WireLog.analyse(payload: payload)
+    XCTAssertNotNil(a.segments.first { $0.kind == .systemPrompt })
+    XCTAssertEqual(a.segments.first { $0.kind == .message }?.children.count, 1)
+}
+
+func test_scalesPartTokensToTheBilledTotal() {
+    // A part's share is exact even though its token count is estimated, so scaling by the
+    // provider's real input count is the honest per-part number.
+    var seg = PayloadSegment(id: "x", label: "x", characters: 250)
+    XCTAssertEqual(seg.estimatedTokens, 62)
+    XCTAssertEqual(seg.scaledTokens(payloadCharacters: 1000, actualTokens: 400), 100)
+    XCTAssertEqual(seg.share(of: 1000), 0.25)
+    // Degrades to the estimate rather than to zero when nothing is known.
+    seg.characters = 400
+    XCTAssertEqual(seg.scaledTokens(payloadCharacters: 0, actualTokens: 0), 100)
+}
+
+func test_readsAWireLogAndFindsItsSession() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appending(path: "aviary-wire-test-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let file = dir.appending(path: "wire.jsonl")
+    let lines = [
+        #"{"v":1,"seq":0,"at":"2026-08-20T10:00:00.000Z","kind":"request","payload":{"model":"m","prompt_cache_key":"sess-1","instructions":"hi"}}"#,
+        #"{"v":1,"seq":1,"at":"2026-08-20T10:00:01.000Z","kind":"response","status":200}"#,
+        "not json at all",
+    ].joined(separator: "\n")
+    try Data(lines.utf8).write(to: file)
+
+    let records = WireLog.read(url: file)
+    XCTAssertEqual(records.count, 2)  // the junk line is skipped, not fatal
+    XCTAssertEqual(records.first?.kind, .request)
+    XCTAssertEqual(records.first?.sessionID, "sess-1")
+    XCTAssertEqual(records.first?.modelID, "m")
+    XCTAssertEqual(records.last?.status, 200)
+    try? FileManager.default.removeItem(at: dir)
+}
+
+func test_usageReasoningIsABreakdownNotAnAddend() {
+    var a = Usage()
+    a.output = 100; a.reasoning = 80; a.totalTokens = 100
+    var b = Usage()
+    b.output = 50; b.totalTokens = 50   // route reported no reasoning at all
+    let sum = a + b
+    // Summing keeps what is known and does not invent zeros.
+    XCTAssertEqual(sum.reasoning, 80)
+    XCTAssertEqual(sum.output, 150)
+    // Two unknowns stay unknown, which is different from zero.
+    XCTAssertNil((b + b).reasoning)
+}
+
+func test_attributesContextFileBodyToItsFile() {
+    // A context file's body is markdown and routinely opens with its own `# ` heading.
+    // Splitting on that heading would credit the file's contents to a phantom section and
+    // report the file as a few dozen characters — misplacing the largest thing a project
+    // contributes to every request.
+    let instructions = [
+        "base rules",
+        "# Project Context",
+        "## /repo/AGENTS.md",
+        "# My Project",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "## Layout",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ].joined(separator: "\n")
+    let seg = WireLog.systemPromptSegment(instructions)
+    let file = seg.children.first { $0.kind == .contextFile }
+    XCTAssertEqual(file?.label, "AGENTS.md")
+    // The file must carry its whole body, headings included.
+    XCTAssertTrue(file?.text?.contains("# My Project") == true)
+    XCTAssertTrue(file?.text?.contains("bbbbbbbb") == true)
+    // And no phantom section should have been created from the body's heading.
+    XCTAssertNil(seg.children.first { $0.label == "My Project" })
+}
+
 // MARK: - Runner
 
 await Harness.run([
@@ -220,4 +339,11 @@ await Harness.run([
     ("peelsSeveralStackedInjections", { test_peelsSeveralStackedInjections() }),
     ("keepsTheMessageWhenTheWrapperIsAllThereIs", { test_keepsTheMessageWhenTheWrapperIsAllThereIs() }),
     ("leavesOrdinaryPromptsAlone", { test_leavesOrdinaryPromptsAlone() }),
+    ("decomposesAResponsesPayload", { test_decomposesAResponsesPayload() }),
+    ("decomposesAnAnthropicPayload", { test_decomposesAnAnthropicPayload() }),
+    ("treatsALeadingSystemMessageAsTheSystemPrompt", { test_treatsALeadingSystemMessageAsTheSystemPrompt() }),
+    ("scalesPartTokensToTheBilledTotal", { test_scalesPartTokensToTheBilledTotal() }),
+    ("readsAWireLogAndFindsItsSession", { try test_readsAWireLogAndFindsItsSession() }),
+    ("usageReasoningIsABreakdownNotAnAddend", { test_usageReasoningIsABreakdownNotAnAddend() }),
+    ("attributesContextFileBodyToItsFile", { test_attributesContextFileBodyToItsFile() }),
 ])

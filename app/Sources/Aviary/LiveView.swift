@@ -413,6 +413,7 @@ struct LauncherSheet: View {
     @State private var thinking = "high"
     @State private var persistSession = true
     @State private var noContextFiles = false
+    @State private var recordPayloads = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -517,9 +518,25 @@ struct LauncherSheet: View {
                     }
 
                     Card("Options", symbol: "slider.horizontal.3") {
-                        VStack(alignment: .leading, spacing: 6) {
+                        VStack(alignment: .leading, spacing: 8) {
                             Toggle("Save the session to disk", isOn: $persistSession)
                             Toggle("Skip AGENTS.md / CLAUDE.md discovery", isOn: $noContextFiles)
+                            Divider().opacity(0.5)
+                            Toggle("Record what's sent to the model", isOn: $recordPayloads)
+                            Text("Captures every provider request — system prompt, context "
+                                + "files, skill catalogue, tool schemas, messages — so the run "
+                                + "can show where its input tokens went. Writes them to a file "
+                                + "in Aviary's support directory, which is why it is off by "
+                                + "default.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if EngineLocator.wireLogExtension() == nil {
+                                Text("Unavailable: harness-extensions/wire-log.ts is missing "
+                                    + "from this checkout.")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Design.warning)
+                            }
                         }
                         .controlSize(.small)
                     }
@@ -543,7 +560,9 @@ struct LauncherSheet: View {
                             model: modelID.isEmpty ? nil : modelID,
                             thinkingLevel: thinking,
                             persistSession: persistSession,
-                            noContextFiles: noContextFiles),
+                            noContextFiles: noContextFiles,
+                            recordPayloads: recordPayloads
+                                && EngineLocator.wireLogExtension() != nil),
                         firstPrompt: prompt.isEmpty ? nil : prompt)
                     dismiss()
                 } label: {
@@ -638,6 +657,8 @@ struct ModelFactsRow: View {
 struct RunInspector: View {
     var run: LiveRun
     @Binding var selectedItem: TranscriptItem?
+    @State private var showBreakdown = false
+    @State private var showRaw = false
 
     var body: some View {
         ScrollView {
@@ -709,11 +730,82 @@ struct RunInspector: View {
                     }
                 }
 
+                contextCard
+
                 Card("Launch command", symbol: "terminal") {
                     CodeBlock(text: run.launchCommand, maxLines: 8, tint: .secondary)
                 }
             }
             .padding(12)
+        }
+        .sheet(isPresented: $showBreakdown) {
+            if let analysis = run.latestAnalysis {
+                VStack(spacing: 0) {
+                    HStack {
+                        Text("What was sent to the model")
+                            .font(.system(size: 13, weight: .semibold))
+                        Spacer()
+                        Button("Done") { showBreakdown = false }
+                            .buttonStyle(.borderedProminent).controlSize(.small)
+                            .keyboardShortcut(.cancelAction)
+                    }
+                    .padding(12)
+                    Divider()
+                    ContextBreakdownView(
+                        analysis: analysis,
+                        actualInputTokens: run.lastInputTokens,
+                        recordedAt: run.wireRecords.last(where: { $0.kind == .request })?.at)
+                }
+                .frame(width: 820, height: 720)
+            }
+        }
+        .sheet(isPresented: $showRaw) {
+            RawPayloadSheet(records: run.wireRecords)
+        }
+    }
+
+    @ViewBuilder
+    private var contextCard: some View {
+        if run.config.recordPayloads {
+            Card("What was sent", symbol: "arrow.up.doc",
+                 accessory: AnyView(
+                    HStack(spacing: 8) {
+                        Button("Breakdown") { showBreakdown = true }
+                            .buttonStyle(.link).font(.system(size: 10))
+                            .disabled(run.latestAnalysis == nil)
+                        Button("Raw") { showRaw = true }
+                            .buttonStyle(.link).font(.system(size: 10))
+                            .disabled(run.wireRecords.isEmpty)
+                    }))
+            {
+                if let analysis = run.latestAnalysis {
+                    VStack(alignment: .leading, spacing: 6) {
+                        DetailRow(
+                            label: "Payload",
+                            value: "\(Fmt.bytes(analysis.totalCharacters)) · ≈\(Fmt.tokens(analysis.estimatedTokens)) tokens")
+                        if let actual = run.lastInputTokens {
+                            DetailRow(label: "Billed input", value: Fmt.tokens(actual), mono: true)
+                        }
+                        Divider().opacity(0.5)
+                        // The three or four biggest parts answer the question on their own.
+                        ForEach(analysis.segments.prefix(4)) { seg in
+                            HStack(spacing: 6) {
+                                Text(seg.label)
+                                    .font(.system(size: 10.5))
+                                    .lineLimit(1).truncationMode(.middle)
+                                Spacer(minLength: 4)
+                                Text(String(format: "%.0f%%", 100 * seg.share(of: analysis.totalCharacters)))
+                                    .font(Design.numeric(10, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } else {
+                    Text("Recording is on. The first provider request will appear here.")
+                        .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 

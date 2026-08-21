@@ -481,6 +481,9 @@ final class LiveRun: Identifiable {
     var stderrTail: [String] = []
     var launchCommand = ""
     var title: String = "New run"
+    /// Recorded provider payloads, when the run was started with recording on.
+    var wireRecords: [WireRecord] = []
+    var wireLogURL: URL?
 
     private let builder = LiveTranscriptBuilder()
     private var session = RPCSession()
@@ -488,6 +491,13 @@ final class LiveRun: Identifiable {
 
     init(engine: EngineLocation, config: RunConfiguration) {
         self.engine = engine
+        var config = config
+        if config.recordPayloads {
+            // The path has to be decided here, where the run's identity exists.
+            let url = WireLog.path(forRun: id)
+            config.wireLogPath = url.path
+            self.wireLogURL = url
+        }
         self.config = config
         self.modelLabel = [config.provider, config.model].compactMap { $0 }.joined(separator: "/")
         self.thinkingLevel = config.thinkingLevel
@@ -543,6 +553,13 @@ final class LiveRun: Identifiable {
         if case .event(let type, _) = message, ["agent_end", "compaction_end"].contains(type) {
             Task { await refreshState() }
         }
+        // The extension appends on every provider request, so a turn boundary is the right
+        // moment to pick up new records.
+        if case .event(let type, _) = message,
+           ["message_end", "agent_end"].contains(type)
+        {
+            refreshWireLog()
+        }
     }
 
     private func sync() {
@@ -558,6 +575,27 @@ final class LiveRun: Identifiable {
         hasExited = true
         isStreaming = false
         sync()
+    }
+
+    /// Re-read the recorded payloads. Cheap: a handful of records per run.
+    func refreshWireLog() {
+        guard let url = wireLogURL else { return }
+        wireRecords = WireLog.read(url: url)
+    }
+
+    /// The most recent request payload, decomposed.
+    var latestAnalysis: PayloadAnalysis? {
+        guard let payload = wireRecords.last(where: { $0.kind == .request })?.payload else {
+            return nil
+        }
+        return WireLog.analyse(payload: payload)
+    }
+
+    /// Input tokens the provider actually charged for the matching turn, so the breakdown
+    /// can report real numbers instead of only estimates.
+    var lastInputTokens: Int? {
+        let inputs = items.compactMap { $0.usage?.input }.filter { $0 > 0 }
+        return inputs.last
     }
 
     func refreshState() async {

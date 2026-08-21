@@ -165,6 +165,13 @@ struct TranscriptRow: View {
                         if let stop = item.stopReason, stop != "stop", stop != "toolUse" {
                             Chip(text: stop, tint: stop == "aborted" ? Design.warning : Design.danger)
                         }
+                        if let r = item.usage?.reasoning, r > 0 {
+                            Chip(text: Fmt.tokens(r), symbol: "brain", tint: Design.thinking)
+                                .help("\(r) reasoning tokens, reported by the provider and "
+                                    + "already counted inside output. On this route the "
+                                    + "reasoning text itself is not returned — this count is "
+                                    + "the only record that it happened.")
+                        }
                         if let u = item.usage, !u.isEmpty {
                             Chip(text: Fmt.tokens(u.totalTokens), symbol: "number", tint: .secondary)
                                 .help(usageTooltip(u))
@@ -386,6 +393,7 @@ struct TranscriptRow: View {
         ]
         if u.cacheRead > 0 { parts.append("cache read \(Fmt.tokens(u.cacheRead))") }
         if u.cacheWrite > 0 { parts.append("cache write \(Fmt.tokens(u.cacheWrite))") }
+        if let r = u.reasoning, r > 0 { parts.append("reasoning \(Fmt.tokens(r))") }
         if u.cost.total > 0 { parts.append(Fmt.cost(u.cost.total)) }
         if let rate = u.cacheHitRate, rate > 0 { parts.append("\(Fmt.percent(rate)) cached") }
         return parts.joined(separator: " · ")
@@ -411,9 +419,15 @@ struct ThinkingBlock: View {
                         .font(.system(size: 9))
                     Text("thinking")
                         .font(.system(size: 10, weight: .medium))
+                    // Reasoning is billed as output, so its size is the interesting part.
+                    // Estimated from the text at four characters per token, because the
+                    // provider reports one total for the whole message.
+                    Text("· ≈\(Fmt.tokens(max(1, text.count / 4))) tokens")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
                     Text("· \(text.count) chars")
                         .font(.system(size: 9.5))
-                        .foregroundStyle(.quaternary)
+                        .foregroundStyle(.tertiary)
                 }
                 .foregroundStyle(Design.thinking)
             }

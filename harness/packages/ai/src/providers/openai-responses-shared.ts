@@ -476,12 +476,17 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 			if (response?.usage) {
 				const cachedTokens = response.usage.input_tokens_details?.cached_tokens || 0;
+				// Reported only by reasoning models, and already counted inside output_tokens.
+				// Kept as a breakdown so a route that hides its reasoning can still account
+				// for it (Aviary fork).
+				const reasoningTokens = response.usage.output_tokens_details?.reasoning_tokens;
 				output.usage = {
 					// OpenAI includes cached tokens in input_tokens, so subtract to get non-cached input
 					input: (response.usage.input_tokens || 0) - cachedTokens,
 					output: response.usage.output_tokens || 0,
 					cacheRead: cachedTokens,
 					cacheWrite: 0,
+					reasoning: typeof reasoningTokens === "number" ? reasoningTokens : undefined,
 					totalTokens: response.usage.total_tokens || 0,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				};

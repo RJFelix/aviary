@@ -8,7 +8,8 @@ struct AviaryApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     init() {
-        // Headless rendering short-circuits before any scene is created and exits.
+        // Headless modes short-circuit before any scene is created, and exit.
+        WireInspect.runIfRequested()
         Snapshot.runIfRequested()
     }
 

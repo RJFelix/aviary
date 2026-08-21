@@ -11,6 +11,15 @@ public struct RunConfiguration: Sendable, Hashable {
     public var persistSession: Bool = true
     /// Skip AGENTS.md / CLAUDE.md discovery.
     public var noContextFiles: Bool = false
+    /// Record every provider request payload, so the run can show exactly what was sent.
+    ///
+    /// Off by default and never implicit: recording writes your full system prompt and
+    /// conversation to a file on disk.
+    public var recordPayloads: Bool = false
+    /// Where the wire log goes when `recordPayloads` is on.
+    public var wireLogPath: String?
+    /// Extra environment for the engine process, merged over the captured shell environment.
+    public var environmentOverrides: [String: String] = [:]
     public var extraArguments: [String] = []
 
     public init(
@@ -21,6 +30,9 @@ public struct RunConfiguration: Sendable, Hashable {
         resume: String? = nil,
         persistSession: Bool = true,
         noContextFiles: Bool = false,
+        recordPayloads: Bool = false,
+        wireLogPath: String? = nil,
+        environmentOverrides: [String: String] = [:],
         extraArguments: [String] = []
     ) {
         self.cwd = cwd
@@ -30,6 +42,9 @@ public struct RunConfiguration: Sendable, Hashable {
         self.resume = resume
         self.persistSession = persistSession
         self.noContextFiles = noContextFiles
+        self.recordPayloads = recordPayloads
+        self.wireLogPath = wireLogPath
+        self.environmentOverrides = environmentOverrides
         self.extraArguments = extraArguments
     }
 
@@ -41,6 +56,13 @@ public struct RunConfiguration: Sendable, Hashable {
         if let resume { a += ["--resume", resume] }
         if !persistSession { a.append("--no-session") }
         if noContextFiles { a.append("-nc") }
+        // The recorder is a harness extension, loaded per run. Nothing is recorded unless
+        // both the extension and its destination are present.
+        if recordPayloads, wireLogPath != nil,
+           let ext = EngineLocator.wireLogExtension()
+        {
+            a += ["-e", ext.path]
+        }
         a += extraArguments
         return a
     }
@@ -127,7 +149,12 @@ public actor RPCSession {
         p.arguments = config.arguments(engine: engine)
         p.currentDirectoryURL = URL(fileURLWithPath: config.cwd, isDirectory: true)
         // The login-shell environment, not launchd's. See ProcessEnvironment.
-        p.environment = ProcessEnvironment.shared.snapshot
+        var env = ProcessEnvironment.shared.snapshot
+        for (k, v) in config.environmentOverrides { env[k] = v }
+        if config.recordPayloads, let wire = config.wireLogPath {
+            env["AVIARY_WIRE_LOG_PATH"] = wire
+        }
+        p.environment = env
 
         launchCommand = ([engine.path] + (p.arguments ?? [])).joined(separator: " ")
 

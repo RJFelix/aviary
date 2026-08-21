@@ -7,6 +7,12 @@ public struct Usage: Sendable, Hashable, Codable {
     public var output: Int = 0
     public var cacheRead: Int = 0
     public var cacheWrite: Int = 0
+    /// Reasoning tokens, when the route reports them. Already counted inside `output`.
+    ///
+    /// nil means the provider did not say — which is not zero. A route that returns
+    /// thinking as text lets you measure it directly; on an encrypted-reasoning route this
+    /// is the only evidence the tokens existed.
+    public var reasoning: Int?
     public var totalTokens: Int = 0
     public var cost: Cost = Cost()
 
@@ -46,6 +52,7 @@ public struct Usage: Sendable, Hashable, Codable {
         output = json["output"]?.intValue ?? 0
         cacheRead = json["cacheRead"]?.intValue ?? 0
         cacheWrite = json["cacheWrite"]?.intValue ?? 0
+        reasoning = json["reasoning"]?.intValue
         totalTokens = json["totalTokens"]?.intValue ?? (input + output + cacheRead + cacheWrite)
         cost = Cost(json: json["cost"])
     }
@@ -56,6 +63,10 @@ public struct Usage: Sendable, Hashable, Codable {
         u.output = a.output + b.output
         u.cacheRead = a.cacheRead + b.cacheRead
         u.cacheWrite = a.cacheWrite + b.cacheWrite
+        // nil + nil stays nil; a known value plus an unknown one is still the known part.
+        if a.reasoning != nil || b.reasoning != nil {
+            u.reasoning = (a.reasoning ?? 0) + (b.reasoning ?? 0)
+        }
         u.totalTokens = a.totalTokens + b.totalTokens
         u.cost = a.cost + b.cost
         return u

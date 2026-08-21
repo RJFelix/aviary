@@ -31,6 +31,7 @@ aviary/
 | **Flock** | The sub-agent tree: who spawned whom, with what instructions, on which model, and a timeline showing whether that fan-out actually ran in parallel. |
 | **Models** | Every provider and model, and whether the credential will resolve — see below. |
 | **Usage** | Tokens and cost across every session on disk, by model, provider, project, and day, plus cache-hit and tool-error rates. |
+| **What was sent** | Optional per-run recording of every provider payload, decomposed: system prompt, each discovered context file, every skill description, tool schemas, messages — with each part's share of the input you were billed for. |
 | **Library** | Skills, prompt templates, extensions, packages — and every directory that was searched, including the empty ones. |
 | **Health** | Process topology, three cross-checked liveness signals, and one-click repair for the failure modes that don't self-heal. |
 
@@ -54,6 +55,43 @@ that reads like a typo in your config, and the same config works fine in Termina
 startup Aviary snapshots `zsh -ilc env` once and uses that for every subprocess. The Models
 screen resolves each key expression the same way the harness would and tells you which of
 the three forms (`!command`, environment variable, literal) applied and what happened.
+
+## Where did my input tokens go?
+
+A two-message session can bill 17,000 input tokens, and nothing on disk explains it: the
+transcript holds messages, while the system prompt, the discovered `AGENTS.md` files, the
+skill catalogue and the tool schemas are assembled at request time and persisted nowhere.
+
+Start a run with **Record what's sent to the model** and Aviary captures each provider
+payload through the harness's `before_provider_request` hook, then breaks it apart:
+
+```
+PART                                               chars   tokens   share
+system prompt                                      66627    15523   89.5%
+  available skills — 68                            46713    10883   62.7%
+  (base instructions)                              10200     2376   13.7%
+  AGENTS.md                                         6335     1475    8.5%
+input — 1 message                                   6086     1417    8.2%
+tools — 1 schema                                     785      182    1.1%
+```
+
+That is a real reading of a real request: 68 installed skills were 63% of the input on
+*every* call. Character counts are measured; token counts are estimated at four characters
+each, then rescaled by each part's exact share of the provider's own input count — so the
+figures are anchored to something billed rather than to a heuristic. On the payload above
+the raw estimate came within 7% of the billed total.
+
+Recording is off by default and per-run, because it writes your full system prompt and
+conversation to a file. The same breakdown is available from a shell:
+
+```sh
+Aviary --analyse-wire ~/Library/Application\ Support/Aviary/wire/run-*.jsonl --input-tokens 17351
+```
+
+**Reasoning tokens.** Where a route returns thinking as text, Aviary shows each block's
+size inline. Where it doesn't — the Codex route encrypts its reasoning — the fork preserves
+`output_tokens_details.reasoning_tokens`, which upstream discards, so at least the count
+survives. See `harness/FORK.md`.
 
 ## Build and run
 

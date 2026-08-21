@@ -10,7 +10,23 @@ changes.
 
 ## Divergence
 
-Nothing yet. Every capability Aviary needs so far, the harness already offered:
+### `Usage.reasoning` — preserve the provider's reasoning-token count
+
+`packages/ai/src/types.ts`, `packages/ai/src/providers/openai-responses-shared.ts`.
+
+The responses API reports `usage.output_tokens_details.reasoning_tokens`; upstream reads
+`input_tokens_details.cached_tokens` from the same object and drops the reasoning count on
+the floor. That makes a hidden-reasoning route unaccountable: on a route that returns
+thinking as text you can measure it yourself, but on an encrypted-reasoning route
+(`include: ["reasoning.encrypted_content"]`, which is what the Codex route uses) the count
+is the *only* evidence the tokens existed. A turn reporting `output: 7` may have burned
+thousands of them.
+
+Added as an optional field, because absent and zero mean different things — absent is
+"this route didn't say". It is a breakdown of `output`, never an addend: providers bill
+reasoning as output.
+
+Everything else Aviary needs, the harness already offered:
 
 - **RPC mode** (`--mode rpc`) for driving a live run — a documented embedding contract with
   LF-delimited JSON commands in and events out.
@@ -20,6 +36,10 @@ Nothing yet. Every capability Aviary needs so far, the harness already offered:
 - **`doctor --json`** for the daemon handshake.
 - The on-disk formats: session JSONL, `rlm-subagents.jsonl`, the spawn ledger, worker
   descriptors, `models.json`, `settings.json`.
+- **`before_provider_request`**, an extension event carrying the exact provider payload
+  after serialization and before the send. Aviary records payloads through it rather than
+  patching the providers, so "show me everything that was sent to the model" needed no
+  divergence at all — see `harness-extensions/wire-log.ts`.
 
 Record changes here as they happen, with the reason. A fork whose divergence is undocumented
 is just a stale copy.

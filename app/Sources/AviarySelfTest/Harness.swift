@@ -70,3 +70,7 @@ func XCTUnwrap<T>(_ v: T?, line: Int = #line) throws -> T {
     guard let v else { throw UnwrapFailure(description: "nil at line \(line)") }
     return v
 }
+
+func XCTAssertNil<T>(_ v: T?, _ m: String = "expected nil", line: Int = #line) {
+    Harness.check(v == nil, m, line: line)
+}

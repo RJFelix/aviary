@@ -204,6 +204,19 @@ export interface Usage {
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
+	/**
+	 * Reasoning tokens, where the provider reports them separately.
+	 *
+	 * Already included in `output` — providers bill reasoning as output — so this is a
+	 * breakdown, never an addend. Absent when a route does not report it, which is not the
+	 * same as zero: it means unknown.
+	 *
+	 * Aviary fork: upstream drops `output_tokens_details.reasoning_tokens` on the floor,
+	 * which makes hidden-thinking routes unaccountable. On a route that returns thinking as
+	 * text you can at least see and measure it; on an encrypted-reasoning route this count
+	 * is the only evidence the tokens existed at all.
+	 */
+	reasoning?: number;
 	totalTokens: number;
 	cost: {
 		input: number;

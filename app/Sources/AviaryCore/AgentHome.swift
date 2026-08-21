@@ -187,6 +187,13 @@ public enum EngineLocator {
         return version
     }
 
+    /// The bundled payload-recording extension, if this checkout has it.
+    public static func wireLogExtension() -> URL? {
+        guard let root = repoRoot() else { return nil }
+        let url = root.appending(path: "harness-extensions/wire-log.ts")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
     static func version(of executable: String, args: [String]) async -> String? {
         guard case .success(let r) = await Shell.run(
             executable, args + ["--version"], timeout: 45), r.ok else { return nil }

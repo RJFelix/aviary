@@ -399,6 +399,11 @@ struct SessionInspector: View {
                     if u.cacheRead > 0 {
                         DetailRow(label: "Cache read", value: Fmt.tokens(u.cacheRead), mono: true)
                     }
+                    if let r = u.reasoning {
+                        DetailRow(
+                            label: "Reasoning", value: Fmt.tokens(r), mono: true,
+                            tint: Design.thinking)
+                    }
                     if u.cost.total > 0 {
                         DetailRow(label: "Cost", value: Fmt.cost(u.cost.total), mono: true)
                     }
