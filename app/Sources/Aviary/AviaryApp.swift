@@ -62,6 +62,10 @@ struct AviaryCommands: Commands {
         CommandMenu("Aviary") {
             Button("Command Palette…") { model.showCommandPalette = true }
                 .keyboardShortcut("k")
+            Button("Improve Aviary…") {
+                model.capturePanelOpen = true
+            }
+            .keyboardShortcut("i", modifiers: [.command, .shift])
             Divider()
             Button("Refresh Everything") { Task { await model.refreshAll() } }
                 .keyboardShortcut("r")
@@ -104,6 +108,7 @@ struct AviaryCommands: Commands {
         case .cockpit: return "1"
         case .live: return "2"
         case .sessions: return "3"
+        case .workshop: return "9"
         case .flock: return "4"
         case .models: return "5"
         case .usage: return "6"

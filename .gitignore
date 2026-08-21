@@ -21,3 +21,7 @@ untracked/
 # ── Snapshot output: contains real session titles from real work ──
 build/shots/
 docs/screens/
+
+# Workshop screenshots: one PNG per filed request, captured from the live window.
+# Useful to the agent servicing the board, not worth carrying in history.
+workshop/shots/

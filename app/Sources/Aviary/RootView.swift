@@ -27,6 +27,9 @@ struct RootView: View {
             CommandPaletteView()
         }
         .overlay(alignment: .bottom) { toastOverlay }
+        // Bottom-trailing, on every screen, deliberately outside the section switch: the
+        // point of the panel is to catch a reaction wherever you have it.
+        .overlay(alignment: .bottomTrailing) { CapturePanel() }
         .animation(.easeInOut(duration: 0.18), value: model.toast?.id)
     }
 
@@ -36,6 +39,7 @@ struct RootView: View {
         case .cockpit: CockpitView()
         case .live: LiveView()
         case .sessions: SessionsView()
+        case .workshop: WorkshopView()
         case .flock: FlockView()
         case .models: ModelsView()
         case .usage: UsageView()
@@ -50,6 +54,9 @@ struct RootView: View {
             return model.engine.map { "\($0.kind.label) · \($0.version ?? "unknown version")" } ?? "No engine"
         case .sessions:
             return "\(model.filteredSessions.count) of \(model.sessions.count)"
+        case .workshop:
+            return "\(model.board.openCount) open · \(model.board.workingCount) in progress · "
+                + "\(model.board.requests.count) total"
         case .live:
             let working = model.liveSessions.filter(\.isWorking).count
             return "\(model.liveSessions.count) live · \(working) working · \(model.runs.count) attached here"
@@ -245,6 +252,9 @@ struct SidebarView: View {
             return n > 0 ? ("\(n)", Design.success) : nil
         case .sessions:
             return model.sessions.isEmpty ? nil : ("\(model.sessions.count)", .secondary)
+        case .workshop:
+            let n = model.board.openCount
+            return n > 0 ? ("\(n)", Design.accent) : nil
         case .flock:
             let n = model.tree.runningCount
             return n > 0 ? ("\(n)", Design.agentMessage) : nil

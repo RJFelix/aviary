@@ -168,6 +168,7 @@ enum Snapshot {
             case .cockpit: CockpitView()
             case .live: LiveView()
             case .sessions: SessionsView()
+            case .workshop: WorkshopView()
             case .flock: FlockView()
             case .models: ModelsView()
             case .usage: UsageView()

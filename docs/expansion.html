@@ -1,0 +1,1038 @@
+<title>Expanding Aviary</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Spectral:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+:root{
+  --ground:#F4F6F6; --panel:#FFFFFF; --panel-2:#E9EEED; --sunk:#DFE6E5;
+  --ink:#151C1E; --ink-2:#3E4B4D; --ink-3:#68787A;
+  --rule:#D1DAD9; --rule-2:#BCC8C7;
+  --accent:#0B5F63; --accent-soft:#D8E8E7; --accent-ink:#08484B;
+  --signal:#A8620A; --signal-soft:#F5E7D2;
+  --risk:#8E2F45; --risk-soft:#F3DEE2;
+  --display:"Archivo",-apple-system,"Helvetica Neue",sans-serif;
+  --body:"Spectral",Georgia,"Times New Roman",serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+  --measure:66ch;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0E1516; --panel:#161F21; --panel-2:#1D282A; --sunk:#121A1B;
+    --ink:#E4EBEA; --ink-2:#AFBEBD; --ink-3:#7E8F8F;
+    --rule:#283739; --rule-2:#374749;
+    --accent:#4FBFB5; --accent-soft:#17322F; --accent-ink:#7FD6CE;
+    --signal:#E0A253; --signal-soft:#33240F;
+    --risk:#E58399; --risk-soft:#331920;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0E1516; --panel:#161F21; --panel-2:#1D282A; --sunk:#121A1B;
+  --ink:#E4EBEA; --ink-2:#AFBEBD; --ink-3:#7E8F8F;
+  --rule:#283739; --rule-2:#374749;
+  --accent:#4FBFB5; --accent-soft:#17322F; --accent-ink:#7FD6CE;
+  --signal:#E0A253; --signal-soft:#33240F;
+  --risk:#E58399; --risk-soft:#331920;
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:var(--body); font-size:16.5px; line-height:1.62;
+  -webkit-font-smoothing:antialiased;
+}
+p,li{max-width:var(--measure)}
+a{color:var(--accent); text-underline-offset:2px}
+code,kbd{font-family:var(--mono); font-size:.84em; background:var(--panel-2);
+  padding:.1em .34em; border-radius:2px; color:var(--ink)}
+pre{font-family:var(--mono); font-size:12.5px; line-height:1.5; background:var(--sunk);
+  border:1px solid var(--rule); border-left:2px solid var(--accent);
+  padding:14px 16px; overflow-x:auto; margin:0; color:var(--ink-2)}
+pre code{background:none;padding:0;font-size:inherit}
+hr{border:0;border-top:1px solid var(--rule);margin:0}
+
+/* ---------- shell ---------- */
+.wrap{max-width:1180px;margin:0 auto;padding:0 28px}
+.shell{display:grid;grid-template-columns:212px minmax(0,1fr);gap:52px;align-items:start}
+@media (max-width:1000px){.shell{grid-template-columns:1fr;gap:0}.rail{display:none}}
+
+/* ---------- masthead ---------- */
+header.mast{border-bottom:1px solid var(--rule-2);margin-bottom:44px;padding:52px 0 30px}
+.kicker{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--ink-3);display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+.kicker b{color:var(--accent);font-weight:600}
+h1{font-family:var(--display);font-weight:700;font-size:clamp(38px,6.4vw,66px);
+  line-height:.98;letter-spacing:-.022em;margin:0 0 18px;text-wrap:balance;max-width:22ch}
+.standfirst{font-size:19px;line-height:1.5;color:var(--ink-2);max-width:56ch;margin:0}
+.standfirst em{color:var(--ink);font-style:italic}
+
+/* ---------- rail ---------- */
+.rail{position:sticky;top:24px;padding-top:8px;font-family:var(--mono);font-size:11px;line-height:1.45}
+.rail h2{font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--ink-3);font-weight:600;margin:0 0 12px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
+.rail ol{list-style:none;margin:0 0 26px;padding:0;display:flex;flex-direction:column;gap:1px}
+.rail a{display:grid;grid-template-columns:20px 1fr;gap:6px;padding:5px 6px;
+  text-decoration:none;color:var(--ink-2);border-radius:2px}
+.rail a:hover{background:var(--panel-2);color:var(--ink)}
+.rail a span:first-child{color:var(--ink-3);font-variant-numeric:tabular-nums}
+.rail .legend{color:var(--ink-3);border-top:1px solid var(--rule);padding-top:12px}
+.rail .legend div{display:flex;gap:7px;align-items:baseline;margin-bottom:6px;max-width:none}
+
+/* ---------- generic section ---------- */
+section{margin-bottom:64px;scroll-margin-top:24px}
+h2.sec{font-family:var(--display);font-weight:600;font-size:clamp(25px,3.1vw,33px);
+  letter-spacing:-.015em;line-height:1.12;margin:0 0 6px;text-wrap:balance}
+h3{font-family:var(--display);font-weight:600;font-size:18px;letter-spacing:-.008em;
+  margin:34px 0 10px;text-wrap:balance}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.15em;text-transform:uppercase;
+  color:var(--accent);font-weight:600;margin:0 0 10px}
+.tuple{font-family:var(--mono);font-size:11px;color:var(--ink-3);margin:0 0 22px;
+  padding:7px 10px;background:var(--panel-2);border-radius:2px;max-width:none;
+  display:flex;gap:6px;flex-wrap:wrap;align-items:baseline}
+.tuple b{color:var(--ink-2);font-weight:500}
+.tuple span{color:var(--rule-2)}
+
+/* ---------- chips ---------- */
+.chip{font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.09em;
+  text-transform:uppercase;padding:2px 6px;border-radius:2px;white-space:nowrap;
+  vertical-align:2px;display:inline-block}
+.c-ver{background:var(--accent-soft);color:var(--accent-ink)}
+.c-sig{background:var(--signal-soft);color:var(--signal)}
+.c-risk{background:var(--risk-soft);color:var(--risk)}
+.c-s{background:var(--panel-2);color:var(--ink-3);border:1px solid var(--rule)}
+
+/* ---------- finding blocks ---------- */
+.finding{border-top:2px solid var(--accent);background:var(--panel);
+  padding:20px 22px;margin:0 0 3px}
+.finding.warn{border-top-color:var(--signal)}
+.finding.kill{border-top-color:var(--risk)}
+.finding h3{margin:0 0 8px;font-size:19px}
+.finding p{margin:0 0 10px;color:var(--ink-2)}
+.finding p:last-child{margin-bottom:0}
+.finding .cite{font-family:var(--mono);font-size:11px;color:var(--ink-3);
+  display:block;margin-top:10px;max-width:none}
+
+/* ---------- proposals ---------- */
+.props{list-style:none;margin:0;padding:0;border-top:1px solid var(--rule)}
+.props>li{border-bottom:1px solid var(--rule);padding:13px 0 13px 0;
+  display:grid;grid-template-columns:1fr 44px;gap:14px;align-items:start;max-width:none}
+.props .nm{font-family:var(--display);font-weight:600;font-size:15px;letter-spacing:-.004em}
+.props .pitch{font-size:14.5px;color:var(--ink-2);margin:2px 0 0;line-height:1.5}
+.props .why{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);
+  margin:6px 0 0;line-height:1.5;max-width:none}
+.props .sz{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink-3);
+  text-align:right;font-variant-numeric:tabular-nums;padding-top:3px}
+.props li.pick{background:var(--panel);margin:0 -14px;padding-left:14px;padding-right:14px;
+  box-shadow:inset 3px 0 0 var(--accent)}
+.props li.pick .sz{color:var(--accent)}
+.props .star{font-family:var(--mono);font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--accent);font-weight:600;margin-left:8px;vertical-align:2px}
+
+/* ---------- objection ---------- */
+.obj{border-left:2px solid var(--risk);padding:2px 0 2px 16px;margin:16px 0 0;
+  font-size:14.5px;color:var(--ink-2);font-style:italic}
+.obj b{font-style:normal;font-family:var(--mono);font-size:10px;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--risk);display:block;margin-bottom:4px;font-weight:600}
+
+/* ---------- tables ---------- */
+.tw{overflow-x:auto;margin:18px 0;border:1px solid var(--rule);background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:520px}
+th,td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--ink-3);font-weight:600;background:var(--panel-2);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td.n{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+td.mono{font-family:var(--mono);font-size:12px}
+.hit{color:var(--accent);font-weight:600}
+.miss{color:var(--rule-2)}
+
+/* ---------- build order ---------- */
+.tier{margin:0 0 26px}
+.tier .tl{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--ink-3);font-weight:600;border-bottom:1px solid var(--rule);
+  padding-bottom:6px;margin-bottom:12px;display:flex;justify-content:space-between;gap:12px}
+.tier ol{margin:0;padding-left:22px}
+.tier li{margin-bottom:9px;font-size:15px}
+.tier li b{font-family:var(--display);font-weight:600}
+
+footer{border-top:1px solid var(--rule-2);margin-top:20px;padding:26px 0 60px;
+  font-family:var(--mono);font-size:11px;color:var(--ink-3);line-height:1.7}
+footer p{max-width:74ch}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="wrap">
+<header class="mast">
+  <div class="kicker">
+    <span><b>10</b> parallel explorations</span>
+    <span><b>59</b> proposals</span>
+    <span><b>4</b> corrections to the record</span>
+    <span>ideonomy &middot; plain</span>
+  </div>
+  <h1>Expanding Aviary</h1>
+  <p class="standfirst">Ten agents were given one brief, one repo, and ten different
+  randomized ideonomy method tuples, and told to find what a Mac-native GUI could do with
+  the Prime Agent harness that nobody has done yet. They came back with fifty-nine
+  proposals &mdash; and, more valuably, <em>with four facts that contradict the brief they
+  were given.</em></p>
+</header>
+
+<div class="shell">
+<nav class="rail" aria-label="Contents">
+  <h2>Corrections</h2>
+  <ol>
+    <li><a href="#corrections"><span>&mdash;</span><span>What the brief got wrong</span></a></li>
+    <li><a href="#convergence"><span>&mdash;</span><span>Where they converged</span></a></li>
+  </ol>
+  <h2>Facets</h2>
+  <ol>
+    <li><a href="#f1"><span>01</span><span>Continual harness</span></a></li>
+    <li><a href="#f2"><span>02</span><span>RLM recursion</span></a></li>
+    <li><a href="#f3"><span>03</span><span>Context economics</span></a></li>
+    <li><a href="#f4"><span>04</span><span>The kernel</span></a></li>
+    <li><a href="#f5"><span>05</span><span>Session topology</span></a></li>
+    <li><a href="#f6"><span>06</span><span>The daemon</span></a></li>
+    <li><a href="#f7"><span>07</span><span>Hooks as API</span></a></li>
+    <li><a href="#f8"><span>08</span><span>The library</span></a></li>
+    <li><a href="#f9"><span>09</span><span>Models &amp; money</span></a></li>
+    <li><a href="#f10"><span>10</span><span>GUI-native</span></a></li>
+  </ol>
+  <h2>Then</h2>
+  <ol>
+    <li><a href="#tension"><span>&mdash;</span><span>The shared casualty</span></a></li>
+    <li><a href="#order"><span>&mdash;</span><span>Build order</span></a></li>
+  </ol>
+  <div class="legend">
+    <div><span class="chip c-ver">Ver</span><span>checked in source this session</span></div>
+    <div><span class="chip c-s">S M L</span><span>agent&rsquo;s own size estimate</span></div>
+    <div><span style="color:var(--accent);font-weight:600">&#9646;</span><span>the agent&rsquo;s own top pick</span></div>
+  </div>
+</nav>
+
+<main>
+
+<!-- ================= CORRECTIONS ================= -->
+<section id="corrections">
+  <p class="eyebrow">Before the ideas</p>
+  <h2 class="sec">Four things the brief asserted that turned out to be false</h2>
+  <p style="color:var(--ink-2)">I wrote the shared brief from my own reading of the harness.
+  Four separate agents came back having checked it, and the corrections change what is worth
+  building. All four are verified in source or in the real session store, not taken on an
+  agent&rsquo;s word.</p>
+
+  <div class="finding">
+    <h3><code>rlm()</code> does not return the child&rsquo;s answer <span class="chip c-ver">Verified</span></h3>
+    <p>The brief called a sub-agent &ldquo;an awaited function call, not a fire-and-forget
+    task.&rdquo; The opposite is true. <code>await rlm('sub-task')</code> returns
+    <em>immediately at task admission</em> with <code>rlm_child_id</code>, <code>name</code>,
+    <code>session_dir</code>, <code>model</code> &mdash; and, in the harness&rsquo;s own words,
+    &ldquo;never waits for or returns the child&rsquo;s answer.&rdquo; Replies arrive
+    out-of-band via <code>agent_message.send(..., receiver_role='parent')</code>, on some later
+    turn, or never.</p>
+    <p>So a sub-agent is <code>fork()</code> plus an unreliable mailbox. The consequence is
+    structural and it is the single best idea in the whole fan-out: <b>the return edge is
+    stored nowhere on disk.</b> Flock draws spawn edges because spawn edges are the only edges
+    that exist.</p>
+    <span class="cite">harness/packages/coding-agent/src/core/prompts/rlm.ts:150</span>
+  </div>
+
+  <div class="finding">
+    <h3>There are 22 hook events, not 5 &mdash; and two of them are levers <span class="chip c-ver">Verified</span></h3>
+    <p>The brief listed five. <code>ExtensionEvent</code> is a union of 22, with 27
+    <code>on()</code> overloads. The two I had missed are the two that matter most:</p>
+    <p><code>ContextEvent</code> returns <code>ContextEventResult { messages }</code> &mdash;
+    an extension can rewrite the message history the model sees, per LLM call, without
+    touching disk. <code>ToolCallEvent</code> returns <code>{ block, reason }</code>, and the
+    type&rsquo;s own comment reads: <em>&ldquo;To modify arguments, mutate
+    <code>event.input</code> in place instead.&rdquo;</em> Because <code>ipython</code> is the
+    only tool, that one handler is a complete permission system that can <em>edit the Python
+    before it runs</em>.</p>
+    <span class="cite">core/extensions/types.ts:845, :874, :976, :995</span>
+  </div>
+
+  <div class="finding warn">
+    <h3>The harness already has a bidirectional UI protocol. Aviary drops it on the floor. <span class="chip c-ver">Verified</span></h3>
+    <p>I described hooks as one-way and speculated about &ldquo;bidirectional hooks that ask
+    the human a question.&rdquo; They exist. In RPC mode the harness emits
+    <code>extension_ui_request</code> with methods <code>select</code>, <code>confirm</code>,
+    <code>input</code>, <code>editor</code>, <code>notify</code>, <code>setStatus</code>,
+    <code>setWidget</code>, <code>setTitle</code>, <code>set_editor_text</code>, and waits for
+    an <code>extension_ui_response</code> correlated by <code>id</code>. <b>The host is
+    expected to render extension UI.</b></p>
+    <p><code>RPCClient.swift</code> handles none of them. Today an extension that asks a
+    question gets silence until the timeout fires. There is even a
+    <code>set_editor_text</code> method that would let an extension prefill Aviary&rsquo;s
+    composer.</p>
+    <span class="cite">modes/rpc/rpc-types.ts:302&ndash;305 &middot; modes/rpc/rpc-extension-ui-context.ts:50, :152</span>
+  </div>
+
+  <div class="finding kill">
+    <h3>Zero of 80 sessions have ever forked &mdash; which kills a proposal <span class="chip c-ver">Verified</span></h3>
+    <p>Facet 05 proposed a &ldquo;Branch Gutter&rdquo; rendering every leaf in the entry tree,
+    then asked for the cheap falsification test first: <em>count the leaves before writing any
+    Swift.</em> I ran it over the real store. Every one of the 80 sessions has exactly two
+    graph leaves &mdash; and in 66 of them the signature is
+    <code>('message','session')</code>: the <code>session</code> header entry&rsquo;s id is
+    simply never anyone&rsquo;s <code>parentId</code>. That is a detached header, not a
+    branch.</p>
+    <p>One real conversational leaf per session, 80 for 80. The Branch Gutter would be an
+    empty rail. The same parser work should ship as <b>Compaction X-ray</b> instead, where the
+    hidden-to-visible ratio is nonzero on every long session &mdash; exactly the fallback that
+    agent named before it knew the answer.</p>
+    <span class="cite">80 files &middot; 22,173 entries &middot; ~/.prime/agent/sessions</span>
+  </div>
+</section>
+
+<hr>
+
+<!-- ================= CONVERGENCE ================= -->
+<section id="convergence" style="padding-top:44px">
+  <p class="eyebrow">Independent agreement</p>
+  <h2 class="sec">Five agents, working blind to each other, reached for the same lever</h2>
+  <p style="color:var(--ink-2)">None of the ten could see another&rsquo;s output. They were
+  given different facets and different method tuples on purpose. So agreement is evidence,
+  not echo &mdash; and they agreed twice.</p>
+
+  <h3>Agreement one: the payload-replacing hook is the only real control point</h3>
+  <p>Five of ten independently built their strongest proposal on
+  <code>before_provider_request</code>&rsquo;s licence to <em>replace</em> the outgoing
+  payload &mdash; each arriving from a different direction, and one of them noting the hook is
+  documented as being &ldquo;mainly useful for debugging provider serialization.&rdquo; Its
+  used purpose has drifted a long way from its stated one.</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>Facet</th><th>Reached for it as</th><th>To do what</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">01 harness</td><td>Veto Gate</td><td>hold an auto-refine proposal for human approval before it writes</td></tr>
+      <tr><td class="mono">03 context</td><td>The Gate / Warrant</td><td>enforce a per-segment context budget on send</td></tr>
+      <tr><td class="mono">07 hooks</td><td>Tariff</td><td>downgrade a request instead of refusing it</td></tr>
+      <tr><td class="mono">08 library</td><td>The Gate</td><td>rewrite <code>&lt;available_skills&gt;</code> down to a ranked budget</td></tr>
+      <tr><td class="mono">09 money</td><td>Governor</td><td>drop thinking level, then model, as a budget ceiling approaches</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Agreement two: the target is the skills catalogue</h3>
+  <p>Three of the ten &ldquo;sharpest&rdquo; picks aim at the same number from three unrelated
+  facets, and a fourth aims at its sibling defect. The number is the one measurement that
+  started this whole line of work: <b>68 installed skills = 46,713 characters &asymp; 10,883
+  tokens = 62.7% of the input on a trivial two-message run</b>, whether or not any skill is
+  used.</p>
+  <p>Facet 03 called it <b>Warrant</b> (admission by relevance, via
+  <code>resources_discover</code>). Facet 07 called it <b>Bonded Knowledge</b> (a staging tier
+  the agent can fetch from but does not carry). Facet 08 called it <b>The Gate</b> (rewrite the
+  block on the wire). Facet 01 aimed at the adjacent wound: the continual harness&rsquo;s
+  6-entry, 180-character, alphabetical injection cap.</p>
+  <p>Two of them independently landed on the same reason it is safe <em>here</em> and nowhere
+  else: because <code>ipython</code> is the only tool, withholding a skill&rsquo;s
+  advertisement withholds <em>discovery</em>, never capability. The module stays importable and
+  the SKILL.md stays readable by path. A denial costs latency, not a lobotomy. In a
+  Read/Write/Bash harness the same move would be silent capability loss.</p>
+  <p>And both then raised the same objection: a pruned skill does not error. It makes the agent
+  look stupid in a way indistinguishable from the model being bad.</p>
+</section>
+
+<hr>
+
+<!-- ================= FACET 1 ================= -->
+<section id="f1" style="padding-top:44px">
+  <p class="eyebrow">Facet 01</p>
+  <h2 class="sec">The continual harness, seen</h2>
+  <p class="tuple"><b>negation</b><span>&times;</span><b>abstraction-lift</b><span>&rarr;</span><b>list</b><span>&middot;</span>hierarchicalness, reversibility, predictability</p>
+  <p>Strip the vocabulary off <code>/refine</code> and what is left is <em>a write-back cache
+  with no eviction policy and an alphabetical read policy &mdash; where the cache is the
+  thing&rsquo;s personality.</em> Neighbouring domains solved it and Prime Agent kept none of
+  the answers: genetics separates germline from soma and makes meiosis the promotion gate;
+  publishing has the editorial diff and the erratum; accounting has double entry, journal for
+  provenance and ledger for state. The superrepo next door already runs the accounting answer.</p>
+  <p>Two of the negations turn out to <em>half-exist in code and have no reader</em>.
+  <b>Journaled:</b> <code>refinements.jsonl</code> and the
+  <code>prime-agent.refinement</code> custom entries already store full
+  <code>before</code>/<code>after</code> snapshots per edit &mdash; a real diff log, written and
+  never read. <b>Tiered:</b> <code>HarnessEntry.metadata</code> is a free-form dict and
+  <code>path</code> is the primary sort key, so tiers and expiry are expressible <em>inside the
+  existing format</em>, as demotion rather than deletion.</p>
+
+  <ul class="props">
+    <li class="pick"><div><span class="nm">Injection Waterline</span><span class="star">&#9646; top pick</span>
+      <p class="pitch">One view drawing the line between what is on disk and what reaches the model, with drag-to-reorder across it.</p>
+      <p class="why">Reimplements <code>buildOverview</code>&rsquo;s policy in Swift; ground-truths against the real injected block captured by <code>wire-log.ts</code>. Reorder works by writing <code>path</code> prefixes &mdash; the cap is alphabetical on a field the agent controls, so injection order is steerable with no fork.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Provenance Rail</span>
+      <p class="pitch">Every harness entry links back to the turn that taught it.</p>
+      <p class="why">Joins <code>appliedEdits[].after.id</code> to refinement custom entries, then walks parent pointers to the preceding user message. Hard only here, because of the three-way session-id problem.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Mortality Sweep</span>
+      <p class="pitch">Lifetime tiers with no schema change: entries expire by sinking below the waterline instead of being deleted.</p>
+      <p class="why">Stamps <code>metadata.aviary_ttl</code>/<code>_tier</code>; on expiry rewrites <code>path</code> to <code>zz-expired/&hellip;</code> so the comparator demotes it while the text stays recoverable. Zero decay machinery plus a path-ordered read policy makes &ldquo;expire&rdquo; implementable as &ldquo;rename.&rdquo;</p></div><div class="sz">S</div></li>
+    <li><div><span class="nm">Veto Gate</span>
+      <p class="pitch">Auto-refine proposals surface for approve / edit / veto before they touch disk.</p>
+      <p class="why">Recognizes the auto-refine review request in <code>before_provider_request</code> and holds it. Must fail open with a deadline, or a wedged UI stalls the agent.</p></div><div class="sz">L</div></li>
+    <li><div><span class="nm">Bicameral Runs</span>
+      <p class="pitch">Pin two harness states, run one prompt against both, score the difference.</p>
+      <p class="why">The injected block is a discretely measurable slice (2,501 chars, ~626 tokens), so harness cost is separable here as it is not elsewhere. Outcome scoring is the whole problem.</p></div><div class="sz">L</div></li>
+    <li><div><span class="nm">Branch-Aware Rewind</span>
+      <p class="pitch">Rewinding a session branch offers to unwrite the harness edits that branch made.</p>
+      <p class="why">Applies the recorded <code>before</code> snapshots directly rather than calling <code>/refine rollback</code>, which does not revert but <em>synthesizes an inverse proposal with another model call</em>. Only a tree-shaped session makes this bug possible.</p></div><div class="sz">M</div></li>
+  </ul>
+  <p class="obj"><b>Its own strongest objection</b>The Waterline dignifies a broken policy
+  instead of replacing it. The honest fix is raising <code>maxEntriesPerKind</code> &mdash;
+  already a parameter, just never passed by any call site &mdash; and retrieving by relevance,
+  which is what the superrepo&rsquo;s whisper hook does with a hook and no GUI at all. Worse,
+  drag-to-reorder permanently graffitis every entry&rsquo;s <code>path</code> with
+  <code>00-hot/</code> prefixes that go inert the moment upstream changes the comparator: a GUI
+  affordance paying rent in someone else&rsquo;s data model.</p>
+</section>
+
+<!-- ================= FACET 2 ================= -->
+<section id="f2">
+  <p class="eyebrow">Facet 02</p>
+  <h2 class="sec">The call with no return value</h2>
+  <p class="tuple"><b>tree-finding</b><span>&times;</span><b>combination</b><span>&rarr;</span><b>procedure</b><span>&middot;</span>scope, autonomy, reversibility</p>
+  <p>This is the facet that found the correction. Walking up one level, <code>rlm()</code> is
+  not a function call at all &mdash; it is <code>fork()</code> plus an unreliable pipe. Walking
+  <em>across</em> to its siblings is where the value is, because each sibling has evolved an
+  instrument Prime Agent lacks:</p>
+  <div class="tw"><table>
+    <thead><tr><th>Sibling</th><th>Its instrument</th><th>What Prime Agent has instead</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">POSIX <code>fork</code></td><td>a debugger that shows the frame</td><td>the frame <em>is</em> on disk &mdash; <code>kernel-state.json</code>, unread</td></tr>
+      <tr><td class="mono">Erlang <code>spawn_link</code></td><td>monitors: a dead child notifies</td><td>nothing. Hence &ldquo;children that die before writing status&rdquo;</td></tr>
+      <tr><td class="mono">Make</td><td>memoization by input hash</td><td><code>prompt</code> is stored verbatim, so the hash exists; the result does not</td></tr>
+      <tr><td class="mono">Prolog</td><td>a proof tree re-enterable at one node</td><td>re-running a node is a fresh billed child</td></tr>
+      <tr><td class="mono">CI job matrix</td><td>A/B by construction</td><td>sibling diffing is not a view</td></tr>
+      <tr><td class="mono">MapReduce</td><td>a named, owned reduce step</td><td>reduce is whatever Python the parent happened to write</td></tr>
+    </tbody>
+  </table></div>
+
+  <ul class="props">
+    <li class="pick"><div><span class="nm">Return-Edge Reconstructor</span><span class="star">&#9646; top pick</span>
+      <p class="pitch">Draw the missing return edge by joining the spawn ledger to the parent&rsquo;s inbound agent messages, and mark every spawn that never answered.</p>
+      <p class="why"><code>rlm-ledger/*.jsonl</code> &times; child session files &times; <code>agent_messages_status</code>. Unlike any chat-log agent GUI, the return edge exists nowhere on disk, so this is reconstruction rather than rendering.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Grave Markers</span>
+      <p class="pitch">A permanent lane in Flock for spawns with a ledger record, no status, and no reply.</p>
+      <p class="why">The harness has two deliberately disagreeing sources &mdash; append-only daemon ledger vs writer-owned artifact &mdash; and the disagreement <em>is</em> the signal.</p></div><div class="sz">S</div></li>
+    <li><div><span class="nm">Ledger Flamegraph</span>
+      <p class="pitch">Read <code>rlm-ledger</code> as a profiler trace: x = wall clock, y = recorded depth, colour = model, inclusive vs exclusive tokens.</p>
+      <p class="why"><code>depth</code> is a stored field and every child is a real session with its own usage, so self-time vs child-time is computable. A single-transcript agent has no depth axis at all.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Twin Spawn</span>
+      <p class="pitch">Re-run one node&rsquo;s exact stored prompt under a different model, quarantined, and diff the two children in the one renderer.</p>
+      <p class="why">The child&rsquo;s input is verbatim on disk, so it is bit-reproducible &mdash; which generic sub-agent GUIs cannot offer, because there the input was a summarized context.</p></div><div class="sz">L</div></li>
+    <li><div><span class="nm">Depth Governor with provenance</span>
+      <p class="pitch">Show the effective max recursion depth <em>and which of five sources set it</em>, plus a live spawns-per-minute budget.</p>
+      <p class="why"><code>RlmMaxDepthStatus.source</code> is default / env / global / <em>inherited</em> / chat. &ldquo;Inherited&rdquo; means a running subtree is governed by a value its parent captured earlier &mdash; a provenance bug no chat UI can have.</p></div><div class="sz">S</div></li>
+    <li><div><span class="nm">Frame Inspector</span>
+      <p class="pitch">Beside the selected child, the parent&rsquo;s live top-level variables, highlighting the ones holding this child&rsquo;s handle.</p>
+      <p class="why">The &ldquo;stack frame&rdquo; of an rlm call is a persistent Python namespace, not a message list. The manifest&rsquo;s <code>skipped</code> names are the frame&rsquo;s real losses.</p></div><div class="sz">M</div></li>
+  </ul>
+  <p class="obj"><b>Its own strongest objection</b>The join is a guess.
+  <code>agent_message</code> carries no correlation id back to an <code>rlm_child_id</code>,
+  only a sender name that <code>op:rename</code> can change mid-flight &mdash; so a parent that
+  spawns three and receives two may be silently mis-attributed. A <em>wrong</em> return edge is
+  worse than a missing one, because it retires exactly the suspicion the view exists to raise.
+  Render attribution confidence as a first-class state (certain / probable / unattributed)
+  rather than snapping every message to a parent &mdash; and push upstream for a
+  <code>reply_to_child_id</code> field. It is a one-field fork.</p>
+</section>
+
+<!-- ================= FACET 3 ================= -->
+<section id="f3">
+  <p class="eyebrow">Facet 03</p>
+  <h2 class="sec">Context economics and the wire</h2>
+  <p class="tuple"><b>negation</b><span>&times;</span><b>substitution</b><span>&rarr;</span><b>matrix</b><span>&middot;</span>scope, predictability, side-effect</p>
+  <p>The interference matrix is the artifact here: rows are the thing you rewrite in flight,
+  columns are the collateral damage. It has a shape nobody would have guessed.</p>
+  <div class="tw"><table>
+    <thead><tr><th>Rewrite&hellip;</th><th>Cache prefix</th><th>Transcript fidelity</th><th>Refine loop</th><th>Cost attribution</th><th>Agent capability</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">base instructions</td><td class="hit">TOTAL</td><td>drift</td><td class="miss">blind</td><td>fixes</td><td>shifts</td></tr>
+      <tr><td class="mono">skills catalogue</td><td class="hit">TOTAL</td><td class="miss">none</td><td>starves</td><td class="hit">FIXES</td><td class="hit">HIDES</td></tr>
+      <tr><td class="mono">AGENTS.md</td><td class="hit">TOTAL</td><td class="miss">none</td><td class="miss">blind</td><td>fixes</td><td>shifts</td></tr>
+      <tr><td class="mono">harness state block</td><td class="hit">TOTAL</td><td class="miss">none</td><td class="hit">LOOPS</td><td>fixes</td><td>forgets</td></tr>
+      <tr><td class="mono">transcript tail</td><td>partial</td><td class="hit">DIVERGES</td><td class="miss">blind</td><td>little</td><td class="miss">none</td></tr>
+      <tr><td class="mono">last user message</td><td class="miss">none</td><td class="hit">DIVERGES</td><td class="miss">blind</td><td class="miss">none</td><td class="miss">none</td></tr>
+      <tr><td class="mono">sampling parameters</td><td class="miss">none</td><td class="miss">none</td><td class="miss">none</td><td class="miss">none</td><td>shifts</td></tr>
+    </tbody>
+  </table></div>
+  <p>Read it column-wise and the design is forced: <b>everything worth editing for cost sits
+  where cache goes TOTAL, and everything cache-safe saves nothing.</b> Transcript fidelity is
+  empty exactly where cache is full &mdash; prefix surgery is honest, message surgery is not.</p>
+  <p>The best substitution was on <em>scope</em>. Budget per request and you have a truncator.
+  Budget per <em>agent tree</em> and the real number appears: every <code>rlm()</code> child
+  re-pays the full 46,713-character catalogue, so a depth-3 fan-out of eight buys 24 copies.
+  Children should inherit an allocation, not a fresh wallet.</p>
+
+  <ul class="props">
+    <li><div><span class="nm">Context Invoice</span>
+      <p class="pitch">Per-request bytes billed to the contributor that put them there, amortized across every session on the machine, priced in dollars.</p>
+      <p class="why">This harness&rsquo;s cost is dominated by resource <em>discovery</em>, not conversation. Generic agent GUIs bill per session because their context is mostly messages.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Assay</span>
+      <p class="pitch">Dead-weight detection: which context never influenced an output.</p>
+      <p class="why">The single-tool design makes attribution near-exact &mdash; every action ever taken is Python source, so &ldquo;did this skill influence anything&rdquo; is a grep for an import, not an inference about attention.</p></div><div class="sz">S</div></li>
+    <li><div><span class="nm">Prefix Weathervane</span>
+      <p class="pitch">Cache forensics that names the culprit byte: first-divergence offset between consecutive payloads, attributed to its enclosing segment.</p>
+      <p class="why">The harness re-injects and re-sorts continual-harness state alphabetically every request, so cache breakage has a specific, fixable, in-house cause. Reports a bracket, not a number.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">The Gate</span>
+      <p class="pitch">Aviary holds the request and may return an edited one &mdash; pass, budget, or edit.</p>
+      <p class="why">The runner awaits and <em>chains</em> handler results, so returning a payload is contractual. But it swallows handler exceptions into an error event, so a broken rewrite ships silently: needs fail-closed pass-through and a visible armed state.</p></div><div class="sz">L</div></li>
+    <li class="pick"><div><span class="nm">Warrant</span><span class="star">&#9646; top pick</span>
+      <p class="pitch">Skills admitted per session by relevance, with a visible denied tray.</p>
+      <p class="why"><code>resources_discover</code> returning filtered <code>skillPaths</code>. It is the superrepo&rsquo;s whisper hook aimed at the harness&rsquo;s largest cost, fixing the defect the continual harness shares: capped, alphabetical, relevance-blind injection.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Slimming Bench</span>
+      <p class="pitch">Counterfactual replay: rerun a recorded payload minus one segment, so allocations become measurements.</p>
+      <p class="why">One wire-log line is a byte-exact fixture sent straight to the provider with no harness in the loop &mdash; so the bench keeps running with the daemon wedged.</p></div><div class="sz">M</div></li>
+  </ul>
+  <p class="obj"><b>Its own strongest objection</b>Warrant reinvents the continual
+  harness&rsquo;s worst bug at ten times the scale: an unreviewed relevance heuristic silently
+  removing capability, failing invisibly because the model cannot ask for a skill it was never
+  shown or report a gap it cannot perceive. The rebuttal is specific and nearly free &mdash;
+  admission governs the description, not the capability, so the denied tray collapses to one
+  prompt line plus an index. <b>But build Assay and Context Invoice first regardless: a warrant
+  issued without evidence of what went unused is a guess with a budget attached.</b></p>
+</section>
+
+<!-- ================= FACET 4 ================= -->
+<section id="f4">
+  <p class="eyebrow">Facet 04</p>
+  <h2 class="sec">One stateful tool instead of many stateless ones</h2>
+  <p class="tuple"><b>dimension-identification</b><span>&times;</span><b>tree-finding</b><span>&rarr;</span><b>timeline</b><span>&middot;</span>decomposability, symmetry, side-effect</p>
+  <p>The tree-walk inverts the product. Going up from the kernel namespace &rarr; session state
+  &rarr; agent context &rarr; what the model believes, <em>each level up is more inspectable
+  than the level below it.</em> And going across: the transcript JSONL,
+  <code>harness_state.json</code>, <code>rlm-subagents.jsonl</code>, worker descriptors and the
+  wire log are all durable, diffable, and already read by Aviary. The live image is the one
+  sibling with no reader.</p>
+  <p>Slide down one level and Aviary is not an agent GUI at all: <em>it is a debugger attached
+  to a long-running Python process that happens to be driven by a model.</em></p>
+  <p>The asymmetries found on the timeline are the specifics worth having. On restore, the
+  model is told what came back via a system notice; <b>the human is told nothing.</b> Only
+  three vendor MIME types are read from <code>display_data</code>, so <code>image/png</code>
+  and <code>text/html</code> fall on the floor. Compaction shrinks the narration and not the
+  image, and divergence begins there. Nothing in <code>modes/rpc/</code> mentions the kernel at
+  all, so the message tree forks and the image cannot. And the measured afterlife: <b>105
+  artifact directories, 58 MB of dill, median 16 saved names, max 185, zero garbage
+  collection.</b></p>
+
+  <ul class="props">
+    <li><div><span class="nm">Namespace Inspector</span>
+      <p class="pitch">A per-session variable explorer built entirely from files already on disk.</p>
+      <p class="why">Reads the <code>kernel-state.json</code> manifest &mdash; savedNames, skipped, pruned, bytes &mdash; that the harness writes once per session and nothing consumes. Hardest part: suppressing the 488 known-benign skill-module skips so a <em>real</em> loss is visible.</p></div><div class="sz">S</div></li>
+    <li class="pick"><div><span class="nm"><code>kernel_exec</code> &mdash; the shared REPL</span><span class="star">&#9646; top pick</span>
+      <p class="pitch">Human and agent type into the same kernel.</p>
+      <p class="why">A new RPC command beside the existing <code>bash</code> verb, routed to the session&rsquo;s <code>KernelManager.execute</code>. <code>bash</code> already exists as a side channel &mdash; but on a one-tool harness the kernel <em>is</em> the machine, so a shell is the wrong side channel.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Rich-output harvest</span>
+      <p class="pitch">Matplotlib figures, DataFrame HTML and PIL images rendered inline in the transcript.</p>
+      <p class="why">The agent never asked for a plotting tool; the figures are <em>already</em> crossing iopub and being discarded. They must not reach the model by default &mdash; which makes them the first deliberate crack in one-renderer-two-sources.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Checkpoint rail</span>
+      <p class="pitch">Give the image the branching the transcript already has.</p>
+      <p class="why"><code>snapshotState()</code> has exactly one caller today &mdash; the dispose path. Add labelled checkpoints and restore by pointing the restore code at a chosen file. Hardest part: an old image under a new transcript must move together or declare the mismatch out loud.</p></div><div class="sz">L</div></li>
+    <li><div><span class="nm">Obituary and cell replay</span>
+      <p class="pitch">When the kernel dies mid-session, emit the ordered cell history as a candidate rebuild script.</p>
+      <p class="why">On a one-tool harness the tool-call history <em>is</em> a replayable program. Nowhere else is the transcript literally source code. Replay re-runs writes and network calls, so it needs cell-by-cell approval.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Image reaper</span>
+      <p class="pitch">58 MB across 105 sessions and no expiry anywhere in the harness.</p>
+      <p class="why">Keyed on manifest timestamp and dead-session status. Hardest part: never reaping a detached-but-live session&rsquo;s image.</p></div><div class="sz">S</div></li>
+  </ul>
+  <p class="obj"><b>Its own strongest objection</b>A shared REPL inverts Aviary&rsquo;s founding
+  bet. Files are truth and RPC is the narrow live lane precisely so the app survives a wedged
+  daemon &mdash; and the harness has no concept of a second writer to the namespace, so the
+  desync bugs land in the most expensive place there is: the model&rsquo;s beliefs about state
+  it thinks it owns exclusively. A read-only <code>whos</code> plus watch expressions gets most
+  of the insight for none of the risk.</p>
+</section>
+
+<!-- ================= FACET 5 ================= -->
+<section id="f5">
+  <p class="eyebrow">Facet 05</p>
+  <h2 class="sec">Git&rsquo;s data model, none of git&rsquo;s verbs</h2>
+  <p class="tuple"><b>abstraction-lift</b><span>&times;</span><b>tree-finding</b><span>&rarr;</span><b>timeline</b><span>&middot;</span>scope, homogeneity, polarity</p>
+  <p>Lifted: <em>a monotonic append log, interpreted as a pointer machine whose pointer is
+  implicit in file position.</em> The privileged leaf is declared nowhere &mdash; it is inferred
+  from whoever wrote last. That is <b>git without a HEAD file</b>: the DAG, the immutable
+  objects, the cheap branching, the non-destructive history, and no <code>branch -a</code>, no
+  <code>reflog</code>, no <code>diff</code>, no <code>log --graph</code>.</p>
+  <p>The sibling table settles the question I was chewing on earlier in this conversation. A
+  Prime Agent session is the only row that owns a live kernel <em>and</em> a mutable prompt
+  <em>and</em> a cron table. Its nearest sibling by state-weight is a Jupyter kernel; its
+  nearest by scope is a git worktree. <b>Both are week-scale, not task-scale.</b></p>
+  <div class="tw"><table>
+    <thead><tr><th>Sibling</th><th>Lifetime</th><th>State that dies with it</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">browser tab</td><td class="n">minutes&ndash;days</td><td>scroll position</td></tr>
+      <tr><td class="mono">tmux window</td><td class="n">hours&ndash;weeks</td><td>shell env</td></tr>
+      <tr><td class="mono">git branch</td><td class="n">days&ndash;weeks</td><td>working tree</td></tr>
+      <tr><td class="mono">git worktree</td><td class="n">days&ndash;weeks</td><td>build cache, node_modules</td></tr>
+      <tr><td class="mono">Jupyter kernel</td><td class="n">hours&ndash;days</td><td><b>variables, imports, handles</b></td></tr>
+      <tr><td class="mono">Linear ticket</td><td class="n">days&ndash;months</td><td>nothing &mdash; pure record</td></tr>
+      <tr><td class="mono"><b>Prime session</b></td><td class="n">&mdash;</td><td><b>kernel + harness/ + jobs + goal</b></td></tr>
+    </tbody>
+  </table></div>
+  <p>Narrow a session to one task and the harness&rsquo;s own numbers stop making sense:
+  auto-refine needs 25 assistant turns plus a 20-minute cooldown and only fires on root
+  sessions, so a task-sized session never refines once. Widen it to a week and the numbers land.
+  <b>One session = one worktree-scale unit of work, and branches are its tasks. The harness
+  already built for that; only the UI assumes otherwise.</b></p>
+
+  <ul class="props">
+    <li class="pick"><div><span class="nm">Branch Gutter</span><span class="star">&#9646; top pick &mdash; falsified</span>
+      <p class="pitch">Render every leaf in the file, not just the last: a ghost rail marking fork points, abandoned branches expandable in place.</p>
+      <p class="why"><span class="chip c-risk">Killed</span> This agent asked for the falsification test before any Swift: count the leaves. I ran it &mdash; 0 of 80 sessions have branched. It would be an empty rail. Its own named fallback, Compaction X-ray, is the one to build.</p></div><div class="sz">S</div></li>
+    <li><div><span class="nm">Branch Diff</span>
+      <p class="pitch">Pick two leaves, diff their <em>resolved contexts</em> from the common ancestor down.</p>
+      <p class="why">The diff&rsquo;s most valuable column is &ldquo;which branch&rsquo;s variables are live,&rdquo; which exists only because the sole tool is <code>ipython</code>. Rewinding the transcript does not rewind Python.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Compaction X-ray</span>
+      <p class="pitch">Render a compaction as an expandable seam: summary on one side, the exact turns the model can no longer see on the other.</p>
+      <p class="why">Compaction is non-destructive on disk &mdash; the model forgets, the file does not. Add one button on the seam: <em>promote to <code>knowledge/</code></em>, turning the moment of forgetting into the superrepo&rsquo;s dated-note intake.</p></div><div class="sz">S/M</div></li>
+    <li><div><span class="nm">Session Agenda</span>
+      <p class="pitch">One pane per session for its <em>forward</em>-facing state: goal, cron jobs, heartbeat, next-run times, turns-until-auto-refine.</p>
+      <p class="why">Schedules, heartbeats and goals are per-session in Prime Agent. The harness already priced sessions as long-lived; nothing shows a session&rsquo;s future. Must degrade to file-derived read-only when the daemon is wedged.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Identity Ribbon</span>
+      <p class="pitch">A persistent chip resolving filename id, header id, daemon <code>activeSessionId</code>, and <code>prompt_cache_key</code> &mdash; each copyable, each marked stable or per-attachment.</p>
+      <p class="why">68 of 80 sessions disagree between filename and header, and every cross-screen join in Aviary silently picks one.</p></div><div class="sz">S</div></li>
+    <li><div><span class="nm">Retire with a Receipt</span>
+      <p class="pitch">An explicit archive action that generates an obituary: branches abandoned, spans compacted away, harness entries authored, commits touched.</p>
+      <p class="why"><code>session_state {status:"archived"}</code> exists in the data model with no GUI writer, and the continual harness has zero prune machinery &mdash; retirement is the only natural promotion point from session to <code>knowledge/</code>.</p></div><div class="sz">M</div></li>
+  </ul>
+  <p class="obj"><b>Its own strongest objection, which proved correct</b>&ldquo;Forks may be
+  rare. If a scan of the 80 real sessions shows most files have exactly one leaf, the gutter is
+  an empty rail &mdash; and worse, the harness <em>deliberately</em> folds abandoned-branch value
+  forward via <code>branch_summary</code>, so re-surfacing branches may just re-litigate what
+  the harness already decided to compress. Count the leaves before writing any Swift.&rdquo;
+  Counted. Median one real leaf, zero forks. This is the fan-out&rsquo;s best moment: an agent
+  that specified the experiment that would kill its own favourite idea.</p>
+</section>
+
+<!-- ================= FACET 6 ================= -->
+<section id="f6">
+  <p class="eyebrow">Facet 06</p>
+  <h2 class="sec">Standing a watch</h2>
+  <p class="tuple"><b>dimension-identification</b><span>&times;</span><b>abstraction-lift</b><span>&rarr;</span><b>notation</b><span>&middot;</span>modularity, decomposability, scope</p>
+  <p>This facet invented a notation for unattended agent time &mdash; one lane per root session
+  tree, time flowing right, the harness <em>build</em> as part of the lane&rsquo;s identity
+  because two builds cannot share a daemon.</p>
+  <pre><code>  =  running, fully attended (events + input)     attach
+  ~  running, watched but mute                    slim_attach
+  -  running, nobody watching                     worker outlives client
+  o  self-woken tick                              cron job / heartbeat
+  ?  blocked on a question to an absent principal start_side_question
+  !  we asked, we don't know if it ran            command_result_uncertain
+  x  worker gone, lease file survives             session-leases/&lt;sha256&gt;.lock
+  &gt;  custody transfer, resume from cursor         reattach + event_sequence
+  #  generation bump, replay lost                 event_replay_not_available
+  /  answers doctor, refuses commands             wedged supervisor
+
+  a real evening:
+    sess-4f1@2.1#7 : ==== ---- o --- ?????????? &gt; ==
+    sub-a9         :      -------- ! x
+    sess-0bd@2.0#1 : ==  /  ......</code></pre>
+  <p>The value is in the slots the notation refuses to leave blank. Every <code>-</code> span
+  must name <b>who gets told when it ends</b> &mdash; the protocol has no notify sink, the span
+  just stops. Every <code>?</code> must carry an <b>age and an escalation</b>;
+  <code>start_side_question</code> has neither. Every <code>&gt;</code> must declare its
+  <b>resume basis</b>, and the third case &mdash; replay lost &mdash; is a designed experience
+  nobody designed. Every <code>x</code> needs a <b>reaper claim</b>: leases are
+  <code>sha256(realpath)</code> directories whose owner record nothing owns the burial of.</p>
+  <p>Lifted, the daemon is <em>a persistent laborer continuing under an intermittently absent
+  principal, where the right to speak to it is a transferable token and obligations raised
+  during absence accumulate unclaimed.</em> That is a <b>watch</b>, and every domain that stands
+  watches invented the same three artifacts Prime Agent lacks: a log book written <em>for the
+  relief</em>, an escalation ladder with a timer, and a chain-of-custody receipt. Aviary&rsquo;s
+  opportunity is not &ldquo;GUI for a daemon.&rdquo; It is to be those three modules the
+  monolith never grew.</p>
+
+  <ul class="props">
+    <li><div><span class="nm">Watch Log</span>
+      <p class="pitch">When you come back, the app tells you what happened while you were gone, per unattended span.</p>
+      <p class="why">Bounded by <code>slim_attach</code> event sequence numbers, rendered from the JSONL. Must be branch-aware, and a mid-span <code>/refine</code> can have rewritten the harness under you &mdash; which belongs in the same entry.</p></div><div class="sz">M</div></li>
+    <li class="pick"><div><span class="nm">The Three-Hour Question</span><span class="star">&#9646; top pick</span>
+      <p class="pitch">A blocked agent ages into a notification with two buttons that mean two different protocol verbs.</p>
+      <p class="why">Prime Agent distinguishes <code>steer</code> (interrupt the running turn) from <code>follow_up</code> (queue for after), so &ldquo;Reply&rdquo; is genuinely two actions. A generic agent GUI has one. Reply must degrade to queue, never steal input custody.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Custody Bar</span>
+      <p class="pitch">Every window states, in one line, which fraction of attachment it holds &mdash; and offers Take Input / Watch Only.</p>
+      <p class="why">The lease key is a hash of the realpath, so Aviary can read custody off disk and still tell the truth when the supervisor is wedged &mdash; preserving the invariant rather than breaking it. Must match the harness&rsquo;s liveness test exactly or you offer a steal against a live owner.</p></div><div class="sz">S/M</div></li>
+    <li><div><span class="nm">Postmortem</span>
+      <p class="pitch">The uncertain and orphaned glyphs made clickable: what we sent, what we never heard back, what is still running orphaned.</p>
+      <p class="why">An orphan here is a <em>live Python heap</em> &mdash; a stray PID may hold the only copy of a loaded dataframe. &ldquo;Kill it&rdquo; is a data-loss decision, and only this harness makes it one.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Build Fence</span>
+      <p class="pitch">Version skew between Aviary&rsquo;s bundled fork and a terminal&rsquo;s global install becomes a first-class screen with a drain plan.</p>
+      <p class="why">Aviary already ships a divergent fork, so skew is the steady state, not an edge case. Hardest part: predicting which unattended sessions will not reach idle before a restart.</p></div><div class="sz">S</div></li>
+    <li><div><span class="nm">Night Shift</span>
+      <p class="pitch">Schedule unattended runs, and make sleep/wake a stated policy rather than an accident.</p>
+      <p class="why">Heartbeats are the agent waking <em>itself</em>; a lid closed through three ticks needs a coalesce / fire-once / skip choice the TUI has no place to put. A missed tick has no representation in the harness at all.</p></div><div class="sz">L</div></li>
+  </ul>
+  <p class="obj"><b>Its own strongest objection</b>&ldquo;Blocked&rdquo; is not one state. An
+  agent may be waiting on a side question, on prompt admission, on <code>input()</code> inside
+  its own kernel, or simply idle with nothing queued &mdash; and only some of those cross the
+  protocol as events. A notification that fires on idle-with-nothing trains you to swipe it
+  away, at which point the real three-hour question goes unanswered too, and Aviary has made
+  the problem worse than silence did. Prove on real transcripts that a blocked
+  <code>?</code> is distinguishable from a quiet <code>-</code> first.</p>
+</section>
+
+<!-- ================= FACET 7 ================= -->
+<section id="f7">
+  <p class="eyebrow">Facet 07</p>
+  <h2 class="sec">Hooks are not the API</h2>
+  <p class="tuple"><b>cross-domain-reinstantiation</b><span>&times;</span><b>dimension-identification</b><span>&rarr;</span><b>cycle</b><span>&middot;</span>intentionality, decomposability, purpose</p>
+  <p>Drawn as a cycle, the hook surface reveals closure constraints nobody documents.
+  <code>resources_discover</code> is the only phase that can change <em>what exists</em>, and it
+  fires before any prompt is known. <code>context</code> is the only phase that can change
+  <em>what is remembered</em> without touching disk. <code>before_provider_request</code> is the
+  only phase that sees ground truth. <code>after_provider_response</code> is the only phase
+  <em>deliberately blinded</em> &mdash; status and headers, no body. And the arc back to
+  <code>resources_discover</code> runs only through <code>/reload</code>: the cycle has exactly
+  one re-entry point, and Aviary controls it.</p>
+  <p>The diagnostic absence: <b>there is no hook between <code>after_provider_response</code>
+  and <code>message_start</code>.</b> Nothing can gate a response before the user sees it. So
+  Aviary&rsquo;s amendment window has to be its own render layer, not a harness hook.</p>
+  <p>Two readings this forces. First, the most valuable hooks are the ones whose <em>used</em>
+  purpose has drifted from their <em>documented</em> one &mdash;
+  <code>before_provider_request</code> is documented as &ldquo;mainly useful for debugging
+  provider serialization,&rdquo; and Aviary&rsquo;s entire context-breakdown screen is a
+  repurposing of it. Second, and this is the thesis: <b>almost no interesting policy is
+  one-hook-decomposable.</b> A spend cap needs both provider hooks plus persistent state. An
+  approval gate needs <code>tool_call</code> plus a host that can ask a human. Hooks are not the
+  API. <em>Compositions over hooks, plus a host that answers questions,</em> is the API.</p>
+  <p>Re-instantiated as a customs regime &mdash; goods moving past checkpoints with statutory
+  powers &mdash; four imports fall out. <b>Pre-clearance:</b> approved shippers skip inspection,
+  so a nag-free approval gate needs a trust registry, not better rules. <b>Bonded
+  warehouse:</b> goods sit in-country, un-cleared, not yet dutiable &mdash; the missing tier for
+  knowledge. <b>Single window:</b> one filing satisfies every agency, whereas today each
+  extension invents its own env var and log file. <b>Amendment window:</b> declarations may be
+  corrected within a period &mdash; the one Prime Agent does not offer.</p>
+
+  <ul class="props">
+    <li><div><span class="nm">Perch</span>
+      <p class="pitch">Aviary implements the host half of the extension UI protocol, so any extension&rsquo;s question becomes a native Mac dialog.</p>
+      <p class="why"><span class="chip c-ver">Verified</span> The protocol exists and Aviary handles none of it. Bidirectional hooks are not a feature to invent. Hardest part: timeout and cancellation semantics while a run streams, with several dialogs outstanding, correlated only by <code>id</code>.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Customs</span>
+      <p class="pitch">One approval gate that covers every side effect the agent can have, because there is only one tool.</p>
+      <p class="why">In a Read/Write/Bash harness a gate is N policies and leaks. Here <code>ipython</code> is the only exit from the sandbox, so a single mutable-input handler is a complete permission system &mdash; and it can <em>edit</em> the Python, not just veto it.</p></div><div class="sz">M</div></li>
+    <li class="pick"><div><span class="nm">Bonded Knowledge</span><span class="star">&#9646; top pick</span>
+      <p class="pitch"><code>resources_discover</code> emits a per-session staging directory: superrepo <code>knowledge/</code> notes rendered as skills, ranked against the prompt, and the 68 installed skills pruned to the ones that earn their tokens.</p>
+      <p class="why">Path-level, so legal without forking &mdash; and it is the same relevance-ranked injection the superrepo&rsquo;s whisper hook already proves in production.</p></div><div class="sz">M/L</div></li>
+    <li><div><span class="nm">Tariff</span>
+      <p class="pitch">A running cost ledger that can downgrade a request instead of failing it.</p>
+      <p class="why">Lives in the same extension Aviary already ships, so it costs one more <code>pi.on</code>. No response body means accounting is always one call stale, and RLM children are separate processes with separate budgets.</p></div><div class="sz">S/M</div></li>
+    <li><div><span class="nm">Single Window</span>
+      <p class="pitch">Aviary becomes the extension host: authoring, install, per-run composition, and one shared event bus every extension files into.</p>
+      <p class="why">Handlers chain <em>in extension load order</em>, and two of them may <em>replace</em> their subject. <b>Order is semantics</b> &mdash; and nothing in the harness shows or controls it. Hardest part: showing that ext A&rsquo;s prompt rewrite was clobbered by ext B.</p></div><div class="sz">L</div></li>
+    <li><div><span class="nm">Divergence Ledger</span>
+      <p class="pitch">A tracked file plus a Health check listing every fork patch with the reason it could not be an extension &mdash; and re-testing that reason.</p>
+      <p class="why">Its only current entry is the reasoning-token patch, whose negative proof is structural: <code>after_provider_response</code> fires before the stream body is consumed, so <code>output_tokens_details</code> is unreachable from any extension. &ldquo;Extension-only unless proven impossible&rdquo; is a real discipline only if the proofs are written down and re-run when upstream moves.</p></div><div class="sz">S</div></li>
+  </ul>
+  <p class="obj"><b>Its own strongest objection</b>A timing objection dressed as an
+  architectural one: <code>resources_discover</code> fires at startup and on
+  <code>/reload</code>, <em>before</em> <code>input</code> and
+  <code>before_agent_start</code> &mdash; so at the moment you must decide what the agent may
+  carry, you do not yet know what it was asked. Aviary can paper over this because it owns the
+  prompt box, but that makes relevance a property of the <em>host</em>, not the session, and it
+  breaks for any run Aviary did not start. Ship the bonded tier &mdash; a listed, fetchable
+  index of what was held back &mdash; or it is silent capability loss.</p>
+</section>
+
+<!-- ================= FACET 8 ================= -->
+<section id="f8">
+  <p class="eyebrow">Facet 08</p>
+  <h2 class="sec">An unpriced commons on a fixed shelf</h2>
+  <p class="tuple"><b>organon-construction</b><span>&times;</span><b>abstraction-lift</b><span>&rarr;</span><b>lattice</b><span>&middot;</span>scope, connectivity, age</p>
+  <p>Lifted: <em>a fixed-size shelf; a population of candidates; each candidate&rsquo;s
+  advertisement occupies shelf space permanently, at no cost to the candidate, whether or not it
+  ever sells.</em> Retail answered it with slotting fees. Dynamic linkers stopped statically
+  resolving every symbol and made the <em>symbol table</em> resident and the <em>code</em>
+  paged. DNS ships thirteen root hints, not the zone. Immunology keeps a few memory B cells
+  resident and the naive repertoire out of circulation. Each is a different answer to <em>what
+  earns residency versus what earns retrievability</em> &mdash; and Prime Agent answers
+  &ldquo;everything earns residency,&rdquo; the one answer none of those domains kept.</p>
+  <p>Built as a lattice ordered by <em>admitted under strictly weaker conditions</em>, two
+  structural facts appear. There is a <b>diamond</b>: <code>&lt;available_skills&gt;</code> and
+  kernel residency are two non-comparable parents of one child, &ldquo;a Python skill.&rdquo;
+  <code>disable-model-invocation: true</code> cuts <em>both</em> edges at once, because the
+  kernel bootstrap is built from the model-visible skill set &mdash; so demoting a skill
+  un-imports it as well as un-advertising it. That is the only eviction primitive the harness
+  has, and it is coarser than it looks.</p>
+  <p>And there is an <b>empty tier</b>, between the 180-character harness entry and the
+  unbudgeted skill advertisement: hook-matched relevant notes. The superrepo has it. Prime Agent
+  has no concept of it. Read along the age axis and the reason nothing works is plain:
+  <b>nothing on the shelf has an age.</b> No ttl, no decay, no last-fired stamp &mdash; so an
+  entry <code>/refine</code> wrote once at 02:14 outranks, alphabetically, one that fires daily.
+  Every resident tier is also a flat list of unrelated items; the only densely-connected tiers
+  are the two the harness either cannot persist (the kernel) or does not have (the whisper).</p>
+
+  <ul class="props">
+    <li><div><span class="nm">Slotting Fees</span>
+      <p class="pitch">A per-skill ledger of chars-injected versus times-fired, with one-click demote.</p>
+      <p class="why">The eviction primitive exists here <em>and is honest about its price</em>: demotion also drops the kernel pre-import, so the GUI must show &ldquo;advertisement withdrawn AND module unimported,&rdquo; which no generic skill manager models. Hardest part: attributing a firing when the model reads a SKILL.md by absolute path without importing anything.</p></div><div class="sz">M</div></li>
+    <li class="pick"><div><span class="nm">The Gate</span><span class="star">&#9646; top pick</span>
+      <p class="pitch">A <code>before_provider_request</code> extension that rewrites <code>&lt;available_skills&gt;</code> down to a ranked budget, with Aviary as its console and auditor.</p>
+      <p class="why">One extension file, one documented hook, payload replacement already sanctioned by the type signature. Uniquely safe here: withholding an advertisement withholds discovery, never capability.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Knowledge Tier</span>
+      <p class="pitch">Port the superrepo&rsquo;s whisper hook into the empty lattice tier: dated, git-backed, cross-referenced notes injected only when they match.</p>
+      <p class="why">Fills the gap between the two lifetimes Prime Agent actually has. Hardest part: the matcher &mdash; keyword overlap is weak and an embedding index is a dependency Aviary has zero of.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Refine Review Queue</span>
+      <p class="pitch">Treat every <code>/refine</code> write as a proposal needing acceptance, not a fait accompli.</p>
+      <p class="why">Mirror each version into a git repo so <code>git diff</code> works; reject by driving <code>/refine rollback</code>. Auto-refine is on by default, every 25 turns, with reasoning forcibly disabled during planning &mdash; an unattended writer with a known-degraded planner whose output is 89% invisible anyway.</p></div><div class="sz">S</div></li>
+    <li><div><span class="nm">Skill Forge</span>
+      <p class="pitch">Author a Python skill in Aviary and refuse to install it until it has run.</p>
+      <p class="why">Skills here are <em>code with a schema</em>, so &ldquo;does it load, and does the declared <code>arguments</code> match the real signature&rdquo; is a decidable question. Probe in a throwaway RPC kernel and keep the transcript as provenance.</p></div><div class="sz">L</div></li>
+  </ul>
+  <p class="obj"><b>Its own strongest objection</b>The Gate breaks the property Aviary has been
+  most careful about &mdash; one renderer, two sources &mdash; by making the prompt Aviary
+  observes differ from the prompt the harness built. Every context breakdown and every
+  &ldquo;why did the model not use X&rdquo; investigation now has a second, Aviary-shaped
+  explanation. A gate that silently starves the model is strictly worse than a shelf that merely
+  costs 10,883 tokens, and detecting starvation requires reading intent from a transcript
+  &mdash; which is exactly what Slotting Fees can measure and the Gate cannot.</p>
+</section>
+
+<!-- ================= FACET 9 ================= -->
+<section id="f9">
+  <p class="eyebrow">Facet 09</p>
+  <h2 class="sec">Metered by the seller</h2>
+  <p class="tuple"><b>abstraction-lift</b><span>&times;</span><b>organon-construction</b><span>&rarr;</span><b>procedure</b><span>&middot;</span>direction, cyclicity, purpose</p>
+  <p>Lifted: <em>a metered resource is consumed by a recursive tree of autonomous delegates,
+  through meters that are unreliable, partly absent, and controlled by the seller.</em> Six
+  domains have answered that shape, and Aviary currently implements one of the six.</p>
+  <div class="tw"><table>
+    <thead><tr><th>Domain</th><th>Its answer</th><th>Aviary</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">building submetering</td><td>meter per riser; allocate the unmeterable by an allocation key</td><td class="miss">no</td></tr>
+      <tr><td class="mono">cloud FinOps</td><td>tags at request time, not reports at month end; showback before chargeback</td><td class="miss">no</td></tr>
+      <tr><td class="mono">double-entry books</td><td>every node reports gross <em>and</em> consolidated; the difference is the delegation</td><td class="hit">yes</td></tr>
+      <tr><td class="mono">corporate spend cards</td><td>envelope with a policy &mdash; downgrade the purchase, don&rsquo;t cancel the trip</td><td class="miss">no</td></tr>
+      <tr><td class="mono">carbon Scope 3</td><td>publish the estimate <em>with</em> its uncertainty band; a bandless number is read as zero</td><td class="miss">no</td></tr>
+      <tr><td class="mono">parimutuel odds</td><td>price is knowable only after all bets are in; show the running estimate anyway</td><td class="miss">no</td></tr>
+    </tbody>
+  </table></div>
+  <p>The eight-step procedure it wrote has one revealing property: read the cyclicity column and
+  <b>nothing in Aviary today is continuous.</b> Everything is post-hoc. The only two continuous
+  rows &mdash; meter at the wire, and put an envelope on it &mdash; are the two that do not
+  exist.</p>
+  <p>Three specific defects fell out along the way. <b>A real mis-attribution bug:</b>
+  <code>UsageAnalytics.byModel</code> buckets a whole session&rsquo;s usage under the last model
+  seen, so any session where you switched models is mis-attributed silently and completely.
+  <span class="chip c-sig">Unverified &mdash; but cheap to check and, if true, a bug rather than a
+  feature request.</span> <b>Dead notches on the effort dial:</b> the thinking-level map sends
+  <code>low</code> to null on Codex routes &mdash; you ask for reasoning and silently get none.
+  <b>And the fork earning its keep:</b> <code>Usage.reasoning == nil</code> is not zero; on an
+  encrypted-reasoning route it is the only evidence the tokens existed.</p>
+
+  <ul class="props">
+    <li><div><span class="nm">Segment Ledger</span>
+      <p class="pitch">Split each session&rsquo;s usage at <code>model_change</code> boundaries so a mixed-model session stops being billed entirely to its last model.</p>
+      <p class="why">Prime Agent sessions are long-lived trees with mid-flight <code>set_model</code> over RPC; the model-per-session assumption is false here in a way it is not for one-shot chats. Hardest part: a usage record emitted in the same turn as the change belongs to the <em>outgoing</em> model, and the JSONL ordering does not say so.</p></div><div class="sz">S</div></li>
+    <li><div><span class="nm">Pre-flight Price Tag</span>
+      <p class="pitch">A live per-request cost estimate priced from the payload before it is sent, then reconciled against reported usage.</p>
+      <p class="why">The harness has no per-request cost event, and the response hook withholds the body &mdash; so prediction-then-settlement is the only shape available. The residual must be labelled &ldquo;cache + tokenizer error,&rdquo; not presented as precision.</p></div><div class="sz">M</div></li>
+    <li class="pick"><div><span class="nm">Governor</span><span class="star">&#9646; top pick</span>
+      <p class="pitch">A budget envelope that, on approach, <em>rewrites</em> the outgoing request to a cheaper thinking level and then a cheaper model, rather than stopping the run.</p>
+      <p class="why">Downgrade-instead-of-abort survives a mid-fan-out ceiling hit, where a hard stop orphans children already paid for. Must consult the thinking-level map to avoid rewriting into a dead notch.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Bake-off Bench</span>
+      <p class="pitch">Pin one prompt, sweep a grid of model &times; thinking level as scoped rlm children in a single kernel cell, plot cost against outcome.</p>
+      <p class="why">The sweep is <em>a Python for-loop in a persistent kernel</em> &mdash; the comparison harness is fifteen lines the agent writes itself, not a feature Aviary implements. Needs a deterministic task (a failing test) or the chart is decorative.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Dead-Notch Report</span>
+      <p class="pitch">Per route, a measured verdict on whether the reasoning dial does anything &mdash; distinguishing &ldquo;provider said zero&rdquo; from &ldquo;provider said nothing.&rdquo;</p>
+      <p class="why">This is the screen that makes the fork&rsquo;s one divergence pay for itself. Costs real money per probe, so it must be explicitly invoked and cached.</p></div><div class="sz">S</div></li>
+    <li><div><span class="nm">Metered-Lane Audit</span>
+      <p class="pitch">Flag any provider whose <code>baseUrl</code> bypasses the local LiteLLM gateway, alongside its key form and what that form will actually resolve to.</p>
+      <p class="why"><code>!command</code> runs through <code>$SHELL -c</code> and is cached for the process lifetime; a bare unset variable is sent <em>as</em> the credential. A GUI app inherits launchd&rsquo;s environment, so the same config resolves differently in Aviary than in a terminal. Hardest part is not technical: resisting the urge to make it blocking.</p></div><div class="sz">S</div></li>
+  </ul>
+  <p class="obj"><b>Its own strongest objection</b>The Governor breaks files-are-truth. A
+  replaced payload means the transcript records the model the <em>session</em> thinks it is
+  using while a different, cheaper model actually answered; <code>model_change</code> is never
+  emitted, so the Segment Ledger would silently mis-bill exactly the requests the Governor
+  touched, and someone debugging a bad answer would be reading the wrong model&rsquo;s
+  reputation. The fix is neither optional nor small: the Governor must write its own
+  substitution log and Aviary must treat that log as co-equal evidence with the transcript
+  &mdash; which is the first place the fork stops being a fork and starts being a different
+  system of record.</p>
+</section>
+
+<!-- ================= FACET 10 ================= -->
+<section id="f10">
+  <p class="eyebrow">Facet 10</p>
+  <h2 class="sec">One expression the TUI can write</h2>
+  <p class="tuple"><b>dimension-identification</b><span>&times;</span><b>substitution</b><span>&rarr;</span><b>notation</b><span>&middot;</span>discovery-vs-invention, complexity, connectivity</p>
+  <p>This facet built a notation where a TUI affordance and a GUI affordance are the same idea
+  at different points in one space &mdash; and then observed that everything a text stream can
+  say collapses to a single expression:</p>
+  <pre><code>  CHANNEL GESTURE &gt; TARGET  @LATENCY  xARITY  /REV  ~CONN  =ORIGIN
+
+  the TUI, entire:
+      "  k &gt; TREE  @!  x1  /x  ~sparse  =D
+
+  glyphs out, keystrokes in, active branch only, one view, no undo.</code></pre>
+  <p>Every proposal is then a substitution into <em>one</em> slot, holding the rest fixed. The
+  most useful slot turned out to be <code>=ORIGIN</code>, which works as a cost oracle:
+  <b>discovered</b> affordances only require Aviary to <em>notice</em> something the harness
+  already writes down; <b>invented</b> ones require Aviary to invent and store state the harness
+  has no concept of &mdash; spatial position, pin order, selection, undo. Prefer discovered; pay
+  for invented deliberately.</p>
+  <p>And the survey that reframes the whole facet: session branching and namespace introspection
+  are <em>discovered</em>, not invented. The harness already ships a <code>clone</code> RPC
+  command with tests, a Python <b>fork-server</b> for cheap kernel forking, and a per-variable
+  kernel state snapshot layer with a namespace enumerator. Meanwhile Aviary&rsquo;s actual GUI
+  surface is narrow: Charts appear in exactly one view, pasteboard-copy in six places, and there
+  is <b>no drag-and-drop, no second window, no Quick Look, and no Services or Shortcuts anywhere
+  in the app.</b></p>
+  <p>The recursive slot is the one worth pausing on: an affordance whose channel is
+  <em>image</em> and whose reader is <em>the author</em>. <code>Aviary --snapshot</code> exists
+  because the developer is blind to the artifact. The notation renders it as an ordinary row,
+  which is exactly right &mdash; the developer is just another agent needing a channel.</p>
+
+  <ul class="props">
+    <li class="pick"><div><span class="nm">Namespace Bench</span><span class="star">&#9646; top pick</span>
+      <p class="pitch">The live IPython namespace as a board of draggable variable tiles, sized by pickled bytes, draggable between two open sessions.</p>
+      <p class="why">Only in a harness whose sole tool is a stateful kernel is &ldquo;the agent&rsquo;s memory&rdquo; a set of named objects rather than text. Hardest part: transplanting a blob into a foreign kernel, and that every read costs a kernel execution which perturbs what it observes.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Fork Board</span>
+      <p class="pitch">Branch a live run at the current turn into N adjacent panes, each on a different model, racing simultaneously in one window.</p>
+      <p class="why"><code>clone</code> and the fork-server already exist. Hardest part is the daemon: one worker per root session tree and ownership leases mean N live branches are N leases the daemon must agree to.</p></div><div class="sz">L</div></li>
+    <li><div><span class="nm">Injection Gutter</span>
+      <p class="pitch"><code>harness_state.json</code> on disk beside the slice the model actually gets, the invisible remainder drawn as proportional grey <em>mass</em>.</p>
+      <p class="why">Alphabetical truncation is a quantity pathology, and mass is the right channel for quantity. A number says &ldquo;89%&rdquo;; a ribbon where the dark part is nine-tenths of the bar says it pre-attentively.</p></div><div class="sz">M</div></li>
+    <li><div><span class="nm">Peripheral Flock</span>
+      <p class="pitch">A status-item mini-map: one cell per live root session, subagent depth as concentric rings, spawn as a pulse, cost as tint.</p>
+      <p class="why">Unbounded recursion is this harness&rsquo;s signature risk <em>and</em> its signature shape. Motion is the only channel that reports growth without being read. Hardest part: coalescing hot ledger writes so the periphery stays peripheral.</p></div><div class="sz">S</div></li>
+    <li><div><span class="nm">Contact Sheet snapshots</span>
+      <p class="pitch">Render screen &times; fixture &times; width into one PNG grid with per-cell perceptual-hash diffs against the previous run.</p>
+      <p class="why">It exists solely because the author cannot see the artifact, and it catches the &ldquo;compiles, correct data, empty rectangle&rdquo; class. Hardest part: determinism &mdash; snapshot currently boots the real agent dir and picks the largest session, so fixtures must be pinned before hashes mean anything.</p></div><div class="sz">S/M</div></li>
+    <li><div><span class="nm">Intervention Track</span>
+      <p class="pitch">Hover the live turn ribbon and drop a steer note at a chosen point; a system-wide Services entry sends any app&rsquo;s selection into the session.</p>
+      <p class="why"><code>steer</code> is a first-class mid-flight channel here, and <code>before_agent_start</code> fires per <em>iteration</em>, giving a real seam to aim at.</p></div><div class="sz">S</div></li>
+  </ul>
+  <p class="obj"><b>Its own strongest objection</b>Reads and writes are both invasive in ways
+  the transcript will not record. Listing names costs a kernel execution, so observation mutates
+  <code>In</code>/<code>Out</code> history and can shadow user names. Dragging a variable in
+  makes Aviary an unlogged actor inside the session, so the JSONL &mdash; the canonical account
+  of why the agent believes what it believes &mdash; becomes false, and the agent will
+  confidently explain a dataframe it never built. Read-only until Aviary can write a real
+  transcript entry for every mutation it performs, which means a fork divergence in the entry
+  schema, not a GUI feature.</p>
+</section>
+
+<hr>
+
+<!-- ================= TENSION ================= -->
+<section id="tension" style="padding-top:44px">
+  <p class="eyebrow">The cross-cutting finding</p>
+  <h2 class="sec">Every good idea kills the same invariant</h2>
+  <p>Four agents, on four unrelated facets, wrote the same objection against their own best
+  proposal without any of them seeing the others. That is the most useful thing the fan-out
+  produced, and it is not an idea &mdash; it is a decision waiting for you.</p>
+  <div class="tw"><table>
+    <thead><tr><th>Facet</th><th>Its best idea</th><th>What it admits it breaks</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">03 context</td><td>The Gate / Warrant</td><td>&ldquo;the prompt Aviary observes differs from the prompt the harness built&rdquo;</td></tr>
+      <tr><td class="mono">04 kernel</td><td><code>kernel_exec</code></td><td>&ldquo;desync lands in the model&rsquo;s beliefs about state it thinks it owns&rdquo;</td></tr>
+      <tr><td class="mono">08 library</td><td>The Gate</td><td>&ldquo;every &lsquo;why did the model not use X&rsquo; now has a second, Aviary-shaped explanation&rdquo;</td></tr>
+      <tr><td class="mono">09 money</td><td>Governor</td><td>&ldquo;the transcript records the model the session <em>thinks</em> it used&rdquo;</td></tr>
+      <tr><td class="mono">10 GUI</td><td>Namespace Bench</td><td>&ldquo;Aviary becomes an unlogged actor; the JSONL becomes false&rdquo;</td></tr>
+    </tbody>
+  </table></div>
+  <p>The invariant is the one the architecture doc states as a virtue: <em>files are truth, one
+  renderer serves two sources, and no part of the agent loop is reimplemented.</em> It is why
+  Aviary stays usable when the daemon is wedged. And it is precisely what makes Aviary a
+  <b>window</b> rather than a <b>control plane</b>.</p>
+  <p>So there is one question upstream of all fifty-nine proposals: <b>may Aviary be in the
+  request path?</b> Five of the ten strongest ideas need yes. Every one of them then needs the
+  same mitigation, which nobody can build halfway:</p>
+  <p><b>If Aviary acts, Aviary must keep a log the transcript cannot contradict</b> &mdash; and
+  Aviary must read that log as co-equal evidence everywhere it renders a session. Facet 09 named
+  the consequence most precisely: that is the point where the fork stops being a fork and starts
+  being a different system of record. Facet 10 named the cheap alternative most precisely:
+  read-only versions of these features get most of the insight for none of the risk.</p>
+  <p>My read: <b>the answer is yes, but not yet.</b> Every acting proposal has a measuring
+  sibling that is strictly cheaper, breaks nothing, and produces the evidence the acting version
+  needs to be aimed. Facet 03 said it plainest about its own top pick &mdash; <em>a warrant
+  issued without evidence of what went unused is a guess with a budget attached.</em> Build the
+  meters. Earn the right to the valve.</p>
+</section>
+
+<!-- ================= ORDER ================= -->
+<section id="order">
+  <p class="eyebrow">Recommendation</p>
+  <h2 class="sec">What I would build, in order</h2>
+
+  <div class="tier">
+    <div class="tl"><span>Tier one &middot; measure, break nothing</span><span>all read-only, all file-first</span></div>
+    <ol>
+      <li><b>Perch.</b> Implement the extension-UI protocol Aviary is already dropping on the
+      floor. Pure gain, zero risk, and the harness is already waiting for a host to answer.
+      Nothing else on this list unlocks as much for as little.</li>
+      <li><b>Slotting Fees + Assay.</b> Which of the 68 skills ever fired? This is the
+      prerequisite for every pruning proposal in facets 03, 07 and 08, and it is a grep for an
+      import rather than an inference about attention &mdash; a precision only the
+      single-tool design allows.</li>
+      <li><b>Injection Waterline.</b> Draw the 6-entry, 180-character, alphabetical cutoff
+      against what is on disk. It answers, on screen, the question that started this
+      conversation.</li>
+      <li><b>Return-Edge Reconstructor</b> with confidence states, plus <b>Grave Markers</b>.
+      The return edge is stored nowhere; render attribution as certain / probable /
+      unattributed and never snap a message to a parent to look tidy.</li>
+      <li><b>Segment Ledger.</b> Verify the mis-attribution claim first &mdash; if
+      <code>byModel</code> really does bucket a whole session under its last model, this is a
+      bug fix wearing a feature&rsquo;s clothes.</li>
+      <li><b>Compaction X-ray</b> and <b>Namespace Inspector.</b> Both render data the harness
+      already writes and nothing reads. The X-ray also gets the promote-to-<code>knowledge/</code>
+      button, which is the cleanest bridge between the two memory systems you own.</li>
+    </ol>
+  </div>
+
+  <div class="tier">
+    <div class="tl"><span>Tier two &middot; act, once the meters read</span><span>needs the invariant decision</span></div>
+    <ol>
+      <li><b>Customs.</b> The single mutable <code>tool_call</code> handler. It is a complete
+      permission system precisely because there is one tool, and it can edit the Python rather
+      than only veto it. Needs a trust registry or it becomes a nag.</li>
+      <li><b>Warrant / Bonded Knowledge.</b> The skills catalogue, aimed with Tier-1 evidence,
+      shipped with the fetchable denied-index. This is the 62.7%.</li>
+      <li><b>Governor</b> with its own substitution log, read co-equally with the transcript
+      everywhere. Do not ship it without that log.</li>
+      <li><b>The Three-Hour Question</b> &mdash; but prove first, on real transcripts, that a
+      blocked agent is distinguishable from a quiet one. If it is not, ship <b>Watch Log</b>
+      instead, which needs no such proof.</li>
+    </ol>
+  </div>
+
+  <div class="tier">
+    <div class="tl"><span>Tier three &middot; the interesting bets</span><span>research, not roadmap</span></div>
+    <ol>
+      <li><b>Fork Board.</b> <code>clone</code> and the fork-server already exist; the daemon
+      lease model is the real obstacle, and finding that out is worth a spike on its own.</li>
+      <li><b>Namespace Bench,</b> read-only first. The tiles are the most genuinely novel thing
+      in the fan-out, and the drag is the part that needs a schema fork.</li>
+      <li><b>Bicameral Runs / Bake-off Bench.</b> Both are blocked on the same unsolved problem
+      &mdash; scoring an outcome &mdash; so solve that once, on a deterministic task, before
+      building either.</li>
+    </ol>
+  </div>
+
+  <div class="tier">
+    <div class="tl"><span>Not worth building</span><span>on present evidence</span></div>
+    <ol>
+      <li><b>Branch Gutter.</b> Zero of 80 sessions have forked. Empty rail.</li>
+      <li><b>Drag-to-reorder on the Waterline.</b> It graffitis every entry&rsquo;s
+      <code>path</code> with sort-hack prefixes that go inert the moment upstream touches the
+      comparator. Draw the waterline; do not move it by vandalizing someone else&rsquo;s data
+      model. Raise <code>maxEntriesPerKind</code> instead &mdash; it is already a parameter, and
+      no call site has ever passed it.</li>
+    </ol>
+  </div>
+</section>
+
+<footer>
+  <p>Ten agents &middot; one shared brief &middot; ten randomized ideonomy method tuples
+  (<code>ideonomy-plain</code>, seeds 1181&ndash;10099) &middot; none could see another&rsquo;s
+  output. Fifty-nine proposals; the twenty most load-bearing are argued above with the
+  agent&rsquo;s own strongest objection attached, because an unopposed proposal is not yet an
+  idea.</p>
+  <p>Items marked <span class="chip c-ver">Verified</span> were checked against harness source
+  or the real session store during this session. Everything else is an agent&rsquo;s reading of
+  the code and should be re-checked before it becomes a commit &mdash; one claim
+  (<code>UsageAnalytics.byModel</code> mis-attribution) is explicitly flagged unverified and is
+  the cheapest thing here to confirm. Source notes:
+  <code>~/duckbill/aviary/docs/expansion.html</code>, raw explorations under the session
+  scratchpad.</p>
+</footer>
+
+</main>
+</div>
+</div>

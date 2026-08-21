@@ -374,4 +374,170 @@ await Harness.run([
     ("usageReasoningIsABreakdownNotAnAddend", { test_usageReasoningIsABreakdownNotAnAddend() }),
     ("attributesContextFileBodyToItsFile", { test_attributesContextFileBodyToItsFile() }),
     ("sessionIdentityIsTheFilenameNotTheHeaderField", { try test_sessionIdentityIsTheFilenameNotTheHeaderField() }),
+
+    ("workshop: fold builds a request from a created event", {
+        let line = #"{"v":1,"at":"2026-08-21T10:00:00.000Z","event":"created","id":"wr-1","title":"Fix the thing","body":"detail","kind":"bug"}"#
+        let out = WorkshopLog.fold(lines: [line])
+        XCTAssertEqual(out.count, 1)
+        let r = try XCTUnwrap(out.first)
+        XCTAssertEqual(r.id, "wr-1")
+        XCTAssertEqual(r.title, "Fix the thing")
+        XCTAssertEqual(r.kind, .bug)
+        XCTAssertEqual(r.status, .open)
+        XCTAssertFalse(r.delivered)
+    }),
+
+    ("workshop: later status events win and accumulate notes", {
+        let lines = [
+            #"{"event":"created","id":"a","at":"2026-08-21T10:00:00.000Z","title":"t","kind":"change"}"#,
+            #"{"event":"status","id":"a","at":"2026-08-21T10:05:00.000Z","status":"claimed","note":"looking","by":"agent"}"#,
+            #"{"event":"status","id":"a","at":"2026-08-21T10:09:00.000Z","status":"done","note":"shipped","by":"agent"}"#,
+        ]
+        let r = try XCTUnwrap(WorkshopLog.fold(lines: lines).first)
+        XCTAssertEqual(r.status, .done)
+        XCTAssertEqual(r.notes.count, 2, "both status notes are kept, not just the last")
+        XCTAssertEqual(r.notes.last?.text, "shipped")
+    }),
+
+    ("workshop: a malformed line is skipped, not fatal", {
+        // The agent hand-writes into this file. One bad line must not cost the board.
+        let lines = [
+            #"{"event":"created","id":"a","at":"2026-08-21T10:00:00.000Z","title":"kept","kind":"idea"}"#,
+            "{ this is not json",
+            "",
+            #"{"event":"created","id":"b","at":"2026-08-21T11:00:00.000Z","title":"also kept","kind":"idea"}"#,
+        ]
+        XCTAssertEqual(WorkshopLog.fold(lines: lines).count, 2)
+    }),
+
+    ("workshop: events for an unknown id are ignored", {
+        let lines = [
+            #"{"event":"status","id":"ghost","at":"2026-08-21T10:00:00.000Z","status":"done"}"#,
+        ]
+        XCTAssertEqual(WorkshopLog.fold(lines: lines).count, 0)
+    }),
+
+    ("workshop: newest request sorts first", {
+        let lines = [
+            #"{"event":"created","id":"old","at":"2026-08-20T10:00:00.000Z","title":"o","kind":"change"}"#,
+            #"{"event":"created","id":"new","at":"2026-08-21T10:00:00.000Z","title":"n","kind":"change"}"#,
+        ]
+        XCTAssertEqual(WorkshopLog.fold(lines: lines).first?.id, "new")
+    }),
+
+    ("workshop: delivered and link events fold in", {
+        let lines = [
+            #"{"event":"created","id":"a","at":"2026-08-21T10:00:00.000Z","title":"t","kind":"change"}"#,
+            #"{"event":"delivered","id":"a","at":"2026-08-21T10:00:01.000Z","session":"01a0-abc"}"#,
+            #"{"event":"link","id":"a","at":"2026-08-21T10:30:00.000Z","commit":"deadbee"}"#,
+            #"{"event":"link","id":"a","at":"2026-08-21T10:31:00.000Z","commit":"deadbee"}"#,
+        ]
+        let r = try XCTUnwrap(WorkshopLog.fold(lines: lines).first)
+        XCTAssertTrue(r.delivered)
+        XCTAssertEqual(r.sessions, ["01a0-abc"])
+        XCTAssertEqual(r.commits.count, 1, "a repeated commit link is not duplicated")
+    }),
+
+    ("workshop: context survives a round trip through the log", {
+        var ctx = WorkshopContext(section: "sessions", sectionSubtitle: "3 of 80")
+        ctx.facts = [
+            .init(group: "Screen", label: "Tab", value: "Sessions"),
+            .init(group: "State", label: "Daemon", value: "healthy"),
+        ]
+        ctx.screenshot = "shots/wr-1.png"
+        let encoded = WorkshopLog.encode(ctx)
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.withoutEscapingSlashes]
+        let payload = JSONValue.object([
+            "event": .string("created"), "id": .string("wr-1"),
+            "at": .string("2026-08-21T10:00:00.000Z"),
+            "title": .string("t"), "kind": .string("change"),
+            "context": encoded,
+        ])
+        let line = String(data: try enc.encode(payload), encoding: .utf8) ?? ""
+        let r = try XCTUnwrap(WorkshopLog.fold(lines: [line]).first)
+        let back = try XCTUnwrap(r.context)
+        XCTAssertEqual(back.section, "sessions")
+        XCTAssertEqual(back.facts.count, 2)
+        XCTAssertEqual(back.screenshot, "shots/wr-1.png")
+        XCTAssertEqual(back.groups, ["Screen", "State"], "group order is preserved")
+    }),
+
+    ("workshop: status maps onto four board columns", {
+        XCTAssertEqual(WorkshopStatus.open.column, .inbox)
+        XCTAssertEqual(WorkshopStatus.claimed.column, .working)
+        XCTAssertEqual(WorkshopStatus.building.column, .working)
+        XCTAssertEqual(WorkshopStatus.done.column, .done)
+        XCTAssertEqual(WorkshopStatus.declined.column, .shelved)
+        XCTAssertEqual(WorkshopStatus.parked.column, .shelved)
+    }),
+
+    ("workshop: undelivered counts only open requests never sent", {
+        let lines = [
+            #"{"event":"created","id":"a","at":"2026-08-21T10:00:00.000Z","title":"t","kind":"change"}"#,
+            #"{"event":"created","id":"b","at":"2026-08-21T10:01:00.000Z","title":"t","kind":"change"}"#,
+            #"{"event":"delivered","id":"b","at":"2026-08-21T10:01:01.000Z"}"#,
+            #"{"event":"created","id":"c","at":"2026-08-21T10:02:00.000Z","title":"t","kind":"change"}"#,
+            #"{"event":"status","id":"c","at":"2026-08-21T10:03:00.000Z","status":"done"}"#,
+        ]
+        let board = WorkshopBoard(requests: WorkshopLog.fold(lines: lines))
+        XCTAssertEqual(board.undeliveredCount, 1, "only 'a' is open and unsent")
+        XCTAssertEqual(board.openCount, 2)
+        XCTAssertEqual(board.doneCount, 1)
+    }),
+
+    ("workshop: the prompt envelope names the id and both paths", {
+        var r = WorkshopRequest(
+            id: "wr-42", createdAt: Date(), title: "Tighten the inspector",
+            body: "It clips.", kind: .bug, status: .open, statusChangedAt: Date())
+        r.context = WorkshopContext(
+            section: "sessions", facts: [.init(group: "Screen", label: "Tab", value: "Sessions")],
+            screenshot: "shots/wr-42.png")
+        let text = r.promptEnvelope(logPath: "workshop/requests.jsonl", briefPath: "workshop/AGENT.md")
+        XCTAssertTrue(text.contains("wr-42"), "the agent must be able to address the request")
+        XCTAssertTrue(text.contains("workshop/requests.jsonl"))
+        XCTAssertTrue(text.contains("workshop/AGENT.md"))
+        XCTAssertTrue(text.contains("shots/wr-42.png"))
+        XCTAssertTrue(text.contains("Tab: Sessions"), "context renders as markdown")
+        XCTAssertTrue(text.contains("Append only"))
+    }),
+
+    ("workshop: ids are sortable and distinct", {
+        var n: UInt32 = 0
+        let a = Workshop.newID(date: Date(timeIntervalSince1970: 1_770_000_000), random: { n += 1; return n })
+        let b = Workshop.newID(date: Date(timeIntervalSince1970: 1_770_000_000), random: { n += 1; return n })
+        XCTAssertTrue(a.hasPrefix("wr-"))
+        XCTAssertFalse(a == b, "two ids minted in the same second differ")
+    }),
+
+    ("workshop: append then load round-trips through a real file", {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-workshop-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try WorkshopLog.append(
+            WorkshopEvent(event: "created", id: "wr-x", fields: [
+                "title": .string("round trip"), "kind": .string("question"),
+            ]), repoRoot: dir)
+        try WorkshopLog.append(
+            WorkshopEvent(event: "status", id: "wr-x", fields: [
+                "status": .string("declined"), "note": .string("out of scope"), "by": .string("agent"),
+            ]), repoRoot: dir)
+        let out = WorkshopLog.load(repoRoot: dir)
+        XCTAssertEqual(out.count, 1)
+        let r = try XCTUnwrap(out.first)
+        XCTAssertEqual(r.status, .declined)
+        XCTAssertEqual(r.kind, .question)
+        XCTAssertEqual(r.notes.first?.text, "out of scope")
+        // Two appends, two lines — the second must not have rewritten the first.
+        let text = try String(contentsOf: Workshop.logURL(repoRoot: dir), encoding: .utf8)
+        XCTAssertEqual(text.split(separator: "\n").count, 2)
+    }),
+
+    ("fmt: relative time is terse", {
+        let now = Date()
+        XCTAssertEqual(Fmt.relative(now.addingTimeInterval(-10), now: now), "now")
+        XCTAssertEqual(Fmt.relative(now.addingTimeInterval(-600), now: now), "10m")
+        XCTAssertEqual(Fmt.relative(now.addingTimeInterval(-7200), now: now), "2h")
+        XCTAssertEqual(Fmt.relative(now.addingTimeInterval(-172800), now: now), "2d")
+    }),
 ])

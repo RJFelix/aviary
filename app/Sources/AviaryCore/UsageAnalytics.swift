@@ -205,6 +205,21 @@ public enum Fmt {
 
     public static func clock(_ d: Date) -> String { clockFormatter.string(from: d) }
 
+    /// Coarse elapsed time — "4m", "3h", "2d".
+    ///
+    /// Deliberately not `RelativeDateTimeFormatter`: that produces "4 minutes ago", which
+    /// is three times the width for the same information in a column where width is the
+    /// scarce resource.
+    public static func relative(_ d: Date, now: Date = Date()) -> String {
+        guard d > .distantPast else { return "—" }
+        let s = now.timeIntervalSince(d)
+        if s < 45 { return "now" }
+        if s < 3600 { return "\(Int(s / 60))m" }
+        if s < 86_400 { return "\(Int(s / 3600))h" }
+        if s < 86_400 * 30 { return "\(Int(s / 86_400))d" }
+        return timestamp(d)
+    }
+
     /// Context-window pressure as a share, when both numbers are known.
     public static func contextShare(used: Int, window: Int?) -> Double? {
         guard let window, window > 0 else { return nil }

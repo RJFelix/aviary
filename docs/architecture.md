@@ -83,3 +83,11 @@ Known limits, both in the capture path rather than the app:
 - The window does not draw reliably until it has been through a couple of section
   transitions, so every screen is rendered twice and only the second pass is written.
   Longer settle times do not help; forcing a rebuild with `.id()` makes it worse.
+- Even with two passes, some screens still come back blank. As of 2026-08-21 a full
+  `just shots` run leaves `cockpit`, `live`, `usage`, `health` and `workshop` as empty
+  frames (all identical in size, which is the tell) while `sessions`, `library`, `flock`
+  and `models` render. **`--bare` renders the blank ones correctly**, so it is the
+  navigation chrome in the capture path that fails, not those views. When a screen comes
+  back empty, re-render it with `--bare` before believing the view is broken — and read
+  the colours with suspicion there, because bare mode has no window background and
+  light-on-light text is an artifact of that, not a contrast bug.

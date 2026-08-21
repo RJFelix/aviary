@@ -1,0 +1,690 @@
+<title>The Fork Line</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Spectral:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+:root{
+  --ground:#F3F2EF; --panel:#FFFFFF; --panel-2:#E8E7E2; --sunk:#DEDDD7;
+  --ink:#1A1A1C; --ink-2:#44454A; --ink-3:#6E7076;
+  --rule:#D5D4CE; --rule-2:#BFBEB6;
+  --live:#3F5D3A; --live-soft:#DDE6DA; --live-ink:#2E4629;
+  --lost:#A8461C; --lost-soft:#F4E1D8; --lost-ink:#8A3814;
+  --slate:#31536E; --slate-soft:#DCE5EC;
+  --display:"Archivo",-apple-system,"Helvetica Neue",sans-serif;
+  --body:"Spectral",Georgia,"Times New Roman",serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+  --measure:66ch;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#141413; --panel:#1C1C1A; --panel-2:#242422; --sunk:#171716;
+    --ink:#EAE8E3; --ink-2:#B5B3AC; --ink-3:#84837C;
+    --rule:#333330; --rule-2:#45443F;
+    --live:#8FBF84; --live-soft:#1E2A1B; --live-ink:#A8D19E;
+    --lost:#E08A5F; --lost-soft:#2E1A11; --lost-ink:#EDA382;
+    --slate:#7EAAC9; --slate-soft:#152530;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#141413; --panel:#1C1C1A; --panel-2:#242422; --sunk:#171716;
+  --ink:#EAE8E3; --ink-2:#B5B3AC; --ink-3:#84837C;
+  --rule:#333330; --rule-2:#45443F;
+  --live:#8FBF84; --live-soft:#1E2A1B; --live-ink:#A8D19E;
+  --lost:#E08A5F; --lost-soft:#2E1A11; --lost-ink:#EDA382;
+  --slate:#7EAAC9; --slate-soft:#152530;
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);
+  font-family:var(--body);font-size:16.5px;line-height:1.62;-webkit-font-smoothing:antialiased}
+p,li{max-width:var(--measure)}
+code,kbd{font-family:var(--mono);font-size:.83em;background:var(--panel-2);
+  padding:.1em .34em;border-radius:2px;color:var(--ink)}
+pre{font-family:var(--mono);font-size:12.5px;line-height:1.5;background:var(--sunk);
+  border:1px solid var(--rule);border-left:2px solid var(--slate);
+  padding:14px 16px;overflow-x:auto;margin:18px 0;color:var(--ink-2)}
+pre code{background:none;padding:0;font-size:inherit}
+hr{border:0;border-top:1px solid var(--rule);margin:0}
+
+.wrap{max-width:1080px;margin:0 auto;padding:0 28px}
+.shell{display:grid;grid-template-columns:196px minmax(0,1fr);gap:50px;align-items:start}
+@media (max-width:960px){.shell{grid-template-columns:1fr;gap:0}.rail{display:none}}
+
+header.mast{border-bottom:1px solid var(--rule-2);margin-bottom:42px;padding:52px 0 28px}
+.kicker{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--ink-3);display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+.kicker b{color:var(--live);font-weight:600}
+h1{font-family:var(--display);font-weight:700;font-size:clamp(40px,6.8vw,72px);
+  line-height:.96;letter-spacing:-.024em;margin:0 0 18px;text-wrap:balance;max-width:20ch}
+.standfirst{font-size:19px;line-height:1.5;color:var(--ink-2);max-width:57ch;margin:0}
+.standfirst em{color:var(--ink);font-style:italic}
+
+.rail{position:sticky;top:24px;padding-top:8px;font-family:var(--mono);font-size:11px;line-height:1.45}
+.rail h2{font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--ink-3);font-weight:600;margin:0 0 12px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
+.rail ol{list-style:none;margin:0 0 24px;padding:0;display:flex;flex-direction:column;gap:1px}
+.rail a{display:block;padding:5px 6px;text-decoration:none;color:var(--ink-2);border-radius:2px}
+.rail a:hover{background:var(--panel-2);color:var(--ink)}
+.rail .legend{color:var(--ink-3);border-top:1px solid var(--rule);padding-top:12px}
+.rail .legend div{display:flex;gap:7px;align-items:baseline;margin-bottom:6px;max-width:none}
+
+section{margin-bottom:60px;scroll-margin-top:24px}
+h2.sec{font-family:var(--display);font-weight:600;font-size:clamp(25px,3.2vw,34px);
+  letter-spacing:-.016em;line-height:1.1;margin:0 0 8px;text-wrap:balance}
+h3{font-family:var(--display);font-weight:600;font-size:18px;letter-spacing:-.008em;
+  margin:32px 0 10px;text-wrap:balance}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.15em;text-transform:uppercase;
+  color:var(--lost);font-weight:600;margin:0 0 10px}
+.tuple{font-family:var(--mono);font-size:11px;color:var(--ink-3);margin:0 0 20px;
+  padding:7px 10px;background:var(--panel-2);border-radius:2px;max-width:none}
+.tuple b{color:var(--ink-2);font-weight:500}
+
+.chip{font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.09em;
+  text-transform:uppercase;padding:2px 6px;border-radius:2px;white-space:nowrap;display:inline-block}
+.c-ver{background:var(--slate-soft);color:var(--slate)}
+.c-live{background:var(--live-soft);color:var(--live-ink)}
+.c-lost{background:var(--lost-soft);color:var(--lost-ink)}
+.c-s{background:var(--panel-2);color:var(--ink-3);border:1px solid var(--rule)}
+
+.thesis{background:var(--panel);border-top:3px solid var(--lost);padding:24px 26px;margin:0 0 4px}
+.thesis h3{margin:0 0 12px;font-size:21px}
+.thesis ol{margin:0;padding-left:24px}
+.thesis li{margin-bottom:12px;font-size:16px}
+.thesis li:last-child{margin-bottom:0}
+.thesis b{font-family:var(--display);font-weight:600}
+
+.finding{border-top:2px solid var(--rule-2);background:var(--panel);padding:18px 22px;margin:0 0 3px}
+.finding.bad{border-top-color:var(--lost)}
+.finding.good{border-top-color:var(--live)}
+.finding h3{margin:0 0 7px;font-size:18px}
+.finding p{margin:0 0 9px;color:var(--ink-2);font-size:15.5px}
+.finding p:last-child{margin-bottom:0}
+.cite{font-family:var(--mono);font-size:11px;color:var(--ink-3);display:block;margin-top:9px;max-width:none}
+
+.tw{overflow-x:auto;margin:18px 0;border:1px solid var(--rule);background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:540px}
+th,td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--ink-3);font-weight:600;background:var(--panel-2);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td.n{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+td.mono{font-family:var(--mono);font-size:12px}
+td.v{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.07em;
+  text-transform:uppercase;white-space:nowrap}
+.sv{color:var(--live)} .ds{color:var(--lost)} .un{color:var(--ink-3)}
+
+.obj{border-left:2px solid var(--lost);padding:2px 0 2px 16px;margin:14px 0 0;
+  font-size:14.5px;color:var(--ink-2);font-style:italic}
+.obj b{font-style:normal;font-family:var(--mono);font-size:10px;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--lost);display:block;margin-bottom:4px;font-weight:600}
+
+.lens{border-top:1px solid var(--rule-2);padding-top:22px;margin-bottom:34px}
+.lens .lh{font-family:var(--display);font-weight:600;font-size:20px;letter-spacing:-.01em;
+  margin:0 0 4px}
+.lens .pick{background:var(--panel);padding:13px 16px;margin:14px 0 0;
+  box-shadow:inset 3px 0 0 var(--live)}
+.lens .pick .pn{font-family:var(--display);font-weight:600;font-size:15px}
+.lens .pick p{margin:4px 0 0;font-size:14.5px;color:var(--ink-2)}
+
+.tier{margin:0 0 24px}
+.tier .tl{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--ink-3);font-weight:600;border-bottom:1px solid var(--rule);
+  padding-bottom:6px;margin-bottom:12px;display:flex;justify-content:space-between;gap:12px}
+.tier ol{margin:0;padding-left:22px}
+.tier li{margin-bottom:9px;font-size:15px}
+.tier li b{font-family:var(--display);font-weight:600}
+
+footer{border-top:1px solid var(--rule-2);margin-top:18px;padding:26px 0 60px;
+  font-family:var(--mono);font-size:11px;color:var(--ink-3);line-height:1.7}
+footer p{max-width:74ch}
+:focus-visible{outline:2px solid var(--slate);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="wrap">
+<header class="mast">
+  <div class="kicker">
+    <span><b>5</b> explorations</span>
+    <span><b>28</b> proposals</span>
+    <span><b>0</b> forks in 81 sessions</span>
+    <span><b>2</b> one-line fixes</span>
+  </div>
+  <h1>The Fork Line</h1>
+  <p class="standfirst">Prime Agent can split a session and has never once been asked to.
+  Five agents went looking for why, and found something better than an explanation: fork is
+  <em>two one-line changes away</em> from being the most valuable primitive in the harness —
+  and one of those lines is quietly costing money on every session that has nothing to do
+  with forking.</p>
+</header>
+
+<div class="shell">
+<nav class="rail" aria-label="Contents">
+  <h2>Findings</h2>
+  <ol>
+    <li><a href="#thesis">The two lines</a></li>
+    <li><a href="#mechanics">How fork works</a></li>
+    <li><a href="#survives">What survives</a></li>
+    <li><a href="#defects">Three surprises</a></li>
+    <li><a href="#cache">The cache leak</a></li>
+    <li><a href="#competes">What fork competes with</a></li>
+  </ol>
+  <h2>Lenses</h2>
+  <ol>
+    <li><a href="#l1">The gesture</a></li>
+    <li><a href="#l2">Unbidden forks</a></li>
+    <li><a href="#l3">What it drops</a></li>
+    <li><a href="#l4">Coming back</a></li>
+    <li><a href="#l5">The price</a></li>
+  </ol>
+  <h2>Then</h2>
+  <ol>
+    <li><a href="#proposals">All 28</a></li>
+    <li><a href="#order">Build order</a></li>
+  </ol>
+  <div class="legend">
+    <div><span class="chip c-ver">Ver</span><span>checked in source</span></div>
+    <div><span class="sv">&#9646;</span><span>survives a fork</span></div>
+    <div><span class="ds">&#9646;</span><span>dies at the fork line</span></div>
+  </div>
+</nav>
+
+<main>
+
+<section id="thesis">
+  <div class="thesis">
+    <h3>Two lines stand between fork and the best tool in the harness</h3>
+    <ol>
+      <li><b>A directory name.</b> The kernel snapshot path is
+      <code>getSessionArtifactDir()</code>, keyed on session id. A fork mints a new id, so
+      restore looks in an empty directory. Prime Agent serializes your entire Python namespace
+      on the way out of a fork, writes it into the <em>parent&rsquo;s</em> artifact dir, boots a
+      cold kernel for the child, and never reads the file it just wrote. <em>The restore
+      machinery is already built and correct; only the directory name is wrong.</em></li>
+      <li><b>A line of text.</b> <code>Conversation log: ${messagesPath}</code> sits in the
+      system prompt <em>ahead of</em> 46,713 characters of skill descriptions. It contains the
+      session&rsquo;s own file path, so it is unique per session — which means no two sessions
+      can share a cached prefix, and a fork pays the full cache write rather than reading its
+      parent&rsquo;s. This is not a fork bug. It is a store-wide cache leak that fork merely
+      makes expensive enough to notice.</li>
+    </ol>
+  </div>
+  <p style="margin-top:22px;color:var(--ink-2)">Everything below is downstream of those two.
+  The five explorations disagreed about what to build and agreed, without coordination, that
+  neither of their favourite ideas is safe until the first line is fixed.</p>
+</section>
+
+<hr>
+
+<section id="mechanics" style="padding-top:40px">
+  <p class="eyebrow">Corrected</p>
+  <h2 class="sec">How fork actually works</h2>
+  <p style="color:var(--ink-2)">Worth stating plainly, because I got it wrong twice — once
+  before this fan-out and once inside the brief I wrote for it. Numbered because it is a real
+  sequence.</p>
+  <ol style="color:var(--ink-2)">
+    <li><b>A fork creates a new session file.</b> It does not append a branch to the existing
+    JSONL. <code>createBranchedSession(leafId)</code> walks the ancestor path, drops
+    <code>label</code> entries, mints a new id, and writes
+    <code>[newHeader, &hellip;ancestorPath, &hellip;reparentedLabels]</code>. Forks make a
+    <em>forest of files</em>.</li>
+    <li><b>The copied entries keep their original ids.</b> Only labels get fresh ones. So
+    sibling files share entry ids and the fork point is an exact set intersection — no
+    heuristic, no prefix hashing, no model call. <span class="chip c-ver">Verified</span></li>
+    <li><b>The only link back is <code>parentSession</code> in the new header,</b> alongside a
+    freshly captured <code>git</code> context. The old file is untouched and still complete.</li>
+    <li><b><code>position:"before"</code> requires a user message and returns its text.</b>
+    It branches from that message&rsquo;s <em>parent</em> — a rewind — and hands back
+    <code>selectedText</code>. The primitive is natively an <em>edit-and-resend</em>.
+    <code>position:"at"</code> is the RPC <code>clone</code> command.</li>
+    <li><b>Forking tears down and rebuilds the runtime.</b> New lease,
+    <code>teardownForReplacement("fork", &hellip;)</code>, new <code>SessionManager</code>, new
+    kernel, new <code>session-artifacts/&lt;new-id&gt;/</code>. On macOS that is a full cold
+    boot — the kernel fork-server is gated on <code>platform === "linux"</code> because
+    fork-without-exec is unsafe on Darwin.</li>
+    <li><b>It works on any session file, not just the live one.</b>
+    <code>SessionManager.open(currentSessionFile, sessionDir)</code> — so forking from history
+    is already supported at the runtime level. <span class="chip c-ver">Verified</span></li>
+    <li><b>Forking the first user message yields an empty prefix.</b>
+    <code>targetLeafId = selectedEntry.parentId</code> can be null, and the runtime then takes
+    <code>newSession()</code> instead. That is a native &ldquo;start over, rephrased&rdquo; no
+    UI exposes.</li>
+    <li><b>There is a cancellable policy hook nothing uses.</b>
+    <code>session_before_fork</code> fires before any of this. Its result type declares
+    <code>cancel</code> and <code>skipConversationRestore</code> — and
+    <code>skipConversationRestore</code> appears <em>nowhere else in the source</em>. It is a
+    dead field: an extension setting it gets silence. <span class="chip c-ver">Verified</span></li>
+  </ol>
+  <p style="color:var(--ink-2)">There is an irony in which field died. Fork carries the
+  conversation and drops the world; the one knob anybody bothered to declare would have let
+  you drop the conversation too.</p>
+</section>
+
+<hr>
+
+<section id="survives" style="padding-top:40px">
+  <p class="eyebrow">The centrepiece</p>
+  <h2 class="sec">What survives the fork line</h2>
+  <p style="color:var(--ink-2)">Established from source rather than assumed. This table is the
+  most valuable thing the fan-out produced, and it is the thing to check before building any
+  fork feature at all.</p>
+  <div class="tw"><table>
+    <thead><tr><th>What</th><th>Verdict</th><th>Settled by</th></tr></thead>
+    <tbody>
+      <tr><td>Ancestor messages, labels</td><td class="v sv">Survives</td><td class="mono">session-manager.ts:1911</td></tr>
+      <tr><td>Goal state, incl. token counters</td><td class="v sv">Survives<br><span class="un">rewound</span></td><td class="mono">agent-session.ts:1575</td></tr>
+      <tr><td>Refinement <em>history</em> (that you refined)</td><td class="v sv">Survives</td><td class="mono">agent-session.ts:7808</td></tr>
+      <tr><td>Global harness state</td><td class="v sv">Survives</td><td class="mono">refinement.ts:268</td></tr>
+      <tr><td>Daemon worker &amp; process</td><td class="v sv">Survives</td><td class="mono">agent-session-runtime.ts:215</td></tr>
+      <tr><td>Ownership lease</td><td class="v sv">Moves</td><td class="mono">agent-session-runtime.ts:239</td></tr>
+      <tr><td><b>Scheduled jobs &amp; heartbeat</b></td><td class="v ds">Moves to the fork<br><span class="un">parent loses them</span></td><td class="mono">cron-jobs.ts:259</td></tr>
+      <tr><td><b>IPython namespace</b></td><td class="v ds">Dies</td><td class="mono">agent-session.ts:8797</td></tr>
+      <tr><td><b>Local harness state</b> (the notes)</td><td class="v ds">Dies</td><td class="mono">refinement.ts:273</td></tr>
+      <tr><td>Live <code>rlm</code> children&rsquo;s runtimes</td><td class="v ds">Die</td><td class="mono">agent-session-runtime.ts:292</td></tr>
+      <tr><td>MCP owners, recap, summary</td><td class="v ds">Dropped</td><td class="mono">daemon-mode.ts:1495</td></tr>
+      <tr><td>Old <code>kernel-state.dill</code></td><td class="v un">Survives, orphaned</td><td class="mono">runtime.ts:196 writes, nothing reads</td></tr>
+      <tr><td><code>rlm</code> child transcripts</td><td class="v un">Survive, orphaned</td><td class="mono">agent-session.ts:9093</td></tr>
+      <tr><td>Files in <code>cwd</code> &amp; git worktree</td><td class="v un">Not forked at all</td><td class="mono">— shared by both siblings</td></tr>
+      <tr><td>Header <code>git</code> context</td><td class="v un">Re-captured, never read</td><td class="mono">session-manager.ts:1621</td></tr>
+      <tr><td>Provider prompt cache</td><td class="v ds">Likely lost</td><td class="mono">inferred — see below</td></tr>
+    </tbody>
+  </table></div>
+  <p>The geography one agent drew from this is worth keeping. Destroyed things are
+  <em>honest</em> — they announce themselves by breaking. The bad region is what it called the
+  <b>orphanage</b>: every byte still on disk, one <code>cp</code> away, and nothing in the
+  harness will ever look at it again. The kernel snapshot, the local harness notes, and the
+  sub-agent transcripts all live there.</p>
+  <p>And the row that reframes reconciliation entirely is the one nobody thinks about:
+  <b>files in <code>cwd</code> are not forked.</b> Fork forks a <em>belief about the world</em>,
+  not the world. Two siblings share one directory and one git worktree — so by the time you
+  want to merge, the merge has already happened, badly, without a record.</p>
+</section>
+
+<hr>
+
+<section id="defects" style="padding-top:40px">
+  <p class="eyebrow">Nobody would guess these</p>
+  <h2 class="sec">Three surprises inside the survival table</h2>
+
+  <div class="finding bad">
+    <h3>Forking steals the parent&rsquo;s cron jobs <span class="chip c-ver">Verified</span></h3>
+    <p>Jobs are keyed on <code>activeSessionId</code> — the stable per-attachment id — not on the
+    session file. When the file changes underneath, <code>rebindSessionJobs</code> rewrites every
+    matching job onto the new session and relocates it into the fork&rsquo;s artifact dir. Its own
+    doc comment says so: <em>&ldquo;move jobs stored for its stable active session id to the new
+    file so future restores target the current session.&rdquo;</em></p>
+    <p>Correct for <code>resume</code> and <code>switch_session</code>. But fork is the one
+    sibling where the parent file is meant to stand as a checkpoint — and there the same code
+    silently transfers the parent&rsquo;s schedule and heartbeat to the child. Right by design
+    for three of four cases, wrong for exactly the one you would want to fork.</p>
+    <span class="cite">core/cron-jobs.ts:259 &middot; modes/daemon/daemon-mode.ts:1453</span>
+  </div>
+
+  <div class="finding bad">
+    <h3>The fork remembers deciding to write the note. It cannot read the note.</h3>
+    <p>Refinement <em>history</em> survives, because it lives in <code>custom</code> entries on
+    the copied ancestor path. Local harness <em>state</em> dies, because it lives in the
+    per-session-id artifact dir. So a forked session inherits a complete record of having taught
+    itself things, and none of the things.</p>
+    <p>Which also means auto-refine — on by default, every 25 assistant turns — keeps writing
+    into a directory the fork will never read.</p>
+    <span class="cite">agent-session.ts:7808 vs refinement.ts:273</span>
+  </div>
+
+  <div class="finding bad">
+    <h3>A mid-goal fork spends one budget twice</h3>
+    <p>Goal state is a <code>custom</code> entry on the ancestor path, so it survives — including
+    <code>tokensUsed</code> and the continuation counters, <em>rewound to the branch point</em>.
+    Fork a session with an active goal and you have two live goals, each believing it has the
+    unspent remainder of the same allowance.</p>
+    <span class="cite">core/agent-session.ts:1575&ndash;1587</span>
+  </div>
+
+  <div class="finding good">
+    <h3>And one gift: the fork point is exactly computable</h3>
+    <p>Because copied entries keep their ids, comparing two siblings is a set intersection rather
+    than a diff heuristic. Every &ldquo;compare these branches&rdquo; feature is cheaper here than
+    it would be in a system that re-keyed on copy. <code>branch-summarization.ts</code> already
+    extracts <code>readFiles</code>/<code>modifiedFiles</code> from a common ancestor — the
+    harness summarizes an abandoned <em>in-file</em> branch on tree-navigate and never on fork, so
+    harvesting is a missing call site, not a missing capability.</p>
+  </div>
+</section>
+
+<hr>
+
+<section id="cache" style="padding-top:40px">
+  <p class="eyebrow">The finding with a dollar sign on it</p>
+  <h2 class="sec">One line of text costs the cache everything</h2>
+  <p>The brief I wrote asserted that a fork shares an exact token prefix with its parent, which
+  is precisely the shape prompt caching rewards. That premise is false as built, and the reason
+  is a single line.</p>
+<pre><code>core/prompts/rlm.ts:88-100    (buildRlmPrompt — the system prompt prefix)
+
+    `Working directory: ${cwd}`,
+    `Conversation log: ${messagesPath}`,     &lt;-- unique per session
+    `Recursive agent depth: ${depth}`,
+    ...
+
+core/system-prompt.ts:123     prompt = buildRlmPrompt({...})
+core/system-prompt.ts:172     prompt += formatSkillsForPrompt(skills)   &lt;-- 46,713 chars</code></pre>
+  <p>Cache blocks are prefix-hashed. A change ~1k in invalidates everything behind it — so the
+  session&rsquo;s own file path, sitting upstream of the entire skill catalogue, means the fork
+  does not read its parent&rsquo;s cache. It writes a fresh one, in full, every time.</p>
+  <p>What that costs, from the measured 10,883 skill tokens at 62.7% of a 17,357-token input:</p>
+  <div class="tw"><table>
+    <thead><tr><th>Per fork</th><th>As a cache read (0.1&times;)</th><th>As a cache write (1.25&times;)</th></tr></thead>
+    <tbody>
+      <tr><td>system prompt only, Opus-class</td><td class="n">$0.026</td><td class="n">$0.326</td></tr>
+      <tr><td>system prompt only, Sonnet-class</td><td class="n">$0.005</td><td class="n">$0.065</td></tr>
+      <tr><td>plus a 100k-token ancestor path, Opus-class</td><td class="n">$0.15</td><td class="n">$1.88</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two consequences worth separating. The first is about fork: <b>a fork off a long trunk is
+  the harness&rsquo;s most expensive gesture, and it is expensive in proportion to how much
+  history you wanted to keep</b> — the exact inverse of the intuition. Fix the line and the same
+  fork costs about three cents.</p>
+  <p>The second is bigger and has nothing to do with forking. <b>Every session&rsquo;s system
+  prompt is unique before the skills block,</b> so no two sessions on this machine have ever
+  shared a cached skill catalogue. The write is paid 81 times instead of once. Fork just makes
+  the leak expensive enough to see.</p>
+  <p class="obj"><b>Honesty about this number</b>The cost table is arithmetic on measured token
+  counts, and the cache-invalidation claim is an inference from how prefix caching works — not a
+  measured hit-rate experiment. The agent that found it proposed the measurement itself: a badge
+  showing cold-boot milliseconds, tokens re-paid, and the <em>actual</em> cached-token count on
+  the first post-fork request. Run that before quoting the dollar figures at anyone.</p>
+</section>
+
+<hr>
+
+<section id="competes" style="padding-top:40px">
+  <p class="eyebrow">Decision aid</p>
+  <h2 class="sec">Fork is the most expensive member of its own family</h2>
+  <p>Walking up one level, fork is a <em>session replacement</em>, and its siblings are
+  <code>newSession</code>, <code>resume</code> and <code>compaction</code> — all four routed
+  through the same <code>teardownForReplacement</code> + <code>buildAndApplyReplacement</code>
+  path. Ordered by what &ldquo;the context is wrong, do something&rdquo; actually costs:</p>
+  <div class="tw"><table>
+    <thead><tr><th>Move</th><th>New file</th><th>Kernel</th><th>Re-pays 68 skills</th><th>Carries</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">navigateTree</td><td class="sv">no</td><td class="sv">kept</td><td class="sv">no</td><td>everything; one summarization call</td></tr>
+      <tr><td class="mono">compaction</td><td class="sv">no</td><td class="sv">kept</td><td class="sv">no</td><td>a summary; destroys the rest</td></tr>
+      <tr><td class="mono">rlm('task')</td><td class="ds">yes</td><td class="ds">cold</td><td class="ds">yes</td><td>the task string, nothing else</td></tr>
+      <tr><td class="mono"><b>fork / clone</b></td><td class="ds">yes</td><td class="ds">cold</td><td class="ds">yes</td><td>the entire ancestor path</td></tr>
+    </tbody>
+  </table></div>
+  <p>Read the last two rows together and the rule falls out: <b>fork is strictly dominated by
+  <code>rlm</code> on cost, differing only by the ancestor path. So fork if and only if the
+  history is worth more than re-caching it</b> — which, today, means a lot, and after the
+  one-line cache fix means almost nothing.</p>
+  <p>The empty branches in that family tree are where the value is: there is no <em>fork that
+  keeps the kernel</em>, and no <em>fork that keeps the session id</em>. And note what else is
+  missing — every other move has an inverse (<code>newSession</code>/<code>resume</code>,
+  compact/expand). <b>Fork has none.</b> There is no merge, and the data model forbids one: an
+  entry has exactly one <code>parentId</code>, a header exactly one
+  <code>parentSession</code>. Every reunion is lossy by construction, so harvesting is not a
+  compromise — it is the only available shape.</p>
+</section>
+
+<hr>
+
+<section id="l1" style="padding-top:40px">
+  <p class="eyebrow">Lens 01</p>
+  <h2 class="sec">Why an impulse never became a command</h2>
+  <p class="tuple"><b>organon-construction</b> &times; <b>negation</b> &rarr; <b>list</b> &middot; predictability, modularity, cardinality</p>
+  <p>The explanation for zero forks in 81 sessions, and it is not that fork is useless:
+  <em>the impulse&rsquo;s half-life is shorter than the command&rsquo;s activation energy.</em>
+  <code>/fork</code> costs recall, then a picker, then a rebuilt kernel — three deliberate acts
+  to express a one-second thought. A GUI&rsquo;s advantage is not better forking; it is that the
+  gesture can be <em>ambient</em>: attached to something already on screen, one click, free to
+  abandon.</p>
+  <p>Its central claim is that the primitive has been mislabelled its whole life.
+  <code>position:"before"</code> refuses anything but a user message and hands back that
+  message&rsquo;s text — nothing else in the RPC surface returns the argument you are replacing.
+  Fork is an edit-and-resend filed under &ldquo;branching,&rdquo; and the filing is why nobody
+  reached for it.</p>
+  <div class="pick" style="background:var(--panel);padding:13px 16px;box-shadow:inset 3px 0 0 var(--live)">
+    <span class="pn">Say It Again</span> <span class="chip c-s">S</span>
+    <p>A hover control on every user bubble that rewinds to just before that turn and drops the
+    original text into the composer, cursor at the end. The primitive&rsquo;s own shape, drawn.</p>
+  </div>
+  <p class="obj"><b>Objection</b>The gesture&rsquo;s felt promise is &ldquo;same situation,
+  different words,&rdquo; and that promise is false. The kernel dies, a cold one boots, and the
+  variables that made the parent turn productive are gone. A one-click fork that silently
+  discards working state is worse than no fork — it will feel like the agent got dumber, and you
+  will blame the model, not the gesture.</p>
+  <p style="color:var(--ink-3);font-size:14px"><b>Also found:</b> Aviary&rsquo;s live transcript
+  mints synthetic ids for user turns (<code>LiveTranscript.swift:32</code>), so no live bubble
+  knows its harness <code>entryId</code>. That is why <code>get_fork_messages</code> is
+  load-bearing rather than convenient.</p>
+</section>
+
+<section id="l2">
+  <p class="eyebrow">Lens 02</p>
+  <h2 class="sec">A lexicon of unbidden forks</h2>
+  <p class="tuple"><b>tree-finding</b> &times; <b>negation</b> &rarr; <b>dictionary</b> &middot; predictability, source, autonomy</p>
+  <p>Written as a dictionary of forks nobody asked for — <em>bulwark</em> (clone before a
+  destructive act, so the frozen parent is the restore point), <em>salvage</em> (fork to the last
+  good user message instead of retrying into a poisoned context), <em>heterofork</em> (N branches,
+  N models), <em>taskbranch</em> (a working branch off a long trunk), <em>handoff</em> (the agent
+  emigrating into a clean continuation of itself), <em>thicket</em> (a forest nobody reads).</p>
+  <p>Its structural point: <b>auto-refine is the existing precedent</b> for autonomous
+  self-modification in this harness — it proves the pattern is tolerable, and it proves the
+  failure mode. Six entries per kind, alphabetical, no prune. An auto-fork policy will fail the
+  same way unless it ships with a reaper.</p>
+  <div class="pick" style="background:var(--panel);padding:13px 16px;box-shadow:inset 3px 0 0 var(--live)">
+    <span class="pn">Bulwark</span> <span class="chip c-s">M</span>
+    <p>Clone before something irreversible, leaving the parent file frozen and complete. Built on
+    the inversion nobody expects: <em>you do not fork to make a spare branch — fork replaces your
+    runtime, so you cannot run two. You clone to become the spare.</em></p>
+  </div>
+  <p class="obj"><b>Objection</b>It checkpoints the wrong layer. The restore point holds your
+  beliefs, not your filesystem — and the acts you most want a bulwark against
+  (<code>git push --force</code>, <code>terraform apply</code>, a dropped table) are exactly the
+  ones a conversation rewind cannot undo. A restore point that feels like insurance and is not
+  may be worse than none.</p>
+</section>
+
+<section id="l3">
+  <p class="eyebrow">Lens 03</p>
+  <h2 class="sec">The territory a fork walks out of</h2>
+  <p class="tuple"><b>dimension-identification</b> &times; <b>cross-domain-reinstantiation</b> &rarr; <b>map</b> &middot; rate, connectivity, polarity</p>
+  <p>This produced the survival table above, then re-instantiated the whole thing in
+  apiculture — a beekeeper&rsquo;s walk-away split, where the bees are the conversation and
+  everything else is comb. Every answer the domain has evolved is a <em>deliberate carry</em>,
+  never a default: move frames of brood and stores across; requeen or accept the brood break;
+  reduce the entrance so foragers do not drift back to the wrong hive; and do not split during a
+  dearth. The drift is exactly the cron theft. The dearth is exactly the macOS cold boot.</p>
+  <div class="pick" style="background:var(--panel);padding:13px 16px;box-shadow:inset 3px 0 0 var(--live)">
+    <span class="pn">Frame Carry</span> <span class="chip c-s">M</span>
+    <p>After <code>session_start{reason:"fork"}</code>, copy the parent&rsquo;s snapshot into the
+    fork&rsquo;s artifact dir and restart the kernel, so the existing resume path revives it. The
+    machinery is built and correct; only the directory name is wrong.</p>
+  </div>
+  <p class="obj"><b>Objection, and it sharpens the fix</b>Carrying the kernel is safe — a dill
+  heap has one writer. Carrying the <em>notes</em> is a split-brain write: two sessions descend
+  from one 6-entry, alphabetically truncated, no-merge list, and both will rewrite it, silently
+  overwriting each other with no ancestry recorded anywhere. So the honest v1 is asymmetric —
+  <b>carry the comb, leave the notes, and say which.</b> The incoherence is not fork&rsquo;s
+  fault: per-session harness state was never designed to have a second owner.</p>
+</section>
+
+<section id="l4">
+  <p class="eyebrow">Lens 04</p>
+  <h2 class="sec">Coming back</h2>
+  <p class="tuple"><b>organon-construction</b> &times; <b>substitution</b> &rarr; <b>matrix</b> &middot; direction, predictability, autonomy</p>
+  <p>A matrix of six diverged things against four verbs reunion could mean — compare, harvest,
+  adopt, retire. Reading it produced the <code>cwd</code> finding above, the observation that
+  <code>reunite(A,B) &ne; reunite(B,A)</code> (only the winner keeps running, only the loser gets
+  summarized — worth surfacing, because &ldquo;merge&rdquo; never sounds irreversible and this
+  is), and the empty cell: <b>there is no verb for &ldquo;both siblings were right.&rdquo;</b></p>
+  <p>Its substitution on <em>direction</em> is the one to steal. Fork today is accumulate-only,
+  structurally identical to the continual harness. Make it <em>decaying</em> instead: a branch
+  carries a TTL and, on expiry, harvests itself into a dated <code>knowledge/</code> draft. The
+  default outcome of a fork becomes a note, not a file.</p>
+  <div class="pick" style="background:var(--panel);padding:13px 16px;box-shadow:inset 3px 0 0 var(--live)">
+    <span class="pn">Speculative fork instead of <code>rlm</code></span> <span class="chip c-s">L</span>
+    <p>Fork is the only mechanism in this harness that hands a child the whole conversation at
+    near-zero context cost, while an <code>rlm</code> child starts blind and re-pays 62.7% of
+    input on skills. Fork should be the cheap child.</p>
+  </div>
+  <p class="obj"><b>Objection, and it may be the real product</b>A fork duplicates the transcript
+  but not the world. The sibling boots with a detailed, confident account of a repository its
+  twin is concurrently editing, no kernel state, and no lock — so it acts on stale belief with
+  full conviction, which is worse than <code>rlm</code>&rsquo;s honest ignorance. Speculative fork
+  is only safe with worktree isolation — <em>and once you add that, the fork has become a
+  worktree agent that happens to remember the conversation, which may be the actual
+  feature.</em></p>
+</section>
+
+<section id="l5">
+  <p class="eyebrow">Lens 05</p>
+  <h2 class="sec">The price of a fork</h2>
+  <p class="tuple"><b>tree-finding</b> &times; <b>dimension-identification</b> &rarr; <b>list</b> &middot; visibility, scope, direction</p>
+  <p>This lens produced the cache finding and the family-cost table above. Its other contribution
+  is the <em>visibility</em> axis: fork spend today is <b>unattributable</b>. The child header
+  records <code>parentSession</code>; the parent is never told it has children. A five-branch
+  exploration reads as five unrelated sessions and nobody sees the $1.60. <em>A cost-control tool
+  that cannot report its own cost is a cost multiplier.</em></p>
+  <div class="pick" style="background:var(--panel);padding:13px 16px;box-shadow:inset 3px 0 0 var(--live)">
+    <span class="pn">Trunk-and-Branch</span> <span class="chip c-s">L</span>
+    <p>At the compaction threshold, fork instead of compacting: a bounded working branch, a
+    pristine trunk, nothing destroyed. The harness owns a lossless alternative to its lossy
+    default and has used it zero times in 81 sessions.</p>
+  </div>
+  <p class="obj"><b>Objection, and it is about ordering</b>A fork&rsquo;s cost scales with the
+  trunk you fork from, so auto-forking <em>at</em> the compaction threshold forks at the most
+  expensive possible instant — ~100k tokens of cache write, ~$1.88 Opus-class, plus a cold boot —
+  precisely when compaction would have cost one cheap summarization call. It is not a cost-control
+  tool until the cache anchor ships. After that the same fork costs ~$0.15 and the argument
+  inverts. <b>Order matters more than the idea.</b></p>
+  <p style="color:var(--ink-3);font-size:14px"><b>And it killed a property I had asserted:</b>
+  &ldquo;an abandoned fork leaves no trace&rdquo; is wrong. <code>hasAssistant</code> is tested
+  over the whole of <code>fileEntries</code>, <em>including the copied ancestor path</em> — so any
+  fork past the first exchange writes its file at fork time, whether or not you ever reply.
+  Speculative forking is not free on disk, and every &ldquo;ghost fork&rdquo; design built on that
+  freedom needs rethinking. <span class="chip c-ver">Verified</span></p>
+</section>
+
+<hr>
+
+<section id="proposals" style="padding-top:40px">
+  <p class="eyebrow">All of them</p>
+  <h2 class="sec">Twenty-eight proposals</h2>
+  <div class="tw"><table>
+    <thead><tr><th>Lens</th><th>Proposal</th><th>What it does</th><th>Size</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">gesture</td><td><b>Say It Again</b></td><td>hover control on a user bubble &rarr; rewind + prefilled composer</td><td class="n">S</td></tr>
+      <tr><td class="mono">gesture</td><td>Rewind (&#8984;&#8997;&uarr;)</td><td>fork-as-undo, walking backwards through fork points</td><td class="n">S</td></tr>
+      <tr><td class="mono">gesture</td><td>Fan of Three</td><td>one click, three rephrasings, three live columns</td><td class="n">M</td></tr>
+      <tr><td class="mono">gesture</td><td>Ghost Fork</td><td>headless speculative child, discarded by ignoring it</td><td class="n">M</td></tr>
+      <tr><td class="mono">gesture</td><td>Fork Anything</td><td>right-click any turn in a <em>historical</em> session</td><td class="n">M</td></tr>
+      <tr><td class="mono">gesture</td><td>Fork Ledger</td><td>render the forest from headers; promote to <code>knowledge/</code></td><td class="n">S</td></tr>
+      <tr><td class="mono">unbidden</td><td>Fork Ledger (motive)</td><td>record why each fork happened; veto over budget</td><td class="n">S</td></tr>
+      <tr><td class="mono">unbidden</td><td><b>Bulwark</b></td><td>clone before a destructive act; frozen parent as restore point</td><td class="n">M</td></tr>
+      <tr><td class="mono">unbidden</td><td>Heterofork Fan</td><td>N branch files from one leaf, N models</td><td class="n">L</td></tr>
+      <tr><td class="mono">unbidden</td><td>Salvage</td><td>on repeated failure, fork to last good message instead of retrying</td><td class="n">S</td></tr>
+      <tr><td class="mono">unbidden</td><td>Thicket Reaper</td><td>rank branches by evidence of being read; reap the rest</td><td class="n">M</td></tr>
+      <tr><td class="mono">drops</td><td>Split Sheet</td><td>pre-fork sheet: carried / orphaned / killed, per item</td><td class="n">S</td></tr>
+      <tr><td class="mono">drops</td><td><b>Frame Carry</b></td><td>copy the parent&rsquo;s snapshot into the fork&rsquo;s artifact dir</td><td class="n">M</td></tr>
+      <tr><td class="mono">drops</td><td>Entrance Board</td><td>surface the stolen schedule; leave behind / duplicate / cancel</td><td class="n">S/M</td></tr>
+      <tr><td class="mono">drops</td><td>Goal Twin Guard</td><td>warn when forking a session with an active goal</td><td class="n">S</td></tr>
+      <tr><td class="mono">drops</td><td>Fork Weather</td><td>cold-boot ms, tokens re-paid, measured cache hit rate</td><td class="n">S</td></tr>
+      <tr><td class="mono">drops</td><td>Orphanage Reaper</td><td>artifact dirs with no reachable session: carry or delete</td><td class="n">M</td></tr>
+      <tr><td class="mono">reunion</td><td>Forest Ribbon</td><td>siblings + exact divergence point by id intersection</td><td class="n">S</td></tr>
+      <tr><td class="mono">reunion</td><td>Fork Contract</td><td>demand one sentence: what would make this branch worth keeping?</td><td class="n">M</td></tr>
+      <tr><td class="mono">reunion</td><td>Harvest to <code>knowledge/</code></td><td>summarize the divergent suffix, draft a dated note, archive the loser</td><td class="n">M</td></tr>
+      <tr><td class="mono">reunion</td><td>Divergence Guard</td><td>compare live git against the fork header&rsquo;s capture</td><td class="n">S</td></tr>
+      <tr><td class="mono">reunion</td><td><b>Speculative fork</b></td><td>full-context branch with a TTL, instead of a blind <code>rlm</code> child</td><td class="n">L</td></tr>
+      <tr><td class="mono">price</td><td><b>Stable Cache Anchor</b></td><td>make a fork&rsquo;s system prompt byte-identical to its parent&rsquo;s</td><td class="n">S</td></tr>
+      <tr><td class="mono">price</td><td>Fork Price Tag</td><td>price the fork before you confirm it</td><td class="n">M</td></tr>
+      <tr><td class="mono">price</td><td>Snapshot Carry-Forward</td><td>Frame Carry, but snapshot-at-entry for rewinds</td><td class="n">M</td></tr>
+      <tr><td class="mono">price</td><td><b>Trunk-and-Branch</b></td><td>fork instead of compacting at the threshold</td><td class="n">L</td></tr>
+      <tr><td class="mono">price</td><td>Forest Reaper</td><td>GC the forest and the 101 orphan artifact dirs</td><td class="n">S</td></tr>
+      <tr><td class="mono">price</td><td>Cheaper Sibling Suggester</td><td>on fork, offer the priced alternatives: navigateTree, rlm</td><td class="n">M</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="order">
+  <p class="eyebrow">Recommendation</p>
+  <h2 class="sec">What I would build, in order</h2>
+  <p>The ordering is forced by the objections rather than chosen. Three of the five lenses
+  independently concluded that their best idea is unsafe or uneconomic until a prerequisite
+  ships — and the prerequisites are the two one-line changes.</p>
+
+  <div class="tier">
+    <div class="tl"><span>First &middot; the two lines</span><span>neither is a feature</span></div>
+    <ol>
+      <li><b>Stable Cache Anchor.</b> Normalize the <code>Conversation log:</code> line so it is
+      not upstream of the skill catalogue — in the harness, or from
+      <code>before_provider_request</code> without touching it. This is not a fork feature. It is
+      a store-wide cache fix that fork happens to have exposed, and it changes the economics of
+      every idea below. Measure the hit rate before and after; that measurement is
+      <b>Fork Weather</b>, so build them together.</li>
+      <li><b>Frame Carry, asymmetric.</b> Carry the kernel snapshot; leave the harness notes;
+      state plainly which. Until this ships, every fork gesture makes the agent look dumber for
+      reasons the user will misattribute to the model.</li>
+    </ol>
+  </div>
+
+  <div class="tier">
+    <div class="tl"><span>Then &middot; make forking legible</span><span>read-only, files are truth</span></div>
+    <ol>
+      <li><b>Forest Ribbon.</b> Render the forest from <code>parentSession</code> headers with
+      the exact divergence point. <code>Transcript.swift</code> already parses
+      <code>parentSession</code> and nothing consumes it, and <code>AgentTree</code> builds edges
+      only from daemon <code>parentSessionId</code>, so forks are invisible even when they exist.</li>
+      <li><b>Split Sheet</b> and <b>Goal Twin Guard.</b> Say what a fork will cost you before it
+      costs it — including the stolen schedule and the duplicated goal. Both are a read plus a
+      dialog.</li>
+      <li><b>Say It Again.</b> Once the kernel carries, draw the primitive as what it actually
+      is. This is the gesture that decides whether fork gets used at all.</li>
+    </ol>
+  </div>
+
+  <div class="tier">
+    <div class="tl"><span>Then &middot; act</span><span>needs the meters from above</span></div>
+    <ol>
+      <li><b>Entrance Board.</b> Fix the cron theft — or at minimum, stop it being silent.</li>
+      <li><b>Harvest to <code>knowledge/</code></b>, wired to <code>branch-summarization.ts</code>.
+      Reunion is lossy by construction, so build the only shape that exists rather than pretending
+      a merge is coming.</li>
+      <li><b>Bulwark</b>, with the caveat on the label. Never call it a restore point; call it a
+      conversation checkpoint, because that is all it is.</li>
+      <li><b>Trunk-and-Branch</b> — but only after the cache anchor, and only with a measurement
+      showing a fork at the threshold now costs cents rather than dollars.</li>
+    </ol>
+  </div>
+
+  <div class="tier">
+    <div class="tl"><span>Reconsider</span><span>on this evidence</span></div>
+    <ol>
+      <li><b>Ghost Fork,</b> and anything else resting on &ldquo;abandoned forks leave no
+      trace.&rdquo; They do leave a file. The design needs a different safety story — probably an
+      explicit reaper rather than a self-erasing child.</li>
+      <li><b>Speculative fork as an <code>rlm</code> replacement</b> — not because it is wrong,
+      but because the honest version is a worktree agent that remembers the conversation. That is
+      a bigger and better idea than a fork feature, and it deserves to be scoped as one.</li>
+    </ol>
+  </div>
+</section>
+
+<footer>
+  <p>Five agents &middot; one verified brief &middot; five randomized ideonomy method tuples
+  (<code>ideonomy-plain</code>, seeds 20231&ndash;20671) &middot; none could see another&rsquo;s
+  output. Companion to <em>Expanding Aviary</em>, which covered ten other facets of the same
+  harness; same type system and structure, because it is the same client and the same
+  investigation.</p>
+  <p>Items marked <span class="chip c-ver">Verified</span> were checked against harness source
+  during this session, as were every row of the survival table, the cron rebinding, the dead
+  <code>skipConversationRestore</code> field, the <code>hasAssistant</code> test, and the
+  position of <code>Conversation log:</code> relative to the skills block. The dollar figures are
+  arithmetic on measured token counts plus an inference about prefix-cache invalidation — treat
+  them as an argument for measuring, not as a measurement. Source:
+  <code>~/duckbill/aviary/docs/fork.html</code>; raw explorations under the session scratchpad.</p>
+</footer>
+
+</main>
+</div>
+</div>

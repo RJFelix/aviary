@@ -4,7 +4,7 @@ import AviaryCore
 
 /// Top-level navigation destinations.
 enum Section: String, CaseIterable, Identifiable, Hashable {
-    case cockpit, live, sessions, flock, models, usage, library, health
+    case cockpit, live, sessions, workshop, flock, models, usage, library, health
 
     var id: String { rawValue }
 
@@ -13,6 +13,7 @@ enum Section: String, CaseIterable, Identifiable, Hashable {
         case .cockpit: return "Cockpit"
         case .live: return "Live"
         case .sessions: return "Sessions"
+        case .workshop: return "Workshop"
         case .flock: return "Flock"
         case .models: return "Models"
         case .usage: return "Usage"
@@ -26,6 +27,7 @@ enum Section: String, CaseIterable, Identifiable, Hashable {
         case .cockpit: return "gauge.open.with.lines.needle.33percent"
         case .live: return "dot.radiowaves.left.and.right"
         case .sessions: return "bubble.left.and.text.bubble.right"
+        case .workshop: return "hammer"
         case .flock: return "bird"
         case .models: return "cpu"
         case .usage: return "chart.bar.xaxis"
@@ -39,6 +41,7 @@ enum Section: String, CaseIterable, Identifiable, Hashable {
         case .cockpit: return "Everything at a glance"
         case .live: return "Start and steer a run"
         case .sessions: return "Read what happened"
+        case .workshop: return "Ask Aviary to change"
         case .flock: return "Sub-agent trees"
         case .models: return "Providers and routes"
         case .usage: return "Tokens and cost"
@@ -131,6 +134,30 @@ final class AppModel {
     var hideThinking = false
     var toast: Toast?
 
+    // MARK: Workshop
+    //
+    // The self-improvement board. Requests you file against Aviary itself, and the
+    // long-lived session that services them.
+
+    /// The Aviary checkout. Everything the workshop writes lives under it, so that the
+    /// board is reviewable with `git diff` rather than buried in Application Support.
+    var repoRoot: URL?
+    var board = WorkshopBoard()
+    var selectedRequestID: String?
+    /// The bottom-right capture panel, available on every screen.
+    var capturePanelOpen = false
+    var draftTitle = ""
+    var draftBody = ""
+    var draftKind: WorkshopKind = .change
+    var draftIncludesShot = true
+    var isSubmitting = false
+    /// The session dedicated to improving Aviary. Remembered across launches.
+    var workshopSessionID: String? {
+        didSet { UserDefaults.standard.set(workshopSessionID, forKey: "aviary.workshop.session") }
+    }
+    /// The attached run servicing the board, when Aviary started one.
+    var workshopRunID: UUID?
+
     struct Toast: Identifiable, Equatable {
         let id = UUID()
         var message: String
@@ -168,6 +195,11 @@ final class AppModel {
         modelsConfig = .load(home: home, auth: auth)
 
         wireIndex = WireLog.buildIndex()
+
+        repoRoot = EngineLocator.repoRoot()
+        workshopSessionID = UserDefaults.standard.string(forKey: "aviary.workshop.session")
+        refreshBoard()
+
         await refreshAll()
         startPolling()
     }
