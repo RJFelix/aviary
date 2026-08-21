@@ -95,8 +95,9 @@ just shot cockpit --bare                    # without the navigation chrome
 
 Two known limits of the capture path, neither affecting the running app:
 
-- The **sidebar column renders white**. `NavigationSplitView`'s sidebar background is an
-  AppKit vibrancy material, and materials do not rasterize through `cacheDisplay`.
+- The **sidebar column renders white**, and so does any column the capture has not drawn
+  before — the Sessions inspector comes out black. Both render correctly in the running
+  app (verified by eye). An unpainted region in a snapshot is not evidence of a bug.
 - Each screen is rendered **twice** and only the second pass is written. The window does not
   draw reliably until it has been through a couple of section transitions; no amount of
   settle time on a single view fixes it, and forcing a rebuild makes it worse.
