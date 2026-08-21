@@ -187,12 +187,21 @@ extension AppModel {
         workshopRunID = runs.last?.id
         section = .workshop
 
-        markDelivered(request.id, session: workshopRun?.sessionID)
-        let id = request.id
-        Task { await trackSession(for: id) }
-        show(resume == nil
-            ? "Opened a workshop session and sent \(request.id)."
-            : "Resumed the workshop session and sent \(request.id).")
+        // Wait for the engine to prove it is alive before claiming the request was
+        // delivered. The first real request was recorded as delivered *and* claimed while
+        // the engine had already exited 1 — the board said an agent had it, nothing had it,
+        // and the only evidence was a line in the harness's own log. A delivery that cannot
+        // fail visibly is worse than no delivery.
+        if await engineProvedAlive() {
+            markDelivered(request.id, session: workshopRun?.sessionID)
+            let id = request.id
+            Task { await trackSession(for: id) }
+            show(resume == nil
+                ? "Opened a workshop session and sent \(request.id)."
+                : "Resumed the workshop session and sent \(request.id).")
+        } else {
+            recordDeliveryFailure(request.id)
+        }
     }
 
     /// Re-send a request that never reached a session.
@@ -222,6 +231,50 @@ extension AppModel {
             ]),
             repoRoot: repoRoot)
         refreshBoard()
+    }
+
+    /// True once the engine has answered with a session id; false if it exited first.
+    ///
+    /// A session id is the cheapest available proof of life: it only exists after the engine
+    /// has booted node, resolved its model and answered `get_state`.
+    private func engineProvedAlive() async -> Bool {
+        for _ in 0..<60 {
+            guard let run = workshopRun else { return false }
+            if let sid = run.sessionID, !sid.isEmpty { return true }
+            if run.hasExited { return false }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return workshopRun?.hasExited == false
+    }
+
+    /// Leave the request open, and write down why it did not get through.
+    ///
+    /// Recorded as a `note` rather than a status change: nothing about the request has
+    /// changed, only our attempt to hand it over, and the next attempt should find it exactly
+    /// where it was.
+    private func recordDeliveryFailure(_ id: String) {
+        guard let repoRoot else { return }
+        let run = workshopRun
+        let stderr = (run?.stderrTail ?? []).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+        let code = run?.exitCode.map { "exit \($0)" } ?? "no exit code"
+        let banner = run?.errorBanner
+        let detail = [banner, stderr.isEmpty ? nil : String(stderr.suffix(1200))]
+            .compactMap { $0 }.joined(separator: "\n")
+
+        var lines = ["Delivery failed — the engine did not start (\(code)). The request is still open."]
+        if let remedy = Workshop.remedy(for: detail) { lines.append(remedy) }
+        if !detail.isEmpty { lines.append("Engine output:\n\(detail)") }
+
+        try? WorkshopLog.append(
+            WorkshopEvent(event: "note", id: id, fields: [
+                "text": .string(lines.joined(separator: "\n\n")),
+                "by": .string("aviary"),
+            ]),
+            repoRoot: repoRoot)
+        refreshBoard()
+        show(Workshop.remedy(for: detail)
+            ?? "Filed \(id), but the engine did not start (\(code)). See the note on the card.",
+            isError: true)
     }
 
     /// Follow a freshly-launched run until the engine reports its session id, then link it.

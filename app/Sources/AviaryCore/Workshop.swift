@@ -44,6 +44,25 @@ public enum Workshop {
         directory(repoRoot: repoRoot).appending(path: "AGENT.md")
     }
 
+    /// Turn a known engine failure into an instruction.
+    ///
+    /// Only one entry so far, and it earns its place: two harness builds cannot share a
+    /// daemon socket, and when the running one has busy sessions the newcomer is refused and
+    /// exits. Nothing in that message tells you what to do about it, and the fix is a recipe
+    /// this repo already ships. Returns nil for anything unrecognised rather than guessing —
+    /// false advice about a failure is worse than none.
+    public static func remedy(for output: String) -> String? {
+        let lower = output.lowercased()
+        let daemonConflict = lower.contains("refusing to replace stale daemon")
+            || lower.contains("different prime agent version")
+            || (lower.contains("stale") && lower.contains("daemon"))
+        guard daemonConflict else { return nil }
+        return "Aviary's engine build and the running daemon are different builds, and the "
+            + "daemon has busy sessions so it will not step aside. Finish or stop those "
+            + "sessions, or run `just daemon-reset` in the Aviary checkout, then send it "
+            + "again from the card."
+    }
+
     /// Sortable, short, and readable aloud — it goes in commit messages.
     public static func newID(date: Date = Date(), random: () -> UInt32 = { arc4random() }) -> String {
         let f = DateFormatter()
@@ -395,7 +414,11 @@ public enum WorkshopLog {
 
             case "delivered":
                 guard var r = byID[id] else { break }
-                r.delivered = true
+                // `retracted` exists because Aviary once recorded a delivery that had not
+                // happened. In an append-only log the correction is a later event that says
+                // so, never an edit to the earlier one — the mistake stays visible and the
+                // derived state still ends up right.
+                r.delivered = !(v["retracted"]?.boolValue ?? false)
                 if let s = v["session"]?.stringValue, !s.isEmpty, !r.sessions.contains(s) {
                     r.sessions.append(s)
                 }

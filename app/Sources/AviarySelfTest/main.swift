@@ -582,4 +582,41 @@ await Harness.run([
         XCTAssertTrue(r.delivered)
         XCTAssertEqual(r.sessions, ["01a0-late"])
     }),
+
+    ("workshop: a daemon-conflict failure is turned into an instruction", {
+        // The real failure text from the first request that silently did not deliver.
+        let output = "daemon-launch: running daemon on /tmp/prime-agent-501/daemon.sock is "
+            + "stale: daemon v0.7.4-beta.531.1.c75a637 vs client v0.7.4\n"
+            + "daemon-launch: refusing to replace stale daemon: busy session(s) present"
+        let remedy = try XCTUnwrap(Workshop.remedy(for: output))
+        XCTAssertTrue(remedy.contains("daemon-reset"), "names the recipe that fixes it")
+        XCTAssertNil(Workshop.remedy(for: "ECONNREFUSED"), "unknown failures get no false advice")
+    }),
+
+    ("workshop: a failed delivery leaves the request open with a note", {
+        // Aviary writes a note, not a status: nothing about the request changed, only our
+        // attempt to hand it over.
+        let lines = [
+            #"{"event":"created","id":"a","at":"2026-08-21T10:00:00.000Z","title":"t","kind":"bug"}"#,
+            #"{"event":"note","id":"a","at":"2026-08-21T10:00:20.000Z","text":"Delivery failed — the engine did not start (exit 1).","by":"aviary"}"#,
+        ]
+        let board = WorkshopBoard(requests: WorkshopLog.fold(lines: lines))
+        let r = try XCTUnwrap(board.requests.first)
+        XCTAssertEqual(r.status, .open, "still waiting, not falsely in progress")
+        XCTAssertFalse(r.delivered, "and not falsely marked delivered")
+        XCTAssertEqual(board.undeliveredCount, 1, "so the banner can say so")
+        XCTAssertEqual(r.notes.first?.by, "aviary")
+    }),
+
+    ("workshop: a delivery can be retracted by a later event", {
+        let lines = [
+            #"{"event":"created","id":"a","at":"2026-08-21T10:00:00.000Z","title":"t","kind":"bug"}"#,
+            #"{"event":"delivered","id":"a","at":"2026-08-21T10:00:05.000Z"}"#,
+            #"{"event":"delivered","id":"a","at":"2026-08-21T10:30:00.000Z","retracted":true}"#,
+        ]
+        let board = WorkshopBoard(requests: WorkshopLog.fold(lines: lines))
+        let r = try XCTUnwrap(board.requests.first)
+        XCTAssertFalse(r.delivered, "the retraction wins because it is later")
+        XCTAssertEqual(board.undeliveredCount, 1)
+    }),
 ])
