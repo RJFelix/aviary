@@ -55,6 +55,10 @@ extension AppModel {
     // MARK: Filing
 
     func submitRequest() {
+        Task { await submitRequestAsync() }
+    }
+
+    private func submitRequestAsync() async {
         let title = draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = draftBody.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty || !body.isEmpty else { return }
@@ -65,8 +69,10 @@ extension AppModel {
 
         isSubmitting = true
         let id = Workshop.newID()
+        // The facts are read before the screenshot, so they describe the same instant even
+        // if the capture takes a moment.
         var context = captureContext()
-        if draftIncludesShot, let name = writeWindowShot(requestID: id, repoRoot: repoRoot) {
+        if draftIncludesShot, let name = await writeWindowShot(requestID: id, repoRoot: repoRoot) {
             context.screenshot = name
         }
 
@@ -430,19 +436,18 @@ extension AppModel {
             .isEmpty ? "development build" : [v, b.map { "(\($0))" }].compactMap { $0 }.joined(separator: " ")
     }
 
-    /// Rasterize the front window into `workshop/shots/`.
+    /// Write the window to `workshop/shots/`, returning the name relative to the workshop
+    /// directory.
     ///
-    /// `cacheDisplay` on our own view rather than a screen capture: it needs no screen-
-    /// recording permission, cannot pick up anything outside Aviary, and is the same path
-    /// `--snapshot` already uses. Returns the name relative to the workshop directory.
-    func writeWindowShot(requestID: String, repoRoot: URL) -> String? {
-        guard let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }),
-              let view = window.contentView,
-              view.bounds.width > 1, view.bounds.height > 1,
-              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)
+    /// See `WindowShot` for why this goes through the WindowServer rather than asking the
+    /// view to draw itself: vibrancy and material layers are composited, not drawn, and a
+    /// screenshot missing the sidebar and the inspector is a screenshot that misleads
+    /// whoever reads it. Failure returns nil and the request is filed without an image —
+    /// never blocked by one.
+    func writeWindowShot(requestID: String, repoRoot: URL) async -> String? {
+        guard let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible })
         else { return nil }
-        view.cacheDisplay(in: view.bounds, to: rep)
-        guard let png = rep.representation(using: .png, properties: [:]) else { return nil }
+        guard let png = await WindowShot.capture(window: window) else { return nil }
         let dir = Workshop.shotsDirectory(repoRoot: repoRoot)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appending(path: "\(requestID).png")
