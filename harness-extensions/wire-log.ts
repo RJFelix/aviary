@@ -34,14 +34,27 @@ interface WireLogRecord {
 	seq: number;
 	at: string;
 	kind: "request" | "response";
+	/**
+	 * The session this record belongs to, from the harness rather than inferred.
+	 *
+	 * Worth stating why: the responses payload carries a `prompt_cache_key` that looks
+	 * exactly like a session id and is not one — measured on a real run the key was
+	 * 01a0222d-510c… while the session written to disk was 01a0222d-4ec9…. Reading
+	 * `ctx.sessionManager.getSessionFile()` is the only reliable link.
+	 */
+	sessionFile?: string;
 	/** The exact object handed to the provider, post-serialization-shaping. */
 	payload?: Json;
 	status?: number;
 	headers?: Record<string, string>;
 }
 
+interface Ctx {
+	sessionManager?: { getSessionFile?: () => string | undefined };
+}
+
 export default function (pi: {
-	on: (event: string, handler: (event: Record<string, Json>, ctx: unknown) => unknown) => void;
+	on: (event: string, handler: (event: Record<string, Json>, ctx: Ctx) => unknown) => void;
 }) {
 	const path = process.env.AVIARY_WIRE_LOG_PATH;
 	if (!path) {
@@ -68,24 +81,34 @@ export default function (pi: {
 		}
 	};
 
-	pi.on("before_provider_request", (event) => {
+	const sessionFileOf = (ctx: Ctx): string | undefined => {
+		try {
+			return ctx?.sessionManager?.getSessionFile?.();
+		} catch {
+			return undefined;
+		}
+	};
+
+	pi.on("before_provider_request", (event, ctx) => {
 		append({
 			v: 1,
 			seq: seq++,
 			at: new Date().toISOString(),
 			kind: "request",
+			sessionFile: sessionFileOf(ctx),
 			payload: event.payload,
 		});
 		// Returning undefined leaves the payload untouched.
 		return undefined;
 	});
 
-	pi.on("after_provider_response", (event) => {
+	pi.on("after_provider_response", (event, ctx) => {
 		append({
 			v: 1,
 			seq: seq++,
 			at: new Date().toISOString(),
 			kind: "response",
+			sessionFile: sessionFileOf(ctx),
 			status: typeof event.status === "number" ? event.status : undefined,
 			headers: (event.headers as Record<string, string>) ?? undefined,
 		});

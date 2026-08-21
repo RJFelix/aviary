@@ -32,6 +32,8 @@ enum Snapshot {
         // screen comes back blank and you need to know whether the fault is in the view or
         // in its container.
         let bare = args.contains("--bare")
+        // Render with a specific session selected, rather than the largest one.
+        let sessionID = stringValue(of: "--session", in: args)
 
         // AppKit has to be alive for CoreAnimation-backed rendering, but the run loop must
         // not start — so initialise the shared application and never call run().
@@ -45,7 +47,7 @@ enum Snapshot {
         // deadlocks against the very task we are waiting for.
         let state = Progress()
         Task { @MainActor in
-            await runSnapshots(outDir: outDir, width: width, height: height, only: only, bare: bare, state: state)
+            await runSnapshots(outDir: outDir, width: width, height: height, only: only, bare: bare, sessionID: sessionID, state: state)
         }
 
         let deadline = Date().addingTimeInterval(600)
@@ -85,7 +87,7 @@ enum Snapshot {
 
     @MainActor
     private static func runSnapshots(
-        outDir: URL, width: Int, height: Int, only: String?, bare: Bool, state: Progress
+        outDir: URL, width: Int, height: Int, only: String?, bare: Bool, sessionID: String?, state: Progress
     ) async {
         var failures = 0
         let model = AppModel()
@@ -98,11 +100,15 @@ enum Snapshot {
             + "daemon: \(model.daemon.health.label)")
 
         // Give the transcript reader something real to draw.
-        if let biggest = model.sessions.max(by: { $0.byteSize < $1.byteSize }) {
+        let chosen = sessionID.flatMap { id in model.sessions.first { $0.id == id } }
+            ?? model.sessions.max(by: { $0.byteSize < $1.byteSize })
+        if let biggest = chosen {
             model.select(session: biggest)
             await model.loadTranscript(for: biggest)
-            log("loaded the largest transcript: \(model.transcript?.items.count ?? 0) rows "
-                + "from \(Fmt.bytes(biggest.byteSize))")
+            log("loaded \(sessionID == nil ? "the largest" : "the requested") transcript: "
+                + "\(model.transcript?.items.count ?? 0) rows from \(Fmt.bytes(biggest.byteSize))"
+                + " · \(model.selectedSessionWire.filter { $0.kind == .request }.count) "
+                + "recorded payload(s)")
         }
 
         let stage = OffscreenWindow(width: CGFloat(width), height: CGFloat(height))

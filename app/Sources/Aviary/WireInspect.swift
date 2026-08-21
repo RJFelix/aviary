@@ -9,11 +9,35 @@ import AviaryCore
 enum WireInspect {
     static var isRequested: Bool {
         CommandLine.arguments.contains("--analyse-wire")
+            || CommandLine.arguments.contains("--wire-index")
     }
 
     static func runIfRequested() {
         guard isRequested else { return }
         let args = CommandLine.arguments
+
+        // `--wire-index` prints which recorded logs are attributed to which session — the
+        // lookup the Sessions tab performs, without needing a window to see it.
+        if args.contains("--wire-index") {
+            let index = WireLog.buildIndex()
+            print("wire directory: \(WireLog.directory.path)")
+            print("\(index.fileCount) log(s) across \(index.sessionCount) session(s)")
+            let home = AgentHome.default
+            for (session, logs) in index.bySession.sorted(by: { $0.key < $1.key }) {
+                let transcript = home.sessionFile(id: session)
+                let exists = FileManager.default.fileExists(atPath: transcript.path)
+                let records = WireLog.records(forSession: session, index: index)
+                let requests = records.filter { $0.kind == .request }.count
+                print("  \(session)  \(requests) request(s)  transcript: "
+                    + (exists ? "found" : "MISSING"))
+                for l in logs { print("     \(l.lastPathComponent)") }
+            }
+            if !index.unattributed.isEmpty {
+                print("  unattributed (no sessionFile recorded):")
+                for l in index.unattributed { print("     \(l.lastPathComponent)") }
+            }
+            exit(0)
+        }
         guard let i = args.firstIndex(of: "--analyse-wire"), args.count > i + 1 else {
             FileHandle.standardError.write(Data("usage: Aviary --analyse-wire <file.jsonl>\n".utf8))
             exit(2)

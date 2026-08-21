@@ -17,13 +17,18 @@ public struct WireRecord: Sendable, Identifiable {
     public var status: Int?
     public var headers: [String: String]
 
-    /// The session this request belonged to, when the payload carries it.
+    /// Path of the session transcript this request belonged to, as reported by the harness.
+    public var sessionFile: String?
+
+    /// The session id, derived from that path.
     ///
-    /// The responses API sends `prompt_cache_key`, which the harness sets to the session id
-    /// — so a wire log can be matched back to a transcript without Aviary having to record
-    /// the mapping itself. Absent on routes that have no such field.
+    /// Deliberately *not* the payload's `prompt_cache_key`. That field looks exactly like a
+    /// session id and is not one — measured on a real run it was `01a0222d-510c…` while the
+    /// session written to disk was `01a0222d-4ec9…`. Attributing logs by it silently
+    /// associates every recording with a session that does not exist.
     public var sessionID: String? {
-        payload?["prompt_cache_key"]?.stringValue
+        guard let sessionFile, !sessionFile.isEmpty else { return nil }
+        return URL(fileURLWithPath: sessionFile).deletingPathExtension().lastPathComponent
     }
 
     public var modelID: String? {
@@ -107,7 +112,8 @@ public enum WireLog {
                 kind: kind,
                 payload: v["payload"],
                 status: v["status"]?.intValue,
-                headers: (v["headers"]?.objectValue ?? [:]).compactMapValues(\.stringValue)))
+                headers: (v["headers"]?.objectValue ?? [:]).compactMapValues(\.stringValue),
+                sessionFile: v["sessionFile"]?.stringValue))
         }
         return out
     }
@@ -128,14 +134,84 @@ public enum WireLog {
         directory.appending(path: "run-\(id.uuidString).jsonl")
     }
 
-    /// Any recorded log whose payloads name this session.
-    public static func logs(forSession sessionID: String) -> [URL] {
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
-        else { return [] }
-        return files.filter { $0.pathExtension == "jsonl" }.filter { url in
-            read(url: url).contains { $0.sessionID == sessionID }
+    /// Maps recorded logs to the sessions they belong to.
+    ///
+    /// Built by reading each file's first record only. The responses API carries
+    /// `prompt_cache_key`, which the harness sets to the session id, so one line is enough
+    /// to attribute a whole log — and a directory that accumulates one file per run should
+    /// not cost a full parse of every payload to search.
+    public struct Index: Sendable {
+        public init() {}
+
+        /// session id → log files, newest first.
+        public var bySession: [String: [URL]] = [:]
+        /// Logs whose payloads carry no session id (routes without a cache key).
+        public var unattributed: [URL] = []
+
+        public func logs(forSession id: String) -> [URL] { bySession[id] ?? [] }
+        public var sessionCount: Int { bySession.count }
+        public var fileCount: Int {
+            bySession.values.reduce(0) { $0 + $1.count } + unattributed.count
         }
+    }
+
+    public static func buildIndex() -> Index {
+        var index = Index()
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles])
+        else { return index }
+
+        let sorted = files
+            .filter { $0.pathExtension == "jsonl" }
+            .sorted {
+                let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                return a > b
+            }
+
+        for url in sorted {
+            if let session = firstSessionID(in: url) {
+                index.bySession[session, default: []].append(url)
+            } else {
+                index.unattributed.append(url)
+            }
+        }
+        return index
+    }
+
+    /// The session id from the first record that names one, without parsing the whole file.
+    static func firstSessionID(in url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var buffer = Data()
+        // A single record is large (a system prompt is tens of kilobytes), so read in
+        // generous chunks and stop at the first complete line.
+        for _ in 0..<8 {
+            guard let chunk = try? handle.read(upToCount: 256 * 1024), !chunk.isEmpty else { break }
+            buffer.append(chunk)
+            if let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let line = buffer.subdata(in: buffer.startIndex..<nl)
+                if let v = JSONValue.parse(line),
+                   let path = v["sessionFile"]?.stringValue, !path.isEmpty
+                {
+                    return URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+                }
+                return nil
+            }
+        }
+        return nil
+    }
+
+    /// Records for one session, across every log that names it.
+    public static func records(forSession id: String, index: Index) -> [WireRecord] {
+        index.logs(forSession: id)
+            .flatMap { read(url: $0) }
+            .filter { $0.sessionID == nil || $0.sessionID == id }
+            .sorted { ($0.at, $0.seq) < ($1.at, $1.seq) }
     }
 
     // MARK: Analysis

@@ -2,7 +2,18 @@ import Foundation
 
 /// One row in the sessions list.
 public struct SessionSummary: Sendable, Identifiable, Hashable {
+    /// The session's identity: its transcript filename without the extension.
+    ///
+    /// **Not** the `id` inside the JSONL header, which disagrees with the filename in the
+    /// large majority of real sessions (68 of 80 in one checkout). Everything else in the
+    /// ecosystem keys on the filename — `session-artifacts/<id>/`, the spawn ledger's
+    /// `parentSessionId`, and `list --json`'s `sessionId` — so the filename is canonical and
+    /// the header field is the outlier. Using the header id silently breaks live-state
+    /// matching, sub-agent grouping, kernel-state lookup and recorded-payload attribution
+    /// for most sessions, and each failure looks like missing data rather than a bad join.
     public var id: String
+    /// The `id` recorded inside the transcript header, kept for reference only.
+    public var headerID: String?
     public var fileURL: URL
     public var name: String?
     public var cwd: String
@@ -59,7 +70,7 @@ public actor SessionCatalog {
     /// The cache keys on file size and mtime, which correctly detects a *changed
     /// transcript* and completely misses a changed *parser*. Without this, improving how
     /// titles are extracted silently does nothing for every session already indexed.
-    static let schemaVersion = 2
+    static let schemaVersion = 3
 
     private let home: AgentHome
     private var cache: [String: CacheEntry] = [:]
@@ -142,7 +153,7 @@ public actor SessionCatalog {
 
         var header: SessionHeader?
         var s = SessionSummary(
-            id: fallbackID, fileURL: fileURL, name: nil, cwd: "", gitBranch: nil,
+            id: fallbackID, headerID: nil, fileURL: fileURL, name: nil, cwd: "", gitBranch: nil,
             createdAt: .distantPast, updatedAt: .distantPast, byteSize: data.count,
             provider: nil, model: nil, usage: Usage(), childUsage: Usage(),
             counts: Transcript.Counts(), firstPrompt: "", lastAssistantText: "",
@@ -159,7 +170,8 @@ public actor SessionCatalog {
             case "session":
                 let h = SessionHeader(json: v, fallbackID: fallbackID)
                 header = h
-                s.id = h.id
+                // s.id stays the filename stem — see the note on SessionSummary.id.
+                s.headerID = h.id == fallbackID ? nil : h.id
                 s.cwd = h.cwd
                 s.createdAt = h.timestamp
                 s.gitBranch = h.gitBranch
@@ -293,6 +305,7 @@ public actor SessionCatalog {
 /// Codable mirror of `SessionSummary` (which carries a URL we'd rather rebuild).
 struct StoredSummary: Codable {
     var id: String
+    var headerID: String?
     var name: String?
     var cwd: String
     var gitBranch: String?
@@ -322,7 +335,7 @@ struct StoredSummary: Codable {
     var cEntries: Int
 
     init(_ s: SessionSummary) {
-        id = s.id; name = s.name; cwd = s.cwd; gitBranch = s.gitBranch
+        id = s.id; headerID = s.headerID; name = s.name; cwd = s.cwd; gitBranch = s.gitBranch
         createdAt = s.createdAt; updatedAt = s.updatedAt; byteSize = s.byteSize
         provider = s.provider; model = s.model; usage = s.usage; childUsage = s.childUsage
         firstPrompt = s.firstPrompt; lastAssistantText = s.lastAssistantText
@@ -352,7 +365,7 @@ struct StoredSummary: Codable {
                 timestamp: statusTimestamp ?? .distantPast)
         }
         return SessionSummary(
-            id: id, fileURL: fileURL, name: name, cwd: cwd, gitBranch: gitBranch,
+            id: id, headerID: headerID, fileURL: fileURL, name: name, cwd: cwd, gitBranch: gitBranch,
             createdAt: createdAt, updatedAt: updatedAt, byteSize: byteSize,
             provider: provider, model: model, usage: usage, childUsage: childUsage,
             counts: counts, firstPrompt: firstPrompt, lastAssistantText: lastAssistantText,

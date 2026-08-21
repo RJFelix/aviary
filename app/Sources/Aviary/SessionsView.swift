@@ -357,6 +357,8 @@ struct TranscriptHeader: View {
 struct SessionInspector: View {
     @Environment(AppModel.self) private var model
     @Binding var selectedItem: TranscriptItem?
+    @State private var showBreakdown = false
+    @State private var showRaw = false
 
     var body: some View {
         ScrollView {
@@ -371,6 +373,7 @@ struct SessionInspector: View {
                 if let t = model.transcript {
                     if !t.modelChanges.isEmpty { modelChangesCard(t) }
                 }
+                wireCard
                 if let kernel = model.kernelState {
                     kernelCard(kernel)
                 }
@@ -378,6 +381,139 @@ struct SessionInspector: View {
             }
             .padding(12)
         }
+    }
+
+    // MARK: What was sent
+
+    /// The recorded provider payload for this session, and — when an assistant turn is
+    /// selected — for that specific turn.
+    ///
+    /// A session's requests and its assistant messages are one-to-one and in order, so the
+    /// nth recorded request is what produced the nth model turn. Sub-agents don't disturb
+    /// this: they run in their own sessions with their own cache keys, so their payloads are
+    /// attributed to them and not to the parent.
+    private var wireRequests: [WireRecord] {
+        model.selectedSessionWire.filter { $0.kind == .request }
+    }
+
+    /// The request that produced the selected assistant message, if one is selected.
+    private var requestForSelection: WireRecord? {
+        guard let selected = selectedItem, selected.kind == .assistant,
+              let transcript = model.transcript
+        else { return nil }
+        let assistants = transcript.items.filter { $0.kind == .assistant }
+        guard let turn = assistants.firstIndex(where: { $0.id == selected.id }),
+              wireRequests.indices.contains(turn)
+        else { return nil }
+        return wireRequests[turn]
+    }
+
+    private var shownRequest: WireRecord? {
+        requestForSelection ?? wireRequests.last
+    }
+
+    @ViewBuilder
+    private var wireCard: some View {
+        if let request = shownRequest, let payload = request.payload {
+            let analysis = WireLog.analyse(payload: payload)
+            Card("What was sent", symbol: "arrow.up.doc",
+                 accessory: AnyView(
+                    HStack(spacing: 8) {
+                        Button("Breakdown") { showBreakdown = true }
+                            .buttonStyle(.link).font(.system(size: 10))
+                        Button("Raw") { showRaw = true }
+                            .buttonStyle(.link).font(.system(size: 10))
+                    }))
+            {
+                VStack(alignment: .leading, spacing: 6) {
+                    if requestForSelection != nil {
+                        Text("For the selected turn — request #\(request.seq).")
+                            .font(.system(size: 10)).foregroundStyle(Design.accent)
+                    } else if wireRequests.count > 1 {
+                        Text("Latest of \(wireRequests.count) recorded requests. Select an "
+                            + "assistant turn to see the one that produced it.")
+                            .font(.system(size: 10)).foregroundStyle(.tertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    DetailRow(
+                        label: "Payload",
+                        value: "\(Fmt.bytes(analysis.totalCharacters)) · ≈\(Fmt.tokens(analysis.estimatedTokens)) tok")
+                    if let billed = billedInput(for: request) {
+                        DetailRow(label: "Billed input", value: Fmt.tokens(billed), mono: true)
+                    }
+                    Divider().opacity(0.5)
+                    ForEach(analysis.segments.prefix(4)) { seg in
+                        HStack(spacing: 6) {
+                            Text(seg.label)
+                                .font(.system(size: 10.5))
+                                .lineLimit(1).truncationMode(.middle)
+                            Spacer(minLength: 4)
+                            Text(String(format: "%.0f%%", 100 * seg.share(of: analysis.totalCharacters)))
+                                .font(Design.numeric(10, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .sheet(isPresented: $showBreakdown) {
+                VStack(spacing: 0) {
+                    HStack {
+                        Text("What was sent to the model")
+                            .font(.system(size: 13, weight: .semibold))
+                        Spacer()
+                        Button("Done") { showBreakdown = false }
+                            .buttonStyle(.borderedProminent).controlSize(.small)
+                            .keyboardShortcut(.cancelAction)
+                    }
+                    .padding(12)
+                    Divider()
+                    ContextBreakdownView(
+                        analysis: analysis,
+                        actualInputTokens: billedInput(for: request),
+                        recordedAt: request.at)
+                }
+                .frame(width: 820, height: 720)
+            }
+            .sheet(isPresented: $showRaw) {
+                RawPayloadSheet(records: model.selectedSessionWire)
+            }
+        } else if let session = model.selectedSession {
+            Card("What was sent", symbol: "arrow.up.doc") {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("No provider payloads were recorded for this session, so its input "
+                        + "tokens can't be broken down. The transcript holds messages; the "
+                        + "system prompt, context files, skill catalogue and tool schemas "
+                        + "are assembled per request and stored nowhere.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        model.continueWithRecording(session)
+                    } label: {
+                        Label("Continue with recording", systemImage: "record.circle")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .disabled(session.isLive || EngineLocator.wireLogExtension() == nil)
+                    Text("Resumes this session in a new run with recording on. The next turn's "
+                        + "payload will include the same system prompt and context this "
+                        + "session has been using.")
+                        .font(.system(size: 9.5)).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    /// Input tokens the provider charged for the turn this request produced.
+    private func billedInput(for request: WireRecord) -> Int? {
+        guard let transcript = model.transcript else { return nil }
+        let assistants = transcript.items.filter { $0.kind == .assistant }
+        guard let turn = wireRequests.firstIndex(where: { $0.seq == request.seq }),
+              assistants.indices.contains(turn),
+              let input = assistants[turn].usage?.input, input > 0
+        else { return nil }
+        return input
     }
 
     private func itemCard(_ item: TranscriptItem) -> some View {

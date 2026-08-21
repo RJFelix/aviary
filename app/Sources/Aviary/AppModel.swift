@@ -88,6 +88,10 @@ final class AppModel {
     var transcriptSessionID: String?
     var isLoadingTranscript = false
     var kernelState: KernelState?
+    /// Recorded provider payloads for the selected session, when a run of it was recorded.
+    var selectedSessionWire: [WireRecord] = []
+    /// Which recorded logs belong to which session.
+    var wireIndex = WireLog.Index()
 
     // MARK: Live
 
@@ -163,6 +167,7 @@ final class AppModel {
         auth = .load(home: home)
         modelsConfig = .load(home: home, auth: auth)
 
+        wireIndex = WireLog.buildIndex()
         await refreshAll()
         startPolling()
     }
@@ -290,6 +295,7 @@ final class AppModel {
         transcript = parsed
         transcriptSessionID = id
         kernelState = KernelState.read(home: home, sessionID: id)
+        selectedSessionWire = WireLog.records(forSession: id, index: wireIndex)
         isLoadingTranscript = false
 
         // Follow the file while it is live.
@@ -339,6 +345,7 @@ final class AppModel {
         transcript = parsed
         transcriptSessionID = node.sessionID
         kernelState = nil
+        selectedSessionWire = WireLog.records(forSession: node.sessionID, index: wireIndex)
         isLoadingTranscript = false
     }
 
@@ -384,6 +391,27 @@ final class AppModel {
         testingProviders.remove(provider.id)
     }
 
+    /// Rescan recorded logs. Cheap: one line read per file.
+    func refreshWireIndex() {
+        wireIndex = WireLog.buildIndex()
+        if let id = selectedSessionID {
+            selectedSessionWire = WireLog.records(forSession: id, index: wireIndex)
+        }
+    }
+
+    /// Start a run that resumes this session with payload recording on — the way to get a
+    /// breakdown for a session that was not recorded the first time.
+    func continueWithRecording(_ session: SessionSummary) {
+        startRun(
+            config: RunConfiguration(
+                cwd: session.cwd.isEmpty ? defaultCwd : session.cwd,
+                provider: session.provider,
+                model: session.model,
+                resume: session.id,
+                recordPayloads: EngineLocator.wireLogExtension() != nil),
+            firstPrompt: nil)
+    }
+
     func reloadModelsConfig() {
         auth = .load(home: home)
         modelsConfig = .load(home: home, auth: auth)
@@ -425,6 +453,13 @@ final class AppModel {
     }
 
     func closeRun(_ run: LiveRun) {
+        if run.config.recordPayloads {
+            // The log is complete now; make it discoverable from the Sessions tab.
+            wireIndex = WireLog.buildIndex()
+            if let id = selectedSessionID {
+                selectedSessionWire = WireLog.records(forSession: id, index: wireIndex)
+            }
+        }
         Task { await run.stop() }
         runs.removeAll { $0.id == run.id }
         if focusedRunID == run.id { focusedRunID = runs.last?.id }

@@ -267,7 +267,10 @@ func test_readsAWireLogAndFindsItsSession() throws {
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     let file = dir.appending(path: "wire.jsonl")
     let lines = [
-        #"{"v":1,"seq":0,"at":"2026-08-20T10:00:00.000Z","kind":"request","payload":{"model":"m","prompt_cache_key":"sess-1","instructions":"hi"}}"#,
+        // sessionFile, not the payload's prompt_cache_key: that field looks exactly like a
+        // session id and is not one — on a real run the key was 01a0222d-510c… while the
+        // session on disk was 01a0222d-4ec9….
+        #"{"v":1,"seq":0,"at":"2026-08-20T10:00:00.000Z","kind":"request","sessionFile":"/s/sess-1.jsonl","payload":{"model":"m","prompt_cache_key":"not-a-session-id","instructions":"hi"}}"#,
         #"{"v":1,"seq":1,"at":"2026-08-20T10:00:01.000Z","kind":"response","status":200}"#,
         "not json at all",
     ].joined(separator: "\n")
@@ -277,6 +280,8 @@ func test_readsAWireLogAndFindsItsSession() throws {
     XCTAssertEqual(records.count, 2)  // the junk line is skipped, not fatal
     XCTAssertEqual(records.first?.kind, .request)
     XCTAssertEqual(records.first?.sessionID, "sess-1")
+    // The lookalike cache key must not be mistaken for the session.
+    XCTAssertEqual(records.first?.payload?["prompt_cache_key"]?.stringValue, "not-a-session-id")
     XCTAssertEqual(records.first?.modelID, "m")
     XCTAssertEqual(records.last?.status, 200)
     try? FileManager.default.removeItem(at: dir)
@@ -319,6 +324,28 @@ func test_attributesContextFileBodyToItsFile() {
     XCTAssertNil(seg.children.first { $0.label == "My Project" })
 }
 
+func test_sessionIdentityIsTheFilenameNotTheHeaderField() throws {
+    // Real sessions disagree: 68 of 80 in one checkout had a header `id` that was not the
+    // filename. The filename is what session-artifacts/, the spawn ledger's
+    // parentSessionId, and `list --json` all key on, so it is the identity. Using the
+    // header field silently breaks live-state matching, sub-agent grouping, kernel lookup
+    // and payload attribution — each of which then looks like missing data.
+    let dir = FileManager.default.temporaryDirectory
+        .appending(path: "aviary-id-test-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let file = dir.appending(path: "file-stem-id.jsonl")
+    let jsonl = [
+        #"{"type":"session","version":3,"id":"a-different-header-id","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp"}"#,
+        #"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":"hi"}}"#,
+    ].joined(separator: "\n")
+    try Data(jsonl.utf8).write(to: file)
+
+    let summary = try XCTUnwrap(SessionCatalog.summarize(fileURL: file))
+    XCTAssertEqual(summary.id, "file-stem-id")
+    XCTAssertEqual(summary.headerID, "a-different-header-id")
+    try? FileManager.default.removeItem(at: dir)
+}
+
 // MARK: - Runner
 
 await Harness.run([
@@ -346,4 +373,5 @@ await Harness.run([
     ("readsAWireLogAndFindsItsSession", { try test_readsAWireLogAndFindsItsSession() }),
     ("usageReasoningIsABreakdownNotAnAddend", { test_usageReasoningIsABreakdownNotAnAddend() }),
     ("attributesContextFileBodyToItsFile", { test_attributesContextFileBodyToItsFile() }),
+    ("sessionIdentityIsTheFilenameNotTheHeaderField", { try test_sessionIdentityIsTheFilenameNotTheHeaderField() }),
 ])
