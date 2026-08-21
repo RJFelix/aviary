@@ -525,8 +525,14 @@ struct EmptyStateView: View {
                     .padding(.top, 2)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Padding inside the greedy frame, never outside it. Reversed, the frame expands to
+        // the proposed height and *then* padding adds 80pt to it, so the view reports back
+        // more than it was offered; the parent re-proposes that, and the height runs away —
+        // measured at 3040pt and still climbing inside a 963pt pane. The visible symptom is
+        // not a too-tall empty state but a stack so oversized that everything above it is
+        // clipped out of the window, which reads as "the header is missing".
         .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

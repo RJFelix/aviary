@@ -13,6 +13,21 @@ struct WorkshopView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
+        // Pinned to exactly the space the pane offers.
+        //
+        // Without this the screen could resolve *taller than its own pane* — measured at
+        // 3167pt inside a 963pt window, and oscillating — because a greedy child inside a
+        // greedy frame can report back more height than it was offered. An over-tall detail
+        // pane does not merely clip: `NavigationSplitView` re-solves the whole window for
+        // it, and the visible casualty was the sidebar, which went blank on this tab and
+        // only this tab. A `GeometryReader` proposes the real size and cannot feed back.
+        GeometryReader { geo in
+            content
+                .frame(width: geo.size.width, height: geo.size.height)
+        }
+    }
+
+    private var content: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 banner
@@ -24,12 +39,27 @@ struct WorkshopView: View {
                     boardColumns
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // `alignment: .top` is the whole fix for a bug that looked like a missing
+            // header. A bare `.frame(maxHeight: .infinity)` *centers* its content, and the
+            // empty state inside asks for infinite height — so the stack grew taller than
+            // the pane and its top was clipped off the top edge rather than compressed.
+            // The header was being drawn above the visible area the entire time, which is
+            // why inserting a solid red rectangle to find it also showed nothing.
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
-            if model.selectedRequest != nil {
+            // Gated on the app-wide inspector toggle (⌥⌘I), like every other screen, and
+            // given a *flexible* width rather than a fixed one.
+            //
+            // Both details are load-bearing. A hard 340pt here plus the sidebar's 196pt
+            // minimum plus a non-shrinkable control row exceeded the 1100pt minimum window,
+            // and NavigationSplitView resolves that overflow by crushing the sidebar to
+            // zero width — the column is still there, so it reads as "the tabs vanished"
+            // rather than as a layout overflow. Same trap the Sessions screen hit; the fix
+            // is to leave nothing in the detail pane that cannot shrink.
+            if model.showInspector, model.selectedRequest != nil {
                 Divider()
                 RequestDetail()
-                    .frame(width: 340)
+                    .frame(minWidth: 250, idealWidth: 320, maxWidth: 380)
                     .background(Color(nsColor: .windowBackgroundColor))
             }
         }
@@ -125,27 +155,20 @@ struct WorkshopView: View {
             .controlSize(.small)
             .disabled(model.engine == nil || model.repoRoot == nil)
 
-            if let run = model.workshopRun, !run.hasExited {
-                Button {
-                    model.focusedRunID = run.id
-                    model.section = .live
-                } label: {
-                    Label("Open transcript", systemImage: "text.alignleft")
-                }
-                .controlSize(.small)
-            }
+            Spacer(minLength: 0)
 
-            Spacer(minLength: 8)
-
-            Button {
-                model.refreshBoard()
-            } label: {
-                Label("Reload board", systemImage: "arrow.clockwise")
-            }
-            .controlSize(.small)
-            .help("Re-read workshop/requests.jsonl from disk")
-
+            // Secondary actions live in the overflow menu rather than the row. Four labelled
+            // buttons gave this row an intrinsic width it could not shrink below, which is
+            // half of why the sidebar was being crushed.
             Menu {
+                Button("Reload board from disk") { model.refreshBoard() }
+                if let run = model.workshopRun, !run.hasExited {
+                    Button("Open the agent's transcript") {
+                        model.focusedRunID = run.id
+                        model.section = .live
+                    }
+                }
+                Divider()
                 if let root = model.repoRoot {
                     Button("Reveal board file in Finder") {
                         NSWorkspace.shared.activateFileViewerSelecting(
@@ -159,6 +182,10 @@ struct WorkshopView: View {
                 Divider()
                 Button("Forget workshop session") { model.forgetWorkshopSession() }
                     .disabled(model.workshopSessionID == nil)
+                Divider()
+                Button(model.showInspector ? "Hide request detail" : "Show request detail") {
+                    model.showInspector.toggle()
+                }
             } label: {
                 Image(systemName: "ellipsis.circle")
             }

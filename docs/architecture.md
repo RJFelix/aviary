@@ -83,11 +83,32 @@ Known limits, both in the capture path rather than the app:
 - The window does not draw reliably until it has been through a couple of section
   transitions, so every screen is rendered twice and only the second pass is written.
   Longer settle times do not help; forcing a rebuild with `.id()` makes it worse.
-- Even with two passes, some screens still come back blank. As of 2026-08-21 a full
-  `just shots` run leaves `cockpit`, `live`, `usage`, `health` and `workshop` as empty
-  frames (all identical in size, which is the tell) while `sessions`, `library`, `flock`
-  and `models` render. **`--bare` renders the blank ones correctly**, so it is the
-  navigation chrome in the capture path that fails, not those views. When a screen comes
-  back empty, re-render it with `--bare` before believing the view is broken — and read
-  the colours with suspicion there, because bare mode has no window background and
-  light-on-light text is an artifact of that, not a contrast bug.
+- The sidebar is **always white** in a capture, on every screen: AppKit vibrancy does not
+  rasterize. It is never evidence of anything. A real sidebar bug cannot be seen here at
+  all — it has to be reproduced by hosting `SidebarView` on its own, which does render.
+- Read colours in `--bare` with suspicion: bare mode has no window background, so
+  light-on-light text is an artifact of that, not a contrast bug. Flat black where a
+  background is explicitly set is the same class.
+
+### The greedy-child trap (2026-08-21)
+
+Four screens used to capture as identical blank frames. Two separate causes, both real
+bugs rather than capture flakiness, and both worth knowing because the symptom in each
+case was *a missing header* rather than anything that pointed at height:
+
+1. `present()` pinned the hosting view with `.frame(width:height:)`. A
+   `NavigationSplitView` given a hard frame lays out against a proposal it never receives
+   in the real app, and its sidebar comes back empty. The hosting view is now sized by the
+   window and autoresizes. This alone took `cockpit` from a blank 42KB frame to a full
+   160KB dashboard, and fixed `health` and `usage` too.
+2. `EmptyStateView` applied `.frame(maxHeight: .infinity)` and *then* `.padding(40)`.
+   Frame-then-padding makes a view report back more height than it was offered, so the
+   parent re-proposes the larger value and the height runs away — measured at 3040pt and
+   still climbing inside a 963pt pane. Padding now goes inside the frame.
+
+The lesson that generalizes: **a screen that resolves taller than its own pane does not
+just clip.** `NavigationSplitView` re-solves the whole window for it, and the casualty is
+whatever else shares the window — in this case the sidebar went blank on one tab and only
+that tab. If a screen has a greedy child, pin the screen to `GeometryReader`'s size, and
+measure with a geometry probe before theorising. Two `onChange(of: g.size)` probes found
+in one build what four rounds of guessing did not.

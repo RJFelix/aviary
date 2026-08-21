@@ -223,11 +223,17 @@ enum Snapshot {
         }
 
         func present<V: View>(_ view: V) {
-            // Pinned to the window's content size. Without an explicit frame the hosting
-            // view reports its content's natural size, the window grows to accommodate it,
-            // and the UI ends up laid out narrower than the frame it was captured in.
-            hosting.rootView = AnyView(
-                view.frame(width: size.width, height: size.height))
+            // The hosting view is sized by the window and resizes with it, rather than the
+            // content being pinned with `.frame(width:height:)`.
+            //
+            // The pinned version looked equivalent and was not: a `NavigationSplitView`
+            // given a hard frame lays out its sidebar against a proposal it never receives
+            // in the real app, and the sidebar comes back empty — which made five of nine
+            // screens capture as blank chrome and, worse, made the tool useless for
+            // diagnosing exactly the class of layout bug it exists to catch.
+            hosting.rootView = AnyView(view)
+            hosting.frame = CGRect(origin: .zero, size: size)
+            hosting.autoresizingMask = [.width, .height]
             hosting.needsLayout = true
             hosting.needsDisplay = true
         }
