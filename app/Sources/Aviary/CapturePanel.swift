@@ -31,12 +31,20 @@ struct CapturePanel: View {
 
     private var pill: some View {
         Button {
-            model.capturePanelOpen = true
+            // Capture happens first, so the shot is free of this panel. The pill shows a
+            // spinner for the few hundred milliseconds that takes rather than looking dead.
+            model.openCapturePanel()
             focus = .title
         } label: {
             HStack(spacing: 6) {
-                Image(systemName: "hammer.fill").font(.system(size: 10, weight: .semibold))
-                Text("Improve Aviary").font(.system(size: 11.5, weight: .medium))
+                if model.isCapturingShot {
+                    ProgressView().controlSize(.small).scaleEffect(0.6)
+                        .frame(width: 10, height: 10)
+                } else {
+                    Image(systemName: "hammer.fill").font(.system(size: 10, weight: .semibold))
+                }
+                Text(model.isCapturingShot ? "Capturing…" : "Improve Aviary")
+                    .font(.system(size: 11.5, weight: .medium))
                 if model.board.openCount > 0 {
                     Text("\(model.board.openCount)")
                         .font(.system(size: 9.5, weight: .bold, design: .rounded))
@@ -117,6 +125,7 @@ struct CapturePanel: View {
             Spacer(minLength: 6)
             Button {
                 model.capturePanelOpen = false
+                model.discardPendingCapture()
             } label: {
                 Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
             }
@@ -128,7 +137,9 @@ struct CapturePanel: View {
     /// The captured state, previewed before it is sent. Shown because a snapshot you cannot
     /// inspect is a snapshot you cannot trust — and this one goes into a git-tracked file.
     private var contextRow: some View {
-        let ctx = model.captureContext()
+        // The held snapshot, not a fresh reading — so the preview is exactly what will be
+        // filed rather than something that merely resembles it.
+        let ctx = model.pendingContext ?? model.captureContext()
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Button {
@@ -143,12 +154,21 @@ struct CapturePanel: View {
                 }
                 .buttonStyle(.plain).foregroundStyle(.secondary)
                 Spacer(minLength: 4)
-                Toggle(isOn: Binding(
-                    get: { model.draftIncludesShot }, set: { model.draftIncludesShot = $0 }))
-                {
-                    Text("Screenshot").font(.system(size: 10.5))
+                if model.pendingShot != nil {
+                    Toggle(isOn: Binding(
+                        get: { model.draftIncludesShot }, set: { model.draftIncludesShot = $0 }))
+                    {
+                        Text("Screenshot").font(.system(size: 10.5))
+                    }
+                    .toggleStyle(.checkbox).controlSize(.mini)
+                } else {
+                    // No image was captured — say so rather than offering a checkbox that
+                    // silently attaches nothing.
+                    Label("No screenshot", systemImage: "photo.badge.exclamationmark")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .help("The window could not be captured. The request will still be filed.")
                 }
-                .toggleStyle(.checkbox).controlSize(.mini)
             }
 
             if showContext {
@@ -185,6 +205,7 @@ struct CapturePanel: View {
             Button("Board") {
                 model.section = .workshop
                 model.capturePanelOpen = false
+                model.discardPendingCapture()
             }
             .controlSize(.small)
             Button(model.isSubmitting ? "Filing…" : "File it") {

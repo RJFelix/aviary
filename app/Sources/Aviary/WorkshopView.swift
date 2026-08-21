@@ -139,7 +139,7 @@ struct WorkshopView: View {
     private var agentControls: some View {
         HStack(spacing: 8) {
             Button {
-                model.capturePanelOpen = true
+                model.openCapturePanel()
             } label: {
                 Label("New request", systemImage: "plus")
             }

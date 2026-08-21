@@ -151,6 +151,13 @@ final class AppModel {
     var draftKind: WorkshopKind = .change
     var draftIncludesShot = true
     var isSubmitting = false
+    /// State captured the instant the panel was asked for, before it existed on screen.
+    ///
+    /// Held rather than re-read at submit time so the request describes what you were
+    /// looking at when you reached for the button — not the compose panel occluding it.
+    var pendingContext: WorkshopContext?
+    var pendingShot: Data?
+    var isCapturingShot = false
     /// The session dedicated to improving Aviary. Remembered across launches.
     var workshopSessionID: String? {
         didSet { UserDefaults.standard.set(workshopSessionID, forKey: "aviary.workshop.session") }

@@ -71,6 +71,25 @@ deliberately *not* a one-to-one mapping of session entries:
 The payoff: a message that just streamed in looks identical to the same message read back
 tomorrow. Any rendering improvement lands in both places at once.
 
+## Workshop capture ordering
+
+The screenshot attached to a request is taken when the compose panel is **asked for**, not
+when the request is filed. Filing-time capture puts the panel on top of the thing being
+reported, and the panel occupies the bottom-right corner of the window, which on this app is
+content rather than margin. Capturing first costs a few hundred milliseconds of latency on
+open — the pill shows a spinner for it — and buys an image that is purely what the person was
+looking at.
+
+The context facts are captured at the same moment for the same reason, and for one more: the
+preview in the panel is then exactly what will be filed rather than a fresh reading that
+could differ. Everything held that way is dropped when the panel is dismissed without
+filing, so a stale image can never be attached to a later request.
+
+Capture goes through ScreenCaptureKit rather than `cacheDisplay`, because AppKit vibrancy and
+material layers are composited by the WindowServer and never drawn by the view — a
+`cacheDisplay` shot loses the sidebar and the Sessions inspector entirely. `cacheDisplay`
+remains the fallback, so a refused Screen Recording grant costs fidelity, not the feature.
+
 ## Snapshot rendering
 
 `Aviary --snapshot <dir>` boots the model against the real agent directory, hosts `RootView`

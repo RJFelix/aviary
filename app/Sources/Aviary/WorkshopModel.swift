@@ -52,6 +52,44 @@ extension AppModel {
         return ("No workshop session yet", .secondary, false)
     }
 
+    // MARK: Opening the panel
+
+    /// Capture first, then show the composer.
+    ///
+    /// The order is the whole point. A screenshot taken at submit time contains the compose
+    /// panel sitting on top of the thing being reported, and the panel covers the
+    /// bottom-right corner of the window — which on this app is real content. Capturing
+    /// before the panel is added to the hierarchy costs a few hundred milliseconds of
+    /// latency on open and buys an image that is purely what you were looking at.
+    ///
+    /// The facts are captured here too, for the same reason and for one more: the preview in
+    /// the panel then shows exactly what will be filed, rather than a fresh reading that
+    /// could differ from it.
+    func openCapturePanel() {
+        guard !capturePanelOpen, !isCapturingShot else { return }
+        pendingContext = captureContext()
+        guard draftIncludesShot, let window = NSApp.keyWindow
+            ?? NSApp.windows.first(where: { $0.isVisible })
+        else {
+            capturePanelOpen = true
+            return
+        }
+        isCapturingShot = true
+        Task {
+            let data = await WindowShot.capture(window: window)
+            pendingShot = data
+            isCapturingShot = false
+            capturePanelOpen = true
+        }
+    }
+
+    /// Drop what was captured. Called when the panel is dismissed without filing, so a stale
+    /// image can never be attached to a later request.
+    func discardPendingCapture() {
+        pendingContext = nil
+        pendingShot = nil
+    }
+
     // MARK: Filing
 
     func submitRequest() {
@@ -69,10 +107,12 @@ extension AppModel {
 
         isSubmitting = true
         let id = Workshop.newID()
-        // The facts are read before the screenshot, so they describe the same instant even
-        // if the capture takes a moment.
-        var context = captureContext()
-        if draftIncludesShot, let name = await writeWindowShot(requestID: id, repoRoot: repoRoot) {
+        // Prefer what was captured when the panel opened. The fallback covers a panel opened
+        // by some path that did not go through `openCapturePanel`.
+        var context = pendingContext ?? captureContext()
+        if draftIncludesShot, let data = pendingShot,
+           let name = writeShot(data, requestID: id, repoRoot: repoRoot)
+        {
             context.screenshot = name
         }
 
@@ -94,6 +134,7 @@ extension AppModel {
 
         draftTitle = ""
         draftBody = ""
+        discardPendingCapture()
         refreshBoard()
         selectedRequestID = id
         capturePanelOpen = false
@@ -436,18 +477,12 @@ extension AppModel {
             .isEmpty ? "development build" : [v, b.map { "(\($0))" }].compactMap { $0 }.joined(separator: " ")
     }
 
-    /// Write the window to `workshop/shots/`, returning the name relative to the workshop
-    /// directory.
+    /// Write an already-captured image to `workshop/shots/`, returning the name relative to
+    /// the workshop directory.
     ///
-    /// See `WindowShot` for why this goes through the WindowServer rather than asking the
-    /// view to draw itself: vibrancy and material layers are composited, not drawn, and a
-    /// screenshot missing the sidebar and the inspector is a screenshot that misleads
-    /// whoever reads it. Failure returns nil and the request is filed without an image —
-    /// never blocked by one.
-    func writeWindowShot(requestID: String, repoRoot: URL) async -> String? {
-        guard let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible })
-        else { return nil }
-        guard let png = await WindowShot.capture(window: window) else { return nil }
+    /// The capture itself happened when the panel opened — see `openCapturePanel`. Failure
+    /// here returns nil and the request is filed without an image, never blocked by one.
+    func writeShot(_ png: Data, requestID: String, repoRoot: URL) -> String? {
         let dir = Workshop.shotsDirectory(repoRoot: repoRoot)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appending(path: "\(requestID).png")

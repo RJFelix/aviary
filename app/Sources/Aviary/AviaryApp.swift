@@ -63,7 +63,7 @@ struct AviaryCommands: Commands {
             Button("Command Palette…") { model.showCommandPalette = true }
                 .keyboardShortcut("k")
             Button("Improve Aviary…") {
-                model.capturePanelOpen = true
+                model.openCapturePanel()
             }
             .keyboardShortcut("i", modifiers: [.command, .shift])
             Divider()
