@@ -27,16 +27,21 @@ Events you write:
 {"v":1,"at":"...","event":"link","id":"wr-...","commit":"a1b2c3d"}
 ```
 
-Statuses: `open` → `claimed` (you have read it and intend to do it) → `building` (you are
-editing code) → `done`. Also `declined` (you will not do it — always say why in `note`) and
-`parked` (worth doing, not now).
+Statuses: `open` → `claimed` → `building` (you are editing code) → `done`. Also `declined`
+(you will not do it — always say why in `note`) and `parked` (worth doing, not now).
 
-Aviary writes `created` and `delivered` events. Do not write those.
+**Aviary writes `created`, `delivered`, `link`, and the first `claimed` for you** — handing a
+request to you is a state change it can see, so the card leaves the inbox the moment it
+reaches you. Do not write those. What is yours: **`building` as soon as you start editing**,
+then `done`, `declined` or `parked`. If you skip `building`, the board cannot distinguish
+"delivered and being worked" from "delivered and ignored", which is the one thing the person
+watching it wants to know.
 
 ## How to work a request
 
-1. **Append `status: claimed` first.** Before reading code. It is how the board stops showing
-   the request as untouched, and it costs one line.
+1. **Append `status: building` before you touch a file.** Aviary has already marked the
+   request claimed, so the useful signal from you is that work has actually started. One
+   line, written before the first edit, not after.
 2. **Read the context snapshot.** It records the tab, the selection, the counts, the daemon
    state, the window size, and usually a screenshot under `workshop/shots/<id>.png`. A GUI bug
    without that state is usually not reproducible; with it, it usually is. You can read the PNG
@@ -47,6 +52,9 @@ Aviary writes `created` and `delivered` events. Do not write those.
 4. **Fix it, then verify.** `just check` runs the test suite and compiles. Both must pass.
 5. **Append `status: done` with a note saying what you changed,** and a `link` event per
    commit if you committed.
+
+If a request is ambiguous, append a `note` with the question and leave the status at
+`claimed` — that reads as "waiting on Ryan" rather than as abandoned.
 
 ## What this codebase expects of you
 

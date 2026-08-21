@@ -140,18 +140,9 @@ extension AppModel {
         workshopRunID = runs.last?.id
         section = .workshop
 
-        // The session id only exists once the engine has answered `get_state`.
-        if let run = workshopRun {
-            for _ in 0..<40 where run.sessionID == nil {
-                try? await Task.sleep(nanoseconds: 250_000_000)
-            }
-            if let sid = run.sessionID {
-                workshopSessionID = sid
-                markDelivered(request.id, session: sid)
-            } else {
-                markDelivered(request.id, session: nil)
-            }
-        }
+        markDelivered(request.id, session: workshopRun?.sessionID)
+        let id = request.id
+        Task { await trackSession(for: id) }
         show(resume == nil
             ? "Opened a workshop session and sent \(request.id)."
             : "Resumed the workshop session and sent \(request.id).")
@@ -163,13 +154,52 @@ extension AppModel {
         Task { await deliver(request) }
     }
 
+    /// Record that a request reached an agent — and that it is therefore no longer waiting.
+    ///
+    /// Aviary writes the `claimed` status itself rather than waiting for the agent to do it.
+    /// Handing work to a live agent *is* a state change, and it is one Aviary observes
+    /// directly; leaving the card in the inbox until the agent volunteers an event means the
+    /// board contradicts the visibly-working session next to it. The agent still owns
+    /// `building`, `done` and `declined`, and any event it writes later supersedes this one.
     private func markDelivered(_ id: String, session: String?) {
         guard let repoRoot else { return }
         var fields: [String: JSONValue] = [:]
         if let session { fields["session"] = .string(session) }
         try? WorkshopLog.append(
             WorkshopEvent(event: "delivered", id: id, fields: fields), repoRoot: repoRoot)
+        try? WorkshopLog.append(
+            WorkshopEvent(event: "status", id: id, fields: [
+                "status": .string(WorkshopStatus.claimed.rawValue),
+                "note": .string("Handed to the workshop agent."),
+                "by": .string("aviary"),
+            ]),
+            repoRoot: repoRoot)
         refreshBoard()
+    }
+
+    /// Follow a freshly-launched run until the engine reports its session id, then link it.
+    ///
+    /// Separate from delivery on purpose. The id does not exist until the engine has booted
+    /// node, opened the kernel and answered `get_state`, which took longer than the ten
+    /// seconds delivery used to wait — so the first real request recorded no session at all
+    /// and the Receipts card had nothing to link. Blocking longer would have been the wrong
+    /// fix: the send has already happened, so this is bookkeeping and belongs off the path.
+    private func trackSession(for requestID: String) async {
+        guard let repoRoot else { return }
+        for _ in 0..<240 {
+            if let sid = workshopRun?.sessionID, !sid.isEmpty {
+                workshopSessionID = sid
+                try? WorkshopLog.append(
+                    WorkshopEvent(event: "link", id: requestID, fields: [
+                        "session": .string(sid),
+                    ]),
+                    repoRoot: repoRoot)
+                refreshBoard()
+                return
+            }
+            if workshopRun?.hasExited == true { return }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
     }
 
     /// Change a request's status from the board. Recorded as an event like any other, with

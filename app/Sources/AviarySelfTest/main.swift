@@ -540,4 +540,46 @@ await Harness.run([
         XCTAssertEqual(Fmt.relative(now.addingTimeInterval(-7200), now: now), "2h")
         XCTAssertEqual(Fmt.relative(now.addingTimeInterval(-172800), now: now), "2d")
     }),
+
+    ("workshop: an aviary-written claimed event moves the card out of the inbox", {
+        // Regression: the first real request sat in Inbox while a session visibly worked on
+        // it, because only the agent could change status. Delivery now records the hand-off.
+        let lines = [
+            #"{"event":"created","id":"a","at":"2026-08-21T10:00:00.000Z","title":"t","kind":"change"}"#,
+            #"{"event":"delivered","id":"a","at":"2026-08-21T10:00:05.000Z","session":"01a0-x"}"#,
+            #"{"event":"status","id":"a","at":"2026-08-21T10:00:05.100Z","status":"claimed","note":"Handed to the workshop agent.","by":"aviary"}"#,
+        ]
+        let board = WorkshopBoard(requests: WorkshopLog.fold(lines: lines))
+        XCTAssertEqual(board.openCount, 0, "no longer waiting")
+        XCTAssertEqual(board.workingCount, 1)
+        XCTAssertEqual(board.undeliveredCount, 0)
+        let r = try XCTUnwrap(board.requests.first)
+        XCTAssertTrue(r.delivered)
+        XCTAssertEqual(r.notes.first?.by, "aviary", "the hand-off is attributed, not anonymous")
+    }),
+
+    ("workshop: an agent status supersedes aviary's claim", {
+        let lines = [
+            #"{"event":"created","id":"a","at":"2026-08-21T10:00:00.000Z","title":"t","kind":"change"}"#,
+            #"{"event":"status","id":"a","at":"2026-08-21T10:00:05.000Z","status":"claimed","by":"aviary"}"#,
+            #"{"event":"status","id":"a","at":"2026-08-21T10:02:00.000Z","status":"building","note":"editing","by":"agent"}"#,
+            #"{"event":"status","id":"a","at":"2026-08-21T10:40:00.000Z","status":"done","note":"shipped","by":"agent"}"#,
+        ]
+        let r = try XCTUnwrap(WorkshopLog.fold(lines: lines).first)
+        XCTAssertEqual(r.status, .done)
+        XCTAssertEqual(r.notes.count, 2, "aviary's note had no text; both agent notes kept")
+    }),
+
+    ("workshop: a link event can carry the session id on its own", {
+        // The session id does not exist until the engine has booted, so it arrives after
+        // delivery rather than with it.
+        let lines = [
+            #"{"event":"created","id":"a","at":"2026-08-21T10:00:00.000Z","title":"t","kind":"change"}"#,
+            #"{"event":"delivered","id":"a","at":"2026-08-21T10:00:05.000Z"}"#,
+            #"{"event":"link","id":"a","at":"2026-08-21T10:00:40.000Z","session":"01a0-late"}"#,
+        ]
+        let r = try XCTUnwrap(WorkshopLog.fold(lines: lines).first)
+        XCTAssertTrue(r.delivered)
+        XCTAssertEqual(r.sessions, ["01a0-late"])
+    }),
 ])
