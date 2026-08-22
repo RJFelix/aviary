@@ -443,3 +443,57 @@ public actor RuntimeHost {
             features: features)
     }
 }
+
+/// A one-shot check that the in-house engine can actually run.
+///
+/// Exists because "no engine configured" was a diagnosable state for the harness and silence
+/// for Aviary's own runtime — and a runtime that fails at first use rather than at inspection
+/// is the same failure the harness's daemon-version conflict was: invisible until it costs you
+/// a run.
+public struct RuntimeProbe: Sendable {
+    public var variant: String
+    public var scriptPath: String
+    public var exists: Bool
+    public var capabilities: RuntimeHost.Capabilities?
+    public var error: String?
+
+    public var ok: Bool { capabilities != nil }
+
+    public var summary: String {
+        if let capabilities { return capabilities.summary }
+        if !exists { return "host script missing" }
+        return error ?? "did not start"
+    }
+
+    public static func probe(repoRoot: URL?, variant: String = "python3") async -> RuntimeProbe {
+        guard let repoRoot else {
+            return RuntimeProbe(
+                variant: variant, scriptPath: "—", exists: false, capabilities: nil,
+                error: "no Aviary checkout found")
+        }
+        let script = repoRoot.appending(path: "runtime-hosts/\(variant)/host.py")
+        guard FileManager.default.fileExists(atPath: script.path) else {
+            return RuntimeProbe(
+                variant: variant, scriptPath: script.path, exists: false, capabilities: nil,
+                error: "not present in this checkout")
+        }
+        let host = RuntimeHost(executable: "/usr/bin/env", arguments: ["python3", script.path])
+        do {
+            let capabilities = try await host.start(timeout: 15)
+            await host.stop()
+            return RuntimeProbe(
+                variant: variant, scriptPath: script.path, exists: true,
+                capabilities: capabilities, error: nil)
+        } catch {
+            let diagnostics = await host.diagnostics
+            await host.stop()
+            return RuntimeProbe(
+                variant: variant, scriptPath: script.path, exists: true, capabilities: nil,
+                // The host's own stderr, when there is any — a Python traceback says far more
+                // than "did not start".
+                error: diagnostics.isEmpty
+                    ? error.localizedDescription
+                    : String(diagnostics.suffix(400)))
+        }
+    }
+}

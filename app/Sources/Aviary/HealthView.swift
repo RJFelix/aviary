@@ -24,6 +24,7 @@ struct HealthView: View {
                     supervisorCard
                     processCard
                 }
+                runtimeCard
                 enginesCard
                 environmentCard
                 workersCard
@@ -226,6 +227,58 @@ struct HealthView: View {
             }
         }
         .frame(width: 380)
+    }
+
+    private var runtimeCard: some View {
+        Card("Aviary's own runtime", symbol: "cube.transparent",
+             accessory: AnyView(
+                Text(model.runtimeProbes.contains(where: \.ok) ? "ready" : "unavailable")
+                    .font(.system(size: 9))
+                    .foregroundStyle(model.runtimeProbes.contains(where: \.ok)
+                        ? Design.success : Design.warning)))
+        {
+            VStack(alignment: .leading, spacing: 9) {
+                if model.runtimeProbes.isEmpty {
+                    Text("Not checked yet.")
+                        .font(.system(size: 11)).foregroundStyle(.tertiary)
+                }
+                ForEach(model.runtimeProbes, id: \.variant) { probe in
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(probe.ok ? Design.success : Design.danger)
+                                .frame(width: 7, height: 7)
+                            Text(probe.variant)
+                                .font(.system(size: 11.5, weight: .medium))
+                            Text(probe.summary)
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(probe.ok ? AnyShapeStyle(.secondary) : AnyShapeStyle(Design.danger))
+                                .lineLimit(2)
+                            Spacer(minLength: 0)
+                        }
+                        if let capabilities = probe.capabilities {
+                            // One wrapping line of text rather than a row of chips: a chip row
+                            // cannot wrap, and eight of them overflow a 380pt column — which
+                            // does not clip, it stops the whole pane resolving and the screen
+                            // comes back blank. Same trap as the Workshop header.
+                            Text(capabilities.features.filter(\.value).keys.sorted()
+                                .joined(separator: " · "))
+                                .font(.system(size: 9.5))
+                                .foregroundStyle(Design.tool)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Text(probe.scriptPath)
+                            .font(Design.mono(9.5)).foregroundStyle(.tertiary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                }
+                Text("No daemon and no Node, so no version conflict. python3 isolates each "
+                    + "session in its own interpreter; python3-shared trades that for numpy "
+                    + "and pandas.")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private var enginesCard: some View {

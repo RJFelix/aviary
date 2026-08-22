@@ -115,6 +115,8 @@ final class AppModel {
     var providerTests: [String: ProviderTestResult] = [:]
     var testingProviders: Set<String> = []
     var library = Library()
+    /// Whether Aviary's own runtime can start, checked rather than assumed.
+    var runtimeProbes: [RuntimeProbe] = []
 
     // MARK: Analytics
 
@@ -220,7 +222,8 @@ final class AppModel {
         async let a: Void = refreshCatalog()
         async let b: Void = refreshDaemon()
         async let c: Void = refreshRuntimeModels()
-        _ = await (a, b, c)
+        async let d: Void = refreshRuntimeProbes()
+        _ = await (a, b, c, d)
         refreshLibrary()
     }
 
@@ -283,6 +286,16 @@ final class AppModel {
             runtimeModelsError = error.localizedDescription
             await session.stop()
         }
+    }
+
+    /// Check both bundled hosts. Cheap — each starts, answers, and exits.
+    func refreshRuntimeProbes() async {
+        let root = EngineLocator.repoRoot()
+        var found: [RuntimeProbe] = []
+        for variant in ["python3", "python3-shared"] {
+            found.append(await RuntimeProbe.probe(repoRoot: root, variant: variant))
+        }
+        runtimeProbes = found
     }
 
     func refreshLibrary() {
