@@ -38,7 +38,7 @@ enum WindowShot {
     // MARK: The good path
 
     @MainActor
-    private static func composited(window: NSWindow) async -> Data? {
+    static func composited(window: NSWindow) async -> Data? {
         let number = window.windowNumber
         guard number > 0 else { return nil }
         do {
@@ -49,7 +49,14 @@ enum WindowShot {
                 false, onScreenWindowsOnly: true)
             guard let target = content.windows.first(where: {
                 $0.windowID == CGWindowID(number)
-            }) else { return nil }
+            }) else {
+                if ProcessInfo.processInfo.environment["AVIARY_CAPTURE_DEBUG"] != nil {
+                    let ids = content.windows.map { "\($0.windowID)" }.joined(separator: ",")
+                    FileHandle.standardError.write(
+                        Data("window \(number) not shareable; saw [\(ids)]\n".utf8))
+                }
+                return nil
+            }
 
             let scale = window.backingScaleFactor
             let config = SCStreamConfiguration()
@@ -66,6 +73,9 @@ enum WindowShot {
                 contentFilter: filter, configuration: config)
             return png(from: image)
         } catch {
+            if ProcessInfo.processInfo.environment["AVIARY_CAPTURE_DEBUG"] != nil {
+                FileHandle.standardError.write(Data("capture failed: \(error)\n".utf8))
+            }
             return nil
         }
     }

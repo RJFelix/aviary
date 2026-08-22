@@ -44,6 +44,11 @@ what it does; this file is how to work on it without relearning the traps.
   `status: current` while refusing every real command. `DaemonInspector` cross-checks with a
   `list` call, which goes through the ownership assertion. `doctor --fix` deliberately skips
   this case; only `shutdown --force` clears it.
+- **A blank snapshot is a capture-path bug before it is a view bug.** Captures go through
+  ScreenCaptureKit because `cacheDisplay` only sees NSView drawing, and most SwiftUI
+  content — every chart, every material — is layer-only. A screen that looks fine in the
+  app and blank in a shot is almost never the screen. Confirm the Screen Recording grant
+  first; a refused grant silently drops to the `cacheDisplay` fallback.
 - **Anything perpetually animated must check `\.staticRendering`.** A `repeatForever`
   animation or an endless `.task` loop is fine on screen and a problem for the snapshot
   renderer. `PulseDot` and `StreamingIndicator` are the existing examples.

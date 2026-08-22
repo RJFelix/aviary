@@ -335,37 +335,60 @@ remains the fallback, so a refused Screen Recording grant costs fidelity, not th
 ## Snapshot rendering
 
 `Aviary --snapshot <dir>` boots the model against the real agent directory, hosts `RootView`
-in an `NSWindow`, and writes a PNG per screen via `cacheDisplay`. `ImageRenderer` cannot do
+in an `NSWindow`, and writes a PNG per screen via ScreenCaptureKit. `ImageRenderer` cannot do
 this job — it refuses `NavigationSplitView` and draws SwiftUI's "unsupported" glyph.
+
+Capture asks the WindowServer for the composited window, the same way the Workshop's own
+capture does and for the same reason. It did not always: it used `cacheDisplay`, and
+`cacheDisplay` captures *NSView drawing* only, while most SwiftUI content lives in CALayers
+with no backing NSView. The symptom was that cockpit, live, usage and health came out blank
+while sessions, library, flock, models and workshop rendered — and the dividing line was
+whether the detail pane held a `List`, which is AppKit-backed and therefore does draw. The
+tell was a class histogram of the captured view tree: the screens that worked had 34-45
+`ListTableRowView`s, the blank ones had only the 12 sidebar rows. Their content was never
+missing; it was never an NSView. Swift Charts, being pure layer content, never appeared at
+all.
+
+Two things fall out of that fix. The window is raised with `.floating` and the app activated,
+because `SCShareableContent` is queried with `onScreenWindowsOnly: true` and will not capture
+a window it cannot see. And `cacheDisplay` stays as the fallback for a machine without a
+Screen Recording grant, where it renders AppKit-backed content and nothing else — a degraded
+shot rather than no tool.
 
 Known limits, both in the capture path rather than the app:
 
-- AppKit vibrancy materials do not rasterize, so the sidebar column comes out white.
 - The window does not draw reliably until it has been through a couple of section
   transitions, so every screen is rendered twice and only the second pass is written.
   Longer settle times do not help; forcing a rebuild with `.id()` makes it worse.
-- The sidebar is **always white** in a capture, on every screen: AppKit vibrancy does not
-  rasterize. It is never evidence of anything. A real sidebar bug cannot be seen here at
-  all — it has to be reproduced by hosting `SidebarView` on its own, which does render.
+- Without a Screen Recording grant the fallback path applies, and there the old limits
+  return in full: the sidebar comes out white, vibrancy is absent, and layer-only content
+  including every chart is missing. If a shot looks like that, check the grant before
+  believing anything it shows.
 - Read colours in `--bare` with suspicion: bare mode has no window background, so
-  light-on-light text is an artifact of that, not a contrast bug. Flat black where a
-  background is explicitly set is the same class.
+  light-on-light text is an artifact of that, not a contrast bug.
 
 ### The greedy-child trap (2026-08-21)
 
-Four screens used to capture as identical blank frames. Two separate causes, both real
-bugs rather than capture flakiness, and both worth knowing because the symptom in each
-case was *a missing header* rather than anything that pointed at height:
+Screens used to capture as identical blank frames, and the cause turned out to be three
+separate things stacked on each other. Two were real layout bugs — worth knowing because
+the symptom in each case was *a missing header* rather than anything that pointed at
+height — and the third was the capture instrument itself:
 
 1. `present()` pinned the hosting view with `.frame(width:height:)`. A
    `NavigationSplitView` given a hard frame lays out against a proposal it never receives
    in the real app, and its sidebar comes back empty. The hosting view is now sized by the
-   window and autoresizes. This alone took `cockpit` from a blank 42KB frame to a full
-   160KB dashboard, and fixed `health` and `usage` too.
+   window and autoresizes. This fixed the empty sidebar, and re-pinning reproduces it, so
+   the fix is load-bearing — but it did **not** fix the blank frames. `cockpit`, `live`,
+   `usage` and `health` stayed blank for two more rounds of investigation, which is worth
+   recording: a real fix that changes the symptom you happen to be looking at is easily
+   mistaken for the fix.
 2. `EmptyStateView` applied `.frame(maxHeight: .infinity)` and *then* `.padding(40)`.
    Frame-then-padding makes a view report back more height than it was offered, so the
    parent re-proposes the larger value and the height runs away — measured at 3040pt and
    still climbing inside a 963pt pane. Padding now goes inside the frame.
+3. `cacheDisplay` could not see layer-only content at all (above). This was the actual
+   cause of the four blank frames, and it was the last thing checked because the two real
+   bugs above made a layout explanation look overwhelmingly likely.
 
 The lesson that generalizes: **a screen that resolves taller than its own pane does not
 just clip.** `NavigationSplitView` re-solves the whole window for it, and the casualty is

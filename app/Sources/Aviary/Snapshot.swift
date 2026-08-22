@@ -121,7 +121,7 @@ enum Snapshot {
         stage.present(Color(nsColor: .windowBackgroundColor))
         for _ in 0..<4 {
             try? await Task.sleep(nanoseconds: 500_000_000)
-            _ = stage.capture()
+            stage.forceDraw()
         }
 
         let sections = Section.allCases.filter { only == nil || $0.rawValue == only }
@@ -144,12 +144,12 @@ enum Snapshot {
                 // SwiftUI needs run-loop turns to lay out and draw; the caller is pumping
                 // the main run loop, so sleeping here yields to it.
                 try? await Task.sleep(nanoseconds: 900_000_000)
-                _ = stage.capture()
+                stage.forceDraw()
                 try? await Task.sleep(nanoseconds: 500_000_000)
 
                 guard pass == 2 else { continue }
                 let url = outDir.appending(path: "\(section.rawValue).png")
-                if let png = stage.capture(), (try? png.write(to: url)) != nil {
+                if let png = await stage.capture(), (try? png.write(to: url)) != nil {
                     log("wrote \(url.lastPathComponent) (\(Fmt.bytes(png.count)))")
                 } else {
                     log("FAILED \(section.rawValue)")
@@ -219,7 +219,17 @@ enum Snapshot {
             window.ignoresMouseEvents = true
             window.collectionBehavior = [.transient, .ignoresCycle]
             window.center()
+            // Raised above other windows and the app activated so the window is genuinely
+            // on screen: `SCShareableContent` is queried with `onScreenWindowsOnly: true`,
+            // and a window it cannot see is a window it will not capture.
+            //
+            // Occlusion is *not* why frames came back blank — that theory was tested and
+            // falsified (a standalone probe rendered a ScrollView in a NavigationSplitView
+            // fine while occluded). The real cause was the capture instrument; see
+            // `capture()`.
+            window.level = .floating
             window.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
         }
 
         func present<V: View>(_ view: V) {
@@ -238,7 +248,35 @@ enum Snapshot {
             hosting.needsDisplay = true
         }
 
-        func capture() -> Data? {
+        /// The composited window, via the WindowServer.
+        ///
+        /// `cacheDisplay` was the wrong instrument and it took three attempts to see why: it
+        /// captures *NSView drawing*, and most SwiftUI content lives in CALayers with no
+        /// backing NSView. Measured — the screens that rendered all had 34-45
+        /// `ListTableRowView`s (a List in the detail pane, which is AppKit-backed and does
+        /// draw), while the blank ones had only the 12 sidebar rows and nothing else. Their
+        /// content was never missing; it was never an NSView.
+        ///
+        /// Asking the WindowServer fixes that, and the two documented artifacts with it:
+        /// vibrancy materials and explicitly-set backgrounds now composite properly, so the
+        /// sidebar is no longer white and an inspector column no longer flat black.
+        /// Nudge AppKit into a real draw pass without paying for a capture.
+        ///
+        /// The warm-up exists because SwiftUI settles over several frames, not because
+        /// anyone wants the bytes. `cacheDisplay` is the cheap way to demand a draw.
+        func forceDraw() {
+            guard let view = window.contentView else { return }
+            view.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                view.cacheDisplay(in: view.bounds, to: rep)
+            }
+        }
+
+        func capture() async -> Data? {
+            if let composited = await WindowShot.composited(window: window) { return composited }
+            // Kept as a fallback for a machine without a Screen Recording grant: it renders
+            // AppKit-backed content, which is better than nothing and is what this used to do.
             guard let view = window.contentView else { return nil }
             view.layoutSubtreeIfNeeded()
             window.displayIfNeeded()
