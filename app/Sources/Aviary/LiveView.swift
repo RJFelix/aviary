@@ -502,29 +502,49 @@ struct LauncherSheet: View {
                     Card("Engine", symbol: "cpu") {
                         VStack(alignment: .leading, spacing: 8) {
                             Picker("", selection: Binding(
-                                get: { model.preferInHouseEngine },
-                                set: { model.preferInHouseEngine = $0 }))
+                                get: { model.engineChoice },
+                                set: { model.engineChoice = $0 }))
                             {
-                                Text("Harness (Prime Agent)").tag(false)
-                                Text("In-house (Aviary)").tag(true)
+                                ForEach(AppModel.Engine.allCases) { Text($0.label).tag($0) }
                             }
                             .pickerStyle(.segmented).labelsHidden()
-                            Text(model.preferInHouseEngine
-                                ? "Aviary's own agent loop, provider client and Python runtime "
-                                    + "host. No harness process and no Node. Skills are ranked "
-                                    + "against your prompt rather than all sent, and the "
-                                    + "transcript is written in the same format so every other "
-                                    + "screen still reads it. Follow-ups continue in the same "
-                                    + "interpreter, so variables persist between prompts. "
-                                    + "Steering, payload recording and resuming a session all "
-                                    + "work; the daemon, kernel list and reachable-model "
-                                    + "catalogue still come from the harness."
-                                : "The vendored Prime Agent harness over its RPC protocol. "
-                                    + "Still the default, and still what the daemon, kernel "
-                                    + "list and reachable-model catalogue are read from.")
+                            Text(engineExplanation)
                                 .font(.system(size: 10))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
+
+                            if model.engineChoice == .claudeCode {
+                                Divider().opacity(0.5)
+                                // Claude Code's own aliases rather than model ids, because
+                                // that is what its `--model` takes.
+                                Picker("Model", selection: Binding(
+                                    get: { model.claudeCodeModel },
+                                    set: { model.claudeCodeModel = $0 }))
+                                {
+                                    ForEach(["sonnet", "opus", "haiku"], id: \.self) {
+                                        Text($0).tag($0)
+                                    }
+                                }
+                                if let auth = model.claudeCodeAuth {
+                                    HStack(spacing: 6) {
+                                        Circle()
+                                            .fill(auth.isSubscription
+                                                ? Design.success : Design.warning)
+                                            .frame(width: 6, height: 6)
+                                        Text(auth.isSubscription
+                                            ? "\(auth.summary) — draws on the plan"
+                                            : "\(auth.summary) — bills metered API credit")
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                } else {
+                                    Text("No `claude` binary found, or it is not signed in. "
+                                        + "Install Claude Code and run `claude /login`.")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(Design.warning)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
                         }
                         .controlSize(.small)
                     }
@@ -571,7 +591,18 @@ struct LauncherSheet: View {
                 }
                 Spacer()
                 Button {
-                    if model.preferInHouseEngine {
+                    if model.engineChoice == .claudeCode {
+                        model.startClaudeCodeRun(
+                            cwd: cwd.isEmpty ? model.defaultCwd : cwd,
+                            model: model.claudeCodeModel,
+                            // "off" is the picker's no-reasoning value; Claude Code has no such
+                            // level, so it is expressed by omitting the flag entirely.
+                            effort: thinking == "off" ? nil : thinking,
+                            prompt: prompt)
+                        dismiss()
+                        return
+                    }
+                    if model.engineChoice == .inHouse {
                         model.startInHouseRun(
                             cwd: cwd.isEmpty ? model.defaultCwd : cwd,
                             providerID: provider.isEmpty ? nil : provider,
@@ -598,7 +629,7 @@ struct LauncherSheet: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.engine == nil && !model.preferInHouseEngine)
+                .disabled(model.engine == nil && model.engineChoice == .harness)
             }
             .padding(14)
         }
@@ -612,6 +643,33 @@ struct LauncherSheet: View {
                 modelID = model.settings.defaultModel ?? modelsForProvider.first?.id ?? ""
             }
             thinking = model.settings.defaultThinkingLevel ?? "high"
+        }
+    }
+
+    /// What each engine actually is, in the terms that matter when choosing one.
+    ///
+    /// The third entry is a different kind of thing from the first two and the text says so:
+    /// the first two are Aviary's loop over a provider, and the third is somebody else's loop
+    /// over Aviary's kernel. Hiding that behind a neutral label would make the picker lie.
+    private var engineExplanation: String {
+        switch model.engineChoice {
+        case .inHouse:
+            return "Aviary's own agent loop, provider client and Python runtime host. No "
+                + "harness process and no Node. Skills are ranked against your prompt rather "
+                + "than all sent, and the transcript is written in the same format so every "
+                + "other screen still reads it. Follow-ups continue in the same interpreter, "
+                + "so variables persist between prompts. Steering, payload recording and "
+                + "resuming a session all work."
+        case .harness:
+            return "The vendored Prime Agent harness over its RPC protocol. Still the "
+                + "default, and still what the daemon and kernel list are read from."
+        case .claudeCode:
+            return "Claude Code drives, and Aviary's kernel is the only tool it gets — its "
+                + "loop, its history, its stopping decision; your interpreter, your skills, "
+                + "your memory. Tokens come out of the Claude plan rather than metered API "
+                + "credit, which is the point. What you give up: steering, sub-agents, model "
+                + "switching mid-run, and resuming an Aviary session, because the "
+                + "conversation belongs to Claude Code and it will not accept a prepared one."
         }
     }
 
@@ -712,6 +770,10 @@ struct RunInspector: View {
 
                 if let driver = run.inHouse {
                     ScheduleCard(driver: driver)
+                }
+
+                if let driver = run.claudeCode {
+                    ClaudeCodeRunCard(driver: driver)
                 }
 
                 Card("Tokens", symbol: "number") {
@@ -939,6 +1001,67 @@ private struct ScheduleCard: View {
                         .disabled(prompt.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
                     .controlSize(.mini)
+                }
+            }
+        }
+    }
+}
+
+/// What is only true of a driven run.
+///
+/// Two facts earn a card of their own. Which allowance the run is spending is the entire
+/// economic premise of this session type, and it comes from Claude Code rather than from
+/// anything Aviary can compute — so it is reported, never inferred. And Claude Code's own
+/// session id is what `claude --resume` takes, which is the only way to reopen this
+/// conversation with its history intact.
+private struct ClaudeCodeRunCard: View {
+    var driver: ClaudeCodeDriver
+
+    var body: some View {
+        Card("Claude Code", symbol: "wand.and.stars") {
+            VStack(alignment: .leading, spacing: 7) {
+                if let limit = driver.rateLimit {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(limit.usingOverage ? Design.warning : Design.success)
+                            .frame(width: 6, height: 6)
+                        Text(limit.summary)
+                            .font(.system(size: 11))
+                            .foregroundStyle(limit.usingOverage ? Design.warning : .secondary)
+                        Spacer()
+                        if let resets = limit.resetsAt {
+                            Text("resets \(Fmt.relative(resets))")
+                                .font(Design.numeric(10)).foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+                if let auth = driver.authSummary {
+                    DetailRow(label: "Login", value: auth)
+                }
+                if let id = driver.claudeSessionID {
+                    DetailRow(label: "Claude session", value: id, mono: true)
+                    Text("`claude --resume \(id)` reopens this conversation in Claude Code "
+                        + "itself, with the history Aviary cannot replay.")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let runtime = driver.runtimeSummary {
+                    DetailRow(label: "Kernel", value: runtime, mono: true)
+                }
+                if let skills = driver.skillsNote {
+                    DetailRow(label: "Skills", value: skills)
+                }
+                if let memory = driver.memoryNote {
+                    DetailRow(label: "Memory", value: memory)
+                }
+                ForEach(Array(driver.warnings.enumerated()), id: \.offset) { _, warning in
+                    HStack(alignment: .top, spacing: 5) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9)).foregroundStyle(Design.warning)
+                        Text(warning)
+                            .font(.system(size: 10)).foregroundStyle(Design.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
         }

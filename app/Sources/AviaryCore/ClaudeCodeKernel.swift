@@ -1,0 +1,217 @@
+import Foundation
+
+/// Aviary's kernel, packaged as the one tool a driven Claude Code gets.
+///
+/// This is where the design earns its keep. Claude Code brings the loop; everything that makes
+/// an Aviary session worth more than a chat window lives *inside* the interpreter — persistent
+/// variables, a shell whose working directory survives, the skill modules, `remember`. None of
+/// that is in the agent loop, so none of it is lost by letting somebody else drive.
+public actor ClaudeCodeKernel {
+
+    private let host: RuntimeHost
+    private let hostSession: String
+    private let memory: MemoryStore?
+    private let sessionFile: URL
+    private let sessionID: String
+    /// The first prompt of the run, recorded as provenance on anything remembered — "why does
+    /// it believe that?" is unanswerable without it.
+    private var firstPrompt: String?
+    private var onOutput: (@Sendable (String) -> Void)?
+
+    public init(
+        host: RuntimeHost, hostSession: String, memory: MemoryStore?,
+        sessionFile: URL, sessionID: String
+    ) {
+        self.host = host
+        self.hostSession = hostSession
+        self.memory = memory
+        self.sessionFile = sessionFile
+        self.sessionID = sessionID
+    }
+
+    public func noteFirstPrompt(_ prompt: String) {
+        if firstPrompt == nil { firstPrompt = prompt }
+    }
+
+    /// Streaming kernel output, for a UI that wants to watch a long cell run.
+    public func onOutput(_ handler: (@Sendable (String) -> Void)?) {
+        onOutput = handler
+    }
+
+    /// The tool to hand to `KernelBridge`.
+    public func tool() -> KernelBridge.Tool {
+        KernelBridge.Tool(
+            name: "python",
+            // Deliberately the same description the in-house agent gets, minus `spawn`. Two
+            // engines describing the same kernel differently would make a transcript's meaning
+            // depend on which one wrote it.
+            description: Self.description(cwd: cwdHint, hasMemory: memory != nil),
+            schema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "code": .object([
+                        "type": .string("string"),
+                        "description": .string("Python source to execute."),
+                    ]),
+                ]),
+                "required": .array([.string("code")]),
+            ])
+        ) { [weak self] arguments in
+            guard let self else {
+                return ("Aviary is no longer running this session.", true)
+            }
+            return await self.run(arguments: arguments)
+        }
+    }
+
+    private var cwdHint = FileManager.default.currentDirectoryPath
+
+    public func setCwdHint(_ cwd: String) { cwdHint = cwd }
+
+    private func run(arguments: JSONValue) async -> (text: String, isError: Bool) {
+        guard let code = arguments["code"]?.stringValue, !code.isEmpty else {
+            return ("The `code` argument is required and must not be empty.", true)
+        }
+        do {
+            let result = try await host.execute(code, in: hostSession)
+            // The same rendering the in-house agent sees, so a transcript reads identically
+            // whichever engine produced it.
+            return (Agent.render(result), result.failed)
+        } catch {
+            // A host failure is *the machinery* breaking, not agent code raising — and saying
+            // so matters, because the model's correct response differs: retrying is right for
+            // a traceback and pointless for a dead interpreter.
+            return ("The Aviary runtime host failed to run this: "
+                + error.localizedDescription, true)
+        }
+    }
+
+    /// Serve a callback from inside the kernel — `remember`, `recall`, `conversation`.
+    ///
+    /// The same verbs the in-house engine serves, with one honest gap: `spawn` needs an
+    /// `AgentRunner` to build a child agent, and a driven session has no runner. Refused with
+    /// a reason rather than silently absent, because agent code that calls `spawn()` and hangs
+    /// is worse than agent code that is told no.
+    public func serveCallback(kind: String, payload: JSONValue) async -> JSONValue {
+        switch kind {
+        case "remember":
+            guard let memory else {
+                return .object(["error": .string("This run has no memory store.")])
+            }
+            let text = (payload["text"]?.stringValue ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                return .object(["error": .string("remember() needs some text.")])
+            }
+            let scope = MemoryScope(rawValue: payload["scope"]?.stringValue ?? "project")
+                ?? .project
+            var expiresAt: Date?
+            if let days = payload["days"]?.intValue, days > 0 {
+                expiresAt = Date().addingTimeInterval(Double(days) * 86_400)
+            }
+            let entry = MemoryEntry(
+                id: MemoryStore.newID(), scope: scope, text: text,
+                tags: (payload["tags"]?.arrayValue ?? []).compactMap { $0.stringValue },
+                createdAt: Date(), updatedAt: Date(), expiresAt: expiresAt,
+                sessionID: sessionID, provenance: firstPrompt)
+            do {
+                try memory.append(entry, sessionID: sessionID)
+                return .object(["id": .string(entry.id), "scope": .string(scope.rawValue)])
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+
+        case "recall":
+            guard let memory else {
+                return .object(["error": .string("This run has no memory store.")])
+            }
+            let query = payload["query"]?.stringValue ?? ""
+            let all = memory.load(sessionID: sessionID)
+            let terms = SkillGate.terms(in: query)
+            let hits = terms.isEmpty ? all : all.filter { entry in
+                let haystack = SkillGate.terms(
+                    in: entry.text + " " + entry.tags.joined(separator: " "))
+                return !terms.intersection(haystack).isEmpty
+            }
+            return .object(["memories": .array(hits.prefix(20).map { entry in
+                .object([
+                    "id": .string(entry.id),
+                    "text": .string(entry.text),
+                    "scope": .string(entry.scope.rawValue),
+                    "tags": .array(entry.tags.map { .string($0) }),
+                ])
+            })])
+
+        case "conversation":
+            // Read back out of the transcript Aviary is writing, rather than out of a message
+            // list — a driven run has no message list, because the history is Claude Code's.
+            // Going through the file means `conversation()` shows the agent exactly what a
+            // person reading the session would see.
+            let limit = max(1, payload["limit"]?.intValue ?? 40)
+            guard let transcript = SessionParser.parse(fileURL: sessionFile) else {
+                return .object(["messages": .array([])])
+            }
+            let turns = transcript.items.filter {
+                $0.kind == .user || $0.kind == .assistant
+            }.suffix(limit)
+            return .object(["messages": .array(turns.map { item in
+                .object([
+                    "role": .string(item.kind == .user ? "user" : "assistant"),
+                    "text": .string(item.plainText),
+                    "toolCalls": .array(item.blocks.compactMap { block in
+                        if case .toolCall(let call) = block { return .string(call.name) }
+                        return nil
+                    }),
+                ])
+            })])
+
+        case "spawn":
+            return .object(["error": .string(
+                "Sub-agents are not available in a Claude-Code-driven session — spawning "
+                    + "builds an Aviary agent, and this session's loop is Claude Code's. Do "
+                    + "the work here, or start an in-house run for it.")])
+
+        default:
+            return .object(["error": .string("Aviary does not serve \(kind) requests.")])
+        }
+    }
+
+    /// What the model is told the tool does.
+    static func description(cwd: String, hasMemory: Bool) -> String {
+        var text = """
+            Run Python in a persistent interpreter. Variables, imports and open handles \
+            survive between calls, so build up state instead of repeating work.
+
+            Available without importing anything:
+              sh(command)  – run a shell command. The working directory and environment \
+            persist across calls, so `sh('cd subdir')` then `sh('pwd')` does what you \
+            expect. Returns {'stdout', 'stderr', 'status'}.
+              cwd()        – the current working directory.
+              conversation(limit=40) – this conversation so far, as a list of \
+            {'role', 'text', 'toolCalls'}. Use it to check what you already tried instead of \
+            re-deriving it.
+            """
+        if hasMemory {
+            text += """
+
+
+                  remember(text, scope='project', days=None, tags=[]) – record something you \
+                will want next time. Scopes: 'session' (this task only), 'project' (about this \
+                codebase — the usual choice), 'global' (true everywhere — rare). Pass `days` \
+                unless it will be true indefinitely.
+                  recall(query) – search what you recorded before.
+
+                Record what cost you effort to discover and would cost the same again: a \
+                non-obvious command, a constraint the code does not state, a dead end worth \
+                not repeating. Not things the repository already says clearly.
+                """
+        }
+        text += """
+
+
+            The value of a trailing expression is echoed back, so ending a cell with a bare \
+            name shows it. Starting directory: \(cwd)
+            """
+        return text
+    }
+}

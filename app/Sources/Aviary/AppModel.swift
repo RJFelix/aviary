@@ -131,12 +131,64 @@ final class AppModel {
     // MARK: Runs
 
     var runs: [LiveRun] = []
-    /// Which engine a new run uses. Remembered, because it is a preference rather than a
-    /// per-run decision once you have picked a side.
-    var preferInHouseEngine: Bool = UserDefaults.standard.bool(forKey: "aviary.inHouseEngine") {
-        didSet { UserDefaults.standard.set(preferInHouseEngine, forKey: "aviary.inHouseEngine") }
+
+    /// Which engine a new run uses.
+    ///
+    /// Three, not two, and the third is a different kind of thing from the first two. Harness
+    /// and in-house are both *Aviary's loop over a provider*; Claude Code is somebody else's
+    /// loop over Aviary's kernel. Modelling that as a third choice in the same picker is
+    /// honest — it is the decision you actually make when starting a run — as long as the
+    /// picker says what the difference is.
+    enum Engine: String, CaseIterable, Identifiable {
+        case harness
+        case inHouse
+        case claudeCode
+
+        public var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .harness: return "Harness"
+            case .inHouse: return "In-house"
+            case .claudeCode: return "Claude Code"
+            }
+        }
     }
+
+    /// Remembered, because it is a preference rather than a per-run decision once you have
+    /// picked a side.
+    ///
+    /// Stored under a new key rather than migrating the old boolean: somebody who had the
+    /// in-house engine selected keeps it, because `Engine(rawValue:)` falls back through the
+    /// old flag when the new key is absent.
+    var engineChoice: Engine = {
+        // `aviary.engineChoice`, not `aviary.engine` — that key is already taken by the
+        // remembered engine *path*, and writing this over it would leave `bootstrap()` unable
+        // to match the saved engine and silently falling back to the first one discovered.
+        if let raw = UserDefaults.standard.string(forKey: "aviary.engineChoice"),
+           let choice = Engine(rawValue: raw) {
+            return choice
+        }
+        return UserDefaults.standard.bool(forKey: "aviary.inHouseEngine") ? .inHouse : .harness
+    }() {
+        didSet { UserDefaults.standard.set(engineChoice.rawValue, forKey: "aviary.engineChoice") }
+    }
+
+    /// Kept as a derived value so the several places that only care "is this the harness or
+    /// not" need no change. A Claude-Code run is not the harness either.
+    var preferInHouseEngine: Bool { engineChoice != .harness }
     var focusedRunID: UUID?
+    /// Which Claude model a driven run asks for. An alias rather than a full id, because that
+    /// is what Claude Code's `--model` takes and what its own docs use.
+    var claudeCodeModel: String = UserDefaults.standard.string(forKey: "aviary.claudeCodeModel")
+        ?? "sonnet"
+    {
+        didSet { UserDefaults.standard.set(claudeCodeModel, forKey: "aviary.claudeCodeModel") }
+    }
+    /// Claude Code's login, read once at bootstrap. Nil until checked, and nil also means "no
+    /// binary found" — which is a different fact from "not signed in", so `Auth.loggedIn`
+    /// carries that one.
+    var claudeCodeAuth: ClaudeCode.Auth?
 
     // MARK: UI state
 
@@ -216,6 +268,10 @@ final class AppModel {
         modelsConfig = .load(home: home, auth: auth)
 
         wireIndex = WireLog.buildIndex()
+
+        // Read once here rather than per-run: it shells out to `claude auth status`, and the
+        // engine picker needs it before a run exists to ask.
+        claudeCodeAuth = await ClaudeCode.authStatus()
 
         repoRoot = EngineLocator.repoRoot()
         workshopSessionID = UserDefaults.standard.string(forKey: "aviary.workshop.session")
@@ -559,6 +615,24 @@ final class AppModel {
         run.startInHouse(prompt: prompt)
     }
 
+    /// Start a Claude-Code-driven run: Claude Code's loop, Aviary's kernel as its only tool.
+    ///
+    /// No provider or model resolution, because there is no provider here — Claude Code holds
+    /// the credential and picks the route. The model is a Claude Code alias (`sonnet`, `opus`,
+    /// `haiku`), which is why it is a plain string rather than a `ModelSpec`.
+    func startClaudeCodeRun(
+        cwd: String, model: String, effort: String?, prompt: String, title: String? = nil
+    ) {
+        let run = LiveRun(
+            claudeCode: ClaudeCodeDriver(home: home, cwd: cwd, model: model, effort: effort),
+            cwd: cwd, modelLabel: "claude-code/\(model)")
+        if let title { run.title = title }
+        runs.append(run)
+        focusedRunID = run.id
+        section = .live
+        run.startClaudeCode(prompt: prompt)
+    }
+
     /// Continue an existing session on whichever engine is selected.
     ///
     /// One entry point for all three "Continue" affordances, so the engine picker governs
@@ -566,7 +640,19 @@ final class AppModel {
     /// resume was harness-only regardless of what the picker said.
     func continueSession(_ s: SessionSummary, recordPayloads: Bool = false) {
         let cwd = s.cwd.isEmpty ? defaultCwd : s.cwd
-        if preferInHouseEngine {
+        if engineChoice == .claudeCode {
+            // Claude Code holds its own history and will not accept a prepared one, so
+            // "continue" here means a new driven session in the same directory rather than a
+            // resumed conversation. Said out loud rather than silently doing something else.
+            toast = Toast(
+                message: "Claude Code keeps its own history, so this starts a fresh driven "
+                    + "session in the same directory.",
+                isError: false)
+            startClaudeCodeRun(
+                cwd: cwd, model: claudeCodeModel, effort: nil, prompt: "", title: s.title)
+            return
+        }
+        if engineChoice == .inHouse {
             startInHouseRun(
                 cwd: cwd, providerID: s.provider, modelID: s.model, prompt: "",
                 recordPayloads: recordPayloads, resume: s.id, title: s.title)
@@ -671,6 +757,10 @@ final class LiveRun: Identifiable {
     private(set) var inHouse: InHouseDriver?
     var isInHouse: Bool { inHouse != nil }
 
+    /// Set when Claude Code is driving this run instead of Aviary.
+    private(set) var claudeCode: ClaudeCodeDriver?
+    var isClaudeCode: Bool { claudeCode != nil }
+
     init(inHouse driver: InHouseDriver, cwd: String, modelLabel: String) {
         self.engine = EngineLocation(
             kind: .fork, path: "aviary", version: "in-house",
@@ -679,6 +769,38 @@ final class LiveRun: Identifiable {
         self.inHouse = driver
         self.modelLabel = modelLabel
         self.title = "New run"
+    }
+
+    init(claudeCode driver: ClaudeCodeDriver, cwd: String, modelLabel: String) {
+        self.engine = EngineLocation(
+            kind: .fork, path: "claude", version: "driven",
+            note: "Claude Code, with Aviary's kernel as its tool")
+        self.config = RunConfiguration(cwd: cwd)
+        self.claudeCode = driver
+        self.modelLabel = modelLabel
+        self.title = "New run"
+    }
+
+    func startClaudeCode(prompt: String) {
+        guard let claudeCode else { return }
+        if !prompt.isEmpty { title = String(prompt.prefix(60)) }
+        claudeCode.start(prompt: prompt)
+        // Mirrored onto this run exactly as the in-house driver is, so every view that reads
+        // `items`, `isStreaming` and `usage` keeps working without knowing which engine — the
+        // same reason all three write one transcript format.
+        mirror = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                self.items = claudeCode.items
+                self.isStreaming = claudeCode.isStreaming
+                self.hasExited = claudeCode.hasExited
+                self.usage = claudeCode.usage
+                self.sessionID = claudeCode.sessionID
+                self.sessionFile = claudeCode.sessionFile?.path
+                self.errorBanner = claudeCode.errorBanner
+                if claudeCode.hasExited { break }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
     }
 
     func startInHouse(prompt: String) {
@@ -836,6 +958,26 @@ final class LiveRun: Identifiable {
 
     func send(_ text: String) async {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        if let claudeCode {
+            guard claudeCode.acceptsFollowUps else {
+                builder.appendNote("The run is still starting — try again in a moment.")
+                sync()
+                return
+            }
+            // No steering. Claude Code owns the turn boundary and will not take an injection
+            // mid-turn, so a message sent now would either be lost or arrive as a second
+            // conversation. Refusing plainly beats a queue that quietly reorders the session.
+            guard !claudeCode.isStreaming else {
+                builder.appendNote(
+                    "Claude Code is mid-turn, and it does not accept steering — the turn "
+                        + "boundary is its own. Wait for it to finish.")
+                sync()
+                return
+            }
+            if title == "New run" { title = String(text.prefix(60)) }
+            claudeCode.send(text)
+            return
+        }
         if let inHouse {
             guard inHouse.acceptsFollowUps else {
                 builder.appendNote("The run is still starting — try again in a moment.")
@@ -879,6 +1021,7 @@ final class LiveRun: Identifiable {
     }
 
     func abort() {
+        if let claudeCode { claudeCode.stop(); return }
         if let inHouse { inHouse.stop(); return }
         Task { await session.abort() }
     }
@@ -918,6 +1061,11 @@ final class LiveRun: Identifiable {
 
     func stop() async {
         mirror?.cancel()
+        if let claudeCode {
+            claudeCode.stop()
+            hasExited = true
+            return
+        }
         if let inHouse {
             inHouse.stop()
             hasExited = true

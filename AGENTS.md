@@ -56,6 +56,18 @@ what it does; this file is how to work on it without relearning the traps.
   completely misses a changed parser. Bump `SessionCatalog.schemaVersion` when you change
   how a summary is derived, or your improvement silently does nothing for every session
   already indexed.
+- **`input_tokens` from Anthropic excludes cached context.** A cached turn reads
+  `input 2, cacheRead 3953`, so summing input and output undercounts a long session by a
+  factor of fifty. `ClaudeCode.usage` is cache-inclusive; `AnthropicMessagesProvider` is not,
+  and that is a known bug rather than a convention worth copying.
+- **Anything that spawns `claude` must scrub the environment first.** `ANTHROPIC_API_KEY` and
+  friends outrank subscription OAuth silently, so the run works and bills metered credit —
+  a failure with no symptom. And Aviary is developed from inside Claude Code, so a child
+  inherits `CLAUDE_CODE_SESSION_ID` and the parent's messaging socket unless you strip them.
+  Use `ClaudeCode.scrubbedEnvironment`, and check `apiKeySource: "none"` in the init frame.
+- **Never resolve `claude` off `PATH` alone.** A terminal multiplexer or IDE integration
+  commonly puts a shim there under `/var/folders/…/T/`, scoped to the session that made it.
+  `ClaudeCode.locate` checks real install paths first and filters temp-dir shims.
 - **Swift 5 language mode is deliberate** (`swiftSettings: [.swiftLanguageMode(.v5)]`).
   Strict concurrency checking on AppKit-adjacent code buys errors, not safety, at this stage.
 
@@ -66,6 +78,13 @@ just test     # core suite
 just compile  # both targets build
 just shots    # every screen renders, against your real agent directory
 ```
+
+Both non-harness engines have a terminal entry point, and using them is how you verify a
+change without clicking: `Aviary --agent "<prompt>"` for the in-house engine, and
+`Aviary --claude-code "<prompt>"` for a driven one. The driven path shares
+`ClaudeCodeSession.prepare` with the GUI, so the CLI genuinely exercises what a window does.
+`AVIARY_CLAUDE_RAW=<file>` dumps every stream-json frame, which is the only way to settle a
+question about that stream's shape — inference about it has been wrong twice.
 
 Look at the PNGs. `just shots` prints what it indexed — session count, sub-agent count,
 reachable models, daemon health — so a change that quietly breaks data loading shows up in

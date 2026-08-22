@@ -37,6 +37,12 @@ shot section *FLAGS:
     mkdir -p {{build_dir}}/shots
     "{{app_dir}}/.build/release/Aviary" --snapshot {{build_dir}}/shots --only {{section}} --width 1600 --height 1000 {{FLAGS}}
 
+# One driven Claude Code session in a terminal. `just drive "count the swift files"`
+# Shares ClaudeCodeSession.prepare with the GUI, so this exercises the same path a window does.
+drive prompt *FLAGS:
+    cd {{app_dir}} && swift build --product Aviary
+    "{{app_dir}}/.build/debug/Aviary" --claude-code {{quote(prompt)}} {{FLAGS}}
+
 # Install dependencies and build the forked harness (the execution engine)
 build-engine:
     cd harness && npm install && npm run build

@@ -3422,6 +3422,453 @@ await Harness.run([
         XCTAssertEqual(MarkdownParser.blocks(from: "   \n  \n"), [])
     }),
 
+
+    // MARK: Claude Code driving
+
+    ("claude-code: a per-session shim is not mistaken for an install", {
+        // A terminal multiplexer or IDE integration commonly puts a shim on PATH under
+        // /var/folders. Resolving to one gives a path that works today and is gone tomorrow,
+        // so `locate()` filters them and this is the predicate that does it.
+        XCTAssertTrue(ClaudeCode.isEphemeral(
+            "/var/folders/2r/673rpyjj/T/cmux-cli-shims/666DD599/claude"))
+        XCTAssertTrue(ClaudeCode.isEphemeral("/private/var/folders/x/T/shim/claude"))
+        XCTAssertTrue(ClaudeCode.isEphemeral("/tmp/claude"))
+        XCTAssertFalse(ClaudeCode.isEphemeral("/opt/homebrew/bin/claude"))
+        XCTAssertFalse(ClaudeCode.isEphemeral("/usr/local/bin/claude"))
+        XCTAssertFalse(ClaudeCode.isEphemeral(
+            NSString(string: "~/.claude/local/claude").expandingTildeInPath))
+    }),
+
+    ("claude-code: the environment scrub removes what outranks the subscription", {
+        let base = [
+            "ANTHROPIC_API_KEY": "sk-ant-leaked",
+            "ANTHROPIC_AUTH_TOKEN": "t",
+            "ANTHROPIC_BASE_URL": "http://elsewhere",
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "CLAUDECODE": "1",
+            "CLAUDE_CODE_SESSION_ID": "parent-session",
+            "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/cc.sock",
+            "CLAUDE_CODE_OAUTH_TOKEN": "keep-me",
+            "PATH": "/usr/bin",
+            "HOME": "/Users/somebody",
+        ]
+        let env = ClaudeCode.scrubbedEnvironment(base: base)
+        // The whole point: an API key silently outranks subscription OAuth, so a driven run
+        // would bill metered credit while every visible sign said it worked.
+        XCTAssertNil(env["ANTHROPIC_API_KEY"])
+        XCTAssertNil(env["ANTHROPIC_AUTH_TOKEN"])
+        XCTAssertNil(env["ANTHROPIC_BASE_URL"])
+        XCTAssertNil(env["CLAUDE_CODE_USE_BEDROCK"])
+        // A parent Claude Code session's own state must not be inherited: Aviary is developed
+        // from inside Claude Code, so these are routinely present.
+        XCTAssertNil(env["CLAUDECODE"])
+        XCTAssertNil(env["CLAUDE_CODE_SESSION_ID"])
+        XCTAssertNil(env["CLAUDE_CODE_MESSAGING_SOCKET"])
+        // Kept: it is the documented way to authenticate a headless subscription session, so
+        // somebody who set one meant it.
+        XCTAssertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "keep-me")
+        XCTAssertEqual(env["HOME"], "/Users/somebody")
+        XCTAssertEqual(env["PATH"], "/usr/bin")
+        // An empty PATH gets a usable one rather than being left to fail obscurely.
+        XCTAssertFalse(ClaudeCode.scrubbedEnvironment(base: ["PATH": ""])["PATH"]!.isEmpty)
+        XCTAssertEqual(
+            ClaudeCode.scrubbedEnvironment(base: [:], adding: ["X": "1"])["X"], "1")
+    }),
+
+    ("claude-code: the invocation carries the flags that make it cheap, and not --bare", {
+        let invocation = ClaudeCode.Invocation(
+            model: "sonnet", cwd: "/tmp", systemPrompt: "You are Aviary.",
+            mcpServers: .object(["aviary": .object(["command": .string("/bin/x")])]),
+            allowedTools: ["mcp__aviary__python", "mcp__aviary__other"],
+            effort: "high", resume: "sid-1")
+        let args = invocation.arguments
+        func flag(_ name: String) -> String? {
+            guard let i = args.firstIndex(of: name), i + 1 < args.count else { return nil }
+            return args[i + 1]
+        }
+        // These three together are the difference between 286 input tokens and 80–106k: the
+        // developer's own CLAUDE.md, plugins, skills and MCP connectors being read in.
+        XCTAssertTrue(args.contains("--strict-mcp-config"))
+        XCTAssertEqual(flag("--setting-sources"), "")
+        XCTAssertTrue(args.contains("--disable-slash-commands"))
+        XCTAssertEqual(flag("--tools"), "", "the built-in tool set must be emptied")
+        // The documented mode for scripted runs is exactly the one that drops subscription
+        // auth, which is the whole reason this session type exists.
+        XCTAssertFalse(args.contains("--bare"))
+        XCTAssertEqual(flag("--model"), "sonnet")
+        XCTAssertEqual(flag("--system-prompt"), "You are Aviary.")
+        XCTAssertEqual(flag("--output-format"), "stream-json")
+        XCTAssertEqual(flag("--input-format"), "stream-json")
+        XCTAssertTrue(args.contains("--include-partial-messages"),
+                      "thinking text only arrives as deltas")
+        XCTAssertEqual(flag("--effort"), "high")
+        XCTAssertEqual(flag("--resume"), "sid-1")
+        // Comma-joined, not space-separated: --allowedTools is variadic and would swallow
+        // whatever came next.
+        XCTAssertEqual(flag("--allowedTools"), "mcp__aviary__python,mcp__aviary__other")
+        let config = try XCTUnwrap(flag("--mcp-config"))
+        XCTAssertTrue(config.contains("mcpServers"))
+        XCTAssertTrue(config.contains("aviary"))
+        // No servers means no flag at all, rather than an empty object Claude Code has to
+        // interpret.
+        let bare = ClaudeCode.Invocation(model: "haiku", cwd: "/tmp", systemPrompt: "x")
+        XCTAssertFalse(bare.arguments.contains("--mcp-config"))
+        XCTAssertFalse(bare.arguments.contains("--allowedTools"))
+    }),
+
+    ("claude-code: the init frame decodes, and reports what the run actually got", {
+        let line = """
+            {"type":"system","subtype":"init","cwd":"/repo","session_id":"abc-123",\
+            "tools":["mcp__aviary__python"],"mcp_servers":[{"name":"aviary","status":"connected"}],\
+            "model":"claude-sonnet-5","apiKeySource":"none","claude_code_version":"2.1.234"}
+            """.replacingOccurrences(of: "\\\n", with: "")
+        guard case .initialized(let info) = try XCTUnwrap(
+            ClaudeCode.decode(line: Data(line.utf8))) else {
+            XCTFail("expected an init frame"); return
+        }
+        XCTAssertEqual(info.sessionID, "abc-123")
+        XCTAssertEqual(info.model, "claude-sonnet-5")
+        XCTAssertEqual(info.apiKeySource, "none")
+        XCTAssertEqual(info.version, "2.1.234")
+        XCTAssertEqual(info.cwd, "/repo")
+        XCTAssertEqual(info.mcpServers.first?.status, "connected")
+        // A clean strip-down complains about nothing.
+        XCTAssertNil(info.complaint(expecting: ["mcp__aviary__python"]))
+    }),
+
+    ("claude-code: init complains about a leaked key, a missing tool, and extra tools", {
+        func frame(tools: [String], apiKeySource: String, servers: String = "[]")
+            -> ClaudeCode.Frame.Init
+        {
+            let json = "{\"type\":\"system\",\"subtype\":\"init\",\"tools\":["
+                + tools.map { "\"\($0)\"" }.joined(separator: ",")
+                + "],\"mcp_servers\":\(servers),\"apiKeySource\":\"\(apiKeySource)\"}"
+            guard case .initialized(let info) = ClaudeCode.decode(line: Data(json.utf8))! else {
+                fatalError("not an init frame")
+            }
+            return info
+        }
+        // Checked against the run's own report rather than the flags passed, because a hook has
+        // been observed firing even with --setting-sources "".
+        let leaked = frame(tools: ["mcp__aviary__python"], apiKeySource: "ANTHROPIC_API_KEY")
+        XCTAssertTrue(try XCTUnwrap(leaked.complaint(expecting: ["mcp__aviary__python"]))
+            .contains("metered"))
+        let missing = frame(tools: [], apiKeySource: "none")
+        let complaint = try XCTUnwrap(missing.complaint(expecting: ["mcp__aviary__python"]))
+        XCTAssertTrue(complaint.contains("mcp__aviary__python"))
+        XCTAssertTrue(complaint.contains("No MCP server connected"))
+        // A server that connected but offered nothing is a different diagnosis, so it says so.
+        let noTools = frame(
+            tools: [], apiKeySource: "none",
+            servers: "[{\"name\":\"aviary\",\"status\":\"failed\"}]")
+        XCTAssertTrue(try XCTUnwrap(noTools.complaint(expecting: ["mcp__aviary__python"]))
+            .contains("aviary (failed)"))
+        // Built-ins leaking back in is the other direction of the same failure.
+        let extra = frame(tools: ["mcp__aviary__python", "Bash"], apiKeySource: "none")
+        XCTAssertTrue(try XCTUnwrap(extra.complaint(expecting: ["mcp__aviary__python"]))
+            .contains("Bash"))
+    }),
+
+    ("claude-code: assistant frames are per-block, so a turn needs assembling", {
+        // Measured, not assumed: two frames share one message id and carry one block each.
+        // Writing each as its own transcript entry would split one reply into three.
+        let thinking = #"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"thinking","thinking":"weighing it up"}]}}"#
+        let text = #"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"text","text":"the answer"}],"stop_reason":"end_turn"}}"#
+        let call = #"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_9","name":"mcp__aviary__python","input":{"code":"1+1"}}]}}"#
+
+        guard case .assistantBlock(let id1, let b1, _) =
+            try XCTUnwrap(ClaudeCode.decode(line: Data(thinking.utf8))),
+              case .thinking(let thought) = b1 else { XCTFail("thinking"); return }
+        XCTAssertEqual(id1, "msg_1")
+        XCTAssertEqual(thought, "weighing it up")
+
+        guard case .assistantBlock(let id2, let b2, let stop) =
+            try XCTUnwrap(ClaudeCode.decode(line: Data(text.utf8))),
+              case .text(let body) = b2 else { XCTFail("text"); return }
+        XCTAssertEqual(id2, id1, "the same message id across blocks is the whole problem")
+        XCTAssertEqual(body, "the answer")
+        XCTAssertEqual(stop, "end_turn")
+
+        guard case .assistantBlock(_, let b3, _) =
+            try XCTUnwrap(ClaudeCode.decode(line: Data(call.utf8))),
+              case .toolCall(let callID, let name, let arguments) = b3 else {
+            XCTFail("tool call"); return
+        }
+        XCTAssertEqual(callID, "toolu_9")
+        XCTAssertEqual(name, "mcp__aviary__python")
+        XCTAssertEqual(arguments["code"]?.stringValue, "1+1")
+    }),
+
+    ("claude-code: the finished token counts come from message_delta, not the block frames", {
+        // The `assistant` frames carry the message_start snapshot, whose output_tokens is a
+        // stub and which has no output_tokens_details at all. Captured from a live run: the two
+        // message_deltas summed exactly to the result frame's 6840/137/61.
+        let delta = #"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":3345,"cache_creation_input_tokens":11,"cache_read_input_tokens":22,"output_tokens":97,"output_tokens_details":{"thinking_tokens":33}}}}"#
+        guard case .messageDone(let usage, let stop) =
+            try XCTUnwrap(ClaudeCode.decode(line: Data(delta.utf8))) else {
+            XCTFail("expected messageDone"); return
+        }
+        let u = try XCTUnwrap(usage)
+        XCTAssertEqual(u.input, 3345)
+        XCTAssertEqual(u.output, 97)
+        XCTAssertEqual(u.cacheWrite, 11)
+        XCTAssertEqual(u.cacheRead, 22)
+        XCTAssertEqual(u.reasoning, 33)
+        // Cache-inclusive. Claude Code caches hard and Anthropic reports cached context
+        // outside input_tokens, so summing input and output only would report 83 tokens for a
+        // turn that really processed about four thousand.
+        XCTAssertEqual(u.totalTokens, 3345 + 97 + 22 + 11)
+        XCTAssertEqual(stop, "tool_use")
+        // A route that says nothing about reasoning leaves it nil, which is not zero.
+        let quiet = #"{"type":"stream_event","event":{"type":"message_delta","delta":{},"usage":{"input_tokens":5,"output_tokens":6}}}"#
+        guard case .messageDone(let plain, _) =
+            try XCTUnwrap(ClaudeCode.decode(line: Data(quiet.utf8))) else {
+            XCTFail("expected messageDone"); return
+        }
+        XCTAssertNil(try XCTUnwrap(plain).reasoning)
+        // Cost stays zero: a subscription run's tokens were never billed at list price, and
+        // total_cost_usd in the stream is documented as a client-side estimate.
+        XCTAssertEqual(try XCTUnwrap(plain).cost.total, 0)
+    }),
+
+    ("claude-code: text and thinking deltas both carry content", {
+        let text = #"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}}"#
+        guard case .textDelta(let t) = try XCTUnwrap(
+            ClaudeCode.decode(line: Data(text.utf8))) else { XCTFail("text"); return }
+        XCTAssertEqual(t, "hello")
+        // The research this was built on concluded thinking comes back empty in `-p`. That is
+        // true of the *complete* block on some routes; the deltas carry the real text, which is
+        // why --include-partial-messages is not optional here.
+        let think = #"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me count"}}}"#
+        guard case .thinkingDelta(let th) = try XCTUnwrap(
+            ClaudeCode.decode(line: Data(think.utf8))) else { XCTFail("thinking"); return }
+        XCTAssertEqual(th, "let me count")
+        // A half-parsed argument object, which is what a tool call's arguments look like on
+        // the wire before the block completes.
+        let partial = #"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"co"}}}"#
+        guard case .toolArgumentsDelta(let p) = try XCTUnwrap(
+            ClaudeCode.decode(line: Data(partial.utf8))) else { XCTFail("args"); return }
+        XCTAssertEqual(p, #"{"co"#)
+    }),
+
+    ("claude-code: a tool result is read back off the user frame", {
+        // The call is executed on Aviary's side but the *result message* is composed on Claude
+        // Code's, so this echo is the only place a driven run can see what its own tool
+        // returned.
+        let line = #"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_9","is_error":false,"content":[{"type":"text","text":"4"}]}]}}"#
+        guard case .toolResult(let id, let text, let isError) = try XCTUnwrap(
+            ClaudeCode.decode(line: Data(line.utf8))) else { XCTFail("tool result"); return }
+        XCTAssertEqual(id, "toolu_9")
+        XCTAssertEqual(text, "4")
+        XCTAssertFalse(isError)
+        let failed = #"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":[{"type":"text","text":"boom"}]}]}}"#
+        guard case .toolResult(_, _, let bad) = try XCTUnwrap(
+            ClaudeCode.decode(line: Data(failed.utf8))) else { XCTFail("error result"); return }
+        XCTAssertTrue(bad)
+    }),
+
+    ("claude-code: the rate-limit frame says plan or extra usage", {
+        // The single most important thing this session type can report, so it is a decoded
+        // field rather than something inferred from a cost estimate.
+        let plan = #"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1787445000,"rateLimitType":"five_hour","isUsingOverage":false}}"#
+        guard case .rateLimit(let limit) = try XCTUnwrap(
+            ClaudeCode.decode(line: Data(plan.utf8))) else { XCTFail("rate limit"); return }
+        XCTAssertEqual(limit.type, "five_hour")
+        XCTAssertFalse(limit.usingOverage)
+        XCTAssertTrue(limit.summary.contains("plan usage"))
+        XCTAssertEqual(limit.resetsAt, Date(timeIntervalSince1970: 1_787_445_000))
+        let overage = #"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","isUsingOverage":true}}"#
+        guard case .rateLimit(let over) = try XCTUnwrap(
+            ClaudeCode.decode(line: Data(overage.utf8))) else { XCTFail("overage"); return }
+        XCTAssertTrue(over.usingOverage)
+        XCTAssertTrue(over.summary.contains("extra usage"))
+    }),
+
+    ("claude-code: the result frame carries denials, and retries name auth trouble", {
+        let line = #"{"type":"result","subtype":"success","session_id":"s1","is_error":false,"result":"done","num_turns":3,"duration_ms":1983,"permission_denials":[{"tool_name":"Bash"}],"usage":{"input_tokens":6840,"output_tokens":137,"output_tokens_details":{"thinking_tokens":61}}}"#
+        guard case .result(let result) = try XCTUnwrap(
+            ClaudeCode.decode(line: Data(line.utf8))) else { XCTFail("result"); return }
+        XCTAssertEqual(result.sessionID, "s1")
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(result.text, "done")
+        XCTAssertEqual(result.turns, 3)
+        XCTAssertEqual(result.durationMS, 1983)
+        XCTAssertEqual(result.usage.input, 6840)
+        XCTAssertEqual(result.usage.reasoning, 61)
+        // A denial matters because Claude Code then answers *around* the refusal rather than
+        // stopping, which reads like a working run that quietly did less.
+        XCTAssertEqual(result.permissionDenials, ["Bash"])
+        // Auth failure is machine-detectable mid-run rather than a mysterious stall.
+        let retry = #"{"type":"system","subtype":"api_retry","error":{"category":"authentication_failed","message":"login expired"}}"#
+        guard case .retry(let category, let detail) = try XCTUnwrap(
+            ClaudeCode.decode(line: Data(retry.utf8))) else { XCTFail("retry"); return }
+        XCTAssertEqual(category, "authentication_failed")
+        XCTAssertEqual(detail, "login expired")
+        // A retry frame whose field names this version does not recognise still has to say
+        // something usable, so the whole frame becomes the detail. A banner reading
+        // "retrying: unknown" reports trouble while withholding the actionable part — which is
+        // exactly what an earlier version did on a real run.
+        let strange = #"{"type":"system","subtype":"api_retry","attempt":2,"delayMs":500}"#
+        guard case .retry(let blank, let raw) = try XCTUnwrap(
+            ClaudeCode.decode(line: Data(strange.utf8))) else { XCTFail("retry"); return }
+        XCTAssertTrue(blank.isEmpty)
+        XCTAssertTrue(raw.contains("attempt"))
+        XCTAssertTrue(raw.contains("delayMs"))
+    }),
+
+    ("claude-code: frames this version does not model are named, not dropped", {
+        // Counted rather than ignored, so a Claude Code release that starts saying something
+        // new shows up as a number instead of as absence. These are the ones a real run emits.
+        for (line, expected) in [
+            (#"{"type":"system","subtype":"status","status":"requesting"}"#, "system/status"),
+            (#"{"type":"stream_event","event":{"type":"message_stop"}}"#, "event/message_stop"),
+            (#"{"type":"stream_event","event":{"type":"content_block_start","index":0}}"#,
+             "event/content_block_start"),
+            (#"{"type":"nonsense"}"#, "nonsense"),
+        ] {
+            guard case .other(let type) = try XCTUnwrap(
+                ClaudeCode.decode(line: Data(line.utf8))) else {
+                XCTFail("expected other for \(expected)"); continue
+            }
+            XCTAssertEqual(type, expected)
+        }
+        // Not JSON at all is nil rather than a protocol error: the CLI does occasionally write
+        // unstructured text to stdout, and ending a run over that would be absurd.
+        XCTAssertNil(ClaudeCode.decode(line: Data("Warning: something\n".utf8)))
+    }),
+
+    ("claude-code: MCP namespacing is stripped before anything is recorded", {
+        // The mcp__<server>__ prefix is MCP's namespacing, not part of the tool. Leaving it in
+        // would make a driven run's transcript disagree with an in-house one about the name of
+        // the same tool.
+        XCTAssertEqual(ClaudeCodeRun.display(tool: "mcp__aviary__python"), "python")
+        XCTAssertEqual(ClaudeCodeRun.display(tool: "python"), "python")
+        XCTAssertEqual(ClaudeCodeRun.display(tool: "mcp__srv__odd__name"), "odd__name")
+        XCTAssertEqual(ClaudeCodeRun.display(tool: "mcp__broken"), "mcp__broken")
+        // And the run offers exactly one tool, because the kernel can already do anything a
+        // file-editing tool could.
+        XCTAssertEqual(ClaudeCodeRun.toolNames, ["mcp__aviary__python"])
+    }),
+
+    ("claude-code: a driven run is recorded as its own provider, with no prices", {
+        let spec = ClaudeCodeRun.modelSpec(for: "sonnet")
+        // Not "anthropic": which client Anthropic sees is exactly what decides whether the
+        // tokens came out of the plan or out of metered credit.
+        XCTAssertEqual(spec.providerID, "claude-code")
+        XCTAssertEqual(spec.id, "sonnet")
+        XCTAssertEqual(spec.qualifiedID, "claude-code/sonnet")
+        XCTAssertEqual(spec.contextWindow, 1_000_000)
+        XCTAssertTrue(spec.reasoning)
+        // No rates, so `sessionsWithoutPricing` keeps meaning "no rates published" rather than
+        // "cost zero" — which is the true thing to say about a subscription run.
+        XCTAssertNil(spec.costInput)
+        XCTAssertNil(spec.costOutput)
+        XCTAssertEqual(spec.priced(Usage()).cost.total, 0)
+        XCTAssertEqual(ClaudeCodeRun.modelSpec(for: "haiku").contextWindow, 200_000)
+        XCTAssertNil(ClaudeCodeRun.modelSpec(for: "some-future-model").contextWindow)
+    }),
+
+    ("claude-code: auth tells a subscription apart from a key", {
+        var auth = ClaudeCode.Auth(
+            loggedIn: true, method: "claude.ai", apiProvider: "firstParty",
+            email: "x@y.com", organization: "Duckbill", subscription: "team")
+        XCTAssertTrue(auth.isSubscription)
+        XCTAssertEqual(auth.summary, "Team · Duckbill")
+        // An API-key login is a working login that bills differently, which is the distinction
+        // the whole session type turns on.
+        auth.method = "apiKey"
+        auth.subscription = nil
+        XCTAssertFalse(auth.isSubscription)
+        auth.loggedIn = false
+        XCTAssertEqual(auth.summary, "Not signed in")
+        XCTAssertFalse(auth.isSubscription)
+    }),
+
+    ("claude-code: the kernel is described identically to the in-house one, minus spawn", {
+        // Two engines describing the same kernel differently would make a transcript's meaning
+        // depend on which one wrote it, so this is an invariant worth pinning.
+        let driven = ClaudeCodeKernel.description(cwd: "/repo", hasMemory: true)
+        let inHouse = try XCTUnwrap(Agent.tools(cwd: "/repo", hasMemory: true).first).description
+        XCTAssertEqual(driven, inHouse)
+        // Without memory, both drop the same paragraph.
+        XCTAssertEqual(
+            ClaudeCodeKernel.description(cwd: "/repo", hasMemory: false),
+            try XCTUnwrap(Agent.tools(cwd: "/repo", hasMemory: false).first).description)
+        XCTAssertFalse(driven.contains("spawn("), "a driven session has no runner to spawn with")
+        XCTAssertTrue(driven.contains("remember("))
+        XCTAssertTrue(driven.contains("/repo"))
+    }),
+
+    ("claude-code: the bridge serves an authenticated courier and refuses everybody else", {
+        // A local integration test rather than a mock: the thing worth testing is that a token
+        // is actually required, and a fake transport would test the mock instead.
+        let bridge = KernelBridge()
+        await bridge.offer([KernelBridge.Tool(
+            name: "python",
+            description: "Run Python.",
+            schema: .object(["type": .string("object")])
+        ) { arguments in
+            let code = arguments["code"]?.stringValue ?? ""
+            return code == "fail" ? ("boom", true) : ("ran: " + code, false)
+        }])
+        let endpoint = try await bridge.start()
+        defer { Task { await bridge.stop() } }
+        XCTAssertTrue(endpoint.port > 0)
+        XCTAssertEqual(endpoint.environment["AVIARY_BRIDGE_PORT"], String(endpoint.port))
+        XCTAssertEqual(endpoint.environment["AVIARY_BRIDGE_TOKEN"]?.count, 48)
+
+        // A wrong token gets nothing. This is the property that keeps a port running arbitrary
+        // Python out of reach of every other process on the machine.
+        let intruder = try BridgeTestClient(port: endpoint.port)
+        XCTAssertNil(intruder.request(["op": .string("hello"), "token": .string("wrong")])?["ok"])
+        // And an unauthenticated connection cannot skip straight to a call.
+        let sneak = try BridgeTestClient(port: endpoint.port)
+        XCTAssertNotNil(sneak.request([
+            "op": .string("call"), "name": .string("python"),
+            "arguments": .object(["code": .string("1")]),
+        ])?["error"])
+
+        let client = try BridgeTestClient(port: endpoint.port)
+        XCTAssertEqual(
+            client.request(["op": .string("hello"), "token": .string(endpoint.token)])?["ok"],
+            .bool(true))
+        let listed = try XCTUnwrap(
+            client.request(["op": .string("tools")])?["tools"]?.arrayValue)
+        XCTAssertEqual(listed.count, 1)
+        XCTAssertEqual(listed[0]["name"]?.stringValue, "python")
+        // `inputSchema`, which is the key MCP's tools/list uses — the courier forwards this
+        // object verbatim, so the name has to be right here.
+        XCTAssertNotNil(listed[0]["inputSchema"])
+
+        let ran = try XCTUnwrap(client.request([
+            "op": .string("call"), "name": .string("python"),
+            "arguments": .object(["code": .string("2+2")]),
+        ]))
+        XCTAssertEqual(ran["text"]?.stringValue, "ran: 2+2")
+        XCTAssertEqual(ran["isError"]?.boolValue, false)
+        // A tool that fails is a result, not a transport error.
+        let failed = try XCTUnwrap(client.request([
+            "op": .string("call"), "name": .string("python"),
+            "arguments": .object(["code": .string("fail")]),
+        ]))
+        XCTAssertEqual(failed["isError"]?.boolValue, true)
+        // An unknown tool is answered rather than dropped, so the model reads a reason instead
+        // of waiting out a timeout.
+        let unknown = try XCTUnwrap(client.request([
+            "op": .string("call"), "name": .string("nope"), "arguments": .object([:]),
+        ]))
+        XCTAssertEqual(unknown["isError"]?.boolValue, true)
+        XCTAssertTrue(try XCTUnwrap(unknown["text"]?.stringValue).contains("No such tool"))
+
+        // Two served calls; the unknown-tool attempt is counted separately, because "the model
+        // called the kernel twice" and "the model asked for a tool that is not there" are
+        // different diagnoses.
+        XCTAssertEqual(await bridge.calls, 2)
+        XCTAssertEqual(await bridge.unknownToolCalls, 1)
+        XCTAssertEqual(await bridge.connections, 1)
+        XCTAssertEqual(await bridge.rejectedConnections, 1)
+    }),
+
     ("codex: the built-in model catalogue matches the harness's", {
         // Transcribed, not invented: a model id this client sends that no known harness sends
         // is an anomaly.

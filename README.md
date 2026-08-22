@@ -39,8 +39,8 @@ uses, so one login serves both.
 
 Flags: `--cwd <path>`, `--host python3-shared` (for numpy/pandas), `--record` (capture request
 payloads), `--budget <tokens>` and `--minutes <n>` (a goal the agent can see and plan against),
-`--quiet`. A prompt starting with `/name` expands a prompt template. In the GUI, the Live tab's launcher picks between the in-house engine and
-the vendored harness.
+`--quiet`. A prompt starting with `/name` expands a prompt template. In the GUI, the Live tab's
+launcher picks between the in-house engine, the vendored harness, and Claude Code driving.
 
 What the agent gets: one tool, `python`, running in a persistent interpreter where variables
 survive between calls. Inside it, `sh(command)` with a working directory and environment that
@@ -50,6 +50,31 @@ rather than all injected. MCP servers from `settings.json` appear as individual 
 
 `just host` drives a runtime host by hand, which is the fastest way to explore one or to check a
 new one against [docs/runtime-host-protocol.md](docs/runtime-host-protocol.md).
+
+## Letting Claude Code drive
+
+The third engine, and the one arrangement that is upside down on purpose:
+
+```sh
+Aviary --claude-code "which file in AviaryCore is the largest, and by how much?"
+```
+
+**Claude Code owns the loop; Aviary's kernel is the only tool it gets.** It has no Read, Edit,
+Grep or Bash — one `python` tool in Aviary's interpreter, which can already do all of that. So
+the interpreter, `sh()`, the gated skills, `remember`/`recall`, your `AGENTS.md` and the
+transcript format all stay Aviary's, while the turn-taking belongs to somebody else.
+
+It is that way around because Claude Code will not accept a conversation history — it reads
+`user` lines from its input stream and silently discards `assistant` lines. Keeping Aviary's
+loop would mean flattening every turn into one giant user message or feeding tool results back
+as prose, which drifts away from the format the model was trained on and does it quietly.
+[plans/claude-code-as-transport.md](plans/claude-code-as-transport.md) has the experiments;
+`docs/architecture.md` has the design.
+
+The reason to want it: tokens come out of the Claude plan rather than metered API credit, and
+Aviary reports which — `plan usage (five-hour)` or `extra usage`, read from Claude Code's own
+rate-limit frame rather than guessed. What you give up is steering, sub-agents, mid-run model
+switching, and resuming an Aviary session, because the conversation belongs to Claude Code.
 
 ## What it does
 

@@ -330,7 +330,7 @@ extension AppModel {
     ///
     /// The in-house engine needs no `engine` at all — that is the whole point of it — so this
     /// cannot just test for one.
-    var canRunWorkshopAgent: Bool { preferInHouseEngine || engine != nil }
+    var canRunWorkshopAgent: Bool { engineChoice != .harness || engine != nil }
 
     /// Open or resume the workshop session on whichever engine is selected.
     ///
@@ -338,14 +338,24 @@ extension AppModel {
     /// `RunConfiguration` directly, which is why the workshop agent was always the harness even
     /// when the picker said otherwise — the last place that ignored the picker.
     private func startWorkshopRun(repoRoot: URL, resume: String?, firstPrompt: String?) {
-        if preferInHouseEngine {
+        switch engineChoice {
+        case .claudeCode:
+            // The workshop's whole working method is one long-lived session it keeps returning
+            // to, and a driven session cannot be resumed from Aviary's side — Claude Code owns
+            // the history. So a driven workshop run is always a fresh session, and the
+            // remembered id is left alone rather than being overwritten with one that the
+            // in-house engine could not pick up either.
+            startClaudeCodeRun(
+                cwd: repoRoot.path, model: claudeCodeModel, effort: nil,
+                prompt: firstPrompt ?? bootstrapPrompt(repoRoot: repoRoot), title: "Workshop")
+        case .inHouse:
             startInHouseRun(
                 cwd: repoRoot.path, providerID: nil, modelID: nil,
                 // An in-house run with no prompt prepares and waits, which is exactly what
                 // attaching to an existing session wants.
                 prompt: firstPrompt ?? "",
                 resume: resume, title: "Workshop")
-        } else {
+        case .harness:
             var config = RunConfiguration(cwd: repoRoot.path, resume: resume)
             // Nothing reads this yet. Kept as a marker so a hook can tell a workshop session
             // from any other run without inspecting its prompt.

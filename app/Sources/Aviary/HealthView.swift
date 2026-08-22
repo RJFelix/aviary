@@ -27,6 +27,7 @@ struct HealthView: View {
                 // adding its name to this list. See docs/architecture.md, "Retired daemon
                 // surfaces".
                 runtimeCard
+                claudeCodeCard
                 enginesCard
                 environmentCard
                 logCard
@@ -276,6 +277,79 @@ struct HealthView: View {
                 Text("No daemon and no Node, so no version conflict. python3 isolates each "
                     + "session in its own interpreter; python3-shared trades that for numpy "
                     + "and pandas.")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Whether a driven run would work, and whether it would draw on the plan.
+    ///
+    /// The second question is the one worth a card. Claude Code's auth precedence puts
+    /// `ANTHROPIC_API_KEY` and friends *above* subscription OAuth, so a machine with one set
+    /// runs perfectly while quietly billing metered credit — a failure with no symptom. Aviary
+    /// strips those from a run it launches, but the point of showing them here is that the
+    /// stripping is doing work you cannot otherwise see.
+    private var claudeCodeCard: some View {
+        let auth = model.claudeCodeAuth
+        let hijackers = ClaudeCode.strippedVariables.filter {
+            $0.hasPrefix("ANTHROPIC_") && ProcessEnvironment.shared.has($0)
+        }
+        let ready = auth?.loggedIn == true
+        return Card("Claude Code", symbol: "wand.and.stars",
+                    accessory: AnyView(
+                        Text(ready ? (auth?.isSubscription == true ? "plan" : "metered")
+                                   : "unavailable")
+                            .font(.system(size: 9))
+                            .foregroundStyle(ready
+                                ? (auth?.isSubscription == true
+                                    ? Design.success : Design.warning)
+                                : Design.warning)))
+        {
+            VStack(alignment: .leading, spacing: 7) {
+                if let auth {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(auth.loggedIn ? Design.success : Design.danger)
+                            .frame(width: 7, height: 7)
+                        Text(auth.summary).font(.system(size: 11.5, weight: .medium))
+                        Spacer(minLength: 0)
+                        if let email = auth.email {
+                            Text(email).font(Design.mono(9.5)).foregroundStyle(.tertiary)
+                                .lineLimit(1).truncationMode(.middle)
+                        }
+                    }
+                    if !auth.isSubscription, auth.loggedIn {
+                        Text("This login is not a subscription one, so a driven run bills "
+                            + "metered API credit rather than the plan — which removes the "
+                            + "only reason to drive Claude Code rather than call the model "
+                            + "directly.")
+                            .font(.system(size: 10)).foregroundStyle(Design.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    Text("No `claude` binary found in the usual install locations. A shim "
+                        + "under /var/folders is ignored on purpose: it belongs to whichever "
+                        + "terminal session created it and is gone tomorrow.")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !hijackers.isEmpty {
+                    HStack(alignment: .top, spacing: 5) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9)).foregroundStyle(Design.warning)
+                        Text("\(hijackers.joined(separator: ", ")) "
+                            + (hijackers.count == 1 ? "is" : "are")
+                            + " set in your shell. Claude Code ranks that above the "
+                            + "subscription, so a run started from a terminal would bill "
+                            + "metered credit. Aviary strips it from runs it launches.")
+                            .font(.system(size: 10)).foregroundStyle(Design.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Text("Claude Code drives; Aviary's kernel is its only tool. The transcript is "
+                    + "written in Aviary's own format, so every other screen reads a driven "
+                    + "run like any other.")
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }

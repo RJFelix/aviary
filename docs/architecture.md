@@ -292,10 +292,149 @@ supervisor socket, and Health's Supervisor card, the cockpit's kernel tile and t
 agents" sidebar all read it. The in-house engine has runtime hosts instead; whether those
 cards map onto runtime-host sessions or go away is an open decision.
 
-The Anthropic subscription login. Deferred deliberately: the harness's own docs say its Claude
-Pro/Max login bills as extra per-token usage rather than against plan limits, so that path was
-never about cheaper tokens — only about which client Anthropic sees. Plan-included Claude usage
-needs Claude Code driving, per `plans/claude-code-as-transport.md`.
+The Anthropic subscription login, as a *provider*. Still deferred, and now for a settled
+reason rather than a pending one: the harness's own docs say its Claude Pro/Max login bills as
+extra per-token usage rather than against plan limits, so that path was never about cheaper
+tokens — only about which client Anthropic sees. Plan-included Claude usage needs Claude Code
+itself, which is what the third engine below is.
+
+## Claude Code driving
+
+The third engine, and it is not a third provider. It is a different arrangement of the same
+parts, so it gets said plainly: **Claude Code owns the loop, and Aviary's kernel is the only
+tool it gets.**
+
+The reason it has to be that way around is one measured fact. Claude Code will not accept a
+conversation history — `--input-format stream-json` reads `user` lines and *silently discards*
+`assistant` lines, so there is no way to hand it a prepared transcript. Every design that keeps
+Aviary's loop therefore has to degrade the tool channel: flatten the history into one giant
+user message each turn, or forge session files, or feed tool results back as prose. All three
+drift away from the format the model was trained on, and they do it quietly — a session that
+looks fine and reasons slightly worse. `plans/claude-code-as-transport.md` has the experiments.
+
+So the loop is given away and the valuable part is kept. That trade is better than it sounds,
+because almost nothing that makes an Aviary session worth more than a chat window lives in the
+agent loop:
+
+| Kept | Given up |
+|---|---|
+| The persistent interpreter, its variables and open handles | Aviary's agent loop |
+| `sh()` with a working directory that survives | Steering — Claude Code owns the turn boundary |
+| Skills, ranked against the prompt rather than all sent | Sub-agents (`spawn` needs a runner) |
+| `remember` / `recall` / `conversation` | Model switching mid-run |
+| `AGENTS.md` / `CLAUDE.md` for the working directory | Resuming an Aviary session |
+| The transcript, in Aviary's own format | Compaction, and Aviary's own message log |
+
+### The courier, and why there is one
+
+MCP servers are spawned *by* the client, so the process that answers `tools/call` is a child of
+`claude` — not of Aviary, and therefore not the process holding the kernel.
+
+```
+Aviary ──▶ claude -p ──▶ Aviary --mcp-bridge   (MCP on stdio)
+   ▲                             │
+   └──────── loopback ───────────┘
+   │
+   └──▶ RuntimeHost (python3 host.py)          (the actual kernel)
+```
+
+`Aviary --mcp-bridge` is the same binary in a headless mode, so there is no second artifact to
+keep in step. It holds no state: the tool list and every result come from the Aviary that
+opened the bridge.
+
+Loopback TCP with a token, not a Unix socket with file permissions. The token reaches the
+courier through its **environment**, which another user cannot read, whereas anything in
+`--mcp-config` lands in the courier's argv and is visible in `ps` to everybody on the machine.
+Since this endpoint runs arbitrary Python on request, an argv-visible path to an
+unauthenticated port would have been a real local privilege surface.
+
+### The flags are the design
+
+Three groups, none of them obvious:
+
+- `--tools ""` empties the built-in tool set. The model does not then hallucinate tool calls;
+  it reaches for the one tool that was attached.
+- `--setting-sources ""`, `--strict-mcp-config` and `--disable-slash-commands` together are the
+  difference between **286 input tokens and 80–106k**. That gap is the developer's own
+  environment — global `CLAUDE.md`, plugins, skills, every claude.ai MCP connector — being read
+  in as context.
+- `--bare` is deliberately **not** used, despite being the documented mode for scripted runs.
+  Bare mode never reads OAuth credentials or the keychain, so the flag designed for
+  programmatic use is exactly the one that removes the subscription this engine exists to use.
+  The docs say bare may become the `-p` default, which makes this a standing durability risk.
+
+Two smaller traps: `--allowedTools` is variadic, so its value is comma-joined rather than
+space-separated or it swallows whatever follows; and the strip-down is verified against the
+run's own `system/init` frame rather than against the flags passed, because a hook has been
+observed firing even with `--setting-sources ""`.
+
+### What the environment can silently do
+
+Claude Code's auth precedence puts `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the cloud
+provider flags *above* subscription OAuth. A machine with one set runs perfectly and bills
+metered credit — a failure with no symptom, and the one that would make this whole engine
+pointless. So `ClaudeCode.scrubbedEnvironment` strips them, `apiKeySource: "none"` in the init
+frame is the check that it worked, and Health says so when your shell has one set.
+
+Stripped alongside them: `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_SOCKET`
+and friends. Aviary is developed from inside Claude Code, so those are routinely in its
+environment, and handing a child the parent's session id and messaging socket makes it a
+participant in a conversation it knows nothing about. `CLAUDE_CODE_OAUTH_TOKEN` is *not*
+stripped: it is the documented way to authenticate a headless subscription session, so somebody
+who set one meant it.
+
+### Reading the stream
+
+`--output-format stream-json --include-partial-messages` emits raw Anthropic SSE frames.
+Two findings there cost a capture each, and both contradicted what could be inferred:
+
+**Thinking text is available.** The research this was built on concluded reasoning comes back
+empty in `-p`. That is true of the *complete* block on some routes, but the `thinking_delta`
+frames carry the real text — so a driven run shows visible reasoning, and
+`--include-partial-messages` is not optional.
+
+**The finished token counts are on `message_delta`.** An `assistant` frame arrives once per
+completed content block, all sharing one message id, and each carries the `message_start`
+snapshot — whose `output_tokens` is a stub of 2 or 3, with no `output_tokens_details` at all.
+The `message_delta` figures are the real ones, and they sum exactly to the `result` frame's
+aggregate. That is why the running total is summed per message rather than taken from `result`:
+the transcript's own entries then add up to the number the Usage screen shows.
+
+A related trap cost two wrong diagnoses. Turns were coming back as `input=2`, which looked like
+a placeholder and was not: Claude Code caches aggressively and Anthropic reports cached context
+*outside* `input_tokens`, so a real turn reads `input 2, cacheWrite 3953` and the next one
+`input 2, cacheRead 3953`. So `totalTokens` here is cache-inclusive, diverging from
+`AnthropicMessagesProvider`, which sums `input + output` only and would report 83 tokens for a
+turn that processed about four thousand. The cache-inclusive sum is also what `Usage(json:)`
+falls back to when no `totalTokens` was written, so it is the arithmetic the reader already
+believes. **The Anthropic provider undercounting the same way is a separate bug, not yet
+fixed.**
+
+### Accounting
+
+The provider is recorded as `claude-code`, not `anthropic`. Not cosmetic — which *client*
+Anthropic sees is precisely what decides whether tokens came out of the plan or out of metered
+credit, so it is the distinction the ledger has to keep.
+
+No prices. A subscription run's tokens were not billed per token, and `total_cost_usd` in the
+stream is documented as a client-side estimate, so pricing them at list would invent spending
+that never happened. `sessionsWithoutPricing` already means "no rates published", which is
+exactly the true thing to say. What *is* reported is the `rate_limit_event` frame:
+`isUsingOverage` is the difference between the plan allowance and paying per token, and it is
+surfaced rather than inferred.
+
+### One assembly, two callers
+
+`ClaudeCodeSession.prepare` builds the whole thing — auth check, kernel, gated skills and
+memory, bridge, callbacks — and both the GUI driver and `--claude-code` call it. They each did
+this independently at first, which is the arrangement where a windowed run and a terminal run
+quietly stop being the same thing: while building, only the CLI gets exercised, so a divergence
+lands in the GUI and is found by a person using it.
+
+`--claude-code "<prompt>"` also has to close stdin once its prompt is sent. Claude Code with
+`--input-format stream-json` waits on stdin indefinitely, which is right for a session that
+stays open and means a one-shot never ends.
+
 
 ## The reachable-model catalogue
 

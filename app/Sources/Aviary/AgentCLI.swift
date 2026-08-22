@@ -18,6 +18,9 @@ enum AgentCLI {
         if args.contains("--codex-login") {
             runCodexLogin(paste: args.contains("--paste"))
         }
+        if args.contains("--mcp-bridge") {
+            runMCPBridge()
+        }
         guard let flag = args.firstIndex(of: "--agent") else { return }
         let prompt = args.count > flag + 1 ? args[flag + 1] : ""
         guard !prompt.isEmpty, !prompt.hasPrefix("--") else {
@@ -47,6 +50,23 @@ enum AgentCLI {
             RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
         }
         exit(0)
+    }
+
+    /// `Aviary --mcp-bridge` — be the MCP server a driven Claude Code talks to.
+    ///
+    /// Not documented in the usage line above, because nobody runs this by hand: Claude Code
+    /// spawns it, with the bridge endpoint in its environment. Reached before any window is
+    /// created, which matters — this mode must never bring up an NSApplication, or every tool
+    /// call would flash a second copy of Aviary onto the Dock.
+    private static func runMCPBridge() -> Never {
+        guard let bridge = MCPBridge.fromEnvironment() else {
+            FileHandle.standardError.write(Data(
+                ("Aviary --mcp-bridge expects AVIARY_BRIDGE_PORT and AVIARY_BRIDGE_TOKEN in "
+                    + "its environment. Claude Code sets them from --mcp-config; there is "
+                    + "nothing to do when they are missing.\n").utf8))
+            exit(2)
+        }
+        bridge.serve()
     }
 
     /// `Aviary --codex-login` — sign in to ChatGPT for the Codex provider.
@@ -347,7 +367,7 @@ enum AgentCLI {
         }
     }
 
-    private static func value(of flag: String, in args: [String]) -> String? {
+    static func value(of flag: String, in args: [String]) -> String? {
         guard let i = args.firstIndex(of: flag), args.count > i + 1 else { return nil }
         return args[i + 1]
     }
@@ -358,7 +378,7 @@ enum AgentCLI {
         FileHandle.standardError.write(Data((s + "\n").utf8))
     }
 
-    private static func fail(_ s: String) -> Never {
+    static func fail(_ s: String) -> Never {
         FileHandle.standardError.write(Data(("aviary: " + s + "\n").utf8))
         exit(2)
     }

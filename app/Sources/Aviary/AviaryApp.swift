@@ -12,6 +12,7 @@ struct AviaryApp: App {
         WireInspect.runIfRequested()
         Snapshot.runIfRequested()
         AgentCLI.runIfRequested()
+        ClaudeCodeCLI.runIfRequested()
     }
 
     var body: some Scene {
