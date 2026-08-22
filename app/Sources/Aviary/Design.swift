@@ -30,6 +30,10 @@ enum Design {
     static let success = Color(red: 0.16, green: 0.65, blue: 0.35)
     static let thinking = Color(red: 0.48, green: 0.44, blue: 0.60)
 
+    /// The surface code sits on. Derived from `textBackgroundColor` rather than fixed, so it
+    /// tracks the system appearance instead of needing a light and a dark constant.
+    static let codeBackground = Color(nsColor: .textBackgroundColor).opacity(0.55)
+
     // MARK: Metrics
 
     static let cardRadius: CGFloat = 10
@@ -368,7 +372,7 @@ struct CodeBlock: View {
         }
         .background(
             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(Color(nsColor: .textBackgroundColor).opacity(0.55))
+                .fill(Design.codeBackground)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 7, style: .continuous)

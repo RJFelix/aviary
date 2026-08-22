@@ -138,9 +138,10 @@ struct TranscriptRow: View {
                     ForEach(split.injected) { injected in
                         InjectedContextBlock(block: injected)
                     }
-                    HighlightedText(text: split.userText, query: searchQuery)
-                        .font(.system(size: 13))
-                        .textSelection(.enabled)
+                    // A prompt is written in markdown too — Ryan's prompts are mostly
+                    // dashed lists — so it gets the same treatment as a reply rather than
+                    // being shown as the only plain-text role in the transcript.
+                    MarkdownText(text: split.userText, query: searchQuery)
                 } else if case .image(let mime, let data) = block {
                     InlineImage(mimeType: mime, base64: data)
                 }
@@ -448,35 +449,17 @@ struct ThinkingBlock: View {
     }
 }
 
-/// Model prose, rendered with inline markdown when it parses.
+/// Model prose.
 ///
-/// `inlineOnlyPreservingWhitespace` is the important option: full markdown parsing
-/// collapses the newlines that structure an agent's answer, and losing them makes long
-/// replies significantly harder to read.
+/// Kept as a name because it is used from several places; the rendering lives in
+/// `MarkdownBody`, which parses block structure first and inline markdown within each block.
+/// This used to be inline-only for the whole string, which meant a heading, a list or a
+/// fenced block rendered as its own literal syntax.
 struct MarkdownText: View {
     var text: String
     var query: String = ""
 
-    var body: some View {
-        if !query.trimmingCharacters(in: .whitespaces).isEmpty {
-            HighlightedText(text: text, query: query)
-                .font(.system(size: 13))
-                .textSelection(.enabled)
-        } else if let attributed = try? AttributedString(
-            markdown: text,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))
-        {
-            Text(attributed)
-                .font(.system(size: 13))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-        } else {
-            Text(text)
-                .font(.system(size: 13))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
+    var body: some View { MarkdownBody(text: text, query: query) }
 }
 
 /// Text with every occurrence of the search query highlighted.

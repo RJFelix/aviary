@@ -2657,6 +2657,229 @@ await Harness.run([
         XCTAssertNil(CodexResponsesProvider.friendlyError("not json"))
     }),
 
+    // MARK: Markdown block structure
+    //
+    // The transcript rendered inline-only markdown, so every block construct arrived as its
+    // own literal syntax. These pin the shape of what replaced it, and in particular the two
+    // ways a block parser goes wrong on agent output: eating newlines it should keep, and
+    // finding structure in prose that has none.
+
+    ("markdown: a plain paragraph keeps its hard line breaks", {
+        // The reason the old renderer used inlineOnlyPreservingWhitespace at all. If this
+        // regresses, every multi-line answer in the transcript reflows into one blob.
+        let blocks = MarkdownParser.blocks(from: "first line\nsecond line\nthird")
+        XCTAssertEqual(blocks.count, 1)
+        XCTAssertEqual(blocks.first, .paragraph("first line\nsecond line\nthird"))
+    }),
+
+    ("markdown: blank lines separate paragraphs and are not themselves blocks", {
+        let blocks = MarkdownParser.blocks(from: "one\n\n\ntwo\n")
+        XCTAssertEqual(blocks, [.paragraph("one"), .paragraph("two")])
+    }),
+
+    ("markdown: ATX headings need the space, so #hashtag stays prose", {
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "## Results"), [.heading(level: 2, text: "Results")])
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "###### deep"), [.heading(level: 6, text: "deep")])
+        // Seven hashes is not a heading in CommonMark and is usually a divider in practice.
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "####### too deep"),
+            [.paragraph("####### too deep")])
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "#hashtag"), [.paragraph("#hashtag")])
+        // Closing hashes are decoration.
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "## Middle ##"), [.heading(level: 2, text: "Middle")])
+    }),
+
+    ("markdown: a heading interrupts the paragraph above it", {
+        let blocks = MarkdownParser.blocks(from: "intro text\n## Section\nbody")
+        XCTAssertEqual(
+            blocks,
+            [.paragraph("intro text"), .heading(level: 2, text: "Section"), .paragraph("body")])
+    }),
+
+    ("markdown: a fenced block is opaque and keeps its own indentation", {
+        let source = """
+        Here:
+
+        ```python
+        def f():
+            # not a heading
+            return "- not a list"
+        ```
+
+        done
+        """
+        let blocks = MarkdownParser.blocks(from: source)
+        XCTAssertEqual(blocks.count, 3)
+        XCTAssertEqual(blocks[0], .paragraph("Here:"))
+        guard case let .code(language, body) = blocks[1] else {
+            XCTFail("expected a code block, got \(blocks[1])")
+            return
+        }
+        XCTAssertEqual(language, "python")
+        XCTAssertEqual(body, "def f():\n    # not a heading\n    return \"- not a list\"")
+        XCTAssertEqual(blocks[2], .paragraph("done"))
+    }),
+
+    ("markdown: an unclosed fence runs to the end rather than swallowing everything", {
+        // A truncated reply is the common cause. Showing the code beats showing nothing.
+        let blocks = MarkdownParser.blocks(from: "```\nhalf a thing")
+        XCTAssertEqual(blocks, [.code(language: nil, source: "half a thing")])
+    }),
+
+    ("markdown: a longer fence contains a shorter one", {
+        // How a model shows fenced markdown at all.
+        let blocks = MarkdownParser.blocks(from: "````md\n```\ninner\n```\n````")
+        XCTAssertEqual(blocks, [.code(language: "md", source: "```\ninner\n```")])
+    }),
+
+    ("markdown: inline triple backticks do not open a block", {
+        let blocks = MarkdownParser.blocks(from: "use ```code``` inline")
+        XCTAssertEqual(blocks, [.paragraph("use ```code``` inline")])
+    }),
+
+    ("markdown: bullet lists carry markers, and dashes in prose do not start one", {
+        guard case let .list(list) = MarkdownParser.blocks(from: "- one\n- two\n* three")[0]
+        else { return XCTFail("expected a list") }
+        XCTAssertFalse(list.ordered)
+        XCTAssertEqual(list.items.map(\.text), ["one", "two", "three"])
+        XCTAssertEqual(list.items.map(\.depth), [0, 0, 0])
+        // No space after the dash: prose, not a list.
+        XCTAssertEqual(MarkdownParser.blocks(from: "-not a list"),
+                       [.paragraph("-not a list")])
+    }),
+
+    ("markdown: ordered lists keep the literal marker so numbering survives", {
+        // A list that starts at 3 is usually a continuation the model meant.
+        guard case let .list(list) = MarkdownParser.blocks(from: "3. three\n4) four")[0]
+        else { return XCTFail("expected a list") }
+        XCTAssertTrue(list.ordered)
+        XCTAssertEqual(list.items.map(\.marker), ["3.", "4)"])
+    }),
+
+    ("markdown: nesting depth follows the indent columns actually used", {
+        // Models mix two- and four-space steps, sometimes in one reply, so depth is derived
+        // from the order of columns seen rather than from an assumed step size.
+        let source = "- a\n   - b\n      - c\n   - d\n- e"
+        guard case let .list(list) = MarkdownParser.blocks(from: source)[0]
+        else { return XCTFail("expected a list") }
+        XCTAssertEqual(list.items.map(\.text), ["a", "b", "c", "d", "e"])
+        XCTAssertEqual(list.items.map(\.depth), [0, 1, 2, 1, 0])
+    }),
+
+    ("markdown: task list items carry their checkbox state", {
+        guard case let .list(list) = MarkdownParser.blocks(from: "- [x] done\n- [ ] todo\n- plain")[0]
+        else { return XCTFail("expected a list") }
+        XCTAssertEqual(list.items.map(\.checked), [true, false, nil])
+        XCTAssertEqual(list.items.map(\.text), ["done", "todo", "plain"])
+    }),
+
+    ("markdown: a wrapped list item keeps its continuation", {
+        guard case let .list(list) = MarkdownParser.blocks(from: "- first\n  wrapped\n- second")[0]
+        else { return XCTFail("expected a list") }
+        XCTAssertEqual(list.items.map(\.text), ["first\nwrapped", "second"])
+    }),
+
+    ("markdown: a rule is a rule, and three dashes are not a one-item list", {
+        XCTAssertEqual(MarkdownParser.blocks(from: "---"), [.rule])
+        XCTAssertEqual(MarkdownParser.blocks(from: "***"), [.rule])
+        XCTAssertEqual(MarkdownParser.blocks(from: "- - -"), [.rule])
+        XCTAssertEqual(MarkdownParser.blocks(from: "--"), [.paragraph("--")])
+    }),
+
+    ("markdown: quotes nest their own blocks", {
+        guard case let .quote(inner) = MarkdownParser.blocks(from: "> ## Q\n> - a\n> - b")[0]
+        else { return XCTFail("expected a quote") }
+        XCTAssertEqual(inner.count, 2)
+        XCTAssertEqual(inner[0], .heading(level: 2, text: "Q"))
+        guard case let .list(list) = inner[1] else { return XCTFail("expected a nested list") }
+        XCTAssertEqual(list.items.map(\.text), ["a", "b"])
+    }),
+
+    ("markdown: a table needs its delimiter row, so piped prose stays prose", {
+        let source = "| name | count |\n| :--- | ----: |\n| a | 1 |\n| b | 2 |"
+        guard case let .table(table) = MarkdownParser.blocks(from: source)[0]
+        else { return XCTFail("expected a table") }
+        XCTAssertEqual(table.header, ["name", "count"])
+        XCTAssertEqual(table.alignments, [.leading, .trailing])
+        XCTAssertEqual(table.rows, [["a", "1"], ["b", "2"]])
+        // Prose containing a pipe is far more common in agent output than a table is.
+        XCTAssertEqual(MarkdownParser.blocks(from: "run a | b to pipe"),
+                       [.paragraph("run a | b to pipe")])
+    }),
+
+    ("markdown: a ragged table row is padded rather than rejected", {
+        // A table with one short row is still a table; the alternative shows raw pipes.
+        let source = "| a | b |\n| - | - |\n| only |\n| x | y | z |"
+        guard case let .table(table) = MarkdownParser.blocks(from: source)[0]
+        else { return XCTFail("expected a table") }
+        XCTAssertEqual(table.rows, [["only", ""], ["x", "y"]])
+    }),
+
+    ("markdown: an escaped pipe stays inside its cell", {
+        let source = "| pattern |\n| --- |\n| a \\| b |"
+        guard case let .table(table) = MarkdownParser.blocks(from: source)[0]
+        else { return XCTFail("expected a table") }
+        XCTAssertEqual(table.rows, [["a | b"]])
+    }),
+
+    ("markdown: centre alignment is read from the delimiter", {
+        guard case let .table(table) =
+            MarkdownParser.blocks(from: "| a |\n| :-: |\n| x |")[0]
+        else { return XCTFail("expected a table") }
+        XCTAssertEqual(table.alignments, [.center])
+    }),
+
+    ("markdown: a realistic reply parses into the blocks it looks like", {
+        let source = """
+        Here is what I found.
+
+        ## Causes
+
+        1. The first one
+        2. The second one
+
+        > Worth noting.
+
+        ```bash
+        just shots
+        ```
+
+        | file | size |
+        | --- | ---: |
+        | a.png | 12K |
+
+        Done.
+        """
+        let blocks = MarkdownParser.blocks(from: source)
+        let kinds = blocks.map { block -> String in
+            switch block {
+            case .heading: return "heading"
+            case .paragraph: return "paragraph"
+            case .list: return "list"
+            case .quote: return "quote"
+            case .code: return "code"
+            case .rule: return "rule"
+            case .table: return "table"
+            }
+        }
+        XCTAssertEqual(
+            kinds,
+            ["paragraph", "heading", "list", "quote", "code", "table", "paragraph"])
+    }),
+
+    ("markdown: text with no structure produces exactly one paragraph", {
+        // The degradation path. Anything this parser cannot recognise must come out as the
+        // old inline-only behaviour rather than disappearing.
+        let odd = "a stray ] bracket, 50% of things, C:\\path, and an <html> tag"
+        XCTAssertEqual(MarkdownParser.blocks(from: odd), [.paragraph(odd)])
+        XCTAssertEqual(MarkdownParser.blocks(from: ""), [])
+        XCTAssertEqual(MarkdownParser.blocks(from: "   \n  \n"), [])
+    }),
+
     ("codex: the built-in model catalogue matches the harness's", {
         // Transcribed, not invented: a model id this client sends that no known harness sends
         // is an anomaly.
