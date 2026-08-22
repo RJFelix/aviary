@@ -96,38 +96,10 @@ struct LiveView: View {
                     }
                 }
 
-                Card("Running elsewhere", symbol: "eye",
-                     accessory: AnyView(
-                        Button {
-                            Task { await model.refreshDaemon() }
-                        } label: {
-                            Image(systemName: "arrow.clockwise").font(.system(size: 9))
-                        }
-                        .buttonStyle(.plain).foregroundStyle(.secondary)))
-                {
-                    if model.liveSessions.isEmpty {
-                        Text("The background service is holding no sessions.")
-                            .font(.system(size: 11.5)).foregroundStyle(.secondary)
-                    } else {
-                        VStack(spacing: 0) {
-                            ForEach(model.liveSessions) { s in
-                                LiveSessionRow(session: s)
-                                    .onTapGesture { model.openTranscript(sessionID: s.sessionID) }
-                                    .contextMenu {
-                                        Button("Open transcript") {
-                                            model.openTranscript(sessionID: s.sessionID)
-                                        }
-                                        Button("Copy attach command") {
-                                            NSPasteboard.general.clearContents()
-                                            NSPasteboard.general.setString(
-                                                "prime-agent attach \(s.id)", forType: .string)
-                                        }
-                                    }
-                                if s.id != model.liveSessions.last?.id { Divider().opacity(0.5) }
-                            }
-                        }
-                    }
-                }
+                // `RunningElsewhereCard` is deliberately not shown — it lists sessions the
+                // harness daemon is holding, and the in-house engine holds its runs itself
+                // (they are right here on this screen). Retired rather than deleted; see
+                // docs/architecture.md, "Retired daemon surfaces".
             }
             .padding(Design.gutter)
         }

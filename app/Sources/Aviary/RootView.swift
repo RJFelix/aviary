@@ -200,47 +200,17 @@ struct SidebarView: View {
                 }
             }
 
-            SwiftUI.Section("Working agents") {
-                let working = model.liveSessions.filter(\.isWorking)
-                if working.isEmpty {
-                    Text("Nothing running")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.tertiary)
-                } else {
-                    ForEach(working.prefix(8)) { s in
-                        Button {
-                            model.openTranscript(sessionID: s.sessionID)
-                        } label: {
-                            HStack(spacing: 6) {
-                                PulseDot(color: s.isSubagent ? Design.agentMessage : Design.success)
-                                VStack(alignment: .leading, spacing: 0) {
-                                    Text(s.displayName)
-                                        .font(.system(size: 11.5))
-                                        .lineLimit(1)
-                                    if let m = s.modelLabel {
-                                        Text(m)
-                                            .font(.system(size: 9.5, design: .monospaced))
-                                            .foregroundStyle(.tertiary)
-                                            .lineLimit(1)
-                                    }
-                                }
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    if working.count > 8 {
-                        Text("+\(working.count - 8) more")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-            }
+            // The "Working agents" section is deliberately not shown — it listed sessions
+            // the harness daemon is holding, and on the in-house engine it was actively wrong:
+            // a live in-house run still rendered "Nothing running". Kept as
+            // `WorkingAgentsSection`; see docs/architecture.md, "Retired daemon surfaces".
         }
         .listStyle(.sidebar)
-        // The sidebar's own vibrancy is removed deliberately. An AppKit material does not
-        // rasterize in an offscreen capture, so keeping it would mean the sidebar is the
-        // one part of the app no screenshot can ever show. A solid ground renders
-        // identically everywhere.
+        // The sidebar's own vibrancy is removed. The original reason no longer holds — that
+        // was a `cacheDisplay` limitation, and captures now go through the WindowServer, which
+        // composites materials fine. Kept solid because a ground that renders identically in
+        // the app and in a screenshot is worth more here than the material was, but this is
+        // now a preference rather than a constraint.
         .scrollContentBackground(.hidden)
         .safeAreaInset(edge: .bottom, spacing: 0) { sidebarFooter }
     }

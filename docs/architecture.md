@@ -347,6 +347,45 @@ make the list feel broken.
 Each provider's own model list is sorted to match the flat list, so a per-provider picker and
 the flat switcher cannot disagree.
 
+### Retired daemon surfaces
+
+The harness runs a supervisor daemon: a long-lived process holding sessions, owning a socket and
+an ownership lease, and managing a pool of IPython kernels and worker processes. The in-house
+engine has none of that — it runs agents in-process and interpreters in a runtime host it owns.
+
+Several screens described that daemon, and on the in-house engine they described it *wrongly*
+rather than merely uselessly: a live in-house run still rendered "Nothing running" in the
+sidebar and "the background service is holding no sessions" on Live. These are no longer
+displayed:
+
+| Surface | Where it lives now |
+|---|---|
+| Supervisor card (pid, build, socket, lease) | `HealthView.supervisorCard` |
+| Processes card (kernels, engine procs, workers) | `HealthView.processCard` |
+| Workers card | `HealthView.workersCard` |
+| "Working now" card and its stat tile | `CockpitView.workingNow` |
+| Kernels stat tile | removed inline |
+| Daemon health and supervisor pid rows | removed inline from `CockpitView.environmentPanel` |
+| "Running elsewhere" card | `RunningElsewhereCard` in `RetiredDaemonSurfaces.swift` |
+| "Working agents" sidebar section | `WorkingAgentsSection` in `RetiredDaemonSurfaces.swift` |
+
+Kept rather than deleted, because the harness is still selectable and retiring a screen is a
+cheaper decision to reverse than rebuilding one. The already-extracted ones stayed where they
+were; the two that were inline were extracted into `RetiredDaemonSurfaces.swift`. Nothing
+references them, and Swift does not warn on an unreferenced view, so they cost nothing. Putting
+one back is adding its name to the relevant `body`.
+
+**Two things were deliberately kept.** The Health verdict, with its `Re-check`, `doctor --fix`
+and `Force shutdown` controls, is the failure surface rather than a status card — while the
+harness is still the default, a wedged daemon needs somewhere to be visible and fixable. And
+the wedged-daemon and version-mismatch notice banners on the cockpit, for the same reason: they
+appear only when something is actually broken. Both are worth removing once the in-house engine
+becomes the default, not before.
+
+`refreshDaemon` still runs. `liveSessions` feeds `annotateLiveState`, which marks a session row
+in the catalogue as live — that is still true and still useful regardless of which engine is
+running.
+
 ## The runtime host
 
 Where agent code runs, as of 2026-08-21. A separate process, one isolated interpreter per

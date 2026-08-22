@@ -20,14 +20,15 @@ struct HealthView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 verdict
-                HStack(alignment: .top, spacing: 14) {
-                    supervisorCard
-                    processCard
-                }
+                // `supervisorCard`, `processCard` and `workersCard` are deliberately not
+                // shown. They describe the harness daemon — its pid, socket, ownership lease,
+                // kernel and worker processes — and the in-house engine has none of that.
+                // Retired rather than deleted: they are intact below and putting one back is
+                // adding its name to this list. See docs/architecture.md, "Retired daemon
+                // surfaces".
                 runtimeCard
                 enginesCard
                 environmentCard
-                workersCard
                 logCard
                 pathsCard
             }

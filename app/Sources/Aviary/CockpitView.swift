@@ -15,17 +15,27 @@ struct CockpitView: View {
             VStack(alignment: .leading, spacing: 14) {
                 notices
                 headline
+                // `workingNow` is deliberately not shown — it lists sessions the harness
+                // daemon is holding, which the in-house engine does not have. Retired rather
+                // than deleted; see docs/architecture.md, "Retired daemon surfaces".
+                // Re-balanced after `workingNow` retired: the chart is paired with the
+                // launcher so both rows sit on the same two-column grid.
+                //
+                // This row is still narrower than the one below it, and the cause is measured
+                // rather than guessed. `Card` is already `maxWidth: .infinity`, so it is not
+                // that the card refuses to stretch — a `GeometryReader` probe showed the
+                // second row being re-offered the full width and growing (380 → 800, row
+                // 724 → 1144) while this row never fires `onChange` at all: it keeps its
+                // first-pass 724 and is never re-offered. Left for a layout pass; four
+                // attempts at fixing it by adding `maxWidth` frames only moved the dead space
+                // around, because the frames were treating a proposal problem as a sizing one.
                 HStack(alignment: .top, spacing: 14) {
-                    workingNow
                     todayPanel
+                    quickLaunch.frame(width: 330)
                 }
                 HStack(alignment: .top, spacing: 14) {
                     recentSessions
-                    VStack(spacing: 14) {
-                        quickLaunch
-                        environmentPanel
-                    }
-                    .frame(width: 330)
+                    environmentPanel.frame(width: 330)
                 }
             }
             .padding(Design.gutter)
@@ -69,7 +79,7 @@ struct CockpitView: View {
                     message: failing.1,
                     actionLabel: "Models") { model.section = .models }
             }
-            if model.engine == nil {
+            if model.engine == nil && !model.preferInHouseEngine {
                 NoticeBanner(
                     level: .danger,
                     title: "No engine found",
@@ -100,14 +110,8 @@ struct CockpitView: View {
 
     private var headline: some View {
         HStack(spacing: 14) {
-            StatTile(
-                label: "Working now",
-                value: "\(model.liveSessions.filter(\.isWorking).count)",
-                caption: "\(model.liveSessions.count) session\(model.liveSessions.count == 1 ? "" : "s") held by the daemon",
-                symbol: "bolt.fill",
-                tint: Design.success,
-                emphasis: true)
-            Divider().frame(height: 46)
+            // "Working now" and "Kernels" tiles retired with the daemon surfaces: both
+            // counted things only the harness supervisor knows about.
             StatTile(
                 label: "Sub-agents",
                 value: "\(model.tree.allNodes.count)",
@@ -116,13 +120,6 @@ struct CockpitView: View {
                     : "none running",
                 symbol: "bird.fill",
                 tint: Design.agentMessage)
-            Divider().frame(height: 46)
-            StatTile(
-                label: "Kernels",
-                value: "\(model.daemon.kernelCount)",
-                caption: "live IPython processes",
-                symbol: "cube.fill",
-                tint: Design.tool)
             Divider().frame(height: 46)
             StatTile(
                 label: "Sessions",
@@ -195,6 +192,9 @@ struct CockpitView: View {
         {
             let days = model.analytics.days(last: 14)
             let peak = max(1, days.map(\.usage.totalTokens).max() ?? 1)
+            // A `Card` stretches only when its content does. This card used to be stretched by
+            // sharing a row with `workingNow`; once that retired it collapsed to the width of
+            // 14 bars, so the fill has to come from here.
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .bottom, spacing: 3) {
                     ForEach(days) { d in
@@ -223,8 +223,10 @@ struct CockpitView: View {
                         label: "cached",
                         value: Fmt.percent(window.cacheHitRate),
                         caption: "of input tokens")
+                    Spacer(minLength: 0)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(width: 380)
     }
@@ -321,11 +323,9 @@ struct CockpitView: View {
                 if let engine = model.engine {
                     DetailRow(label: "Source", value: engine.kind.label)
                     DetailRow(label: "Version", value: engine.version ?? "unknown", mono: true)
-                    DetailRow(label: "Daemon", value: model.daemon.health.label,
-                              tint: model.daemon.health == .healthy ? Design.success : Design.warning)
-                    if let pid = model.daemon.pid {
-                        DetailRow(label: "Supervisor pid", value: "\(pid)", mono: true)
-                    }
+                    // The daemon health row and supervisor pid retired with the other daemon
+                    // surfaces: this card is about which engine Aviary would launch, which is a
+                    // question the harness supervisor does not answer.
                     DetailRow(
                         label: "Environment",
                         value: model.loginShellEnvironmentLoaded ? "login shell" : "launchd",
