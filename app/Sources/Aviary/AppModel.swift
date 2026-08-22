@@ -123,6 +123,11 @@ final class AppModel {
     // MARK: Runs
 
     var runs: [LiveRun] = []
+    /// Which engine a new run uses. Remembered, because it is a preference rather than a
+    /// per-run decision once you have picked a side.
+    var preferInHouseEngine: Bool = UserDefaults.standard.bool(forKey: "aviary.inHouseEngine") {
+        didSet { UserDefaults.standard.set(preferInHouseEngine, forKey: "aviary.inHouseEngine") }
+    }
     var focusedRunID: UUID?
 
     // MARK: UI state
@@ -479,6 +484,26 @@ final class AppModel {
 
     // MARK: Runs
 
+    /// Start an in-house run: Aviary's own loop, its own provider client, its own runtime
+    /// host. No harness process and no Node.
+    func startInHouseRun(cwd: String, providerID: String?, modelID: String?, prompt: String) {
+        guard let (providerSpec, model) = AgentCLI.resolve(
+            [providerID, modelID].compactMap { $0 }.joined(separator: "/"),
+            in: modelsConfig) ?? AgentCLI.resolve(modelID, in: modelsConfig)
+        else {
+            toast = Toast(message: "No configured provider serves that model.", isError: true)
+            return
+        }
+        let run = LiveRun(
+            inHouse: InHouseDriver(
+                home: home, cwd: cwd, model: model, providerSpec: providerSpec),
+            cwd: cwd, modelLabel: model.qualifiedID)
+        runs.append(run)
+        focusedRunID = run.id
+        section = .live
+        run.startInHouse(prompt: prompt)
+    }
+
     func startRun(config: RunConfiguration, firstPrompt: String?) {
         guard let engine else {
             toast = Toast(message: "No engine configured", isError: true)
@@ -562,6 +587,47 @@ final class LiveRun: Identifiable {
     private let builder = LiveTranscriptBuilder()
     private var session = RPCSession()
     private var pump: Task<Void, Never>?
+
+    /// Set when this run is Aviary's own rather than the harness's.
+    ///
+    /// One type with two backends rather than two types, because every view that renders a run
+    /// — the transcript, the token panel, the sidebar row — should not have to know which
+    /// engine produced it. That is the same reason the file format is shared.
+    private(set) var inHouse: InHouseDriver?
+    var isInHouse: Bool { inHouse != nil }
+
+    init(inHouse driver: InHouseDriver, cwd: String, modelLabel: String) {
+        self.engine = EngineLocation(
+            kind: .fork, path: "aviary", version: "in-house",
+            note: "Aviary's own agent loop")
+        self.config = RunConfiguration(cwd: cwd)
+        self.inHouse = driver
+        self.modelLabel = modelLabel
+        self.title = "New run"
+    }
+
+    func startInHouse(prompt: String) {
+        guard let inHouse else { return }
+        if !prompt.isEmpty { title = String(prompt.prefix(60)) }
+        inHouse.start(prompt: prompt)
+        // Mirror the driver's observable state onto this run, so views that already read
+        // `items`, `isStreaming` and `usage` keep working untouched.
+        mirror = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                self.items = inHouse.items
+                self.isStreaming = inHouse.isStreaming
+                self.hasExited = inHouse.hasExited
+                self.usage = inHouse.usage
+                self.sessionID = inHouse.sessionID
+                self.sessionFile = inHouse.sessionFile?.path
+                self.errorBanner = inHouse.errorBanner
+                if inHouse.hasExited && !inHouse.isStreaming { break }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+    }
+
+    private var mirror: Task<Void, Never>?
 
     init(engine: EngineLocation, config: RunConfiguration) {
         self.engine = engine
@@ -693,6 +759,14 @@ final class LiveRun: Identifiable {
 
     func send(_ text: String) async {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        if inHouse != nil {
+            // Multi-turn on an in-house run is not wired yet: the loop takes one prompt and
+            // runs it to completion. Said plainly rather than silently dropped.
+            builder.appendNote("Follow-up prompts are not supported on an in-house run yet — "
+                + "start another run.")
+            sync()
+            return
+        }
         if title == "New run" { title = String(text.prefix(60)) }
         builder.appendLocalUserMessage(text)
         sync()
@@ -719,6 +793,7 @@ final class LiveRun: Identifiable {
     }
 
     func abort() {
+        if let inHouse { inHouse.stop(); return }
         Task { await session.abort() }
     }
 
@@ -756,6 +831,12 @@ final class LiveRun: Identifiable {
     }
 
     func stop() async {
+        mirror?.cancel()
+        if let inHouse {
+            inHouse.stop()
+            hasExited = true
+            return
+        }
         pump?.cancel()
         await session.stop()
         hasExited = true

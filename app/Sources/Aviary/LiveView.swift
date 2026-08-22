@@ -517,6 +517,31 @@ struct LauncherSheet: View {
                         }
                     }
 
+                    Card("Engine", symbol: "cpu") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Picker("", selection: Binding(
+                                get: { model.preferInHouseEngine },
+                                set: { model.preferInHouseEngine = $0 }))
+                            {
+                                Text("Harness (Prime Agent)").tag(false)
+                                Text("In-house (Aviary)").tag(true)
+                            }
+                            .pickerStyle(.segmented).labelsHidden()
+                            Text(model.preferInHouseEngine
+                                ? "Aviary's own agent loop, provider client and Python runtime "
+                                    + "host. No harness process and no Node. Skills are ranked "
+                                    + "against your prompt rather than all sent, and the "
+                                    + "transcript is written in the same format so every other "
+                                    + "screen still reads it. One prompt per run for now."
+                                : "The vendored Prime Agent harness over its RPC protocol. "
+                                    + "Supports follow-ups, steering and payload recording.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .controlSize(.small)
+                    }
+
                     Card("Options", symbol: "slider.horizontal.3") {
                         VStack(alignment: .leading, spacing: 8) {
                             Toggle("Save the session to disk", isOn: $persistSession)
@@ -553,6 +578,15 @@ struct LauncherSheet: View {
                 }
                 Spacer()
                 Button {
+                    if model.preferInHouseEngine {
+                        model.startInHouseRun(
+                            cwd: cwd.isEmpty ? model.defaultCwd : cwd,
+                            providerID: provider.isEmpty ? nil : provider,
+                            modelID: modelID.isEmpty ? nil : modelID,
+                            prompt: prompt)
+                        dismiss()
+                        return
+                    }
                     model.startRun(
                         config: RunConfiguration(
                             cwd: cwd.isEmpty ? model.defaultCwd : cwd,
@@ -570,7 +604,7 @@ struct LauncherSheet: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.engine == nil)
+                .disabled(model.engine == nil && !model.preferInHouseEngine)
             }
             .padding(14)
         }
