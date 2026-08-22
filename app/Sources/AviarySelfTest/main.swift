@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 @testable import AviaryCore
 
@@ -1198,7 +1199,8 @@ await Harness.run([
         XCTAssertEqual(parsed.counts.toolErrors, 0)
         // A tool call and its result must have been paired into one renderable row, with the
         // output attached — the thing the renderer depends on.
-        let tool = try XCTUnwrap(parsed.items.first { $0.kind == .tool })
+        let toolItems: [TranscriptItem] = parsed.items.filter { $0.kind == .tool }
+        let tool = try XCTUnwrap(toolItems.first)
         XCTAssertEqual(tool.toolCall?.name, "python")
         XCTAssertTrue((tool.toolResultText ?? "").contains("side effect"))
         XCTAssertTrue(parsed.items.contains { $0.kind == .assistant })
@@ -2378,5 +2380,306 @@ await Harness.run([
         // filesystem order is not a decision anyone made.
         XCTAssertEqual(found, ["10-first.py", "20-second.py"])
         XCTAssertEqual(HookDiscovery.paths(repoRoot: nil), [])
+    }),
+
+    // ------------------------------------------------------------------ codex auth
+    //
+    // These assert *fidelity to the harness*, not correctness in the abstract. Every constant
+    // here was transcribed from harness/packages/ai/src/utils/oauth/openai-codex.ts and
+    // providers/openai-codex-responses.ts. A failure means the two clients now differ, which is
+    // the thing to avoid — third-party harness use is tolerated, and looking like a *novel*
+    // client is what risks being mistaken for credential resale.
+
+    ("codex: the constants match the reference exactly", {
+        XCTAssertEqual(CodexAuth.clientID, "app_EMoamEEZ73f0CkXaXp7hrann")
+        XCTAssertEqual(CodexAuth.authorizeURL, "https://auth.openai.com/oauth/authorize")
+        XCTAssertEqual(CodexAuth.tokenURL, "https://auth.openai.com/oauth/token")
+        // The port is registered against the client id; any other value is rejected.
+        XCTAssertEqual(CodexAuth.redirectURI, "http://localhost:1455/auth/callback")
+        XCTAssertEqual(CodexAuth.callbackPort, 1455)
+        XCTAssertEqual(CodexAuth.scope, "openid profile email offline_access")
+        XCTAssertEqual(CodexAuth.jwtClaimPath, "https://api.openai.com/auth")
+        // The client's identity to OpenAI. A different originator is exactly the anomaly to
+        // avoid.
+        XCTAssertEqual(CodexAuth.originator, "pi")
+    }),
+
+    ("codex: the authorize URL carries all ten parameters in the reference's order", {
+        let url = CodexAuth.authorizationURL(challenge: "CH", state: "ST")
+        let items = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
+        XCTAssertEqual(items.map(\.name), [
+            "response_type", "client_id", "redirect_uri", "scope",
+            "code_challenge", "code_challenge_method", "state",
+            // Codex-specific and not optional in practice: without them the consent screen
+            // differs and the token lacks organization claims.
+            "id_token_add_organizations", "codex_cli_simplified_flow", "originator",
+        ])
+        XCTAssertEqual(items.first { $0.name == "code_challenge_method" }?.value, "S256")
+        XCTAssertEqual(items.first { $0.name == "id_token_add_organizations" }?.value, "true")
+        XCTAssertEqual(items.first { $0.name == "codex_cli_simplified_flow" }?.value, "true")
+        XCTAssertEqual(items.first { $0.name == "originator" }?.value, "pi")
+    }),
+
+    ("codex: PKCE hashes the encoded verifier, not the raw bytes", {
+        // Getting this backwards produces a challenge the server rejects, and the failure is a
+        // generic invalid_grant that says nothing about why.
+        let (verifier, challenge) = CodexAuth.generatePKCE()
+        XCTAssertEqual(verifier.count, 43, "32 bytes, base64url, unpadded")
+        for token in ["+", "/", "="] {
+            XCTAssertFalse(verifier.contains(token), "base64url, not base64")
+            XCTAssertFalse(challenge.contains(token))
+        }
+        // Recomputing over the verifier *string* must reproduce the challenge.
+        let expected = CodexAuth.base64URLEncode(
+            Data(SHA256.hash(data: Data(verifier.utf8))))
+        XCTAssertEqual(challenge, expected)
+        let (other, _) = CodexAuth.generatePKCE()
+        XCTAssertNotEqual(verifier, other, "fresh randomness each time")
+    }),
+
+    ("codex: form encoding matches URLSearchParams", {
+        // The token endpoint takes x-www-form-urlencoded, and a wrongly-escaped verifier fails
+        // with the same opaque error as a wrong challenge.
+        let encoded = CodexAuth.formEncode(["grant_type": "refresh_token", "a b": "c+d/e=f"])
+        XCTAssertTrue(encoded.contains("grant_type=refresh_token"))
+        XCTAssertTrue(encoded.contains("a%20b=c%2Bd%2Fe%3Df"),
+                      "reserved characters escaped, got: \(encoded)")
+    }),
+
+    ("codex: the account id comes from the right JWT claim", {
+        // Nested under "https://api.openai.com/auth", which is not a path a generic JWT reader
+        // would find.
+        let payload = #"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-123"},"sub":"x"}"#
+        let encoded = CodexAuth.base64URLEncode(Data(payload.utf8))
+        let token = "header.\(encoded).signature"
+        XCTAssertEqual(CodexAuth.accountID(fromAccessToken: token), "acct-123")
+        // Absent claim, wrong shape, and a non-JWT all return nil rather than something wrong.
+        let empty = CodexAuth.base64URLEncode(Data(#"{"sub":"x"}"#.utf8))
+        XCTAssertNil(CodexAuth.accountID(fromAccessToken: "h.\(empty).s"))
+        XCTAssertNil(CodexAuth.accountID(fromAccessToken: "not-a-jwt"))
+    }),
+
+    ("codex: expiry uses the same comparison as the harness", {
+        // `>=` on milliseconds, with no early-refresh window: a different threshold would mean
+        // the two clients disagree about whether a stored token is still usable.
+        let now = Int(Date().timeIntervalSince1970 * 1000)
+        XCTAssertTrue(CodexAuth.Credentials(
+            access: "a", refresh: "r", expires: now - 1, accountId: "x").isExpired)
+        XCTAssertFalse(CodexAuth.Credentials(
+            access: "a", refresh: "r", expires: now + 60_000, accountId: "x").isExpired)
+    }),
+
+    ("codex: pasted input is accepted in all four shapes", {
+        let url = CodexAuth.parseAuthorizationInput(
+            "http://localhost:1455/auth/callback?code=C1&state=S1")
+        XCTAssertEqual(url.code, "C1")
+        XCTAssertEqual(url.state, "S1")
+        let hashed = CodexAuth.parseAuthorizationInput("C2#S2")
+        XCTAssertEqual(hashed.code, "C2")
+        XCTAssertEqual(hashed.state, "S2")
+        let query = CodexAuth.parseAuthorizationInput("code=C3&state=S3")
+        XCTAssertEqual(query.code, "C3")
+        XCTAssertEqual(query.state, "S3")
+        XCTAssertEqual(CodexAuth.parseAuthorizationInput("  C4  ").code, "C4")
+        XCTAssertNil(CodexAuth.parseAuthorizationInput("   ").code)
+    }),
+
+    ("codex: the credential store shares auth.json without disturbing other providers", {
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        try FileManager.default.createDirectory(at: home.root, withIntermediateDirectories: true)
+        // Something the harness put there that Aviary must not lose.
+        try #"{"anthropic":{"type":"api_key","key":"sk-keep-me"}}"#
+            .write(to: home.authFile, atomically: true, encoding: .utf8)
+
+        let store = CodexAuth.Store(home: home)
+        XCTAssertNil(store.credentials(), "nothing stored for codex yet")
+        try store.save(CodexAuth.Credentials(
+            access: "at", refresh: "rt", expires: 1_700_000_000_000, accountId: "acct"))
+
+        let read = try XCTUnwrap(store.credentials())
+        XCTAssertEqual(read.access, "at")
+        XCTAssertEqual(read.accountId, "acct")
+        XCTAssertEqual(read.expires, 1_700_000_000_000, "milliseconds, as the harness stores it")
+
+        let raw = try XCTUnwrap(JSONValue.parse(
+            try Data(contentsOf: home.authFile)))
+        XCTAssertEqual(raw.path("anthropic.key")?.stringValue, "sk-keep-me",
+                       "the other provider survived a read-modify-write")
+        XCTAssertEqual(raw.path("openai-codex.type")?.stringValue, "oauth")
+        // 0600, like the harness — an atomic replace does not inherit the old mode.
+        let mode = try FileManager.default.attributesOfItem(
+            atPath: home.authFile.path)[.posixPermissions] as? Int
+        XCTAssertEqual(mode, 0o600)
+    }),
+
+    // ------------------------------------------------------------------ codex requests
+    ("codex: the URL is <base>/codex/responses, however the base is written", {
+        XCTAssertEqual(
+            CodexResponsesProvider.resolveURL(nil).absoluteString,
+            "https://chatgpt.com/backend-api/codex/responses")
+        for base in ["https://x.test", "https://x.test/", "https://x.test/codex",
+                     "https://x.test/codex/responses"] {
+            XCTAssertEqual(
+                CodexResponsesProvider.resolveURL(base).absoluteString,
+                "https://x.test/codex/responses", "base \(base)")
+        }
+    }),
+
+    ("codex: the header set matches the reference, spellings included", {
+        let headers = CodexResponsesProvider.headers(
+            token: "TK", accountID: "ACC", sessionID: "SID")
+        XCTAssertEqual(headers["Authorization"], "Bearer TK")
+        XCTAssertEqual(headers["chatgpt-account-id"], "ACC")
+        XCTAssertEqual(headers["originator"], "pi")
+        XCTAssertEqual(headers["OpenAI-Beta"], "responses=experimental")
+        // Lowercase, because that is how the reference sets them.
+        XCTAssertEqual(headers["accept"], "text/event-stream")
+        XCTAssertEqual(headers["content-type"], "application/json")
+        XCTAssertEqual(headers["session_id"], "SID")
+        XCTAssertEqual(headers["x-client-request-id"], "SID")
+        // `pi (<platform> <release>; <arch>)`, and Node reports x64 rather than x86_64.
+        let agent = try XCTUnwrap(headers["User-Agent"])
+        XCTAssertTrue(agent.hasPrefix("pi (darwin "), "got \(agent)")
+        XCTAssertFalse(agent.contains("x86_64"), "Node reports x64")
+        // Without a session id, neither correlation header is invented.
+        let bare = CodexResponsesProvider.headers(token: "T", accountID: "A", sessionID: nil)
+        XCTAssertNil(bare["session_id"])
+        XCTAssertNil(bare["x-client-request-id"])
+    }),
+
+    ("codex: the request body matches a captured harness payload field for field", {
+        // Verified empirically against a real recorded harness request on 2026-08-22: every
+        // field below was compared and found identical.
+        let body = CodexResponsesProvider.body(
+            for: ChatRequest(
+                model: "gpt-5.6-terra",
+                messages: [.system("SYS"), .user("hello")],
+                tools: Agent.tools(cwd: "/tmp")),
+            sessionID: "sess-1", model: nil)
+        XCTAssertEqual(body["model"]?.stringValue, "gpt-5.6-terra")
+        // The endpoint rejects store: true ("Store must be set to false").
+        XCTAssertEqual(body["store"]?.boolValue, false)
+        XCTAssertEqual(body["stream"]?.boolValue, true)
+        // The system prompt is `instructions`, not a message.
+        XCTAssertEqual(body["instructions"]?.stringValue, "SYS")
+        XCTAssertEqual(body.path("text.verbosity")?.stringValue, "low")
+        // How reasoning survives a turn on this route.
+        XCTAssertEqual(body["include"]?.arrayValue?.first?.stringValue,
+                       "reasoning.encrypted_content")
+        XCTAssertEqual(body["tool_choice"]?.stringValue, "auto")
+        XCTAssertEqual(body["parallel_tool_calls"]?.boolValue, true)
+        XCTAssertEqual(body["prompt_cache_key"]?.stringValue, "sess-1")
+        XCTAssertEqual(body["service_tier"]?.stringValue, "default")
+        // Present by default, because it is present on a harness request.
+        XCTAssertEqual(body.path("reasoning.effort")?.stringValue, "medium")
+        XCTAssertEqual(body.path("reasoning.summary")?.stringValue, "auto")
+        // `strict: null` for this provider — not false, and not absent.
+        let tool = try XCTUnwrap(body["tools"]?.arrayValue?.first)
+        XCTAssertEqual(tool["type"]?.stringValue, "function")
+        XCTAssertTrue(tool["strict"]?.isNull ?? false)
+        XCTAssertNotNil(tool["parameters"])
+        // No system message in `input`.
+        let input = try XCTUnwrap(body["input"]?.arrayValue)
+        XCTAssertEqual(input.count, 1)
+        XCTAssertEqual(input[0]["role"]?.stringValue, "user")
+        XCTAssertEqual(input[0].path("content.0.type")?.stringValue, "input_text")
+    }),
+
+    ("codex: an empty system prompt still sends the reference's fallback", {
+        let body = CodexResponsesProvider.body(
+            for: ChatRequest(model: "m", messages: [.user("hi")]),
+            sessionID: nil, model: nil)
+        XCTAssertEqual(body["instructions"]?.stringValue, "You are a helpful assistant.")
+        XCTAssertNil(body["prompt_cache_key"], "not invented when there is no session")
+    }),
+
+    ("codex: a thinking level the model maps to null omits reasoning entirely", {
+        // The map's values are optional for exactly this: gpt-5.6 sends `minimal` to null, and
+        // sending a default instead would be a request the route did not ask for.
+        var model = fakeModel()
+        model.thinkingLevelMap = ["xhigh": "xhigh", "minimal": nil, "max": "max"]
+        let omitted = CodexResponsesProvider.body(
+            for: ChatRequest(model: "m", messages: [.user("x")], reasoningEffort: "minimal"),
+            sessionID: nil, model: model)
+        XCTAssertNil(omitted["reasoning"])
+        let mapped = CodexResponsesProvider.body(
+            for: ChatRequest(model: "m", messages: [.user("x")], reasoningEffort: "xhigh"),
+            sessionID: nil, model: model)
+        XCTAssertEqual(mapped.path("reasoning.effort")?.stringValue, "xhigh")
+    }),
+
+    ("codex: tool calls and results use call_id and encoded arguments", {
+        let body = CodexResponsesProvider.body(
+            for: ChatRequest(model: "m", messages: [
+                ChatMessage(role: .assistant, content: [
+                    // The harness's ids can be `callId|itemId`; only the call id is sent.
+                    .toolCall(id: "call_1|fc_abc", name: "python",
+                              arguments: .object(["code": .string("1+1")])),
+                ]),
+                ChatMessage(role: .tool, content: [
+                    .toolResult(id: "call_1|fc_abc", name: "python", text: "2", isError: false),
+                ]),
+            ]), sessionID: nil, model: nil)
+        let input = try XCTUnwrap(body["input"]?.arrayValue)
+        XCTAssertEqual(input[0]["type"]?.stringValue, "function_call")
+        XCTAssertEqual(input[0]["call_id"]?.stringValue, "call_1")
+        // A JSON *string*, which is what the Responses API takes here.
+        XCTAssertEqual(input[0]["arguments"]?.stringValue, #"{"code":"1+1"}"#)
+        XCTAssertEqual(input[1]["type"]?.stringValue, "function_call_output")
+        XCTAssertEqual(input[1]["call_id"]?.stringValue, "call_1")
+        XCTAssertEqual(input[1]["output"]?.stringValue, "2")
+    }),
+
+    ("codex: retry classification matches the reference", {
+        for status in [429, 500, 502, 503, 504] {
+            XCTAssertTrue(CodexResponsesProvider.isRetryable(status: status, body: ""), "\(status)")
+        }
+        XCTAssertFalse(CodexResponsesProvider.isRetryable(status: 400, body: "bad request"))
+        XCTAssertFalse(CodexResponsesProvider.isRetryable(status: 401, body: "unauthorized"))
+        // And the body patterns, which catch a 200-with-error and an upstream failure.
+        XCTAssertTrue(CodexResponsesProvider.isRetryable(status: 400, body: "Rate limit hit"))
+        XCTAssertTrue(CodexResponsesProvider.isRetryable(status: 400, body: "upstream connect error"))
+        XCTAssertTrue(CodexResponsesProvider.isRetryable(status: 400, body: "service unavailable"))
+    }),
+
+    ("codex: a usage-limit error becomes something a person can act on", {
+        let resets = Date().addingTimeInterval(1800).timeIntervalSince1970
+        let friendly = CodexResponsesProvider.friendlyError(
+            #"{"error":{"code":"usage_limit_reached","plan_type":"Plus","resets_at":\#(Int(resets))}}"#)
+        let text = try XCTUnwrap(friendly)
+        XCTAssertTrue(text.contains("usage limit"))
+        XCTAssertTrue(text.contains("plus plan"))
+        XCTAssertTrue(text.contains("29 minutes") || text.contains("30 minutes"), "got \(text)")
+        // An ordinary error passes its message through rather than being dressed up.
+        XCTAssertEqual(
+            CodexResponsesProvider.friendlyError(#"{"error":{"message":"nope"}}"#), "nope")
+        XCTAssertNil(CodexResponsesProvider.friendlyError("not json"))
+    }),
+
+    ("codex: the built-in model catalogue matches the harness's", {
+        // Transcribed, not invented: a model id this client sends that no known harness sends
+        // is an anomaly.
+        let provider = BuiltInProviders.openAICodex()
+        XCTAssertEqual(provider.id, "openai-codex")
+        XCTAssertEqual(provider.api, "openai-codex-responses")
+        XCTAssertEqual(provider.baseURL, "https://chatgpt.com/backend-api")
+        XCTAssertTrue(provider.isBuiltIn)
+        let ids = provider.models.map(\.id)
+        for expected in ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
+                         "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2-codex",
+                         "gpt-5.2", "gpt-5.1", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"] {
+            XCTAssertTrue(ids.contains(expected), "missing \(expected)")
+        }
+        let terra = try XCTUnwrap(provider.models.first { $0.id == "gpt-5.6-terra" })
+        XCTAssertEqual(terra.contextWindow, 272_000)
+        XCTAssertEqual(terra.maxTokens, 128_000)
+        XCTAssertEqual(terra.costInput, 2.5)
+        XCTAssertEqual(terra.costCacheWrite, 3.125)
+        XCTAssertTrue(terra.reasoning)
+        // The null in this map is the load-bearing part.
+        XCTAssertTrue(terra.thinkingLevelMap?["minimal"] == .some(nil))
+        let spark = try XCTUnwrap(provider.models.first { $0.id == "gpt-5.3-codex-spark" })
+        XCTAssertEqual(spark.contextWindow, 128_000, "the one model with a smaller window")
     }),
 ])

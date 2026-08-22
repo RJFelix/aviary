@@ -189,14 +189,60 @@ The shipped example is disabled by default, and its first version is a lesson: i
 `rm -rf /tmp/scratch`, which is fine and which an agent has every reason to run. A guard that
 refuses reasonable things teaches the agent to route around it, which is worse than no guard.
 
+### The Codex path is a transcription, not a design
+
+`CodexAuth.swift`, `CodexLogin.swift`, `CodexProvider.swift` and the catalogue in
+`BuiltInProviders.swift` are a **deliberate one-to-one reimplementation** of the harness's
+`utils/oauth/openai-codex.ts` and `providers/openai-codex-responses.ts`. Every value that
+reaches an OpenAI server is copied rather than chosen: the client id, endpoints, scope, the
+three Codex-specific authorize parameters, the PKCE method, the header set and its exact
+spellings, the body's fields and defaults, the retry policy.
+
+**The rule for those files is that a difference is a bug, not an improvement.** Third-party
+harness use is in a tolerated grey area; looking like a *novel* client is what risks being
+mistaken for credential resale. Comments mark every field that looks arbitrary so a future
+reader does not tidy it away.
+
+Verified empirically rather than by reading alone. A harness request was captured with the
+wire-log extension and diffed field by field against Aviary's for the same model:
+
+```
+keys identical: True     harness-only: []     mine-only: []
+  include, model, parallel_tool_calls, service_tier, store, stream, text,
+  tool_choice          all identical
+  reasoning            {"effort":"high"} vs {"effort":"medium"} — session preference,
+                       and "medium" is the harness's own DEFAULT_THINKING_LEVEL
+  tools[].strict       null in both (not false, not absent)
+```
+
+That diff found two real deviations that reading had missed: `service_tier` was absent
+entirely, and `reasoning` was omitted when no effort was requested where a harness request
+always carries it. Both fixed. Outgoing headers were captured the same way and match, including
+`originator: pi` and the `pi (darwin <release>; <arch>)` user agent — with Node's `x64` spelling
+rather than uname's `x86_64`.
+
+**One known residual difference**, recorded because pretending otherwise would be worse:
+URLSession adds `Accept-Language` to every request and it cannot be suppressed from
+`httpAdditionalHeaders`. Node's fetch does not send it. It is a transport-layer default of every
+native macOS client rather than an application-level identity signal, and hand-rolling an HTTP
+stack to remove one standard header would be a far larger deviation than the header is.
+
+Credentials live in the harness's own `auth.json`, in the same shape and mode 0600, so a login
+done in either client works in the other. There is one account; two stores would mean two
+logins and a refresh race.
+
+`Aviary --codex-login` runs the flow. `--paste` adds a manual code entry that **races** the
+browser callback rather than replacing it — the reference does this, and implementing them as
+alternatives broke a real login: the paste prompt returned immediately, tore down the listener,
+and the browser's redirect hit a closed port. The listener binds `127.0.0.1` only, and a state
+mismatch answers 400 and keeps waiting rather than ending the login, both matching the reference.
+
 ### What the harness still does and this does not
 
-The OAuth-authenticated built-in providers — `openai-codex` and the Anthropic subscription
-login. A real gap, and a large one: device-code flows, token storage and refresh, plus the
-`openai-responses` wire format. Worth noting the reason it is not the priority it looks like:
-the harness's own docs say its Claude Pro/Max login bills as extra per-token usage rather than
-against plan limits, so that path was never about cheaper tokens — only about which client
-Anthropic sees.
+The Anthropic subscription login. Deferred deliberately: the harness's own docs say its Claude
+Pro/Max login bills as extra per-token usage rather than against plan limits, so that path was
+never about cheaper tokens — only about which client Anthropic sees. Plan-included Claude usage
+needs Claude Code driving, per `plans/claude-code-as-transport.md`.
 
 ## The runtime host
 

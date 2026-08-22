@@ -33,6 +33,10 @@ just build
 Aviary --agent "count the swift files under app/Sources" --model litellm/claude-haiku-4-5
 ```
 
+Sign in to ChatGPT for the Codex models with `Aviary --codex-login` (add `--paste` if the
+browser redirect cannot reach this machine). Credentials go in the same `auth.json` the harness
+uses, so one login serves both.
+
 Flags: `--cwd <path>`, `--host python3-shared` (for numpy/pandas), `--record` (capture request
 payloads), `--budget <tokens>` and `--minutes <n>` (a goal the agent can see and plan against),
 `--quiet`. A prompt starting with `/name` expands a prompt template. In the GUI, the Live tab's launcher picks between the in-house engine and

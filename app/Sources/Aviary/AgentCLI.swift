@@ -15,6 +15,9 @@ enum AgentCLI {
 
     static func runIfRequested() {
         let args = ProcessInfo.processInfo.arguments
+        if args.contains("--codex-login") {
+            runCodexLogin(paste: args.contains("--paste"))
+        }
         guard let flag = args.firstIndex(of: "--agent") else { return }
         let prompt = args.count > flag + 1 ? args[flag + 1] : ""
         guard !prompt.isEmpty, !prompt.hasPrefix("--") else {
@@ -45,6 +48,75 @@ enum AgentCLI {
         exit(0)
     }
 
+    /// `Aviary --codex-login` — sign in to ChatGPT for the Codex provider.
+    private static func runCodexLogin(paste: Bool) -> Never {
+        let done = Atomic(false)
+        var failure: String?
+        Task {
+            _ = await ProcessEnvironment.shared.loadFromLoginShell()
+            let store = CodexAuth.Store(home: .default)
+            let login = CodexLogin()
+            do {
+                let started = try await login.begin()
+                note("Opening your browser to sign in to ChatGPT.")
+                note("If it does not open, visit:\n\n\(started.url.absoluteString)\n")
+                _ = await Shell.run("/usr/bin/open", [started.url.absoluteString], timeout: 15)
+
+                // The paste option *races* the browser callback rather than replacing it —
+                // which is what the reference does, and getting it wrong cost a real login: a
+                // paste prompt that returned immediately tore down the listener while the
+                // browser was still on the consent screen, so the redirect hit a closed port.
+                //
+                // Whichever arrives first wins, and the listener stays up either way.
+                note("Waiting for the browser to come back on port \(CodexAuth.callbackPort).")
+                if paste {
+                    note("Or paste the code / full redirect URL here and press return.")
+                }
+                let code: String = try await withThrowingTaskGroup(of: String.self) { group in
+                    group.addTask { try await login.waitForCode() }
+                    if paste {
+                        group.addTask {
+                            // readLine blocks a thread, so it runs off the cooperative pool.
+                            let typed: String = await withCheckedContinuation { cont in
+                                Thread.detachNewThread { cont.resume(returning: readLine() ?? "") }
+                            }
+                            let parsed = CodexAuth.parseAuthorizationInput(typed)
+                            guard let parsedCode = parsed.code, !parsedCode.isEmpty else {
+                                // Not a failure of the whole login: the callback may still be
+                                // coming, so this branch simply never wins the race.
+                                try await Task.sleep(nanoseconds: 300 * 1_000_000_000)
+                                throw CodexAuth.AuthError.callbackFailed("nothing pasted")
+                            }
+                            if let parsedState = parsed.state, parsedState != started.state {
+                                throw CodexAuth.AuthError.stateMismatch
+                            }
+                            return parsedCode
+                        }
+                    }
+                    let first = try await group.next()!
+                    group.cancelAll()
+                    return first
+                }
+
+                let credentials = try await login.complete(
+                    code: code, verifier: started.verifier, expectedState: nil, store: store)
+                note("Signed in. Account \(credentials.accountId), token valid until "
+                    + "\(Fmt.timestamp(credentials.expiresAt)).")
+                note("Stored in \(store.url.path) — the same file the harness reads, so this "
+                    + "login works in both.")
+            } catch {
+                failure = error.localizedDescription
+            }
+            await login.stop()
+            done.set(true)
+        }
+        while !done.get() {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        if let failure { fail(failure) }
+        exit(0)
+    }
+
     private static func run(
         prompt: String, modelRef: String?, cwd: String, variant: String, quiet: Bool,
         record: Bool, tokenBudget: Int?, minutes: Double?
@@ -59,20 +131,41 @@ enum AgentCLI {
         // 1. A model, and the provider that serves it.
         let auth = AuthInfo.load(home: home)
         let config = ModelsConfig.load(home: home, auth: auth)
-        guard let (providerSpec, model) = resolve(modelRef, in: config) else {
-            let available = config.providers.flatMap { p in p.models.map { "\(p.id)/\($0.id)" } }
+        guard let (providerSpec, model) = resolve(modelRef, in: config, auth: auth) else {
+            let available = (config.providers + [BuiltInProviders.openAICodex()])
+                .flatMap { p in p.models.map { "\(p.id)/\($0.id)" } }
             fail("No such model. Configured: \(available.prefix(12).joined(separator: ", "))")
         }
-        guard let baseURL = providerSpec.baseURL.flatMap(URL.init(string:)) else {
-            fail("Provider \(providerSpec.id) has no baseUrl.")
+        let provider: ChatProvider
+        if providerSpec.api == "openai-codex-responses" {
+            // OAuth rather than a key. Resolved up front so a missing login is an error at
+            // launch rather than a 401 three turns in.
+            let credentialStore = CodexAuth.Store(home: home)
+            guard credentialStore.credentials() != nil else {
+                fail("Not signed in to OpenAI Codex. Run `Aviary --codex-login`.")
+            }
+            provider = CodexResponsesProvider(
+                id: providerSpec.id, store: credentialStore, model: model,
+                baseURL: providerSpec.baseURL, sessionID: UUID().uuidString)
+        } else {
+            guard let baseURL = providerSpec.baseURL.flatMap(URL.init(string:)) else {
+                fail("Provider \(providerSpec.id) has no baseUrl.")
+            }
+            let key = await ApiKeyResolver.resolve(providerSpec.apiKeyExpression)
+            if !key.ok {
+                // Non-blocking: a provider may legitimately need no key, and refusing to start
+                // on a format guess is how a working setup gets called broken.
+                note("credentials: \(key.explanation)")
+            }
+            let resolvedKey = await resolvedSecret(providerSpec.apiKeyExpression)
+            provider = providerSpec.api == "anthropic-messages"
+                ? AnthropicMessagesProvider(
+                    id: providerSpec.id, baseURL: baseURL, apiKey: resolvedKey,
+                    extraHeaders: providerSpec.headers)
+                : OpenAICompletionsProvider(
+                    id: providerSpec.id, baseURL: baseURL, apiKey: resolvedKey,
+                    extraHeaders: providerSpec.headers)
         }
-        let key = await ApiKeyResolver.resolve(providerSpec.apiKeyExpression)
-        if !key.ok {
-            // Non-blocking: a provider may legitimately need no key, and refusing to start on
-            // a format guess is how a working setup gets called broken.
-            note("credentials: \(key.explanation)")
-        }
-        let resolvedKey = await resolvedSecret(providerSpec.apiKeyExpression)
 
         // 2. The runtime host.
         let hostScript = repoRoot.appending(path: "runtime-hosts/\(variant)/host.py")
@@ -92,9 +185,6 @@ enum AgentCLI {
         }
 
         // 3. A runner, which owns session creation, sub-agents and the callback wiring.
-        let provider = OpenAICompletionsProvider(
-            id: providerSpec.id, baseURL: baseURL, apiKey: resolvedKey,
-            extraHeaders: providerSpec.headers)
         // A prompt template, if the prompt is a slash command. Expanded before anything else
         // reads the prompt, so skills and memory rank against what will actually be sent.
         let expander = PromptExpander(
@@ -210,10 +300,13 @@ enum AgentCLI {
 
     /// `provider/model`, or a bare model id matched across providers, or the first configured.
     static func resolve(
-        _ reference: String?, in config: ModelsConfig
+        _ reference: String?, in config: ModelsConfig, auth: AuthInfo? = nil
     ) -> (ProviderSpec, ModelSpec)? {
+        // Built-ins last, so a models.json entry always wins — someone who has configured a
+        // provider explicitly meant it.
+        let providers = config.providers + [BuiltInProviders.openAICodex(auth: auth)]
         guard let reference, !reference.isEmpty else {
-            for provider in config.providers {
+            for provider in providers {
                 if let first = provider.models.first { return (provider, first) }
             }
             return nil
@@ -222,13 +315,13 @@ enum AgentCLI {
             // Split on the *first* slash only: model ids contain slashes too, as with
             // `baseten/deepseek-v4-pro` behind the gateway.
             let parts = reference.split(separator: "/", maxSplits: 1).map(String.init)
-            if let provider = config.providers.first(where: { $0.id == parts[0] }),
+            if let provider = providers.first(where: { $0.id == parts[0] }),
                let model = provider.models.first(where: { $0.id == parts[1] })
             {
                 return (provider, model)
             }
         }
-        for provider in config.providers {
+        for provider in providers {
             if let model = provider.models.first(where: { $0.id == reference }) {
                 return (provider, model)
             }

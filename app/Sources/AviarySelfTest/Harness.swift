@@ -53,6 +53,10 @@ func XCTAssertEqual<T: Equatable>(_ a: T, _ b: T, _ m: String = "", line: Int = 
     Harness.check(a == b, m.isEmpty ? "\(a) != \(b)" : m, line: line)
 }
 
+func XCTAssertNotEqual<T: Equatable>(_ a: T, _ b: T, _ m: String = "", line: Int = #line) {
+    Harness.check(a != b, m.isEmpty ? "\(a) == \(b)" : m, line: line)
+}
+
 func XCTAssertNotNil<T>(_ v: T?, _ m: String = "expected non-nil", line: Int = #line) {
     Harness.check(v != nil, m, line: line)
 }
