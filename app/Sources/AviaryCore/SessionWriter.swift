@@ -150,6 +150,19 @@ public actor SessionWriter {
             // Written only when the provider said something. Absent and zero mean different
             // things on an encrypted-reasoning route, and flattening them loses the evidence.
             if let reasoning = usage.reasoning { u["reasoning"] = .number(Double(reasoning)) }
+            // Cost, when the model published rates. Written into the transcript rather than
+            // derived at display time, so the Usage and Cockpit screens read the same numbers
+            // for an in-house run as for a harness one — and `sessionsWithoutPricing` keeps
+            // meaning "no rates published" rather than "cost zero".
+            if usage.cost.total > 0 {
+                u["cost"] = .object([
+                    "input": .number(usage.cost.input),
+                    "output": .number(usage.cost.output),
+                    "cacheRead": .number(usage.cost.cacheRead),
+                    "cacheWrite": .number(usage.cost.cacheWrite),
+                    "total": .number(usage.cost.total),
+                ])
+            }
             message["usage"] = .object(u)
         }
         if let stopReason { message["stopReason"] = .string(stopReason) }

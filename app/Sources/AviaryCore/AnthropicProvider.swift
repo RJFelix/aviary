@@ -54,8 +54,10 @@ public struct AnthropicMessagesProvider: ChatProvider {
             req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         }
         for (k, v) in extraHeaders { req.setValue(v, forHTTPHeaderField: k) }
-        req.httpBody = try JSONEncoder().encode(Self.body(for: request))
+        let payload = Self.body(for: request)
+        req.httpBody = try JSONEncoder().encode(payload)
         req.timeoutInterval = 600
+        yield(.requestBody(payload))
 
         let (bytes, response) = try await session.bytes(for: req)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {

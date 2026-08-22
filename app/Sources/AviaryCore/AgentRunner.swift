@@ -22,11 +22,14 @@ public actor AgentRunner {
         /// Where `remember` writes. Nil disables memory for the run, which is a legitimate
         /// configuration rather than a degraded one.
         public var memory: MemoryStore?
+        /// Record request payloads for the root run. Off unless asked: it writes the whole
+        /// system prompt and conversation to disk.
+        public var recordPayloads = false
 
         public init(
             home: AgentHome, cwd: String, model: ModelSpec, systemPrompt: String,
             maxDepth: Int = 3, maxIterations: Int = 40, childMaxIterations: Int = 20,
-            memory: MemoryStore? = nil
+            memory: MemoryStore? = nil, recordPayloads: Bool = false
         ) {
             self.home = home
             self.cwd = cwd
@@ -36,6 +39,7 @@ public actor AgentRunner {
             self.maxIterations = maxIterations
             self.childMaxIterations = childMaxIterations
             self.memory = memory
+            self.recordPayloads = recordPayloads
         }
     }
 
@@ -69,6 +73,9 @@ public actor AgentRunner {
         await agent.observe { event in obs?(event) }
         await agent.setSpawnDelegate(Delegate(runner: self, parentSessionID: writer.sessionID))
         await agent.setMemory(settings.memory)
+        if settings.recordPayloads {
+            await agent.recordPayloads(to: WireLog.path(forRun: UUID()))
+        }
 
         // Route the runtime's callbacks to this agent. One host serves many sessions, so the
         // handler dispatches on the host-session id rather than assuming a single agent.

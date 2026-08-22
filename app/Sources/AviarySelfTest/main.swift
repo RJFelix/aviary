@@ -1970,4 +1970,90 @@ await Harness.run([
         XCTAssertTrue(withMemory.contains("Not things the repository already says"),
                       "and what not to record, which is the harder half")
     }),
+
+    ("pricing: rates are per million tokens, and silence is not zero", {
+        var model = fakeModel()
+        var usage = Usage()
+        usage.input = 1_000_000
+        usage.output = 500_000
+        usage.cacheRead = 2_000_000
+        // No rates published: cost must stay empty so `sessionsWithoutPricing` keeps meaning
+        // "nothing published" rather than "free".
+        XCTAssertEqual(model.priced(usage).cost.total, 0)
+
+        model.costInput = 3
+        model.costOutput = 15
+        model.costCacheRead = 0.3
+        let priced = model.priced(usage)
+        XCTAssertEqual(priced.cost.input, 3, "1M input at $3/Mtok")
+        XCTAssertEqual(priced.cost.output, 7.5, "0.5M output at $15/Mtok")
+        XCTAssertEqual(priced.cost.cacheRead, 0.6, "2M cache reads at $0.30/Mtok")
+        XCTAssertEqual(priced.cost.total, 11.1)
+
+        // A route that publishes no cache rate still charges something, so the input rate is
+        // the fallback rather than zero.
+        model.costCacheRead = nil
+        XCTAssertEqual(model.priced(usage).cost.cacheRead, 6, "2M cache reads at the input rate")
+    }),
+
+    ("agent: recorded payloads land in the shape the breakdown screen reads", {
+        // The harness could only offer this through an extension, and even then the payload was
+        // whatever the harness had already built. Owning the provider makes it a first-class
+        // event.
+        guard let server = try FakeProviderServer(script: [["text": "hi"]]) else {
+            print("      skipped: no fixture"); return
+        }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let logURL = home.root.appending(path: "wire/run.jsonl")
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp",
+                          systemPrompt: "a distinctive system prompt"))
+        await agent.recordPayloads(to: logURL)
+        await agent.send("hello")
+        await writer.close()
+
+        let records = WireLog.read(url: logURL)
+        XCTAssertEqual(records.count, 1)
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(record.kind, .request)
+        // Attributed by session *file*, which is the canonical id — the harness's own
+        // prompt_cache_key looked like a session id and was a different one.
+        XCTAssertEqual(record.sessionFile, writer.fileURL.path)
+        let analysis = try XCTUnwrap(record.payload.map { WireLog.analyse(payload: $0) })
+        XCTAssertTrue(analysis.totalCharacters > 0)
+        XCTAssertTrue(analysis.segments.contains { $0.text?.contains("distinctive") == true },
+                      "the system prompt is decomposable, which is the point of recording it")
+    }),
+
+    ("agent: nothing is recorded unless recording was asked for", {
+        // It writes the full system prompt and conversation to disk, so it must never be
+        // implicit.
+        guard let server = try FakeProviderServer(script: [["text": "hi"]]) else { return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s"))
+        await agent.send("hello")
+        await writer.close()
+        let wireDir = home.root.appending(path: "wire")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: wireDir.path),
+                       "no recording was requested, so nothing should exist")
+    }),
 ])

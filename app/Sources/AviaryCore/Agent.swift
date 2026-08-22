@@ -96,6 +96,9 @@ public actor Agent {
     /// Where `remember` writes and `recall` reads. Absent means the run has no memory, which
     /// is a legitimate configuration rather than an error.
     private var memory: MemoryStore?
+    /// Where request payloads go, when a run is recording them. Off unless asked for: it writes
+    /// the full system prompt and conversation to disk, which should never be implicit.
+    private var wireLogURL: URL?
 
     public init(
         provider: ChatProvider, host: RuntimeHost, writer: SessionWriter,
@@ -132,6 +135,11 @@ public actor Agent {
 
     public func setMemory(_ store: MemoryStore?) {
         memory = store
+    }
+
+    /// Record every request payload, so the run can show where its input tokens went.
+    public func recordPayloads(to url: URL?) {
+        wireLogURL = url
     }
 
     /// Serve a request from the runtime. Wire this to `RuntimeHost.onCallback`.
@@ -539,8 +547,12 @@ public actor Agent {
                 emit(.thinkingDelta(t))
             case .toolCall(let id, let name, let arguments):
                 turn.toolCalls.append((id: id, name: name, arguments: arguments))
+            case .requestBody(let payload):
+                record(payload)
             case .usage(let u):
-                turn.usage = u
+                // Priced here rather than at display time, so the transcript carries dollars
+                // and every screen that reads it agrees without re-deriving them.
+                turn.usage = config.model.priced(u)
             case .done(let reason):
                 turn.stopReason = reason
             }
@@ -604,6 +616,37 @@ public actor Agent {
         if parts.isEmpty { return "(no output)" }
         return parts.joined(separator: "\n")
     }
+
+    /// Append one payload to the wire log, in the shape `WireLog` already reads.
+    private func record(_ payload: JSONValue) {
+        guard let wireLogURL else { return }
+        let record = JSONValue.object([
+            "v": .number(1),
+            "seq": .number(Double(recordedRequests)),
+            "at": .string(SessionWriter.stamp()),
+            "kind": .string("request"),
+            "sessionFile": .string(writer.fileURL.path),
+            "payload": payload,
+        ])
+        recordedRequests += 1
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        guard var data = try? encoder.encode(record) else { return }
+        data.append(UInt8(ascii: "\n"))
+        try? FileManager.default.createDirectory(
+            at: wireLogURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: wireLogURL.path) {
+            FileManager.default.createFile(atPath: wireLogURL.path, contents: nil)
+        }
+        // Best-effort, and silent on failure: diagnostics must never take down a run, and a
+        // full disk should not produce one error per model call.
+        guard let handle = try? FileHandle(forWritingTo: wireLogURL) else { return }
+        defer { try? handle.close() }
+        try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
+    }
+
+    private var recordedRequests = 0
 
     private func emit(_ event: Event) {
         observer?(event)

@@ -486,7 +486,10 @@ final class AppModel {
 
     /// Start an in-house run: Aviary's own loop, its own provider client, its own runtime
     /// host. No harness process and no Node.
-    func startInHouseRun(cwd: String, providerID: String?, modelID: String?, prompt: String) {
+    func startInHouseRun(
+        cwd: String, providerID: String?, modelID: String?, prompt: String,
+        recordPayloads: Bool = false
+    ) {
         guard let (providerSpec, model) = AgentCLI.resolve(
             [providerID, modelID].compactMap { $0 }.joined(separator: "/"),
             in: modelsConfig) ?? AgentCLI.resolve(modelID, in: modelsConfig)
@@ -496,7 +499,8 @@ final class AppModel {
         }
         let run = LiveRun(
             inHouse: InHouseDriver(
-                home: home, cwd: cwd, model: model, providerSpec: providerSpec),
+                home: home, cwd: cwd, model: model, providerSpec: providerSpec,
+                recordPayloads: recordPayloads),
             cwd: cwd, modelLabel: model.qualifiedID)
         runs.append(run)
         focusedRunID = run.id

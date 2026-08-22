@@ -557,7 +557,13 @@ struct LauncherSheet: View {
                                 .font(.system(size: 10))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
-                            if EngineLocator.wireLogExtension() == nil {
+                            if model.preferInHouseEngine {
+                                Text("On the in-house engine this is native — the provider "
+                                    + "announces each payload as it sends it, so there is no "
+                                    + "extension to install.")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.tertiary)
+                            } else if EngineLocator.wireLogExtension() == nil {
                                 Text("Unavailable: harness-extensions/wire-log.ts is missing "
                                     + "from this checkout.")
                                     .font(.system(size: 10))
@@ -584,7 +590,8 @@ struct LauncherSheet: View {
                             cwd: cwd.isEmpty ? model.defaultCwd : cwd,
                             providerID: provider.isEmpty ? nil : provider,
                             modelID: modelID.isEmpty ? nil : modelID,
-                            prompt: prompt)
+                            prompt: prompt,
+                            recordPayloads: recordPayloads)
                         dismiss()
                         return
                     }

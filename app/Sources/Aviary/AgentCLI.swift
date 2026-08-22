@@ -18,18 +18,21 @@ enum AgentCLI {
         guard let flag = args.firstIndex(of: "--agent") else { return }
         let prompt = args.count > flag + 1 ? args[flag + 1] : ""
         guard !prompt.isEmpty, !prompt.hasPrefix("--") else {
-            fail("usage: Aviary --agent \"<prompt>\" [--model provider/id] [--cwd path] [--host python3|python3-shared]")
+            fail("usage: Aviary --agent \"<prompt>\" [--model provider/id] [--cwd path] "
+                + "[--host python3|python3-shared] [--record] [--quiet]")
         }
         let model = value(of: "--model", in: args)
         let cwd = value(of: "--cwd", in: args) ?? FileManager.default.currentDirectoryPath
         let variant = value(of: "--host", in: args) ?? "python3"
         let quiet = args.contains("--quiet")
+        let record = args.contains("--record")
 
         // Its own run loop: this process has no NSApplication, and the async work below needs
         // the main queue drained or nothing progresses. The same reason `--snapshot` pumps it.
         let done = Atomic(false)
         Task {
-            await run(prompt: prompt, modelRef: model, cwd: cwd, variant: variant, quiet: quiet)
+            await run(prompt: prompt, modelRef: model, cwd: cwd, variant: variant,
+                      quiet: quiet, record: record)
             done.set(true)
         }
         while !done.get() {
@@ -39,7 +42,8 @@ enum AgentCLI {
     }
 
     private static func run(
-        prompt: String, modelRef: String?, cwd: String, variant: String, quiet: Bool
+        prompt: String, modelRef: String?, cwd: String, variant: String, quiet: Bool,
+        record: Bool
     ) async {
         _ = await ProcessEnvironment.shared.loadFromLoginShell()
         let home = AgentHome.default
@@ -120,7 +124,7 @@ enum AgentCLI {
                 systemPrompt: SystemPrompt.build(
                     cwd: cwd, model: model, skills: gate.render(selection),
                     memory: memoryGate.render(recalled)),
-                memory: memory))
+                memory: memory, recordPayloads: record))
 
         await runner.observe { event in
             switch event {

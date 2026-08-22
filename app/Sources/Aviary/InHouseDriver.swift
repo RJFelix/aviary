@@ -41,7 +41,14 @@ final class InHouseDriver {
     private var agent: Agent?
     private(set) var acceptsFollowUps = false
 
-    init(home: AgentHome, cwd: String, model: ModelSpec, providerSpec: ProviderSpec) {
+    /// Whether to record request payloads, so the run's "what was sent" breakdown works.
+    private let recordPayloads: Bool
+
+    init(
+        home: AgentHome, cwd: String, model: ModelSpec, providerSpec: ProviderSpec,
+        recordPayloads: Bool = false
+    ) {
+        self.recordPayloads = recordPayloads
         self.home = home
         self.cwd = cwd
         self.model = model
@@ -112,7 +119,7 @@ final class InHouseDriver {
                 systemPrompt: SystemPrompt.build(
                     cwd: cwd, model: model, skills: gate.render(selection),
                     memory: memoryGate.render(recalled)),
-                memory: memory))
+                memory: memory, recordPayloads: recordPayloads))
         self.runner = runner
 
         await runner.observe { [weak self] event in

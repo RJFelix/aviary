@@ -85,6 +85,14 @@ public struct ChatRequest: Sendable {
 // MARK: - Streaming
 
 public enum ChatEvent: Sendable {
+    /// The exact serialized request, before it goes out.
+    ///
+    /// The harness could only offer this through an extension hook, and even then the payload
+    /// was whatever the harness had already built. Owning the provider means the "what was
+    /// sent" breakdown is a first-class event rather than a debugging side channel — and it is
+    /// emitted whether or not anybody is recording, because a caller that ignores it pays
+    /// nothing.
+    case requestBody(JSONValue)
     case textDelta(String)
     case thinkingDelta(String)
     /// A tool call, only once its arguments are complete — the loop has no use for a partial
@@ -246,8 +254,10 @@ public struct OpenAICompletionsProvider: ChatProvider {
             req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
         for (k, v) in extraHeaders { req.setValue(v, forHTTPHeaderField: k) }
-        req.httpBody = try JSONEncoder().encode(Self.body(for: request))
+        let payload = Self.body(for: request)
+        req.httpBody = try JSONEncoder().encode(payload)
         req.timeoutInterval = 600
+        yield(.requestBody(payload))
 
         let (bytes, response) = try await session.bytes(for: req)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
