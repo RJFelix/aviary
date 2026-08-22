@@ -532,7 +532,8 @@ struct LauncherSheet: View {
                                     + "host. No harness process and no Node. Skills are ranked "
                                     + "against your prompt rather than all sent, and the "
                                     + "transcript is written in the same format so every other "
-                                    + "screen still reads it. One prompt per run for now."
+                                    + "screen still reads it. Follow-ups continue in the same "
+                                    + "interpreter, so variables persist between prompts."
                                 : "The vendored Prime Agent harness over its RPC protocol. "
                                     + "Supports follow-ups, steering and payload recording.")
                                 .font(.system(size: 10))

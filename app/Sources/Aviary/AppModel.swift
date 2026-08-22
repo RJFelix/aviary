@@ -621,7 +621,9 @@ final class LiveRun: Identifiable {
                 self.sessionID = inHouse.sessionID
                 self.sessionFile = inHouse.sessionFile?.path
                 self.errorBanner = inHouse.errorBanner
-                if inHouse.hasExited && !inHouse.isStreaming { break }
+                // Only stop mirroring once the run is genuinely finished. Idle-between-prompts
+                // is not finished — the interpreter and the conversation are still alive.
+                if inHouse.hasExited { break }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
         }
@@ -759,12 +761,20 @@ final class LiveRun: Identifiable {
 
     func send(_ text: String) async {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        if inHouse != nil {
-            // Multi-turn on an in-house run is not wired yet: the loop takes one prompt and
-            // runs it to completion. Said plainly rather than silently dropped.
-            builder.appendNote("Follow-up prompts are not supported on an in-house run yet — "
-                + "start another run.")
-            sync()
+        if let inHouse {
+            guard inHouse.acceptsFollowUps else {
+                builder.appendNote("The run is still starting — try again in a moment.")
+                sync()
+                return
+            }
+            guard !inHouse.isStreaming else {
+                // No queue yet, and saying so beats appearing to accept a prompt that is
+                // then dropped.
+                builder.appendNote("Still working. Wait for this turn to finish.")
+                sync()
+                return
+            }
+            inHouse.send(text)
             return
         }
         if title == "New run" { title = String(text.prefix(60)) }

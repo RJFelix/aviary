@@ -34,6 +34,11 @@ final class InHouseDriver {
     private var writer: SessionWriter?
     private var watcher: SessionWatcher?
     private var task: Task<Void, Never>?
+    /// Kept so the run can take another prompt. The loop is per-prompt; the conversation,
+    /// the runtime session and its Python state all persist across them — which is the whole
+    /// reason a session is worth more than a request.
+    private var agent: Agent?
+    private(set) var acceptsFollowUps = false
 
     init(home: AgentHome, cwd: String, model: ModelSpec, providerSpec: ProviderSpec) {
         self.home = home
@@ -107,12 +112,16 @@ final class InHouseDriver {
         do {
             let (writer, agent) = try await runner.run(prompt: prompt)
             self.writer = writer
+            self.agent = agent
+            acceptsFollowUps = true
             usage = await agent.totalUsage
         } catch {
             errorBanner = error.localizedDescription
+            hasExited = true
         }
         isStreaming = false
-        hasExited = true
+        // Not exited: the conversation, the interpreter and its variables are all still here,
+        // so the run stays open for a follow-up rather than being torn down after one prompt.
         reload()
     }
 
@@ -168,6 +177,19 @@ final class InHouseDriver {
                     if parsed.usage.totalTokens > 0 { self.usage = parsed.usage }
                 }
             }
+        }
+    }
+
+    /// Another prompt in the same session — same conversation, same interpreter, same
+    /// variables.
+    func send(_ prompt: String) {
+        guard let agent, !isStreaming else { return }
+        task = Task {
+            isStreaming = true
+            await agent.send(prompt)
+            usage = await agent.totalUsage
+            isStreaming = false
+            reload()
         }
     }
 

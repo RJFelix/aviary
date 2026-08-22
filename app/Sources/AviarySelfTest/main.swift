@@ -1299,8 +1299,8 @@ await Harness.run([
         XCTAssertTrue(log.names.contains("finished:stop"), "the run continued and completed")
         let sent = try server.recordedRequests()
         let second = try XCTUnwrap(sent.last?["messages"]?.arrayValue)
-        XCTAssertTrue((second.last?["content"]?.stringValue ?? "").contains("only tool is"),
-                      "the model was told what went wrong")
+        XCTAssertTrue((second.last?["content"]?.stringValue ?? "").contains("No tool named"),
+                      "the model was told what went wrong, and what it could call instead")
     }),
 
     ("agent: compacts when the context window fills, and records what it dropped", {
@@ -1624,5 +1624,183 @@ await Harness.run([
         let selection = gate.select(skills: skills, prompt: "compaction", cwd: "/tmp")
         XCTAssertEqual(selection.included.first?.name, "compaction",
                        "the skill actually named for the topic wins")
+    }),
+
+    ("agent: a second prompt continues the same conversation and interpreter", {
+        // What makes a session worth more than a request: the variables from turn one are
+        // still there in turn two, and the model can see what it already said.
+        guard let server = try FakeProviderServer(script: [
+            ["tool": ["name": "python", "arguments": ["code": "treasure = 'buried'"]]],
+            ["text": "Stored it."],
+            ["tool": ["name": "python", "arguments": ["code": "treasure"]]],
+            ["text": "It is still buried."],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "sys"))
+        await agent.send("hide something")
+        await agent.send("what did you hide?")
+        await writer.close()
+
+        // The interpreter kept the variable across prompts, not just across turns.
+        let sent = try server.recordedRequests()
+        XCTAssertEqual(sent.count, 4)
+        let last = try XCTUnwrap(sent.last?["messages"]?.arrayValue)
+        let flat = last.map { $0["content"]?.stringValue ?? "" }.joined(separator: " ")
+        XCTAssertTrue(flat.contains("'buried'"),
+                      "the second prompt's tool result proves the variable survived")
+        XCTAssertTrue(flat.contains("hide something"),
+                      "and the first prompt is still in the conversation")
+
+        // One transcript, both exchanges, still readable.
+        let parsed = try XCTUnwrap(SessionParser.parse(fileURL: writer.fileURL))
+        XCTAssertEqual(parsed.items.filter { $0.kind == .user }.count, 2)
+        XCTAssertEqual(parsed.counts.toolCalls, 2)
+    }),
+
+    // ------------------------------------------------------------------ MCP
+    ("mcp: starts a server, lists its tools, and calls one", {
+        // Driven against a real stdio server rather than a mock, for the same reason the
+        // runtime-host tests are: the protocol is the contract, and a stub proves nothing
+        // about whether a server on the other end behaves.
+        guard let root = EngineLocator.repoRoot() else { return }
+        let fixture = root.appending(path: "test-fixtures/mcp-echo.py")
+        guard FileManager.default.fileExists(atPath: fixture.path) else {
+            print("      skipped: no mcp fixture"); return
+        }
+        let client = MCPClient(
+            name: "echo", executable: "/usr/bin/env",
+            arguments: ["python3", fixture.path])
+        let tools = try await client.start()
+        XCTAssertEqual(tools.map(\.name).sorted(), ["echo", "explode"])
+        let echo = try XCTUnwrap(tools.first { $0.name == "echo" })
+        // Namespaced, so two servers offering the same name do not collide silently.
+        XCTAssertEqual(echo.qualifiedName, "mcp__echo__echo")
+        XCTAssertEqual(echo.schema.path("properties.text.type")?.stringValue, "string")
+
+        let ok = try await client.callTool("echo", arguments: .object(["text": .string("hello")]))
+        XCTAssertEqual(ok.text, "hello")
+        XCTAssertFalse(ok.isError)
+
+        // A tool that reports failure is a result, not a thrown error: the agent needs to read
+        // it and try something else.
+        let bad = try await client.callTool("explode", arguments: .object([:]))
+        XCTAssertTrue(bad.isError)
+        XCTAssertTrue(bad.text.contains("deliberate"))
+        await client.stop()
+    }),
+
+    ("mcp: a missing server fails at start rather than at first call", {
+        let client = MCPClient(
+            name: "nope", executable: "/usr/bin/env",
+            arguments: ["python3", "/nonexistent/definitely-not-here.py"])
+        do {
+            _ = try await client.start(timeout: 6)
+            XCTFail("expected a failure from a server that cannot run")
+        } catch {
+            // Either shape is correct — what matters is that it fails now, with something
+            // readable, rather than looking healthy until a tool is called.
+            XCTAssertFalse(error.localizedDescription.isEmpty)
+        }
+        await client.stop()
+    }),
+
+    ("mcp: configuration is read from the harness's own settings", {
+        // An existing config should just work rather than needing a second one.
+        let config = try XCTUnwrap(JSONValue.parse(Data(#"""
+        {"mcpServers":{
+          "files":{"command":"npx","args":["-y","server-filesystem","/tmp"],"env":{"A":"1"}},
+          "remote":{"type":"sse","url":"https://example.com"},
+          "off":{"command":"foo","disabled":true}
+        }}
+        """#.utf8)))
+        let servers = MCPConfiguration.parse(config)
+        XCTAssertEqual(servers.map(\.name), ["files", "off"],
+                       "sse is skipped: this client speaks stdio, and half-starting it would "
+                           + "fail at the first call instead of at load")
+        let files = try XCTUnwrap(servers.first)
+        XCTAssertEqual(files.command, "npx")
+        XCTAssertEqual(files.arguments.count, 3)
+        XCTAssertEqual(files.environment["A"], "1")
+        XCTAssertTrue(files.enabled)
+        XCTAssertFalse(try XCTUnwrap(servers.last).enabled, "`disabled` is honoured")
+    }),
+
+    ("agent: MCP tools are declared individually and dispatched by name", {
+        guard let root = EngineLocator.repoRoot() else { return }
+        let fixture = root.appending(path: "test-fixtures/mcp-echo.py")
+        guard FileManager.default.fileExists(atPath: fixture.path) else {
+            print("      skipped: no mcp fixture"); return
+        }
+        guard let server = try FakeProviderServer(script: [
+            ["tool": ["name": "mcp__echo__echo", "arguments": ["text": "via mcp"]]],
+            ["text": "Echoed."],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let mcp = MCPClient(
+            name: "echo", executable: "/usr/bin/env", arguments: ["python3", fixture.path])
+        let tools = try await mcp.start()
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "sys"))
+        await agent.addMCPTools(tools, from: mcp)
+        let log = EventLog()
+        await agent.observe { log.record($0) }
+        await agent.send("echo something")
+        await writer.close()
+        await mcp.stop()
+
+        XCTAssertTrue(log.names.contains("tool:mcp__echo__echo"))
+        XCTAssertTrue(log.names.contains("tool-ok"))
+        // Each MCP tool gets its own schema in the request, rather than hiding behind one
+        // dispatcher — a model picks a tool by reading its schema.
+        let sent = try server.recordedRequests()
+        let declared = (sent.first?["tools"]?.arrayValue ?? [])
+            .compactMap { $0.path("function.name")?.stringValue }
+        XCTAssertTrue(declared.contains("python"))
+        XCTAssertTrue(declared.contains("mcp__echo__echo"))
+        XCTAssertTrue(declared.contains("mcp__echo__explode"))
+        // And the result reached the model.
+        let second = try XCTUnwrap(sent.last?["messages"]?.arrayValue)
+        XCTAssertTrue(second.contains { $0["content"]?.stringValue == "via mcp" })
+    }),
+
+    ("agent: an unknown tool name lists what is actually available", {
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(
+                id: "f", baseURL: URL(string: "http://127.0.0.1:1/v1")!, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s"))
+        let (text, isError) = await agent.executeForTesting(
+            id: "x", name: "read_file", arguments: .object([:]))
+        XCTAssertTrue(isError)
+        XCTAssertTrue(text.contains("python"), "says what it could have called instead")
+        await writer.close()
     }),
 ])

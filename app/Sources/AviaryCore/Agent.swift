@@ -87,6 +87,10 @@ public actor Agent {
     private var compactions = 0
     /// How a child reports back to its parent, and who to notify.
     private var spawnDelegate: SpawnDelegate?
+    /// MCP servers whose tools this run may call, keyed by the namespaced tool name the model
+    /// sees. Namespaced because two servers may both offer `search`, and a bare name would
+    /// make that collision silent.
+    private var mcpTools: [String: (client: MCPClient, tool: MCPClient.Tool)] = [:]
 
     public init(
         provider: ChatProvider, host: RuntimeHost, writer: SessionWriter,
@@ -114,6 +118,11 @@ public actor Agent {
 
     public func setSpawnDelegate(_ delegate: SpawnDelegate?) {
         spawnDelegate = delegate
+    }
+
+    /// Offer this run a set of MCP tools.
+    public func addMCPTools(_ tools: [MCPClient.Tool], from client: MCPClient) {
+        for tool in tools { mcpTools[tool.qualifiedName] = (client, tool) }
     }
 
     /// Serve a request from the runtime. Wire this to `RuntimeHost.onCallback`.
@@ -253,10 +262,22 @@ public actor Agent {
 
     /// The tools this run actually offers, given its depth and whether spawning is wired up.
     private var activeTools: [ChatTool] {
-        Self.tools(
+        var tools = Self.tools(
             cwd: config.cwd,
             canSpawn: spawnDelegate != nil && config.depth < config.maxDepth,
             spawnBudget: max(0, config.maxDepth - config.depth))
+        // MCP tools are declared individually rather than behind one dispatcher, because a
+        // model picks a tool by reading its schema and a single `call_mcp(name, args)` hides
+        // every schema behind a string.
+        for (qualified, entry) in mcpTools.sorted(by: { $0.key < $1.key }) {
+            tools.append(ChatTool(
+                name: qualified,
+                description: entry.tool.description.isEmpty
+                    ? "Tool `\(entry.tool.name)` from the \(entry.tool.server) MCP server."
+                    : entry.tool.description,
+                parameters: entry.tool.schema))
+        }
+        return tools
     }
 
     // MARK: Running
@@ -444,13 +465,32 @@ public actor Agent {
         return turn
     }
 
+    /// Exposed for tests: dispatching a tool call is worth asserting directly, and driving a
+    /// whole model round trip to reach it would test the fixture more than the dispatch.
+    public func executeForTesting(
+        id: String, name: String, arguments: JSONValue
+    ) async -> (String, Bool) {
+        await execute((id: id, name: name, arguments: arguments))
+    }
+
     private func execute(
         _ call: (id: String, name: String, arguments: JSONValue)
     ) async -> (String, Bool) {
-        guard call.name == "python" else {
+        if call.name != "python" {
+            if let entry = mcpTools[call.name] {
+                do {
+                    let result = try await entry.client.callTool(
+                        entry.tool.name, arguments: call.arguments)
+                    return (result.text, result.isError)
+                } catch {
+                    return ("The \(entry.tool.server) MCP server failed: "
+                        + error.localizedDescription, true)
+                }
+            }
             // Answered rather than thrown: a model inventing a tool name is a thing to tell
             // it about, not a reason to end the run.
-            return ("No tool named \(call.name). The only tool is `python`.", true)
+            let available = (["python"] + mcpTools.keys.sorted()).joined(separator: ", ")
+            return ("No tool named \(call.name). Available: \(available).", true)
         }
         guard let code = call.arguments["code"]?.stringValue, !code.isEmpty else {
             return ("The `python` tool needs a non-empty `code` argument.", true)
