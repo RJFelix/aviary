@@ -1,6 +1,11 @@
 # Claude Code as the model transport for Prime Agent
 
-**Status:** research only. Nothing was implemented. No files in `harness/` or `app/` were changed.
+**Status:** **implemented 2026-08-22** as approach A — Aviary's third engine. See
+`docs/architecture.md`, "Claude Code driving", and `~/duckbill/knowledge/claude-code-headless.md`.
+Two findings below turned out to be **wrong** and are corrected in place: §1.5 (thinking is *not*
+empty — the deltas carry it) and the token-accounting assumption behind §2 (`input_tokens`
+excludes cached context, so a cached turn really does report 2). The ToS reading in §5 was not
+revisited; the recommendation in §6 was overtaken by the decision to build.
 **Date:** 2026-08-21
 **Versions on this machine:** `claude` 2.1.234 (native build, shim at
 `/var/folders/.../cmux-cli-shims/…/claude`); Prime fork at upstream
@@ -119,10 +124,16 @@ the 12th Fibonacci number is…"). You cannot ask it to *stop* at a tool call.
 `AssistantMessageEventStream` wants; mapping is mechanical. Tool-call arguments arrive as
 `partial_json` deltas, so `toolcall_delta` is available too.
 
-### 1.5 Thinking comes back empty
+### 1.5 Thinking comes back empty — **WRONG, corrected 2026-08-22**
 
-With `--effort high`, the assistant message contained a `thinking` block whose `thinking` field was
-the **empty string** and whose `signature` was an opaque ~200-byte blob. The token count *is*
+**Correction:** thinking text *is* available. With `--include-partial-messages`, the
+`content_block_delta` / `thinking_delta` frames carry the real reasoning text, and the completed
+`assistant` frame's thinking block was populated too on later runs. What follows was measured on
+the *complete* block alone, which is sometimes redacted — testing only that is what produced the
+wrong conclusion. Aviary's driven sessions display real reasoning.
+
+Original finding: with `--effort high`, the assistant message contained a `thinking` block whose
+`thinking` field was the **empty string** and whose `signature` was an opaque ~200-byte blob. The token count *is*
 reported: `usage.output_tokens_details.thinking_tokens: 274`. So through Claude Code, Prime would get
 zero visible reasoning content and only a count — structurally identical to the encrypted-reasoning
 situation this fork already cares about, and it maps cleanly onto the fork's `Usage.reasoning`. I did
@@ -483,11 +494,12 @@ Artifacts from this investigation (throwaway, safe to delete):
 
 - **What the 286-token floor contains.** `--debug api --debug-file` did not log request payloads in
   2.1.234, and I did not intercept TLS. So I cannot say whether a residual system prompt, a tool-free
-  scaffold, or metadata accounts for it.
-- **Whether thinking text can be exposed in `-p`.** It came back as an empty string with a signature
-  under `--effort high` with settings stripped. I did not test `/config thinking=…`, an interactive
-  session, or other effort levels, so I cannot say whether this is a `-p` property, a redaction, or a
-  setting I removed.
+  scaffold, or metadata accounts for it. *Partial answer 2026-08-22:* a model's own visible
+  reasoning in one driven run referred to "system reminders about email and dates", so at least
+  some of it is reminder text.
+- ~~**Whether thinking text can be exposed in `-p`.**~~ **Answered 2026-08-22: yes.**
+  `--include-partial-messages` yields `thinking_delta` frames with the real text. The empty
+  string was a property of the completed block, not of `-p`.
 - **Whether interrupt-and-resume holds up over many turns.** I verified exactly one capture → execute
   → resume round trip. I did not test ten, or images in results, or two tool calls in one assistant
   turn, or what the dangling `tool_use` records do to the transcript over time.
