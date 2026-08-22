@@ -115,6 +115,8 @@ public actor Agent {
     /// Where request payloads go, when a run is recording them. Off unless asked for: it writes
     /// the full system prompt and conversation to disk, which should never be implicit.
     private var wireLogURL: URL?
+    /// Whether any hooks are loaded. Checked so a run with none pays nothing for the feature.
+    private var hooksEnabled = false
 
     public init(
         provider: ChatProvider, host: RuntimeHost, writer: SessionWriter,
@@ -156,6 +158,10 @@ public actor Agent {
     /// Record every request payload, so the run can show where its input tokens went.
     public func recordPayloads(to url: URL?) {
         wireLogURL = url
+    }
+
+    public func enableHooks(_ enabled: Bool) {
+        hooksEnabled = enabled
     }
 
     /// Serve a request from the runtime. Wire this to `RuntimeHost.onCallback`.
@@ -665,8 +671,33 @@ public actor Agent {
             let available = (["python"] + mcpTools.keys.sorted()).joined(separator: ", ")
             return ("No tool named \(call.name). Available: \(available).", true)
         }
-        guard let code = call.arguments["code"]?.stringValue, !code.isEmpty else {
+        guard var code = call.arguments["code"]?.stringValue, !code.isEmpty else {
             return ("The `python` tool needs a non-empty `code` argument.", true)
+        }
+        // A hook may block this call or rewrite it. Because `ipython` is the only tool, a
+        // single hook here is a complete permission system — and it can edit the code rather
+        // than only veto it, which is the difference between a gate and a wall.
+        if hooksEnabled,
+           let decision = await host.callHook("before_tool", payload: .object([
+               "name": .string(call.name),
+               "code": .string(code),
+               "session": .string(hostSession),
+           ]))
+        {
+            if decision["block"]?.boolValue == true {
+                let reason = decision["reason"]?.stringValue
+                    ?? "A hook blocked this. Try a different approach."
+                try? await writer.appendNote(
+                    "A hook blocked a tool call: \(reason)", customType: "aviary.hook")
+                return (reason, true)
+            }
+            if let rewritten = decision["code"]?.stringValue, rewritten != code {
+                // Recorded, because a rewritten call that looks like the agent's own would
+                // make the transcript lie about what ran.
+                try? await writer.appendNote(
+                    "A hook rewrote a tool call.", customType: "aviary.hook")
+                code = rewritten
+            }
         }
         do {
             let result = try await host.execute(code, in: hostSession)

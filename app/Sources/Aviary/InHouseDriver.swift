@@ -122,7 +122,8 @@ final class InHouseDriver {
                 systemPrompt: SystemPrompt.build(
                     cwd: cwd, model: model, skills: gate.render(selection),
                     memory: memoryGate.render(recalled)),
-                memory: memory, recordPayloads: recordPayloads))
+                memory: memory, recordPayloads: recordPayloads,
+                hookPaths: HookDiscovery.paths(repoRoot: repoRoot)))
         self.runner = runner
 
         await runner.observe { [weak self] event in

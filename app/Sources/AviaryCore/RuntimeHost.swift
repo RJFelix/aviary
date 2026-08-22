@@ -415,6 +415,40 @@ public actor RuntimeHost {
     /// The capability that a host you own buys and a Jupyter kernel cannot: listing names
     /// there meant executing a cell, which mutated `In`/`Out` and could shadow the very names
     /// being listed — observation perturbed the observed.
+    /// Load hook files into the host's hook interpreter.
+    ///
+    /// Returns which loaded and which did not, because a hook that silently failed to load is
+    /// indistinguishable from one that decided to do nothing — and the difference matters when
+    /// the hook was supposed to be blocking something.
+    @discardableResult
+    public func loadHooks(_ paths: [String], timeout: TimeInterval = 60) async throws
+        -> (loaded: [(path: String, events: [String])], failed: [(path: String, detail: String)])
+    {
+        guard let data = try await send("hook.load", [
+            "paths": .array(paths.map { .string($0) }),
+        ], timeout: timeout) else { return ([], []) }
+        let loaded = (data["loaded"]?.arrayValue ?? []).map { entry in
+            (path: entry["path"]?.stringValue ?? "",
+             events: (entry["events"]?.arrayValue ?? []).compactMap { $0.stringValue })
+        }
+        let failed = (data["failed"]?.arrayValue ?? []).map { entry in
+            (path: entry["path"]?.stringValue ?? "",
+             detail: entry["detail"]?.stringValue ?? "unknown")
+        }
+        return (loaded, failed)
+    }
+
+    /// Call every hook that handles `event`. Returns their combined decision, or nil if none
+    /// handled it.
+    public func callHook(
+        _ event: String, payload: JSONValue, timeout: TimeInterval = 60
+    ) async -> JSONValue? {
+        guard let data = try? await send("hook.call", [
+            "event": .string(event), "payload": payload,
+        ], timeout: timeout) else { return nil }
+        return (data["handled"]?.boolValue ?? false) ? data : nil
+    }
+
     public func inspect(_ session: String, timeout: TimeInterval = 60) async throws -> Namespace {
         guard let data = try await send("inspect", ["session": .string(session)], timeout: timeout)
         else { throw HostError.malformedReply }

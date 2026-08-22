@@ -149,7 +149,8 @@ enum AgentCLI {
                 goal: (tokenBudget != nil || minutes != nil)
                     ? Goal(text: prompt, tokenBudget: tokenBudget,
                            timeBudget: minutes.map { $0 * 60 })
-                    : nil))
+                    : nil,
+                hookPaths: HookDiscovery.paths(repoRoot: repoRoot)))
 
         await runner.observe { event in
             switch event {

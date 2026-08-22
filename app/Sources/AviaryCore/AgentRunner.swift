@@ -28,11 +28,14 @@ public actor AgentRunner {
         /// A budget and finishing condition for the root run. Children get their own iteration
         /// ceiling instead — a shared token budget would let one child starve its siblings.
         public var goal: Goal?
+        /// Hook files to load. Empty means the feature costs nothing.
+        public var hookPaths: [String] = []
 
         public init(
             home: AgentHome, cwd: String, model: ModelSpec, systemPrompt: String,
             maxDepth: Int = 3, maxIterations: Int = 40, childMaxIterations: Int = 20,
-            memory: MemoryStore? = nil, recordPayloads: Bool = false, goal: Goal? = nil
+            memory: MemoryStore? = nil, recordPayloads: Bool = false, goal: Goal? = nil,
+            hookPaths: [String] = []
         ) {
             self.home = home
             self.cwd = cwd
@@ -44,6 +47,7 @@ public actor AgentRunner {
             self.memory = memory
             self.recordPayloads = recordPayloads
             self.goal = goal
+            self.hookPaths = hookPaths
         }
     }
 
@@ -77,6 +81,20 @@ public actor AgentRunner {
         await agent.observe { event in obs?(event) }
         await agent.setSpawnDelegate(Delegate(runner: self, parentSessionID: writer.sessionID))
         await agent.setMemory(settings.memory)
+        if !settings.hookPaths.isEmpty {
+            let result = try? await host.loadHooks(settings.hookPaths)
+            // A hook that failed to load is reported into the transcript rather than swallowed:
+            // silently absent and deliberately doing nothing are indistinguishable, and the
+            // difference matters when the hook was supposed to be blocking something.
+            for failure in result?.failed ?? [] {
+                try? await writer.appendNote(
+                    "A hook failed to load: \(failure.path)\n\(failure.detail)",
+                    customType: "aviary.hook")
+            }
+            if let loaded = result?.loaded, !loaded.isEmpty {
+                await agent.enableHooks(true)
+            }
+        }
         if settings.recordPayloads {
             await agent.recordPayloads(to: WireLog.path(forRun: UUID()))
         }

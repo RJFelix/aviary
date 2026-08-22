@@ -252,3 +252,22 @@ public struct MemoryGate: Sendable {
         return out.joined(separator: "\n")
     }
 }
+
+/// Hook files on disk.
+///
+/// `hooks/*.py` in the checkout, sorted so load order — and therefore the order in which a
+/// chain of hooks refines a decision — is stable rather than filesystem-dependent. A
+/// `.disabled` suffix is how an example ships without being active.
+public enum HookDiscovery {
+    public static func paths(repoRoot: URL?) -> [String] {
+        guard let repoRoot else { return [] }
+        let dir = repoRoot.appending(path: "hooks", directoryHint: .isDirectory)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
+            return []
+        }
+        return names
+            .filter { $0.hasSuffix(".py") }
+            .sorted()
+            .map { dir.appending(path: $0).path }
+    }
+}

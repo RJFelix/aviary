@@ -2251,4 +2251,132 @@ await Harness.run([
         XCTAssertEqual(b.load().count, 0, "another session sees nothing of it")
         XCTAssertTrue(a.fileURL.path.contains("session-artifacts/session-a"))
     }),
+
+    ("hooks: a hook can block a tool call and say why", {
+        // Because `python` is the only built-in tool, one hook here is a complete permission
+        // system — and it can rewrite rather than only veto, which is the difference between a
+        // gate and a wall.
+        guard let host = try makeHost(.reference) else { return }
+        let capabilities = try await host.start()
+        defer { Task { await host.stop() } }
+        guard capabilities.has("hooks") else { print("      skipped: host has no hooks"); return }
+
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-hooks-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let hook = dir.appending(path: "guard.py")
+        try """
+            def on_before_tool(payload):
+                if "forbidden" in payload["code"]:
+                    return {"block": True, "reason": "Not that. Try the other thing."}
+                if "widen" in payload["code"]:
+                    return {"code": payload["code"] + "\\nwidened = True"}
+                return None
+            """.write(to: hook, atomically: true, encoding: .utf8)
+
+        let result = try await host.loadHooks([hook.path])
+        XCTAssertEqual(result.failed.count, 0)
+        XCTAssertEqual(result.loaded.first?.events, ["on_before_tool"],
+                       "a hook declares itself by defining on_<event>; nothing to register")
+
+        let blocked = await host.callHook("before_tool", payload: .object([
+            "code": .string("do something forbidden"),
+        ]))
+        XCTAssertEqual(blocked?["block"]?.boolValue, true)
+        XCTAssertTrue((blocked?["reason"]?.stringValue ?? "").contains("Try the other thing"))
+
+        let rewritten = await host.callHook("before_tool", payload: .object([
+            "code": .string("widen this"),
+        ]))
+        XCTAssertTrue((rewritten?["code"]?.stringValue ?? "").contains("widened = True"))
+
+        // An event no hook handles returns nil, so the loop pays nothing for it.
+        let ignored = await host.callHook("after_response", payload: .object([:]))
+        XCTAssertNil(ignored)
+    }),
+
+    ("hooks: a broken hook is reported and does not stop anything", {
+        // One bad extension must never take the run with it.
+        guard let host = try makeHost(.reference) else { return }
+        let capabilities = try await host.start()
+        defer { Task { await host.stop() } }
+        guard capabilities.has("hooks") else { return }
+
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-hooks-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // One that cannot even import.
+        let broken = dir.appending(path: "broken.py")
+        try "import a_module_that_does_not_exist\n".write(
+            to: broken, atomically: true, encoding: .utf8)
+        // One with no events, which is a mistake worth naming rather than loading silently.
+        let empty = dir.appending(path: "empty.py")
+        try "x = 1\n".write(to: empty, atomically: true, encoding: .utf8)
+        // One that loads and then throws when called.
+        let throwing = dir.appending(path: "throwing.py")
+        try "def on_before_tool(payload):\n    raise ValueError('boom')\n".write(
+            to: throwing, atomically: true, encoding: .utf8)
+
+        let result = try await host.loadHooks([broken.path, empty.path, throwing.path])
+        XCTAssertEqual(result.failed.count, 2, "the unimportable one and the eventless one")
+        XCTAssertTrue(result.failed.contains { $0.detail.contains("ModuleNotFound") })
+        XCTAssertTrue(result.failed.contains { $0.detail.contains("on_<event>") },
+                      "and it says what a hook file is supposed to look like")
+        XCTAssertEqual(result.loaded.count, 1)
+
+        // The throwing hook does not block, does not crash, and the host still serves.
+        let decision = await host.callHook("before_tool", payload: .object([
+            "code": .string("anything"),
+        ]))
+        XCTAssertNil(decision, "a hook that raised decided nothing")
+        let session = try await host.createSession(cwd: "/tmp")
+        let alive = try await host.execute("'still here'", in: session)
+        XCTAssertEqual(alive.value, "'still here'")
+    }),
+
+    ("hooks: they cannot see a session's variables", {
+        // Their own interpreter, so a hook cannot read one session's state while running on
+        // behalf of another.
+        guard let host = try makeHost(.reference) else { return }
+        let capabilities = try await host.start()
+        defer { Task { await host.stop() } }
+        guard capabilities.has("hooks") else { return }
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-hooks-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let hook = dir.appending(path: "peek.py")
+        try """
+            def on_before_tool(payload):
+                return {"saw": "secret_value" in globals()}
+            """.write(to: hook, atomically: true, encoding: .utf8)
+        _ = try await host.loadHooks([hook.path])
+
+        let session = try await host.createSession(cwd: "/tmp")
+        _ = try await host.execute("secret_value = 'hunter2'", in: session)
+        let decision = await host.callHook("before_tool", payload: .object([
+            "code": .string("x"), "session": .string(session),
+        ]))
+        XCTAssertEqual(decision?["saw"]?.boolValue, false,
+                       "the hook interpreter is separate from every session")
+    }),
+
+    ("hooks: discovery is ordered and ignores disabled files", {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-repo-\(UUID().uuidString)")
+        let hooks = dir.appending(path: "hooks")
+        try FileManager.default.createDirectory(at: hooks, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for name in ["20-second.py", "10-first.py", "example.py.disabled", "README.md"] {
+            FileManager.default.createFile(atPath: hooks.appending(path: name).path, contents: nil)
+        }
+        let found = HookDiscovery.paths(repoRoot: dir).map { URL(fileURLWithPath: $0).lastPathComponent }
+        // Sorted, because load order decides how a chain of hooks refines a decision and
+        // filesystem order is not a decision anyone made.
+        XCTAssertEqual(found, ["10-first.py", "20-second.py"])
+        XCTAssertEqual(HookDiscovery.paths(repoRoot: nil), [])
+    }),
 ])

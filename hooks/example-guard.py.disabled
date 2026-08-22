@@ -1,0 +1,41 @@
+"""
+An example hook, disabled by default — rename to `.py` to load it.
+
+Blocks two things that are easy to do by accident and expensive to undo, and rewrites a third.
+Deliberately small: a guard that refuses too much teaches the agent to work around it, which is
+worse than no guard at all.
+"""
+
+import re
+
+# Narrow on purpose. The first version of this matched `rm -rf /tmp/scratch`, which is fine and
+# which the agent had every reason to run — and a guard that refuses reasonable things teaches
+# the agent to route around it, which is worse than no guard. So: only paths that are actually
+# dangerous, and `/tmp` is explicitly not one of them.
+DESTRUCTIVE = [
+    (re.compile(r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+"
+                r"(?:/\s*$|~/?\s*$|\$HOME/?\s*$|/(?:Users|etc|usr|var|System|Library|opt|bin|sbin)\b)"),
+     "a recursive delete of a system or home path"),
+    (re.compile(r"git\s+push\b(?=.*--force)(?!.*--force-with-lease)"), "a force push"),
+]
+
+
+def on_before_tool(payload):
+    code = payload.get("code") or ""
+
+    for pattern, what in DESTRUCTIVE:
+        if pattern.search(code):
+            return {
+                "block": True,
+                # Written as an instruction: the reason reaches the model as the tool result,
+                # and "no" without an alternative just gets retried.
+                "reason": f"Blocked {what}. If you need to remove something, move it to a "
+                          f"temporary directory instead, and say what you moved.",
+            }
+
+    # A rewrite rather than a refusal: an unbounded recursive grep over this checkout walks
+    # 8.9GB of provider binaries under terraform/.terraform and looks like a hang.
+    if re.search(r"\bgrep\s+-[a-zA-Z]*r", code) and "--exclude-dir" not in code:
+        return {"code": code.replace("grep -r", "grep -r --exclude-dir=.terraform", 1)}
+
+    return None

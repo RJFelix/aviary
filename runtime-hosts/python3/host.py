@@ -303,6 +303,68 @@ for __k in ("__aviary_names", "__k", "__v", "__r", "__n", "__fh", "__aviary_stat
 '''
 
 
+_HOOK_LOAD_BODY = r'''
+import json, importlib.util, os, sys, traceback
+
+if "__aviary_hooks" not in globals():
+    globals()["__aviary_hooks"] = []
+
+__result = {"ok": False, "detail": None, "events": []}
+try:
+    __name = "aviary_hook_" + str(len(globals()["__aviary_hooks"]))
+    __spec = importlib.util.spec_from_file_location(__name, __AVIARY_HOOK_PATH)
+    __module = importlib.util.module_from_spec(__spec)
+    __spec.loader.exec_module(__module)
+    # A hook declares what it wants by defining functions named for events. Nothing to
+    # register, nothing to import from us — the file is the interface.
+    __events = [n for n in dir(__module) if n.startswith("on_")]
+    if not __events:
+        __result = {"ok": False,
+                    "detail": "no on_* functions found; a hook file defines on_<event>(payload)",
+                    "events": []}
+    else:
+        globals()["__aviary_hooks"].append(__module)
+        __result = {"ok": True, "detail": None, "events": __events}
+except Exception:
+    __result = {"ok": False, "detail": traceback.format_exc()[-500:], "events": []}
+
+with open(__AVIARY_OUT, "w") as __fh:
+    json.dump(__result, __fh, default=str)
+for __n in ("__result", "__name", "__spec", "__module", "__events", "__fh", "__n",
+            "__AVIARY_HOOK_PATH", "__AVIARY_OUT"):
+    globals().pop(__n, None)
+'''
+
+
+_HOOK_CALL_BODY = r'''
+import json, traceback
+
+__payload = json.loads(__AVIARY_PAYLOAD)
+__out = {"handled": False}
+for __hook in globals().get("__aviary_hooks", []):
+    __fn = getattr(__hook, "on_" + __AVIARY_EVENT, None)
+    if __fn is None:
+        continue
+    try:
+        __r = __fn(__payload)
+    except Exception:
+        # One hook failing does not stop the others, and does not stop the run.
+        __out.setdefault("errors", []).append(traceback.format_exc()[-300:])
+        continue
+    if isinstance(__r, dict) and __r:
+        # Later hooks see earlier decisions, so a chain can refine rather than fight.
+        __payload.update({k: v for k, v in __r.items() if k in ("payload", "code")})
+        __out.update(__r)
+        __out["handled"] = True
+
+with open(__AVIARY_OUT, "w") as __fh:
+    json.dump(__out, __fh, default=str)
+for __n in ("__payload", "__out", "__hook", "__fn", "__r", "__fh", "__n",
+            "__AVIARY_EVENT", "__AVIARY_PAYLOAD", "__AVIARY_OUT"):
+    globals().pop(__n, None)
+'''
+
+
 # ---------------------------------------------------------------------------
 # One session
 # ---------------------------------------------------------------------------
@@ -441,6 +503,7 @@ class Host:
     def __init__(self) -> None:
         self.sessions: dict[str, Session] = {}
         self.lock = threading.Lock()
+        self.hook_interp = None
 
     # -- dispatch ----------------------------------------------------------
 
@@ -457,6 +520,10 @@ class Host:
             elif op == "session.list":
                 with self.lock:
                     self.reply(rid, {"sessions": sorted(self.sessions)})
+            elif op == "hook.load":
+                self.reply(rid, self.load_hooks(msg.get("paths") or []))
+            elif op == "hook.call":
+                self.reply(rid, self.call_hook(msg.get("event") or "", msg.get("payload") or {}))
             elif op == "callback.result":
                 resolve_callback(msg.get("rid") or "", msg.get("result") or {})
                 self.reply(rid, {"delivered": True})
@@ -477,6 +544,65 @@ class Host:
             raise
         except Exception:
             self.fail(rid, "host_error", traceback.format_exc())
+
+    # ---- hooks -----------------------------------------------------------
+    #
+    # Hooks are Python, loaded into their own interpreter, and called by the client at points
+    # in the agent loop. Python rather than Swift because the whole premise of this system is
+    # a runtime you can change without rebuilding the app — a hook that needs a compiler is
+    # not an extension point, it is a patch.
+    #
+    # Their own interpreter, separate from every session, for two reasons: a hook that breaks
+    # must not corrupt an agent's namespace, and a hook must not be able to read one session's
+    # variables while running on behalf of another.
+
+    def load_hooks(self, paths: list) -> dict:
+        if subinterpreters is None:
+            raise RuntimeError("no sub-interpreter support, so hooks cannot be isolated")
+        if self.hook_interp is None:
+            self.hook_interp = subinterpreters.create()
+        loaded, failed = [], []
+        for path in paths:
+            fd, out = tempfile.mkstemp(prefix="aviary-hook-", suffix=".json")
+            os.close(fd)
+            code = _prelude(__AVIARY_HOOK_PATH=path, __AVIARY_OUT=out) + _HOOK_LOAD_BODY
+            try:
+                subinterpreters.run_string(self.hook_interp, code)
+                with open(out) as fh:
+                    result = json.load(fh)
+                (loaded if result.get("ok") else failed).append(
+                    {"path": path, "detail": result.get("detail"),
+                     "events": result.get("events") or []})
+            except Exception:
+                failed.append({"path": path, "detail": traceback.format_exc()[-400:]})
+            finally:
+                try:
+                    os.unlink(out)
+                except OSError:
+                    pass
+        return {"loaded": loaded, "failed": failed}
+
+    def call_hook(self, event: str, payload: dict) -> dict:
+        if self.hook_interp is None:
+            return {"handled": False}
+        fd, out = tempfile.mkstemp(prefix="aviary-hookcall-", suffix=".json")
+        os.close(fd)
+        code = _prelude(
+            __AVIARY_EVENT=event, __AVIARY_PAYLOAD=json.dumps(payload), __AVIARY_OUT=out
+        ) + _HOOK_CALL_BODY
+        try:
+            subinterpreters.run_string(self.hook_interp, code)
+            with open(out) as fh:
+                return json.load(fh)
+        except Exception:
+            # A broken hook must never stop a run. It is reported and ignored, which is the
+            # only safe default: the alternative is one bad extension taking the agent with it.
+            return {"handled": False, "error": traceback.format_exc()[-400:]}
+        finally:
+            try:
+                os.unlink(out)
+            except OSError:
+                pass
 
     def capabilities(self) -> dict:
         return {
@@ -499,6 +625,9 @@ class Host:
                 # asking a person. Declared, so a client that cannot serve callbacks knows
                 # not to offer code that uses them.
                 "callbacks": True,
+                # Hooks run in their own interpreter, so a broken one cannot reach an agent's
+                # namespace or another hook's state.
+                "hooks": subinterpreters is not None,
             },
         }
 

@@ -162,10 +162,41 @@ templating language and a `/` mid-sentence is far more often a path. A name that
 is refused with the list of ones that do, rather than sent to the model as a literal slash,
 which reads as the model ignoring an instruction.
 
+### Hooks
+
+`hooks/*.py` in the checkout, loaded on each in-house run. A file defines `on_<event>(payload)`
+and there is nothing to register — the file is the interface. See [hooks/README.md](../hooks/README.md).
+
+Python rather than Swift because the premise of this whole system is a runtime you can change
+without rebuilding the app: a hook that needs a compiler is not an extension point, it is a
+patch. They run in **their own interpreter**, separate from every session, so a hook cannot read
+a session's variables (asserted) and a broken hook cannot corrupt one.
+
+`on_before_tool` can return `{"block": true, "reason": …}` or `{"code": …}`. Because `python`
+is the only built-in tool, that single event is a complete permission system — and it can
+*rewrite* a call rather than only veto it, which is the difference between a gate and a wall. A
+rewrite is noted in the transcript, because a silently altered call would make the record lie
+about what ran.
+
+Three failure behaviours, all deliberate. A hook that cannot import is reported into the
+transcript, not swallowed: silently absent and deliberately doing nothing are
+indistinguishable, and the difference matters when the hook was supposed to be blocking
+something. A hook with no `on_*` functions is refused with an explanation rather than loaded as
+a no-op. And **a hook that raises is ignored** — one bad extension must never take the run
+with it.
+
+The shipped example is disabled by default, and its first version is a lesson: it matched
+`rm -rf /tmp/scratch`, which is fine and which an agent has every reason to run. A guard that
+refuses reasonable things teaches the agent to route around it, which is worse than no guard.
+
 ### What the harness still does and this does not
 
-Extension hooks, and the OAuth-authenticated built-in providers (`openai-codex`, Anthropic
-subscription login). Both are real gaps rather than deliberate omissions.
+The OAuth-authenticated built-in providers — `openai-codex` and the Anthropic subscription
+login. A real gap, and a large one: device-code flows, token storage and refresh, plus the
+`openai-responses` wire format. Worth noting the reason it is not the priority it looks like:
+the harness's own docs say its Claude Pro/Max login bills as extra per-token usage rather than
+against plan limits, so that path was never about cheaper tokens — only about which client
+Anthropic sees.
 
 ## The runtime host
 
