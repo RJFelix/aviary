@@ -440,6 +440,31 @@ final class FakeProviderServer {
     }
 }
 
+
+/// A `ModelsConfig` built in memory, so catalogue tests need no `models.json`.
+func testModelsConfig(_ providers: [String: [String]]) -> ModelsConfig {
+    var obj: [String: JSONValue] = [:]
+    for (pid, models) in providers {
+        obj[pid] = .object([
+            "apiKey": .string("sk-test"),
+            "models": .array(models.map { .object(["id": .string($0)]) }),
+        ])
+    }
+    let raw = JSONValue.object(["providers": .object(obj)])
+    let specs: [ProviderSpec] = providers.keys.sorted().map { pid in
+        var p = ProviderSpec(
+            id: pid, name: nil, baseURL: nil, api: nil, apiKeyExpression: "sk-test",
+            authHeader: nil, headers: [:], models: [])
+        p.models = (providers[pid] ?? []).map { mid in
+            ModelSpec(id: mid, providerID: pid, json: .object(["id": .string(mid)]), provider: .object([:]))
+        }
+        return p
+    }
+    return ModelsConfig(
+        providers: specs, raw: raw,
+        fileURL: URL(fileURLWithPath: "/tmp/models.json"), exists: true)
+}
+
 /// A model pointed at the fake server.
 func fakeModel() -> ModelSpec {
     var m = ModelSpec(rpc: .object([
@@ -1305,6 +1330,49 @@ await Harness.run([
         await writer.close()
         let parsed = try XCTUnwrap(SessionParser.parse(fileURL: writer.fileURL))
         XCTAssertEqual(parsed.items.filter { $0.kind == .user }.map(\.plainText), ["now go"])
+    }),
+
+    ("resume: preparing a resumed run seeds history without sending", {
+        // The workshop's attach path: reopen the long-lived session, replay what it said, and
+        // wait. Both halves have their own test; this is the combination, which is what
+        // actually runs when a request is filed against an existing workshop session.
+        guard let first = try FakeProviderServer(script: [["text": "noted: 5150"]])
+        else { print("      skipped: no fixture"); return }
+        guard let host = try makeHost(.reference) else { first.stop(); return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+
+        let one = AgentRunner(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: first.baseURL, apiKey: nil),
+            host: host,
+            settings: .init(home: home, cwd: "/tmp", model: fakeModel(), systemPrompt: "sys"))
+        let (writerOne, _) = try await one.run(prompt: "remember 5150")
+        let sessionID = writerOne.sessionID
+        await writerOne.close()
+        first.stop()
+
+        guard let second = try FakeProviderServer(script: [["text": "5150"]])
+        else { print("      skipped: no fixture"); return }
+        defer { second.stop() }
+        let two = AgentRunner(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: second.baseURL, apiKey: nil),
+            host: host,
+            settings: .init(
+                home: home, cwd: "/tmp", model: fakeModel(), systemPrompt: "sys",
+                resume: sessionID))
+        let (writerTwo, agent) = try await two.prepare()
+        XCTAssertEqual(writerTwo.sessionID, sessionID)
+        XCTAssertEqual(try second.recordedRequests().count, 0, "prepare must not call the model")
+
+        await agent.send("what was it?")
+        let sent = try XCTUnwrap(try second.recordedRequests().first)
+        let texts = (sent["messages"]?.arrayValue ?? []).map { $0["content"]?.stringValue ?? "" }
+        XCTAssertTrue(texts.contains("remember 5150"), "history was not seeded")
+        XCTAssertTrue(texts.contains { $0.contains("5150") })
+        XCTAssertTrue(texts.contains("what was it?"))
+        await writerTwo.close()
     }),
 
     ("agent: a provider failure ends the run and says so in the transcript", {
@@ -2751,6 +2819,139 @@ await Harness.run([
         XCTAssertEqual(
             CodexResponsesProvider.friendlyError(#"{"error":{"message":"nope"}}"#), "nope")
         XCTAssertNil(CodexResponsesProvider.friendlyError("not json"))
+    }),
+
+    // MARK: The reachable-model catalogue
+    //
+    // This replaced booting the harness over RPC to ask what models exist. The rules that
+    // matter are about *stability*: a catalogue that reshuffles when a provider adds a model,
+    // or that makes a disabled model unresumable, is worse than the RPC call it replaced.
+
+    ("catalog: only providers with working credentials are reachable", {
+        let config = testModelsConfig([
+            "gateway": ["a", "b"],
+            "nokey": ["c"],
+        ])
+        let catalog = ModelCatalogBuilder.build(
+            config: config, auth: nil, credentialed: ["gateway"],
+            preferences: ModelPreferences())
+        XCTAssertEqual(catalog.reachable.map(\.id), ["gateway"])
+        XCTAssertEqual(catalog.models.map(\.id), ["a", "b"])
+        // The unreachable one is kept, not dropped: "you configured this and it is not working"
+        // is more useful than showing nothing.
+        XCTAssertTrue(catalog.unreachable.contains { $0.id == "nokey" })
+    }),
+
+    ("catalog: a built-in provider is reachable exactly when its login is stored", {
+        var auth = AuthInfo()
+        let empty = ModelCatalogBuilder.build(
+            config: testModelsConfig([:]), auth: auth, credentialed: [],
+            preferences: ModelPreferences())
+        XCTAssertTrue(empty.models.isEmpty, "codex must not be offered without a login")
+
+        auth.providers.insert("openai-codex")
+        let logged = ModelCatalogBuilder.build(
+            config: testModelsConfig([:]), auth: auth, credentialed: [],
+            preferences: ModelPreferences())
+        XCTAssertEqual(logged.reachable.map(\.id), ["openai-codex"])
+        XCTAssertTrue(logged.models.contains { $0.id == "gpt-5.6-terra" })
+        // Every codex model comes through, which is the count the RPC catalogue reported.
+        XCTAssertEqual(logged.models.count, BuiltInProviders.openAICodex().models.count)
+    }),
+
+    ("catalog: a models.json provider beats a built-in with the same id", {
+        // Same precedence as `AgentCLI.resolve`: configuring a provider explicitly means it.
+        var auth = AuthInfo()
+        auth.providers.insert("openai-codex")
+        let config = testModelsConfig(["openai-codex": ["my-own-model"]])
+        let catalog = ModelCatalogBuilder.build(
+            config: config, auth: auth, credentialed: ["openai-codex"],
+            preferences: ModelPreferences())
+        XCTAssertEqual(catalog.reachable.count, 1)
+        XCTAssertEqual(catalog.models.map(\.id), ["my-own-model"])
+    }),
+
+    ("catalog: an explicit order is honoured and unlisted models keep catalogue order", {
+        // The stability rule. A model that shows up in models.json tomorrow must neither jump
+        // to the top nor disappear — it lands after the pinned ones, where it came in.
+        let config = testModelsConfig(["p": ["a", "b", "c", "d"]])
+        let prefs = ModelPreferences(order: ["p/c", "p/a"])
+        let catalog = ModelCatalogBuilder.build(
+            config: config, auth: nil, credentialed: ["p"], preferences: prefs)
+        XCTAssertEqual(catalog.models.map(\.id), ["c", "a", "b", "d"])
+    }),
+
+    ("catalog: a disabled model is offered nowhere but is still findable", {
+        // Disabling hides a model from pickers. It must not break resuming a session that
+        // already uses it, which is why `find` ignores the preference.
+        let config = testModelsConfig(["p": ["keep", "hide"]])
+        let prefs = ModelPreferences(disabled: ["p/hide"])
+        let catalog = ModelCatalogBuilder.build(
+            config: config, auth: nil, credentialed: ["p"], preferences: prefs)
+        XCTAssertEqual(catalog.models.count, 2)
+        XCTAssertEqual(catalog.enabled.map(\.id), ["keep"])
+        XCTAssertEqual(catalog.disabledCount, 1)
+        XCTAssertEqual(catalog.find("p/hide")?.id, "hide")
+        XCTAssertEqual(catalog.find("hide")?.id, "hide")
+    }),
+
+    ("catalog: disabling is keyed on the qualified id, not the bare model", {
+        // The same model id can be reachable directly and through a gateway; those are
+        // different routes at different prices, and hiding one must not hide the other.
+        let config = testModelsConfig(["direct": ["shared"], "gateway": ["shared"]])
+        let prefs = ModelPreferences(disabled: ["gateway/shared"])
+        let catalog = ModelCatalogBuilder.build(
+            config: config, auth: nil, credentialed: ["direct", "gateway"], preferences: prefs)
+        XCTAssertEqual(catalog.enabled.map(\.qualifiedID), ["direct/shared"])
+    }),
+
+    ("catalog: each provider's own list matches the flat order", {
+        // A per-provider picker and the flat switcher must not disagree.
+        let config = testModelsConfig(["p": ["a", "b"], "q": ["x", "y"]])
+        let prefs = ModelPreferences(order: ["p/b", "q/y", "p/a"])
+        let catalog = ModelCatalogBuilder.build(
+            config: config, auth: nil, credentialed: ["p", "q"], preferences: prefs)
+        XCTAssertEqual(catalog.models.map(\.qualifiedID), ["p/b", "q/y", "p/a", "q/x"])
+        let p = try XCTUnwrap(catalog.reachable.first { $0.id == "p" })
+        XCTAssertEqual(p.models.map(\.id), ["b", "a"])
+        let q = try XCTUnwrap(catalog.reachable.first { $0.id == "q" })
+        XCTAssertEqual(q.models.map(\.id), ["y", "x"])
+    }),
+
+    ("catalog: pinning a group leaves other groups where they were", {
+        // Reordering one provider's models must not scramble another's.
+        let config = testModelsConfig(["p": ["a", "b"], "q": ["x", "y"]])
+        var prefs = ModelPreferences(order: ["q/y", "q/x", "p/a", "p/b"])
+        let pModels = ModelCatalogBuilder.build(
+            config: config, auth: nil, credentialed: ["p", "q"], preferences: prefs)
+            .models.filter { $0.providerID == "p" }
+        // Reverse p's two models.
+        prefs.pin(pModels.reversed())
+        let after = ModelCatalogBuilder.build(
+            config: config, auth: nil, credentialed: ["p", "q"], preferences: prefs)
+        // p's pair flipped and stayed after q's pair, which was untouched.
+        XCTAssertEqual(after.models.map(\.qualifiedID), ["q/y", "q/x", "p/b", "p/a"])
+    }),
+
+    ("catalog: a full round trip through the preferences store", {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-prefs-\(UUID().uuidString)")
+        let store = ModelPreferencesStore(directory: dir)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        XCTAssertEqual(store.load(), ModelPreferences(), "a missing file is not an error")
+        let prefs = ModelPreferences(order: ["p/b", "p/a"], disabled: ["p/c"])
+        store.save(prefs)
+        XCTAssertEqual(store.load(), prefs)
+    }),
+
+    ("catalog: an api key expression that resolves to nothing is not a credential", {
+        // A provider whose `!command` fails silently would otherwise look reachable and then
+        // fail on the first request, which is a much worse place to find out.
+        XCTAssertNil(await ModelCatalogBuilder.resolveSecret(nil))
+        XCTAssertNil(await ModelCatalogBuilder.resolveSecret(""))
+        XCTAssertEqual(await ModelCatalogBuilder.resolveSecret("sk-literal"), "sk-literal")
+        XCTAssertNil(await ModelCatalogBuilder.resolveSecret("!exit 1"))
+        XCTAssertEqual(await ModelCatalogBuilder.resolveSecret("!printf hello"), "hello")
     }),
 
     // MARK: Resuming a session

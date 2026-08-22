@@ -125,7 +125,7 @@ struct ModelsView: View {
                     StatTile(
                         label: "reachable models",
                         value: "\(model.runtimeModels.count)",
-                        caption: "what the engine says it can call",
+                        caption: "backed by credentials that resolve",
                         symbol: "checkmark.circle.fill", tint: Design.success, emphasis: true)
                     Divider().frame(height: 46)
                     StatTile(
@@ -151,18 +151,45 @@ struct ModelsView: View {
                 if let err = model.runtimeModelsError {
                     NoticeBanner(
                         level: .warning,
-                        title: "Could not ask the engine for its model catalog",
+                        title: "No models are reachable",
                         message: err)
                 }
 
-                Card("Everything reachable", symbol: "list.bullet.rectangle") {
-                    ModelTable(models: model.runtimeModels, search: $modelSearch)
+                ModelOrderCard()
+
+                if !model.modelCatalog.unreachable.isEmpty {
+                    Card("Configured but unreachable", symbol: "exclamationmark.triangle") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("These providers are in models.json but their credentials did "
+                                + "not resolve, so their models are not offered anywhere.")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            ForEach(model.modelCatalog.unreachable) { p in
+                                HStack(spacing: 8) {
+                                    Text(p.displayName).font(Design.mono(11))
+                                    Text("\(p.models.count) model(s)")
+                                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                                    Spacer()
+                                    if let form = p.keyForm {
+                                        Text(form.label)
+                                            .font(.system(size: 10)).foregroundStyle(.tertiary)
+                                    } else {
+                                        Text("no apiKey")
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(Design.warning)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 Card("Where this comes from", symbol: "questionmark.circle") {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Two different catalogs feed this screen, and they do not agree "
-                            + "by design.")
+                        Text("Two catalogues feed this screen, and they do not agree by "
+                            + "design. Your ordering and the models you have switched off are "
+                            + "Aviary's own, kept out of models.json because that file records "
+                            + "facts about providers rather than preferences about pickers.")
                             .font(.system(size: 11.5))
                         DetailRow(
                             label: "models.json", value: model.modelsConfig.fileURL.path, mono: true)
@@ -171,12 +198,14 @@ struct ModelsView: View {
                             .font(.system(size: 10.5)).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         Divider().opacity(0.5)
-                        DetailRow(label: "engine catalog", value: "get_available_models over RPC")
-                        Text("What the engine can actually reach right now, including built-in "
-                            + "providers that authenticate by OAuth and never appear in "
-                            + "models.json. Context windows here are route-specific: the same "
-                            + "weights are often declared with very different limits on a "
-                            + "subscription route versus a metered API route.")
+                        DetailRow(label: "built-in catalogue", value: "BuiltInProviders")
+                        Text("Providers that authenticate by OAuth and never appear in "
+                            + "models.json, so nothing on disk lists them. This used to be "
+                            + "asked of the engine over RPC — Aviary now assembles it locally, "
+                            + "which is why opening this screen no longer boots Node. Context "
+                            + "windows are route-specific: the same weights are often declared "
+                            + "with very different limits on a subscription route versus a "
+                            + "metered API route.")
                             .font(.system(size: 10.5)).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }

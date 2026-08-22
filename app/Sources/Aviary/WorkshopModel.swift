@@ -168,7 +168,7 @@ extension AppModel {
             return
         }
 
-        guard engine != nil else {
+        guard canRunWorkshopAgent else {
             show("Filed \(request.id). No engine configured, so it was not delivered.", isError: true)
             return
         }
@@ -176,15 +176,11 @@ extension AppModel {
         // Nothing attached. Resume the remembered session, or open a new one, and
         // deliver as the first prompt.
         let resume = workshopSessionID
-        var config = RunConfiguration(cwd: repoRoot.path, resume: resume)
-        config.environmentOverrides["AVIARY_WORKSHOP"] = "1"
-
         let first = resume == nil
             ? bootstrapPrompt(repoRoot: repoRoot) + "\n\n---\n\n" + message
             : message
 
-        startRun(config: config, firstPrompt: first)
-        workshopRunID = runs.last?.id
+        startWorkshopRun(repoRoot: repoRoot, resume: resume, firstPrompt: first)
         section = .workshop
 
         // Wait for the engine to prove it is alive before claiming the request was
@@ -330,20 +326,46 @@ extension AppModel {
         refreshBoard()
     }
 
+    /// Whether there is anything that can run the workshop agent.
+    ///
+    /// The in-house engine needs no `engine` at all — that is the whole point of it — so this
+    /// cannot just test for one.
+    var canRunWorkshopAgent: Bool { preferInHouseEngine || engine != nil }
+
+    /// Open or resume the workshop session on whichever engine is selected.
+    ///
+    /// One launcher for both entry points. They each used to build a harness
+    /// `RunConfiguration` directly, which is why the workshop agent was always the harness even
+    /// when the picker said otherwise — the last place that ignored the picker.
+    private func startWorkshopRun(repoRoot: URL, resume: String?, firstPrompt: String?) {
+        if preferInHouseEngine {
+            startInHouseRun(
+                cwd: repoRoot.path, providerID: nil, modelID: nil,
+                // An in-house run with no prompt prepares and waits, which is exactly what
+                // attaching to an existing session wants.
+                prompt: firstPrompt ?? "",
+                resume: resume, title: "Workshop")
+        } else {
+            var config = RunConfiguration(cwd: repoRoot.path, resume: resume)
+            // Nothing reads this yet. Kept as a marker so a hook can tell a workshop session
+            // from any other run without inspecting its prompt.
+            config.environmentOverrides["AVIARY_WORKSHOP"] = "1"
+            startRun(config: config, firstPrompt: firstPrompt)
+        }
+        workshopRunID = runs.last?.id
+    }
+
     /// Attach to the remembered workshop session without filing anything.
     func attachWorkshopSession() {
-        guard let repoRoot, engine != nil else { return }
+        guard let repoRoot, canRunWorkshopAgent else { return }
         if let run = workshopRun, !run.hasExited {
             focusedRunID = run.id
             section = .live
             return
         }
-        var config = RunConfiguration(cwd: repoRoot.path, resume: workshopSessionID)
-        config.environmentOverrides["AVIARY_WORKSHOP"] = "1"
-        startRun(
-            config: config,
+        startWorkshopRun(
+            repoRoot: repoRoot, resume: workshopSessionID,
             firstPrompt: workshopSessionID == nil ? bootstrapPrompt(repoRoot: repoRoot) : nil)
-        workshopRunID = runs.last?.id
         Task {
             if let run = workshopRun {
                 for _ in 0..<40 where run.sessionID == nil {

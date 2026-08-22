@@ -153,7 +153,7 @@ struct WorkshopView: View {
                       systemImage: "dot.radiowaves.left.and.right")
             }
             .controlSize(.small)
-            .disabled(model.engine == nil || model.repoRoot == nil)
+            .disabled(!model.canRunWorkshopAgent || model.repoRoot == nil)
 
             Spacer(minLength: 0)
 
@@ -419,7 +419,7 @@ private struct RequestDetail: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .disabled(model.isSubmitting || model.engine == nil)
+                    .disabled(model.isSubmitting || !model.canRunWorkshopAgent)
                 }
                 Text("Status is a log event, not a field — yours are recorded as “you”, the "
                     + "agent's as “agent”, and both survive in the file.")

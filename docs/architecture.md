@@ -282,24 +282,70 @@ the other. The parser now accepts both keys so sessions already on disk render t
 
 ### What the harness still does and this does not
 
-**The reachable-model catalogue.** Built-in OAuth providers are absent from `models.json`, so
-the only way to ask what models are actually reachable is to boot the engine over RPC — which
-is what the Models screen and the cockpit's model count read. Aviary has its own catalogue for
-Codex already; merging it with `models.json` is the remaining work.
+Two gaps closed since this list was written: resuming a session (above) and the
+reachable-model catalogue (below). Workshop dispatch now routes through the engine picker
+too — it was the last place that built a harness `RunConfiguration` regardless of what the
+picker said.
 
 **The daemon, kernels, workers and live-session list.** `DaemonInspector` talks to the harness
 supervisor socket, and Health's Supervisor card, the cockpit's kernel tile and the "Working
 agents" sidebar all read it. The in-house engine has runtime hosts instead; whether those
 cards map onto runtime-host sessions or go away is an open decision.
 
-**Workshop dispatch.** `deliver()` builds a harness `RunConfiguration` directly, so the
-workshop agent is always the harness even when the picker says otherwise. Now unblocked —
-resume was the missing piece — but not yet done.
-
 The Anthropic subscription login. Deferred deliberately: the harness's own docs say its Claude
 Pro/Max login bills as extra per-token usage rather than against plan limits, so that path was
 never about cheaper tokens — only about which client Anthropic sees. Plan-included Claude usage
 needs Claude Code driving, per `plans/claude-code-as-transport.md`.
+
+## The reachable-model catalogue
+
+Which models are offered is worked out locally, by `ModelCatalogBuilder`. It used to be asked
+of the engine over RPC — `get_available_models` — because built-in OAuth providers are absent
+from `models.json` and the harness was the only thing that knew about them. Aviary has its own
+`BuiltInProviders` now, so the answer can be assembled without booting Node, and opening the
+Models screen no longer starts a process.
+
+Reachable means the same thing it did: backed by credentials that resolve. A built-in provider
+is reachable when its OAuth login is stored; a configured one when its `apiKey` expression
+resolves to something non-empty, which means actually running the `!command` form. A provider
+that is configured but has no working credential is kept and shown as unreachable, because
+"you configured this and it is not working" is more useful than showing nothing. On this
+machine the local build reproduces the RPC catalogue's count exactly: 18 from `models.json`
+plus 13 built-in Codex models, 31 either way.
+
+The precedence matches `AgentCLI.resolve` — a `models.json` entry beats a built-in with the
+same id, because configuring a provider explicitly means you meant it.
+
+If an Anthropic subscription login is added, it needs a `BuiltInProviders` entry too, or its
+models will be missing rather than merely unreachable.
+
+### Order and disabling are yours, and live outside models.json
+
+`ModelPreferences` holds an order and a set of disabled models, stored in Aviary's
+Application Support directory. Not in `models.json`: that file is hand-maintained and records
+facts about providers, whereas "don't offer me this" is a fact about you — and writing a
+cosmetic preference into a file another tool owns would mean rewriting it on every drag.
+
+Four rules, each tested, all of them about not surprising you later:
+
+- **Keyed on the qualified id** (`provider/model`). A bare model id is not unique: the same
+  weights are often reachable directly *and* through a gateway, at different prices. Hiding one
+  route must not hide the other.
+- **Unlisted models sort last but keep catalogue order.** A model that appears in `models.json`
+  tomorrow neither jumps to the top of your list nor disappears from it.
+- **Disabled is a denylist, and it only affects pickers.** `ModelCatalog.find` ignores it, so
+  disabling a model cannot break resuming a session that already uses it. A preference about
+  what to offer is not a claim the model is gone.
+- **Pinning one group leaves the others alone.** Reordering a provider's models re-pins only
+  those ids, at the position the group already held, so another provider's ordering is not
+  collateral damage.
+
+Reordering and disabling re-derive the catalogue without re-resolving credentials — one of the
+key expressions on this machine shells out through `zsh -ic`, and paying that per drag would
+make the list feel broken.
+
+Each provider's own model list is sorted to match the flat list, so a per-provider picker and
+the flat switcher cannot disagree.
 
 ## The runtime host
 

@@ -311,13 +311,23 @@ struct RunPane: View {
                 }
             }
         }
-        .disabled(run.hasExited || model.runtimeModels.isEmpty)
+        .disabled(run.hasExited || model.pickerModels.isEmpty)
     }
 
+    /// Grouped for the switcher, in your order rather than alphabetically.
+    ///
+    /// Providers are ordered by where their first model sits, so pinning a model to the top
+    /// brings its provider with it instead of leaving the group buried under `a`-something.
     private var groupedModels: [(String, [ModelSpec])] {
-        Dictionary(grouping: model.runtimeModels, by: \.providerID)
-            .map { ($0.key, $0.value.sorted { $0.id < $1.id }) }
-            .sorted { $0.0 < $1.0 }
+        var groups: [(String, [ModelSpec])] = []
+        for m in model.pickerModels {
+            if let i = groups.firstIndex(where: { $0.0 == m.providerID }) {
+                groups[i].1.append(m)
+            } else {
+                groups.append((m.providerID, [m]))
+            }
+        }
+        return groups
     }
 
     @ViewBuilder
@@ -470,7 +480,7 @@ struct LauncherSheet: View {
 
                     Card("Model", symbol: "cpu") {
                         VStack(alignment: .leading, spacing: 8) {
-                            if model.runtimeModels.isEmpty {
+                            if model.pickerModels.isEmpty {
                                 Text(model.runtimeModelsError
                                     ?? "Asking the engine which models it can reach…")
                                     .font(.system(size: 11))
@@ -633,12 +643,15 @@ struct LauncherSheet: View {
         }
     }
 
+    /// In catalogue order, de-duplicated by first appearance, so the picker agrees with the
+    /// switcher and both follow your ordering.
     private var providers: [String] {
-        Array(Set(model.runtimeModels.map(\.providerID))).sorted()
+        var seen = Set<String>()
+        return model.pickerModels.compactMap { seen.insert($0.providerID).inserted ? $0.providerID : nil }
     }
 
     private var modelsForProvider: [ModelSpec] {
-        model.runtimeModels.filter { $0.providerID == provider }.sorted { $0.id < $1.id }
+        model.pickerModels.filter { $0.providerID == provider }
     }
 
     private func chooseDirectory() {

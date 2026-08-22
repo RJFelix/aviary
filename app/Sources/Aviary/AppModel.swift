@@ -112,6 +112,12 @@ final class AppModel {
     /// appear in models.json.
     var runtimeModels: [ModelSpec] = []
     var runtimeModelsError: String?
+    /// The reachable model catalogue, assembled locally rather than asked of the engine.
+    var modelCatalog = ModelCatalog()
+    let modelPreferencesStore = ModelPreferencesStore()
+    var modelPreferences = ModelPreferences()
+    /// What a picker offers: reachable, enabled, in your order.
+    var pickerModels: [ModelSpec] { modelCatalog.enabled }
     var providerTests: [String: ProviderTestResult] = [:]
     var testingProviders: Set<String> = []
     var library = Library()
@@ -197,6 +203,7 @@ final class AppModel {
         loginShellEnvironmentLoaded = await ProcessEnvironment.shared.loadFromLoginShell()
 
         catalog = SessionCatalog(home: home)
+        modelPreferences = modelPreferencesStore.load()
         engines = await EngineLocator.discover(
             customPath: UserDefaults.standard.string(forKey: "aviary.customEnginePath"))
         let remembered = UserDefaults.standard.string(forKey: "aviary.engine")
@@ -266,26 +273,60 @@ final class AppModel {
         }
     }
 
+    /// Work out which models are reachable, without booting the engine.
+    ///
+    /// This used to open a short-lived RPC session, because built-in OAuth providers are absent
+    /// from `models.json` and the harness was the only thing that knew about them. Aviary now
+    /// has its own built-in catalogue, so the answer can be assembled locally — which removes a
+    /// harness dependency from app startup and stops every launch paying for a Node boot.
+    ///
+    /// If an Anthropic subscription login is ever added, it needs a `BuiltInProviders` entry
+    /// here too, or its models will be missing rather than merely unreachable.
     func refreshRuntimeModels() async {
-        guard let engine else { return }
-        // A short-lived RPC session is the only way to ask the engine what models it can
-        // actually reach: built-in OAuth providers are absent from models.json entirely.
-        let session = RPCSession()
-        do {
-            let stream = try await session.start(
-                engine: engine,
-                config: RunConfiguration(
-                    cwd: FileManager.default.homeDirectoryForCurrentUser.path,
-                    persistSession: false))
-            // Drain in the background so the pipe never fills.
-            Task.detached { for await _ in stream {} }
-            runtimeModels = try await session.availableModels()
-            runtimeModelsError = nil
-            await session.stop()
-        } catch {
-            runtimeModelsError = error.localizedDescription
-            await session.stop()
-        }
+        let credentialed = await ModelCatalogBuilder.credentialedProviders(
+            config: modelsConfig, auth: auth)
+        modelCatalog = ModelCatalogBuilder.build(
+            config: modelsConfig, auth: auth, credentialed: credentialed,
+            preferences: modelPreferences)
+        runtimeModels = modelCatalog.models
+        runtimeModelsError = modelCatalog.models.isEmpty
+            ? (modelsConfig.exists
+                ? "No provider has working credentials. Check the API keys in models.json."
+                : "No models.json, and no built-in provider is logged in.")
+            : nil
+    }
+
+    /// Re-apply preferences without re-resolving credentials.
+    ///
+    /// Reordering or disabling a model must not run a `!command` API-key expression again — on
+    /// this machine one of them shells out through `zsh -ic`, and paying that on every drag
+    /// would make the list feel broken.
+    private func reapplyModelPreferences() {
+        modelCatalog = ModelCatalogBuilder.build(
+            config: modelsConfig, auth: auth,
+            credentialed: Set(modelCatalog.reachable.map(\.id)),
+            preferences: modelPreferences)
+        runtimeModels = modelCatalog.models
+    }
+
+    func setModelEnabled(_ enabled: Bool, for model: ModelSpec) {
+        modelPreferences.setEnabled(enabled, for: model)
+        modelPreferencesStore.save(modelPreferences)
+        reapplyModelPreferences()
+    }
+
+    /// Pin an explicit order for a list of models, as shown to the person doing the dragging.
+    func setModelOrder(_ models: [ModelSpec]) {
+        modelPreferences.pin(models)
+        modelPreferencesStore.save(modelPreferences)
+        reapplyModelPreferences()
+    }
+
+    /// Forget every ordering and re-enable everything.
+    func resetModelPreferences() {
+        modelPreferences = ModelPreferences()
+        modelPreferencesStore.save(modelPreferences)
+        reapplyModelPreferences()
     }
 
     /// Check both bundled hosts. Cheap — each starts, answers, and exits.

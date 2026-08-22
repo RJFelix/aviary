@@ -184,7 +184,7 @@ struct CommandPaletteView: View {
                 if out.count > 160 { break }
             }
 
-            for m in model.runtimeModels where m.qualifiedID.lowercased().contains(q) {
+            for m in model.pickerModels where m.qualifiedID.lowercased().contains(q) {
                 out.append(Entry(
                     kind: .model, title: m.qualifiedID,
                     subtitle: [
