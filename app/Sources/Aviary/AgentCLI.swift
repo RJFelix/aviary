@@ -103,12 +103,24 @@ enum AgentCLI {
                 + "\(Fmt.bytes(selection.savedCharacters)) saved)")
         }
 
+        // Memory, gated the same way skills are. Read before the run so it can go in the
+        // prompt; written during it through the `remember` callback.
+        let memory = MemoryStore(repoRoot: repoRoot, home: home, cwd: cwd)
+        let memoryGate = MemoryGate()
+        let recalled = memoryGate.select(memory.load(sessionID: nil), prompt: prompt)
+        if !quiet, recalled.totalAvailable > 0 {
+            note("memory \(recalled.included.count) recalled"
+                + (recalled.listed.isEmpty ? "" : ", \(recalled.listed.count) listed"))
+        }
+
         let runner = AgentRunner(
             provider: provider, host: host,
             settings: .init(
                 home: home, cwd: cwd, model: model,
                 systemPrompt: SystemPrompt.build(
-                    cwd: cwd, model: model, skills: gate.render(selection))))
+                    cwd: cwd, model: model, skills: gate.render(selection),
+                    memory: memoryGate.render(recalled)),
+                memory: memory))
 
         await runner.observe { event in
             switch event {
@@ -237,7 +249,9 @@ final class Atomic: @unchecked Sendable {
 /// Starting from nothing and adding only what earns its tokens is the whole point of owning
 /// this.
 enum SystemPrompt {
-    static func build(cwd: String, model: ModelSpec, skills: String = "") -> String {
+    static func build(
+        cwd: String, model: ModelSpec, skills: String = "", memory: String = ""
+    ) -> String {
         var lines = [
             "You are a coding agent working in \(cwd) on a macOS machine.",
             "",
@@ -255,6 +269,10 @@ enum SystemPrompt {
             "Say what you found, not what you are about to do. When you are finished, stop "
                 + "calling tools and answer.",
         ]
+        if !memory.isEmpty {
+            lines.append("")
+            lines.append(memory)
+        }
         if !skills.isEmpty {
             lines.append("")
             lines.append(skills)

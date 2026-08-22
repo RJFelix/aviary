@@ -53,7 +53,8 @@ PROTOCOL_VERSION = 2
 # Everything the host puts into the agent's namespace. Listed once, because `inspect` must
 # hide exactly this set: the namespace belongs to the agent, and a host whose own helpers show
 # up in it is lying about what the agent put there.
-_AVIARY_INJECTED = frozenset({"sh", "cwd", "ask_app", "spawn", "conversation"})
+_AVIARY_INJECTED = frozenset({"sh", "cwd", "ask_app", "spawn", "conversation",
+                              "remember", "recall"})
 
 # ---------------------------------------------------------------------------
 # Writing to stdout
@@ -257,6 +258,12 @@ class Session:
             "spawn", {"prompt": prompt, "name": name, "model": model}, sid)
         self.globals["conversation"] = lambda limit=40: request_from_app(
             "conversation", {"limit": limit}, sid)
+        self.globals["remember"] = lambda text, scope="project", days=None, tags=None: (
+            request_from_app("remember",
+                             {"text": text, "scope": scope, "days": days, "tags": tags or []},
+                             sid))
+        self.globals["recall"] = lambda query="": request_from_app(
+            "recall", {"query": query}, sid)
         self.thread = threading.Thread(target=self._loop, name=f"session-{sid}", daemon=True)
         self.thread.start()
 

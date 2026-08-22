@@ -79,6 +79,8 @@ public actor Agent {
     private var messages: [ChatMessage] = []
     private var observer: Observer?
     private var cancelled = false
+    /// The prompt that opened the run, kept for memory provenance.
+    private var firstPrompt: String?
 
     public private(set) var totalUsage = Usage()
     /// The last input-token count the provider reported. The cheapest available measure of
@@ -91,6 +93,9 @@ public actor Agent {
     /// sees. Namespaced because two servers may both offer `search`, and a bare name would
     /// make that collision silent.
     private var mcpTools: [String: (client: MCPClient, tool: MCPClient.Tool)] = [:]
+    /// Where `remember` writes and `recall` reads. Absent means the run has no memory, which
+    /// is a legitimate configuration rather than an error.
+    private var memory: MemoryStore?
 
     public init(
         provider: ChatProvider, host: RuntimeHost, writer: SessionWriter,
@@ -123,6 +128,10 @@ public actor Agent {
     /// Offer this run a set of MCP tools.
     public func addMCPTools(_ tools: [MCPClient.Tool], from client: MCPClient) {
         for tool in tools { mcpTools[tool.qualifiedName] = (client, tool) }
+    }
+
+    public func setMemory(_ store: MemoryStore?) {
+        memory = store
     }
 
     /// Serve a request from the runtime. Wire this to `RuntimeHost.onCallback`.
@@ -158,6 +167,61 @@ public actor Agent {
             ]
             if result.isError { out["error"] = .string(result.answer) }
             return .object(out)
+
+        case "remember":
+            guard let memory else {
+                return .object(["error": .string("This run has no memory store.")])
+            }
+            let text = (payload["text"]?.stringValue ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                return .object(["error": .string("remember() needs some text.")])
+            }
+            let scope = MemoryScope(rawValue: payload["scope"]?.stringValue ?? "project")
+                ?? .project
+            var expiresAt: Date?
+            if let days = payload["days"]?.intValue, days > 0 {
+                expiresAt = Date().addingTimeInterval(Double(days) * 86_400)
+            }
+            let entry = MemoryEntry(
+                id: MemoryStore.newID(), scope: scope, text: text,
+                tags: (payload["tags"]?.arrayValue ?? []).compactMap { $0.stringValue },
+                createdAt: Date(), updatedAt: Date(), expiresAt: expiresAt,
+                sessionID: writer.sessionID,
+                // Provenance, because the harness recorded none and "why does it think that?"
+                // was unanswerable. The prompt that produced the belief is the answer.
+                provenance: firstPrompt)
+            do {
+                try memory.append(entry, sessionID: writer.sessionID)
+                // Recorded in the transcript too, so a reader sees the agent deciding to
+                // believe something at the moment it decided.
+                try? await writer.appendNote(
+                    "Remembered (\(scope.rawValue)): \(text)", customType: "aviary.memory")
+                return .object(["id": .string(entry.id), "scope": .string(scope.rawValue)])
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+
+        case "recall":
+            guard let memory else {
+                return .object(["error": .string("This run has no memory store.")])
+            }
+            let query = payload["query"]?.stringValue ?? ""
+            let all = memory.load(sessionID: writer.sessionID)
+            let terms = SkillGate.terms(in: query)
+            let hits = terms.isEmpty ? all : all.filter { entry in
+                let haystack = SkillGate.terms(
+                    in: entry.text + " " + entry.tags.joined(separator: " "))
+                return !terms.intersection(haystack).isEmpty
+            }
+            return .object(["memories": .array(hits.prefix(20).map { entry in
+                .object([
+                    "id": .string(entry.id),
+                    "text": .string(entry.text),
+                    "scope": .string(entry.scope.rawValue),
+                    "tags": .array(entry.tags.map { .string($0) }),
+                ])
+            })])
 
         case "conversation":
             // The agent reading its own history, programmatically. Useful on its own — it can
@@ -210,7 +274,9 @@ public actor Agent {
     /// and the agent spent twenty turns grepping the codebase looking for it before giving up.
     /// A capability the model is not told about does not exist — and worse, it looks like a
     /// broken environment rather than a missing sentence.
-    public static func tools(cwd: String, canSpawn: Bool = false, spawnBudget: Int = 0) -> [ChatTool] {
+    public static func tools(
+        cwd: String, canSpawn: Bool = false, spawnBudget: Int = 0, hasMemory: Bool = false
+    ) -> [ChatTool] {
         var description = """
             Run Python in a persistent interpreter. Variables, imports and open handles \
             survive between calls, so build up state instead of repeating work.
@@ -224,6 +290,21 @@ public actor Agent {
             {'role', 'text', 'toolCalls'}. Use it to check what you already tried instead of \
             re-deriving it.
             """
+        if hasMemory {
+            description += """
+
+
+                  remember(text, scope='project', days=None, tags=[]) – record something you \
+                will want next time. Scopes: 'session' (this task only), 'project' (about this \
+                codebase — the usual choice), 'global' (true everywhere — rare). Pass `days` \
+                unless it will be true indefinitely.
+                  recall(query) – search what you recorded before.
+
+                Record what cost you effort to discover and would cost the same again: a \
+                non-obvious command, a constraint the code does not state, a dead end worth \
+                not repeating. Not things the repository already says clearly.
+                """
+        }
         if canSpawn {
             description += """
 
@@ -265,7 +346,8 @@ public actor Agent {
         var tools = Self.tools(
             cwd: config.cwd,
             canSpawn: spawnDelegate != nil && config.depth < config.maxDepth,
-            spawnBudget: max(0, config.maxDepth - config.depth))
+            spawnBudget: max(0, config.maxDepth - config.depth),
+            hasMemory: memory != nil)
         // MCP tools are declared individually rather than behind one dispatcher, because a
         // model picks a tool by reading its schema and a single `call_mcp(name, args)` hides
         // every schema behind a string.
@@ -286,6 +368,7 @@ public actor Agent {
     public func send(_ prompt: String) async {
         cancelled = false
         emit(.started(session: writer.sessionID))
+        if firstPrompt == nil { firstPrompt = prompt }
         try? await writer.appendUser(prompt)
         messages.append(.user(prompt))
 

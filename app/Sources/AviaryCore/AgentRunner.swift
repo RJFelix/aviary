@@ -19,10 +19,14 @@ public actor AgentRunner {
         /// Children get a tighter ceiling than their parent. A delegated task is meant to be
         /// narrower, and an unbounded child is how a fan-out becomes a runaway.
         public var childMaxIterations: Int
+        /// Where `remember` writes. Nil disables memory for the run, which is a legitimate
+        /// configuration rather than a degraded one.
+        public var memory: MemoryStore?
 
         public init(
             home: AgentHome, cwd: String, model: ModelSpec, systemPrompt: String,
-            maxDepth: Int = 3, maxIterations: Int = 40, childMaxIterations: Int = 20
+            maxDepth: Int = 3, maxIterations: Int = 40, childMaxIterations: Int = 20,
+            memory: MemoryStore? = nil
         ) {
             self.home = home
             self.cwd = cwd
@@ -31,6 +35,7 @@ public actor AgentRunner {
             self.maxDepth = maxDepth
             self.maxIterations = maxIterations
             self.childMaxIterations = childMaxIterations
+            self.memory = memory
         }
     }
 
@@ -63,6 +68,7 @@ public actor AgentRunner {
         let obs = observer
         await agent.observe { event in obs?(event) }
         await agent.setSpawnDelegate(Delegate(runner: self, parentSessionID: writer.sessionID))
+        await agent.setMemory(settings.memory)
 
         // Route the runtime's callbacks to this agent. One host serves many sessions, so the
         // handler dispatches on the host-session id rather than assuming a single agent.
@@ -152,6 +158,9 @@ public actor AgentRunner {
                     maxIterations: settings.childMaxIterations, maxTokens: model.maxTokens,
                     maxDepth: settings.maxDepth, depth: depth))
             await child.setSpawnDelegate(Delegate(runner: self, parentSessionID: writer.sessionID))
+            // Children remember too: a finding is no less true for having been discovered by
+            // a delegate, and a child that cannot record one has to hand it back in prose.
+            await child.setMemory(settings.memory)
             register(hostSession: hostSession, agent: child)
 
             // A child's own events are not forwarded to the parent's observer: a fan-out of

@@ -52,7 +52,8 @@ PROTOCOL_VERSION = 2
 # hide exactly this set: the namespace belongs to the agent, and a host whose own helpers show
 # up in it is lying about what the agent put there. Adding a helper without adding it here is
 # how that contract quietly breaks.
-_AVIARY_INJECTED = frozenset({"sh", "cwd", "ask_app", "spawn", "conversation"})
+_AVIARY_INJECTED = frozenset({"sh", "cwd", "ask_app", "spawn", "conversation",
+                              "remember", "recall"})
 
 # Callbacks in flight: a runtime asked Aviary for something and is blocked on the answer.
 #
@@ -229,6 +230,9 @@ __aviary_ns["ask_app"] = __aviary_ask_app
 __aviary_ns["spawn"] = lambda prompt, name=None, model=None: __aviary_ask_app(
     "spawn", prompt=prompt, name=name, model=model)
 __aviary_ns["conversation"] = lambda limit=40: __aviary_ask_app("conversation", limit=limit)
+__aviary_ns["remember"] = lambda text, scope="project", days=None, tags=None: __aviary_ask_app(
+    "remember", text=text, scope=scope, days=days, tags=tags or [])
+__aviary_ns["recall"] = lambda query="": __aviary_ask_app("recall", query=query)
 
 try:
     sys.stdout, sys.stderr = __aviary_out, __aviary_err

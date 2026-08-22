@@ -24,6 +24,7 @@ final class InHouseDriver {
     var errorBanner: String?
     var runtimeSummary: String?
     var skillsNote: String?
+    var memoryNote: String?
 
     private let home: AgentHome
     private let cwd: String
@@ -96,12 +97,22 @@ final class InHouseDriver {
                 + " · \(Fmt.bytes(selection.savedCharacters)) saved"
         }
 
+        let memory = MemoryStore(repoRoot: repoRoot, home: home, cwd: cwd)
+        let memoryGate = MemoryGate()
+        let recalled = memoryGate.select(memory.load(sessionID: nil), prompt: prompt)
+        if recalled.totalAvailable > 0 {
+            memoryNote = "\(recalled.included.count) memories recalled"
+                + (recalled.listed.isEmpty ? "" : ", \(recalled.listed.count) listed")
+        }
+
         let runner = AgentRunner(
             provider: provider, host: host,
             settings: .init(
                 home: home, cwd: cwd, model: model,
                 systemPrompt: SystemPrompt.build(
-                    cwd: cwd, model: model, skills: gate.render(selection))))
+                    cwd: cwd, model: model, skills: gate.render(selection),
+                    memory: memoryGate.render(recalled)),
+                memory: memory))
         self.runner = runner
 
         await runner.observe { [weak self] event in

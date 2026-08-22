@@ -1803,4 +1803,171 @@ await Harness.run([
         XCTAssertTrue(text.contains("python"), "says what it could have called instead")
         await writer.close()
     }),
+
+    // ------------------------------------------------------------------ memory
+    ("memory: an append-only log folds into current beliefs", {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-mem-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = MemoryStore(repoRoot: root, home: AgentHome(root: root), cwd: "/tmp/proj")
+
+        let first = MemoryEntry(
+            id: "m1", scope: .project, text: "the test suite is an executable, not swift test",
+            tags: ["testing"], createdAt: Date(), updatedAt: Date(),
+            sessionID: "s1", provenance: "how do I run tests?")
+        try store.append(first, sessionID: "s1")
+        let live = store.load(sessionID: "s1")
+        XCTAssertEqual(live.count, 1)
+        XCTAssertEqual(live.first?.provenance, "how do I run tests?",
+                       "why it believes this is answerable, unlike the harness's version")
+
+        // Correction is an append, not an edit: the mistake stays visible in the file.
+        var retraction = first
+        retraction.retired = true
+        retraction.updatedAt = Date().addingTimeInterval(60)
+        try store.append(retraction, sessionID: "s1")
+        XCTAssertEqual(store.load(sessionID: "s1").count, 0, "retired, and by a later event")
+        let raw = try String(contentsOf: try XCTUnwrap(store.url(for: .project)), encoding: .utf8)
+        XCTAssertEqual(raw.split(separator: "\n").count, 2, "both events are still on disk")
+    }),
+
+    ("memory: an expiry stops something being recalled without deleting it", {
+        // The tier the harness had no concept of: true for now, not forever.
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-mem-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = MemoryStore(repoRoot: root, home: AgentHome(root: root), cwd: "/tmp/proj")
+        try store.append(MemoryEntry(
+            id: "old", scope: .project, text: "the staging box is down",
+            tags: [], createdAt: Date(), updatedAt: Date(),
+            expiresAt: Date().addingTimeInterval(-3600)), sessionID: nil)
+        try store.append(MemoryEntry(
+            id: "new", scope: .project, text: "prod is on the new schema",
+            tags: [], createdAt: Date(), updatedAt: Date(),
+            expiresAt: Date().addingTimeInterval(3600)), sessionID: nil)
+        let live = store.load(sessionID: nil)
+        XCTAssertEqual(live.map(\.id), ["new"], "the expired one is not recalled")
+        let raw = try String(contentsOf: try XCTUnwrap(store.url(for: .project)), encoding: .utf8)
+        XCTAssertTrue(raw.contains("staging box"), "but it is still on disk to read")
+    }),
+
+    ("memory: session scope is written where the session's own artifacts live", {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-mem-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = AgentHome(root: root)
+        let store = MemoryStore(repoRoot: nil, home: home, cwd: "/tmp/proj")
+        try store.append(MemoryEntry(
+            id: "s", scope: .session, text: "mid-investigation: the flake is in fixture teardown",
+            tags: [], createdAt: Date(), updatedAt: Date()), sessionID: "sess-9")
+        let url = try XCTUnwrap(store.url(for: .session, sessionID: "sess-9"))
+        XCTAssertTrue(url.path.contains("session-artifacts/sess-9"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        // And a different session cannot see it — that is what makes the scope meaningful.
+        XCTAssertEqual(store.load(sessionID: "sess-other").count, 0)
+        XCTAssertEqual(store.load(sessionID: "sess-9").count, 1)
+    }),
+
+    ("memory: the gate lists what it cannot fit, with subjects rather than a count", {
+        // The specific failure this replaces: the harness injected 6 entries per kind at 180
+        // characters, sorted alphabetically, and rendered the rest as "+N more" — a number the
+        // model could do nothing with, hiding the most recent entry behind the sort.
+        let entries = (0..<30).map { i in
+            MemoryEntry(
+                id: "m\(i)", scope: .project, text: String(repeating: "detail \(i) ", count: 20),
+                tags: ["topic-\(i)"], createdAt: Date(),
+                updatedAt: Date().addingTimeInterval(Double(i)))
+        }
+        let gate = MemoryGate(budget: 600)
+        let selection = gate.select(entries, prompt: "unrelated question")
+        XCTAssertTrue(selection.included.count < entries.count, "the budget bit")
+        XCTAssertFalse(selection.listed.isEmpty)
+        // Recency decides ties, so the newest entry is included rather than hidden.
+        XCTAssertEqual(selection.included.first?.id, "m29",
+                       "newest first — the harness's alphabetical sort hid exactly this one")
+        let rendered = gate.render(selection)
+        XCTAssertTrue(rendered.contains("detail 29"), "the newest entry is shown in full")
+        // The ones that missed the budget are named by subject, not counted — "+N more" told
+        // the model a number it could do nothing with.
+        let listedTag = try XCTUnwrap(selection.listed.first?.tags.first)
+        XCTAssertTrue(rendered.contains(listedTag), "a listed entry is identified, not tallied")
+        XCTAssertTrue(rendered.contains("recall(query)"), "says how to reach the rest")
+        XCTAssertTrue(rendered.contains("remember(text"), "and how to add to it")
+    }),
+
+    ("memory: relevance beats recency, and session scope gets a thumb on the scale", {
+        let old = MemoryEntry(
+            id: "relevant", scope: .project, text: "clickhouse Identifier params cannot be dotted",
+            tags: ["clickhouse"], createdAt: Date(), updatedAt: Date().addingTimeInterval(-9999))
+        let recent = MemoryEntry(
+            id: "irrelevant", scope: .project, text: "the icon script needs python3",
+            tags: ["icons"], createdAt: Date(), updatedAt: Date())
+        let working = MemoryEntry(
+            id: "session", scope: .session, text: "currently bisecting the parser",
+            tags: [], createdAt: Date(), updatedAt: Date().addingTimeInterval(-500))
+        let gate = MemoryGate(budget: 10_000)
+        let selection = gate.select([recent, old, working], prompt: "a clickhouse Identifier bug")
+        XCTAssertEqual(selection.included.first?.id, "relevant",
+                       "an older entry that matches beats a newer one that does not")
+        // Session-scoped working state is nearly always relevant and always short-lived, so it
+        // outranks an unrelated project note.
+        let ids = selection.included.map(\.id)
+        XCTAssertTrue(ids.firstIndex(of: "session")! < ids.firstIndex(of: "irrelevant")!)
+    }),
+
+    ("agent: remember and recall round-trip through the callback channel", {
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-mem-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(
+                id: "f", baseURL: URL(string: "http://127.0.0.1:1/v1")!, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s"))
+
+        // Without a store, the verbs refuse rather than silently doing nothing.
+        let refused = await agent.serveCallback(
+            kind: "remember", payload: .object(["text": .string("x")]))
+        XCTAssertTrue((refused["error"]?.stringValue ?? "").contains("no memory store"))
+
+        await agent.setMemory(MemoryStore(repoRoot: root, home: home, cwd: "/tmp/proj"))
+        let empty = await agent.serveCallback(kind: "remember", payload: .object([:]))
+        XCTAssertNotNil(empty["error"], "empty text is refused")
+
+        let saved = await agent.serveCallback(kind: "remember", payload: .object([
+            "text": .string("the fixture server records requests at /_requests"),
+            "scope": .string("project"), "days": .number(7),
+            "tags": .array([.string("testing")]),
+        ]))
+        XCTAssertNotNil(saved["id"]?.stringValue)
+        XCTAssertEqual(saved["scope"]?.stringValue, "project")
+
+        let found = await agent.serveCallback(
+            kind: "recall", payload: .object(["query": .string("fixture requests")]))
+        let hits = try XCTUnwrap(found["memories"]?.arrayValue)
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertTrue((hits[0]["text"]?.stringValue ?? "").contains("_requests"))
+
+        // And the decision is visible in the transcript, at the moment it was made.
+        await writer.close()
+        let text = try String(contentsOf: writer.fileURL, encoding: .utf8)
+        XCTAssertTrue(text.contains("Remembered (project)"))
+    }),
+
+    ("agent: memory verbs are only advertised when there is a store", {
+        XCTAssertFalse(Agent.tools(cwd: "/tmp")[0].description.contains("remember("))
+        let withMemory = Agent.tools(cwd: "/tmp", hasMemory: true)[0].description
+        XCTAssertTrue(withMemory.contains("remember(text"))
+        XCTAssertTrue(withMemory.contains("recall(query)"))
+        XCTAssertTrue(withMemory.contains("'project'"), "names the scope it should usually pick")
+        XCTAssertTrue(withMemory.contains("Not things the repository already says"),
+                      "and what not to record, which is the harder half")
+    }),
 ])
