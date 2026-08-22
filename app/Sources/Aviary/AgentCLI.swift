@@ -23,7 +23,7 @@ enum AgentCLI {
         guard !prompt.isEmpty, !prompt.hasPrefix("--") else {
             fail("usage: Aviary --agent \"<prompt>\" [--model provider/id] [--cwd path] "
                 + "[--host python3|python3-shared] [--record] [--quiet] "
-                + "[--budget <tokens>] [--minutes <n>]")
+                + "[--budget <tokens>] [--minutes <n>] [--resume <session-id>]")
         }
         let model = value(of: "--model", in: args)
         let cwd = value(of: "--cwd", in: args) ?? FileManager.default.currentDirectoryPath
@@ -32,6 +32,7 @@ enum AgentCLI {
         let record = args.contains("--record")
         let tokenBudget = value(of: "--budget", in: args).flatMap { Int($0) }
         let minutes = value(of: "--minutes", in: args).flatMap { Double($0) }
+        let resume = value(of: "--resume", in: args)
 
         // Its own run loop: this process has no NSApplication, and the async work below needs
         // the main queue drained or nothing progresses. The same reason `--snapshot` pumps it.
@@ -39,7 +40,7 @@ enum AgentCLI {
         Task {
             await run(prompt: prompt, modelRef: model, cwd: cwd, variant: variant,
                       quiet: quiet, record: record, tokenBudget: tokenBudget,
-                      minutes: minutes)
+                      minutes: minutes, resume: resume)
             done.set(true)
         }
         while !done.get() {
@@ -119,7 +120,7 @@ enum AgentCLI {
 
     private static func run(
         prompt: String, modelRef: String?, cwd: String, variant: String, quiet: Bool,
-        record: Bool, tokenBudget: Int?, minutes: Double?
+        record: Bool, tokenBudget: Int?, minutes: Double?, resume: String? = nil
     ) async {
         _ = await ProcessEnvironment.shared.loadFromLoginShell()
         let home = AgentHome.default
@@ -240,7 +241,8 @@ enum AgentCLI {
                     ? Goal(text: prompt, tokenBudget: tokenBudget,
                            timeBudget: minutes.map { $0 * 60 })
                     : nil,
-                hookPaths: HookDiscovery.paths(repoRoot: repoRoot)))
+                hookPaths: HookDiscovery.paths(repoRoot: repoRoot),
+                resume: resume))
 
         await runner.observe { event in
             switch event {

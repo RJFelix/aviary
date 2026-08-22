@@ -1211,6 +1211,102 @@ await Harness.run([
         XCTAssertFalse(summary.firstPrompt.isEmpty)
     }),
 
+    ("resume: a second run continues the same file and sends the prior turns", {
+        // The end-to-end claim, asserted on the wire rather than inferred: the resumed run's
+        // request must actually contain the earlier exchange, and the file must still be one
+        // conversation rather than two stapled together.
+        guard let first = try FakeProviderServer(script: [["text": "The number is 8891."]])
+        else { print("      skipped: no fixture"); return }
+        guard let host = try makeHost(.reference) else { first.stop(); return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+
+        // Turn one, through the runner so the writer and session id come from the real path.
+        let runnerOne = AgentRunner(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: first.baseURL, apiKey: nil),
+            host: host,
+            settings: .init(home: home, cwd: "/tmp", model: fakeModel(), systemPrompt: "sys"))
+        let (writerOne, _) = try await runnerOne.run(prompt: "pick a number")
+        let sessionID = writerOne.sessionID
+        await writerOne.close()
+        first.stop()
+
+        // Turn two: same session, a new server so its recorded requests are only this run's.
+        guard let second = try FakeProviderServer(script: [["text": "8891"]])
+        else { print("      skipped: no fixture"); return }
+        defer { second.stop() }
+        let runnerTwo = AgentRunner(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: second.baseURL, apiKey: nil),
+            host: host,
+            settings: .init(
+                home: home, cwd: "/tmp", model: fakeModel(),
+                systemPrompt: "a freshly built prompt", resume: sessionID))
+        let (writerTwo, _) = try await runnerTwo.run(prompt: "what was it?")
+        // Same session, not a new one.
+        XCTAssertEqual(writerTwo.sessionID, sessionID)
+        XCTAssertEqual(writerTwo.fileURL, writerOne.fileURL)
+        await writerTwo.close()
+
+        // What went over the wire on the resumed run.
+        let requests = try second.recordedRequests()
+        let sent = try XCTUnwrap(requests.first)
+        let messages = try XCTUnwrap(sent["messages"]?.arrayValue)
+        let roles = messages.compactMap { $0["role"]?.stringValue }
+        // system, the earlier user turn, the earlier assistant turn, then the new prompt.
+        XCTAssertEqual(roles, ["system", "user", "assistant", "user"])
+        XCTAssertEqual(messages[0]["content"]?.stringValue, "a freshly built prompt")
+        let texts = messages.map { $0["content"]?.stringValue ?? "" }
+        XCTAssertTrue(texts.contains("pick a number"), "prior prompt was not replayed")
+        XCTAssertTrue(texts.contains { $0.contains("8891") }, "prior reply was not replayed")
+        XCTAssertTrue(texts.contains("what was it?"))
+        // Exactly one system message, and it is the new one — not the recorded run's.
+        XCTAssertEqual(roles.filter { $0 == "system" }.count, 1)
+
+        // And the file is still one conversation: the parser's active branch reaches the
+        // original turn, which is what `parentId` threading on resume exists for.
+        let parsed = try XCTUnwrap(SessionParser.parse(fileURL: writerTwo.fileURL))
+        let prompts = parsed.items.filter { $0.kind == .user }.map(\.plainText)
+        XCTAssertEqual(prompts, ["pick a number", "what was it?"])
+        // Only one session header, so a reader does not see the tail as a different session.
+        let lines = try String(contentsOf: writerTwo.fileURL, encoding: .utf8)
+            .split(separator: "\n")
+        XCTAssertEqual(lines.filter { $0.contains("\"type\":\"session\"") }.count, 1)
+        // The resume was recorded in the transcript, not just shown once in the UI.
+        XCTAssertTrue(
+            parsed.items.contains { $0.customType == "aviary.resume" },
+            "no resume note was written")
+    }),
+
+    ("resume: preparing a run sends nothing until asked", {
+        // How the UI resumes: continuing a session opens a run whose conversation is already
+        // there and waits. An empty first prompt would be a real, and rejectable, empty turn.
+        guard let server = try FakeProviderServer(script: [["text": "ok"]])
+        else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let runner = AgentRunner(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
+            host: host,
+            settings: .init(home: home, cwd: "/tmp", model: fakeModel(), systemPrompt: "sys"))
+        let (writer, agent) = try await runner.prepare()
+        XCTAssertEqual(try server.recordedRequests().count, 0, "prepare must not call the model")
+
+        // Then the first real prompt goes through the same agent.
+        await agent.send("now go")
+        XCTAssertEqual(try server.recordedRequests().count, 1)
+        await writer.close()
+        let parsed = try XCTUnwrap(SessionParser.parse(fileURL: writer.fileURL))
+        XCTAssertEqual(parsed.items.filter { $0.kind == .user }.map(\.plainText), ["now go"])
+    }),
+
     ("agent: a provider failure ends the run and says so in the transcript", {
         guard let server = try FakeProviderServer(script: [
             ["status": 401, "message": "Incorrect API key provided: LITELLM_MASTER_KEY"],
@@ -2655,6 +2751,251 @@ await Harness.run([
         XCTAssertEqual(
             CodexResponsesProvider.friendlyError(#"{"error":{"message":"nope"}}"#), "nope")
         XCTAssertNil(CodexResponsesProvider.friendlyError("not json"))
+    }),
+
+    // MARK: Resuming a session
+    //
+    // Resume's failure mode is that it works and is subtly wrong: a conversation that differs
+    // from the recorded one makes the model behave oddly while the transcript still looks
+    // fine. These pin the departures the replay is allowed to make, and the two shapes that
+    // are not valid to send at all.
+
+    ("resume: a plain exchange replays in wire order with no system message", {
+        // The agent builds its own system prompt from the current skills and context files;
+        // a replayed one would silently override it.
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"first"}]}}
+        {"type":"message","id":"a2","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"reply"}]}}
+        {"type":"message","id":"a3","parentId":"a2","timestamp":"2026-08-20T10:00:03.000Z","message":{"role":"user","content":[{"type":"text","text":"second"}]}}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        let r = SessionResume.replay(t)
+        XCTAssertEqual(r.messages.map(\.role), [.user, .assistant, .user])
+        XCTAssertEqual(r.messages.map(\.plainText), ["first", "reply", "second"])
+        XCTAssertFalse(r.messages.contains { $0.role == .system })
+        XCTAssertNil(r.caveat)
+        XCTAssertEqual(r.turnCount, 3)
+    }),
+
+    ("resume: a tool call and its result replay as an assistant turn then a tool turn", {
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"count"}]}}
+        {"type":"message","id":"a2","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"running"},{"type":"toolCall","id":"tc1","name":"ipython","arguments":{"code":"print(1)"}}]}}
+        {"type":"message","id":"a3","parentId":"a2","timestamp":"2026-08-20T10:00:03.000Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"ipython","content":[{"type":"text","text":"1"}],"isError":false}}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        let r = SessionResume.replay(t)
+        XCTAssertEqual(r.messages.map(\.role), [.user, .assistant, .tool])
+        // The call stays attached to the assistant turn that made it.
+        XCTAssertEqual(r.messages[1].toolCalls.count, 1)
+        XCTAssertEqual(r.messages[1].toolCalls.first?.id, "tc1")
+        XCTAssertEqual(r.messages[1].toolCalls.first?.arguments["code"]?.stringValue, "print(1)")
+        guard case let .toolResult(id, name, text, isError) = r.messages[2].content[0] else {
+            return XCTFail("expected a tool result, got \(r.messages[2].content)")
+        }
+        XCTAssertEqual(id, "tc1")
+        XCTAssertEqual(name, "ipython")
+        XCTAssertEqual(text, "1")
+        XCTAssertFalse(isError)
+        XCTAssertNil(r.caveat)
+    }),
+
+    ("resume: an interrupted tool call gets a synthetic result", {
+        // A call with no result is not a valid request — providers reject it. The run that
+        // died mid-tool is exactly the one worth resuming, so this cannot just drop the turn.
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"go"}]}}
+        {"type":"message","id":"a2","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc1","name":"ipython","arguments":{"code":"sleep(999)"}}]}}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        let r = SessionResume.replay(t)
+        XCTAssertEqual(r.messages.map(\.role), [.user, .assistant, .tool])
+        XCTAssertEqual(r.synthesizedToolResults, 1)
+        guard case let .toolResult(id, _, text, isError) = r.messages[2].content[0] else {
+            return XCTFail("expected a synthetic tool result")
+        }
+        XCTAssertEqual(id, "tc1")
+        XCTAssertTrue(isError)
+        XCTAssertTrue(text.contains("No result recorded"), "got \(text)")
+        XCTAssertEqual(r.caveat, "1 unfinished tool call marked as interrupted")
+    }),
+
+    ("resume: an empty tool result is kept, because empty is a real result", {
+        // Distinguishing "" from nil is the whole reason the synthetic path is safe.
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"go"}]}}
+        {"type":"message","id":"a2","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc1","name":"ipython","arguments":{"code":"pass"}}]}}
+        {"type":"message","id":"a3","parentId":"a2","timestamp":"2026-08-20T10:00:03.000Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"ipython","content":[{"type":"text","text":""}],"isError":false}}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        let r = SessionResume.replay(t)
+        XCTAssertEqual(r.synthesizedToolResults, 0)
+        guard case let .toolResult(_, _, text, isError) = r.messages[2].content[0] else {
+            return XCTFail("expected a tool result")
+        }
+        XCTAssertEqual(text, "")
+        XCTAssertFalse(isError)
+    }),
+
+    ("resume: visible thinking is dropped rather than re-sent", {
+        // The routes that produce reasoning want their own encrypted form echoed back, and
+        // Codex's `reasoning.encrypted_content` is deliberately not persisted. Sending the
+        // human-readable summary in its place would be a quiet lie about what it thought.
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"go"}]}}
+        {"type":"message","id":"a2","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"let me think"},{"type":"text","text":"done"}]}}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        let r = SessionResume.replay(t)
+        XCTAssertEqual(r.droppedThinkingBlocks, 1)
+        XCTAssertEqual(r.messages[1].content.count, 1)
+        XCTAssertEqual(r.messages[1].plainText, "done")
+    }),
+
+    ("resume: an assistant turn that was only thinking is not sent as an empty message", {
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"go"}]}}
+        {"type":"message","id":"a2","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"only thoughts"}]}}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        let r = SessionResume.replay(t)
+        XCTAssertEqual(r.messages.map(\.role), [.user])
+    }),
+
+    ("resume: a compaction marker cuts history to first task plus summary", {
+        // Mirrors the in-process shape exactly — `compactIfNeeded` keeps [system, first task],
+        // replaces the middle with one user turn, and keeps the tail. A resumed run whose
+        // history differs in shape from a run that compacted while alive is a divergence
+        // nobody would ever see.
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"the original task"}]}}
+        {"type":"message","id":"a2","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"lots of middle"}]}}
+        {"type":"message","id":"a3","parentId":"a2","timestamp":"2026-08-20T10:00:03.000Z","message":{"role":"user","content":[{"type":"text","text":"more middle"}]}}
+        {"type":"compaction","id":"a4","parentId":"a3","timestamp":"2026-08-20T10:00:04.000Z","summary":"Established X and Y.","tokensBefore":90000}
+        {"type":"message","id":"a5","parentId":"a4","timestamp":"2026-08-20T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"after the cut"}]}}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        let r = SessionResume.replay(t)
+        XCTAssertTrue(r.resumedAfterCompaction)
+        XCTAssertEqual(r.messages.map(\.role), [.user, .user, .assistant])
+        XCTAssertEqual(r.messages[0].plainText, "the original task")
+        XCTAssertEqual(r.messages[1].plainText, "[Earlier work, compacted]\n\nEstablished X and Y.")
+        XCTAssertEqual(r.messages[2].plainText, "after the cut")
+        XCTAssertEqual(r.caveat, "resuming from a compaction summary")
+    }),
+
+    ("resume: a departure before the compaction cut is not reported", {
+        // The interrupted call was dropped along with everything else the summary replaced,
+        // so reporting it would describe something that is not being sent.
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"task"}]}}
+        {"type":"message","id":"a2","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc1","name":"ipython","arguments":{}}]}}
+        {"type":"compaction","id":"a3","parentId":"a2","timestamp":"2026-08-20T10:00:03.000Z","summary":"Summary."}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        let r = SessionResume.replay(t)
+        XCTAssertEqual(r.synthesizedToolResults, 0)
+        XCTAssertEqual(r.caveat, "resuming from a compaction summary")
+    }),
+
+    ("resume: only the active branch is replayed", {
+        // A session file is every conversation the session ever had. Replaying an abandoned
+        // branch would resurrect work the person deliberately backed out of.
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"root"}]}}
+        {"type":"message","id":"dead","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"abandoned branch"}]}}
+        {"type":"message","id":"a2","parentId":"a1","timestamp":"2026-08-20T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"kept branch"}]}}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        let r = SessionResume.replay(t)
+        XCTAssertEqual(r.messages.map(\.plainText), ["root", "kept branch"])
+    }),
+
+    ("resume: an agent message replays as a user turn", {
+        // A message *to* this agent is the user role on the wire, whoever sent it. This is how
+        // a Workshop request that arrived mid-session survives a resume.
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"go"}]}}
+        {"type":"custom_message","id":"a2","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","customType":"agent_message","content":[{"type":"text","text":"from ryan: also do Z"}]}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        let r = SessionResume.replay(t)
+        XCTAssertEqual(r.messages.map(\.role), [.user, .user])
+        XCTAssertEqual(r.messages[1].plainText, "from ryan: also do Z")
+    }),
+
+    ("resume: a session with nothing to replay is empty rather than a failure", {
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        let r = SessionResume.replay(t)
+        XCTAssertTrue(r.isEmpty)
+        XCTAssertNil(r.caveat)
+    }),
+
+    ("resume: the agent seeds history after its system prompt and never from it", {
+        let history: [ChatMessage] = [
+            .system("a stale prompt from the recorded run"),
+            .user("earlier"),
+            ChatMessage(role: .assistant, content: [.text("earlier reply")]),
+        ]
+        let spec: ModelSpec = ModelSpec(rpc: .object([
+            "id": .string("m"), "provider": .string("p"), "name": .string("m"),
+        ]))
+        var config = Agent.Configuration(
+            model: spec, cwd: "/tmp", systemPrompt: "the freshly built prompt")
+        config.resumedHistory = history
+        XCTAssertEqual(config.resumedHistory.count, 3)
+        // The filter lives in Agent's init; assert the contract it enforces so a refactor
+        // that drops it fails here rather than in a run that mysteriously ignores its skills.
+        let seeded = [ChatMessage.system(config.systemPrompt)]
+            + config.resumedHistory.filter { $0.role != .system }
+        XCTAssertEqual(seeded.map(\.role), [.system, .user, .assistant])
+        XCTAssertEqual(seeded[0].plainText, "the freshly built prompt")
+    }),
+
+    ("resume: a model switch is on the active branch and names its model", {
+        // Two bugs that hid each other. An unparented `model_change` is not on the active
+        // branch, so the row never rendered — which meant nobody noticed that the writer's
+        // `model` key did not match the parser's `modelId` and every Aviary-written session
+        // recorded an empty model.
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","provider":"openai-codex","modelId":"gpt-5.6-terra"}
+        {"type":"message","id":"a1","parentId":"m1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        XCTAssertEqual(t.modelChanges.count, 1)
+        XCTAssertEqual(t.lastModel, "gpt-5.6-terra")
+        XCTAssertEqual(t.lastProvider, "openai-codex")
+        XCTAssertTrue(t.items.contains { $0.text == "Model → openai-codex/gpt-5.6-terra" })
+        // A state change carries no model-visible content, so it is skipped, not replayed.
+        let r = SessionResume.replay(t)
+        XCTAssertEqual(r.messages.map(\.role), [.user])
+        XCTAssertEqual(r.skippedEntries, 1)
+        XCTAssertEqual(r.lastModel, "gpt-5.6-terra")
+    }),
+
+    ("resume: the legacy `model` key still renders", {
+        // Sessions already on disk were written with `model`. They should not show blanks.
+        let jsonl = """
+        {"type":"session","version":3,"id":"s1","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp/p"}
+        {"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","provider":"p","model":"legacy-model"}
+        {"type":"message","id":"a1","parentId":"m1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+        """
+        let t = try XCTUnwrap(SessionParser.parse(data: Data(jsonl.utf8), fallbackID: "s1"))
+        XCTAssertEqual(t.lastModel, "legacy-model")
     }),
 
     // MARK: Markdown block structure

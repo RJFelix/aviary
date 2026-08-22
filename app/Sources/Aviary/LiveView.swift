@@ -533,9 +533,13 @@ struct LauncherSheet: View {
                                     + "against your prompt rather than all sent, and the "
                                     + "transcript is written in the same format so every other "
                                     + "screen still reads it. Follow-ups continue in the same "
-                                    + "interpreter, so variables persist between prompts."
+                                    + "interpreter, so variables persist between prompts. "
+                                    + "Steering, payload recording and resuming a session all "
+                                    + "work; the daemon, kernel list and reachable-model "
+                                    + "catalogue still come from the harness."
                                 : "The vendored Prime Agent harness over its RPC protocol. "
-                                    + "Supports follow-ups, steering and payload recording.")
+                                    + "Still the default, and still what the daemon, kernel "
+                                    + "list and reachable-model catalogue are read from.")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)

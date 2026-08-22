@@ -459,14 +459,10 @@ final class AppModel {
     /// Start a run that resumes this session with payload recording on — the way to get a
     /// breakdown for a session that was not recorded the first time.
     func continueWithRecording(_ session: SessionSummary) {
-        startRun(
-            config: RunConfiguration(
-                cwd: session.cwd.isEmpty ? defaultCwd : session.cwd,
-                provider: session.provider,
-                model: session.model,
-                resume: session.id,
-                recordPayloads: EngineLocator.wireLogExtension() != nil),
-            firstPrompt: nil)
+        // On the in-house engine recording is native, so it needs no extension to be present.
+        continueSession(
+            session,
+            recordPayloads: preferInHouseEngine || EngineLocator.wireLogExtension() != nil)
     }
 
     func reloadModelsConfig() {
@@ -501,7 +497,7 @@ final class AppModel {
     /// host. No harness process and no Node.
     func startInHouseRun(
         cwd: String, providerID: String?, modelID: String?, prompt: String,
-        recordPayloads: Bool = false
+        recordPayloads: Bool = false, resume: String? = nil, title: String? = nil
     ) {
         guard let (providerSpec, model) = AgentCLI.resolve(
             [providerID, modelID].compactMap { $0 }.joined(separator: "/"),
@@ -513,12 +509,33 @@ final class AppModel {
         let run = LiveRun(
             inHouse: InHouseDriver(
                 home: home, cwd: cwd, model: model, providerSpec: providerSpec,
-                recordPayloads: recordPayloads),
+                recordPayloads: recordPayloads, resume: resume),
             cwd: cwd, modelLabel: model.qualifiedID)
+        if let title { run.title = title }
         runs.append(run)
         focusedRunID = run.id
         section = .live
         run.startInHouse(prompt: prompt)
+    }
+
+    /// Continue an existing session on whichever engine is selected.
+    ///
+    /// One entry point for all three "Continue" affordances, so the engine picker governs
+    /// resume too. They each used to build a harness `RunConfiguration` directly, which is why
+    /// resume was harness-only regardless of what the picker said.
+    func continueSession(_ s: SessionSummary, recordPayloads: Bool = false) {
+        let cwd = s.cwd.isEmpty ? defaultCwd : s.cwd
+        if preferInHouseEngine {
+            startInHouseRun(
+                cwd: cwd, providerID: s.provider, modelID: s.model, prompt: "",
+                recordPayloads: recordPayloads, resume: s.id, title: s.title)
+            return
+        }
+        startRun(
+            config: RunConfiguration(
+                cwd: cwd, provider: s.provider, model: s.model, resume: s.id,
+                recordPayloads: recordPayloads),
+            firstPrompt: nil)
     }
 
     func startRun(config: RunConfiguration, firstPrompt: String?) {

@@ -30,12 +30,15 @@ public actor AgentRunner {
         public var goal: Goal?
         /// Hook files to load. Empty means the feature costs nothing.
         public var hookPaths: [String] = []
+        /// An existing session id to continue. The run appends to that transcript and picks up
+        /// its conversation; nil starts a new session.
+        public var resume: String?
 
         public init(
             home: AgentHome, cwd: String, model: ModelSpec, systemPrompt: String,
             maxDepth: Int = 3, maxIterations: Int = 40, childMaxIterations: Int = 20,
             memory: MemoryStore? = nil, recordPayloads: Bool = false, goal: Goal? = nil,
-            hookPaths: [String] = []
+            hookPaths: [String] = [], resume: String? = nil
         ) {
             self.home = home
             self.cwd = cwd
@@ -48,6 +51,7 @@ public actor AgentRunner {
             self.recordPayloads = recordPayloads
             self.goal = goal
             self.hookPaths = hookPaths
+            self.resume = resume
         }
     }
 
@@ -67,15 +71,42 @@ public actor AgentRunner {
     }
 
     /// Run a root agent to completion. Returns its transcript so a caller can render it.
+    /// Build the run and send its first prompt.
     public func run(prompt: String) async throws -> (writer: SessionWriter, agent: Agent) {
+        let prepared = try await prepare()
+        await prepared.agent.send(prompt)
+        return prepared
+    }
+
+    /// Build the run without sending anything.
+    ///
+    /// Resuming needs this: continuing a session opens a run whose conversation is already
+    /// there and then waits for what you want to say next, which is not the same as sending an
+    /// empty prompt — an empty user turn is a real turn, and some routes reject it.
+    public func prepare() async throws -> (writer: SessionWriter, agent: Agent) {
         let hostSession = try await host.createSession(cwd: settings.cwd)
-        let writer = try SessionWriter(home: settings.home, cwd: settings.cwd, model: settings.model)
+
+        // Replay before opening the writer, so a session that cannot be read does not leave a
+        // `model_change` appended to it.
+        var replay = SessionReplay()
+        let writer: SessionWriter
+        if let resume = settings.resume {
+            replay = SessionResume.replay(fileURL: settings.home.sessionFile(id: resume))
+                ?? SessionReplay()
+            writer = try SessionWriter(
+                home: settings.home, resuming: resume, cwd: settings.cwd, model: settings.model)
+        } else {
+            writer = try SessionWriter(
+                home: settings.home, cwd: settings.cwd, model: settings.model)
+        }
+
         let agent = Agent(
             provider: provider, host: host, writer: writer, hostSession: hostSession,
             config: .init(
                 model: settings.model, cwd: settings.cwd, systemPrompt: settings.systemPrompt,
                 maxIterations: settings.maxIterations, maxTokens: settings.model.maxTokens,
-                maxDepth: settings.maxDepth, depth: 0, goal: settings.goal))
+                maxDepth: settings.maxDepth, depth: 0, goal: settings.goal,
+                resumedHistory: replay.messages))
 
         let obs = observer
         await agent.observe { event in obs?(event) }
@@ -104,7 +135,17 @@ public actor AgentRunner {
         await register(hostSession: hostSession, agent: agent)
         await installCallbackHandler()
 
-        await agent.send(prompt)
+        // Recorded in the transcript, not just shown once in the UI: a resumed run whose
+        // history was altered should still say so when the session is read back tomorrow.
+        if settings.resume != nil {
+            var note = "Resumed: picked up \(replay.turnCount) prior turn(s)."
+            if let caveat = replay.caveat { note += " " + caveat + "." }
+            if replay.messages.isEmpty {
+                note = "Resumed, but no prior conversation could be replayed from this session."
+            }
+            try? await writer.appendNote(note, customType: "aviary.resume")
+        }
+
         return (writer, agent)
     }
 

@@ -181,16 +181,17 @@ struct SessionsView: View {
             NSPasteboard.general.setString(s.id, forType: .string)
         }
         Button("Copy resume command") {
+            // Matches the selected engine, so pasting it continues the session the same way
+            // the Continue button would.
+            let command = model.preferInHouseEngine
+                ? "Aviary --agent \"<prompt>\" --cwd \(s.cwd) --resume \(s.id)"
+                : "prime-agent --cwd \(s.cwd) -r \(s.id)"
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString("prime-agent --cwd \(s.cwd) -r \(s.id)", forType: .string)
+            NSPasteboard.general.setString(command, forType: .string)
         }
         Divider()
         Button("Continue this session in a new run") {
-            model.startRun(
-                config: RunConfiguration(
-                    cwd: s.cwd.isEmpty ? model.defaultCwd : s.cwd,
-                    provider: s.provider, model: s.model, resume: s.id),
-                firstPrompt: nil)
+            model.continueSession(s)
         }
         .disabled(s.isLive)
         Divider()
@@ -494,7 +495,9 @@ struct SessionInspector: View {
                             .font(.system(size: 11))
                     }
                     .buttonStyle(.bordered).controlSize(.small)
-                    .disabled(session.isLive || EngineLocator.wireLogExtension() == nil)
+                    .disabled(session.isLive
+                        || (!model.preferInHouseEngine
+                            && EngineLocator.wireLogExtension() == nil))
                     Text("Resumes this session in a new run with recording on. The next turn's "
                         + "payload will include the same system prompt and context this "
                         + "session has been using.")
@@ -582,11 +585,7 @@ struct SessionInspector: View {
                     }
                     .buttonStyle(.link).font(.system(size: 10.5))
                     Button("Continue") {
-                        model.startRun(
-                            config: RunConfiguration(
-                                cwd: s.cwd.isEmpty ? model.defaultCwd : s.cwd,
-                                provider: s.provider, model: s.model, resume: s.id),
-                            firstPrompt: nil)
+                        model.continueSession(s)
                     }
                     .buttonStyle(.link).font(.system(size: 10.5))
                     .disabled(s.isLive)

@@ -237,7 +237,64 @@ alternatives broke a real login: the paste prompt returned immediately, tore dow
 and the browser's redirect hit a closed port. The listener binds `127.0.0.1` only, and a state
 mismatch answers 400 and keeps waiting rather than ending the login, both matching the reference.
 
+### Resuming a session
+
+`AgentRunner.Settings.resume` continues an existing session: the run appends to that
+transcript and picks up its conversation. `SessionResume` rebuilds the message list, and it is
+built on `SessionParser` rather than re-reading the JSONL — the parser already decides which
+branch is live, so **what gets replayed is exactly what the transcript shows**. A second
+reader would eventually disagree with the screen, invisibly.
+
+Four things it has to get right, each with a test:
+
+- **`parentId` threading.** Entries form a tree and the parser walks backwards from the *last*
+  line, so a resumed run whose first entry has no parent orphans the whole prior conversation.
+  The transcript would then show only the new turns and look perfectly well-formed doing it.
+  `SessionWriter.init(home:resuming:…)` seeds `lastEntryID` from the file.
+- **One session header.** A reader that meets a second one treats the tail as a different
+  session, so the resuming initialiser writes no header.
+- **Unfinished tool calls.** A call with no result is not a valid request, and the run that
+  died mid-tool is exactly the one worth resuming — so each gets a synthetic error result
+  saying the previous run ended before it returned. An empty *string* result is left alone;
+  only a missing result entry is synthesised, which is why the distinction matters.
+- **Compaction.** History is cut at the marker and rebuilt as first task + summary + tail,
+  reproducing `compactIfNeeded`'s in-process shape exactly. A resumed run whose history
+  differs in shape from a run that compacted while alive is a divergence nobody would see.
+
+Visible reasoning is dropped rather than replayed. The routes that produce it want their own
+encrypted form echoed back — Codex's `reasoning.encrypted_content`, deliberately not persisted
+— and sending the human-readable summary in its place would be a quiet lie about what the
+model previously thought. It costs the model its earlier train of thought, which is the
+cheaper of the two errors.
+
+Every departure from the file is counted and surfaced: `SessionReplay.caveat` becomes a line
+in the UI *and* an `aviary.resume` note in the transcript, so a session read back tomorrow
+still says its history was altered.
+
+`AgentRunner.prepare()` builds a run without sending anything. That is how the UI resumes —
+continuing a session opens a run whose conversation is already there and then waits for what
+you want to say next, which is not the same as sending an empty prompt.
+
+Fixed on the way, because resume inherited both: `model_change` entries were written unparented
+(so they never landed on the active branch and never rendered) and keyed `model` where the
+parser reads `modelId` (so every Aviary-written session recorded an empty model). Each bug hid
+the other. The parser now accepts both keys so sessions already on disk render too.
+
 ### What the harness still does and this does not
+
+**The reachable-model catalogue.** Built-in OAuth providers are absent from `models.json`, so
+the only way to ask what models are actually reachable is to boot the engine over RPC — which
+is what the Models screen and the cockpit's model count read. Aviary has its own catalogue for
+Codex already; merging it with `models.json` is the remaining work.
+
+**The daemon, kernels, workers and live-session list.** `DaemonInspector` talks to the harness
+supervisor socket, and Health's Supervisor card, the cockpit's kernel tile and the "Working
+agents" sidebar all read it. The in-house engine has runtime hosts instead; whether those
+cards map onto runtime-host sessions or go away is an open decision.
+
+**Workshop dispatch.** `deliver()` builds a harness `RunConfiguration` directly, so the
+workshop agent is always the harness even when the picker says otherwise. Now unblocked —
+resume was the missing piece — but not yet done.
 
 The Anthropic subscription login. Deferred deliberately: the harness's own docs say its Claude
 Pro/Max login bills as extra per-token usage rather than against plan limits, so that path was

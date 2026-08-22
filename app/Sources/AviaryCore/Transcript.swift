@@ -520,7 +520,9 @@ public enum SessionParser {
 
             case "model_change":
                 let provider = v["provider"]?.stringValue ?? ""
-                let model = v["modelId"]?.stringValue ?? ""
+                // `model` is accepted too: Aviary wrote that key for a while, and sessions
+                // already on disk should render rather than showing an empty switch.
+                let model = v["modelId"]?.stringValue ?? v["model"]?.stringValue ?? ""
                 t.modelChanges.append((date: ts, provider: provider, model: model))
                 t.lastModel = model
                 t.lastProvider = provider

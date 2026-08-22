@@ -36,12 +36,20 @@ public actor Agent {
         /// A budget and a finishing condition. Nil means the only limit is `maxIterations`,
         /// which the agent cannot see and therefore cannot plan against.
         public var goal: Goal?
+        /// Prior turns to continue from, replayed by `SessionResume`. Carried in the
+        /// configuration rather than set afterwards so it cannot be supplied too late — the
+        /// history has to be in place before the first model call, and a `seed()` method
+        /// callable at any time is a bug waiting for a refactor.
+        ///
+        /// Must not contain a system message; the agent builds its own from the current skills
+        /// and context files, which is the point of resuming rather than replaying.
+        public var resumedHistory: [ChatMessage] = []
 
         public init(
             model: ModelSpec, cwd: String, systemPrompt: String,
             maxIterations: Int = 40, maxTokens: Int? = nil, reasoningEffort: String? = nil,
             compactAtContextShare: Double = 0.7, maxDepth: Int = 3, depth: Int = 0,
-            goal: Goal? = nil
+            goal: Goal? = nil, resumedHistory: [ChatMessage] = []
         ) {
             self.model = model
             self.cwd = cwd
@@ -53,6 +61,7 @@ public actor Agent {
             self.maxDepth = maxDepth
             self.depth = depth
             self.goal = goal
+            self.resumedHistory = resumedHistory
         }
     }
 
@@ -127,7 +136,11 @@ public actor Agent {
         self.writer = writer
         self.hostSession = hostSession
         self.config = config
+        // A defensive filter rather than a precondition: a stale system prompt from a previous
+        // run would silently override the one just built, and the failure would look like the
+        // agent ignoring its own configuration.
         self.messages = [.system(config.systemPrompt)]
+            + config.resumedHistory.filter { $0.role != .system }
     }
 
     public func observe(_ observer: Observer?) {

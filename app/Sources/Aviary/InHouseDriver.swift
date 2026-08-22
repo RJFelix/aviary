@@ -46,12 +46,15 @@ final class InHouseDriver {
 
     /// Whether to record request payloads, so the run's "what was sent" breakdown works.
     private let recordPayloads: Bool
+    /// An existing session to continue, or nil for a new one.
+    private let resume: String?
 
     init(
         home: AgentHome, cwd: String, model: ModelSpec, providerSpec: ProviderSpec,
-        recordPayloads: Bool = false
+        recordPayloads: Bool = false, resume: String? = nil
     ) {
         self.recordPayloads = recordPayloads
+        self.resume = resume
         self.home = home
         self.cwd = cwd
         self.model = model
@@ -123,7 +126,7 @@ final class InHouseDriver {
                     cwd: cwd, model: model, skills: gate.render(selection),
                     memory: memoryGate.render(recalled)),
                 memory: memory, recordPayloads: recordPayloads,
-                hookPaths: HookDiscovery.paths(repoRoot: repoRoot)))
+                hookPaths: HookDiscovery.paths(repoRoot: repoRoot), resume: resume))
         self.runner = runner
 
         await runner.observe { [weak self] event in
@@ -132,7 +135,10 @@ final class InHouseDriver {
 
         isStreaming = true
         do {
-            let (writer, agent) = try await runner.run(prompt: prompt)
+            // An empty prompt means "open the run and wait" — the resume case.
+            let (writer, agent) = prompt.isEmpty
+                ? try await runner.prepare()
+                : try await runner.run(prompt: prompt)
             self.writer = writer
             self.agent = agent
             acceptsFollowUps = true

@@ -35,6 +35,65 @@ public actor SessionWriter {
         return "\(hex.prefix(8))-\(hex.suffix(4))-7\(tail.prefix(3))-\(tail.dropFirst(3).prefix(4))-\(tail.dropFirst(7).prefix(12))"
     }
 
+    public enum ResumeFailure: LocalizedError {
+        case noSuchSession(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .noSuchSession(let id): return "No session file for \(id) to resume."
+            }
+        }
+    }
+
+    /// Continue writing an existing session.
+    ///
+    /// Two things make this more than opening the file in append mode.
+    ///
+    /// No second `session` header: the file already has one, and a reader that meets a second
+    /// treats the tail as a different session.
+    ///
+    /// And `lastEntryID` is seeded from the last entry already in the file. Entries thread
+    /// `parentId`, and the parser walks the active branch backwards from the *last* line — so a
+    /// resumed run whose first entry has no parent orphans the entire prior conversation. The
+    /// transcript would show only the new turns and look perfectly well-formed doing it.
+    public init(home: AgentHome, resuming sessionID: String, cwd: String, model: ModelSpec?) throws {
+        self.sessionID = sessionID
+        self.fileURL = home.sessionFile(id: sessionID)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw ResumeFailure.noSuchSession(sessionID)
+        }
+        handle = try FileHandle(forWritingTo: fileURL)
+        try handle.seekToEnd()
+
+        let tail = Self.tailEntry(of: fileURL)
+        lastEntryID = tail.id
+        entryCount = tail.count
+
+        // A model_change is written when resuming with a model, because a resumed run may use
+        // a different one and the transcript already renders switches.
+        if let model { try appendModelChange(model) }
+    }
+
+    /// The id of the last entry in an existing session, and how many entries it holds.
+    ///
+    /// Reads the whole file, which is the honest cost of resuming: the largest transcript in
+    /// this agent directory is 12 MB, read once at run start.
+    private static func tailEntry(of url: URL) -> (id: String?, count: Int) {
+        guard let data = FileManager.default.contents(atPath: url.path) else { return (nil, 0) }
+        var lastID: String?
+        var count = 0
+        for chunk in data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true) {
+            var slice = Data(chunk)
+            if slice.last == UInt8(ascii: "\r") { slice.removeLast() }
+            guard !slice.isEmpty, let v = JSONValue.parse(slice) else { continue }
+            count += 1
+            // The header has an id too, and is a legitimate parent for a resumed run whose
+            // session recorded nothing else.
+            if let id = v["id"]?.stringValue { lastID = id }
+        }
+        return (lastID, count)
+    }
+
     public init(home: AgentHome, sessionID: String? = nil, cwd: String, model: ModelSpec?) throws {
         let sid = sessionID ?? Self.newSessionID()
         self.sessionID = sid
@@ -64,15 +123,20 @@ public actor SessionWriter {
             ])
         }
         try writeRaw(.object(header))
-        if let model {
-            try writeRaw(.object([
-                "type": .string("model_change"),
-                "id": .string(Self.newEntryID()),
-                "timestamp": .string(Self.stamp()),
-                "provider": .string(model.providerID),
-                "model": .string(model.id),
-            ]))
-        }
+        if let model { try appendModelChange(model) }
+    }
+
+    /// Record which model is answering from here on.
+    ///
+    /// Threaded through `append` rather than written raw, and keyed `modelId`. Both were bugs:
+    /// an unparented entry is not on the active branch, so the row never rendered — and the
+    /// parser reads `modelId`, so the `model` key this used to write left every Aviary-written
+    /// session with an empty model in its switch list. Each one hid the other.
+    private func appendModelChange(_ model: ModelSpec) throws {
+        try append(type: "model_change", fields: [
+            "provider": .string(model.providerID),
+            "modelId": .string(model.id),
+        ])
     }
 
     static func stamp(_ date: Date = Date()) -> String {
