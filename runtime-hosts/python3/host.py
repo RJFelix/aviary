@@ -46,7 +46,56 @@ except ImportError:  # pragma: no cover - newer Pythons renamed it
     except ImportError:
         subinterpreters = None
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+
+# Everything the host puts into the agent's namespace. Listed once, because `inspect` must
+# hide exactly this set: the namespace belongs to the agent, and a host whose own helpers show
+# up in it is lying about what the agent put there. Adding a helper without adding it here is
+# how that contract quietly breaks.
+_AVIARY_INJECTED = frozenset({"sh", "cwd", "ask_app", "spawn", "conversation"})
+
+# Callbacks in flight: a runtime asked Aviary for something and is blocked on the answer.
+#
+# This is the channel that lets agent code reach back into the app — spawning a sub-agent,
+# reading the conversation it is part of, asking a person a question. Without it a runtime can
+# only compute; with it the runtime is where an agent's whole behaviour can live, which is the
+# point of making the environment programmable in the first place.
+_callbacks: dict = {}
+_callback_lock = threading.Lock()
+_callback_seq = [0]
+
+
+def request_from_app(kind: str, payload: dict, session: str = "", timeout: float = 900.0) -> dict:
+    """Ask Aviary to do something, and block this session's thread until it answers.
+
+    Blocking is correct here: the agent wrote `await spawn(...)` and expects a result. Only
+    the calling session's thread waits — other sessions have their own interpreters and their
+    own GILs, so a session waiting on a sub-agent does not stall the host.
+    """
+    with _callback_lock:
+        _callback_seq[0] += 1
+        rid = f"cb-{_callback_seq[0]}"
+        event = threading.Event()
+        _callbacks[rid] = {"event": event, "result": None}
+    # The session must travel with the request: one host serves many sessions, and a client
+    # routing a callback has no other way to know which agent asked.
+    emit({"event": "callback", "rid": rid, "kind": kind, "payload": payload,
+          "session": session})
+    if not event.wait(timeout):
+        with _callback_lock:
+            _callbacks.pop(rid, None)
+        return {"error": f"Aviary did not answer the {kind} request within {int(timeout)}s"}
+    with _callback_lock:
+        entry = _callbacks.pop(rid, None)
+    return (entry or {}).get("result") or {}
+
+
+def resolve_callback(rid: str, result: dict) -> None:
+    with _callback_lock:
+        entry = _callbacks.get(rid)
+    if entry:
+        entry["result"] = result
+        entry["event"].set()
 
 # ---------------------------------------------------------------------------
 # Writing to stdout
@@ -147,8 +196,39 @@ def __aviary_sh(command, timeout=None):
     return {"stdout": proc.stdout, "stderr": proc.stderr, "status": proc.returncode}
 
 
+def __aviary_ask_app(kind, **payload):
+    # Objects cannot cross an interpreter boundary, so a callback is marshalled through two
+    # files: this side writes the request and spins on the reply. The spin is cheap because
+    # this interpreter has its own GIL — waiting here does not stall any other session.
+    import json as _json, os as _os, tempfile as _tf, time as _time
+    fd, req_path = _tf.mkstemp(prefix="aviary-cb-req-", suffix=".json")
+    _os.close(fd)
+    reply_path = req_path.replace("-req-", "-rep-")
+    with open(req_path, "w") as fh:
+        _json.dump({"kind": kind, "payload": payload, "reply": reply_path}, fh)
+    with open(__AVIARY_CALLBACK_DIR + "/pending", "a") as fh:
+        fh.write(req_path + "\n")
+    deadline = _time.time() + 900
+    while _time.time() < deadline:
+        if _os.path.exists(reply_path):
+            try:
+                with open(reply_path) as fh:
+                    out = _json.load(fh)
+                _os.unlink(reply_path)
+                return out
+            except Exception:
+                _time.sleep(0.02)
+                continue
+        _time.sleep(0.02)
+    return {"error": "Aviary did not answer in time"}
+
+
 __aviary_ns["sh"] = __aviary_sh
 __aviary_ns["cwd"] = lambda: __aviary_state["cwd"]
+__aviary_ns["ask_app"] = __aviary_ask_app
+__aviary_ns["spawn"] = lambda prompt, name=None, model=None: __aviary_ask_app(
+    "spawn", prompt=prompt, name=name, model=model)
+__aviary_ns["conversation"] = lambda limit=40: __aviary_ask_app("conversation", limit=limit)
 
 try:
     sys.stdout, sys.stderr = __aviary_out, __aviary_err
@@ -195,7 +275,7 @@ __aviary_ns = globals().get("__aviary_ns", {})
 __aviary_state = globals().get("__aviary_session_state", {"cwd": None})
 __aviary_names = []
 for __k, __v in list(__aviary_ns.items()):
-    if __k.startswith("__") or __k in ("sh", "cwd"):
+    if __k.startswith("__") or __k in __AVIARY_INJECTED:
         continue
     try:
         __r = repr(__v)
@@ -214,7 +294,7 @@ with open(__AVIARY_OUT, "w") as __fh:
     json.dump({"names": sorted(__aviary_names, key=lambda d: d["name"]),
                "cwd": __aviary_state.get("cwd")}, __fh, default=repr)
 for __k in ("__aviary_names", "__k", "__v", "__r", "__n", "__fh", "__aviary_state",
-            "__AVIARY_OUT"):
+            "__AVIARY_OUT", "__AVIARY_INJECTED"):
     globals().pop(__k, None)
 '''
 
@@ -238,11 +318,55 @@ class Session:
         self.jobs: queue.Queue = queue.Queue()
         self.interp = subinterpreters.create()
         self.closed = False
+        # Where the sub-interpreter drops callback requests. A directory rather than a pipe
+        # because a file is the only thing both sides can see without sharing objects, and
+        # this is not a hot path — a callback is a sub-agent or a question, not a loop.
+        self.cb_dir = tempfile.mkdtemp(prefix=f"aviary-cb-{sid}-")
+        open(os.path.join(self.cb_dir, "pending"), "w").close()
+        self.watcher = threading.Thread(
+            target=self._watch_callbacks, name=f"cb-{sid}", daemon=True)
+        self.watcher.start()
         self.thread = threading.Thread(target=self._loop, name=f"session-{sid}", daemon=True)
         self.thread.start()
 
     def submit(self, job) -> None:
         self.jobs.put(job)
+
+    def _watch_callbacks(self) -> None:
+        """Forward callback requests from the interpreter to Aviary and write back replies.
+
+        Each request is served on its own thread so several outstanding callbacks — a fan-out
+        of sub-agents, say — do not serialise behind one another.
+        """
+        path = os.path.join(self.cb_dir, "pending")
+        seen = 0
+        while not self.closed:
+            try:
+                with open(path) as fh:
+                    lines = [l.strip() for l in fh if l.strip()]
+                while seen < len(lines):
+                    req_path = lines[seen]
+                    seen += 1
+                    threading.Thread(
+                        target=self._serve_callback, args=(req_path,), daemon=True).start()
+            except Exception:
+                pass
+            threading.Event().wait(0.02)
+
+    def _serve_callback(self, req_path: str) -> None:
+        try:
+            with open(req_path) as fh:
+                req = json.load(fh)
+            os.unlink(req_path)
+        except Exception:
+            return
+        result = request_from_app(req.get("kind") or "", req.get("payload") or {},
+                                  session=self.sid)
+        try:
+            with open(req["reply"], "w") as fh:
+                json.dump(result, fh, default=str)
+        except Exception:
+            pass
 
     def _loop(self) -> None:
         while True:
@@ -272,10 +396,10 @@ class Session:
 
     def execute(self, code: str, mode: str) -> dict:
         return self._run(_EXEC_BODY, __AVIARY_CODE=code, __AVIARY_MODE=mode,
-                         __AVIARY_CWD=self.cwd)
+                         __AVIARY_CWD=self.cwd, __AVIARY_CALLBACK_DIR=self.cb_dir)
 
     def inspect(self) -> dict:
-        return self._run(_INSPECT_BODY)
+        return self._run(_INSPECT_BODY, __AVIARY_INJECTED=sorted(_AVIARY_INJECTED))
 
     def close(self, join: float = 2.0) -> None:
         """Tear the interpreter down from the thread that owns it.
@@ -297,6 +421,11 @@ class Session:
         self.jobs.put(teardown)
         self.jobs.put(None)
         self.thread.join(timeout=join)
+        try:
+            import shutil
+            shutil.rmtree(self.cb_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +453,9 @@ class Host:
             elif op == "session.list":
                 with self.lock:
                     self.reply(rid, {"sessions": sorted(self.sessions)})
+            elif op == "callback.result":
+                resolve_callback(msg.get("rid") or "", msg.get("result") or {})
+                self.reply(rid, {"delivered": True})
             elif op in ("exec", "inspect"):
                 self.dispatch_to_session(rid, op, msg)
             elif op == "shutdown":
@@ -359,6 +491,10 @@ class Host:
                 "interruptSubprocess": False,
                 "interruptPython": False,
                 "snapshot": False,
+                # The runtime can call back into the app: sub-agents, conversation access,
+                # asking a person. Declared, so a client that cannot serve callbacks knows
+                # not to offer code that uses them.
+                "callbacks": True,
             },
         }
 

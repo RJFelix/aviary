@@ -83,29 +83,17 @@ enum AgentCLI {
                 + (capabilities.has("perSessionGIL") ? "on" : "off"))
         }
 
-        // 3. A session on disk, in the format every Aviary screen already reads.
-        let writer: SessionWriter
-        let hostSession: String
-        do {
-            hostSession = try await host.createSession(cwd: cwd)
-            writer = try SessionWriter(home: home, cwd: cwd, model: model)
-        } catch {
-            fail("Could not open a session: \(error.localizedDescription)")
-        }
-        if !quiet { note("session \(writer.sessionID) · \(model.qualifiedID) · \(cwd)") }
-
-        // 4. Run.
+        // 3. A runner, which owns session creation, sub-agents and the callback wiring.
         let provider = OpenAICompletionsProvider(
             id: providerSpec.id, baseURL: baseURL, apiKey: resolvedKey,
             extraHeaders: providerSpec.headers)
-        let agent = Agent(
-            provider: provider, host: host, writer: writer, hostSession: hostSession,
-            config: .init(
-                model: model, cwd: cwd,
-                systemPrompt: SystemPrompt.build(cwd: cwd, model: model),
-                maxTokens: model.maxTokens))
+        let runner = AgentRunner(
+            provider: provider, host: host,
+            settings: .init(
+                home: home, cwd: cwd, model: model,
+                systemPrompt: SystemPrompt.build(cwd: cwd, model: model)))
 
-        await agent.observe { event in
+        await runner.observe { event in
             switch event {
             case .textDelta(let t):
                 FileHandle.standardOutput.write(Data(t.utf8))
@@ -129,19 +117,29 @@ enum AgentCLI {
                 note("\n— finished (\(reason))")
             case .failed(let detail):
                 note("\n— failed: \(detail)")
-            case .started:
-                break
+            case .compacted(let before, _, _):
+                note("\n— compacted at \(Fmt.tokens(before)) tokens")
+            case .childStarted(_, let name, let prompt):
+                note("\n⤷ \(name): \(prompt.prefix(80))")
+            case .childFinished(_, let name, _, let isError):
+                note((isError ? "⤶ \(name) failed" : "⤶ \(name) done"))
+            case .started(let session):
+                if !quiet { note("session \(session) · \(model.qualifiedID) · \(cwd)") }
             }
         }
 
-        await agent.send(prompt)
-        let total = await agent.totalUsage
-        if !quiet {
-            note("total \(Fmt.tokens(total.totalTokens)) tokens"
-                + (total.cacheHitRate.map { String(format: " · %.0f%% cached", $0 * 100) } ?? ""))
-            note("transcript \(writer.fileURL.path)")
+        do {
+            let (writer, agent) = try await runner.run(prompt: prompt)
+            let total = await agent.totalUsage
+            if !quiet {
+                note("total \(Fmt.tokens(total.totalTokens)) tokens"
+                    + (total.cacheHitRate.map { String(format: " · %.0f%% cached", $0 * 100) } ?? ""))
+                note("transcript \(writer.fileURL.path)")
+            }
+            await writer.close()
+        } catch {
+            note("could not start: \(error.localizedDescription)")
         }
-        await writer.close()
         await host.stop()
     }
 

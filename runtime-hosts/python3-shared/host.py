@@ -48,7 +48,12 @@ except ImportError:  # pragma: no cover - newer Pythons renamed it
     except ImportError:
         subinterpreters = None
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+
+# Everything the host puts into the agent's namespace. Listed once, because `inspect` must
+# hide exactly this set: the namespace belongs to the agent, and a host whose own helpers show
+# up in it is lying about what the agent put there.
+_AVIARY_INJECTED = frozenset({"sh", "cwd", "ask_app", "spawn", "conversation"})
 
 # ---------------------------------------------------------------------------
 # Writing to stdout
@@ -244,6 +249,14 @@ class Session:
         self.state = {"cwd": cwd, "env": {}}
         self.globals["sh"] = self._make_sh()
         self.globals["cwd"] = lambda: self.state["cwd"]
+        # Same namespace surface as the reference host, so agent code is portable between
+        # them. Here the closure can be handed over directly; the sub-interpreter host has to
+        # marshal through a file because objects cannot cross an interpreter boundary.
+        self.globals["ask_app"] = lambda kind, **payload: request_from_app(kind, payload, sid)
+        self.globals["spawn"] = lambda prompt, name=None, model=None: request_from_app(
+            "spawn", {"prompt": prompt, "name": name, "model": model}, sid)
+        self.globals["conversation"] = lambda limit=40: request_from_app(
+            "conversation", {"limit": limit}, sid)
         self.thread = threading.Thread(target=self._loop, name=f"session-{sid}", daemon=True)
         self.thread.start()
 
@@ -331,7 +344,7 @@ class Session:
     def inspect(self) -> dict:
         names = []
         for k, v in list(self.globals.items()):
-            if k.startswith("__") or k in ("sh", "cwd"):
+            if k.startswith("__") or k in _AVIARY_INJECTED:
                 continue
             try:
                 r = repr(v)

@@ -39,11 +39,35 @@ Failure is a response, not a dropped connection:
 | `exec` | `session`, `code`, `mode?` (`exec`\|`eval`) | `{stdout, stderr, value, exception}` |
 | `inspect` | `session` | `{names: [{name,type,repr,length}], cwd}` |
 | `shutdown` | — | `{stopping:true}`, then the process exits |
+| `callback.result` | `rid`, `result` | `{delivered:true}` — answers a `callback` event |
 
 `value` is the repr of a trailing expression, the way a REPL echoes one — agents write
 `x.head()` on the last line and expect to see it. `exception` is a formatted traceback.
 **Both are data.** Agent code that raises, or calls `SystemExit`, must never take the host
 down; verified in the suite.
+
+## Callbacks: the runtime asking the client for something
+
+Protocol 2 added a second direction. The runtime emits
+
+```
+← {"event":"callback","rid":"cb-1","session":"s1","kind":"spawn","payload":{"prompt":"…"}}
+→ {"id":"9","op":"callback.result","rid":"cb-1","result":{"answer":"42"}}
+```
+
+and the agent code that asked is unblocked with that result. This is what makes the runtime
+more than a calculator: `spawn(prompt)` runs a whole sub-agent and returns its answer,
+`conversation(limit)` hands back the transcript the code is part of, and `ask_app(kind, …)` is
+the general form.
+
+Two rules. **The session id travels with the request** — one host serves many sessions and a
+client has no other way to know which agent asked; leaving it out cost a debugging session.
+And **a refusal is a payload with an `error` key, never silence**: the agent is blocked on a
+line of code, so an error it can read beats a nine-minute timeout it cannot.
+
+A client that serves no callbacks should still answer, saying so. The reference host declares
+`callbacks: true`; a runtime without the channel declares it false and must not offer
+`spawn` in its namespace.
 
 ## Capabilities, and why they are declared
 
@@ -53,10 +77,10 @@ it cannot interrupt a running Python loop, and a UI that offered a Stop button o
 of an assumption would be lying to the person pressing it.
 
 ```json
-{"protocol":1,"runtime":"cpython","runtimeVersion":"3.12.9",
+{"protocol":2,"runtime":"cpython","runtimeVersion":"3.12.9",
  "features":{"isolatedSessions":true,"perSessionGIL":true,"namespaceInspection":true,
              "persistentShellState":true,"interruptSubprocess":false,
-             "interruptPython":false,"snapshot":false}}
+             "interruptPython":false,"snapshot":false,"callbacks":true}}
 ```
 
 ## What a host must guarantee

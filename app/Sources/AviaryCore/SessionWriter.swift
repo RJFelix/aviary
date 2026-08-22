@@ -181,6 +181,18 @@ public actor SessionWriter {
         ])
     }
 
+    /// Mark a compaction. The dropped entries stay in the file above this marker — the model
+    /// forgets, the record does not, and a reader can still see exactly what went.
+    public func appendCompaction(
+        summary: String, tokensBefore: Int, droppedMessages: Int
+    ) throws {
+        try append(type: "compaction", fields: [
+            "summary": .string(summary),
+            "tokensBefore": .number(Double(tokensBefore)),
+            "droppedMessages": .number(Double(droppedMessages)),
+        ])
+    }
+
     public func appendStatus(_ status: String) throws {
         try append(type: "session_state", fields: ["status": .string(status)])
     }

@@ -81,6 +81,17 @@ public actor RuntimeHost {
     /// result can ignore these; a UI wants them.
     public typealias OutputHandler = @Sendable (_ session: String, _ stream: String, _ text: String) -> Void
 
+    /// Serves a request *from* the runtime: a sub-agent spawn, a look at the conversation, a
+    /// question for a person.
+    ///
+    /// The direction that makes the runtime more than a calculator. Agent code calls
+    /// `spawn(...)` and blocks; this is what unblocks it. Returning a payload with an `error`
+    /// key is how a refusal reaches the agent as something it can read and react to, rather
+    /// than as a hang.
+    public typealias CallbackHandler = @Sendable (
+        _ session: String, _ kind: String, _ payload: JSONValue
+    ) async -> JSONValue
+
     // MARK: State
 
     private let executable: String
@@ -91,6 +102,7 @@ public actor RuntimeHost {
     private var nextID = 0
     private var readyContinuation: CheckedContinuation<Capabilities, Error>?
     private var outputHandler: OutputHandler?
+    private var callbackHandler: CallbackHandler?
     private var stderrTail: [String] = []
 
     public private(set) var capabilities: Capabilities?
@@ -222,6 +234,15 @@ public actor RuntimeHost {
                 capabilities = caps
                 readyContinuation?.resume(returning: caps)
                 readyContinuation = nil
+            case "callback":
+                // Served on a detached task: the handler may take minutes (a sub-agent is a
+                // whole agent run), and blocking the reader would stop every other session's
+                // events from being delivered.
+                let rid = v["rid"]?.stringValue ?? ""
+                let kind = v["kind"]?.stringValue ?? ""
+                let payload = v["payload"] ?? .object([:])
+                let session = v["session"]?.stringValue ?? ""
+                Task { await self.serveCallback(rid: rid, kind: kind, payload: payload, session: session) }
             case "output":
                 outputHandler?(
                     v["session"]?.stringValue ?? "",
@@ -320,6 +341,28 @@ public actor RuntimeHost {
 
     public func onOutput(_ handler: OutputHandler?) {
         outputHandler = handler
+    }
+
+    public func onCallback(_ handler: CallbackHandler?) {
+        callbackHandler = handler
+    }
+
+    private func serveCallback(
+        rid: String, kind: String, payload: JSONValue, session: String
+    ) async {
+        let result: JSONValue
+        if let callbackHandler {
+            result = await callbackHandler(session, kind, payload)
+        } else {
+            // An honest refusal rather than a timeout. A runtime whose client serves no
+            // callbacks should learn that immediately, in words the agent can act on.
+            result = .object([
+                "error": .string("This client does not serve \(kind) requests."),
+            ])
+        }
+        _ = try? await send("callback.result", [
+            "rid": .string(rid), "result": result,
+        ], timeout: 30)
     }
 
     public func hello() async throws -> Capabilities {

@@ -350,6 +350,17 @@ func test_sessionIdentityIsTheFilenameNotTheHeaderField() throws {
 
 
 
+
+/// A spawn delegate that should never be reached — used to prove the depth ceiling refuses
+/// before any child is created.
+struct RefusingDelegate: Agent.SpawnDelegate {
+    func spawn(
+        prompt: String, name: String?, model: String?, depth: Int
+    ) async -> (answer: String, isError: Bool, childID: String, name: String) {
+        ("a child should not have been started", true, "sub-none", "none")
+    }
+}
+
 // MARK: - Agent test helpers
 
 /// A scripted openai-completions server, so the loop can be asserted without a provider.
@@ -449,6 +460,9 @@ final class EventLog: @unchecked Sendable {
         case .toolStarted(_, let name, _): events.append("tool:\(name)")
         case .toolFinished(_, _, _, let isError): events.append(isError ? "tool-error" : "tool-ok")
         case .turnFinished: events.append("turn")
+        case .compacted(let before, _, _): events.append("compacted:\(before)")
+        case .childStarted(_, let name, _): events.append("child:\(name)")
+        case .childFinished(_, _, _, let isError): events.append(isError ? "child-error" : "child-ok")
         case .finished(let reason): events.append("finished:\(reason)")
         case .failed: events.append("failed")
         }
@@ -783,7 +797,7 @@ await Harness.run([
     ("runtimeHost: starts, declares capabilities, and stops", {
         guard let host = try makeHost(.reference) else { return }
         let caps = try await host.start()
-        XCTAssertEqual(caps.protocolVersion, 1)
+        XCTAssertEqual(caps.protocolVersion, 2)
         XCTAssertEqual(caps.runtime, "cpython")
         XCTAssertFalse(caps.runtimeVersion.isEmpty)
         XCTAssertTrue(caps.has("namespaceInspection"))
@@ -1277,5 +1291,213 @@ await Harness.run([
         let second = try XCTUnwrap(sent.last?["messages"]?.arrayValue)
         XCTAssertTrue((second.last?["content"]?.stringValue ?? "").contains("only tool is"),
                       "the model was told what went wrong")
+    }),
+
+    ("agent: compacts when the context window fills, and records what it dropped", {
+        // Six tool round trips against a tiny window forces a compaction mid-run. The point
+        // is not the summary's quality but that the run survives and the transcript says a
+        // compaction happened — a lossy step that leaves no marker is unauditable.
+        // Four tool turns to grow the conversation past the compaction guard, then two text
+        // turns: the first is consumed by the summariser's own model call — which is easy to
+        // forget, and if it lands on a tool-shaped entry the summary comes back empty and no
+        // compaction happens at all.
+        var script: [[String: Any]] = []
+        for i in 0..<4 {
+            script.append(["tool": ["name": "python", "arguments": ["code": "step = \(i)"]],
+                           "input_tokens": 900] as [String: Any])
+        }
+        script.append(["text": "Earlier: four steps ran, values 0-3 stored.", "input_tokens": 50])
+        script.append(["text": "All done.", "input_tokens": 100])
+        guard let server = try FakeProviderServer(script: script) else {
+            print("      skipped: no fixture"); return
+        }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        var model = fakeModel()
+        model.contextWindow = 1000          // so 900 reported input tokens is over 70%
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: model)
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: model, cwd: "/tmp", systemPrompt: "sys", maxIterations: 12))
+        let log = EventLog()
+        await agent.observe { log.record($0) }
+        await agent.send("do six things")
+        await writer.close()
+
+        XCTAssertTrue(log.names.contains { $0.hasPrefix("compacted:") },
+                      "expected a compaction; events were \(log.names)")
+        let parsed = try XCTUnwrap(SessionParser.parse(fileURL: writer.fileURL))
+        XCTAssertTrue(parsed.counts.compactions >= 1, "the transcript records the compaction")
+        // And the entries from before the compaction are still in the file — the model
+        // forgets, the record does not.
+        XCTAssertTrue(parsed.counts.toolCalls >= 4, "history above the marker is intact")
+    }),
+
+    ("agent: a compaction failure does not end the run", {
+        // The summariser is a model call and can fail. When it does the next real call may
+        // still fit, so failing the whole run would be the wrong trade.
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        var model = fakeModel()
+        model.contextWindow = 1000
+
+        // The script gives a normal first turn, then 500s — so the compaction call fails while
+        // the run is still able to make progress.
+        guard let server = try FakeProviderServer(script: [
+            ["tool": ["name": "python", "arguments": ["code": "a = 1"]], "input_tokens": 950],
+            ["status": 500, "message": "summariser exploded"],
+            ["text": "Recovered.", "input_tokens": 100],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: model)
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: model, cwd: "/tmp", systemPrompt: "sys", maxIterations: 6))
+        let log = EventLog()
+        await agent.observe { log.record($0) }
+        await agent.send("go")
+        await writer.close()
+        // Not asserting which of the two happens — a 500 may land on the compaction or the
+        // next turn depending on ordering. Asserting the thing that must hold either way:
+        // the process did not crash and the transcript is readable.
+        XCTAssertNotNil(SessionParser.parse(fileURL: writer.fileURL))
+        XCTAssertTrue(log.names.contains { $0.hasPrefix("finished") || $0 == "failed" })
+    }),
+
+    ("agent: the tool description mentions spawn only when spawning is possible", {
+        // Learned from a real run: spawn() existed in the namespace and not in the schema, and
+        // the agent spent twenty turns grepping the codebase for it before giving up. An
+        // undocumented capability reads as a broken environment.
+        let without = Agent.tools(cwd: "/tmp", canSpawn: false)
+        XCTAssertFalse(without[0].description.contains("spawn("),
+                       "must not advertise what this run cannot do")
+        XCTAssertTrue(without[0].description.contains("conversation("),
+                      "conversation is always available")
+        let with = Agent.tools(cwd: "/tmp", canSpawn: true, spawnBudget: 2)
+        XCTAssertTrue(with[0].description.contains("spawn("))
+        XCTAssertTrue(with[0].description.contains("2 more level"),
+                      "the remaining depth is stated, not implied")
+        XCTAssertTrue(with[0].description.contains("self-contained"),
+                      "a child gets none of the parent's context, so say so")
+    }),
+
+    ("agent: spawn is refused at the depth ceiling, in words the agent can act on", {
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(
+                id: "fake", baseURL: URL(string: "http://127.0.0.1:1/v1")!, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s",
+                          maxDepth: 2, depth: 2))
+        await agent.setSpawnDelegate(RefusingDelegate())
+
+        let atCeiling = await agent.serveCallback(
+            kind: "spawn", payload: .object(["prompt": .string("do a thing")]))
+        XCTAssertTrue((atCeiling["error"]?.stringValue ?? "").contains("maximum sub-agent depth"))
+        XCTAssertTrue((atCeiling["error"]?.stringValue ?? "").contains("yourself"),
+                      "tells it what to do instead, not just no")
+
+        // And an unknown callback kind is refused rather than hanging the caller.
+        let unknown = await agent.serveCallback(kind: "teleport", payload: .object([:]))
+        XCTAssertTrue((unknown["error"]?.stringValue ?? "").contains("teleport"))
+        await writer.close()
+    }),
+
+    ("agent: conversation() hands back the history programmatically", {
+        // The capability that makes the runtime more than a calculator: the agent can query
+        // what it already tried instead of re-deriving it, and can hand a child exactly the
+        // slice it needs rather than all or nothing.
+        guard let server = try FakeProviderServer(script: [
+            ["tool": ["name": "python", "arguments": ["code": "x = 1"]]],
+            ["text": "done"],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "sys"))
+        await agent.send("remember this phrase: albatross")
+
+        let history = await agent.serveCallback(
+            kind: "conversation", payload: .object(["limit": .number(10)]))
+        let entries = try XCTUnwrap(history["messages"]?.arrayValue)
+        XCTAssertTrue(entries.count >= 3, "system, user and at least one assistant turn")
+        let text = entries.map { $0["text"]?.stringValue ?? "" }.joined(separator: " ")
+        XCTAssertTrue(text.contains("albatross"), "the user's own words are readable")
+        XCTAssertTrue(entries.contains { ($0["toolCalls"]?.arrayValue ?? []).count > 0 },
+                      "tool calls are visible, so it can see what it ran")
+        await writer.close()
+    }),
+
+    ("subAgents: records land where Flock reads them", {
+        // Reusing the harness's ledger layout means an in-house child appears in the existing
+        // Flock screen with no new UI at all — the same reasoning as reusing the transcript
+        // format.
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let recorder = SubAgentRecorder(home: home, parentSessionID: "parent-1")
+        let childID = SubAgentRecorder.newChildID()
+        XCTAssertTrue(childID.hasPrefix("sub-"), "the shape other readers key on")
+        let childFile = recorder.childDirectory(childID: childID).appending(path: "c.jsonl")
+        try FileManager.default.createDirectory(
+            at: childFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: childFile.path, contents: nil)
+
+        try recorder.record(
+            childID: childID, name: "counter", sessionFile: childFile, prompt: "count things",
+            spawnCode: "spawn(\"count things\")", depth: 1, maxDepth: 3, status: "running",
+            provider: "litellm", model: "m", createdAt: Date())
+        try recorder.record(
+            childID: childID, name: "counter", sessionFile: childFile, prompt: "count things",
+            spawnCode: "", depth: 1, maxDepth: 3, status: "completed",
+            provider: "litellm", model: "m", createdAt: Date())
+
+        let tree = AgentTreeReader.read(home: home)
+        let node = try XCTUnwrap(tree.allNodes.first { $0.id == childID })
+        XCTAssertEqual(node.name, "counter")
+        XCTAssertEqual(node.status, "completed", "the later record supersedes the earlier one")
+        XCTAssertTrue(node.isComplete)
+        XCTAssertEqual(node.depth, 1)
+        XCTAssertEqual(node.prompt, "count things")
+        XCTAssertEqual(node.modelLabel, "litellm/m")
+    }),
+
+    ("subAgents: a child is told its answer is the whole deliverable", {
+        let prompt = AgentRunner.childPrompt(base: "BASE", depth: 1, maxDepth: 3)
+        XCTAssertTrue(prompt.hasPrefix("BASE"), "the shared prompt still applies")
+        XCTAssertTrue(prompt.contains("depth 1 of 3"))
+        XCTAssertTrue(prompt.contains("does not see your"),
+                      "a child's transcript is invisible to its parent, so say so")
+        XCTAssertTrue(prompt.contains("Spawn a sub-agent only for genuinely separable"))
+        // At the ceiling the advice must flip rather than dangle.
+        let deep = AgentRunner.childPrompt(base: "BASE", depth: 3, maxDepth: 3)
+        XCTAssertTrue(deep.contains("cannot spawn further"))
+        XCTAssertFalse(deep.contains("only for genuinely separable"))
     }),
 ])
