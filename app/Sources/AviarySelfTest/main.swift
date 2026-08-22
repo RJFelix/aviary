@@ -349,6 +349,115 @@ func test_sessionIdentityIsTheFilenameNotTheHeaderField() throws {
 // MARK: - Runner
 
 
+
+// MARK: - Agent test helpers
+
+/// A scripted openai-completions server, so the loop can be asserted without a provider.
+///
+/// Testing the loop against a live model is not possible in any useful sense — you cannot
+/// assert that a model will decide to call a tool — and paying for a round trip to find out is
+/// a bad test. This serves a fixed script, which makes the interesting path assertable: request
+/// encoding, SSE framing, tool-call reassembly, execution in the runtime host, and the result
+/// going back for a second turn.
+final class FakeProviderServer {
+    let port: Int
+    private let process: Process
+    private let scriptURL: URL
+
+    init?(script: [[String: Any]]) throws {
+        guard let root = EngineLocator.repoRoot() else { return nil }
+        let fixture = root.appending(path: "test-fixtures/fake-openai.py")
+        guard FileManager.default.fileExists(atPath: fixture.path) else { return nil }
+
+        // A port from the ephemeral range, chosen per instance so concurrent cases cannot
+        // collide on a fixed one.
+        port = Int.random(in: 41000..<48000)
+        scriptURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-fake-\(UUID().uuidString).json")
+        try JSONSerialization.data(withJSONObject: script).write(to: scriptURL)
+
+        process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["python3", fixture.path, "\(port)", scriptURL.path]
+        var env = ProcessInfo.processInfo.environment
+        env["PYTHONUNBUFFERED"] = "1"
+        process.environment = env
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = Pipe()
+        try process.run()
+
+        // Wait for the readiness line rather than sleeping: a fixed sleep is either flaky or
+        // slow, and this is neither.
+        let handle = out.fileHandleForReading
+        var buffer = Data()
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            let chunk = handle.availableData
+            if !chunk.isEmpty {
+                buffer.append(chunk)
+                if String(data: buffer, encoding: .utf8)?.contains("listening") == true { return }
+            }
+        }
+        process.terminate()
+        return nil
+    }
+
+    var baseURL: URL { URL(string: "http://127.0.0.1:\(port)/v1")! }
+
+    /// Exactly what the client sent, so encoding is asserted rather than assumed.
+    func recordedRequests() throws -> [JSONValue] {
+        let url = URL(string: "http://127.0.0.1:\(port)/_requests")!
+        let data = try Data(contentsOf: url)
+        return JSONValue.parse(data)?.arrayValue ?? []
+    }
+
+    func stop() {
+        process.terminate()
+        try? FileManager.default.removeItem(at: scriptURL)
+    }
+}
+
+/// A model pointed at the fake server.
+func fakeModel() -> ModelSpec {
+    var m = ModelSpec(rpc: .object([
+        "id": .string("test-model"),
+        "provider": .string("fake"),
+    ]))
+    m.contextWindow = 100_000
+    return m
+}
+
+/// A session writer in a throwaway agent directory, so tests never touch the real store.
+func scratchHome() -> AgentHome {
+    AgentHome(root: URL(fileURLWithPath: NSTemporaryDirectory())
+        .appending(path: "aviary-agent-test-\(UUID().uuidString)"))
+}
+
+/// Collects agent events off whatever task emits them.
+final class EventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+    private var text = ""
+
+    func record(_ event: Agent.Event) {
+        lock.lock(); defer { lock.unlock() }
+        switch event {
+        case .started: events.append("started")
+        case .textDelta(let t): text += t
+        case .thinkingDelta: events.append("thinking")
+        case .toolStarted(_, let name, _): events.append("tool:\(name)")
+        case .toolFinished(_, _, _, let isError): events.append(isError ? "tool-error" : "tool-ok")
+        case .turnFinished: events.append("turn")
+        case .finished(let reason): events.append("finished:\(reason)")
+        case .failed: events.append("failed")
+        }
+    }
+
+    var names: [String] { lock.lock(); defer { lock.unlock() }; return events }
+    var assistantText: String { lock.lock(); defer { lock.unlock() }; return text }
+}
+
 // MARK: - Runtime host test helpers
 
 enum HostVariant: String {
@@ -903,5 +1012,270 @@ await Harness.run([
         XCTAssertTrue(caps.has("snapshot"))
         XCTAssertFalse(caps.has("perSessionGIL"))
         XCTAssertEqual(caps.summary, "lua 5.4 · protocol 2")
+    }),
+
+    // ------------------------------------------------------------------ provider
+    ("provider: SSE framing joins multi-line data and passes [DONE] through", {
+        var parser = SSEParser()
+        XCTAssertNil(parser.feed(line: ":keep-alive"))
+        XCTAssertNil(parser.feed(line: "data: {\"a\":1}"))
+        XCTAssertEqual(parser.feed(line: ""), "{\"a\":1}")
+        // Several data: lines in one event concatenate with newlines, per the SSE spec —
+        // getting this wrong truncates tool arguments and looks like model misbehaviour.
+        XCTAssertNil(parser.feed(line: "data: line1"))
+        XCTAssertNil(parser.feed(line: "data: line2"))
+        XCTAssertEqual(parser.feed(line: ""), "line1\nline2")
+        XCTAssertNil(parser.feed(line: "data: [DONE]"))
+        XCTAssertEqual(parser.feed(line: ""), "[DONE]")
+    }),
+
+    ("provider: usage keeps reasoning absent when the provider is silent", {
+        // Absent and zero mean different things on an encrypted-reasoning route, and this is
+        // the distinction the harness fork existed to preserve.
+        let quiet = try XCTUnwrap(JSONValue.parse(Data(
+            #"{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}"#.utf8)))
+        XCTAssertNil(OpenAICompletionsProvider.usage(from: quiet).reasoning)
+
+        let loud = try XCTUnwrap(JSONValue.parse(Data(
+            #"{"prompt_tokens":10,"completion_tokens":9,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens_details":{"cached_tokens":6}}"#.utf8)))
+        let u = OpenAICompletionsProvider.usage(from: loud)
+        XCTAssertEqual(u.reasoning, 0, "a reported zero is data, not silence")
+        XCTAssertEqual(u.cacheRead, 6)
+        XCTAssertEqual(u.totalTokens, 19, "computed when the provider omits a total")
+    }),
+
+    ("provider: request encoding puts tools, calls and results where they belong", {
+        let messages: [ChatMessage] = [
+            .system("be brief"),
+            .user("hello"),
+            ChatMessage(role: .assistant, content: [
+                .thinking("secret"),
+                .text("calling"),
+                .toolCall(id: "c1", name: "python", arguments: .object(["code": .string("1+1")])),
+            ]),
+            ChatMessage(role: .tool, content: [
+                .toolResult(id: "c1", name: "python", text: "2", isError: false),
+            ]),
+        ]
+        let body = OpenAICompletionsProvider.body(for: ChatRequest(
+            model: "m", messages: messages, tools: Agent.tools(cwd: "/tmp"), maxTokens: 99))
+        let wire = try XCTUnwrap(body["messages"]?.arrayValue)
+        guard wire.count == 4 else { XCTFail("expected 4 wire messages, got \(wire.count)"); return }
+        XCTAssertEqual(wire[2]["role"]?.stringValue, "assistant")
+        XCTAssertEqual(wire[2]["content"]?.stringValue, "calling",
+                       "thinking must not be echoed back — providers reject foreign reasoning")
+        XCTAssertFalse((wire[2]["content"]?.stringValue ?? "").contains("secret"))
+        XCTAssertEqual(wire[2].path("tool_calls.0.function.name")?.stringValue, "python")
+        XCTAssertEqual(wire[3]["role"]?.stringValue, "tool", "a result is its own message here")
+        XCTAssertEqual(wire[3]["tool_call_id"]?.stringValue, "c1")
+        XCTAssertEqual(body.path("tools.0.function.name")?.stringValue, "python")
+        XCTAssertEqual(body["stream"]?.boolValue, true)
+        XCTAssertEqual(body.path("stream_options.include_usage")?.boolValue, true,
+                       "without this most servers omit usage while streaming")
+        XCTAssertEqual(body["max_tokens"]?.intValue, 99)
+    }),
+
+    ("agent: tool output rendering puts the traceback last", {
+        var r = RuntimeHost.ExecResult(stdout: "printed\n", stderr: "", value: "42", exception: nil)
+        XCTAssertEqual(Agent.render(r), "printed\n42")
+        r = RuntimeHost.ExecResult(stdout: "", stderr: "", value: nil, exception: nil)
+        XCTAssertEqual(Agent.render(r), "(no output)",
+                       "a blank result reads as a broken tool, so say it explicitly")
+        r = RuntimeHost.ExecResult(stdout: "a\n", stderr: "warn\n", value: nil,
+                                   exception: "Traceback…\nValueError: no\n")
+        let rendered = Agent.render(r)
+        XCTAssertTrue(rendered.hasPrefix("a\n"))
+        XCTAssertTrue(rendered.hasSuffix("ValueError: no"), "most actionable part nearest the end")
+    }),
+
+    // ------------------------------------------------------------------ the loop
+    ("agent: runs a full tool-calling loop against a scripted provider", {
+        // The whole spine, end to end and in-house: encode a request, stream SSE, reassemble a
+        // split tool call, execute it in the runtime host, feed the result back, finish.
+        guard let server = try FakeProviderServer(script: [
+            ["tool": ["name": "python", "arguments": ["code": "answer = 6 * 7\nanswer"]],
+             "thinking": "let me compute", "reasoning_tokens": 11],
+            ["text": "The answer is 42.", "input_tokens": 250, "output_tokens": 8],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let provider = OpenAICompletionsProvider(
+            id: "fake", baseURL: server.baseURL, apiKey: "test-key")
+        let agent = Agent(
+            provider: provider, host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "be brief"))
+        let log = EventLog()
+        await agent.observe { log.record($0) }
+        await agent.send("what is six times seven?")
+
+        XCTAssertEqual(log.names, ["started", "thinking", "turn", "tool:python", "tool-ok",
+                                   "turn", "finished:stop"])
+        XCTAssertEqual(log.assistantText, "The answer is 42.")
+
+        // Usage accumulates across turns, and a reported reasoning count survives.
+        let usage = await agent.totalUsage
+        XCTAssertEqual(usage.input, 350, "100 from turn one plus 250 from turn two")
+        XCTAssertEqual(usage.reasoning, 11)
+
+        // The second request must carry the first turn's tool call *and* its result, or the
+        // model has no idea what happened.
+        let sent = try server.recordedRequests()
+        XCTAssertEqual(sent.count, 2)
+        let second = try XCTUnwrap(sent.last?["messages"]?.arrayValue)
+        // Guarded rather than indexed: this harness's assertions record and continue, so a
+        // bare subscript after a count check traps the whole suite instead of failing one case.
+        guard second.count == 4 else {
+            XCTFail("expected system, user, assistant-with-call, tool-result; got \(second.count): "
+                + second.map { $0["role"]?.stringValue ?? "?" }.joined(separator: ","))
+            return
+        }
+        XCTAssertEqual(second[3]["role"]?.stringValue, "tool")
+        XCTAssertEqual(second[3]["content"]?.stringValue, "42",
+                       "the tool's echoed value went back to the model")
+
+        await writer.close()
+    }),
+
+    ("agent: the transcript it writes is one Aviary can already read", {
+        // The reason to reuse the harness's on-disk format rather than invent one: the parser,
+        // renderer, catalog and analytics all keep working.
+        guard let server = try FakeProviderServer(script: [
+            ["tool": ["name": "python", "arguments": ["code": "print('side effect')"]]],
+            ["text": "Done."],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "sys"))
+        await agent.send("go")
+        await writer.close()
+
+        let parsed = try XCTUnwrap(SessionParser.parse(fileURL: writer.fileURL))
+        XCTAssertEqual(parsed.items.filter { $0.kind == .user }.count, 1)
+        XCTAssertEqual(parsed.counts.toolCalls, 1)
+        XCTAssertEqual(parsed.counts.toolErrors, 0)
+        // A tool call and its result must have been paired into one renderable row, with the
+        // output attached — the thing the renderer depends on.
+        let tool = try XCTUnwrap(parsed.items.first { $0.kind == .tool })
+        XCTAssertEqual(tool.toolCall?.name, "python")
+        XCTAssertTrue((tool.toolResultText ?? "").contains("side effect"))
+        XCTAssertTrue(parsed.items.contains { $0.kind == .assistant })
+        XCTAssertTrue(parsed.usage.totalTokens > 0, "usage survived the round trip to disk")
+        // And the catalog can summarise it, which is what the Sessions list is built on.
+        let summary = try XCTUnwrap(SessionCatalog.summarize(fileURL: writer.fileURL))
+        XCTAssertEqual(summary.id, writer.fileURL.deletingPathExtension().lastPathComponent)
+        XCTAssertFalse(summary.firstPrompt.isEmpty)
+    }),
+
+    ("agent: a provider failure ends the run and says so in the transcript", {
+        guard let server = try FakeProviderServer(script: [
+            ["status": 401, "message": "Incorrect API key provided: LITELLM_MASTER_KEY"],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: "x"),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "sys"))
+        let log = EventLog()
+        await agent.observe { log.record($0) }
+        await agent.send("hello")
+        await writer.close()
+
+        XCTAssertTrue(log.names.contains("failed"))
+        XCTAssertFalse(log.names.contains { $0.hasPrefix("finished") },
+                       "a failure is not a completion")
+        // The transcript must carry the reason. The body matters more than the status: this
+        // one names an unexpanded variable, which is a config bug rather than a bad key.
+        let text = try String(contentsOf: writer.fileURL, encoding: .utf8)
+        XCTAssertTrue(text.contains("401"))
+        XCTAssertTrue(text.contains("LITELLM_MASTER_KEY"))
+    }),
+
+    ("agent: the iteration ceiling stops a non-converging loop and records it", {
+        // A model that keeps calling tools forever must stop, and the transcript must say why
+        // — a run that quietly stopped looks identical to one that finished.
+        let script = (0..<6).map { _ in
+            ["tool": ["name": "python", "arguments": ["code": "1"]]] as [String: Any]
+        }
+        guard let server = try FakeProviderServer(script: script) else {
+            print("      skipped: no fixture"); return
+        }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "sys", maxIterations: 3))
+        let log = EventLog()
+        await agent.observe { log.record($0) }
+        await agent.send("loop forever")
+        await writer.close()
+
+        XCTAssertEqual(log.names.filter { $0 == "tool:python" }.count, 3, "stopped at the ceiling")
+        XCTAssertTrue(log.names.contains("finished:iteration limit"))
+        let text = try String(contentsOf: writer.fileURL, encoding: .utf8)
+        XCTAssertTrue(text.contains("Stopped after 3 model calls"))
+    }),
+
+    ("agent: an unknown tool name is answered, not fatal", {
+        guard let server = try FakeProviderServer(script: [
+            ["tool": ["name": "read_file", "arguments": ["path": "/etc/hosts"]]],
+            ["text": "Understood, I'll use python."],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "sys"))
+        let log = EventLog()
+        await agent.observe { log.record($0) }
+        await agent.send("read a file")
+        await writer.close()
+
+        XCTAssertTrue(log.names.contains("tool-error"))
+        XCTAssertTrue(log.names.contains("finished:stop"), "the run continued and completed")
+        let sent = try server.recordedRequests()
+        let second = try XCTUnwrap(sent.last?["messages"]?.arrayValue)
+        XCTAssertTrue((second.last?["content"]?.stringValue ?? "").contains("only tool is"),
+                      "the model was told what went wrong")
     }),
 ])

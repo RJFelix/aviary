@@ -11,6 +11,7 @@ struct AviaryApp: App {
         // Headless modes short-circuit before any scene is created, and exit.
         WireInspect.runIfRequested()
         Snapshot.runIfRequested()
+        AgentCLI.runIfRequested()
     }
 
     var body: some Scene {

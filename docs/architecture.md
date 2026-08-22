@@ -41,6 +41,47 @@ What is deliberately *not* here: any reimplementation of the agent loop. The IPy
 the provider routes, compaction, sub-agent spawning — that is the harness's job and the
 reason to keep it.
 
+## The in-house agent
+
+As of 2026-08-21 Aviary can run a session with no harness and no Node: its own provider client,
+its own loop, its own transcript writer, tools executing in its own runtime host. Verified
+end to end against a real model through the LiteLLM gateway.
+
+```
+prompt ─▶ Agent ─┬─▶ ChatProvider  (OpenAICompletionsProvider → LiteLLM → anything)
+                 ├─▶ RuntimeHost   (python tool, persistent interpreter)
+                 └─▶ SessionWriter (JSONL the existing parser already reads)
+```
+
+Four decisions worth keeping:
+
+- **The transcript format is the harness's.** Aviary has a parser, renderer, catalog, usage
+  analytics and sub-agent tree reader built on it. Inventing a second format would mean
+  duplicating all of that or losing it, so an in-house run produces files indistinguishable
+  from a harness run and every existing screen works unchanged.
+- **One tool, `python`.** From the measured corpus: `subprocess` was the top import by 4×,
+  27.7% of cells shelled out, and two cells in 5,574 touched pandas. A menu of file and search
+  tools would be a menu of things `sh()` already does, paid for with a bigger schema on every
+  request.
+- **The header is written immediately.** The harness defers file creation until the first
+  assistant message, so a run that dies during its first model call leaves no transcript —
+  which is exactly the run worth reading.
+- **The system prompt starts from nothing.** The harness's cost was 68 skill descriptions at
+  62.7% of input on a trivial run, paid whether or not any skill was used. Things earn their
+  way in here.
+
+`Aviary --agent "<prompt>" [--model provider/id] [--cwd path] [--host python3-shared]` drives
+it headless — the only way to verify the stack without a window, and where most work starts
+anyway.
+
+### The SSE trap, recorded because it cost a debugging session
+
+`AsyncLineSequence` (`bytes.lines`) **silently discards blank lines**, and in server-sent
+events the blank line *is* the record separator. Five `data:` events arrived as five lines with
+no separators, so a spec-correct parser emitted nothing and every turn came back empty with no
+error anywhere. `SSELineSequence` in `ChatModel.swift` splits raw bytes and keeps empty lines.
+Framing an SSE stream is the client's job, not the stdlib's.
+
 ## The runtime host
 
 Where agent code runs, as of 2026-08-21. A separate process, one isolated interpreter per
