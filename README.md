@@ -1,7 +1,10 @@
 # Aviary
 
-A native macOS app for working with the Prime Agent harness — and a hard fork of the
-harness itself, to evolve as needed.
+A native macOS app that runs coding agents, and reads every agent session on the machine.
+
+It started as a GUI over the Prime Agent harness and now has its own agent: its own provider
+clients, its own loop, its own Python runtime host, its own memory. No Node, no daemon, no
+version conflicts. The vendored harness is still selectable, and nothing requires it.
 
 Prime Agent is a genuinely good agent runtime: one IPython kernel as the only tool, a
 hundred-odd provider routes, recursive sub-agents, compaction, a daemon that keeps sessions
@@ -31,7 +34,8 @@ Aviary --agent "count the swift files under app/Sources" --model litellm/claude-
 ```
 
 Flags: `--cwd <path>`, `--host python3-shared` (for numpy/pandas), `--record` (capture request
-payloads), `--quiet`. In the GUI, the Live tab's launcher picks between the in-house engine and
+payloads), `--budget <tokens>` and `--minutes <n>` (a goal the agent can see and plan against),
+`--quiet`. A prompt starting with `/name` expands a prompt template. In the GUI, the Live tab's launcher picks between the in-house engine and
 the vendored harness.
 
 What the agent gets: one tool, `python`, running in a persistent interpreter where variables

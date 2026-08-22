@@ -33,11 +33,15 @@ public actor Agent {
         /// floor is the one failure mode that can spend without bound while nobody watches.
         public var maxDepth: Int = 3
         public var depth: Int = 0
+        /// A budget and a finishing condition. Nil means the only limit is `maxIterations`,
+        /// which the agent cannot see and therefore cannot plan against.
+        public var goal: Goal?
 
         public init(
             model: ModelSpec, cwd: String, systemPrompt: String,
             maxIterations: Int = 40, maxTokens: Int? = nil, reasoningEffort: String? = nil,
-            compactAtContextShare: Double = 0.7, maxDepth: Int = 3, depth: Int = 0
+            compactAtContextShare: Double = 0.7, maxDepth: Int = 3, depth: Int = 0,
+            goal: Goal? = nil
         ) {
             self.model = model
             self.cwd = cwd
@@ -48,17 +52,21 @@ public actor Agent {
             self.compactAtContextShare = compactAtContextShare
             self.maxDepth = maxDepth
             self.depth = depth
+            self.goal = goal
         }
     }
 
     public enum Event: Sendable {
         case started(session: String)
+        /// A queued message was taken up. Emitted so a UI can stop showing it as pending.
+        case steered(String)
         case textDelta(String)
         case thinkingDelta(String)
         case toolStarted(id: String, name: String, arguments: JSONValue)
         case toolFinished(id: String, name: String, output: String, isError: Bool)
         case turnFinished(usage: Usage?, stopReason: String?)
         case compacted(before: Int, after: Int, summary: String)
+        case goalExhausted(String)
         case childStarted(id: String, name: String, prompt: String)
         case childFinished(id: String, name: String, answer: String, isError: Bool)
         /// The loop stopped. `reason` is why, in words, because "it stopped" is never enough
@@ -81,6 +89,14 @@ public actor Agent {
     private var cancelled = false
     /// The prompt that opened the run, kept for memory provenance.
     private var firstPrompt: String?
+    /// Messages to inject before the next model call, and after the run finishes.
+    ///
+    /// Two queues because they answer different questions. Steering is "change course now" and
+    /// lands at the next turn boundary — not mid-turn, because a tool call already in flight
+    /// has to be answered before the model can be told anything. A follow-up is "and then do
+    /// this", and waits for the run to settle.
+    private var pendingSteering: [String] = []
+    private var pendingFollowUps: [String] = []
 
     public private(set) var totalUsage = Usage()
     /// The last input-token count the provider reported. The cheapest available measure of
@@ -254,6 +270,28 @@ public actor Agent {
         cancelled = true
     }
 
+    /// Change course at the next turn boundary.
+    ///
+    /// Queued rather than applied immediately: a tool call in flight must be answered before
+    /// the model can be told anything, and injecting a message between a call and its result
+    /// produces a conversation the provider rejects.
+    public func steer(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        pendingSteering.append(trimmed)
+    }
+
+    /// Queue a prompt for after this run settles.
+    public func queueFollowUp(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        pendingFollowUps.append(trimmed)
+    }
+
+    public var queued: (steering: [String], followUps: [String]) {
+        (pendingSteering, pendingFollowUps)
+    }
+
     /// The conversation so far, for a caller that wants to fork or inspect it.
     public var conversation: [ChatMessage] { messages }
 
@@ -389,6 +427,29 @@ public actor Agent {
             }
             iterations += 1
 
+            // The budget is checked before spending more of it, and the stop is recorded —
+            // an agent that ran out of allowance and one that finished must not look alike.
+            if let goal = config.goal {
+                let status = goal.status(spent: totalUsage.totalTokens)
+                if status.isFinished, let note = goal.exhaustionNote(status) {
+                    try? await writer.appendNote(note, customType: "aviary.goal")
+                    emit(.goalExhausted(note))
+                    emit(.finished(reason: "goal budget"))
+                    return
+                }
+            }
+
+            // Steering lands here, between turns, where the conversation is well-formed.
+            if !pendingSteering.isEmpty {
+                let messagesToInject = pendingSteering
+                pendingSteering.removeAll()
+                for text in messagesToInject {
+                    try? await writer.appendUser(text)
+                    messages.append(.user(text))
+                    emit(.steered(text))
+                }
+            }
+
             // Before the call, not after: compaction needs room to run, and discovering the
             // window is full at the moment of sending is discovering it too late.
             await compactIfNeeded()
@@ -421,6 +482,16 @@ public actor Agent {
             messages.append(ChatMessage(role: .assistant, content: assistantContent))
 
             if turn.toolCalls.isEmpty {
+                // Nothing more to do this turn — but a queued message means the run is not
+                // actually over, so continue rather than making the caller start again.
+                if !pendingSteering.isEmpty { continue }
+                if let next = pendingFollowUps.first {
+                    pendingFollowUps.removeFirst()
+                    try? await writer.appendUser(next)
+                    messages.append(.user(next))
+                    emit(.steered(next))
+                    continue
+                }
                 emit(.finished(reason: turn.stopReason ?? "stopped"))
                 return
             }
@@ -529,9 +600,16 @@ public actor Agent {
     }
 
     private func runTurn() async throws -> Turn {
+        var messagesForTurn = messages
+        if let goal = config.goal, let first = messagesForTurn.first, first.role == .system {
+            // Refreshed every turn rather than stated once: the remaining budget is the part
+            // that changes, and a stale number is worse than none.
+            messagesForTurn[0] = .system(
+                first.plainText + "\n\n" + goal.briefing(spent: totalUsage.totalTokens))
+        }
         let request = ChatRequest(
             model: config.model.id,
-            messages: messages,
+            messages: messagesForTurn,
             tools: activeTools,
             maxTokens: config.maxTokens,
             reasoningEffort: config.reasoningEffort)

@@ -721,6 +721,10 @@ struct RunInspector: View {
                     }
                 }
 
+                if let driver = run.inHouse {
+                    ScheduleCard(driver: driver)
+                }
+
                 Card("Tokens", symbol: "number") {
                     VStack(alignment: .leading, spacing: 7) {
                         HStack(spacing: 10) {
@@ -867,5 +871,87 @@ extension View {
     /// reach a view rather than the model.
     func onNotification(_ name: Notification.Name, perform: @escaping () -> Void) -> some View {
         onReceive(NotificationCenter.default.publisher(for: name)) { _ in perform() }
+    }
+}
+
+// MARK: - Schedules
+
+/// Work a session does on its own, and a way to add some.
+///
+/// Only shown for in-house runs, because only they have a scheduler. The harness's own cron
+/// jobs are readable through `list --json` but not settable from here, and offering one control
+/// that silently does nothing for half the runs would be worse than offering none.
+private struct ScheduleCard: View {
+    let driver: InHouseDriver
+    @State private var prompt = ""
+    @State private var minutes = 15.0
+    @State private var whenIdle = true
+    @State private var adding = false
+
+    var body: some View {
+        Card("On its own", symbol: "clock.arrow.2.circlepath",
+             accessory: AnyView(
+                Button {
+                    adding.toggle()
+                } label: {
+                    Image(systemName: adding ? "xmark" : "plus").font(.system(size: 9, weight: .bold))
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary)))
+        {
+            VStack(alignment: .leading, spacing: 7) {
+                if driver.jobs.isEmpty && !adding {
+                    Text("Nothing scheduled. This session can poke itself on an interval — "
+                        + "useful for watching a build, or checking back on something slow.")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ForEach(driver.jobs) { job in
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: job.onlyWhenIdle ? "moon.zzz" : "clock")
+                            .font(.system(size: 9)).foregroundStyle(Design.accent)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(job.prompt)
+                                .font(.system(size: 11)).lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(job.summary)
+                                .font(Design.numeric(9)).foregroundStyle(.tertiary)
+                        }
+                        Spacer(minLength: 4)
+                        Button {
+                            driver.removeJob(id: job.id)
+                        } label: {
+                            Image(systemName: "trash").font(.system(size: 8.5))
+                        }
+                        .buttonStyle(.plain).foregroundStyle(.tertiary)
+                    }
+                }
+                if adding {
+                    Divider().opacity(0.5)
+                    TextField("What should it ask?", text: $prompt, axis: .vertical)
+                        .textFieldStyle(.roundedBorder).font(.system(size: 11)).lineLimit(1...3)
+                    HStack(spacing: 6) {
+                        Text("every")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                        // Minutes, not a cron expression: every real case in the corpus was
+                        // "every N minutes", and a cron parser is a class of bugs bought for a
+                        // case nobody had.
+                        Stepper("\(Int(minutes))m", value: $minutes, in: 1...240, step: 5)
+                            .font(.system(size: 10))
+                        Spacer(minLength: 4)
+                        Toggle("only when idle", isOn: $whenIdle)
+                            .toggleStyle(.checkbox).font(.system(size: 10))
+                        Button("Add") {
+                            driver.addJob(
+                                prompt: prompt, everyMinutes: minutes, onlyWhenIdle: whenIdle)
+                            prompt = ""
+                            adding = false
+                        }
+                        .controlSize(.small)
+                        .disabled(prompt.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                    .controlSize(.mini)
+                }
+            }
+        }
     }
 }

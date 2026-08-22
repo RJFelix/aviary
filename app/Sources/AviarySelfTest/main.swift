@@ -465,6 +465,8 @@ final class EventLog: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         switch event {
         case .started: events.append("started")
+        case .steered: events.append("steered")
+        case .goalExhausted: events.append("goal-exhausted")
         case .textDelta(let t): text += t
         case .thinkingDelta: events.append("thinking")
         case .toolStarted(_, let name, _): events.append("tool:\(name)")
@@ -2055,5 +2057,198 @@ await Harness.run([
         let wireDir = home.root.appending(path: "wire")
         XCTAssertFalse(FileManager.default.fileExists(atPath: wireDir.path),
                        "no recording was requested, so nothing should exist")
+    }),
+
+    // ------------------------------------------------------------------ parity
+    ("steering: a queued message lands at the next turn, not mid-turn", {
+        // Mid-turn is impossible, not merely awkward: a tool call in flight has to be answered
+        // before the model can be told anything, and injecting between a call and its result
+        // makes a conversation the provider rejects.
+        guard let server = try FakeProviderServer(script: [
+            ["tool": ["name": "python", "arguments": ["code": "a = 1"]]],
+            ["text": "First answer."],
+            ["text": "Adjusted."],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "f", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s"))
+        let log = EventLog()
+        await agent.observe { log.record($0) }
+        await agent.steer("actually, do it differently")
+        await agent.send("do a thing")
+        await writer.close()
+
+        XCTAssertTrue(log.names.contains("steered"))
+        // The steer was injected before the first model call, so it is in the first request.
+        let sent = try server.recordedRequests()
+        let first = try XCTUnwrap(sent.first?["messages"]?.arrayValue)
+        let text = first.map { $0["content"]?.stringValue ?? "" }.joined(separator: " ")
+        XCTAssertTrue(text.contains("do it differently"))
+        // And a queue drained mid-run keeps the loop going rather than ending it.
+        XCTAssertTrue(log.names.contains("finished:stop"))
+    }),
+
+    ("steering: a follow-up continues the run instead of ending it", {
+        guard let server = try FakeProviderServer(script: [
+            ["text": "Done with the first."],
+            ["text": "Done with the second."],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "f", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s"))
+        await agent.queueFollowUp("and now the second thing")
+        await agent.send("the first thing")
+        await writer.close()
+        XCTAssertEqual(try server.recordedRequests().count, 2,
+                       "the follow-up produced a second model call in the same run")
+        let queued = await agent.queued
+        XCTAssertTrue(queued.followUps.isEmpty, "and the queue drained")
+    }),
+
+    ("goals: the budget is stated to the agent and enforced against it", {
+        let goal = Goal(text: "audit the parser", tokenBudget: 1000)
+        XCTAssertEqual(goal.status(spent: 999), .running)
+        XCTAssertEqual(goal.status(spent: 1000), .tokensExhausted(spent: 1000, budget: 1000))
+        // Stated, because a budget the agent cannot see is one it cannot plan against — it
+        // spends the whole allowance exploring and gets cut off mid-thought.
+        let briefing = goal.briefing(spent: 400)
+        XCTAssertTrue(briefing.contains("audit the parser"))
+        XCTAssertTrue(briefing.contains("600"), "remaining, not just the total")
+        XCTAssertTrue(briefing.contains("what remains"), "and what to do when it runs short")
+
+        let timed = Goal(
+            text: "t", timeBudget: 600, startedAt: Date().addingTimeInterval(-601))
+        guard case .timeExhausted = timed.status(spent: 0) else {
+            XCTFail("expected the time budget to bite"); return
+        }
+        XCTAssertNotNil(timed.exhaustionNote(timed.status(spent: 0)))
+        XCTAssertNil(goal.exhaustionNote(.running), "a running goal has nothing to report")
+    }),
+
+    ("goals: exhaustion stops the run and is recorded distinctly", {
+        // A run that ran out of allowance and one that finished must not look alike.
+        let script = (0..<6).map { _ in
+            ["tool": ["name": "python", "arguments": ["code": "1"]], "input_tokens": 400]
+                as [String: Any]
+        }
+        guard let server = try FakeProviderServer(script: script) else { return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(id: "f", baseURL: server.baseURL, apiKey: nil),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s",
+                          maxIterations: 10, goal: Goal(text: "t", tokenBudget: 500)))
+        let log = EventLog()
+        await agent.observe { log.record($0) }
+        await agent.send("go")
+        await writer.close()
+        XCTAssertTrue(log.names.contains("goal-exhausted"))
+        XCTAssertTrue(log.names.contains("finished:goal budget"),
+                      "distinct from a normal stop and from the iteration ceiling")
+        let text = try String(contentsOf: writer.fileURL, encoding: .utf8)
+        XCTAssertTrue(text.contains("Goal stopped"))
+    }),
+
+    ("promptTemplates: a slash command expands, and a wrong one is refused", {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-prompts-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appending(path: "review.md")
+        try "Review $ARGUMENTS for correctness.".write(to: file, atomically: true, encoding: .utf8)
+        let template = PromptTemplate(
+            name: "review", url: file, sourceLabel: "test",
+            firstLine: "Review", byteSize: 30)
+        let expander = PromptExpander(templates: [template])
+
+        let expanded = expander.expand("/review app/Sources/Agent.swift")
+        XCTAssertEqual(expanded.prompt, "Review app/Sources/Agent.swift for correctness.")
+        XCTAssertEqual(expanded.template?.name, "review")
+
+        // A mistyped command must not reach the model as a literal slash — that reads as the
+        // model ignoring an instruction.
+        XCTAssertEqual(expander.expand("/revieww x").missing, "revieww")
+        // A path in the middle of a sentence is not a command.
+        XCTAssertNil(expander.expand("look at app/Sources /review").template)
+        // Ordinary prompts pass through untouched.
+        XCTAssertEqual(expander.expand("just do the thing").prompt, "just do the thing")
+    }),
+
+    ("promptTemplates: an argument with nowhere to go is appended, not dropped", {
+        XCTAssertEqual(
+            PromptExpander.substitute("Do the thing.", argument: "on file.swift"),
+            "Do the thing.\n\non file.swift")
+        XCTAssertEqual(
+            PromptExpander.substitute("Check {{args}} twice.", argument: "x"),
+            "Check x twice.")
+        XCTAssertEqual(PromptExpander.substitute("Nothing to add.", argument: ""),
+                       "Nothing to add.")
+    }),
+
+    ("schedules: a job is due on its interval and its counter advances", {
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let store = ScheduleStore(home: home, sessionID: "s1")
+        XCTAssertTrue(store.load().isEmpty)
+
+        try store.add(ScheduledJob(
+            id: "j1", prompt: "check CI", everySeconds: 600,
+            createdAt: Date().addingTimeInterval(-601)))
+        var jobs = store.load()
+        XCTAssertEqual(jobs.count, 1)
+        XCTAssertTrue(try XCTUnwrap(jobs.first).isDue(), "created long enough ago")
+
+        try store.markRun(id: "j1")
+        jobs = store.load()
+        let job = try XCTUnwrap(jobs.first)
+        XCTAssertEqual(job.runCount, 1)
+        XCTAssertFalse(job.isDue(), "the counter advanced, so it is not due again yet")
+        XCTAssertTrue(job.summary.contains("every 10m"))
+
+        // Disabled jobs never fire, and removal is by id.
+        try store.save([ScheduledJob(
+            id: "j1", prompt: "check CI", everySeconds: 1, enabled: false,
+            createdAt: Date().addingTimeInterval(-999))])
+        XCTAssertFalse(try XCTUnwrap(store.load().first).isDue())
+        try store.remove(id: "j1")
+        XCTAssertTrue(store.load().isEmpty)
+    }),
+
+    ("schedules: they live with the session, so they cannot outlive it", {
+        // The harness keyed cron jobs on a stable attachment id instead, which is why forking
+        // a session silently moved its parent's schedule to the child.
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let a = ScheduleStore(home: home, sessionID: "session-a")
+        let b = ScheduleStore(home: home, sessionID: "session-b")
+        try a.add(ScheduledJob(prompt: "a's job", everySeconds: 60))
+        XCTAssertEqual(a.load().count, 1)
+        XCTAssertEqual(b.load().count, 0, "another session sees nothing of it")
+        XCTAssertTrue(a.fileURL.path.contains("session-artifacts/session-a"))
     }),
 ])

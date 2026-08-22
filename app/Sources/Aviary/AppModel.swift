@@ -784,11 +784,12 @@ final class LiveRun: Identifiable {
                 sync()
                 return
             }
-            guard !inHouse.isStreaming else {
-                // No queue yet, and saying so beats appearing to accept a prompt that is
-                // then dropped.
-                builder.appendNote("Still working. Wait for this turn to finish.")
-                sync()
+            if inHouse.isStreaming {
+                // Steer rather than refuse: the composer should stay usable while the agent
+                // works, and the message lands at the next turn boundary where the
+                // conversation is well-formed.
+                inHouse.steer(text)
+                queuedSteering = inHouse.pendingSteering
                 return
             }
             inHouse.send(text)

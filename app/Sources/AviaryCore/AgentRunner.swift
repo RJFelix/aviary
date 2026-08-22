@@ -25,11 +25,14 @@ public actor AgentRunner {
         /// Record request payloads for the root run. Off unless asked: it writes the whole
         /// system prompt and conversation to disk.
         public var recordPayloads = false
+        /// A budget and finishing condition for the root run. Children get their own iteration
+        /// ceiling instead — a shared token budget would let one child starve its siblings.
+        public var goal: Goal?
 
         public init(
             home: AgentHome, cwd: String, model: ModelSpec, systemPrompt: String,
             maxDepth: Int = 3, maxIterations: Int = 40, childMaxIterations: Int = 20,
-            memory: MemoryStore? = nil, recordPayloads: Bool = false
+            memory: MemoryStore? = nil, recordPayloads: Bool = false, goal: Goal? = nil
         ) {
             self.home = home
             self.cwd = cwd
@@ -40,6 +43,7 @@ public actor AgentRunner {
             self.childMaxIterations = childMaxIterations
             self.memory = memory
             self.recordPayloads = recordPayloads
+            self.goal = goal
         }
     }
 
@@ -67,7 +71,7 @@ public actor AgentRunner {
             config: .init(
                 model: settings.model, cwd: settings.cwd, systemPrompt: settings.systemPrompt,
                 maxIterations: settings.maxIterations, maxTokens: settings.model.maxTokens,
-                maxDepth: settings.maxDepth, depth: 0))
+                maxDepth: settings.maxDepth, depth: 0, goal: settings.goal))
 
         let obs = observer
         await agent.observe { event in obs?(event) }

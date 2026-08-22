@@ -132,11 +132,40 @@ giving up. The schema is now built from what the run can actually do — includi
 sub-agent depth remains — and there is a test asserting `spawn` is advertised only when it is
 possible.
 
+### Session lifecycle
+
+**Steering** queues a message that lands at the next turn boundary. Not mid-turn, and not
+because that would be awkward: a tool call in flight has to be answered before the model can be
+told anything, and injecting between a call and its result produces a conversation the provider
+rejects. The Live composer stays usable while the agent works, and a queued message shows in the
+inspector until it is taken up. **Follow-ups** continue the run rather than ending it.
+
+**Goals** are a budget and a finishing condition. The useful part is not the word but the two
+numbers — an agent asked to do something open-ended otherwise runs until an iteration ceiling it
+cannot see, which is the worst kind of stop: silent, arbitrary, and indistinguishable from
+success. The remaining budget is restated in the system prompt every turn, because a stale
+number is worse than none, and exhaustion is recorded as its own outcome so a run that ran out
+does not look like one that finished. `--budget <tokens>` and `--minutes <n>`.
+
+**Scheduled jobs** are per session and stored in the session's own artifacts directory, so a
+schedule cannot outlive the thing it schedules. The harness keyed cron jobs on a stable
+*attachment* id instead, which is why forking a session silently moved its parent's schedule to
+the child. Intervals rather than cron expressions: every real case in the corpus was "every N
+minutes", and a cron parser is a weekend and a class of bugs bought for a case nobody had. A
+job marked *only when idle* is a heartbeat; a due job that arrives while a turn is running is
+skipped rather than queued, because a heartbeat that piles up delivers a burst the moment the
+turn ends.
+
+**Prompt templates** expand `/name argument` from the templates already on disk — only at the
+start of a prompt and only one, because a prompt that expands templates anywhere becomes a
+templating language and a `/` mid-sentence is far more often a path. A name that does not exist
+is refused with the list of ones that do, rather than sent to the model as a literal slash,
+which reads as the model ignoring an instruction.
+
 ### What the harness still does and this does not
 
-Scheduled jobs, heartbeats, session goals, prompt templates, extension hooks, and the
-OAuth-authenticated built-in providers. Steering a run mid-turn is harness-only; an in-house
-run takes prompts between turns, not during one.
+Extension hooks, and the OAuth-authenticated built-in providers (`openai-codex`, Anthropic
+subscription login). Both are real gaps rather than deliberate omissions.
 
 ## The runtime host
 

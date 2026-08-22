@@ -40,6 +40,9 @@ final class InHouseDriver {
     /// reason a session is worth more than a request.
     private var agent: Agent?
     private(set) var acceptsFollowUps = false
+    /// Schedules for this session, and the timer that fires them.
+    private(set) var jobs: [ScheduledJob] = []
+    private var scheduler: Task<Void, Never>?
 
     /// Whether to record request payloads, so the run's "what was sent" breakdown works.
     private let recordPayloads: Bool
@@ -132,6 +135,7 @@ final class InHouseDriver {
             self.writer = writer
             self.agent = agent
             acceptsFollowUps = true
+            if let sessionID { jobs = ScheduleStore(home: home, sessionID: sessionID).load() }
             usage = await agent.totalUsage
         } catch {
             errorBanner = error.localizedDescription
@@ -149,6 +153,9 @@ final class InHouseDriver {
             sessionID = session
             sessionFile = home.sessionFile(id: session)
             follow()
+        case .steered(let text):
+            pendingSteering.removeAll { $0 == text }
+            reload()
         case .textDelta(let t):
             streamingText += t
         case .thinkingDelta(let t):
@@ -159,7 +166,7 @@ final class InHouseDriver {
             streamingText = ""
             streamingThinking = ""
             reload()
-        case .toolStarted, .toolFinished, .compacted, .childStarted, .childFinished:
+        case .goalExhausted, .toolStarted, .toolFinished, .compacted, .childStarted, .childFinished:
             reload()
         case .finished:
             isStreaming = false
@@ -198,6 +205,62 @@ final class InHouseDriver {
         }
     }
 
+    /// Change course without waiting for the current turn to finish.
+    ///
+    /// Queued on the agent, which injects it at the next turn boundary — the composer stays
+    /// usable while the agent works, which is the whole point of steering.
+    func steer(_ text: String) {
+        guard let agent else { return }
+        Task { await agent.steer(text) }
+        pendingSteering.append(text)
+    }
+
+    /// Shown in the composer so a queued message is visible until it is taken up.
+    private(set) var pendingSteering: [String] = []
+
+    /// Add a scheduled job to this session, and start ticking if this is the first one.
+    func addJob(prompt: String, everyMinutes: Double, onlyWhenIdle: Bool) {
+        guard let sessionID else { return }
+        let store = ScheduleStore(home: home, sessionID: sessionID)
+        try? store.add(ScheduledJob(
+            prompt: prompt, everySeconds: everyMinutes * 60, onlyWhenIdle: onlyWhenIdle))
+        jobs = store.load()
+        startScheduler()
+    }
+
+    func removeJob(id: String) {
+        guard let sessionID else { return }
+        let store = ScheduleStore(home: home, sessionID: sessionID)
+        try? store.remove(id: id)
+        jobs = store.load()
+    }
+
+    /// Fires due jobs. Checks every fifteen seconds rather than sleeping until the next due
+    /// time, because jobs can be added and removed while it waits and a recomputed sleep is
+    /// more code than a cheap poll.
+    private func startScheduler() {
+        guard scheduler == nil else { return }
+        scheduler = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self, let sessionID = self.sessionID, !self.hasExited else { return }
+                let store = ScheduleStore(home: self.home, sessionID: sessionID)
+                let due = store.load().filter { job in
+                    job.isDue() && !(job.onlyWhenIdle && self.isStreaming)
+                }
+                for job in due {
+                    // Skipped rather than queued when busy: a heartbeat that piles up while a
+                    // long turn runs would deliver a burst the moment it finishes.
+                    guard !self.isStreaming else { continue }
+                    try? store.markRun(id: job.id)
+                    self.jobs = store.load()
+                    self.send(job.prompt)
+                    break
+                }
+            }
+        }
+    }
+
     /// Another prompt in the same session — same conversation, same interpreter, same
     /// variables.
     func send(_ prompt: String) {
@@ -212,6 +275,7 @@ final class InHouseDriver {
     }
 
     func stop() {
+        scheduler?.cancel()
         task?.cancel()
         watcher?.stop()
         let host = self.host

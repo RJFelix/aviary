@@ -19,20 +19,24 @@ enum AgentCLI {
         let prompt = args.count > flag + 1 ? args[flag + 1] : ""
         guard !prompt.isEmpty, !prompt.hasPrefix("--") else {
             fail("usage: Aviary --agent \"<prompt>\" [--model provider/id] [--cwd path] "
-                + "[--host python3|python3-shared] [--record] [--quiet]")
+                + "[--host python3|python3-shared] [--record] [--quiet] "
+                + "[--budget <tokens>] [--minutes <n>]")
         }
         let model = value(of: "--model", in: args)
         let cwd = value(of: "--cwd", in: args) ?? FileManager.default.currentDirectoryPath
         let variant = value(of: "--host", in: args) ?? "python3"
         let quiet = args.contains("--quiet")
         let record = args.contains("--record")
+        let tokenBudget = value(of: "--budget", in: args).flatMap { Int($0) }
+        let minutes = value(of: "--minutes", in: args).flatMap { Double($0) }
 
         // Its own run loop: this process has no NSApplication, and the async work below needs
         // the main queue drained or nothing progresses. The same reason `--snapshot` pumps it.
         let done = Atomic(false)
         Task {
             await run(prompt: prompt, modelRef: model, cwd: cwd, variant: variant,
-                      quiet: quiet, record: record)
+                      quiet: quiet, record: record, tokenBudget: tokenBudget,
+                      minutes: minutes)
             done.set(true)
         }
         while !done.get() {
@@ -43,7 +47,7 @@ enum AgentCLI {
 
     private static func run(
         prompt: String, modelRef: String?, cwd: String, variant: String, quiet: Bool,
-        record: Bool
+        record: Bool, tokenBudget: Int?, minutes: Double?
     ) async {
         _ = await ProcessEnvironment.shared.loadFromLoginShell()
         let home = AgentHome.default
@@ -91,6 +95,23 @@ enum AgentCLI {
         let provider = OpenAICompletionsProvider(
             id: providerSpec.id, baseURL: baseURL, apiKey: resolvedKey,
             extraHeaders: providerSpec.headers)
+        // A prompt template, if the prompt is a slash command. Expanded before anything else
+        // reads the prompt, so skills and memory rank against what will actually be sent.
+        let expander = PromptExpander(
+            templates: Library.discover(
+                home: home, settings: HarnessSettings.load(home: home),
+                projectRoot: URL(fileURLWithPath: cwd), enginePackageRoot: nil).prompts)
+        let expansion = expander.expand(prompt)
+        if let missing = expansion.missing {
+            fail("No prompt template named /\(missing). "
+                + "Available: " + expander.templates.map(\.name).sorted()
+                    .prefix(12).joined(separator: ", "))
+        }
+        let prompt = expansion.prompt
+        if let template = expansion.template, !quiet {
+            note("template /\(template.name) → \(Fmt.bytes(prompt.count))")
+        }
+
         // Skills, gated. The harness sent all 68 on every request — 62.7% of input tokens on
         // a trivial run — so this is the one place worth doing differently rather than
         // faithfully.
@@ -124,7 +145,11 @@ enum AgentCLI {
                 systemPrompt: SystemPrompt.build(
                     cwd: cwd, model: model, skills: gate.render(selection),
                     memory: memoryGate.render(recalled)),
-                memory: memory, recordPayloads: record))
+                memory: memory, recordPayloads: record,
+                goal: (tokenBudget != nil || minutes != nil)
+                    ? Goal(text: prompt, tokenBudget: tokenBudget,
+                           timeBudget: minutes.map { $0 * 60 })
+                    : nil))
 
         await runner.observe { event in
             switch event {
@@ -156,6 +181,10 @@ enum AgentCLI {
                 note("\n⤷ \(name): \(prompt.prefix(80))")
             case .childFinished(_, let name, _, let isError):
                 note((isError ? "⤶ \(name) failed" : "⤶ \(name) done"))
+            case .goalExhausted(let note):
+                note2(note)
+            case .steered(let text):
+                note("\n↻ \(text.prefix(70))")
             case .started(let session):
                 if !quiet { note("session \(session) · \(model.qualifiedID) · \(cwd)") }
             }
@@ -226,6 +255,8 @@ enum AgentCLI {
         guard let i = args.firstIndex(of: flag), args.count > i + 1 else { return nil }
         return args[i + 1]
     }
+
+    private static func note2(_ s: String) { note("\n— " + s) }
 
     private static func note(_ s: String) {
         FileHandle.standardError.write(Data((s + "\n").utf8))
