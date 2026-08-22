@@ -21,6 +21,28 @@ aviary/
 └── justfile     Every task worth naming.
 ```
 
+## Running an agent
+
+Aviary runs agents itself — no harness, no Node, no daemon:
+
+```sh
+just build
+Aviary --agent "count the swift files under app/Sources" --model litellm/claude-haiku-4-5
+```
+
+Flags: `--cwd <path>`, `--host python3-shared` (for numpy/pandas), `--record` (capture request
+payloads), `--quiet`. In the GUI, the Live tab's launcher picks between the in-house engine and
+the vendored harness.
+
+What the agent gets: one tool, `python`, running in a persistent interpreter where variables
+survive between calls. Inside it, `sh(command)` with a working directory and environment that
+*persist* across calls, `spawn(prompt)` for sub-agents, `conversation(limit)` to read its own
+history, and `remember`/`recall` for things worth keeping. Skills are ranked against the prompt
+rather than all injected. MCP servers from `settings.json` appear as individual tools.
+
+`just host` drives a runtime host by hand, which is the fastest way to explore one or to check a
+new one against [docs/runtime-host-protocol.md](docs/runtime-host-protocol.md).
+
 ## What it does
 
 | Screen | What it answers |

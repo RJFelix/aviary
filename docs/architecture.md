@@ -43,44 +43,100 @@ reason to keep it.
 
 ## The in-house agent
 
-As of 2026-08-21 Aviary can run a session with no harness and no Node: its own provider client,
-its own loop, its own transcript writer, tools executing in its own runtime host. Verified
-end to end against a real model through the LiteLLM gateway.
+As of 2026-08-22 Aviary runs agents itself: its own provider clients, its own loop, its own
+transcript writer, tools in its own runtime host. No harness, no Node, no daemon. The vendored
+harness is still there and still selectable, but nothing requires it.
 
 ```
-prompt ─▶ Agent ─┬─▶ ChatProvider  (OpenAICompletionsProvider → LiteLLM → anything)
-                 ├─▶ RuntimeHost   (python tool, persistent interpreter)
-                 └─▶ SessionWriter (JSONL the existing parser already reads)
+prompt ─▶ AgentRunner ─▶ Agent ─┬─▶ ChatProvider   openai-completions │ anthropic-messages
+                                ├─▶ RuntimeHost    python tool, persistent interpreter
+                                ├─▶ MCPClient      other people's tools, per server
+                                ├─▶ MemoryStore    remember / recall
+                                └─▶ SessionWriter  JSONL the existing parser already reads
 ```
 
-Four decisions worth keeping:
+| Piece | What it is |
+|---|---|
+| `ChatModel.swift` | message and tool types, the `openai-completions` wire format, SSE framing |
+| `AnthropicProvider.swift` | `anthropic-messages`, which differs in every way that 400s if missed |
+| `Agent.swift` | the loop: stream, execute tools, append, repeat; compaction; callbacks |
+| `AgentRunner.swift` | builds agents, including the children they spawn, and routes callbacks |
+| `RuntimeHost.swift` | client for the runtime-host protocol |
+| `SessionWriter.swift` | writes the harness's transcript format |
+| `SubAgents.swift` | writes the harness's sub-agent ledger, so Flock draws in-house children |
+| `SkillGate.swift` | which skills a request carries |
+| `Memory.swift` | what the agent has learned, and how much of it a request carries |
+| `MCPClient.swift` | stdio JSON-RPC: initialize, tools/list, tools/call |
 
-- **The transcript format is the harness's.** Aviary has a parser, renderer, catalog, usage
-  analytics and sub-agent tree reader built on it. Inventing a second format would mean
-  duplicating all of that or losing it, so an in-house run produces files indistinguishable
-  from a harness run and every existing screen works unchanged.
-- **One tool, `python`.** From the measured corpus: `subprocess` was the top import by 4×,
-  27.7% of cells shelled out, and two cells in 5,574 touched pandas. A menu of file and search
-  tools would be a menu of things `sh()` already does, paid for with a bigger schema on every
-  request.
-- **The header is written immediately.** The harness defers file creation until the first
-  assistant message, so a run that dies during its first model call leaves no transcript —
-  which is exactly the run worth reading.
-- **The system prompt starts from nothing.** The harness's cost was 68 skill descriptions at
-  62.7% of input on a trivial run, paid whether or not any skill was used. Things earn their
-  way in here.
+### Decisions, and the measurement behind each
 
-`Aviary --agent "<prompt>" [--model provider/id] [--cwd path] [--host python3-shared]` drives
-it headless — the only way to verify the stack without a window, and where most work starts
-anyway.
+**The transcript format is the harness's.** Aviary has a parser, renderer, catalog, usage
+analytics and sub-agent tree reader built on it. A second format would mean duplicating all of
+that or losing it, so an in-house run produces files indistinguishable from a harness run.
+Sub-agents write the same ledger, which is why Flock went from 53 children to 55 with no UI
+work at all.
 
-### The SSE trap, recorded because it cost a debugging session
+**One tool, `python`.** From the measured corpus of 5,574 real cells: `subprocess` was the top
+import by 4×, 27.7% shelled out, and **two cells** touched pandas. A menu of file and search
+tools would be a menu of things `sh()` already does, paid for on every request.
 
-`AsyncLineSequence` (`bytes.lines`) **silently discards blank lines**, and in server-sent
-events the blank line *is* the record separator. Five `data:` events arrived as five lines with
-no separators, so a spec-correct parser emitted nothing and every turn came back empty with no
-error anywhere. `SSELineSequence` in `ChatModel.swift` splits raw bytes and keeps empty lines.
-Framing an SSE stream is the client's job, not the stdlib's.
+**The header is written immediately.** The harness defers file creation until the first
+assistant message, so a run that dies during its first model call leaves no transcript — which
+is exactly the run worth reading.
+
+**Skills are ranked, not dumped.** The harness sent all 68 descriptions every time: 62.7% of
+input tokens on a two-message run. Measured on the real library of 57 — "what is 2+2?" gets 0
+descriptions and saves 29 KB; a ClickHouse question gets 12 and still saves 22 KB. What misses
+the budget is **listed by name**, never hidden: a capability the model cannot see and cannot
+ask for is silent capability loss that reads as the model being stupid.
+
+**Memory has scopes, lifetimes, provenance, and no silent cap.** Each of those is a flaw in
+the harness's continual harness, measured earlier in this project: 6 entries per kind at 180
+characters sorted *alphabetically* (so the newest was the hidden one), no tier between
+session-lifetime and forever, a 0600 blob rewritten in place, and no record of why it believed
+anything. Here: append-only JSONL under `memory/`, session/project/global with optional TTLs,
+every entry naming the prompt that produced it, relevance-then-recency ranking, and a listed
+remainder.
+
+**Payload recording is native.** The harness needed an extension hook and could only show what
+the harness had already assembled. Owning the provider makes the exact serialized request a
+`ChatEvent`, so the "what was sent" breakdown works with nothing installed. Still opt-in: it
+writes the whole system prompt and conversation to disk.
+
+**Cost is priced at write time.** Usage and Cockpit read dollars out of the transcript, so a
+run reporting tokens and no cost would look free — and `sessionsWithoutPricing` exists to
+distinguish "no rates published" from "cost zero".
+
+### Callbacks: the runtime calling back into the app
+
+Protocol 2 added a second direction, and it is what makes the environment more than a
+calculator. Agent code calls `spawn(prompt)` and blocks; a whole sub-agent runs; the answer
+comes back as a return value. `conversation(limit)` hands back the transcript the code is part
+of. `remember`/`recall` persist findings. `ask_app(kind, …)` is the general form.
+
+Two rules learned the hard way. **The session id travels with every request** — one host serves
+many sessions and there is no other way to route the answer; leaving it out cost a debugging
+session. And **a refusal is a payload with an `error` key, never silence**: the agent is blocked
+on a line of code, so an error it can read beats a nine-minute timeout it cannot.
+
+### Two bugs worth not rediscovering
+
+**`AsyncLineSequence` discards blank lines**, and in SSE the blank line *is* the record
+separator. Five `data:` events arrived as five lines with no separators, a spec-correct parser
+emitted nothing, and every turn came back empty with no error anywhere. `SSELineSequence` splits
+raw bytes and keeps them.
+
+**A capability the model is not told about does not exist.** `spawn()` was in the namespace and
+absent from the tool schema; a real run spent twenty turns grepping the codebase for it before
+giving up. The schema is now built from what the run can actually do — including how much
+sub-agent depth remains — and there is a test asserting `spawn` is advertised only when it is
+possible.
+
+### What the harness still does and this does not
+
+Scheduled jobs, heartbeats, session goals, prompt templates, extension hooks, and the
+OAuth-authenticated built-in providers. Steering a run mid-turn is harness-only; an in-house
+run takes prompts between turns, not during one.
 
 ## The runtime host
 
