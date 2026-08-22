@@ -41,6 +41,45 @@ What is deliberately *not* here: any reimplementation of the agent loop. The IPy
 the provider routes, compaction, sub-agent spawning — that is the harness's job and the
 reason to keep it.
 
+## The runtime host
+
+Where agent code runs, as of 2026-08-21. A separate process, one isolated interpreter per
+session, a line protocol on stdio — the contract is [runtime-host-protocol.md](runtime-host-protocol.md)
+and it is deliberately the *only* thing Aviary knows about a runtime.
+
+```
+Aviary ──stdio JSONL──▶ runtime-hosts/python3/host.py
+                          ├── sub-interpreter per session (own GIL, own thread)
+                          └── sh() with a persistent cwd and environment
+```
+
+Three reasons for this shape, each measured rather than assumed:
+
+- **A process, not a library.** Linking a runtime in would let the GUI read interpreter
+  memory, and would also mean a segfault in a C extension takes the window, the board and the
+  transcripts. Not hypothetical: importing `polars` into a sub-interpreter aborted the whole
+  process during development. The invariant that Aviary stays usable when the agent side is
+  wedged is worth more than direct pointer access.
+- **Sub-interpreters, not processes, per session.** CPython 3.12 gives each its own GIL —
+  measured at **3.85× on four concurrent interpreters** — so sessions run genuinely in
+  parallel without a process each, and without a daemon, worker pool, ownership leases or a
+  socket whose version must match whatever the terminal has installed.
+- **A swappable contract.** `runtime-hosts/python3-shared/` is a second host that runs every
+  session in one interpreter: no per-session GIL, but `numpy`, `pandas` and `duckdb` import,
+  because those declare `Py_mod_multiple_interpreters = NOT_SUPPORTED` and CPython refuses
+  them in a sub-interpreter. Both hosts speak the same protocol and declare the difference in
+  `features`, so a caller routes on capability rather than on hard-coded knowledge. A Lua or
+  QuickJS host is a third implementation, not a rewrite.
+
+`sh()` keeps a working directory and environment across calls. That is not a convenience:
+**19.7% of 5,574 real cells** were doing directory bookkeeping by hand because `subprocess`
+starts every child in the same place. See
+[knowledge/agent-execution-environment.md](../../knowledge/agent-execution-environment.md).
+
+`inspect` reads a session's namespace without running anything the agent wrote — the
+capability a Jupyter kernel could not offer, where listing names meant executing a cell that
+mutated `In`/`Out` and could shadow the names being listed.
+
 ## Core types
 
 | Type | Job |

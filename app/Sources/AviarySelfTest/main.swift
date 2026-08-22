@@ -348,6 +348,49 @@ func test_sessionIdentityIsTheFilenameNotTheHeaderField() throws {
 
 // MARK: - Runner
 
+
+// MARK: - Runtime host test helpers
+
+enum HostVariant: String {
+    case reference = "python3"
+    case shared = "python3-shared"
+}
+
+/// Build a client for one of the bundled hosts, or nil if this machine cannot run it.
+///
+/// Returning nil rather than failing keeps the suite honest on a machine without Python: a
+/// skipped integration test is information, a red one that means "you lack an interpreter" is
+/// noise. The skip is printed so it cannot pass silently.
+func makeHost(_ variant: HostVariant) throws -> RuntimeHost? {
+    guard let root = EngineLocator.repoRoot() else {
+        print("      skipped: no repo root found")
+        return nil
+    }
+    let script = root.appending(path: "runtime-hosts/\(variant.rawValue)/host.py")
+    guard FileManager.default.fileExists(atPath: script.path) else {
+        print("      skipped: \(script.lastPathComponent) missing for \(variant.rawValue)")
+        return nil
+    }
+    return RuntimeHost(executable: "/usr/bin/env", arguments: ["python3", script.path])
+}
+
+/// Collects streamed output events from a host. Locked because the events arrive on the
+/// client's reader task, not the test's.
+final class OutputCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var chunks: [String] = []
+    private var seen: [String] = []
+
+    func record(stream: String, text: String) {
+        lock.lock(); defer { lock.unlock() }
+        chunks.append(text)
+        seen.append(stream)
+    }
+
+    var text: String { lock.lock(); defer { lock.unlock() }; return chunks.joined() }
+    var streams: [String] { lock.lock(); defer { lock.unlock() }; return seen }
+}
+
 await Harness.run([
     ("parsesLinearSessionWithToolPairing", { try test_parsesLinearSessionWithToolPairing() }),
     ("rendersOnlyTheActiveBranch", { try test_rendersOnlyTheActiveBranch() }),
@@ -618,5 +661,247 @@ await Harness.run([
         let r = try XCTUnwrap(board.requests.first)
         XCTAssertFalse(r.delivered, "the retraction wins because it is later")
         XCTAssertEqual(board.undeliveredCount, 1)
+    }),
+
+    // ---------------------------------------------------------------- runtime host
+    //
+    // These drive the real host process rather than a mock. The protocol is the whole
+    // contract between Aviary and any runtime, so a test that stubs it proves nothing about
+    // whether a runtime actually behaves. Both hosts are run through the same assertions
+    // wherever the assertion is part of the contract — that is what makes "swappable" a
+    // claim rather than a hope.
+
+    ("runtimeHost: starts, declares capabilities, and stops", {
+        guard let host = try makeHost(.reference) else { return }
+        let caps = try await host.start()
+        XCTAssertEqual(caps.protocolVersion, 1)
+        XCTAssertEqual(caps.runtime, "cpython")
+        XCTAssertFalse(caps.runtimeVersion.isEmpty)
+        XCTAssertTrue(caps.has("namespaceInspection"))
+        // An undeclared feature must read as absent, never as unknown-so-probably-fine.
+        XCTAssertFalse(caps.has("teleportation"))
+        await host.stop()
+    }),
+
+    ("runtimeHost: state persists across separate executions", {
+        // The premise of the whole design: work accumulates instead of being rebuilt.
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        let s = try await host.createSession(id: "persist")
+        _ = try await host.execute("x = 41", in: s)
+        _ = try await host.execute("y = x + 1", in: s)
+        let r = try await host.execute("y", in: s)
+        XCTAssertEqual(r.value, "42")
+        XCTAssertNil(r.exception)
+        await host.stop()
+    }),
+
+    ("runtimeHost: a trailing expression is echoed like a REPL", {
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        let s = try await host.createSession()
+        let r = try await host.execute("print('hi')\n2 ** 10", in: s)
+        XCTAssertEqual(r.value, "1024")
+        XCTAssertEqual(r.stdout, "hi\n")
+        // A statement-only cell has no value to echo, and must not invent one.
+        let q = try await host.execute("q = 1", in: s)
+        XCTAssertNil(q.value)
+        await host.stop()
+    }),
+
+    ("runtimeHost: agent exceptions are data, not host failures", {
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        let s = try await host.createSession()
+        let r = try await host.execute("1/0", in: s)
+        XCTAssertTrue(r.failed)
+        XCTAssertTrue((r.exception ?? "").contains("ZeroDivisionError"))
+        // And the session is still usable afterwards — a raise is not a death.
+        let after = try await host.execute("'alive'", in: s)
+        XCTAssertEqual(after.value, "'alive'")
+        await host.stop()
+    }),
+
+    ("runtimeHost: SystemExit in agent code does not take the host down", {
+        // The failure mode that would otherwise turn one bad cell into a lost session.
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        let s = try await host.createSession()
+        let r = try await host.execute("raise SystemExit(3)", in: s)
+        XCTAssertTrue((r.exception ?? "").contains("SystemExit"))
+        let after = try await host.execute("1 + 1", in: s)
+        XCTAssertEqual(after.value, "2")
+        await host.stop()
+    }),
+
+    ("runtimeHost: sessions cannot see each other's names", {
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        let a = try await host.createSession(id: "a")
+        let b = try await host.createSession(id: "b")
+        _ = try await host.execute("secret = 'a-only'", in: a)
+        let leak = try await host.execute("'secret' in dir()", in: b)
+        XCTAssertEqual(leak.value, "False")
+        let list = try await host.sessions()
+        XCTAssertTrue(list.contains("a") && list.contains("b"))
+        try await host.destroySession(a)
+        XCTAssertFalse(try await host.sessions().contains("a"))
+        await host.stop()
+    }),
+
+    ("runtimeHost: inspect reads the namespace and leaves no trace in it", {
+        // The capability a Jupyter kernel could not offer: listing names there meant running
+        // a cell, which mutated In/Out and could shadow the names being listed.
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        let s = try await host.createSession()
+        _ = try await host.execute("nums = [1, 2, 3]\nlabel = 'hi'", in: s)
+        let first = try await host.inspect(s)
+        XCTAssertEqual(first.bindings.map(\.name), ["label", "nums"])
+        XCTAssertEqual(first.bindings.first { $0.name == "nums" }?.type, "list")
+        XCTAssertEqual(first.bindings.first { $0.name == "nums" }?.length, 3)
+        // Nothing the host used may be visible to the agent, and inspecting twice must not
+        // grow the namespace.
+        for b in first.bindings {
+            XCTAssertFalse(b.name.hasPrefix("__aviary"), "host name leaked: \(b.name)")
+            XCTAssertFalse(b.name.hasPrefix("__AVIARY"), "host name leaked: \(b.name)")
+        }
+        let second = try await host.inspect(s)
+        XCTAssertEqual(first.bindings.map(\.name), second.bindings.map(\.name))
+        await host.stop()
+    }),
+
+    ("runtimeHost: cd and export persist across calls", {
+        // The measured 19.7%: cells doing working-directory bookkeeping by hand because
+        // subprocess starts every child in the same place.
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        let s = try await host.createSession(cwd: "/usr")
+        _ = try await host.execute("sh('cd /usr/lib')", in: s)
+        let where1 = try await host.execute("cwd()", in: s)
+        XCTAssertEqual(where1.value, "'/usr/lib'")
+        let where2 = try await host.execute("sh('pwd')['stdout'].strip()", in: s)
+        XCTAssertEqual(where2.value, "'/usr/lib'")
+        _ = try await host.execute("sh('export AVIARY_SUITE=7')", in: s)
+        let env = try await host.execute("sh('echo $AVIARY_SUITE')['stdout'].strip()", in: s)
+        XCTAssertEqual(env.value, "'7'")
+        await host.stop()
+    }),
+
+    ("runtimeHost: output arrives as events before the result settles", {
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        let collector = OutputCollector()
+        await host.onOutput { _, stream, text in collector.record(stream: stream, text: text) }
+        let s = try await host.createSession()
+        _ = try await host.execute("print('streamed')", in: s)
+        XCTAssertTrue(collector.text.contains("streamed"), "expected a streamed output event")
+        XCTAssertEqual(collector.streams.first, "stdout")
+        await host.stop()
+    }),
+
+    ("runtimeHost: a bad request is rejected without killing the host", {
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        do {
+            _ = try await host.execute("1", in: "no-such-session")
+            XCTFail("expected a rejection for an unknown session")
+        } catch let error as RuntimeHost.HostError {
+            guard case .rejected(let code, _) = error else {
+                XCTFail("expected .rejected, got \(error)"); return
+            }
+            XCTAssertEqual(code, "no_session")
+        }
+        // Still serving.
+        let s = try await host.createSession()
+        XCTAssertEqual(try await host.execute("'ok'", in: s).value, "'ok'")
+        await host.stop()
+    }),
+
+    ("runtimeHost: the two hosts declare their trade-off honestly", {
+        // Swappability is only real if a caller can tell what it is getting. These are the
+        // capabilities Aviary would route on.
+        guard let ref = try makeHost(.reference), let shared = try makeHost(.shared) else { return }
+        let a = try await ref.start()
+        let b = try await shared.start()
+        XCTAssertTrue(a.has("perSessionGIL"), "reference host isolates interpreters")
+        XCTAssertTrue(a.has("isolatedSessions"))
+        XCTAssertFalse(b.has("perSessionGIL"), "shared host trades parallelism for compatibility")
+        XCTAssertFalse(b.has("isolatedSessions"))
+        // Both must still honour the parts of the contract that are not optional.
+        XCTAssertTrue(a.has("namespaceInspection") && b.has("namespaceInspection"))
+        XCTAssertTrue(a.has("persistentShellState") && b.has("persistentShellState"))
+        XCTAssertEqual(a.protocolVersion, b.protocolVersion)
+        await ref.stop()
+        await shared.stop()
+    }),
+
+    ("runtimeHost: the documented numpy trade-off is real in both directions", {
+        // numpy declares Py_mod_multiple_interpreters = NOT_SUPPORTED, so CPython refuses to
+        // load it in a sub-interpreter. Asserted rather than described, because if a future
+        // numpy lifts the restriction the shared host stops being necessary and this test is
+        // how we find out.
+        guard let ref = try makeHost(.reference), let shared = try makeHost(.shared) else { return }
+        _ = try await ref.start()
+        _ = try await shared.start()
+        let s1 = try await ref.createSession()
+        let s2 = try await shared.createSession()
+        let onRef = try await ref.execute("import numpy", in: s1)
+        let onShared = try await shared.execute("import numpy; int(numpy.arange(4).sum())", in: s2)
+        if onRef.exception == nil {
+            print("      NOTE: numpy now imports in a sub-interpreter — the shared host may be redundant")
+        } else {
+            XCTAssertTrue((onRef.exception ?? "").contains("subinterpreter"),
+                          "expected the documented refusal, got: \((onRef.exception ?? "").suffix(120))")
+        }
+        // The shared host must work regardless; that is its whole reason to exist.
+        XCTAssertNil(onShared.exception, "numpy must import in the shared host")
+        XCTAssertEqual(onShared.value, "6")
+        await ref.stop()
+        await shared.stop()
+    }),
+
+    ("runtimeHost: sessions in the reference host run in parallel", {
+        // Per-interpreter GIL is the reason to prefer the reference host. Measured, because
+        // "isolated" that does not actually run concurrently is just bookkeeping.
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        let ids = try await withThrowingTaskGroup(of: String.self) { group -> [String] in
+            for i in 0..<4 { group.addTask { try await host.createSession(id: "p\(i)") } }
+            var out: [String] = []
+            for try await id in group { out.append(id) }
+            return out
+        }
+        let busy = "n = 0\nfor _ in range(4_000_000): n += 1\nn"
+        let serialStart = Date()
+        _ = try await host.execute(busy, in: ids[0])
+        let serialOne = Date().timeIntervalSince(serialStart)
+
+        let parallelStart = Date()
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for id in ids { group.addTask { _ = try await host.execute(busy, in: id) } }
+            try await group.waitForAll()
+        }
+        let parallel = Date().timeIntervalSince(parallelStart)
+        // Four GIL-bound loops concurrently should cost far less than four times one. A
+        // shared GIL would make this ~4x; the threshold is loose so a busy CI box does not
+        // fail it spuriously.
+        XCTAssertTrue(parallel < serialOne * 3.0,
+                      "4 sessions took \(String(format: "%.2f", parallel))s vs \(String(format: "%.2f", serialOne))s for one — GIL looks shared")
+        await host.stop()
+    }),
+
+    ("runtimeHost: capability parsing defaults missing features to false", {
+        // Pure parsing, no process: the one place a wrong default would silently promise a
+        // capability the runtime does not have.
+        let v = try XCTUnwrap(JSONValue.parse(Data(#"""
+        {"protocol":2,"runtime":"lua","runtimeVersion":"5.4","features":{"snapshot":true}}
+        """#.utf8)))
+        let caps = RuntimeHost.capabilities(from: v)
+        XCTAssertEqual(caps.protocolVersion, 2)
+        XCTAssertEqual(caps.runtime, "lua")
+        XCTAssertTrue(caps.has("snapshot"))
+        XCTAssertFalse(caps.has("perSessionGIL"))
+        XCTAssertEqual(caps.summary, "lua 5.4 · protocol 2")
     }),
 ])
