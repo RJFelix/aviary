@@ -87,11 +87,28 @@ enum AgentCLI {
         let provider = OpenAICompletionsProvider(
             id: providerSpec.id, baseURL: baseURL, apiKey: resolvedKey,
             extraHeaders: providerSpec.headers)
+        // Skills, gated. The harness sent all 68 on every request — 62.7% of input tokens on
+        // a trivial run — so this is the one place worth doing differently rather than
+        // faithfully.
+        let settings = HarnessSettings.load(home: home)
+        let library = Library.discover(
+            home: home, settings: settings,
+            projectRoot: URL(fileURLWithPath: cwd), enginePackageRoot: nil)
+        let gate = SkillGate()
+        let selection = gate.select(skills: library.skills, prompt: prompt, cwd: cwd)
+        if !quiet, !library.skills.isEmpty {
+            note("skills \(selection.included.count) of \(library.skills.count) described "
+                + "(\(Fmt.bytes(selection.charactersUsed)) of "
+                + "\(Fmt.bytes(selection.charactersIfAllIncluded)); "
+                + "\(Fmt.bytes(selection.savedCharacters)) saved)")
+        }
+
         let runner = AgentRunner(
             provider: provider, host: host,
             settings: .init(
                 home: home, cwd: cwd, model: model,
-                systemPrompt: SystemPrompt.build(cwd: cwd, model: model)))
+                systemPrompt: SystemPrompt.build(
+                    cwd: cwd, model: model, skills: gate.render(selection))))
 
         await runner.observe { event in
             switch event {
@@ -220,7 +237,7 @@ final class Atomic: @unchecked Sendable {
 /// Starting from nothing and adding only what earns its tokens is the whole point of owning
 /// this.
 enum SystemPrompt {
-    static func build(cwd: String, model: ModelSpec) -> String {
+    static func build(cwd: String, model: ModelSpec, skills: String = "") -> String {
         var lines = [
             "You are a coding agent working in \(cwd) on a macOS machine.",
             "",
@@ -238,6 +255,10 @@ enum SystemPrompt {
             "Say what you found, not what you are about to do. When you are finished, stop "
                 + "calling tools and answer.",
         ]
+        if !skills.isEmpty {
+            lines.append("")
+            lines.append(skills)
+        }
         // Project instructions, if the working directory has any. Read at start rather than
         // discovered per turn, so the cost is visible and paid once.
         for name in ["AGENTS.md", "CLAUDE.md"] {

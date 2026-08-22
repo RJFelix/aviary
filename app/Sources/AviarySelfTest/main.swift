@@ -361,6 +361,16 @@ struct RefusingDelegate: Agent.SpawnDelegate {
     }
 }
 
+
+/// A skill entry with just the fields the gate reads.
+func fakeSkill(_ name: String, _ description: String) -> SkillEntry {
+    SkillEntry(
+        name: name, description: description,
+        url: URL(fileURLWithPath: "/tmp/skills/\(name)/SKILL.md"),
+        sourceLabel: "test", precedence: 0, bodyLength: description.count,
+        hasPythonBacking: false, allowedTools: [])
+}
+
 // MARK: - Agent test helpers
 
 /// A scripted openai-completions server, so the loop can be asserted without a provider.
@@ -1499,5 +1509,120 @@ await Harness.run([
         let deep = AgentRunner.childPrompt(base: "BASE", depth: 3, maxDepth: 3)
         XCTAssertTrue(deep.contains("cannot spawn further"))
         XCTAssertFalse(deep.contains("only for genuinely separable"))
+    }),
+
+    // ------------------------------------------------------------------ anthropic
+    ("anthropic: the system prompt is a field, not a message", {
+        // The first thing that differs from chat-completions, and sending it as a message is
+        // a 400 rather than a warning.
+        let body = AnthropicMessagesProvider.body(for: ChatRequest(
+            model: "claude", messages: [.system("be terse"), .user("hi")], maxTokens: 100))
+        XCTAssertEqual(body["system"]?.stringValue, "be terse")
+        let messages = try XCTUnwrap(body["messages"]?.arrayValue)
+        XCTAssertEqual(messages.count, 1, "the system message must not appear here")
+        XCTAssertEqual(messages[0]["role"]?.stringValue, "user")
+        XCTAssertEqual(body["max_tokens"]?.intValue, 100, "required by this API")
+    }),
+
+    ("anthropic: tool results are user blocks, and same-role turns merge", {
+        // Two more differences that produce a 400 if missed: a result is not its own role, and
+        // consecutive same-role messages must be merged into one.
+        let wire = AnthropicMessagesProvider.encode([
+            ChatMessage(role: .assistant, content: [
+                .text("running it"),
+                .toolCall(id: "t1", name: "python", arguments: .object(["code": .string("1")])),
+            ]),
+            ChatMessage(role: .tool, content: [
+                .toolResult(id: "t1", name: "python", text: "1", isError: false),
+            ]),
+            ChatMessage(role: .tool, content: [
+                .toolResult(id: "t2", name: "python", text: "2", isError: true),
+            ]),
+        ])
+        XCTAssertEqual(wire.count, 2, "assistant turn, then one merged user turn")
+        XCTAssertEqual(wire[0]["role"]?.stringValue, "assistant")
+        XCTAssertEqual(wire[0].path("content.1.type")?.stringValue, "tool_use")
+        XCTAssertEqual(wire[1]["role"]?.stringValue, "user")
+        let blocks = try XCTUnwrap(wire[1]["content"]?.arrayValue)
+        XCTAssertEqual(blocks.count, 2, "two results merged into one user message")
+        XCTAssertEqual(blocks[0]["type"]?.stringValue, "tool_result")
+        XCTAssertEqual(blocks[1]["is_error"]?.boolValue, true)
+    }),
+
+    ("anthropic: thinking is a budget, and it must fit inside max_tokens", {
+        let none = AnthropicMessagesProvider.body(for: ChatRequest(
+            model: "c", messages: [.user("hi")], maxTokens: 100, reasoningEffort: "minimal"))
+        XCTAssertNil(none["thinking"], "an effort this API cannot express is omitted, not faked")
+
+        let high = AnthropicMessagesProvider.body(for: ChatRequest(
+            model: "c", messages: [.user("hi")], maxTokens: 100, reasoningEffort: "high"))
+        XCTAssertEqual(high.path("thinking.budget_tokens")?.intValue, 24_000)
+        // A budget larger than max_tokens is rejected by the API, so the ceiling is raised
+        // rather than left for the caller to trip over.
+        XCTAssertTrue((high["max_tokens"]?.intValue ?? 0) > 24_000)
+    }),
+
+    // ------------------------------------------------------------------ skill gate
+    ("skillGate: an unrelated prompt earns no descriptions at all", {
+        // The measured failure this replaces: the harness sent all 68 skill descriptions on
+        // every request, 62.7% of input tokens on a two-message run.
+        let skills = [
+            fakeSkill("clickhouse-quirks", "ClickHouse server behaviours and Identifier params"),
+            fakeSkill("gig-worker-temporal", "Temporal activity prefixing and org exports"),
+            fakeSkill("preview-envs", "Spinning up preview environments"),
+        ]
+        let gate = SkillGate()
+        let idle = gate.select(skills: skills, prompt: "what is 2+2?", cwd: "/tmp")
+        XCTAssertEqual(idle.included.count, 0, "nothing relevant, so nothing described")
+        XCTAssertEqual(idle.listed.count, 3, "but everything is still listed")
+        XCTAssertTrue(idle.savedCharacters > 0)
+
+        let relevant = gate.select(
+            skills: skills, prompt: "debug a ClickHouse Identifier parameter error", cwd: "/tmp")
+        XCTAssertEqual(relevant.included.map(\.name), ["clickhouse-quirks"])
+        XCTAssertEqual(relevant.listed.count, 2)
+    }),
+
+    ("skillGate: the working directory counts for less than the prompt", {
+        // Weighting them equally meant every skill mentioning the project matched everything:
+        // "what is 2+2?" in the Skyway checkout pulled in fifteen skills.
+        let skills = (0..<12).map { fakeSkill("skyway-thing-\($0)", "Notes about skyway internals") }
+        let gate = SkillGate()
+        let trivial = gate.select(
+            skills: skills, prompt: "what is 2+2?", cwd: "/Users/x/duckbill/skyway")
+        XCTAssertEqual(trivial.included.count, 0,
+                       "the directory alone must not make everything relevant")
+        let real = gate.select(
+            skills: skills, prompt: "explain skyway internals", cwd: "/Users/x/duckbill/skyway")
+        XCTAssertTrue(real.included.count > 0, "an actual mention still matches")
+    }),
+
+    ("skillGate: nothing is hidden, and pinned skills always make it", {
+        // A pruned skill the model cannot see and cannot ask for is silent capability loss,
+        // and the failure looks like the model being stupid rather than the gate being wrong.
+        let skills = (0..<40).map { fakeSkill("skill-\($0)", "does thing \($0) with widgets") }
+        var gate = SkillGate(budget: 200)
+        gate.pinned = ["skill-39"]
+        let selection = gate.select(skills: skills, prompt: "widgets widgets widgets", cwd: "/tmp")
+        XCTAssertTrue(selection.included.contains { $0.name == "skill-39" },
+                      "pinned survives a budget that could not otherwise fit it")
+        XCTAssertTrue(selection.listed.count > 0, "the budget was exceeded, so some are listed")
+        let rendered = gate.render(selection)
+        for skill in skills {
+            XCTAssertTrue(rendered.contains(skill.name), "\(skill.name) vanished entirely")
+        }
+        XCTAssertTrue(rendered.contains("Read the file for the full"),
+                      "and it says how to read the ones that were only listed")
+    }),
+
+    ("skillGate: a name match outranks a description match", {
+        let skills = [
+            fakeSkill("mentions-compaction-in-passing", "a note that also discusses compaction"),
+            fakeSkill("compaction", "how context compaction works"),
+        ]
+        let gate = SkillGate(budget: 60)
+        let selection = gate.select(skills: skills, prompt: "compaction", cwd: "/tmp")
+        XCTAssertEqual(selection.included.first?.name, "compaction",
+                       "the skill actually named for the topic wins")
     }),
 ])
