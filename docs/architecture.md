@@ -313,6 +313,37 @@ deliberately *not* a one-to-one mapping of session entries:
 The payoff: a message that just streamed in looks identical to the same message read back
 tomorrow. Any rendering improvement lands in both places at once.
 
+### Markdown is parsed as blocks, then inline within each block
+
+Prose used to go through `AttributedString(markdown:)` in
+`inlineOnlyPreservingWhitespace` mode. That mode was chosen for a real reason — full
+markdown parsing collapses the newlines that structure an answer, and a long reply reflowed
+into one blob is materially harder to read — but the price was that every *block* construct
+rendered as its own literal syntax. A four-item numbered list was four lines starting with
+a digit and a dot.
+
+`MarkdownParser` (in `AviaryCore`, so it is testable without a window) resolves that rather
+than picking a side: it splits prose into blocks, and inline markdown is parsed within each
+block. Newlines survive because block structure is what decides them.
+
+It is deliberately not CommonMark. Two of its rules are judgement calls about what agents
+actually emit, and both are pinned by tests:
+
+- **A table needs its delimiter row.** Prose containing a pipe (`grep x | head`) is far more
+  common in agent output than a table is, and a permissive check turns any such line into a
+  one-column table.
+- **List depth follows the indent columns observed**, not an assumed two- or four-space step.
+  Models mix both, sometimes within one reply, so depth is assigned in the order new columns
+  appear and outdenting discards the levels it left.
+
+Where it cannot recognise something it falls through to a paragraph, so unrecognised input
+degrades to exactly the old behaviour instead of vanishing. Search wins over formatting:
+while a query is active every block renders as highlighted plain text, because a match
+inside a run that markdown consumed is a match the reader cannot see.
+
+User prompts go through the same path. They were the only plain-text role in the
+transcript, and a prompt is written in markdown like everything else.
+
 ## Workshop capture ordering
 
 The screenshot attached to a request is taken when the compose panel is **asked for**, not
