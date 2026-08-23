@@ -392,6 +392,18 @@ public enum WorkshopLog {
                 }
                 byID[id] = r
 
+            // Requests are immutable log records. Editing appends a later overlay rather
+            // than replacing the original `created` event, so the captured context and
+            // what the agent first received remain auditable.
+            case "edited":
+                guard var r = byID[id] else { break }
+                if let title = v["title"]?.stringValue { r.title = title }
+                if let body = v["body"]?.stringValue { r.body = body }
+                if let kind = WorkshopKind(rawValue: v["kind"]?.stringValue ?? "") {
+                    r.kind = kind
+                }
+                byID[id] = r
+
             case "note":
                 guard var r = byID[id] else { break }
                 if let text = v["text"]?.stringValue, !text.isEmpty {

@@ -216,6 +216,20 @@ final class AppModel {
     var draftKind: WorkshopKind = .change
     var draftIncludesShot = true
     var isSubmitting = false
+    /// The Workshop's full-size request editor. The global capture panel remains the quick
+    /// way to file an observation from any screen; this is the place to write and revise it.
+    enum WorkshopEditorMode: Identifiable {
+        case new
+        case edit(String)
+
+        var id: String {
+            switch self {
+            case .new: return "new"
+            case .edit(let id): return "edit-\(id)"
+            }
+        }
+    }
+    var workshopEditor: WorkshopEditorMode?
     /// State captured the instant the panel was asked for, before it existed on screen.
     ///
     /// Held rather than re-read at submit time so the request describes what you were

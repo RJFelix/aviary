@@ -591,6 +591,18 @@ await Harness.run([
         XCTAssertFalse(r.delivered)
     }),
 
+    ("workshop: edits overlay the original without losing omitted fields", {
+        let lines = [
+            #"{"v":1,"at":"2026-08-21T10:00:00.000Z","event":"created","id":"wr-1","title":"First title","body":"Original detail","kind":"bug"}"#,
+            #"{"v":1,"at":"2026-08-21T10:01:00.000Z","event":"edited","id":"wr-1","title":"Amended title","kind":"idea"}"#,
+            #"{"v":1,"at":"2026-08-21T10:02:00.000Z","event":"edited","id":"wr-1","body":"Rewritten detail"}"#,
+        ]
+        let request = try XCTUnwrap(WorkshopLog.fold(lines: lines).first)
+        XCTAssertEqual(request.title, "Amended title", "the latest supplied title wins")
+        XCTAssertEqual(request.body, "Rewritten detail", "a later supplied body wins")
+        XCTAssertEqual(request.kind, .idea, "the earlier edit survives when the later one omits kind")
+    }),
+
     ("workshop: later status events win and accumulate notes", {
         let lines = [
             #"{"event":"created","id":"a","at":"2026-08-21T10:00:00.000Z","title":"t","kind":"change"}"#,

@@ -92,13 +92,42 @@ extension AppModel {
 
     // MARK: Filing
 
-    func submitRequest() {
-        Task { await submitRequestAsync() }
+    /// Open the Workshop's full-size editor for a new request. It captures before presenting
+    /// for the same reason as the global quick-capture panel: the sheet itself must not be
+    /// the screenshot attached to the request.
+    func openWorkshopEditor() {
+        guard workshopEditor == nil, !isCapturingShot else { return }
+        pendingContext = captureContext()
+        pendingShot = nil
+        draftIncludesShot = true
+        guard let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) else {
+            workshopEditor = .new
+            return
+        }
+        isCapturingShot = true
+        Task {
+            pendingShot = await WindowShot.capture(window: window)
+            isCapturingShot = false
+            workshopEditor = .new
+        }
     }
 
-    private func submitRequestAsync() async {
-        let title = draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        let body = draftBody.trimmingCharacters(in: .whitespacesAndNewlines)
+    func closeWorkshopEditor() {
+        workshopEditor = nil
+        discardPendingCapture()
+    }
+
+    func submitRequest() {
+        submitRequest(title: draftTitle, body: draftBody, kind: draftKind)
+    }
+
+    func submitRequest(title rawTitle: String, body rawBody: String, kind: WorkshopKind) {
+        Task { await submitRequestAsync(title: rawTitle, body: rawBody, kind: kind) }
+    }
+
+    private func submitRequestAsync(title rawTitle: String, body rawBody: String, kind: WorkshopKind) async {
+        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = rawBody.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty || !body.isEmpty else { return }
         guard let repoRoot else {
             show("No Aviary checkout found, so there is nowhere to file this.", isError: true)
@@ -116,7 +145,6 @@ extension AppModel {
             context.screenshot = name
         }
 
-        let kind = draftKind
         do {
             try WorkshopLog.append(
                 WorkshopEvent(event: "created", id: id, fields: [
@@ -138,6 +166,7 @@ extension AppModel {
         refreshBoard()
         selectedRequestID = id
         capturePanelOpen = false
+        workshopEditor = nil
 
         guard let request = board.requests.first(where: { $0.id == id }) else {
             isSubmitting = false
@@ -324,6 +353,39 @@ extension AppModel {
             ]),
             repoRoot: repoRoot)
         refreshBoard()
+    }
+
+    /// Amend request text without ever rewriting the original event or its captured context.
+    /// A later `edited` event is the board's durable, reviewable source of truth.
+    func updateRequest(_ request: WorkshopRequest, title rawTitle: String, body rawBody: String,
+                       kind: WorkshopKind) {
+        guard let repoRoot else { return }
+        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = rawBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty || !body.isEmpty else {
+            show("A request needs a title or detail.", isError: true)
+            return
+        }
+        guard title != request.title || body != request.body || kind != request.kind else {
+            workshopEditor = nil
+            return
+        }
+        do {
+            try WorkshopLog.append(
+                WorkshopEvent(event: "edited", id: request.id, fields: [
+                    "title": .string(title),
+                    "body": .string(body),
+                    "kind": .string(kind.rawValue),
+                    "by": .string("you"),
+                ]),
+                repoRoot: repoRoot)
+            refreshBoard()
+            selectedRequestID = request.id
+            workshopEditor = nil
+            show("Updated \(request.id).")
+        } catch {
+            show("Could not update the request: \(error.localizedDescription)", isError: true)
+        }
     }
 
     /// Whether there is anything that can run the workshop agent.

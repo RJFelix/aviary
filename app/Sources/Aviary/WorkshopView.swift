@@ -25,6 +25,21 @@ struct WorkshopView: View {
             content
                 .frame(width: geo.size.width, height: geo.size.height)
         }
+        .sheet(isPresented: Binding(
+            get: { model.workshopEditor != nil },
+            set: { if !$0 { model.closeWorkshopEditor() } }))
+        {
+            switch model.workshopEditor {
+            case .new:
+                WorkshopRequestEditor()
+            case .edit(let id):
+                if let request = model.board.requests.first(where: { $0.id == id }) {
+                    WorkshopRequestEditor(request: request)
+                }
+            case nil:
+                EmptyView()
+            }
+        }
     }
 
     private var content: some View {
@@ -139,11 +154,12 @@ struct WorkshopView: View {
     private var agentControls: some View {
         HStack(spacing: 8) {
             Button {
-                model.openCapturePanel()
+                model.openWorkshopEditor()
             } label: {
-                Label("New request", systemImage: "plus")
+                Label(model.isCapturingShot ? "Capturing…" : "New request", systemImage: "plus")
             }
             .controlSize(.small)
+            .disabled(model.isCapturingShot)
             .keyboardShortcut("n", modifiers: [.command, .shift])
 
             Button {
@@ -390,6 +406,12 @@ private struct RequestDetail: View {
                 .textSelection(.enabled)
             Text("Filed \(Fmt.timestamp(r.createdAt))")
                 .font(.system(size: 10)).foregroundStyle(.tertiary)
+            Button {
+                model.workshopEditor = .edit(r.id)
+            } label: {
+                Label("Edit request", systemImage: "square.and.pencil")
+            }
+            .controlSize(.small)
         }
     }
 
@@ -555,6 +577,126 @@ private struct RequestDetail: View {
         case .done: return Design.success
         case .declined: return Design.danger
         case .parked: return .secondary
+        }
+    }
+}
+
+/// The deliberate, roomy place to compose a request or revise the text on an existing one.
+/// The small global capture panel remains useful for a quick thought on another screen; this
+/// editor belongs to the board and makes both creation and amendment use the same controls.
+private struct WorkshopRequestEditor: View {
+    @Environment(AppModel.self) private var model
+    let request: WorkshopRequest?
+    @State private var title: String
+    @State private var detail: String
+    @State private var kind: WorkshopKind
+
+    init(request: WorkshopRequest? = nil) {
+        self.request = request
+        _title = State(initialValue: request?.title ?? "")
+        _detail = State(initialValue: request?.body ?? "")
+        _kind = State(initialValue: request?.kind ?? .change)
+    }
+
+    private var isEditing: Bool { request != nil }
+    private var hasText: Bool {
+        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var bodyView: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(isEditing ? "Edit request" : "New request")
+                        .font(.system(size: 18, weight: .semibold))
+                    Text(isEditing
+                         ? "Save an amendment to the append-only board history."
+                         : "Describe the change while the captured context is still attached.")
+                        .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Cancel") { model.closeWorkshopEditor() }
+                    .controlSize(.small)
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            Picker("Kind", selection: $kind) {
+                ForEach(WorkshopKind.allCases, id: \.self) { option in
+                    Label(option.label, systemImage: option.symbol).tag(option)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("TITLE").font(Design.sectionTitle).foregroundStyle(.secondary)
+                TextField("One line: what should change?", text: $title)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 13))
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("DETAIL").font(Design.sectionTitle).foregroundStyle(.secondary)
+                TextEditor(text: $detail)
+                    .font(.system(size: 13))
+                    .scrollContentBackground(.hidden)
+                    .padding(8)
+                    .frame(minHeight: 220)
+                    .background(RoundedRectangle(cornerRadius: 7).fill(.background.secondary))
+                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.separator, lineWidth: 1))
+                    .overlay(alignment: .topLeading) {
+                        if detail.isEmpty {
+                            Text("Add the detail the agent needs: expected behavior, what happened, and any constraints.")
+                                .font(.system(size: 13)).foregroundStyle(.tertiary)
+                                .padding(.horizontal, 13).padding(.top, 13)
+                                .allowsHitTesting(false)
+                        }
+                    }
+            }
+
+            if !isEditing {
+                let facts = model.pendingContext?.facts.count ?? 0
+                HStack(spacing: 6) {
+                    Image(systemName: model.pendingShot == nil ? "camera.badge.ellipsis" : "camera")
+                    Text("\(facts) facts captured from the \(model.section.title) tab")
+                    if model.pendingShot != nil {
+                        Toggle(isOn: Binding(
+                            get: { model.draftIncludesShot },
+                            set: { model.draftIncludesShot = $0 }))
+                        {
+                            Text("Screenshot")
+                        }
+                        .toggleStyle(.checkbox).controlSize(.mini)
+                    }
+                }
+                .font(.system(size: 10.5)).foregroundStyle(.secondary)
+            }
+
+            HStack {
+                if isEditing {
+                    Text("The original request and its snapshot remain in the log.")
+                        .font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                }
+                Spacer()
+                Button(model.isSubmitting ? "Saving…" : (isEditing ? "Save changes" : "File request")) {
+                    save()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.isSubmitting || !hasText)
+                .keyboardShortcut(.return, modifiers: .command)
+            }
+        }
+        .padding(20)
+        .frame(width: 580)
+    }
+
+    var body: some View { bodyView }
+
+    private func save() {
+        if let request {
+            model.updateRequest(request, title: title, body: detail, kind: kind)
+        } else {
+            model.submitRequest(title: title, body: detail, kind: kind)
         }
     }
 }
