@@ -200,41 +200,11 @@ public actor ClaudeCodeKernel {
     }
 
     /// What the model is told the tool does.
+    ///
+    /// The same render the in-house engine uses, minus `spawn` — a driven session has no
+    /// runner to spawn with. Two engines describing the same kernel in their own words would
+    /// make a transcript's meaning depend on which one wrote it.
     static func description(cwd: String, hasMemory: Bool) -> String {
-        var text = """
-            Run Python in a persistent interpreter. Variables, imports and open handles \
-            survive between calls, so build up state instead of repeating work.
-
-            Available without importing anything:
-              sh(command)  – run a shell command. The working directory and environment \
-            persist across calls, so `sh('cd subdir')` then `sh('pwd')` does what you \
-            expect. Returns {'stdout', 'stderr', 'status'}.
-              cwd()        – the current working directory.
-              conversation(limit=40) – this conversation so far, as a list of \
-            {'role', 'text', 'toolCalls'}. Use it to check what you already tried instead of \
-            re-deriving it.
-            """
-        if hasMemory {
-            text += """
-
-
-                  remember(text, scope='project', days=None, tags=[]) – record something you \
-                will want next time. Scopes: 'session' (this task only), 'project' (about this \
-                codebase — the usual choice), 'global' (true everywhere — rare). Pass `days` \
-                unless it will be true indefinitely.
-                  recall(query) – search what you recorded before.
-
-                Record what cost you effort to discover and would cost the same again: a \
-                non-obvious command, a constraint the code does not state, a dead end worth \
-                not repeating. Not things the repository already says clearly.
-                """
-        }
-        text += """
-
-
-            The value of a trailing expression is echoed back, so ending a cell with a bare \
-            name shows it. Starting directory: \(cwd)
-            """
-        return text
+        Builtins.description(Builtins.Context(cwd: cwd, hasMemory: hasMemory, canSpawn: false))
     }
 }

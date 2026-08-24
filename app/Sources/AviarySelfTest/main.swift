@@ -4247,4 +4247,62 @@ let cases6: [Case] = [
     }),
 ]
 
-await Harness.run(cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6)
+let casesBuiltins: [Case] = [
+
+    ("builtins: everything in the namespace is in the sentence that makes it real", {
+        // The bug this pins: `spawn()` was bound in the namespace and missing from the tool
+        // description, and a real run spent twenty turns grepping the codebase for it. A
+        // capability the model is not told about does not exist — so the description is
+        // rendered from the same list the namespace is built from, and this asserts the two
+        // cannot come apart.
+        for (memory, spawn) in [(false, false), (true, false), (false, true), (true, true)] {
+            let ctx = Builtins.Context(
+                cwd: "/repo", hasMemory: memory, canSpawn: spawn, spawnBudget: 2)
+            let text = Builtins.description(ctx)
+            for name in Builtins.names(ctx) {
+                XCTAssertTrue(text.contains(name + "("), "\(name) is bound but undescribed")
+            }
+            for entry in Builtins.all(ctx) where !entry.isAvailable {
+                XCTAssertFalse(
+                    text.contains(entry.name + "("),
+                    "\(entry.name) is described but not bound")
+            }
+        }
+    }),
+
+    ("builtins: the remaining sub-agent budget is a number the model can read", {
+        // A budget the model cannot see is the worst kind of ceiling: silent, arbitrary, and
+        // indistinguishable from success when it is hit.
+        let two = Builtins.description(
+            Builtins.Context(cwd: "/repo", canSpawn: true, spawnBudget: 2))
+        XCTAssertTrue(two.contains("nest 2 more level(s)"))
+        let none = Builtins.description(Builtins.Context(cwd: "/repo", canSpawn: false))
+        XCTAssertFalse(none.contains("more level(s)"))
+    }),
+
+    ("builtins: both engines render the one catalogue rather than describing it twice", {
+        let ctx = Builtins.Context(cwd: "/repo", hasMemory: true)
+        XCTAssertEqual(ClaudeCodeKernel.description(cwd: "/repo", hasMemory: true),
+                       Builtins.description(ctx))
+        XCTAssertEqual(
+            try XCTUnwrap(Agent.tools(cwd: "/repo", hasMemory: true).first).description,
+            Builtins.description(ctx))
+    }),
+
+    ("builtins: the catalogue says how each name is served, not just that it exists", {
+        // The Library shows this, and it is the difference between a free call and one that
+        // blocks the cell on a round trip through the app.
+        let all = Builtins.all(.reference)
+        let sh = try XCTUnwrap(all.first { $0.name == "sh" })
+        XCTAssertEqual(sh.mechanism, .kernel)
+        let remember = try XCTUnwrap(all.first { $0.name == "remember" })
+        XCTAssertEqual(remember.mechanism, .callback)
+        XCTAssertEqual(remember.requirement, .memory)
+        // The reference context is the whole shelf, so nothing is filtered out of it.
+        XCTAssertTrue(all.allSatisfy(\.isAvailable))
+        XCTAssertTrue(all.allSatisfy { !$0.summary.isEmpty && !$0.signature.isEmpty })
+    }),
+]
+
+await Harness.run(
+    cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins)

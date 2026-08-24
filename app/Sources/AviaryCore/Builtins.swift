@@ -1,0 +1,222 @@
+import Foundation
+
+/// The functions the agent finds already in its Python namespace.
+///
+/// There is one *tool* — `python` — so everything else the runtime can do arrives as a name
+/// already bound in the namespace. This file is the list of those names, and it is the only
+/// place their prose lives.
+///
+/// It exists because the prose used to live twice: `Agent.tools` wrote it for an in-house run
+/// and `ClaudeCodeKernel.description` wrote it again for a driven one, kept in step by a test
+/// asserting the two strings were equal. That test was the tell. Two engines describing the
+/// same kernel differently would make a transcript's meaning depend on which one wrote it, and
+/// the honest fix is one source rendered twice rather than two sources compared.
+///
+/// The rule this list enforces, learned expensively: **a capability the model is not told about
+/// does not exist.** `spawn()` was in the namespace and absent from the description, and a real
+/// run spent twenty turns grepping the codebase for it before giving up — which reads as a
+/// broken environment rather than a missing sentence. Adding a name to the runtime without
+/// adding it here reproduces that bug exactly.
+public enum Builtins {
+
+    /// What has to be true for a builtin to be in the namespace at all.
+    public enum Requirement: String, Sendable, Hashable, CaseIterable, Identifiable {
+        /// In every session, on every engine.
+        case always
+        /// Only when the session has a memory store behind it.
+        case memory
+        /// Only when there is sub-agent depth left to spend.
+        case spawn
+
+        public var id: String { rawValue }
+
+        public var label: String {
+            switch self {
+            case .always: return "Always"
+            case .memory: return "With memory"
+            case .spawn: return "With sub-agents"
+            }
+        }
+
+        public var explanation: String {
+            switch self {
+            case .always:
+                return "Bound in every session, on both engines."
+            case .memory:
+                return "Bound when the run has a memory store — off for a session with "
+                    + "nowhere to write."
+            case .spawn:
+                return "Bound only while sub-agent depth remains, and the remaining depth is "
+                    + "written into the description so the model can see its own budget."
+            }
+        }
+    }
+
+    /// Where the work actually happens, which decides what a call costs.
+    public enum Mechanism: String, Sendable, Hashable {
+        /// Runs inside the interpreter. No round trip.
+        case kernel
+        /// Marshalled out to Aviary and back, so the cell blocks until the app answers.
+        case callback
+
+        public var label: String {
+            switch self {
+            case .kernel: return "in-kernel"
+            case .callback: return "calls back into Aviary"
+            }
+        }
+    }
+
+    public struct Entry: Sendable, Identifiable, Hashable {
+        public var id: String { name }
+        /// The bare name, as bound in the namespace.
+        public var name: String
+        /// The call shape, for a reader rather than the model.
+        public var signature: String
+        /// One line, for the Library list.
+        public var summary: String
+        /// The exact line the model is given, verbatim. Rendered with a two-space indent.
+        public var bullet: String
+        /// A paragraph rendered after this requirement group's bullets, if any.
+        public var note: String?
+        public var requirement: Requirement
+        public var mechanism: Mechanism
+        /// Whether this particular run actually has it.
+        public var isAvailable: Bool
+
+        public init(
+            name: String, signature: String, summary: String, bullet: String,
+            note: String? = nil, requirement: Requirement, mechanism: Mechanism,
+            isAvailable: Bool
+        ) {
+            self.name = name
+            self.signature = signature
+            self.summary = summary
+            self.bullet = bullet
+            self.note = note
+            self.requirement = requirement
+            self.mechanism = mechanism
+            self.isAvailable = isAvailable
+        }
+    }
+
+    /// What a run can do, which decides both the namespace and the description.
+    public struct Context: Sendable {
+        public var cwd: String
+        public var hasMemory: Bool
+        public var canSpawn: Bool
+        public var spawnBudget: Int
+
+        public init(
+            cwd: String, hasMemory: Bool = false, canSpawn: Bool = false, spawnBudget: Int = 0
+        ) {
+            self.cwd = cwd
+            self.hasMemory = hasMemory
+            self.canSpawn = canSpawn
+            self.spawnBudget = spawnBudget
+        }
+
+        /// Everything switched on, for a reader who wants to see the whole shelf rather than
+        /// one run's slice of it.
+        public static let reference = Context(
+            cwd: "<the session's working directory>", hasMemory: true, canSpawn: true,
+            spawnBudget: 1)
+    }
+
+    /// Every builtin, in description order, each marked with whether this run has it.
+    public static func all(_ ctx: Context) -> [Entry] {
+        [
+            Entry(
+                name: "sh",
+                signature: "sh(command)",
+                summary: "Run a shell command whose working directory and environment persist.",
+                bullet: "sh(command)  – run a shell command. The working directory and "
+                    + "environment persist across calls, so `sh('cd subdir')` then `sh('pwd')` "
+                    + "does what you expect. Returns {'stdout', 'stderr', 'status'}.",
+                requirement: .always, mechanism: .kernel, isAvailable: true),
+            Entry(
+                name: "cwd",
+                signature: "cwd()",
+                summary: "Where the shell currently is.",
+                bullet: "cwd()        – the current working directory.",
+                requirement: .always, mechanism: .kernel, isAvailable: true),
+            Entry(
+                name: "conversation",
+                signature: "conversation(limit=40)",
+                summary: "The transcript this code is part of, as data.",
+                bullet: "conversation(limit=40) – this conversation so far, as a list of "
+                    + "{'role', 'text', 'toolCalls'}. Use it to check what you already tried "
+                    + "instead of re-deriving it.",
+                requirement: .always, mechanism: .callback, isAvailable: true),
+            Entry(
+                name: "remember",
+                signature: "remember(text, scope='project', days=None, tags=[])",
+                summary: "Record something worth having next time.",
+                bullet: "remember(text, scope='project', days=None, tags=[]) – record "
+                    + "something you will want next time. Scopes: 'session' (this task only), "
+                    + "'project' (about this codebase — the usual choice), 'global' (true "
+                    + "everywhere — rare). Pass `days` unless it will be true indefinitely.",
+                requirement: .memory, mechanism: .callback, isAvailable: ctx.hasMemory),
+            Entry(
+                name: "recall",
+                signature: "recall(query)",
+                summary: "Search what earlier sessions recorded.",
+                bullet: "recall(query) – search what you recorded before.",
+                note: "Record what cost you effort to discover and would cost the same again: "
+                    + "a non-obvious command, a constraint the code does not state, a dead end "
+                    + "worth not repeating. Not things the repository already says clearly.",
+                requirement: .memory, mechanism: .callback, isAvailable: ctx.hasMemory),
+            Entry(
+                name: "spawn",
+                signature: "spawn(prompt, name=None)",
+                summary: "Run a sub-agent and block on its answer.",
+                bullet: "spawn(prompt, name=None) – run a sub-agent and wait for its answer. "
+                    + "Returns {'answer': str, 'name': str, 'id': str}, or a dict with an "
+                    + "'error' key. Blocking, so several spawns in one cell run one after "
+                    + "another; write them in separate cells if you want to interleave other "
+                    + "work. You may nest \(ctx.spawnBudget) more level(s).",
+                note: "A sub-agent starts with none of your context and returns only its final "
+                    + "message, so the prompt must be self-contained and must say what to "
+                    + "report back. Delegate genuinely separable work; doing it yourself is "
+                    + "usually cheaper.",
+                requirement: .spawn, mechanism: .callback, isAvailable: ctx.canSpawn),
+        ]
+    }
+
+    /// The tool description, which must describe *everything* the runtime can do.
+    ///
+    /// Rendered rather than written, so a builtin cannot be added to the namespace and left
+    /// out of the sentence that makes it real.
+    public static func description(_ ctx: Context) -> String {
+        let available = all(ctx).filter(\.isAvailable)
+        var text = """
+            Run Python in a persistent interpreter. Variables, imports and open handles \
+            survive between calls, so build up state instead of repeating work.
+
+            Available without importing anything:
+            """
+        for requirement in Requirement.allCases {
+            let group = available.filter { $0.requirement == requirement }
+            guard !group.isEmpty else { continue }
+            // The first group runs straight on from the "Available without importing" line;
+            // later ones are their own paragraph.
+            text += requirement == .always ? "\n" : "\n\n"
+            text += group.map { "  " + $0.bullet }.joined(separator: "\n")
+            if let note = group.compactMap(\.note).last {
+                text += "\n\n" + note
+            }
+        }
+        text += """
+
+
+            The value of a trailing expression is echoed back, so ending a cell with a bare \
+            name shows it. Starting directory: \(ctx.cwd)
+            """
+        return text
+    }
+
+    /// The names bound in the namespace for this run — what the kernel must actually provide.
+    public static func names(_ ctx: Context) -> [String] {
+        all(ctx).filter(\.isAvailable).map(\.name)
+    }
+}

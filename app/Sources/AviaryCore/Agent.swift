@@ -335,62 +335,16 @@ public actor Agent {
     /// things `sh()` already does, at the cost of a bigger schema on every request.
     /// The tool schema, which must describe *everything* the runtime can do.
     ///
-    /// Learned the hard way: `spawn()` was in the namespace and absent from this description,
-    /// and the agent spent twenty turns grepping the codebase looking for it before giving up.
-    /// A capability the model is not told about does not exist — and worse, it looks like a
-    /// broken environment rather than a missing sentence.
+    /// Rendered from `Builtins`, not written here. It used to be written here *and* again in
+    /// `ClaudeCodeKernel`, which is how a description drifts from the namespace it describes —
+    /// and a capability the model is not told about does not exist. `spawn()` proved it: in the
+    /// namespace, absent from this text, and a real run spent twenty turns grepping the
+    /// codebase for it before giving up.
     public static func tools(
         cwd: String, canSpawn: Bool = false, spawnBudget: Int = 0, hasMemory: Bool = false
     ) -> [ChatTool] {
-        var description = """
-            Run Python in a persistent interpreter. Variables, imports and open handles \
-            survive between calls, so build up state instead of repeating work.
-
-            Available without importing anything:
-              sh(command)  – run a shell command. The working directory and environment \
-            persist across calls, so `sh('cd subdir')` then `sh('pwd')` does what you \
-            expect. Returns {'stdout', 'stderr', 'status'}.
-              cwd()        – the current working directory.
-              conversation(limit=40) – this conversation so far, as a list of \
-            {'role', 'text', 'toolCalls'}. Use it to check what you already tried instead of \
-            re-deriving it.
-            """
-        if hasMemory {
-            description += """
-
-
-                  remember(text, scope='project', days=None, tags=[]) – record something you \
-                will want next time. Scopes: 'session' (this task only), 'project' (about this \
-                codebase — the usual choice), 'global' (true everywhere — rare). Pass `days` \
-                unless it will be true indefinitely.
-                  recall(query) – search what you recorded before.
-
-                Record what cost you effort to discover and would cost the same again: a \
-                non-obvious command, a constraint the code does not state, a dead end worth \
-                not repeating. Not things the repository already says clearly.
-                """
-        }
-        if canSpawn {
-            description += """
-
-
-                  spawn(prompt, name=None) – run a sub-agent and wait for its answer. Returns \
-                {'answer': str, 'name': str, 'id': str}, or a dict with an 'error' key. \
-                Blocking, so several spawns in one cell run one after another; write them in \
-                separate cells if you want to interleave other work. You may nest \
-                \(spawnBudget) more level(s).
-
-                A sub-agent starts with none of your context and returns only its final \
-                message, so the prompt must be self-contained and must say what to report \
-                back. Delegate genuinely separable work; doing it yourself is usually cheaper.
-                """
-        }
-        description += """
-
-
-            The value of a trailing expression is echoed back, so ending a cell with a bare \
-            name shows it. Starting directory: \(cwd)
-            """
+        let description = Builtins.description(Builtins.Context(
+            cwd: cwd, hasMemory: hasMemory, canSpawn: canSpawn, spawnBudget: spawnBudget))
         return [ChatTool(
             name: "python",
             description: description,
