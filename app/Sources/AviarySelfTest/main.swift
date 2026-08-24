@@ -347,6 +347,28 @@ func test_sessionIdentityIsTheFilenameNotTheHeaderField() throws {
     try? FileManager.default.removeItem(at: dir)
 }
 
+/// Batch Trash records an error for an already-missing session instead of throwing away the
+/// rest of the batch. This needs no real Trash round-trip, so it leaves no test files behind.
+func test_batchTrashReportsIndividualFailures() async throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appending(path: "aviary-batch-trash-test-\(UUID().uuidString)", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let file = dir.appending(path: "missing-after-summary.jsonl")
+    let jsonl = [
+        #"{"type":"session","version":3,"id":"header","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp"}"#,
+        #"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":"hi"}}"#,
+    ].joined(separator: "\n")
+    try Data(jsonl.utf8).write(to: file)
+    let summary = try XCTUnwrap(SessionCatalog.summarize(fileURL: file))
+    try FileManager.default.removeItem(at: file)
+
+    let catalog = SessionCatalog(home: AgentHome(root: dir))
+    let result = await catalog.trash(sessions: [summary])
+    XCTAssertTrue(result.trashedIDs.isEmpty)
+    XCTAssertNotNil(result.failures[summary.id])
+}
+
 // MARK: - Runner
 
 
@@ -578,6 +600,7 @@ await Harness.run([
     ("usageReasoningIsABreakdownNotAnAddend", { test_usageReasoningIsABreakdownNotAnAddend() }),
     ("attributesContextFileBodyToItsFile", { test_attributesContextFileBodyToItsFile() }),
     ("sessionIdentityIsTheFilenameNotTheHeaderField", { try test_sessionIdentityIsTheFilenameNotTheHeaderField() }),
+    ("batchTrashReportsIndividualFailures", { try await test_batchTrashReportsIndividualFailures() }),
 
     ("workshop: fold builds a request from a created event", {
         let line = #"{"v":1,"at":"2026-08-21T10:00:00.000Z","event":"created","id":"wr-1","title":"Fix the thing","body":"detail","kind":"bug"}"#

@@ -86,7 +86,11 @@ final class AppModel {
     // MARK: Selection & transcript
 
     var section: Section = .cockpit
+    /// The focused session remains the transcript shown in the center pane. The set is the
+    /// List's native macOS multi-selection, used for batch actions in the sidebar.
     var selectedSessionID: String?
+    var selectedSessionIDs: Set<String> = []
+    var isTrashingSessions = false
     var transcript: Transcript?
     var transcriptSessionID: String?
     var isLoadingTranscript = false
@@ -456,7 +460,41 @@ final class AppModel {
     // MARK: Transcript
 
     func select(session: SessionSummary) {
+        selectedSessionIDs = [session.id]
         selectedSessionID = session.id
+        Task { await loadTranscript(for: session) }
+    }
+
+    /// Adopt the native List selection without conflating every selected row with the one
+    /// whose transcript is open. If a single row was newly added, make that row the focus;
+    /// otherwise keep the current transcript as long as it remains selected.
+    func setSelectedSessions(_ ids: Set<String>) {
+        let known = Set(sessions.map(\.id))
+        let selection = ids.intersection(known)
+        let added = selection.subtracting(selectedSessionIDs)
+        selectedSessionIDs = selection
+
+        let focus: String? = {
+            if added.count == 1 { return added.first }
+            if let current = selectedSessionID, selection.contains(current) { return current }
+            return sessions.first(where: { selection.contains($0.id) })?.id
+        }()
+        guard focus != selectedSessionID else { return }
+        selectedSessionID = focus
+        selectedItemForSessionSelectionChanged()
+    }
+
+    /// Clear the detail state when the List no longer has a focused session.
+    private func selectedItemForSessionSelectionChanged() {
+        guard let id = selectedSessionID,
+              let session = sessions.first(where: { $0.id == id })
+        else {
+            transcript = nil
+            transcriptSessionID = nil
+            kernelState = nil
+            selectedSessionWire = []
+            return
+        }
         Task { await loadTranscript(for: session) }
     }
 
@@ -547,17 +585,47 @@ final class AppModel {
         sessions.first { $0.id == selectedSessionID }
     }
 
-    func trashSelectedSession() async {
-        guard let catalog, let s = selectedSession else { return }
-        do {
-            try await catalog.trash(session: s)
-            sessions.removeAll { $0.id == s.id }
-            selectedSessionID = nil
-            transcript = nil
-            toast = Toast(message: "Moved “\(s.title.prefix(40))” to the Trash")
-        } catch {
-            toast = Toast(message: error.localizedDescription, isError: true)
+    var selectedSessions: [SessionSummary] {
+        sessions.filter { selectedSessionIDs.contains($0.id) }
+    }
+
+    /// Batch deletion deliberately shares the single-item Trash path. It moves each transcript
+    /// and its artifacts to macOS Trash, never unlinks history, and refuses a mixed selection
+    /// containing a live session instead of quietly deleting only some of it.
+    func trashSelectedSessions() async {
+        guard let catalog, !isTrashingSessions else { return }
+        let targets = selectedSessions
+        guard !targets.isEmpty else { return }
+        guard !targets.contains(where: \.isLive) else {
+            show("Stop or deselect live sessions before moving the selection to the Trash.", isError: true)
+            return
         }
+
+        isTrashingSessions = true
+        defer { isTrashingSessions = false }
+        let result = await catalog.trash(sessions: targets)
+        let removed = result.trashedIDs
+        guard !removed.isEmpty else {
+            toast = Toast(
+                message: result.failures.values.joined(separator: "\n"), isError: true)
+            return
+        }
+
+        sessions.removeAll { removed.contains($0.id) }
+        selectedSessionIDs.subtract(removed)
+        if let focused = selectedSessionID, removed.contains(focused) {
+            selectedSessionID = sessions.first(where: { selectedSessionIDs.contains($0.id) })?.id
+            selectedItemForSessionSelectionChanged()
+        }
+        let count = removed.count
+        let message = count == 1
+            ? "Moved 1 session to the Trash"
+            : "Moved \(count) sessions to the Trash"
+        toast = Toast(
+            message: result.failures.isEmpty
+                ? message
+                : message + "; \(result.failures.count) could not be moved",
+            isError: !result.failures.isEmpty)
     }
 
     // MARK: Provider testing

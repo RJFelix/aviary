@@ -13,6 +13,7 @@ struct SessionsView: View {
     @State private var sortOrder: SortOrder = .recent
     @State private var filter: Filter = .all
     @State private var selectedItem: TranscriptItem?
+    @State private var confirmTrashSelection = false
 
     enum SortOrder: String, CaseIterable {
         case recent = "Recent"
@@ -60,6 +61,16 @@ struct SessionsView: View {
                     .frame(maxHeight: .infinity)
                     .background(Color(nsColor: .windowBackgroundColor))
             }
+        }
+        .confirmationDialog(
+            "Move \(model.selectedSessionIDs.count) session\(model.selectedSessionIDs.count == 1 ? "" : "s") to the Trash?",
+            isPresented: $confirmTrashSelection)
+        {
+            Button("Move to Trash", role: .destructive) {
+                Task { await model.trashSelectedSessions() }
+            }
+        } message: {
+            Text("The selected transcripts and their artifacts move to macOS Trash. They are not permanently deleted.")
         }
     }
 
@@ -112,12 +123,18 @@ struct SessionsView: View {
                 Text("\(rows.count)")
                     .font(Design.numeric(10))
                     .foregroundStyle(.tertiary)
+                    .help("Shift-click selects a range. Command-click adds or removes a session.")
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
             .background(.bar)
 
             Divider()
+
+            if model.selectedSessionIDs.count > 1 {
+                selectionActions
+                Divider()
+            }
 
             if rows.isEmpty {
                 EmptyStateView(
@@ -127,12 +144,14 @@ struct SessionsView: View {
                         ? "Reading \(model.scanProgress.total) transcript files."
                         : "Try a different filter, or clear the search.")
             } else {
+                // A Set binding is the native macOS multi-selection contract: Shift selects
+                // a range and Command adds/removes rows. Keep the focused transcript separate
+                // so selecting a batch never starts several expensive transcript reads.
                 List(selection: Binding(
-                    get: { model.selectedSessionID },
-                    set: { id in
-                        guard let id, let s = model.sessions.first(where: { $0.id == id }) else { return }
+                    get: { model.selectedSessionIDs },
+                    set: { ids in
                         selectedItem = nil
-                        model.select(session: s)
+                        model.setSelectedSessions(ids)
                     }))
                 {
                     ForEach(rows) { s in
@@ -146,6 +165,44 @@ struct SessionsView: View {
             }
         }
         .background(.background.secondary)
+    }
+
+    private var selectionActions: some View {
+        let selected = model.selectedSessions
+        let containsLive = selected.contains(where: \.isLive)
+        return HStack(spacing: 6) {
+            Label("\(selected.count) selected", systemImage: "checkmark.circle.fill")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(Design.accent)
+            Spacer(minLength: 0)
+            Menu {
+                Button("Copy session IDs") { copySessionIDs(selected) }
+                Button("Reveal transcripts in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting(selected.map(\.fileURL))
+                }
+                Divider()
+                Button("Move \(selected.count) to Trash…", role: .destructive) {
+                    confirmTrashSelection = true
+                }
+                .disabled(containsLive || model.isTrashingSessions)
+                if containsLive {
+                    Text("Deselect live sessions before moving this selection to the Trash.")
+                }
+            } label: {
+                Label("Actions", systemImage: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(Design.accentSoft.opacity(0.45))
+    }
+
+    private func copySessionIDs(_ sessions: [SessionSummary]) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(sessions.map(\.id).joined(separator: "\n"), forType: .string)
+        model.show("Copied \(sessions.count) session IDs")
     }
 
     private var rows: [SessionSummary] {
@@ -195,11 +252,17 @@ struct SessionsView: View {
         }
         .disabled(s.isLive)
         Divider()
-        Button("Move to Trash…", role: .destructive) {
-            model.selectedSessionID = s.id
-            Task { await model.trashSelectedSession() }
+        let targets = model.selectedSessionIDs.contains(s.id) ? model.selectedSessions : [s]
+        Button(targets.count == 1 ? "Move to Trash…" : "Move \(targets.count) selected to Trash…",
+               role: .destructive)
+        {
+            if !model.selectedSessionIDs.contains(s.id) {
+                selectedItem = nil
+                model.setSelectedSessions([s.id])
+            }
+            confirmTrashSelection = true
         }
-        .disabled(s.isLive)
+        .disabled(targets.contains(where: \.isLive) || model.isTrashingSessions)
     }
 
     // MARK: Transcript

@@ -58,6 +58,18 @@ public struct SessionSummary: Sendable, Identifiable, Hashable {
     }
 }
 
+/// The result of a batch Trash request. A bad file must not stop later selected sessions
+/// from moving to Trash, and the UI needs exact identities to leave failed rows selected.
+public struct SessionTrashResult: Sendable {
+    public var trashedIDs: Set<String>
+    public var failures: [String: String]
+
+    public init(trashedIDs: Set<String> = [], failures: [String: String] = [:]) {
+        self.trashedIDs = trashedIDs
+        self.failures = failures
+    }
+}
+
 /// Scans and caches the session catalog.
 ///
 /// Reimplemented natively rather than shelling out to the harness's catalog process: the
@@ -276,6 +288,21 @@ public actor SessionCatalog {
         }
         cache.removeValue(forKey: session.fileURL.lastPathComponent)
         saveCache()
+    }
+
+    /// Move every selected transcript independently. One unreadable or already-moved file
+    /// reports its own failure but never prevents the rest of a deliberate batch from moving.
+    public func trash(sessions: [SessionSummary]) -> SessionTrashResult {
+        var result = SessionTrashResult()
+        for session in sessions {
+            do {
+                try trash(session: session)
+                result.trashedIDs.insert(session.id)
+            } catch {
+                result.failures[session.id] = error.localizedDescription
+            }
+        }
+        return result
     }
 
     public func invalidate(_ id: String) {
