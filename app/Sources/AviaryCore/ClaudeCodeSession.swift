@@ -115,12 +115,16 @@ public enum ClaudeCodeSession {
 
         let kernel = ClaudeCodeKernel(
             host: host, hostSession: hostSession, memory: memory,
-            sessionFile: run.fileURL, sessionID: run.sessionID)
+            sessionFile: run.fileURL, sessionID: run.sessionID,
+            artifacts: ArtifactStore(home: home, sessionID: run.sessionID))
         await kernel.setCwdHint(cwd)
         await kernel.noteFirstPrompt(firstPrompt)
+        await kernel.onNote { text, customType in
+            await run.note(text, customType: customType)
+        }
         await bridge.offer([await kernel.tool()])
-        // `remember`, `recall` and `conversation` come from inside the interpreter, so they
-        // arrive as host callbacks rather than as tool calls.
+        // `remember`, `recall`, `conversation` and `artifact` come from inside the interpreter,
+        // so they arrive as host callbacks rather than as tool calls.
         await host.onCallback { session, kind, payload in
             guard session == hostSession else {
                 return .object(["error": .string("Unknown kernel session.")])

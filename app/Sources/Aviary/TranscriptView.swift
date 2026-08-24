@@ -79,7 +79,11 @@ struct TranscriptRow: View {
         case .tool: toolRow
         case .bash: bashRow
         case .agentMessage: agentMessageRow
-        case .custom: customRow
+        case .custom:
+            // An artifact is a custom entry, but showing it as one would print the document's
+            // location as grey machinery text — the least useful thing on screen about a file
+            // somebody is meant to open.
+            if let artifact = item.artifact { artifactRow(artifact) } else { customRow }
         case .compaction, .branchSummary: summaryRow
         case .stateChange, .note: inlineRow
         }
@@ -336,6 +340,67 @@ struct TranscriptRow: View {
         .overlay(alignment: .leading) {
             Rectangle().fill(Color.secondary.opacity(0.3)).frame(width: 2.5)
         }
+    }
+
+    /// A document the agent wrote, as a card rather than as its contents.
+    ///
+    /// The body is deliberately not shown: an artifact exists because several thousand words
+    /// inline is the failure being fixed, and reproducing them here would undo it. What the
+    /// card owes the reader is that one was made, what it is, and how to get to it.
+    private func artifactRow(_ artifact: ArtifactNote) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            header(
+                "artifact", tint: Design.accent, symbol: "doc.richtext.fill",
+                trailing: AnyView(
+                    HStack(spacing: 5) {
+                        if !artifact.format.isEmpty {
+                            Chip(text: artifact.format, tint: Design.accent)
+                        }
+                        if artifact.byteCount > 0 {
+                            Chip(text: Fmt.bytes(artifact.byteCount), symbol: "doc",
+                                 tint: .secondary)
+                        }
+                    }))
+
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(artifact.title)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .textSelection(.enabled)
+                    Text(artifact.path)
+                        .font(Design.mono(9.5))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                Spacer(minLength: 6)
+                Button {
+                    NSWorkspace.shared.open(artifact.url)
+                } label: {
+                    Image(systemName: "arrow.up.forward.app").font(.system(size: 11))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Design.accent)
+                .help("Open the artifact")
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([artifact.url])
+                } label: {
+                    Image(systemName: "folder").font(.system(size: 11))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Design.accent)
+                .help("Reveal in Finder")
+            }
+            rawPane
+        }
+        .padding(11)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Design.accent.opacity(0.06)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Design.accent.opacity(0.25), lineWidth: 1))
     }
 
     private var summaryRow: some View {

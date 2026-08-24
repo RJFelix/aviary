@@ -121,6 +121,9 @@ public actor Agent {
     /// Where `remember` writes and `recall` reads. Absent means the run has no memory, which
     /// is a legitimate configuration rather than an error.
     private var memory: MemoryStore?
+    /// Where `artifact` writes. Installed by whoever knows the agent home, which the loop does
+    /// not; every real caller installs one, so an absent store means a harness in a test.
+    private var artifacts: ArtifactStore?
     /// Where request payloads go, when a run is recording them. Off unless asked for: it writes
     /// the full system prompt and conversation to disk, which should never be implicit.
     private var wireLogURL: URL?
@@ -166,6 +169,10 @@ public actor Agent {
 
     public func setMemory(_ store: MemoryStore?) {
         memory = store
+    }
+
+    public func setArtifacts(_ store: ArtifactStore?) {
+        artifacts = store
     }
 
     /// Record every request payload, so the run can show where its input tokens went.
@@ -265,6 +272,25 @@ public actor Agent {
                     "tags": .array(entry.tags.map { .string($0) }),
                 ])
             })])
+
+        case "artifact":
+            guard let artifacts else {
+                return .object(["error": .string(
+                    "This run has nowhere to write artifacts.")])
+            }
+            do {
+                let written = try artifacts.write(
+                    text: payload["text"]?.stringValue ?? "",
+                    title: payload["title"]?.stringValue,
+                    format: payload["format"]?.stringValue ?? "md")
+                // Recorded in the transcript as well as returned, because the return value is
+                // read once by the model and the transcript is what a person opens tomorrow.
+                try? await writer.appendNote(
+                    written.note.text, customType: ArtifactNote.customType)
+                return written.payload
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
 
         case "conversation":
             // The agent reading its own history, programmatically. Useful on its own — it can

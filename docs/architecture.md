@@ -112,7 +112,15 @@ distinguish "no rates published" from "cost zero".
 Protocol 2 added a second direction, and it is what makes the environment more than a
 calculator. Agent code calls `spawn(prompt)` and blocks; a whole sub-agent runs; the answer
 comes back as a return value. `conversation(limit)` hands back the transcript the code is part
-of. `remember`/`recall` persist findings. `ask_app(kind, …)` is the general form.
+of. `remember`/`recall` persist findings. `artifact(text, title, format)` writes a document.
+`ask_app(kind, …)` is the general form.
+
+**`artifact()` is a callback rather than a file write** for the same reason the others are: the
+kernel does not know the session id and has no business choosing a directory, so Aviary writes
+it — under `session-artifacts/<id>/artifacts/`, filename slugified from the title, never
+overwriting an earlier one. It exists because a run asked for a report answers with several
+thousand words inline, which cannot be opened, edited or sent on, and is re-read into context
+every turn after. The transcript records a card, not the body.
 
 Two rules learned the hard way. **The session id travels with every request** — one host serves
 many sessions and there is no other way to route the answer; leaving it out cost a debugging

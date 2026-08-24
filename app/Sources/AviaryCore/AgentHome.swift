@@ -69,6 +69,16 @@ public struct AgentHome: Sendable, Hashable {
     public func scheduledJobs(forSession id: String) -> URL {
         artifacts(forSession: id).appending(path: "scheduled-jobs.json")
     }
+
+    /// Where `artifact()` writes documents.
+    ///
+    /// A subdirectory rather than the session's artifacts root, because that root already
+    /// holds machinery — `scheduled-jobs.json`, `sub-*/` child sessions — and the filenames
+    /// here are derived from titles a model chose. One report called "Scheduled jobs" should
+    /// not be able to land on the file that drives them.
+    public func artifactDocuments(forSession id: String) -> URL {
+        artifacts(forSession: id).appending(path: "artifacts", directoryHint: .isDirectory)
+    }
 }
 
 /// Where the execution engine lives, and how sure we are about it.

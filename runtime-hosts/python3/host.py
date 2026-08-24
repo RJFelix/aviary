@@ -53,7 +53,7 @@ PROTOCOL_VERSION = 2
 # up in it is lying about what the agent put there. Adding a helper without adding it here is
 # how that contract quietly breaks.
 _AVIARY_INJECTED = frozenset({"sh", "cwd", "ask_app", "spawn", "conversation",
-                              "remember", "recall"})
+                              "remember", "recall", "artifact"})
 
 # Callbacks in flight: a runtime asked Aviary for something and is blocked on the answer.
 #
@@ -233,6 +233,11 @@ __aviary_ns["conversation"] = lambda limit=40: __aviary_ask_app("conversation", 
 __aviary_ns["remember"] = lambda text, scope="project", days=None, tags=None: __aviary_ask_app(
     "remember", text=text, scope=scope, days=days, tags=tags or [])
 __aviary_ns["recall"] = lambda query="": __aviary_ask_app("recall", query=query)
+# Storage is Aviary's: the kernel does not know the session id or where its artifacts live, and
+# a runtime that picked its own directory would put the same document somewhere different on
+# each engine.
+__aviary_ns["artifact"] = lambda text, title=None, format="md": __aviary_ask_app(
+    "artifact", text=text, title=title, format=format)
 
 try:
     sys.stdout, sys.stderr = __aviary_out, __aviary_err

@@ -4304,5 +4304,228 @@ let casesBuiltins: [Case] = [
     }),
 ]
 
+let casesArtifact: [Case] = [
+
+    ("artifact: a document lands in the session's own artifacts directory", {
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let store = ArtifactStore(home: home, sessionID: "s-1")
+
+        let written = try store.write(
+            text: "# Findings\n\nThe cache key misses the parser.\n",
+            title: "Cache findings", format: "md")
+        XCTAssertEqual(written.id, "cache-findings")
+        XCTAssertEqual(written.format, .markdown)
+        XCTAssertEqual(
+            written.url.deletingLastPathComponent().path,
+            home.artifactDocuments(forSession: "s-1").path,
+            "not the artifacts root, which already holds scheduled-jobs.json and sub-*/")
+        XCTAssertEqual(
+            try String(contentsOf: written.url, encoding: .utf8),
+            "# Findings\n\nThe cache key misses the parser.\n")
+        XCTAssertEqual(written.byteCount, 45)
+    }),
+
+    ("artifact: the same title twice is two documents, not one overwritten", {
+        // The loss this prevents is total and silent: the second write would destroy a report
+        // the run already paid to produce, and nothing anywhere would say so.
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let store = ArtifactStore(home: home, sessionID: "s-1")
+
+        let first = try store.write(text: "one", title: "Report", format: "md")
+        let second = try store.write(text: "two", title: "Report", format: "md")
+        XCTAssertNotEqual(first.url.path, second.url.path)
+        XCTAssertEqual(first.id, "report")
+        XCTAssertEqual(second.id, "report-2")
+        XCTAssertEqual(try String(contentsOf: first.url, encoding: .utf8), "one")
+        XCTAssertEqual(store.list().count, 2)
+
+        // A title is model-written text: it may hold slashes, dots and leading hyphens, all of
+        // which mean something to a filesystem.
+        let awkward = try store.write(
+            text: "x", title: "../../etc/passwd — v2.1", format: "txt")
+        XCTAssertEqual(awkward.id, "etc-passwd-v2-1")
+        XCTAssertEqual(
+            awkward.url.deletingLastPathComponent().path, store.directory.path,
+            "the slug cannot climb out of the directory")
+
+        // An untitled document still gets a findable name, taken from its own first heading.
+        let untitled = try store.write(
+            text: "# Migration plan\n\nStep one.", title: nil, format: "md")
+        XCTAssertEqual(untitled.title, "Migration plan")
+        XCTAssertEqual(untitled.id, "migration-plan")
+    }),
+
+    ("artifact: a format nobody supports is an error the agent can read", {
+        // The agent is blocked on a line of code, so a payload it can branch on beats an
+        // exception that reaches it as a traceback with no list of what would have worked.
+        guard let host = try makeHost(.reference) else { return }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(
+                id: "fake", baseURL: URL(string: "http://127.0.0.1:1/v1")!, apiKey: nil),
+            host: host, writer: writer, hostSession: "none",
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s"))
+        await agent.setArtifacts(ArtifactStore(home: home, sessionID: writer.sessionID))
+
+        let bad = await agent.serveCallback(kind: "artifact", payload: .object([
+            "text": .string("body"), "title": .string("T"), "format": .string("pdf"),
+        ]))
+        let message = bad["error"]?.stringValue ?? ""
+        XCTAssertTrue(message.contains("pdf"), "names what was asked for")
+        XCTAssertTrue(message.contains("'md'") && message.contains("'html'"),
+                      "and what would have worked")
+        XCTAssertNil(bad["path"])
+
+        let empty = await agent.serveCallback(kind: "artifact", payload: .object([
+            "text": .string("   \n"), "format": .string("md"),
+        ]))
+        XCTAssertTrue((empty["error"]?.stringValue ?? "").contains("text"))
+
+        // 'markdown' for 'md' is the mistake that would otherwise lose a finished report.
+        let alias = await agent.serveCallback(kind: "artifact", payload: .object([
+            "text": .string("body"), "title": .string("Alias"),
+            "format": .string("markdown"),
+        ]))
+        XCTAssertEqual(alias["format"]?.stringValue, "md")
+        await writer.close()
+    }),
+
+    ("artifact: the in-house engine writes the file and records it in the transcript", {
+        guard let host = try makeHost(.reference) else { return }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(
+                id: "fake", baseURL: URL(string: "http://127.0.0.1:1/v1")!, apiKey: nil),
+            host: host, writer: writer, hostSession: "none",
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s"))
+        await agent.setArtifacts(ArtifactStore(home: home, sessionID: writer.sessionID))
+
+        let reply = await agent.serveCallback(kind: "artifact", payload: .object([
+            "text": .string("# Q3\n\nRevenue is up."),
+            "title": .string("Q3 review"),
+            "format": .string("md"),
+        ]))
+        XCTAssertNil(reply["error"])
+        XCTAssertEqual(reply["id"]?.stringValue, "q3-review")
+        XCTAssertEqual(reply["title"]?.stringValue, "Q3 review")
+        XCTAssertEqual(reply["bytes"]?.intValue, 20)
+        let path = try XCTUnwrap(reply["path"]?.stringValue)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        await writer.close()
+
+        // A file nobody can see is a dead end, so the transcript says one was made — and says
+        // it in a form a reader that has never heard of an artifact still renders usefully.
+        let transcript = try XCTUnwrap(SessionParser.parse(fileURL: writer.fileURL))
+        let note = try XCTUnwrap(transcript.items.compactMap(\.artifact).last)
+        XCTAssertEqual(note.title, "Q3 review")
+        XCTAssertEqual(note.format, "md")
+        XCTAssertEqual(note.byteCount, 20)
+        XCTAssertEqual(note.path, path)
+        let raw = try XCTUnwrap(transcript.items.last { $0.artifact != nil }).plainText
+        XCTAssertTrue(raw.contains("Artifact: Q3 review") && raw.contains(path))
+    }),
+
+    ("artifact: a driven session writes it the same way an in-house one does", {
+        // Both engines serve the same verbs against the same store. An artifact that landed
+        // somewhere else depending on who was driving would make a session's output depend on
+        // a choice the person who asked for the report never made.
+        guard let host = try makeHost(.reference) else { return }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let sid = writer.sessionID
+        let kernel = ClaudeCodeKernel(
+            host: host, hostSession: "none", memory: nil,
+            sessionFile: writer.fileURL, sessionID: sid,
+            artifacts: ArtifactStore(home: home, sessionID: sid))
+        let noted = OutputCollector()
+        await kernel.onNote { text, customType in noted.record(stream: customType, text: text) }
+
+        let reply = await kernel.serveCallback(kind: "artifact", payload: .object([
+            "text": .string("<h1>Ledger</h1>"), "title": .string("Ledger"),
+            "format": .string("html"),
+        ]))
+        XCTAssertEqual(reply["format"]?.stringValue, "html")
+        let path = try XCTUnwrap(reply["path"]?.stringValue)
+        XCTAssertEqual(
+            path, home.artifactDocuments(forSession: sid).appending(path: "ledger.html").path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        XCTAssertEqual(noted.streams, [ArtifactNote.customType])
+        XCTAssertNotNil(ArtifactNote.parse(noted.text))
+        await writer.close()
+    }),
+
+    ("artifact: the name bound in the interpreter reaches the store that writes it", {
+        // The seam no Swift-only test can see: `artifact` is a lambda in host.py whose keyword
+        // arguments have to match what the callback reads. A mismatch there compiles fine and
+        // fails the first time an agent calls it.
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let store = ArtifactStore(home: home, sessionID: "s-live")
+        await host.onCallback { _, kind, payload in
+            guard kind == "artifact" else {
+                return .object(["error": .string("unexpected callback \(kind)")])
+            }
+            guard let written = try? store.write(
+                text: payload["text"]?.stringValue ?? "",
+                title: payload["title"]?.stringValue,
+                format: payload["format"]?.stringValue ?? "md")
+            else { return .object(["error": .string("the store refused it")]) }
+            return written.payload
+        }
+        let session = try await host.createSession(cwd: "/tmp")
+        defer { Task { await host.destroySessionQuietly(session) } }
+
+        let result = try await host.execute(
+            "artifact('# Live\\n\\nbody', title='Live run', format='md')['path']",
+            in: session)
+        XCTAssertNil(result.exception, result.exception ?? "")
+        let path = (result.value ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
+        XCTAssertEqual(
+            path, home.artifactDocuments(forSession: "s-live")
+                .appending(path: "live-run.md").path)
+        XCTAssertEqual(
+            try String(contentsOfFile: path, encoding: .utf8), "# Live\n\nbody")
+
+        // And it is hidden from `inspect`, like every other name the host injects — the
+        // namespace is supposed to show what the agent put there, not what Aviary did.
+        let namespace = try await host.inspect(session)
+        XCTAssertFalse(namespace.bindings.contains { $0.name == "artifact" })
+    }),
+
+    ("artifact: both engines tell the model it exists, in every configuration", {
+        // The rule this repo enforces structurally: a capability the model is not told about
+        // does not exist. `artifact` is bound in every session, so it must be described in
+        // every one — including the runs with no memory and no sub-agent depth.
+        for (memory, spawn) in [(false, false), (true, false), (false, true), (true, true)] {
+            let text = Builtins.description(Builtins.Context(
+                cwd: "/repo", hasMemory: memory, canSpawn: spawn, spawnBudget: 1))
+            XCTAssertTrue(text.contains("artifact(text, title=None, format='md')"))
+            XCTAssertTrue(text.contains("'html'"), "the formats are named, not implied")
+            XCTAssertTrue(text.contains("extended piece of writing"),
+                          "and when to reach for it, which is the whole point of adding it")
+        }
+        XCTAssertTrue(
+            ClaudeCodeKernel.description(cwd: "/repo", hasMemory: false).contains("artifact("))
+        XCTAssertTrue(
+            try XCTUnwrap(Agent.tools(cwd: "/repo").first).description.contains("artifact("))
+
+        let entry = try XCTUnwrap(Builtins.all(.reference).first { $0.name == "artifact" })
+        XCTAssertEqual(entry.requirement, .always)
+        XCTAssertEqual(entry.mechanism, .callback,
+                       "storage is the app's; the kernel does not know the session id")
+    }),
+]
+
 await Harness.run(
-    cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins)
+    cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
+        + casesArtifact)
