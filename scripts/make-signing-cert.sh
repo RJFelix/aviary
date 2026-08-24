@@ -32,15 +32,16 @@
 #   2. Imports both into your **login** keychain, authorised for /usr/bin/codesign.
 #   3. Marks it trusted for code signing in your **user** trust settings — not the system
 #      domain, so no sudo.
-#   4. Adds codesign to the key's **partition list**. This is the step that is easy to miss and
-#      the one that hurts: without it `codesign` does not fail, it blocks on a GUI password
-#      dialog. Every build. And an unattended build — the workshop reload starts one — hangs
-#      instead of failing, leaving a half-written `.cstemp` in the bundle that makes every
-#      later signing attempt fail with "invalid or unsupported format for signature".
-#      It needs your login-keychain password, which is why this script has to ask. The
-#      alternative, if you would rather not type it here: run a build and answer the dialog with
-#      **Always Allow** rather than Allow — "Allow" authorises one signature and changes
-#      nothing.
+#   4. Authorises codesign to use the key without asking every time. This is the step that is
+#      easy to miss and the one that hurts: without it `codesign` does not fail, it blocks on a
+#      GUI dialog. Every build. And an unattended build — the workshop reload starts one — hangs
+#      instead of failing, leaving a half-written `.cstemp` in the bundle that makes every later
+#      signing attempt fail with "invalid or unsupported format for signature".
+#
+#      It asks you to answer one dialog with **Always Allow**, which needs no password. "Allow"
+#      authorises a single signature and changes nothing — that is the trap. If the dialog route
+#      does not take, it falls back to setting the key's partition list, which does need your
+#      login-keychain password.
 #
 # Reversing it: delete "Aviary Local Signing" in Keychain Access. `bundle-app.sh` then falls
 # back to ad-hoc and the re-prompting returns.
@@ -92,61 +93,76 @@ security find-identity -v -p codesigning | grep -F "$NAME"
 
 # --- 4: the partition list ------------------------------------------------------------------
 
-# Attempted every run, not only on creation. An identity can be perfectly valid and still
-# demand a dialog for every signature — which looks completely healthy and hangs the next
-# unattended build. `-A` on the import above is not a substitute: that ACL predates partition
-# lists and macOS consults both.
+# --- 4: authorising codesign to use the key ------------------------------------------------
 #
-# Set unconditionally, and NOT gated on a timing probe. Gating on one was the previous version's
-# bug: if the dialog appears and a human types their password inside the deadline, the probe
-# completes and is indistinguishable from no dialog having appeared. It then reports "nothing to
-# authorise" about a machine that will prompt on every build. Timing cannot tell those apart, so
-# it is not asked to.
-echo "==> Authorising codesign to use the key"
-echo "    Needs your login-keychain password — the one you log in with."
-printf "    Password: "
-read -rs KEYCHAIN_PASSWORD
-echo ""
-if security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
-        -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null 2>&1; then
-    echo "    Set."
-else
-    echo "    FAILED — wrong password, or the keychain is locked." >&2
-    echo "" >&2
-    echo "    Fallback that needs no password here: run 'just build', and when the dialog" >&2
-    echo "    appears choose **Always Allow**, not Allow. 'Allow' authorises that one" >&2
-    echo "    signature; 'Always Allow' adds codesign to the key permanently." >&2
-    exit 1
-fi
-unset KEYCHAIN_PASSWORD
+# An identity can be perfectly valid and still demand a dialog for every signature, which looks
+# completely healthy and hangs the next unattended build. `-A` on the import above is not a
+# substitute: that ACL predates partition lists and macOS consults both.
+#
+# Two ways to fix it, and the *dialog* one is tried first because it needs no secret: answering
+# a keychain prompt with **Always Allow** adds codesign to the key permanently. "Allow"
+# authorises that one signature and changes nothing, which is the trap.
 
-# Verified with a deliberately tight deadline. Two seconds is too fast for anyone to read a
-# dialog and type a password, so finishing inside it means no dialog was involved — which is
-# the property being checked, and the one a ten-second deadline could not establish.
-echo "==> Verifying that signing needs no dialog"
-cp /usr/bin/true "$WORK/probe"
-( codesign --force --sign "$NAME" --identifier works.duckbill.probe "$WORK/probe" \
-    >/dev/null 2>&1 ) &
-PROBE_PID=$!
-WAITED=0
-while kill -0 "$PROBE_PID" 2>/dev/null; do
-    if [ "$WAITED" -ge 8 ]; then
-        kill "$PROBE_PID" 2>/dev/null || true
-        wait "$PROBE_PID" 2>/dev/null || true
-        break
-    fi
-    sleep 0.25
-    WAITED=$((WAITED + 1))
-done
-if [ "$WAITED" -ge 8 ]; then
-    echo "    Still asking. If a dialog is on screen, answer it with 'Always Allow'." >&2
-    exit 1
-fi
-if codesign -d -r- "$WORK/probe" 2>&1 | grep -q "certificate"; then
-    echo "    Signed in under two seconds with no prompt."
+# Deliberately tight. Two seconds is too fast for anyone to read a dialog and type a password,
+# so finishing inside it establishes that no dialog was involved. A ten-second deadline cannot:
+# a human answering in time is indistinguishable from no prompt at all, and gating on one is
+# how an earlier version of this script announced "nothing to authorise" about a machine that
+# prompted on every build.
+signs_silently() {
+    cp /usr/bin/true "$WORK/probe"
+    ( codesign --force --sign "$NAME" --identifier works.duckbill.probe "$WORK/probe" \
+        >/dev/null 2>&1 ) &
+    local pid=$! waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge 8 ]; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 1
+        fi
+        sleep 0.25
+        waited=$((waited + 1))
+    done
+    wait "$pid" 2>/dev/null || return 1
+    codesign -d -r- "$WORK/probe" 2>&1 | grep -q "certificate"
+}
+
+echo "==> Checking whether signing needs authorisation"
+if signs_silently; then
+    echo "    It does not — signed in under two seconds with no prompt."
 else
-    echo "    Signed, but the requirement does not name the certificate." >&2
-    exit 1
+    echo ""
+    echo "    It does. A keychain dialog should be on screen now."
+    echo "    Click 'Always Allow' — not 'Allow'. 'Allow' authorises one signature;"
+    echo "    'Always Allow' adds codesign to the key for good."
+    echo ""
+    printf "    Press return once you have done that: "
+    read -r _
+    if signs_silently; then
+        echo "    Authorised."
+    else
+        # The dialog route did not take. Fall back to setting the partition list directly,
+        # which does the same thing and needs the keychain password.
+        echo "    Still asking. Setting the key's partition list instead."
+        echo "    This needs your login-keychain password — the one you log in with."
+        printf "    Password: "
+        read -rs KEYCHAIN_PASSWORD
+        echo ""
+        if ! security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+                -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null 2>&1; then
+            unset KEYCHAIN_PASSWORD
+            echo "    FAILED — wrong password, or the keychain is locked." >&2
+            exit 1
+        fi
+        unset KEYCHAIN_PASSWORD
+        if signs_silently; then
+            echo "    Authorised."
+        else
+            echo "    Still asking, and out of ideas. Open Keychain Access, find the" >&2
+            echo "    '$NAME' private key, Get Info -> Access Control, and add" >&2
+            echo "    /usr/bin/codesign to the always-allow list." >&2
+            exit 1
+        fi
+    fi
 fi
 
 echo ""
