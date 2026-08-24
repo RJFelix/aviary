@@ -30,3 +30,6 @@ workshop/shots/
 # working tree, but not committed by default: it is one person's accumulated beliefs, and a
 # shared repo would need a review gate first. Delete this line to start tracking it.
 memory/
+
+# Agent worktrees are checkouts, not content.
+.claude/worktrees/

@@ -4304,5 +4304,138 @@ let casesBuiltins: [Case] = [
     }),
 ]
 
+
+// MARK: - Library usage, read back out of the trajectories
+
+private func usageFixture() throws -> (dir: URL, transcripts: [URL]) {
+    let dir = FileManager.default.temporaryDirectory
+        .appending(path: "aviary-usage-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    func cell(_ code: String, at: String) -> String {
+        let escaped = code.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+        return #"{"type":"message","timestamp":"\#(at)","message":{"role":"assistant","#
+            + #""content":[{"type":"toolCall","name":"python","id":"t1","#
+            + #""arguments":{"code":"\#(escaped)"}}]}}"#
+    }
+    let one = dir.appending(path: "one.jsonl")
+    try [
+        #"{"type":"session","id":"one","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp"}"#,
+        cell("print(sh('ls'))", at: "2026-08-20T10:00:01.000Z"),
+        cell("sh('git status')\nsh('git diff')", at: "2026-08-20T10:00:02.000Z"),
+        #"{"type":"message","timestamp":"2026-08-20T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"sh( is not a call here"}]}}"#,
+        cell("open('skills/writer/SKILL.md').read()", at: "2026-08-21T09:00:00.000Z"),
+    ].joined(separator: "\n").write(to: one, atomically: true, encoding: .utf8)
+
+    let two = dir.appending(path: "two.jsonl")
+    try [
+        #"{"type":"session","id":"two","timestamp":"2026-08-21T10:00:00.000Z","cwd":"/tmp"}"#,
+        cell("remember('a thing')", at: "2026-08-21T10:00:01.000Z"),
+        "not json at all",
+    ].joined(separator: "\n").write(to: two, atomically: true, encoding: .utf8)
+
+    return (dir, [one, two])
+}
+
+let casesLibraryUsage: [Case] = [
+
+    ("usage: a call site is a call, and a suffix collision is not", {
+        // `foo.sh(` and `my_sh(` are somebody else's function. Getting this wrong inflates
+        // every number on the screen, and an inflated number is worse than no number.
+        XCTAssertEqual(LibraryUsage.callSites(of: "sh", in: "sh('a'); sh('b')"), 2)
+        XCTAssertEqual(LibraryUsage.callSites(of: "sh", in: "proc.sh('a')"), 0)
+        XCTAssertEqual(LibraryUsage.callSites(of: "sh", in: "my_sh('a')"), 0)
+        XCTAssertEqual(LibraryUsage.callSites(of: "sh", in: "sh ('a')"), 1, "whitespace is fine")
+        XCTAssertEqual(LibraryUsage.callSites(of: "sh", in: "shell('a')"), 0)
+        XCTAssertEqual(LibraryUsage.callSites(of: "sh", in: "sh"), 0, "a name is not a call")
+        // Documented upper bound: prose inside a string is indistinguishable from source.
+        XCTAssertEqual(LibraryUsage.callSites(of: "sh", in: "x = 'call sh() first'"), 1)
+    }),
+
+    ("usage: counted per day, per cell, per session, from the transcripts themselves", {
+        let fixture = try usageFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.dir) }
+        let usage = LibraryUsage.scan(
+            transcripts: fixture.transcripts, builtins: ["sh", "remember", "spawn"], skills: [])
+        XCTAssertEqual(usage.transcriptsScanned, 2)
+        XCTAssertEqual(usage.cellsScanned, 4)
+        let sh = try XCTUnwrap(usage.builtin(named: "sh"))
+        XCTAssertEqual(sh.calls, 3, "two in one cell, one in another")
+        XCTAssertEqual(sh.cells, 2, "the assistant's prose is not a cell")
+        XCTAssertEqual(sh.sessions, 1)
+        XCTAssertEqual(sh.byDay.count, 1)
+        let remember = try XCTUnwrap(usage.builtin(named: "remember"))
+        XCTAssertEqual(remember.calls, 1)
+        XCTAssertEqual(remember.sessions, 1, "a different transcript is a different session")
+        let spawn = try XCTUnwrap(usage.builtin(named: "spawn"))
+        XCTAssertFalse(spawn.wasEverUsed)
+        XCTAssertNil(spawn.lastUsed)
+        // A line that is not JSON ends that line, not the scan.
+        XCTAssertNotNil(usage.lastActivity)
+    }),
+
+    ("usage: a skill is credited by its path, never by its name", {
+        // Bundled skills are called `edit`, `goal`, `compact` — ordinary English words that
+        // would match half the corpus if a bare name counted.
+        let fixture = try usageFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.dir) }
+        let writer = SkillEntry(
+            name: "writer", description: "", url: URL(fileURLWithPath: "/x/skills/writer/SKILL.md"),
+            sourceLabel: "test", precedence: 0, bodyLength: 0, hasPythonBacking: false,
+            allowedTools: [])
+        let ls = SkillEntry(
+            name: "ls", description: "", url: URL(fileURLWithPath: "/x/skills/ls/SKILL.md"),
+            sourceLabel: "test", precedence: 0, bodyLength: 0, hasPythonBacking: false,
+            allowedTools: [])
+        let usage = LibraryUsage.scan(
+            transcripts: fixture.transcripts, builtins: ["sh"], skills: [writer, ls])
+        XCTAssertEqual(usage.skill(named: "writer")?.calls, 1)
+        XCTAssertEqual(usage.skill(named: "ls")?.calls, 0, "`sh('ls')` is not the `ls` skill")
+    }),
+
+    ("usage: the window is dense, because the gaps are the information", {
+        // Three calls spread over a month look like a habit if only the busy days are drawn.
+        var series = LibraryUsage.Series(name: "sh", calls: 2, cells: 2, sessions: 1)
+        let calendar = Calendar(identifier: .gregorian)
+        let now = try XCTUnwrap(DateComponents(
+            calendar: calendar, year: 2026, month: 8, day: 20, hour: 12).date)
+        let today = calendar.startOfDay(for: now)
+        let earlier = try XCTUnwrap(calendar.date(byAdding: .day, value: -3, to: today))
+        series.byDay = [
+            LibraryUsage.Day(day: earlier, count: 1), LibraryUsage.Day(day: today, count: 1),
+        ]
+        let days = series.days(last: 7, calendar: calendar, now: now)
+        XCTAssertEqual(days.count, 7)
+        XCTAssertEqual(days.map(\.count), [0, 0, 0, 1, 0, 0, 1])
+        XCTAssertEqual(days.last?.day, today, "the window ends today, not at the last call")
+    }),
+
+    ("usage: skills are filed under the builtins they actually teach", {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-index-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func write(_ name: String, _ body: String) throws -> SkillEntry {
+            let skillDir = dir.appending(path: name, directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: skillDir, withIntermediateDirectories: true)
+            let url = skillDir.appending(path: "SKILL.md")
+            try body.write(to: url, atomically: true, encoding: .utf8)
+            return SkillEntry(
+                name: name, description: "", url: url, sourceLabel: "test", precedence: 0,
+                bodyLength: body.count, hasPythonBacking: false, allowedTools: [])
+        }
+        let notes = try write("notes", "Call remember('x') when you learn something.")
+        let foreign = try write("foreign", "Call rlm_heartbeat.create('x') from IPython.")
+        let index = SkillBuiltinIndex.build(
+            skills: [notes, foreign], builtins: ["sh", "remember", "recall"])
+        XCTAssertEqual(index.skills(for: "remember"), ["notes"])
+        XCTAssertTrue(index.skills(for: "sh").isEmpty)
+        // The inverse of the undescribed-capability bug: a skill teaching names this runtime
+        // never binds. Worth surfacing rather than hiding behind an empty list.
+        XCTAssertEqual(index.unattached, ["foreign"])
+    }),
+]
+
 await Harness.run(
-    cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins)
+    cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
+        + casesLibraryUsage)

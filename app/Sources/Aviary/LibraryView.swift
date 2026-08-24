@@ -10,11 +10,15 @@ import AviaryCore
 /// both, and marks which copy of a same-named skill actually wins.
 struct LibraryView: View {
     @Environment(AppModel.self) private var model
-    @State private var tab: Tab = .skills
+    @State private var tab: Tab = .builtins
     @State private var search = ""
     @State private var selectedSkill: SkillEntry?
+    @State private var selectedBuiltin: String?
+    /// Shared by every chart on the screen, so switching tabs does not switch time window.
+    @State private var window = 30
 
     enum Tab: String, CaseIterable, Identifiable {
+        case builtins = "Builtins"
         case skills = "Skills"
         case prompts = "Prompts"
         case extensions = "Extensions"
@@ -25,6 +29,7 @@ struct LibraryView: View {
 
         var symbol: String {
             switch self {
+            case .builtins: return "curlybraces"
             case .skills: return "wand.and.stars"
             case .prompts: return "text.badge.plus"
             case .extensions: return "puzzlepiece.extension"
@@ -83,6 +88,8 @@ struct LibraryView: View {
     @ViewBuilder
     private var content: some View {
         switch tab {
+        case .builtins:
+            BuiltinsPane(search: search, selected: $selectedBuiltin, window: $window)
         case .skills: skillsPane
         case .prompts: promptsPane
         case .extensions: extensionsPane
@@ -120,6 +127,12 @@ struct LibraryView: View {
                                     if s.hasPythonBacking {
                                         Chip(text: "python", symbol: "cube", tint: Design.tool)
                                     }
+                                    if let used = model.libraryUsage.skill(named: s.name),
+                                       used.calls > 0
+                                    {
+                                        Chip(text: "\(used.calls)×", symbol: "arrow.up.right",
+                                             tint: Design.accent)
+                                    }
                                     Spacer()
                                     Text(s.sourceLabel)
                                         .font(.system(size: 9)).foregroundStyle(.tertiary)
@@ -144,7 +157,11 @@ struct LibraryView: View {
 
             Group {
                 if let s = selectedSkill {
-                    SkillDetail(skill: s)
+                    SkillDetail(
+                        skill: s,
+                        usage: model.libraryUsage.skill(named: s.name),
+                        scanned: model.libraryUsageScanned,
+                        window: $window)
                 } else {
                     EmptyStateView(
                         symbol: "doc.text",
@@ -191,6 +208,8 @@ struct LibraryView: View {
                         }
                     }
                 }
+                NoUsageFootnote(subject: "template expansions happen before the model sees "
+                    + "the prompt and")
             }
             .padding(Design.gutter)
         }
@@ -251,6 +270,7 @@ struct LibraryView: View {
                         }
                     }
                 }
+                NoUsageFootnote(subject: "hooks fire outside the conversation and")
             }
             .padding(Design.gutter)
         }
@@ -376,6 +396,9 @@ struct LibraryView: View {
 
 struct SkillDetail: View {
     var skill: SkillEntry
+    var usage: LibraryUsage.Series?
+    var scanned: Bool
+    @Binding var window: Int
     @State private var body_text = ""
 
     var body: some View {
@@ -415,6 +438,31 @@ struct SkillDetail: View {
                         .textSelection(.enabled)
                 }
 
+                Card("Reached for", symbol: "chart.bar.xaxis",
+                     accessory: AnyView(WindowPicker(window: $window)))
+                {
+                    // A skill is credited when a cell names its *path*. Several of the
+                    // bundled skills are called `edit`, `goal`, `compact` — ordinary words
+                    // that would match half the corpus on a bare-name search.
+                    VStack(alignment: .leading, spacing: 8) {
+                        if !scanned {
+                            Text("Reading the trajectories…")
+                                .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                        } else if let usage, usage.wasEverUsed {
+                            UsageChart(days: usage.days(last: window), tint: Design.assistant,
+                                       height: 96)
+                            Text("\(usage.cells) cells across \(usage.sessions) session(s) "
+                                + "referenced this skill's path.")
+                                .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                        } else {
+                            Text("No cell in the recorded history opened or ran anything from "
+                                + "this skill's directory.")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+
                 Card("Instructions", symbol: "doc.plaintext") {
                     if body_text.isEmpty {
                         Text("Empty or unreadable.")
@@ -436,5 +484,30 @@ struct SkillDetail: View {
                 return Frontmatter.parse(text).body.trimmingCharacters(in: .whitespacesAndNewlines)
             }.value
         }
+    }
+}
+
+/// Why two of these tabs have no chart.
+///
+/// Use is read back out of the trajectories, and a transcript records what the *model* did: the
+/// cells it ran, and therefore the builtins and skill files those cells touched. A prompt
+/// template is expanded before the model sees anything, and a hook fires outside the
+/// conversation entirely — neither leaves a mark in the record, so a chart here would be
+/// fabricated rather than sparse. Recording them is a change to the writer, not to this screen.
+struct NoUsageFootnote: View {
+    var subject: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "info.circle")
+                .font(.system(size: 9)).foregroundStyle(.tertiary)
+            Text("No usage chart: \(subject) leave no trace in a transcript, so there is "
+                + "nothing to count. Builtins and skills do, because the model's own cells "
+                + "name them.")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+        }
+        .padding(.top, 4)
     }
 }

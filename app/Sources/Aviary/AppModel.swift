@@ -125,6 +125,15 @@ final class AppModel {
     var providerTests: [String: ProviderTestResult] = [:]
     var testingProviders: Set<String> = []
     var library = Library()
+    /// What the agent finds already bound in its Python namespace, and which skills reference
+    /// each name. The catalogue is static; the index is read off the skills on disk.
+    var builtinIndex = SkillBuiltinIndex()
+    /// How often each name was actually reached for, read back out of the trajectories. Empty
+    /// until the first scan finishes, which is why every reader treats zero as "not yet known"
+    /// only in combination with `libraryUsageScanned`.
+    var libraryUsage = LibraryUsage()
+    var libraryUsageScanned = false
+    private var libraryUsageTask: Task<Void, Never>?
     /// Whether Aviary's own runtime can start, checked rather than assumed.
     var runtimeProbes: [RuntimeProbe] = []
 
@@ -478,6 +487,29 @@ final class AppModel {
         library = Library.discover(
             home: home, settings: settings,
             projectRoot: projectRoot, enginePackageRoot: enginePackageRoot)
+        let names = Builtins.all(.reference).map(\.name)
+        builtinIndex = SkillBuiltinIndex.build(skills: library.skills, builtins: names)
+        rescanLibraryUsage(skills: library.skills, builtins: names)
+    }
+
+    /// Read every transcript and count what got called.
+    ///
+    /// Off the main actor and cancel-the-previous, because it walks the whole corpus — ~0.4s
+    /// over 18 transcripts today — and a Library refresh should never be the thing that makes
+    /// the window drop frames.
+    private func rescanLibraryUsage(skills: [SkillEntry], builtins: [String]) {
+        libraryUsageTask?.cancel()
+        let home = self.home
+        libraryUsageTask = Task { [weak self] in
+            let scanned = await Task.detached(priority: .utility) {
+                LibraryUsage.scan(home: home, builtins: builtins, skills: skills)
+            }.value
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.libraryUsage = scanned
+                self?.libraryUsageScanned = true
+            }
+        }
     }
 
     private func startPolling() {
