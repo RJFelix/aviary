@@ -38,3 +38,4 @@
 {"at":"2026-08-24T20:42:01.416Z","event":"delivered","id":"wr-20260824-54b1","session":"01a0357e-b3ca-71b3-03bd-ef61742aaa36","v":1}
 {"at":"2026-08-24T20:42:01.416Z","by":"aviary","event":"status","id":"wr-20260824-54b1","note":"Handed to the workshop agent.","status":"claimed","v":1}
 {"at": "2026-08-24T22:31:54.366Z", "by": "agent", "event": "status", "id": "wr-20260824-54b1", "note": "Adding artifact() as a kernel builtin, served by both engines.", "status": "building", "v": 1}
+{"at": "2026-08-24T22:32:27.076Z", "by": "agent", "event": "status", "id": "wr-20260824-54b1", "note": "artifact(text, title=None, format=md|txt|html) is bound in every session and served by both engines; Aviary writes the file under session-artifacts/<id>/artifacts/, never overwriting. Described in Builtins with a note recommending it for reports and plans; the transcript shows a card with open/reveal. Commit 6cb99b0 on worktree-agent-a2266c5a6512a024c.", "status": "done", "v": 1}
