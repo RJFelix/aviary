@@ -15,7 +15,32 @@ import Network
 public final class MCPBridge: @unchecked Sendable {
 
     /// MCP protocol version. Matches what `MCPClient` speaks, so both halves move together.
+    /// What this server speaks, newest first.
+    ///
+    /// Dual-era on purpose. 2026-07-28 removed the `initialize` handshake, but the client on
+    /// the other end of this pipe is Claude Code, whose era is not ours to choose — so the
+    /// bridge answers whichever opening it gets: a request carrying modern `_meta` is served
+    /// statelessly, an `initialize` selects handshake semantics. The spec's own guidance for
+    /// a dual-era server, and the only version of this that cannot break the driven engine.
+    static let modernVersion = "2026-07-28"
+    static let legacyVersions = ["2025-11-25", "2025-06-18", "2024-11-05"]
+    /// Kept for the legacy handshake, whose reply must name a version the client asked about.
     static let protocolVersion = "2024-11-05"
+
+    static let serverInfo = JSONValue.object([
+        "name": .string("aviary-kernel"), "version": .string("1"),
+    ])
+
+    /// Every modern result carries `resultType` and identifies its sender. Additive JSON, so
+    /// a handshake-era client simply ignores both rather than choking on them.
+    static func complete(_ fields: [String: JSONValue]) -> JSONValue {
+        var out = fields
+        out["resultType"] = .string("complete")
+        var meta = out["_meta"]?.objectValue ?? [:]
+        meta["io.modelcontextprotocol/serverInfo"] = serverInfo
+        out["_meta"] = .object(meta)
+        return .object(out)
+    }
 
     private let port: UInt16
     private let token: String
@@ -170,13 +195,34 @@ public final class MCPBridge: @unchecked Sendable {
         let id = message["id"]
 
         switch method {
-        case "initialize":
-            respond(id: id, result: .object([
-                "protocolVersion": .string(Self.protocolVersion),
+        case "server/discover":
+            // Servers MUST implement this in 2026-07-28, and on stdio it doubles as the
+            // client's era probe: answering it at all is what tells a dual-era client it does
+            // not need the handshake.
+            respond(id: id, result: Self.complete([
+                "supportedVersions": .array(
+                    ([Self.modernVersion] + Self.legacyVersions).map { .string($0) }),
                 "capabilities": .object(["tools": .object([:])]),
-                "serverInfo": .object([
-                    "name": .string("aviary-kernel"), "version": .string("1"),
-                ]),
+                "instructions": .string(
+                    "Aviary's Python kernel. One tool, `python`, running in a persistent "
+                        + "interpreter that keeps its variables between calls."),
+                // The tool list changes only when a run's capabilities change, which cannot
+                // happen mid-session. Private: it is this run's kernel, not a public service.
+                "ttlMs": .number(300_000),
+                "cacheScope": .string("private"),
+            ]))
+
+        case "initialize":
+            // A legacy client. Echo a version it actually asked for where we can, because a
+            // handshake client has no way to fall forward and this reply is all it gets.
+            let asked = message.path("params.protocolVersion")?.stringValue
+            let agreed = Self.legacyVersions.contains(asked ?? "")
+                ? (asked ?? Self.protocolVersion)
+                : Self.protocolVersion
+            respond(id: id, result: .object([
+                "protocolVersion": .string(agreed),
+                "capabilities": .object(["tools": .object([:])]),
+                "serverInfo": Self.serverInfo,
             ]))
 
         case "notifications/initialized", "notifications/cancelled":
@@ -184,7 +230,11 @@ public final class MCPBridge: @unchecked Sendable {
             break
 
         case "tools/list":
-            respond(id: id, result: .object(["tools": .array(tools)]))
+            respond(id: id, result: Self.complete([
+                "tools": .array(tools),
+                "ttlMs": .number(300_000),
+                "cacheScope": .string("private"),
+            ]))
 
         case "tools/call":
             let name = message.path("params.name")?.stringValue ?? ""
@@ -215,13 +265,15 @@ public final class MCPBridge: @unchecked Sendable {
                     "mimeType": .string(mime),
                 ]))
             }
-            respond(id: id, result: .object([
+            respond(id: id, result: Self.complete([
                 "content": .array(content),
                 "isError": .bool(reply?["isError"]?.boolValue ?? (reply == nil)),
             ]))
 
         case "ping":
-            respond(id: id, result: .object([:]))
+            // Removed in 2026-07-28, kept because a handshake-era client may still send it
+            // and a "method not found" would read as a dead server.
+            respond(id: id, result: Self.complete([:]))
 
         default:
             guard id != nil else { break }

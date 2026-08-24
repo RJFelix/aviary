@@ -66,7 +66,7 @@ prompt ─▶ AgentRunner ─▶ Agent ─┬─▶ ChatProvider   openai-comple
 | `SubAgents.swift` | writes the harness's sub-agent ledger, so Flock draws in-house children |
 | `SkillGate.swift` | which skills a request carries |
 | `Memory.swift` | what the agent has learned, and how much of it a request carries |
-| `MCPClient.swift` | stdio JSON-RPC: initialize, tools/list, tools/call |
+| `MCPClient.swift` | stdio JSON-RPC, dual-era: `server/discover` probe, `tools/list`, `tools/call` |
 
 ### Decisions, and the measurement behind each
 
@@ -334,6 +334,36 @@ agent loop:
 | The transcript, in Aviary's own format | Compaction, and Aviary's own message log |
 
 ### The courier, and why there is one
+
+### Two eras of MCP, on purpose
+
+The `2026-07-28` revision removed the `initialize` handshake outright. Version, identity and
+capabilities now ride in `_meta` on every request, and nothing is inferred from the connection —
+which suits a client like this one, where a server process may be reused across unrelated
+sessions and the old model quietly assumed a connection *was* a conversation.
+
+Almost nothing in the wild speaks it yet, so both halves are dual-era.
+
+**As a client**, `MCPClient` runs the spec's own stdio probe: send `server/discover`, and read
+the *shape of the failure*. A reserved-range error code (`-32020`…`-32099`) means a modern
+server that merely objected to something; anything else — unknown method, silence, a timeout —
+means handshake-era, and the client falls back to `initialize`, walking the legacy versions
+newest-first. The era is settled once and cached, because it is a property of the server rather
+than of a request.
+
+One trap worth keeping: plenty of handshake-era servers answer *any* unknown method with an
+empty object rather than `-32601` — this repo's own echo fixture does. A probe that accepted
+that as a `DiscoverResult` would go stateless against a server that ignores `_meta` entirely, so
+a reply without `supportedVersions` is treated as legacy no matter how successful it looks.
+
+**As a server**, `MCPBridge` answers whichever opening arrives, because its client is Claude
+Code and its era is not ours to choose. A request carrying modern `_meta` is served statelessly;
+an `initialize` selects handshake semantics. `resultType` and `serverInfo` are additive, so a
+legacy client ignores them rather than choking.
+
+Absent by choice: roots, sampling and elicitation — all three deprecated in this revision — so
+the client declares no capabilities and treats an `input_required` result as a readable error
+rather than an empty answer.
 
 MCP servers are spawned *by* the client, so the process that answers `tools/call` is a child of
 `claude` — not of Aviary, and therefore not the process holding the kernel.

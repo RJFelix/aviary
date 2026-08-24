@@ -4886,6 +4886,118 @@ let casesAttachImage: [Case] = [
     }),
 ]
 
+
+// MARK: - MCP, both eras
+
+private func mcpFixture(_ name: String) -> String? {
+    guard let root = EngineLocator.repoRoot() else { return nil }
+    let path = root.appending(path: "test-fixtures/\(name)").path
+    return FileManager.default.fileExists(atPath: path) ? path : nil
+}
+
+let casesMCPVersions: [Case] = [
+
+    ("mcp: a modern server is served statelessly, and gets the metadata it demands", {
+        // The fixture refuses any request without the per-request `_meta` the 2026-07-28
+        // revision requires, so this passing is evidence the metadata actually crossed the
+        // wire rather than that both sides agreed to skip it.
+        guard let fixture = mcpFixture("mcp-modern.py") else {
+            print("      skipped: no modern fixture"); return
+        }
+        let client = MCPClient(
+            name: "modern", executable: "/usr/bin/env", arguments: ["python3", fixture])
+        let tools = try await client.start(timeout: 20)
+        let era = try XCTUnwrap(await client.era)
+        XCTAssertTrue(era.isModern, "server/discover answered, so no handshake was needed")
+        XCTAssertEqual(era.version, "2026-07-28")
+        XCTAssertEqual(await client.serverInfo?.contains("modern-fixture"), true)
+        XCTAssertEqual(tools.map(\.name).sorted(), ["needs_input", "whoami"])
+        // The freshness hint is recorded rather than discarded.
+        XCTAssertEqual(await client.toolsTTL, 60)
+
+        let who = try await client.callTool("whoami", arguments: .object([:]))
+        XCTAssertEqual(who.text, "2026-07-28 aviary",
+                       "the server saw our version and our identity on the call itself")
+        await client.stop()
+    }),
+
+    ("mcp: an interim result is not mistaken for an answer", {
+        // resultType "input_required" means the server wants sampling or elicitation back.
+        // Aviary declares no such capabilities, so the honest outcome is a readable error —
+        // treating the interim result as complete would hand the agent an empty answer and
+        // let it carry on as though the call had worked.
+        guard let fixture = mcpFixture("mcp-modern.py") else {
+            print("      skipped: no modern fixture"); return
+        }
+        let client = MCPClient(
+            name: "modern", executable: "/usr/bin/env", arguments: ["python3", fixture])
+        _ = try await client.start(timeout: 20)
+        var said: String?
+        do {
+            _ = try await client.callTool("needs_input", arguments: .object([:]))
+            XCTFail("an input_required result must not read as a completed call")
+        } catch { said = error.localizedDescription }
+        XCTAssertTrue(said?.contains("sampling/createMessage") == true, said ?? "no error")
+        await client.stop()
+    }),
+
+    ("mcp: a handshake-era server still works, and is detected as one", {
+        // The echo fixture answers *any* unknown method with an empty object rather than
+        // -32601 — which is exactly the trap: a probe that took that for a DiscoverResult
+        // would go stateless against a server that ignores _meta entirely.
+        guard let fixture = mcpFixture("mcp-echo.py") else {
+            print("      skipped: no echo fixture"); return
+        }
+        let client = MCPClient(
+            name: "echo", executable: "/usr/bin/env", arguments: ["python3", fixture])
+        let tools = try await client.start(timeout: 20)
+        let era = try XCTUnwrap(await client.era)
+        XCTAssertFalse(era.isModern, "an empty reply is not a DiscoverResult")
+        XCTAssertEqual(era.version, "2024-11-05", "the version the server itself named")
+        XCTAssertEqual(tools.map(\.name).sorted(), ["echo", "explode"])
+        let ok = try await client.callTool("echo", arguments: .object(["text": .string("hi")]))
+        XCTAssertEqual(ok.text, "hi")
+        await client.stop()
+    }),
+
+    ("mcp: the bridge answers both eras, because its client is not ours to choose", {
+        // Claude Code is on the other end of this one. Bumping the bridge to modern-only
+        // would have broken the driven engine on whatever version Claude Code happens to
+        // speak, so it serves whichever opening arrives.
+        let discover = MCPBridge.complete([
+            "supportedVersions": .array(
+                ([MCPBridge.modernVersion] + MCPBridge.legacyVersions).map { .string($0) }),
+        ])
+        XCTAssertEqual(discover["resultType"]?.stringValue, "complete")
+        XCTAssertEqual(
+            discover["_meta"]?["io.modelcontextprotocol/serverInfo"]?["name"]?.stringValue,
+            "aviary-kernel")
+        let versions = (discover["supportedVersions"]?.arrayValue ?? []).compactMap(\.stringValue)
+        XCTAssertTrue(versions.contains("2026-07-28"))
+        XCTAssertTrue(versions.contains("2024-11-05"), "and the era Claude Code may still use")
+    }),
+
+    ("mcp: configured servers are what a run actually gets", {
+        // The config reader predates any caller. This pins the shape it reads, since a typo
+        // here is a server that silently never starts.
+        let config = try XCTUnwrap(JSONValue.parse(Data("""
+            {"mcpServers": {
+              "linear": {"command": "npx", "args": ["-y", "linear-mcp"], "env": {"K": "v"}},
+              "off": {"command": "x", "disabled": true},
+              "remote": {"type": "http", "url": "https://example.com"}
+            }}
+            """.utf8)))
+        let servers = MCPConfiguration.parse(config)
+        XCTAssertEqual(servers.map(\.name), ["linear", "off", "remote"].filter { $0 != "remote" },
+                       "a transport this client cannot speak is skipped, not half-started")
+        let linear = try XCTUnwrap(servers.first { $0.name == "linear" })
+        XCTAssertEqual(linear.arguments, ["-y", "linear-mcp"])
+        XCTAssertEqual(linear.environment["K"], "v")
+        XCTAssertTrue(linear.enabled)
+        XCTAssertFalse(try XCTUnwrap(servers.first { $0.name == "off" }).enabled)
+    }),
+]
+
 await Harness.run(
     cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
-        + casesLibraryUsage + casesArtifact + casesAttachImage)
+        + casesLibraryUsage + casesArtifact + casesAttachImage + casesMCPVersions)

@@ -72,6 +72,57 @@ public actor AgentRunner {
 
     /// Run a root agent to completion. Returns its transcript so a caller can render it.
     /// Build the run and send its first prompt.
+    /// Live MCP servers, held so they can be stopped with the run that started them.
+    private var mcpClients: [MCPClient] = []
+
+    struct MCPReport {
+        var client: MCPClient?
+        var tools: [MCPClient.Tool]
+        var note: String
+    }
+
+    /// Start every configured MCP server and collect its tools.
+    ///
+    /// One failing server must not take the run with it: an MCP server is somebody else's
+    /// program, frequently a `npx` invocation that will fail the first time it is run on a
+    /// machine, and a run that refuses to start because a note-taking integration is broken is
+    /// a worse outcome than a run without that integration. So each is reported into the
+    /// transcript and the rest continue.
+    private func startMCPServers() async -> [MCPReport] {
+        let configured = MCPConfiguration.load(home: settings.home).filter(\.enabled)
+        guard !configured.isEmpty else { return [] }
+        var reports: [MCPReport] = []
+        for server in configured {
+            let client = MCPClient(
+                name: server.name, executable: server.command, arguments: server.arguments,
+                environment: server.environment)
+            do {
+                let tools = try await client.start()
+                mcpClients.append(client)
+                let era = await client.era
+                reports.append(MCPReport(
+                    client: client, tools: tools,
+                    note: "MCP · \(server.name): \(tools.count) tool(s) over "
+                        + "\(era?.label ?? "an unknown protocol")"))
+            } catch {
+                await client.stop()
+                let diagnostics = await client.diagnostics
+                reports.append(MCPReport(
+                    client: nil, tools: [],
+                    note: "MCP · \(server.name) did not start: \(error.localizedDescription)"
+                        + (diagnostics.isEmpty ? "" : "\n" + String(diagnostics.suffix(400)))))
+            }
+        }
+        return reports
+    }
+
+    /// Stop the servers this run started.
+    public func stopMCPServers() async {
+        let clients = mcpClients
+        mcpClients.removeAll()
+        for client in clients { await client.stop() }
+    }
+
     public func run(prompt: String) async throws -> (writer: SessionWriter, agent: Agent) {
         let prepared = try await prepare()
         await prepared.agent.send(prompt)
@@ -130,6 +181,16 @@ public actor AgentRunner {
         }
         if settings.recordPayloads {
             await agent.recordPayloads(to: WireLog.path(forRun: UUID()))
+        }
+
+        // MCP servers from settings.json. Started here rather than at app launch because a
+        // server is a child process holding credentials, and the honest lifetime for that is
+        // the run that asked for it.
+        for report in await startMCPServers() {
+            try? await writer.appendNote(report.note, customType: "aviary.mcp")
+            if let client = report.client, !report.tools.isEmpty {
+                await agent.addMCPTools(report.tools, from: client)
+            }
         }
 
         // Route the runtime's callbacks to this agent. One host serves many sessions, so the

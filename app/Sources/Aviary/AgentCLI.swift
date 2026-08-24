@@ -302,6 +302,7 @@ enum AgentCLI {
         } catch {
             note("could not start: \(error.localizedDescription)")
         }
+        await runner.stopMCPServers()
         await host.stop()
     }
 

@@ -283,8 +283,10 @@ final class InHouseDriver {
         task?.cancel()
         watcher?.stop()
         let host = self.host
+        let runner = self.runner
         Task {
             await self.writer?.close()
+            await runner?.stopMCPServers()
             await host?.stop()
         }
         hasExited = true
