@@ -169,7 +169,8 @@ final class InHouseDriver {
             streamingText = ""
             streamingThinking = ""
             reload()
-        case .goalExhausted, .toolStarted, .toolFinished, .compacted, .childStarted, .childFinished:
+        case .goalExhausted, .toolStarted, .toolFinished, .compacted, .childStarted,
+             .childFinished, .imageAttached:
             reload()
         case .finished:
             isStreaming = false

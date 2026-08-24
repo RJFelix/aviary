@@ -255,6 +255,8 @@ enum AgentCLI {
                 FileHandle.standardOutput.write(Data(t.utf8))
             case .thinkingDelta:
                 break  // shown in the GUI, noise in a terminal
+            case .imageAttached(let path, let width, let height):
+                note("\n👁 \(path) (\(width)×\(height))")
             case .toolStarted(_, _, let arguments):
                 let code = arguments["code"]?.stringValue ?? ""
                 note("\n▸ python\n" + code.split(separator: "\n").map { "  \($0)" }

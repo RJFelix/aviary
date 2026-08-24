@@ -1,5 +1,8 @@
+import CoreGraphics
 import CryptoKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 @testable import AviaryCore
 
 /// The transcript parser is the one piece where a silent mistake is invisible: a dropped
@@ -512,6 +515,7 @@ final class EventLog: @unchecked Sendable {
     func record(_ event: Agent.Event) {
         lock.lock(); defer { lock.unlock() }
         switch event {
+        case .imageAttached: events.append("imageAttached")
         case .started: events.append("started")
         case .steered: events.append("steered")
         case .goalExhausted: events.append("goal-exhausted")
@@ -3849,13 +3853,23 @@ let cases6: [Case] = [
     ("claude-code: the kernel is described identically to the in-house one, minus spawn", {
         // Two engines describing the same kernel differently would make a transcript's meaning
         // depend on which one wrote it, so this is an invariant worth pinning.
+        // Same catalogue, same context, same words. A driven session is always a Claude
+        // model, so it always has vision; an in-house run has it only if its model does, which
+        // is a difference in the *run*, not in how the two engines describe one.
         let driven = ClaudeCodeKernel.description(cwd: "/repo", hasMemory: true)
-        let inHouse = try XCTUnwrap(Agent.tools(cwd: "/repo", hasMemory: true).first).description
+        let inHouse = try XCTUnwrap(Agent.tools(
+            cwd: "/repo", hasMemory: true, supportsImages: true).first).description
         XCTAssertEqual(driven, inHouse)
         // Without memory, both drop the same paragraph.
         XCTAssertEqual(
             ClaudeCodeKernel.description(cwd: "/repo", hasMemory: false),
-            try XCTUnwrap(Agent.tools(cwd: "/repo", hasMemory: false).first).description)
+            try XCTUnwrap(Agent.tools(
+                cwd: "/repo", hasMemory: false, supportsImages: true).first).description)
+        // And a text-only run differs by exactly one name, rather than by a paragraph of
+        // prose somebody rewrote in one place and not the other.
+        let textOnly = try XCTUnwrap(Agent.tools(cwd: "/repo", hasMemory: true).first).description
+        XCTAssertFalse(textOnly.contains("attach_image("))
+        XCTAssertTrue(driven.contains("attach_image("))
         XCTAssertFalse(driven.contains("spawn("), "a driven session has no runner to spawn with")
         XCTAssertTrue(driven.contains("remember("))
         XCTAssertTrue(driven.contains("/repo"))
@@ -3871,7 +3885,9 @@ let cases6: [Case] = [
             schema: .object(["type": .string("object")])
         ) { arguments in
             let code = arguments["code"]?.stringValue ?? ""
-            return code == "fail" ? ("boom", true) : ("ran: " + code, false)
+            return code == "fail"
+                ? KernelBridge.Result(text: "boom", isError: true)
+                : KernelBridge.Result(text: "ran: " + code)
         }])
         let endpoint = try await bridge.start()
         defer { Task { await bridge.stop() } }
@@ -4255,9 +4271,13 @@ let casesBuiltins: [Case] = [
         // capability the model is not told about does not exist — so the description is
         // rendered from the same list the namespace is built from, and this asserts the two
         // cannot come apart.
-        for (memory, spawn) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (memory, spawn, vision) in [
+            (false, false, false), (true, false, false), (false, true, false),
+            (true, true, false), (true, true, true), (false, false, true),
+        ] {
             let ctx = Builtins.Context(
-                cwd: "/repo", hasMemory: memory, canSpawn: spawn, spawnBudget: 2)
+                cwd: "/repo", hasMemory: memory, canSpawn: spawn, spawnBudget: 2,
+                supportsImages: vision)
             let text = Builtins.description(ctx)
             for name in Builtins.names(ctx) {
                 XCTAssertTrue(text.contains(name + "("), "\(name) is bound but undescribed")
@@ -4281,11 +4301,12 @@ let casesBuiltins: [Case] = [
     }),
 
     ("builtins: both engines render the one catalogue rather than describing it twice", {
-        let ctx = Builtins.Context(cwd: "/repo", hasMemory: true)
+        let ctx = Builtins.Context(cwd: "/repo", hasMemory: true, supportsImages: true)
         XCTAssertEqual(ClaudeCodeKernel.description(cwd: "/repo", hasMemory: true),
                        Builtins.description(ctx))
         XCTAssertEqual(
-            try XCTUnwrap(Agent.tools(cwd: "/repo", hasMemory: true).first).description,
+            try XCTUnwrap(Agent.tools(
+                cwd: "/repo", hasMemory: true, supportsImages: true).first).description,
             Builtins.description(ctx))
     }),
 
@@ -4728,6 +4749,143 @@ let casesArtifact: [Case] = [
     }),
 ]
 
+
+/// A real encoded PNG of a given size — the point of these tests is the decode/scale path, so
+/// a hand-written byte array would test nothing.
+private func writePNG(width: Int, height: Int, to url: URL) throws {
+    let context = CGContext(
+        data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    context.setFillColor(CGColor(red: 0.2, green: 0.5, blue: 0.9, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    let image = context.makeImage()!
+    let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!
+    CGImageDestinationAddImage(dest, image, nil)
+    _ = CGImageDestinationFinalize(dest)
+}
+
+// MARK: - Looking at an image
+
+let casesAttachImage: [Case] = [
+
+    ("attach_image: a huge screenshot is scaled to something worth sending", {
+        // Images bill by area. A retina screenshot is 3024x1964 before anything has happened,
+        // and sending it untouched is several thousand tokens for a picture whose legible
+        // content survives being halved.
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-img-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let big = dir.appending(path: "screenshot.png")
+        try writePNG(width: 3024, height: 1964, to: big)
+
+        let image = try AttachedImage.read(path: big.path)
+        XCTAssertEqual(max(image.width, image.height), AttachedImage.maxEdge)
+        XCTAssertEqual(image.width, 1568)
+        XCTAssertEqual(image.height, 1018, "the aspect ratio survives")
+        XCTAssertNotNil(image.scaledFrom, "and the agent is told it was scaled")
+        XCTAssertFalse(image.base64.isEmpty)
+
+        // Small enough to send as-is is left alone: rescaling a diagram blurs the text on it.
+        let small = dir.appending(path: "small.png")
+        try writePNG(width: 320, height: 200, to: small)
+        let untouched = try AttachedImage.read(path: small.path)
+        XCTAssertEqual(untouched.width, 320)
+        XCTAssertNil(untouched.scaledFrom)
+    }),
+
+    ("attach_image: a missing or undecodable file is an error the agent can act on", {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-img-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        var missingSaid: String?
+        do {
+            _ = try AttachedImage.read(path: dir.appending(path: "nope.png").path)
+        } catch { missingSaid = error.localizedDescription }
+        XCTAssertTrue(missingSaid?.contains("No file at") == true,
+                      "a path typo must read as a path typo")
+
+        let notAnImage = dir.appending(path: "notes.txt")
+        try "these are not pixels".write(to: notAnImage, atomically: true, encoding: .utf8)
+        var undecodableSaid: String?
+        do {
+            _ = try AttachedImage.read(path: notAnImage.path)
+        } catch { undecodableSaid = error.localizedDescription }
+        // Names the formats rather than saying "unreadable": the usual causes are a wrong
+        // path and a file that is not an image, and the fix differs.
+        XCTAssertTrue(undecodableSaid?.contains("PNG") == true, undecodableSaid ?? "no error")
+    }),
+
+    ("attach_image: a text-only model is not offered it at all", {
+        // The failure mode this avoids is a provider 400 the agent cannot read. A name that
+        // is absent is a fact the model can work with; a name that exists and always fails
+        // is not.
+        let vision = Builtins.description(
+            Builtins.Context(cwd: "/repo", supportsImages: true))
+        XCTAssertTrue(vision.contains("attach_image("))
+        let textOnly = Builtins.description(Builtins.Context(cwd: "/repo"))
+        XCTAssertFalse(textOnly.contains("attach_image("))
+        let entry = try XCTUnwrap(Builtins.all(.reference).first { $0.name == "attach_image" })
+        XCTAssertEqual(entry.requirement, .vision)
+        XCTAssertEqual(entry.mechanism, .callback)
+    }),
+
+    ("attach_image: the kernel carries the picture back inside the tool result", {
+        // A driven session is the interesting case: Aviary owns no part of Claude Code's
+        // message list, so the result of the call the model just made is the only channel
+        // into its context.
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-img-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appending(path: "chart.png")
+        try writePNG(width: 64, height: 48, to: file)
+        let image = try AttachedImage.read(path: file.path)
+
+        let result = KernelBridge.Result(text: "ran", images: [image])
+        XCTAssertEqual(result.images.count, 1)
+        XCTAssertEqual(result.images.first?.mimeType, "image/png")
+        XCTAssertFalse(result.isError)
+        // The summary handed back to Python is what the cell prints, so it must be readable.
+        let summary = image.summary
+        XCTAssertEqual(summary["width"]?.doubleValue, 64)
+        XCTAssertEqual(summary["height"]?.doubleValue, 48)
+        XCTAssertNotNil(summary["path"]?.stringValue)
+    }),
+
+    ("attach_image: the transcript keeps the picture, not a note saying there was one", {
+        // A session replayed tomorrow has to show what the agent was looking at, or the
+        // reasoning that followed it is unreadable.
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-img-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appending(path: "shot.png")
+        try writePNG(width: 32, height: 32, to: file)
+        let image = try AttachedImage.read(path: file.path)
+
+        let home = AgentHome(root: dir.appending(path: "home", directoryHint: .isDirectory))
+        let writer = try SessionWriter(home: home, cwd: dir.path, model: nil)
+        try await writer.appendImage(
+            mimeType: image.mimeType, base64: image.base64, path: image.path,
+            note: "the failing dialog")
+        await writer.close()
+
+        let parsed = try XCTUnwrap(SessionParser.parse(fileURL: writer.fileURL))
+        let images = parsed.items.flatMap { item -> [(String, String)] in
+            item.blocks.compactMap {
+                if case .image(let mime, let data) = $0 { return (mime, data) } else { return nil }
+            }
+        }
+        XCTAssertEqual(images.count, 1, "the image is in the file, decodable")
+        XCTAssertEqual(images.first?.0, "image/png")
+        XCTAssertEqual(images.first?.1, image.base64)
+    }),
+]
+
 await Harness.run(
     cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
-        + casesLibraryUsage + casesArtifact)
+        + casesLibraryUsage + casesArtifact + casesAttachImage)

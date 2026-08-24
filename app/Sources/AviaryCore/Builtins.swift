@@ -27,6 +27,8 @@ public enum Builtins {
         case memory
         /// Only when there is sub-agent depth left to spend.
         case spawn
+        /// Only when the model on this run actually accepts images.
+        case vision
 
         public var id: String { rawValue }
 
@@ -35,6 +37,7 @@ public enum Builtins {
             case .always: return "Always"
             case .memory: return "With memory"
             case .spawn: return "With sub-agents"
+            case .vision: return "With a vision model"
             }
         }
 
@@ -48,6 +51,9 @@ public enum Builtins {
             case .spawn:
                 return "Bound only while sub-agent depth remains, and the remaining depth is "
                     + "written into the description so the model can see its own budget."
+            case .vision:
+                return "Bound only when the model's input modalities include images. Offering "
+                    + "it to a text-only model would trade a provider error for a capability."
             }
         }
     }
@@ -106,21 +112,24 @@ public enum Builtins {
         public var hasMemory: Bool
         public var canSpawn: Bool
         public var spawnBudget: Int
+        public var supportsImages: Bool
 
         public init(
-            cwd: String, hasMemory: Bool = false, canSpawn: Bool = false, spawnBudget: Int = 0
+            cwd: String, hasMemory: Bool = false, canSpawn: Bool = false, spawnBudget: Int = 0,
+            supportsImages: Bool = false
         ) {
             self.cwd = cwd
             self.hasMemory = hasMemory
             self.canSpawn = canSpawn
             self.spawnBudget = spawnBudget
+            self.supportsImages = supportsImages
         }
 
         /// Everything switched on, for a reader who wants to see the whole shelf rather than
         /// one run's slice of it.
         public static let reference = Context(
             cwd: "<the session's working directory>", hasMemory: true, canSpawn: true,
-            spawnBudget: 1)
+            spawnBudget: 1, supportsImages: true)
     }
 
     /// Every builtin, in description order, each marked with whether this run has it.
@@ -195,6 +204,19 @@ public enum Builtins {
                     + "report back. Delegate genuinely separable work; doing it yourself is "
                     + "usually cheaper.",
                 requirement: .spawn, mechanism: .callback, isAvailable: ctx.canSpawn),
+            Entry(
+                name: "attach_image",
+                signature: "attach_image(path, note=None)",
+                summary: "Put an image on screen for yourself — a screenshot, a chart, a scan.",
+                bullet: "attach_image(path, note=None) – look at an image file. It is added to "
+                    + "the conversation as something you can actually see, not described to "
+                    + "you. Returns {'path', 'width', 'height', 'bytes'}, or a dict with an "
+                    + "'error' key. Large images are scaled down before they are sent.",
+                note: "Use it when the answer is in a picture — a screenshot of a failing UI, "
+                    + "a chart you just plotted, a scanned page. An image costs roughly as "
+                    + "much as a page of text, so attach the one that decides the question "
+                    + "rather than everything you have.",
+                requirement: .vision, mechanism: .callback, isAvailable: ctx.supportsImages),
         ]
     }
 

@@ -76,26 +76,36 @@ public actor ClaudeCodeKernel {
             ])
         ) { [weak self] arguments in
             guard let self else {
-                return ("Aviary is no longer running this session.", true)
+                return KernelBridge.Result(
+                    text: "Aviary is no longer running this session.", isError: true)
             }
             return await self.run(arguments: arguments)
         }
     }
 
     private var cwdHint = FileManager.default.currentDirectoryPath
+    /// Images this cell asked to look at, waiting for the cell to finish.
+    private var pendingImages: [AttachedImage] = []
 
     public func setCwdHint(_ cwd: String) { cwdHint = cwd }
 
-    private func run(arguments: JSONValue) async -> (text: String, isError: Bool) {
+    private func run(arguments: JSONValue) async -> KernelBridge.Result {
         guard let code = arguments["code"]?.stringValue, !code.isEmpty else {
-            return ("The `code` argument is required and must not be empty.", true)
+            return KernelBridge.Result(
+                text: "The `code` argument is required and must not be empty.", isError: true)
         }
         do {
             let result = try await host.execute(code, in: hostSession)
             hostFailures = 0
             // The same rendering the in-house agent sees, so a transcript reads identically
             // whichever engine produced it.
-            return (Agent.render(result), result.failed)
+            // Drained here rather than returned by the callback, because the callback answers
+            // the *cell* and the image has to reach Claude Code, which only ever sees the tool
+            // result. So it waits for the call that queued it to finish.
+            let images = pendingImages
+            pendingImages.removeAll()
+            return KernelBridge.Result(
+                text: Agent.render(result), isError: result.failed, images: images)
         } catch {
             // A host failure is *the machinery* breaking, not agent code raising — and saying
             // so matters, because the model's correct response differs: retrying is right for
@@ -109,7 +119,7 @@ public actor ClaudeCodeKernel {
             hostFailures += 1
             let detail = error.localizedDescription
             if hostFailures >= 2 {
-                return ("""
+                return KernelBridge.Result(text: """
                     The Aviary runtime host is gone and is not coming back in this session: \
                     \(detail)
 
@@ -117,9 +127,10 @@ public actor ClaudeCodeKernel {
                     Stop now and report what you had established before it died, so the work \
                     is not lost. A person has to restart the session to get an interpreter \
                     back.
-                    """, true)
+                    """, isError: true)
             }
-            return ("The Aviary runtime host failed to run this: " + detail, true)
+            return KernelBridge.Result(
+                text: "The Aviary runtime host failed to run this: " + detail, isError: true)
         }
     }
 
@@ -132,6 +143,22 @@ public actor ClaudeCodeKernel {
     /// is worse than agent code that is told no.
     public func serveCallback(kind: String, payload: JSONValue) async -> JSONValue {
         switch kind {
+        case "attach_image":
+            guard let path = payload["path"]?.stringValue, !path.isEmpty else {
+                return .object(["error": .string("attach_image() needs a path.")])
+            }
+            do {
+                let image = try AttachedImage.read(path: path)
+                pendingImages.append(image)
+                await appendNote?(
+                    "Looked at \(URL(fileURLWithPath: image.path).lastPathComponent) "
+                        + "(\(image.width)×\(image.height))",
+                    "aviary.image")
+                return image.summary
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+
         case "remember":
             guard let memory else {
                 return .object(["error": .string("This run has no memory store.")])
@@ -236,6 +263,9 @@ public actor ClaudeCodeKernel {
     /// runner to spawn with. Two engines describing the same kernel in their own words would
     /// make a transcript's meaning depend on which one wrote it.
     static func description(cwd: String, hasMemory: Bool) -> String {
-        Builtins.description(Builtins.Context(cwd: cwd, hasMemory: hasMemory, canSpawn: false))
+        // supportsImages unconditionally: this engine is always driven by a Claude model, and
+        // every one of them reads images.
+        Builtins.description(Builtins.Context(
+            cwd: cwd, hasMemory: hasMemory, canSpawn: false, supportsImages: true))
     }
 }

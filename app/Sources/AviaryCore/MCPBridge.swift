@@ -197,10 +197,26 @@ public final class MCPBridge: @unchecked Sendable {
             let text = reply?["text"]?.stringValue
                 ?? reply?["error"]?.stringValue
                 ?? "Aviary did not answer this call. The run may have ended."
+            var content: [JSONValue] = [.object([
+                "type": .string("text"), "text": .string(text),
+            ])]
+            // Images ride back inside the tool result, which is how a driven session sees one
+            // at all: Aviary owns no part of Claude Code's message list, so the only channel
+            // into its context is the result of the call it just made. MCP's own image block,
+            // not a data: URI in the text — the client decodes this and the model sees a
+            // picture rather than eighty thousand characters of base64.
+            for image in reply?["images"]?.arrayValue ?? [] {
+                guard let data = image["data"]?.stringValue,
+                      let mime = image["mimeType"]?.stringValue
+                else { continue }
+                content.append(.object([
+                    "type": .string("image"),
+                    "data": .string(data),
+                    "mimeType": .string(mime),
+                ]))
+            }
             respond(id: id, result: .object([
-                "content": .array([.object([
-                    "type": .string("text"), "text": .string(text),
-                ])]),
+                "content": .array(content),
                 "isError": .bool(reply?["isError"]?.boolValue ?? (reply == nil)),
             ]))
 

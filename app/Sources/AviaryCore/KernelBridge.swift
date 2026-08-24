@@ -26,16 +26,34 @@ import Security
 public actor KernelBridge {
 
     /// One tool this bridge offers, and what running it does.
+    /// What a kernel call answers with.
+    ///
+    /// A struct rather than the `(text, isError)` tuple it started as, because a driven
+    /// session's only channel into Claude Code's context is the result of the call it just
+    /// made — Aviary owns no part of that message list. So an image the agent asked to look at
+    /// has to travel here or not at all.
+    public struct Result: Sendable {
+        public var text: String
+        public var isError: Bool
+        public var images: [AttachedImage]
+
+        public init(text: String, isError: Bool = false, images: [AttachedImage] = []) {
+            self.text = text
+            self.isError = isError
+            self.images = images
+        }
+    }
+
     public struct Tool: Sendable {
         public var name: String
         public var description: String
         public var schema: JSONValue
         /// Runs the tool. Returns the text the model should see, and whether it failed.
-        public var run: @Sendable (JSONValue) async -> (text: String, isError: Bool)
+        public var run: @Sendable (JSONValue) async -> Result
 
         public init(
             name: String, description: String, schema: JSONValue,
-            run: @escaping @Sendable (JSONValue) async -> (text: String, isError: Bool)
+            run: @escaping @Sendable (JSONValue) async -> Result
         ) {
             self.name = name
             self.description = description
@@ -221,11 +239,20 @@ public actor KernelBridge {
             let arguments = request["arguments"] ?? .object([:])
             Task {
                 let result = await tool.run(arguments)
-                self.reply(.object([
+                var payload: [String: JSONValue] = [
                     "id": id,
                     "text": .string(result.text),
                     "isError": .bool(result.isError),
-                ]), on: connection)
+                ]
+                if !result.images.isEmpty {
+                    payload["images"] = .array(result.images.map {
+                        .object([
+                            "mimeType": .string($0.mimeType),
+                            "data": .string($0.base64),
+                        ])
+                    })
+                }
+                self.reply(.object(payload), on: connection)
             }
 
         default:

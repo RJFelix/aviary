@@ -78,6 +78,8 @@ public actor Agent {
         case goalExhausted(String)
         case childStarted(id: String, name: String, prompt: String)
         case childFinished(id: String, name: String, answer: String, isError: Bool)
+        /// The agent put an image in front of itself.
+        case imageAttached(path: String, width: Int, height: Int)
         /// The loop stopped. `reason` is why, in words, because "it stopped" is never enough
         /// to act on.
         case finished(reason: String)
@@ -118,6 +120,8 @@ public actor Agent {
     /// sees. Namespaced because two servers may both offer `search`, and a bare name would
     /// make that collision silent.
     private var mcpTools: [String: (client: MCPClient, tool: MCPClient.Tool)] = [:]
+    /// Images the cell asked to look at, waiting for the end of the tool call that queued them.
+    private var pendingImages: [(image: AttachedImage, note: String?)] = []
     /// Where `remember` writes and `recall` reads. Absent means the run has no memory, which
     /// is a legitimate configuration rather than an error.
     private var memory: MemoryStore?
@@ -190,6 +194,27 @@ public actor Agent {
     /// code and is blocked on the reply, so a refusal it can read beats a hang it cannot.
     public func serveCallback(kind: String, payload: JSONValue) async -> JSONValue {
         switch kind {
+        case "attach_image":
+            guard config.model.supportsImages else {
+                return .object(["error": .string(
+                    "\(config.model.id) does not accept images. Describe what you need from "
+                        + "the file instead, or switch the run to a vision model.")])
+            }
+            guard let path = payload["path"]?.stringValue, !path.isEmpty else {
+                return .object(["error": .string("attach_image() needs a path.")])
+            }
+            do {
+                let image = try AttachedImage.read(path: path)
+                // Queued rather than returned: an image has to reach the model as a content
+                // block in the conversation, and a tool result is text. The loop drains this
+                // straight after the result that produced it, so the picture arrives with the
+                // reasoning that asked for it rather than a turn later.
+                pendingImages.append((image, payload["note"]?.stringValue))
+                return image.summary
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+
         case "spawn":
             guard let delegate = spawnDelegate else {
                 return .object(["error": .string("Sub-agents are not enabled for this run.")])
@@ -367,10 +392,12 @@ public actor Agent {
     /// namespace, absent from this text, and a real run spent twenty turns grepping the
     /// codebase for it before giving up.
     public static func tools(
-        cwd: String, canSpawn: Bool = false, spawnBudget: Int = 0, hasMemory: Bool = false
+        cwd: String, canSpawn: Bool = false, spawnBudget: Int = 0, hasMemory: Bool = false,
+        supportsImages: Bool = false
     ) -> [ChatTool] {
         let description = Builtins.description(Builtins.Context(
-            cwd: cwd, hasMemory: hasMemory, canSpawn: canSpawn, spawnBudget: spawnBudget))
+            cwd: cwd, hasMemory: hasMemory, canSpawn: canSpawn, spawnBudget: spawnBudget,
+            supportsImages: supportsImages))
         return [ChatTool(
             name: "python",
             description: description,
@@ -392,7 +419,8 @@ public actor Agent {
             cwd: config.cwd,
             canSpawn: spawnDelegate != nil && config.depth < config.maxDepth,
             spawnBudget: max(0, config.maxDepth - config.depth),
-            hasMemory: memory != nil)
+            hasMemory: memory != nil,
+            supportsImages: config.model.supportsImages)
         // MCP tools are declared individually rather than behind one dispatcher, because a
         // model picks a tool by reading its schema and a single `call_mcp(name, args)` hides
         // every schema behind a string.
@@ -504,6 +532,7 @@ public actor Agent {
                 messages.append(ChatMessage(role: .tool, content: [
                     .toolResult(id: call.id, name: call.name, text: output, isError: isError),
                 ]))
+                await drainPendingImages()
             }
         }
 
@@ -513,6 +542,29 @@ public actor Agent {
             + "Raise maxIterations, or narrow the task."
         try? await writer.appendNote(note)
         emit(.finished(reason: "iteration limit"))
+    }
+
+    /// Move anything `attach_image` queued into the conversation.
+    ///
+    /// A user message rather than part of the tool result, because that is the one shape all
+    /// three providers accept: Anthropic allows images inside a tool result, the OpenAI
+    /// completions shape does not, and a capability that works on two routes out of three is
+    /// worse than one that works everywhere.
+    private func drainPendingImages() async {
+        guard !pendingImages.isEmpty else { return }
+        let queued = pendingImages
+        pendingImages.removeAll()
+        for (image, note) in queued {
+            var content: [ChatContent] = []
+            let caption = note?.trimmingCharacters(in: .whitespacesAndNewlines)
+            content.append(.text(caption.map { "\($0)\n\n" } ?? ""
+                + "[\(image.path) — \(image.width)×\(image.height)]"))
+            content.append(.image(mimeType: image.mimeType, base64: image.base64))
+            messages.append(ChatMessage(role: .user, content: content))
+            try? await writer.appendImage(
+                mimeType: image.mimeType, base64: image.base64, path: image.path, note: caption)
+            emit(.imageAttached(path: image.path, width: image.width, height: image.height))
+        }
     }
 
     // MARK: Compaction

@@ -179,6 +179,29 @@ public actor SessionWriter {
         ])
     }
 
+    /// An image the agent asked to look at.
+    ///
+    /// Written into the transcript as a real user-role image block, the same shape the parser
+    /// already reads, so a session replayed tomorrow shows the picture rather than a note
+    /// saying one was here. The path and caption ride along as text in the same message —
+    /// they are what makes the image legible in a list of thumbnails.
+    public func appendImage(
+        mimeType: String, base64: String, path: String, note: String?
+    ) throws {
+        var blocks: [JSONValue] = []
+        let caption = [note, "[\(path)]"].compactMap { $0 }.filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        blocks.append(.object(["type": .string("text"), "text": .string(caption)]))
+        blocks.append(.object([
+            "type": .string("image"),
+            "mimeType": .string(mimeType),
+            "data": .string(base64),
+        ]))
+        try append(type: "message", fields: [
+            "message": .object(["role": .string("user"), "content": .array(blocks)]),
+        ])
+    }
+
     /// One assistant turn: its text, its visible thinking, its tool calls, and what it cost.
     public func appendAssistant(
         text: String, thinking: String, toolCalls: [(id: String, name: String, arguments: JSONValue)],
