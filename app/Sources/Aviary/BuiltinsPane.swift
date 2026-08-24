@@ -310,7 +310,9 @@ struct UsageChart: View {
         }
         .chartXScale(domain: domain)
         .chartYAxis {
-            AxisMarks { value in
+            // Leading, not the default trailing: the most recent day is the rightmost bar and
+            // the one anybody looks at first, and a trailing axis draws its labels on top of it.
+            AxisMarks(position: .leading) { value in
                 AxisGridLine().foregroundStyle(.separator.opacity(0.5))
                 AxisValueLabel {
                     if let v = value.as(Int.self) { Text("\(v)").font(.system(size: 9)) }

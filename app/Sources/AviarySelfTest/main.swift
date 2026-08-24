@@ -4289,6 +4289,35 @@ let casesBuiltins: [Case] = [
             Builtins.description(ctx))
     }),
 
+    ("builtins: the kernel binds every name the catalogue promises", {
+        // The catalogue is Swift and the namespace is Python, so the invariant that made
+        // `Builtins` worth writing — one list, no drift — stops at the language boundary
+        // unless something checks across it. host.py keeps its own frozenset so `inspect` can
+        // hide the host's helpers from the agent's own variables; a name in the catalogue and
+        // missing there is a name the model is told about and never given.
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // AviarySelfTest
+            .deletingLastPathComponent()  // Sources
+            .deletingLastPathComponent()  // app
+            .deletingLastPathComponent()  // repo root
+        let host = repo.appending(path: "runtime-hosts/python3/host.py")
+        let source = try String(contentsOf: host, encoding: .utf8)
+        let marker = "_AVIARY_INJECTED = frozenset({"
+        let start = try XCTUnwrap(source.range(of: marker))
+        let rest = source[start.upperBound...]
+        let literal = String(rest[..<(try XCTUnwrap(rest.firstIndex(of: "}")))])
+        let bound = Set(literal.split(separator: ",").map {
+            $0.trimmingCharacters(in: CharacterSet(charactersIn: " \n\"'"))
+        })
+        for name in Builtins.names(.reference) {
+            XCTAssertTrue(bound.contains(name),
+                          "\(name) is described to the model but host.py never binds it")
+        }
+        // The reverse is allowed: `ask_app` is the general form the specific callbacks are
+        // built from, deliberately unadvertised so the model does not guess at kinds.
+        XCTAssertTrue(bound.contains("ask_app"))
+    }),
+
     ("builtins: the catalogue says how each name is served, not just that it exists", {
         // The Library shows this, and it is the difference between a free call and one that
         // blocks the cell on a round trip through the app.
