@@ -414,21 +414,7 @@ struct RunPane: View {
 // MARK: - Launcher
 
 struct LauncherSheet: View {
-    @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
-
-    @State private var cwd = ""
-    @State private var prompt = ""
-    @State private var provider: String = ""
-    @State private var modelID: String = ""
-    @State private var thinking = "high"
-    /// Which engine to go back to when you leave `claude-code` behind. Remembered because
-    /// Harness and In-house are a real choice between themselves, and snapping to one of them
-    /// arbitrarily would silently change what a run is.
-    @State private var lastDirectEngine: AppModel.Engine = .inHouse
-    @State private var persistSession = true
-    @State private var noContextFiles = false
-    @State private var recordPayloads = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -444,6 +430,36 @@ struct LauncherSheet: View {
 
             Divider()
 
+            LauncherFormBody(onStart: { dismiss() })
+        }
+        .frame(width: 560, height: 640)
+    }
+}
+
+/// The launcher's cards and start action, shared by the modal (`LauncherSheet`, used from Live)
+/// and Cockpit's inline composer (`NewSessionPane`). Same options either way — a run does not
+/// need fewer of them just because it was started from a card instead of a sheet — so the form
+/// lives once and each caller supplies its own chrome and its own `onStart`.
+struct LauncherFormBody: View {
+    @Environment(AppModel.self) private var model
+    var onStart: () -> Void
+
+    @State private var cwd = ""
+    @State private var prompt = ""
+    @State private var provider: String = ""
+    @State private var modelID: String = ""
+    @State private var thinking = "high"
+    /// Which engine to go back to when you leave `claude-code` behind. Remembered because
+    /// Harness and In-house are a real choice between themselves, and snapping to one of them
+    /// arbitrarily would silently change what a run is.
+    @State private var lastDirectEngine: AppModel.Engine = .inHouse
+    @State private var persistSession = true
+    @State private var noContextFiles = false
+    @State private var recordPayloads = false
+
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     Card("Working directory", symbol: "folder") {
@@ -650,7 +666,7 @@ struct LauncherSheet: View {
                             // level, so it is expressed by omitting the flag entirely.
                             effort: thinking == "off" ? nil : thinking,
                             prompt: prompt)
-                        dismiss()
+                        onStart()
                         return
                     }
                     if model.engineChoice == .inHouse {
@@ -660,7 +676,7 @@ struct LauncherSheet: View {
                             modelID: modelID.isEmpty ? nil : modelID,
                             prompt: prompt,
                             recordPayloads: recordPayloads)
-                        dismiss()
+                        onStart()
                         return
                     }
                     model.startRun(
@@ -674,7 +690,7 @@ struct LauncherSheet: View {
                             recordPayloads: recordPayloads
                                 && EngineLocator.wireLogExtension() != nil),
                         firstPrompt: prompt.isEmpty ? nil : prompt)
-                    dismiss()
+                    onStart()
                 } label: {
                     Label("Start run", systemImage: "play.fill")
                 }
@@ -684,7 +700,6 @@ struct LauncherSheet: View {
             }
             .padding(14)
         }
-        .frame(width: 560, height: 640)
         .onAppear {
             if cwd.isEmpty { cwd = model.defaultCwd }
             if model.engineChoice != .claudeCode { lastDirectEngine = model.engineChoice }
@@ -708,6 +723,7 @@ struct LauncherSheet: View {
             thinking = model.settings.defaultThinkingLevel ?? "high"
         }
     }
+
 
     /// What each engine actually is, in the terms that matter when choosing one.
     ///

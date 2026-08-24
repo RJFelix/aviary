@@ -571,3 +571,77 @@ public enum ProviderTester {
             ?? v["detail"]?.stringValue
     }
 }
+
+/// Which client serves a provider's declared `api`.
+///
+/// One factory, because it was two: `AgentCLI` had a Codex case, `InHouseDriver` did not, and
+/// the GUI therefore sent Codex traffic to the completions client —
+/// `chatgpt.com/backend-api/chat/completions`, which answers `404 {"detail":"Not Found"}`. That
+/// reads as a broken model rather than as a missing case, so it survived until somebody tried
+/// to resume a Codex session from the app. Two switch statements over the same enum is the
+/// shape of that bug; one is not.
+public enum ChatProviderRouting {
+
+    public enum RoutingError: LocalizedError, Equatable {
+        case notSignedIn(String)
+        case noBaseURL(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .notSignedIn(let id):
+                return "Not signed in to \(id). Run `Aviary --codex-login`, or sign in from "
+                    + "the Models tab."
+            case .noBaseURL(let id):
+                return "Provider \(id) has no baseUrl."
+            }
+        }
+    }
+
+    /// Whether a route builds its URL from the provider's `baseUrl`.
+    ///
+    /// Codex carries its own endpoint, so a missing `baseUrl` must not stop it starting —
+    /// while for the others it is a real configuration error worth reporting up front.
+    public static func needsBaseURL(_ api: String?) -> Bool {
+        api != "openai-codex-responses"
+    }
+
+    /// Always true: there is a default. Present so a test can assert that a new api name is
+    /// deliberately routed rather than accidentally unhandled.
+    public static func isKnown(_ api: String?) -> Bool { true }
+
+    /// The client for this provider, or why there isn't one.
+    ///
+    /// `resolveSecret` is injected so this is testable without shelling out to a `!command`
+    /// key expression — on this machine one of them goes through `zsh -ic`.
+    public static func makeProvider(
+        spec: ProviderSpec,
+        model: ModelSpec,
+        home: AgentHome,
+        sessionID: String = UUID().uuidString,
+        resolveSecret: (String?) async -> String? = { await ModelCatalogBuilder.resolveSecret($0) }
+    ) async -> Result<ChatProvider, RoutingError> {
+        if spec.api == "openai-codex-responses" {
+            // OAuth rather than a key, and resolved up front so a missing login is an error at
+            // launch rather than a 401 three turns in.
+            let store = CodexAuth.Store(home: home)
+            guard store.credentials() != nil else {
+                return .failure(.notSignedIn(spec.id))
+            }
+            return .success(CodexResponsesProvider(
+                id: spec.id, store: store, model: model,
+                baseURL: spec.baseURL, sessionID: sessionID))
+        }
+        guard let baseURL = spec.baseURL.flatMap(URL.init(string:)) else {
+            return .failure(.noBaseURL(spec.id))
+        }
+        let key = await resolveSecret(spec.apiKeyExpression)
+        if spec.api == "anthropic-messages" {
+            return .success(AnthropicMessagesProvider(
+                id: spec.id, baseURL: baseURL, apiKey: key, extraHeaders: spec.headers))
+        }
+        // Most vendors speak the completions shape, so it is the useful default for an api
+        // this build does not recognise — served rather than refused.
+        return .success(OpenAICompletionsProvider(
+            id: spec.id, baseURL: baseURL, apiKey: key, extraHeaders: spec.headers))
+    }
+}

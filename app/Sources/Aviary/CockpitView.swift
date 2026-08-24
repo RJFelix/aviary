@@ -5,7 +5,10 @@ import AviaryCore
 /// run Aviary currently owns; selecting one keeps its shared transcript and composer in view.
 struct CockpitView: View {
     @Environment(AppModel.self) private var model
-    @State private var showLauncher = false
+    /// Selected like a run, not sheet-presented: the New Session card lives in the same rail
+    /// as every other run, and choosing it fills the same detail pane a run's chat would use
+    /// rather than opening a modal over it. See `NewSessionPane`.
+    @State private var composingNewSession = false
 
     var body: some View {
         GeometryReader { geo in
@@ -18,7 +21,6 @@ struct CockpitView: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
-        .sheet(isPresented: $showLauncher) { LauncherSheet() }
     }
 
     private var ongoingRuns: [LiveRun] {
@@ -36,6 +38,13 @@ struct CockpitView: View {
         return ongoingRuns.first
     }
 
+    /// A run card reads as selected only when it is actually what's showing in the detail
+    /// pane. Without this, an old selection would still look highlighted while the New
+    /// Session card is the one open — two cards claiming the same state at once.
+    private func isShowing(_ run: LiveRun) -> Bool {
+        !composingNewSession && run.id == selectedRun?.id
+    }
+
     private var runRail: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
@@ -51,12 +60,15 @@ struct CockpitView: View {
                 .padding(.horizontal, 12).padding(.top, 12)
 
                 ForEach(ongoingRuns) { run in
-                    RunRailCard(run: run, selected: run.id == selectedRun?.id) {
+                    RunRailCard(run: run, selected: isShowing(run)) {
                         model.focusedRunID = run.id
+                        composingNewSession = false
                     }
                 }
 
-                NewRunRailCard { showLauncher = true }
+                NewRunRailCard(selected: composingNewSession) {
+                    composingNewSession = true
+                }
             }
             .padding(.horizontal, 9)
             .padding(.bottom, 12)
@@ -66,7 +78,10 @@ struct CockpitView: View {
 
     @ViewBuilder
     private var detail: some View {
-        if let run = selectedRun {
+        if composingNewSession {
+            NewSessionPane(onStart: { composingNewSession = false },
+                            onCancel: { composingNewSession = false })
+        } else if let run = selectedRun {
             // Live keeps its optional diagnostics inspector. Cockpit promises chat space.
             RunPane(run: run, showsInspector: false)
         } else {
@@ -75,6 +90,32 @@ struct CockpitView: View {
                 title: "Start a session",
                 message: "Your ongoing sessions appear in the left rail. Start one here, then "
                     + "its chat and Markdown-aware composer stay on this page.")
+        }
+    }
+}
+
+/// Cockpit's inline replacement for opening `LauncherSheet` over the window: the same
+/// `LauncherFormBody`, given the detail pane's width instead of a modal's fixed frame, with a
+/// header that reads "cancel back to whatever was selected" rather than "dismiss".
+private struct NewSessionPane: View {
+    var onStart: () -> Void
+    var onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Label("New session", systemImage: "plus.circle.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(14)
+
+            Divider()
+
+            LauncherFormBody(onStart: onStart)
         }
     }
 }
@@ -131,6 +172,7 @@ private struct RunRailCard: View {
 }
 
 private struct NewRunRailCard: View {
+    var selected: Bool = false
     let action: () -> Void
 
     var body: some View {
@@ -145,10 +187,14 @@ private struct NewRunRailCard: View {
             .padding(12)
             .frame(maxWidth: .infinity)
             .foregroundStyle(Design.accent)
-            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Design.accentSoft.opacity(0.45)))
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(selected ? Design.accentSoft : Design.accentSoft.opacity(0.45)))
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Design.accent.opacity(0.5), style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+                    // Dashed while idle, like an empty slot; solid once it's the one open in
+                    // the detail pane, matching the selected treatment `RunRailCard` uses.
+                    .strokeBorder(Design.accent.opacity(selected ? 0.85 : 0.5),
+                        style: StrokeStyle(lineWidth: 1, dash: selected ? [] : [4, 3])))
         }
         .buttonStyle(.plain)
     }

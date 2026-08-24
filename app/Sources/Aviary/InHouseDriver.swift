@@ -71,32 +71,28 @@ final class InHouseDriver {
             hasExited = true
             return
         }
-        guard let baseURL = providerSpec.baseURL.flatMap(URL.init(string:)) else {
-            errorBanner = "Provider \(providerSpec.id) has no baseUrl."
+        // The same factory `--agent` uses. Two switch statements over the same api enum is
+        // what let the GUI send Codex traffic to the completions client and 404.
+        let routed = await ChatProviderRouting.makeProvider(
+            spec: providerSpec, model: model, home: home)
+        guard case .success(let provider) = routed else {
+            if case .failure(let why) = routed { errorBanner = why.localizedDescription }
             hasExited = true
             return
         }
 
+        // Started after the provider is settled, so a run that cannot reach a model does not
+        // boot a Python interpreter first and leave it to be torn down again.
         let script = repoRoot.appending(path: "runtime-hosts/python3/host.py")
         let host = RuntimeHost(executable: "/usr/bin/env", arguments: ["python3", script.path])
         self.host = host
         do {
-            let capabilities = try await host.start()
-            runtimeSummary = capabilities.summary
+            runtimeSummary = try await host.start().summary
         } catch {
             errorBanner = "Could not start the runtime host: \(error.localizedDescription)"
             hasExited = true
             return
         }
-
-        let key = await AgentCLI.resolvedSecret(providerSpec.apiKeyExpression)
-        let provider: ChatProvider = providerSpec.api == "anthropic-messages"
-            ? AnthropicMessagesProvider(
-                id: providerSpec.id, baseURL: baseURL, apiKey: key,
-                extraHeaders: providerSpec.headers)
-            : OpenAICompletionsProvider(
-                id: providerSpec.id, baseURL: baseURL, apiKey: key,
-                extraHeaders: providerSpec.headers)
 
         // Skills, gated. Reported so the saving is visible rather than assumed.
         let settings = HarnessSettings.load(home: home)

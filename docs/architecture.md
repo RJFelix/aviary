@@ -779,6 +779,55 @@ sha1`.
 This matters more since the workshop reload landed. That feature exists to rebuild the app more
 often, which means it multiplies exactly this prompt.
 
+## Two switch statements over one enum
+
+`AgentCLI` and `InHouseDriver` each mapped a provider's `api` to a client, and only one of them
+had a case for `openai-codex-responses`. So the terminal ran Codex correctly while the GUI fell
+through to the completions client and posted to `chatgpt.com/backend-api/chat/completions`,
+which answers `404 {"detail":"Not Found"}`. That reads as a broken model, not as a missing case,
+which is why it survived until somebody tried to resume a Codex session from the app.
+
+`ChatProviderRouting.makeProvider` is now the only place that decision is made, and both
+callers use it. `resolveSecret` is injected so it can be tested without shelling out to a
+`!command` key expression. Codex is also the one route that supplies its own endpoint, so
+`needsBaseURL` exists: for every other api a missing `baseUrl` is a real configuration error
+worth reporting before the run starts.
+
+The general shape is worth remembering, because this codebase has now produced it twice — the
+other was `ClaudeCodeSession.prepare`, extracted after the CLI and the GUI assembled a driven
+session independently. **Two code paths switching over the same set of cases will diverge, and
+the one that is exercised less is the one that breaks.**
+
+## A dead kernel must stop the model, not feed it errors
+
+A driven session found in the wild had twenty-six consecutive
+`the runtime host is not running` tool results. Claude Code owns the loop, so a tool that
+errors is an invitation to try again — and against a kernel that is never coming back it will
+retry indefinitely, spending plan quota on a fixed outcome.
+
+Aviary cannot stop that loop from the tool side; it can only change what the result *says*. So
+`ClaudeCodeKernel` counts consecutive machinery failures, and on the second one the message
+stops being an error report and becomes an instruction: the interpreter is gone, do not call
+this again, stop and report what you had. A tool result is the only channel available, so it has
+to carry the control signal.
+
+### Why the kernel died: teardown order, and SIGTERM as a request
+
+`ClaudeCodeRun.stop()` closed stdin, called `terminate()`, and moved on. Two things were wrong.
+
+`claude` **does not die on SIGTERM** — verified directly: a plain `kill` left it running and
+only `kill -9` ended it. So a stopped run left an orphaned `claude` reparented to launchd,
+still holding its MCP courier. One was found alive thirteen minutes after its Aviary had exited.
+
+And the order was backwards. The kernel was being torn down while its caller was still alive,
+which is what turns "the run stopped" into "the run keeps calling a session that is being
+dismantled". Now the model process is ended first and *verified* — escalating to SIGKILL after
+two seconds, the same escalation `RuntimeHost.stop` already did for its own child — and only
+then does anything it might call go away.
+
+Orphaned `host.py` processes from earlier sessions were found too, which suggests the in-house
+path can leak a kernel the same way. Not yet chased down.
+
 ## Workshop capture ordering
 
 The screenshot attached to a request is taken when the compose panel is **asked for**, not

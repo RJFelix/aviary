@@ -243,15 +243,36 @@ public actor ClaudeCodeRun {
     }
 
     public func stop() async {
-        // Closing stdin is the polite ending: Claude Code finishes the turn in flight and
-        // exits. Terminating outright would leave the tool call it is waiting on unresolved in
-        // its own history, which is exactly the drift this design avoids.
+        // Order matters, and so does verifying. Closing stdin is the polite ending — Claude
+        // Code finishes the turn in flight and exits, leaving no unresolved tool call in its
+        // own history. But SIGTERM is a request, not an outcome: a `claude` that does not
+        // take it becomes an orphan (reparented to launchd) still holding its MCP courier,
+        // and it goes on calling a session that is being dismantled underneath it. One was
+        // found alive thirteen minutes after its Aviary had exited.
+        //
+        // So the model process is ended *first and for certain*, and only then is anything it
+        // might call taken away. Tearing the kernel down while the caller is still alive is
+        // what produced twenty-six consecutive "the runtime host is not running" results in a
+        // real session.
+        isFinished = true
         try? stdin?.close()
         stdin = nil
-        process?.terminate()
+
+        if let process, process.isRunning {
+            process.terminate()
+            for _ in 0..<20 where process.isRunning {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            if process.isRunning {
+                // The same escalation `RuntimeHost.stop` already does for its own child.
+                kill(process.processIdentifier, SIGKILL)
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+        }
+        self.process = nil
+
         await bridge.stop()
         await writer.close()
-        isFinished = true
     }
 
     // MARK: Frames

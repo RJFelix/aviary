@@ -4172,6 +4172,54 @@ let cases6: [Case] = [
         XCTAssertEqual(reordered.models.first?.qualifiedID, "claude-code/haiku")
     }),
 
+
+    ("in-house: every configured api maps to a client that exists", {
+        // The Codex route is the one this pins. Its api is `openai-codex-responses`, and a
+        // driver that falls through to the completions client posts to
+        // `chatgpt.com/backend-api/chat/completions` and gets 404 {"detail":"Not Found"} —
+        // which reads as a broken model rather than as an unhandled provider. That is exactly
+        // what the GUI did while the CLI handled it correctly.
+        func spec(_ api: String, baseURL: String? = "https://example.test/v1") -> ProviderSpec {
+            ProviderSpec(
+                id: "p-" + api, name: nil, baseURL: baseURL, api: api, apiKeyExpression: nil,
+                authHeader: nil, headers: [:], models: [])
+        }
+        let model = ModelSpec(rpc: .object(["id": .string("m"), "provider": .string("p")]))
+        let home = AgentHome(root: FileManager.default.temporaryDirectory
+            .appending(path: "routing-\(UUID().uuidString)"))
+
+        // Anthropic and the default both build a client from `baseUrl`.
+        for api in ["anthropic-messages", "openai-completions", "some-new-vendor-api"] {
+            let routed = await ChatProviderRouting.makeProvider(
+                spec: spec(api), model: model, home: home, resolveSecret: { _ in "k" })
+            guard case .success = routed else {
+                XCTFail("no client for \(api)"); continue
+            }
+            XCTAssertTrue(ChatProviderRouting.needsBaseURL(api))
+        }
+        // Missing baseUrl is a real configuration error for those, reported up front rather
+        // than as a malformed request later.
+        let noURL = await ChatProviderRouting.makeProvider(
+            spec: spec("openai-completions", baseURL: nil), model: model, home: home,
+            resolveSecret: { _ in nil })
+        guard case .failure(.noBaseURL) = noURL else {
+            XCTFail("a missing baseUrl should be named as such"); return
+        }
+
+        // Codex carries its own endpoint, so a missing baseUrl must not stop it — and with no
+        // stored OAuth it fails as "not signed in", never by falling through to the
+        // completions client, which posts to chatgpt.com/backend-api/chat/completions and gets
+        // 404 {"detail":"Not Found"}. That fall-through was the bug.
+        XCTAssertFalse(ChatProviderRouting.needsBaseURL("openai-codex-responses"))
+        let codex = await ChatProviderRouting.makeProvider(
+            spec: spec("openai-codex-responses", baseURL: nil), model: model, home: home,
+            resolveSecret: { _ in nil })
+        guard case .failure(.notSignedIn(let who)) = codex else {
+            XCTFail("Codex with no credentials must say so, not route elsewhere"); return
+        }
+        XCTAssertEqual(who, "p-openai-codex-responses")
+    }),
+
     ("codex: the built-in model catalogue matches the harness's", {
         // Transcribed, not invented: a model id this client sends that no known harness sends
         // is an anomaly.

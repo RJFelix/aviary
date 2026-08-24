@@ -17,6 +17,10 @@ public actor ClaudeCodeKernel {
     /// it believe that?" is unanswerable without it.
     private var firstPrompt: String?
     private var onOutput: (@Sendable (String) -> Void)?
+    /// Consecutive machinery failures. Counted because a driven run cannot be stopped from
+    /// here — Claude Code decides when to stop — so the only lever is what the tool result
+    /// says, and it has to change once retrying is hopeless.
+    private var hostFailures = 0
 
     public init(
         host: RuntimeHost, hostSession: String, memory: MemoryStore?,
@@ -74,6 +78,7 @@ public actor ClaudeCodeKernel {
         }
         do {
             let result = try await host.execute(code, in: hostSession)
+            hostFailures = 0
             // The same rendering the in-house agent sees, so a transcript reads identically
             // whichever engine produced it.
             return (Agent.render(result), result.failed)
@@ -81,8 +86,26 @@ public actor ClaudeCodeKernel {
             // A host failure is *the machinery* breaking, not agent code raising — and saying
             // so matters, because the model's correct response differs: retrying is right for
             // a traceback and pointless for a dead interpreter.
-            return ("The Aviary runtime host failed to run this: "
-                + error.localizedDescription, true)
+            //
+            // Pointless, and not free. Claude Code owns the loop here, so "the tool errored"
+            // is an invitation to try again — and against a dead kernel it will, indefinitely.
+            // One real session produced twenty-six identical failures in a row before anyone
+            // noticed. So the message stops being an error report and becomes an instruction
+            // once it is clear the kernel is not coming back.
+            hostFailures += 1
+            let detail = error.localizedDescription
+            if hostFailures >= 2 {
+                return ("""
+                    The Aviary runtime host is gone and is not coming back in this session: \
+                    \(detail)
+
+                    Do not call this tool again — every further call will fail the same way. \
+                    Stop now and report what you had established before it died, so the work \
+                    is not lost. A person has to restart the session to get an interpreter \
+                    back.
+                    """, true)
+            }
+            return ("The Aviary runtime host failed to run this: " + detail, true)
         }
     }
 

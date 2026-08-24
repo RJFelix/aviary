@@ -83,6 +83,14 @@ what it does; this file is how to work on it without relearning the traps.
   Answer one dialog with **Always Allow** ("Allow" fixes nothing), and never send `codesign`
   output to /dev/null. A correctly authorised key signs in ~250ms, so anything slower than a
   second is a dialog you cannot see.
+- **`claude` ignores SIGTERM.** `Process.terminate()` will not end it; escalate to SIGKILL and
+  verify, or you leave an orphan reparented to launchd still holding its MCP courier. Same for
+  any child that might outlive a run — check with `ps -o ppid=`, and treat PPID 1 as a leak.
+- **Never switch over a provider's `api` in two places.** `AgentCLI` and `InHouseDriver` did,
+  only one had the Codex case, and the GUI silently 404'd against
+  `chatgpt.com/backend-api/chat/completions` for months. Route through
+  `ChatProviderRouting.makeProvider`. The rule generalises: the path exercised less is the one
+  that breaks.
 - **A comment-only Swift change produces a byte-identical binary.** llbuild recompiles the
   file, sees the same object, and skips the relink — so the executable keeps its mtime. Any
   test of "did a rebuild happen?" must change emitted code, not a comment. This cost two

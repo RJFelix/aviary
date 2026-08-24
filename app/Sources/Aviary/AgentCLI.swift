@@ -157,35 +157,20 @@ enum AgentCLI {
                 .flatMap { p in p.models.map { "\(p.id)/\($0.id)" } }
             fail("No such model. Configured: \(available.prefix(12).joined(separator: ", "))")
         }
-        let provider: ChatProvider
-        if providerSpec.api == "openai-codex-responses" {
-            // OAuth rather than a key. Resolved up front so a missing login is an error at
-            // launch rather than a 401 three turns in.
-            let credentialStore = CodexAuth.Store(home: home)
-            guard credentialStore.credentials() != nil else {
-                fail("Not signed in to OpenAI Codex. Run `Aviary --codex-login`.")
-            }
-            provider = CodexResponsesProvider(
-                id: providerSpec.id, store: credentialStore, model: model,
-                baseURL: providerSpec.baseURL, sessionID: UUID().uuidString)
-        } else {
-            guard let baseURL = providerSpec.baseURL.flatMap(URL.init(string:)) else {
-                fail("Provider \(providerSpec.id) has no baseUrl.")
-            }
+        // The same factory the GUI uses. Two switch statements over the same api enum is how
+        // the GUI ended up sending Codex traffic to the completions client and getting a 404.
+        let routed = await ChatProviderRouting.makeProvider(
+            spec: providerSpec, model: model, home: home,
+            resolveSecret: { await resolvedSecret($0) })
+        guard case .success(let provider) = routed else {
+            if case .failure(let why) = routed { fail(why.localizedDescription) }
+            return
+        }
+        if providerSpec.api != "openai-codex-responses" {
             let key = await ApiKeyResolver.resolve(providerSpec.apiKeyExpression)
-            if !key.ok {
-                // Non-blocking: a provider may legitimately need no key, and refusing to start
-                // on a format guess is how a working setup gets called broken.
-                note("credentials: \(key.explanation)")
-            }
-            let resolvedKey = await resolvedSecret(providerSpec.apiKeyExpression)
-            provider = providerSpec.api == "anthropic-messages"
-                ? AnthropicMessagesProvider(
-                    id: providerSpec.id, baseURL: baseURL, apiKey: resolvedKey,
-                    extraHeaders: providerSpec.headers)
-                : OpenAICompletionsProvider(
-                    id: providerSpec.id, baseURL: baseURL, apiKey: resolvedKey,
-                    extraHeaders: providerSpec.headers)
+            // Non-blocking: a provider may legitimately need no key, and refusing to start on
+            // a format guess is how a working setup gets called broken.
+            if !key.ok { note("credentials: \(key.explanation)") }
         }
 
         // 2. The runtime host.
