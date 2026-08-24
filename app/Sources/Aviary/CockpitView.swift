@@ -1,351 +1,156 @@
 import SwiftUI
-import AppKit
 import AviaryCore
 
-/// The landing screen: what is happening right now, what just happened, and anything
-/// that needs a decision.
-///
-/// Ordered by urgency rather than by category. A wedged daemon or an unresolvable
-/// credential goes above the pretty numbers, because those are the states that stop work.
+/// The landing screen is a working set, not a second analytics dashboard. The rail is every
+/// run Aviary currently owns; selecting one keeps its shared transcript and composer in view.
 struct CockpitView: View {
     @Environment(AppModel.self) private var model
+    @State private var showLauncher = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                notices
-                headline
-                // `workingNow` is deliberately not shown — it lists sessions the harness
-                // daemon is holding, which the in-house engine does not have. Retired rather
-                // than deleted; see docs/architecture.md, "Retired daemon surfaces".
-                // Re-balanced after `workingNow` retired: the chart is paired with the
-                // launcher so both rows sit on the same two-column grid.
-                //
-                // This row is still narrower than the one below it, and the cause is measured
-                // rather than guessed. `Card` is already `maxWidth: .infinity`, so it is not
-                // that the card refuses to stretch — a `GeometryReader` probe showed the
-                // second row being re-offered the full width and growing (380 → 800, row
-                // 724 → 1144) while this row never fires `onChange` at all: it keeps its
-                // first-pass 724 and is never re-offered. Left for a layout pass; four
-                // attempts at fixing it by adding `maxWidth` frames only moved the dead space
-                // around, because the frames were treating a proposal problem as a sizing one.
-                HStack(alignment: .top, spacing: 14) {
-                    todayPanel
-                    quickLaunch.frame(width: 330)
-                }
-                HStack(alignment: .top, spacing: 14) {
-                    recentSessions
-                    environmentPanel.frame(width: 330)
-                }
+        GeometryReader { geo in
+            HStack(spacing: 0) {
+                runRail
+                    .frame(width: geo.size.width / 3)
+                Divider()
+                detail
+                    .frame(width: geo.size.width * 2 / 3 - 1)
             }
-            .padding(Design.gutter)
+            .frame(width: geo.size.width, height: geo.size.height)
         }
+        .sheet(isPresented: $showLauncher) { LauncherSheet() }
     }
 
-    // MARK: Notices
+    private var ongoingRuns: [LiveRun] {
+        // An exited run is still valuable on Live until dismissed, but it is no longer an
+        // ongoing conversation. Keep the front page about work that can receive a message.
+        model.runs.filter { !$0.hasExited }
+    }
+
+    private var selectedRun: LiveRun? {
+        if let focused = model.focusedRunID,
+           let run = ongoingRuns.first(where: { $0.id == focused })
+        {
+            return run
+        }
+        return ongoingRuns.first
+    }
+
+    private var runRail: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("ONGOING")
+                        .font(Design.sectionTitle).tracking(0.6)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(ongoingRuns.count)")
+                        .font(Design.numeric(10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 12).padding(.top, 12)
+
+                ForEach(ongoingRuns) { run in
+                    RunRailCard(run: run, selected: run.id == selectedRun?.id) {
+                        model.focusedRunID = run.id
+                    }
+                }
+
+                NewRunRailCard { showLauncher = true }
+            }
+            .padding(.horizontal, 9)
+            .padding(.bottom, 12)
+        }
+        .background(.background.secondary)
+    }
 
     @ViewBuilder
-    private var notices: some View {
-        VStack(spacing: 8) {
-            if model.daemon.health == .wedged {
-                NoticeBanner(
-                    level: .danger,
-                    title: "The background service is wedged",
-                    message: model.daemon.diagnostic,
-                    actionLabel: "Force shutdown") {
-                        Task { await model.shutdownDaemon(force: true) }
-                    }
-            }
-            if model.daemon.health == .versionMismatch {
-                NoticeBanner(
-                    level: .warning,
-                    title: "A different engine build owns the daemon",
-                    message: model.daemon.diagnostic,
-                    actionLabel: "Open Health") { model.section = .health }
-            }
-            if !model.loginShellEnvironmentLoaded {
-                NoticeBanner(
-                    level: .warning,
-                    title: "Running with launchd's environment",
-                    message: "Aviary could not read your login shell's environment, so "
-                        + "credentials stored in environment variables may resolve to their "
-                        + "own names and 401. Check Health → Environment.",
-                    actionLabel: "Health") { model.section = .health }
-            }
-            if let failing = failingProvider {
-                NoticeBanner(
-                    level: .warning,
-                    title: "\(failing.0) cannot authenticate",
-                    message: failing.1,
-                    actionLabel: "Models") { model.section = .models }
-            }
-            if model.engine == nil && !model.preferInHouseEngine {
-                NoticeBanner(
-                    level: .danger,
-                    title: "No engine found",
-                    message: "Aviary needs a prime-agent build to run agents. Build the "
-                        + "bundled fork with `just build-engine`, or point at an install in "
-                        + "Settings.")
-            }
+    private var detail: some View {
+        if let run = selectedRun {
+            // Live keeps its optional diagnostics inspector. Cockpit promises chat space.
+            RunPane(run: run, showsInspector: false)
+        } else {
+            EmptyStateView(
+                symbol: "plus.bubble",
+                title: "Start a session",
+                message: "Your ongoing sessions appear in the left rail. Start one here, then "
+                    + "its chat and Markdown-aware composer stay on this page.")
         }
     }
+}
 
-    /// A provider whose key expression will not resolve — worth surfacing before the
-    /// first 401, not after.
-    private var failingProvider: (String, String)? {
-        for p in model.modelsConfig.providers {
-            guard let expr = p.apiKeyExpression else { continue }
-            if case .environmentVariable(let name) = ApiKeyForm.classify(expr),
-               !ProcessEnvironment.shared.has(name)
-            {
-                return (p.displayName,
-                        "$\(name) is not set in the environment Aviary captured, so the "
-                            + "harness will send the literal string \"\(name)\" as the credential.")
-            }
-        }
-        return nil
-    }
+private struct RunRailCard: View {
+    let run: LiveRun
+    let selected: Bool
+    let action: () -> Void
 
-    // MARK: Headline
-
-    private var headline: some View {
-        HStack(spacing: 14) {
-            // "Working now" and "Kernels" tiles retired with the daemon surfaces: both
-            // counted things only the harness supervisor knows about.
-            StatTile(
-                label: "Sub-agents",
-                value: "\(model.tree.allNodes.count)",
-                caption: model.tree.runningCount > 0
-                    ? "\(model.tree.runningCount) still running"
-                    : "none running",
-                symbol: "bird.fill",
-                tint: Design.agentMessage)
-            Divider().frame(height: 46)
-            StatTile(
-                label: "Sessions",
-                value: "\(model.sessions.count)",
-                caption: model.sessions.first.map { "last active \(Fmt.ago($0.updatedAt))" } ?? "—",
-                symbol: "tray.full.fill",
-                tint: Design.user)
-            Divider().frame(height: 46)
-            StatTile(
-                label: "All-time tokens",
-                value: Fmt.tokens(model.analytics.total.totalTokens),
-                caption: model.analytics.total.cost.total > 0
-                    ? "\(Fmt.cost(model.analytics.total.cost.total)) attributed"
-                    : "no pricing reported",
-                symbol: "number",
-                tint: Design.assistant)
-        }
-        .padding(Design.cardPadding)
-        .background(
-            RoundedRectangle(cornerRadius: Design.cardRadius, style: .continuous)
-                .fill(.background.secondary))
-        .overlay(
-            RoundedRectangle(cornerRadius: Design.cardRadius, style: .continuous)
-                .strokeBorder(.separator.opacity(0.6), lineWidth: 1))
-    }
-
-    // MARK: Working now
-
-    private var workingNow: some View {
-        Card("Working now", symbol: "dot.radiowaves.left.and.right",
-             accessory: AnyView(
-                Button("Flock") { model.section = .flock }
-                    .buttonStyle(.link).font(.system(size: 10.5))))
-        {
-            let working = model.liveSessions.sorted { a, b in
-                if a.isWorking != b.isWorking { return a.isWorking }
-                return (a.lastActivityAt ?? .distantPast) > (b.lastActivityAt ?? .distantPast)
-            }
-            if working.isEmpty {
-                Text("Nothing is running. Start something from Live, or the terminal — "
-                    + "Aviary sees both.")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(.secondary)
-                    .padding(.vertical, 6)
-            } else {
-                VStack(spacing: 0) {
-                    ForEach(working.prefix(9)) { s in
-                        LiveSessionRow(session: s)
-                            .onTapGesture { model.openTranscript(sessionID: s.sessionID) }
-                        if s.id != working.prefix(9).last?.id { Divider().opacity(0.5) }
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 6) {
+                    if run.isStreaming {
+                        PulseDot()
+                    } else {
+                        Circle().fill(Design.accent.opacity(0.75)).frame(width: 7, height: 7)
                     }
-                    if working.count > 9 {
-                        Button("Show all \(working.count)") { model.section = .flock }
-                            .buttonStyle(.link)
-                            .font(.system(size: 10.5))
-                            .padding(.top, 6)
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: Today
-
-    private var todayPanel: some View {
-        Card("Last 14 days", symbol: "chart.bar.fill",
-             accessory: AnyView(
-                Button("Usage") { model.section = .usage }
-                    .buttonStyle(.link).font(.system(size: 10.5))))
-        {
-            let days = model.analytics.days(last: 14)
-            let peak = max(1, days.map(\.usage.totalTokens).max() ?? 1)
-            // A `Card` stretches only when its content does. This card used to be stretched by
-            // sharing a row with `workingNow`; once that retired it collapsed to the width of
-            // 14 bars, so the fill has to come from here.
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .bottom, spacing: 3) {
-                    ForEach(days) { d in
-                        VStack(spacing: 3) {
-                            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                                .fill(d.usage.totalTokens > 0
-                                    ? Design.accent.opacity(0.85)
-                                    : Color.secondary.opacity(0.12))
-                                .frame(height: max(3, 74 * CGFloat(d.usage.totalTokens) / CGFloat(peak)))
-                            Text(Fmt.day(d.day).suffix(2))
-                                .font(.system(size: 8))
-                                .foregroundStyle(.tertiary)
-                        }
-                        .help("\(Fmt.day(d.day)) · \(Fmt.tokens(d.usage.totalTokens)) tokens · \(d.sessions) sessions")
-                    }
-                }
-                .frame(height: 92, alignment: .bottom)
-
-                Divider().opacity(0.5)
-
-                HStack(spacing: 12) {
-                    let window = days.reduce(into: Usage()) { $0 += $1.usage }
-                    StatTile(label: "tokens", value: Fmt.tokens(window.totalTokens))
-                    StatTile(label: "cost", value: Fmt.cost(window.cost.total))
-                    StatTile(
-                        label: "cached",
-                        value: Fmt.percent(window.cacheHitRate),
-                        caption: "of input tokens")
+                    Text(run.title)
+                        .font(.system(size: 12, weight: .semibold))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
                     Spacer(minLength: 0)
                 }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .frame(width: 380)
-    }
-
-    // MARK: Recent sessions
-
-    private var recentSessions: some View {
-        Card("Recent sessions", symbol: "clock.arrow.circlepath",
-             accessory: AnyView(
-                Button("All sessions") { model.section = .sessions }
-                    .buttonStyle(.link).font(.system(size: 10.5))))
-        {
-            if model.sessions.isEmpty {
-                Text(model.isScanning ? "Scanning…" : "No sessions found in \(model.home.sessionsDir.path)")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(.secondary)
-            } else {
-                VStack(spacing: 0) {
-                    ForEach(model.sessions.prefix(8)) { s in
-                        Button {
-                            model.section = .sessions
-                            model.select(session: s)
-                        } label: {
-                            SessionRow(session: s, compact: true)
-                        }
-                        .buttonStyle(.plain)
-                        if s.id != model.sessions.prefix(8).last?.id { Divider().opacity(0.5) }
+                HStack(spacing: 5) {
+                    Text(run.projectName).foregroundStyle(Design.accent)
+                    if let model = run.modelLabel, !model.isEmpty {
+                        Text(model).lineLimit(1).truncationMode(.middle)
                     }
                 }
-            }
-        }
-    }
-
-    // MARK: Quick launch
-
-    private var quickLaunch: some View {
-        Card("Start a run", symbol: "play.circle.fill") {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(model.settings.defaultModelQualified ?? "no default model set")
-                    .font(Design.mono(11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                if let level = model.settings.defaultThinkingLevel {
-                    Chip(text: "thinking \(level)", symbol: "brain", tint: Design.thinking)
-                }
-                Button {
-                    model.section = .live
-                    NotificationCenter.default.post(name: .aviaryNewRun, object: nil)
-                } label: {
-                    Label("New run…", systemImage: "plus")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.regular)
-
-                if !model.recentCwds.isEmpty {
-                    Text("RECENT DIRECTORIES")
-                        .font(.system(size: 9, weight: .semibold))
-                        .tracking(0.5)
-                        .foregroundStyle(.tertiary)
-                        .padding(.top, 2)
-                    ForEach(model.recentCwds.prefix(4), id: \.self) { cwd in
-                        Button {
-                            model.startRun(
-                                config: RunConfiguration(
-                                    cwd: cwd,
-                                    provider: model.settings.defaultProvider,
-                                    model: model.settings.defaultModel,
-                                    thinkingLevel: model.settings.defaultThinkingLevel),
-                                firstPrompt: nil)
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: "folder")
-                                    .font(.system(size: 9))
-                                Text(URL(fileURLWithPath: cwd).lastPathComponent)
-                                    .font(.system(size: 11))
-                                Spacer()
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(Design.accent)
-                        .help(cwd)
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: Environment
-
-    private var environmentPanel: some View {
-        Card("Engine", symbol: "cpu") {
-            VStack(alignment: .leading, spacing: 7) {
-                if let engine = model.engine {
-                    DetailRow(label: "Source", value: engine.kind.label)
-                    DetailRow(label: "Version", value: engine.version ?? "unknown", mono: true)
-                    // The daemon health row and supervisor pid retired with the other daemon
-                    // surfaces: this card is about which engine Aviary would launch, which is a
-                    // question the harness supervisor does not answer.
-                    DetailRow(
-                        label: "Environment",
-                        value: model.loginShellEnvironmentLoaded ? "login shell" : "launchd",
-                        tint: model.loginShellEnvironmentLoaded ? nil : Design.warning)
-                } else {
-                    Text("No engine configured").font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
-                }
-                Divider().opacity(0.5)
+                .font(.system(size: 9.5)).foregroundStyle(.secondary)
                 HStack {
-                    Button("Health") { model.section = .health }
-                        .buttonStyle(.link).font(.system(size: 10.5))
+                    Text(run.isStreaming ? "working" : "ready")
+                        .foregroundStyle(run.isStreaming ? Design.success : .secondary)
                     Spacer()
-                    Button("Reveal agent dir") {
-                        NSWorkspace.shared.activateFileViewerSelecting([model.home.root])
-                    }
-                    .buttonStyle(.link).font(.system(size: 10.5))
+                    Text(Fmt.duration(run.elapsed))
                 }
+                .font(Design.numeric(9.5))
             }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(selected ? AnyShapeStyle(Design.accentSoft) : AnyShapeStyle(.background)))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(selected
+                        ? AnyShapeStyle(Design.accent.opacity(0.7))
+                        : AnyShapeStyle(.separator.opacity(0.55)),
+                        lineWidth: 1))
         }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct NewRunRailCard: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "plus")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("New session")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity)
+            .foregroundStyle(Design.accent)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Design.accentSoft.opacity(0.45)))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Design.accent.opacity(0.5), style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+        }
+        .buttonStyle(.plain)
     }
 }
 

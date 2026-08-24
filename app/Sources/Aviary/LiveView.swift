@@ -111,8 +111,12 @@ struct LiveView: View {
 struct RunPane: View {
     @Environment(AppModel.self) private var model
     var run: LiveRun
+    /// Cockpit owns its two-column layout, so it reuses the chat/composer without a third
+    /// technical column. Live keeps the detailed inspector.
+    var showsInspector = true
 
     @State private var draft = ""
+    @State private var showMarkdownPreview = true
     @State private var showLaunchDetails = false
     @State private var selectedItem: TranscriptItem?
 
@@ -138,7 +142,7 @@ struct RunPane: View {
             }
             .frame(minWidth: 380)
 
-            if model.showInspector {
+            if showsInspector && model.showInspector {
                 Divider()
                 RunInspector(run: run, selectedItem: $selectedItem)
                     .frame(width: 300)
@@ -341,6 +345,15 @@ struct RunPane: View {
                         .strokeBorder(.separator, lineWidth: 1))
 
                 VStack(spacing: 5) {
+                    Button { showMarkdownPreview.toggle() } label: {
+                        Image(systemName: showMarkdownPreview ? "eye.slash" : "eye")
+                            .font(.system(size: 10))
+                            .frame(width: 26, height: 20)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(draft.isEmpty)
+                    .help(showMarkdownPreview ? "Hide Markdown preview" : "Show Markdown preview")
+
                     Button {
                         send()
                     } label: {
@@ -371,6 +384,22 @@ struct RunPane: View {
             }
             .padding(.horizontal, Design.gutter)
             .padding(.vertical, 9)
+
+            if showMarkdownPreview, !draft.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("MARKDOWN PREVIEW")
+                        .font(Design.sectionTitle).foregroundStyle(.secondary)
+                    ScrollView {
+                        MarkdownText(text: draft)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 130)
+                }
+                .padding(.horizontal, Design.gutter)
+                .padding(.vertical, 9)
+                .background(.background.secondary)
+            }
         }
         .background(.bar)
     }
