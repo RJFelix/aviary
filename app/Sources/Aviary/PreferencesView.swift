@@ -21,6 +21,8 @@ struct PreferencesView: View {
                 .tabItem { Label("Agent defaults", systemImage: "slider.horizontal.3") }
             appearanceTab
                 .tabItem { Label("Display", systemImage: "eye") }
+            workshopTab
+                .tabItem { Label("Workshop", systemImage: "wrench.and.screwdriver") }
             aboutTab
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
@@ -247,6 +249,68 @@ struct PreferencesView: View {
                         }
                         .buttonStyle(.bordered).controlSize(.small)
                     }
+                }
+            }
+            .padding(14)
+        }
+    }
+
+    // MARK: Workshop
+
+    private var workshopTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Card("Reloading after a request", symbol: "arrow.triangle.2.circlepath") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Toggle("Rebuild when a request is marked done", isOn: Binding(
+                            get: { model.reloader.isEnabled },
+                            set: { model.reloader.isEnabled = $0 }))
+                        Text("The workshop agent edits Aviary's own source, so its work is "
+                            + "invisible until the binary is rebuilt. This watches the board "
+                            + "and starts the build the moment a request finishes, in the "
+                            + "background — so by the time you look, the only thing left is "
+                            + "the relaunch.")
+                            .font(.system(size: 10)).foregroundStyle(.tertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Divider().opacity(0.5)
+                        Toggle("Relaunch as soon as the build succeeds", isOn: Binding(
+                            get: { model.reloader.autoRelaunch },
+                            set: { model.reloader.autoRelaunch = $0 }))
+                            .disabled(!model.reloader.isEnabled)
+                        Text("Off by default for one specific reason: when the agent finishes "
+                            + "a request, the session that finished it is usually still "
+                            + "attached and holding a live interpreter. Relaunching ends it. "
+                            + "The transcript survives and the session can be resumed, but "
+                            + "the variables in that interpreter cannot.")
+                            .font(.system(size: 10)).foregroundStyle(.tertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let mode = model.reloader.launchMode {
+                            Divider().opacity(0.5)
+                            DetailRow(label: "Rebuilds", value: mode.describedTarget, mono: true)
+                            Text("Read from the running image's own path, so it rebuilds what "
+                                + "you are actually using — rebuilding the other "
+                                + "configuration would succeed and change nothing visible.")
+                                .font(.system(size: 10)).foregroundStyle(.tertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("This copy of Aviary was not launched from a place that can "
+                                + "be rebuilt in situ, so reloading is unavailable.")
+                                .font(.system(size: 10)).foregroundStyle(Design.warning)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .controlSize(.small)
+                }
+
+                Card("What this is not", symbol: "info.circle") {
+                    Text("Not hot reload in the code-injection sense — the process is "
+                        + "replaced, not patched. That needs `-Xlinker -interposable` and an "
+                        + "injection framework, and there is no Xcode here to hang one off. "
+                        + "What makes it feel like a reload instead of a restart is that the "
+                        + "build has already happened and the app comes back on the screen "
+                        + "you were on, with the workshop agent reattached.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(14)

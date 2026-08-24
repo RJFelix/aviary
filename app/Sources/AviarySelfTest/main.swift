@@ -3881,6 +3881,177 @@ await Harness.run([
         XCTAssertEqual(await bridge.rejectedConnections, 1)
     }),
 
+
+    // MARK: Reloading after a workshop request
+
+    ("reload: a request already done at launch is not a completion", {
+        // The bug this prevents is the loud one: without a baseline, every request that was
+        // finished before the window opened reads as fresh news and the app rebuilds itself
+        // on every launch.
+        let done = WorkshopRequest(
+            id: "wr-1", createdAt: Date(), title: "Earlier work", body: "",
+            kind: .change, status: .done, statusChangedAt: Date())
+        let board = WorkshopBoard(requests: [done], logExists: true)
+
+        let first = WorkshopReload.completion(board: board, lastSeen: [:])
+        XCTAssertNil(first.completed, "seen for the first time is not a transition")
+        XCTAssertEqual(first.lastSeen["wr-1"], .done)
+
+        // And a later log write that merely mentions it still says nothing.
+        let again = WorkshopReload.completion(board: board, lastSeen: first.lastSeen)
+        XCTAssertNil(again.completed)
+    }),
+
+    ("reload: the transition into done is what fires a build", {
+        var request = WorkshopRequest(
+            id: "wr-2", createdAt: Date(), title: "Add a thing", body: "",
+            kind: .change, status: .building, statusChangedAt: Date())
+        var seen = WorkshopReload.completion(
+            board: WorkshopBoard(requests: [request]), lastSeen: [:]).lastSeen
+        XCTAssertEqual(seen["wr-2"], .building)
+
+        request.status = .done
+        let fired = WorkshopReload.completion(
+            board: WorkshopBoard(requests: [request]), lastSeen: seen)
+        XCTAssertEqual(fired.completed?.id, "wr-2")
+        seen = fired.lastSeen
+
+        // Not twice for the same finish.
+        XCTAssertNil(WorkshopReload.completion(
+            board: WorkshopBoard(requests: [request]), lastSeen: seen).completed)
+
+        // Reopened and finished again is a genuine second completion: the agent revised its
+        // work and there is a new binary to look at.
+        request.status = .building
+        seen = WorkshopReload.completion(
+            board: WorkshopBoard(requests: [request]), lastSeen: seen).lastSeen
+        request.status = .done
+        XCTAssertEqual(WorkshopReload.completion(
+            board: WorkshopBoard(requests: [request]), lastSeen: seen).completed?.id, "wr-2")
+
+        // A request that ends `declined` is not a completion — nothing was built.
+        var declined = request
+        declined.id = "wr-3"
+        declined.status = .declined
+        XCTAssertNil(WorkshopReload.completion(
+            board: WorkshopBoard(requests: [declined]),
+            lastSeen: ["wr-3": .building]).completed)
+    }),
+
+    ("reload: the launch mode is read from the running image, not guessed", {
+        // Rebuilding the *other* configuration would succeed and change nothing visible,
+        // which is the most confusing outcome available.
+        XCTAssertEqual(
+            WorkshopReload.launchMode(
+                executablePath: "/Users/r/aviary/build/Aviary.app/Contents/MacOS/Aviary",
+                bundlePath: "/Users/r/aviary/build/Aviary.app", hasCheckout: true),
+            .bundle(path: "/Users/r/aviary/build/Aviary.app"))
+        XCTAssertEqual(
+            WorkshopReload.launchMode(
+                executablePath: "/Users/r/aviary/app/.build/debug/Aviary",
+                bundlePath: "/Users/r/aviary/app/.build/debug", hasCheckout: true),
+            .binary(path: "/Users/r/aviary/app/.build/debug/Aviary", release: false))
+        XCTAssertEqual(
+            WorkshopReload.launchMode(
+                executablePath: "/Users/r/aviary/app/.build/release/Aviary",
+                bundlePath: "/Users/r/aviary/app/.build/release", hasCheckout: true),
+            .binary(path: "/Users/r/aviary/app/.build/release/Aviary", release: true))
+        // Whole path components, not a substring: a checkout living under a directory called
+        // `release` is still a debug build.
+        XCTAssertEqual(
+            WorkshopReload.launchMode(
+                executablePath: "/Users/r/release/aviary/app/.build/debug/Aviary",
+                bundlePath: "/x", hasCheckout: true),
+            .binary(path: "/Users/r/release/aviary/app/.build/debug/Aviary", release: false))
+        // No checkout, nothing to rebuild from, so the feature reports itself unavailable
+        // rather than running a build that cannot work.
+        XCTAssertNil(WorkshopReload.launchMode(
+            executablePath: "/usr/local/bin/Aviary", bundlePath: "/usr/local/bin",
+            hasCheckout: false))
+    }),
+
+    ("reload: each launch mode rebuilds itself the way it was built", {
+        let root = URL(fileURLWithPath: "/repo")
+        let bundle = WorkshopReload.buildCommand(
+            for: .bundle(path: "/repo/build/Aviary.app"), repoRoot: root)
+        // The whole bundle: the plist, icon and ad-hoc signature are part of what makes the
+        // running app the app, so a fresh Mach-O in a stale bundle is not what `just build`
+        // produces.
+        XCTAssertEqual(bundle.executable, "/bin/bash")
+        XCTAssertTrue(bundle.arguments.contains("/repo/scripts/bundle-app.sh"))
+        XCTAssertTrue(bundle.arguments.contains("release"))
+
+        let debug = WorkshopReload.buildCommand(
+            for: .binary(path: "/repo/app/.build/debug/Aviary", release: false), repoRoot: root)
+        XCTAssertEqual(debug.executable, "/usr/bin/swift")
+        XCTAssertEqual(debug.arguments, ["build", "--product", "Aviary"])
+        XCTAssertEqual(debug.cwd.path, "/repo/app")
+
+        let release = WorkshopReload.buildCommand(
+            for: .binary(path: "/repo/app/.build/release/Aviary", release: true), repoRoot: root)
+        XCTAssertTrue(release.arguments.contains("-c"))
+        XCTAssertTrue(release.arguments.contains("release"))
+
+        // And the executable a rebuild is expected to replace.
+        XCTAssertEqual(
+            WorkshopReload.LaunchMode.bundle(path: "/repo/build/Aviary.app").executablePath,
+            "/repo/build/Aviary.app/Contents/MacOS/Aviary")
+        XCTAssertEqual(
+            WorkshopReload.LaunchMode.binary(path: "/x/Aviary", release: false).executablePath,
+            "/x/Aviary")
+    }),
+
+    ("reload: a failed build reports the first real errors, not the tail", {
+        // The tail of a failed swift build is "error: emit-module command failed", which says
+        // nothing about what is wrong — so showing the last lines shows the least useful ones.
+        let output = """
+            [3/6] Compiling Aviary AppModel.swift
+            /repo/app/Sources/Aviary/AppModel.swift:12:9: error: cannot find 'nope' in scope
+               |         `- error: cannot find 'nope' in scope
+            /repo/app/Sources/Aviary/AppModel.swift:12:9: error: cannot find 'nope' in scope
+            /repo/app/Sources/Aviary/RootView.swift:4:1: error: missing brace
+            note: this is only a note
+            error: emit-module command failed with exit code 1
+            """
+        let reported = WorkshopReload.firstErrors(in: output)
+        let lines = reported.split(separator: "\n").map(String.init)
+        XCTAssertTrue(lines[0].contains("cannot find 'nope' in scope"))
+        XCTAssertTrue(reported.contains("missing brace"))
+        // One mistake repeats once per compilation its file takes part in, so duplicates are
+        // collapsed or four lines of banner describe a single error.
+        XCTAssertEqual(lines.filter { $0.contains("cannot find 'nope'") }.count, 1)
+        XCTAssertEqual(WorkshopReload.firstErrors(in: output, limit: 1)
+            .split(separator: "\n").count, 1)
+        // Failing in a way this does not model still has to say something.
+        let mystery = "linking failed\nld: framework not found\nexit 1"
+        XCTAssertTrue(WorkshopReload.firstErrors(in: mystery).contains("ld: framework not found"))
+    }),
+
+    ("reload: an unchanged binary is not offered as something to relaunch into", {
+        // A request that only touched docs, the agent's brief, or the board itself builds
+        // cleanly and changes nothing. Offering a restart for that teaches you to ignore the
+        // banner, which is how you miss the one that matters.
+        XCTAssertFalse(WorkshopReload.binaryChanged(before: "100@5", after: "100@5"))
+        XCTAssertTrue(WorkshopReload.binaryChanged(before: "100@5", after: "100@6"))
+        XCTAssertTrue(WorkshopReload.binaryChanged(before: "100@5", after: "220@5"))
+        // An unreadable stamp counts as changed: better a needless relaunch offered than a
+        // real one withheld.
+        XCTAssertTrue(WorkshopReload.binaryChanged(before: nil, after: "100@5"))
+        XCTAssertTrue(WorkshopReload.binaryChanged(before: "100@5", after: nil))
+
+        // And the stamp itself moves when a real file does.
+        let tmp = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-reload-\(UUID().uuidString)")
+        try Data("one".utf8).write(to: tmp)
+        let before = WorkshopReload.stamp(ofFileAt: tmp.path)
+        XCTAssertNotNil(before)
+        try Data("substantially longer contents".utf8).write(to: tmp)
+        XCTAssertTrue(WorkshopReload.binaryChanged(
+            before: before, after: WorkshopReload.stamp(ofFileAt: tmp.path)))
+        try? FileManager.default.removeItem(at: tmp)
+        XCTAssertNil(WorkshopReload.stamp(ofFileAt: tmp.path))
+    }),
+
     ("codex: the built-in model catalogue matches the harness's", {
         // Transcribed, not invented: a model id this client sends that no known harness sends
         // is an anomaly.

@@ -625,6 +625,84 @@ inside a run that markdown consumed is a match the reader cannot see.
 User prompts go through the same path. They were the only plain-text role in the
 transcript, and a prompt is written in markdown like everything else.
 
+## Reloading Aviary after the workshop changes Aviary
+
+The workshop agent edits this app's own source, so the result of a request is invisible until
+the binary is rebuilt and the process replaced. Quitting, rebuilding by hand and reopening is
+three steps and a lost train of thought, for a change you asked for and are waiting on.
+
+**Not hot reload in the code-injection sense.** The process is replaced, not patched — that
+would need `-Xlinker -interposable` and an injection framework, and there is no Xcode here to
+hang one off. What makes it *feel* like a reload is that the slow part has already happened:
+the build starts the moment the request is marked done, in the background, so the click is
+immediate — and the app comes back on the screen you were on with the agent reattached.
+
+One fact makes it possible at all, and it was verified rather than assumed: **SwiftPM can
+relink `Aviary` while `Aviary` is running.** The linker writes and renames, and macOS permits
+renaming over the file backing a running image.
+
+### The decisions, and why each one is a decision
+
+`WorkshopReload` in the core holds them, so they are tested without a window, a process or a
+compiler. Each is a place where the obvious shortcut is wrong.
+
+**Fire on the transition into `done`, and never on first sight of it.** A request seen as done
+for the first time is one that was already finished when the window opened. Treating that as
+news makes the app rebuild itself on every launch — which is why the board is baselined
+*before* the watcher starts.
+
+**Read the launch mode off the running image.** `build/Aviary.app`, `.build/debug/Aviary` and
+`.build/release/Aviary` are rebuilt three different ways, and rebuilding the wrong one succeeds
+and changes nothing visible — the most confusing outcome available. A bundle is rebuilt whole,
+via `scripts/bundle-app.sh`, because the plist, icon and ad-hoc signature are part of what
+makes the running app the app.
+
+**Compare the executable before and after.** A request that only touched documentation, the
+agent's brief or the board itself builds cleanly and changes nothing, and offering a relaunch
+for that teaches you to ignore the banner. This has a sharp edge worth knowing: a
+**comment-only source change compiles to a byte-identical object**, llbuild skips the relink,
+and the executable keeps its mtime. That is genuinely nothing to reload for — but while testing
+this it reads exactly like the trigger having failed, and it cost two rounds of wrong diagnosis.
+
+**Show the first errors, not the tail.** The tail of a failed `swift build` is `error:
+emit-module command failed`, which says nothing. Two kinds of duplication have to go first: an
+error repeats once per compilation its file takes part in, and every diagnostic is followed by a
+source-excerpt line restating it under a caret — which contains `error:`, is not an identical
+string, and so survives naive deduplication and doubles the banner.
+
+**A failed build offers no relaunch.** The executable is unchanged, so relaunching would show
+you the old app while you believed you were looking at the new one. Instead the banner offers
+*Tell the agent*, which appends the compiler errors to the request as a note — the agent marked
+this done and it does not compile, which is exactly the thing it needs to know and the one
+thing it cannot observe, since it is not the process that builds.
+
+### Replacing the process
+
+macOS activates the existing instance rather than starting a second one with the same bundle
+identifier, so the new app cannot start until this one is gone — and this one cannot start
+anything after it has exited. So a detached `/bin/sh` waits for the pid to disappear and then
+launches. Runs are stopped first rather than left to die with the process, so each closes its
+session file and its runtime host exits cleanly; a killed host leaves a kernel process behind
+and a transcript with no final entry.
+
+What survives the replacement is what makes it a reload rather than a restart: the section you
+were on, the request you had selected, and whether the workshop agent was attached — written to
+`UserDefaults` with a timestamp, restored only if it is under three minutes old, and cleared
+unconditionally either way so a stale position cannot fire on some unrelated launch days later.
+
+### Automatic build, manual relaunch
+
+The build is automatic. The relaunch is one click, and the default is deliberate rather than
+timid: **right after the agent finishes a request, the session that finished it is usually still
+attached and holding a live interpreter.** Relaunching ends it. The transcript survives and the
+session can be resumed, but that interpreter's variables cannot — so the banner names the cost
+at the moment of the decision, and there is a preference for those who would rather not be
+asked.
+
+`AVIARY_RELOAD_DEBUG=1` logs each step. Worth having because this path is invisible by
+construction — it runs while you are looking at something else, and its most likely failure is
+doing nothing at all, which has no symptom.
+
 ## Workshop capture ordering
 
 The screenshot attached to a request is taken when the compose panel is **asked for**, not

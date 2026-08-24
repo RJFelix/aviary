@@ -26,11 +26,15 @@ struct RootView: View {
         {
             CommandPaletteView()
         }
+        // Top, and outside the section switch, because the point is that you do not have to
+        // be looking at the Workshop to learn that the thing you asked for is ready.
+        .overlay(alignment: .top) { ReloadBanner() }
         .overlay(alignment: .bottom) { toastOverlay }
         // Bottom-trailing, on every screen, deliberately outside the section switch: the
         // point of the panel is to catch a reaction wherever you have it.
         .overlay(alignment: .bottomTrailing) { CapturePanel() }
         .animation(.easeInOut(duration: 0.18), value: model.toast?.id)
+        .animation(.easeInOut(duration: 0.2), value: model.reloader.phase)
     }
 
     @ViewBuilder

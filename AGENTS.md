@@ -68,6 +68,10 @@ what it does; this file is how to work on it without relearning the traps.
 - **Never resolve `claude` off `PATH` alone.** A terminal multiplexer or IDE integration
   commonly puts a shim there under `/var/folders/…/T/`, scoped to the session that made it.
   `ClaudeCode.locate` checks real install paths first and filters temp-dir shims.
+- **A comment-only Swift change produces a byte-identical binary.** llbuild recompiles the
+  file, sees the same object, and skips the relink — so the executable keeps its mtime. Any
+  test of "did a rebuild happen?" must change emitted code, not a comment. This cost two
+  rounds of wrong diagnosis while building the workshop reload.
 - **Swift 5 language mode is deliberate** (`swiftSettings: [.swiftLanguageMode(.v5)]`).
   Strict concurrency checking on AppKit-adjacent code buys errors, not safety, at this stage.
 

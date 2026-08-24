@@ -244,6 +244,9 @@ final class AppModel {
     /// The attached run servicing the board, when Aviary started one.
     var workshopRunID: UUID?
 
+    /// Rebuilding and relaunching Aviary when the workshop has changed Aviary.
+    let reloader = Reloader()
+
     struct Toast: Identifiable, Equatable {
         let id = UUID()
         var message: String
@@ -289,7 +292,14 @@ final class AppModel {
 
         repoRoot = EngineLocator.repoRoot()
         workshopSessionID = UserDefaults.standard.string(forKey: "aviary.workshop.session")
-        refreshBoard()
+        board = WorkshopBoard.load(repoRoot: repoRoot)
+        // Baselined *before* watching starts, so requests that were already done when this
+        // window opened do not read as fresh completions and rebuild the app on launch.
+        reloader.begin(repoRoot: repoRoot, board: board) { [weak self] in
+            self?.refreshBoard()
+        }
+        reloader.requestRelaunch = { [weak self] in self?.reloadNow() }
+        restoreAfterReload()
 
         await refreshAll()
         startPolling()

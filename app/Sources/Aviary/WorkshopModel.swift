@@ -20,6 +20,9 @@ extension AppModel {
         if let id = selectedRequestID, !board.requests.contains(where: { $0.id == id }) {
             selectedRequestID = board.requests.first?.id
         }
+        // One reader for the log, so the board and the reload banner cannot disagree about
+        // what it says. This is also what starts a rebuild when a request becomes done.
+        reloader.boardChanged(board)
     }
 
     var selectedRequest: WorkshopRequest? {
@@ -638,6 +641,98 @@ extension AppModel {
             return "shots/\(requestID).png"
         } catch {
             return nil
+        }
+    }
+}
+
+// MARK: - Reloading Aviary after the workshop changes Aviary
+
+extension AppModel {
+
+    /// What a relaunch has to put back, and how long a note about it stays valid.
+    ///
+    /// A restart that dumps you on the Cockpit is a restart; one that comes back on the
+    /// request you were watching, with the agent re-attached, is a reload. The whole
+    /// difference between the two is written down here.
+    private enum Restore {
+        static let section = "aviary.reload.restore.section"
+        static let request = "aviary.reload.restore.request"
+        static let attach = "aviary.reload.restore.attach"
+        static let stamp = "aviary.reload.restore.stamp"
+        /// Beyond this, a stored position is somebody's old session rather than the reload
+        /// that just happened, and restoring it would be a surprise.
+        static let validFor: TimeInterval = 180
+    }
+
+    /// What relaunching now would cost, or nil when it costs nothing.
+    ///
+    /// Named rather than prevented. Right after the workshop agent finishes, the session that
+    /// finished it is usually still attached and holding a live interpreter — and that is
+    /// exactly the moment you want to reload. So the price is stated and the choice is yours.
+    var reloadCost: String? {
+        let streaming = runs.filter { $0.isStreaming && !$0.hasExited }
+        let attached = runs.filter { !$0.hasExited }
+        if !streaming.isEmpty {
+            return "\(streaming.count) run\(streaming.count == 1 ? "" : "s") still working — "
+                + "relaunching stops \(streaming.count == 1 ? "it" : "them") mid-turn"
+        }
+        if !attached.isEmpty {
+            return "\(attached.count) attached run\(attached.count == 1 ? "" : "s") will end; "
+                + "the transcript survives, the interpreter's variables do not"
+        }
+        return nil
+    }
+
+    /// Write down where we are, then replace the process.
+    func reloadNow() {
+        let defaults = UserDefaults.standard
+        defaults.set(section.rawValue, forKey: Restore.section)
+        defaults.set(selectedRequestID, forKey: Restore.request)
+        // Re-attach on the way back only if a workshop run was attached here — otherwise a
+        // reload would silently start an agent session you never asked for.
+        defaults.set(workshopRun != nil, forKey: Restore.attach)
+        defaults.set(Date().timeIntervalSince1970, forKey: Restore.stamp)
+
+        // Runs are stopped rather than left to die with the process, so each one closes its
+        // session file and its runtime host exits cleanly. A killed host leaves a kernel
+        // process behind and a transcript with no final entry.
+        for run in runs { Task { await run.stop() } }
+
+        if !reloader.relaunch() {
+            toast = Toast(
+                message: "Could not work out how to relaunch this copy of Aviary. "
+                    + "Rebuild with `just build` and reopen.",
+                isError: true)
+        }
+    }
+
+    /// Come back where we were, if we got here by reloading.
+    func restoreAfterReload() {
+        let defaults = UserDefaults.standard
+        let stamp = defaults.double(forKey: Restore.stamp)
+        guard stamp > 0 else { return }
+        defer {
+            // Cleared unconditionally, including when it was too old to use: a stored
+            // position that survives its own expiry would fire on some unrelated launch days
+            // later.
+            for key in [Restore.section, Restore.request, Restore.attach, Restore.stamp] {
+                defaults.removeObject(forKey: key)
+            }
+        }
+        guard Date().timeIntervalSince1970 - stamp < Restore.validFor else { return }
+
+        if let raw = defaults.string(forKey: Restore.section),
+           let restored = Section(rawValue: raw) {
+            section = restored
+        }
+        if let id = defaults.string(forKey: Restore.request) { selectedRequestID = id }
+        let shouldAttach = defaults.bool(forKey: Restore.attach)
+        toast = Toast(message: "Reloaded" + (shouldAttach ? " — reattaching the agent" : ""))
+        guard shouldAttach, workshopSessionID != nil else { return }
+        // After the board and the engine list exist, or attaching has nothing to attach to.
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            attachWorkshopSession()
         }
     }
 }

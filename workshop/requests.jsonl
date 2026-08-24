@@ -14,3 +14,4 @@
 {"at":"2026-08-23T23:34:40.023Z","event":"link","id":"wr-20260823-49ce","session":"01a030f9-e90a-7106-a837-2f4522fe172b","v":1}
 {"v":1,"at":"2026-08-23T23:34:53.818Z","event":"status","id":"wr-20260823-49ce","status":"building","note":"Locating the Workshop request editor and its snapshot coverage before implementation.","by":"agent"}
 {"v":1,"at":"2026-08-23T23:41:18.064Z","event":"status","id":"wr-20260823-49ce","status":"done","note":"Added a full-size Workshop request editor for new and existing items. Edits append an `edited` event so the original request and captured context remain intact. Verified with just check and a Workshop snapshot.","by":"agent"}
+{"v":1,"at":"2026-08-23T23:41:23.676Z","event":"link","id":"wr-20260823-49ce","commit":"d2b4037"}

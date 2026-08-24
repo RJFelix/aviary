@@ -76,6 +76,19 @@ Aviary reports which — `plan usage (five-hour)` or `extra usage`, read from Cl
 rate-limit frame rather than guessed. What you give up is steering, sub-agents, mid-run model
 switching, and resuming an Aviary session, because the conversation belongs to Claude Code.
 
+## Seeing what the workshop built
+
+The workshop agent edits Aviary's own source, so its work is invisible until the app is
+rebuilt. Aviary watches its own board: when a request is marked done it starts the build in the
+background, and a banner offers to replace the running process — coming back on the screen you
+were on, with the agent reattached.
+
+Not hot reload in the code-injection sense; the process is replaced, not patched. What makes it
+feel like a reload is that the build has already finished by the time you look, so the click is
+immediate. The relaunch is a click rather than automatic for one specific reason: the session
+that just finished your request is usually still attached and holding a live interpreter, and
+relaunching ends it. Preferences → Workshop turns either half off.
+
 ## What it does
 
 | Screen | What it answers |
