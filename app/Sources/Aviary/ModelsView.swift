@@ -74,7 +74,11 @@ struct ModelsView: View {
                             BuiltInProviderRow(
                                 id: id,
                                 modelCount: reachableCount(id),
-                                authKind: model.auth.kinds[id])
+                                // From the catalogue's own spec, not `auth.json`. Codex stores
+                                // its credential there; Claude Code's lives in the `claude`
+                                // binary's keychain entry, so reading auth.json for it renders
+                                // a reachable provider as signed-out.
+                                authKind: builtInAuthKind(id))
                                 .tag("builtin:\(id)")
                         }
                     }
@@ -89,6 +93,19 @@ struct ModelsView: View {
     private var builtInProviders: [String] {
         let configured = Set(model.modelsConfig.providers.map(\.id))
         return Array(Set(model.runtimeModels.map(\.providerID)).subtracting(configured)).sorted()
+    }
+
+    /// How a built-in provider's credential should be labelled.
+    ///
+    /// From the catalogue's own spec rather than `auth.json`. Codex stores its credential
+    /// there; Claude Code's lives in the `claude` binary's keychain entry, which Aviary cannot
+    /// read — so consulting auth.json for it renders a perfectly reachable provider as
+    /// signed-out.
+    private func builtInAuthKind(_ id: String) -> String? {
+        if let spec = model.modelCatalog.reachable.first(where: { $0.id == id }) {
+            return spec.authKind ?? (spec.hasStoredAuth ? "authenticated" : nil)
+        }
+        return model.auth.kinds[id]
     }
 
     private func reachableCount(_ providerID: String) -> Int {

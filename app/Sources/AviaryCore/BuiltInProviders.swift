@@ -29,6 +29,56 @@ public enum BuiltInProviders {
         return spec
     }
 
+    /// Claude Code, as a provider you can pick a model from.
+    ///
+    /// It is not an HTTP route and has no `baseUrl` or key — the credential belongs to the
+    /// `claude` binary and Aviary never sees it. It is in the catalogue anyway, because
+    /// "which model is answering" is the same question here as anywhere else, and answering it
+    /// somewhere else would mean two model pickers that disagree.
+    ///
+    /// The ids are Claude Code's own aliases rather than full model ids, because that is what
+    /// its `--model` flag takes.
+    ///
+    /// No prices. A subscription run's tokens were not billed per token, so pricing them at
+    /// list would invent spending; `sessionsWithoutPricing` already means "no rates
+    /// published", which is the true thing to say.
+    public static func claudeCode(signedIn: Bool = false) -> ProviderSpec {
+        var spec = ProviderSpec(
+            id: "claude-code",
+            name: "Claude Code (subscription)",
+            baseURL: nil,
+            api: "claude-code-cli",
+            apiKeyExpression: nil,
+            authHeader: nil,
+            headers: [:],
+            models: claudeCodeModels)
+        spec.isBuiltIn = true
+        spec.hasStoredAuth = signedIn
+        spec.authKind = signedIn ? "claude.ai" : nil
+        return spec
+    }
+
+    static let claudeCodeModels: [ModelSpec] = [
+        claudeCodeModel("opus", "Claude Opus", contextWindow: 200_000),
+        claudeCodeModel("sonnet", "Claude Sonnet", contextWindow: 1_000_000),
+        claudeCodeModel("haiku", "Claude Haiku", contextWindow: 200_000),
+    ]
+
+    static func claudeCodeModel(
+        _ id: String, _ name: String, contextWindow: Int
+    ) -> ModelSpec {
+        var m = ModelSpec(rpc: .object([
+            "id": .string(id),
+            "name": .string(name),
+            "provider": .string("claude-code"),
+            "api": .string("claude-code-cli"),
+            "reasoning": .bool(true),
+            "contextWindow": .number(Double(contextWindow)),
+        ]))
+        m.isBuiltIn = true
+        return m
+    }
+
     static func model(
         _ id: String, _ name: String, cost: (Double, Double, Double, Double),
         thinking: [String: String?]? = nil, contextWindow: Int = 272_000,

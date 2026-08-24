@@ -126,14 +126,29 @@ public enum ModelCatalogBuilder {
         var candidates = config.providers
         let codex = BuiltInProviders.openAICodex(auth: auth)
         if !candidates.contains(where: { $0.id == codex.id }) { candidates.append(codex) }
+        // Claude Code is a provider here even though it is not an HTTP route, because "which
+        // model is answering" is the same question for it as for anything else. Its
+        // reachability is decided by the caller — it depends on `claude auth status`, not on a
+        // key expression — and arrives through `credentialed` like a configured provider's.
+        let claudeCode = BuiltInProviders.claudeCode(
+            signedIn: credentialed.contains("claude-code"))
+        if !candidates.contains(where: { $0.id == claudeCode.id }) {
+            candidates.append(claudeCode)
+        }
 
         for provider in candidates {
             // A built-in is reachable when its OAuth credentials are stored; a configured one
             // when its `apiKey` expression resolved. This is the same notion of "reachable" the
             // harness's `get_available_models` uses — models backed by active credentials.
-            let usable = provider.isBuiltIn
-                ? (auth?.providers.contains(provider.id) ?? false)
-                : credentialed.contains(provider.id)
+            // A built-in is reachable when its stored credentials are there. Codex reads that
+            // from `auth.json`; Claude Code's credential lives in the `claude` binary's own
+            // keychain entry, which Aviary cannot and should not read — so the caller resolves
+            // it and passes it in.
+            let usable = provider.id == "claude-code"
+                ? credentialed.contains("claude-code")
+                : provider.isBuiltIn
+                    ? (auth?.providers.contains(provider.id) ?? false)
+                    : credentialed.contains(provider.id)
             if usable {
                 out.reachable.append(provider)
             } else {

@@ -367,8 +367,12 @@ final class AppModel {
     /// If an Anthropic subscription login is ever added, it needs a `BuiltInProviders` entry
     /// here too, or its models will be missing rather than merely unreachable.
     func refreshRuntimeModels() async {
-        let credentialed = await ModelCatalogBuilder.credentialedProviders(
+        var credentialed = await ModelCatalogBuilder.credentialedProviders(
             config: modelsConfig, auth: auth)
+        // Claude Code's credential lives in the `claude` binary's own keychain entry, which
+        // Aviary cannot read and should not try to — so reachability is what `claude auth
+        // status` says, resolved once at bootstrap.
+        if claudeCodeAuth?.loggedIn == true { credentialed.insert("claude-code") }
         modelCatalog = ModelCatalogBuilder.build(
             config: modelsConfig, auth: auth, credentialed: credentialed,
             preferences: modelPreferences)
@@ -715,6 +719,9 @@ final class AppModel {
     func startClaudeCodeRun(
         cwd: String, model: String, effort: String?, prompt: String, title: String? = nil
     ) {
+        // Remembered for the next run, and for the places that start one without a sheet —
+        // the workshop launcher and `continueSession`.
+        claudeCodeModel = model
         let run = LiveRun(
             claudeCode: ClaudeCodeDriver(home: home, cwd: cwd, model: model, effort: effort),
             cwd: cwd, modelLabel: "claude-code/\(model)")

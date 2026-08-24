@@ -574,7 +574,16 @@ final class OutputCollector: @unchecked Sendable {
     var streams: [String] { lock.lock(); defer { lock.unlock() }; return seen }
 }
 
-await Harness.run([
+/// One case: a name and a body.
+///
+/// The suite is split into several arrays rather than one literal, and the annotation is not
+/// decoration. As a single expression of two hundred closures, Swift's type-checker exceeded
+/// its time limit — and it reported that as an error on an arbitrary innocent line in an
+/// unrelated case, which reads as a broken test rather than as a file that got too big. Adding
+/// a case would break a different one at random.
+typealias Case = (String, () async throws -> Void)
+
+let cases0: [Case] = [
     ("parsesLinearSessionWithToolPairing", { try test_parsesLinearSessionWithToolPairing() }),
     ("rendersOnlyTheActiveBranch", { try test_rendersOnlyTheActiveBranch() }),
     ("collapsesAgentStatusToLatestOnly", { try test_collapsesAgentStatusToLatestOnly() }),
@@ -638,6 +647,9 @@ await Harness.run([
         XCTAssertEqual(r.notes.last?.text, "shipped")
     }),
 
+]
+
+let cases1: [Case] = [
     ("workshop: a malformed line is skipped, not fatal", {
         // The agent hand-writes into this file. One bad line must not cost the board.
         let lines = [
@@ -1032,6 +1044,9 @@ await Harness.run([
         await shared.stop()
     }),
 
+]
+
+let cases2: [Case] = [
     ("runtimeHost: the documented numpy trade-off is real in both directions", {
         // numpy declares Py_mod_multiple_interpreters = NOT_SUPPORTED, so CPython refuses to
         // load it in a sub-interpreter. Asserted rather than described, because if a future
@@ -1829,6 +1844,9 @@ await Harness.run([
                        "the skill actually named for the topic wins")
     }),
 
+]
+
+let cases3: [Case] = [
     ("agent: a second prompt continues the same conversation and interpreter", {
         // What makes a session worth more than a request: the variables from turn one are
         // still there in turn two, and the model can see what it already said.
@@ -2603,6 +2621,9 @@ await Harness.run([
         XCTAssertEqual(CodexAuth.originator, "pi")
     }),
 
+]
+
+let cases4: [Case] = [
     ("codex: the authorize URL carries all ten parameters in the reference's order", {
         let url = CodexAuth.authorizationURL(challenge: "CH", state: "ST")
         let items = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
@@ -3077,6 +3098,9 @@ await Harness.run([
         XCTAssertFalse(isError)
     }),
 
+]
+
+let cases5: [Case] = [
     ("resume: visible thinking is dropped rather than re-sent", {
         // The routes that produce reasoning want their own encrypted form echoed back, and
         // Codex's `reasoning.encrypted_content` is deliberately not persisted. Sending the
@@ -3403,6 +3427,9 @@ await Harness.run([
         XCTAssertEqual(table.rows, [["a | b"]])
     }),
 
+]
+
+let cases6: [Case] = [
     ("markdown: centre alignment is read from the delimiter", {
         guard case let .table(table) =
             MarkdownParser.blocks(from: "| a |\n| :-: |\n| x |")[0]
@@ -4037,7 +4064,10 @@ await Harness.run([
             error: emit-module command failed with exit code 1
             """
         let reported = WorkshopReload.firstErrors(in: output)
-        let lines = reported.split(separator: "\n").map(String.init)
+        // Explicit closure rather than `map(String.init)`: the initializer's overload set makes
+        // the expression expensive enough to trip the type-checker's time limit as this file
+        // grows, which fails as a compiler error in an unrelated test.
+        let lines: [String] = reported.split(separator: "\n").map { String($0) }
         XCTAssertTrue(lines[0].contains("cannot find 'nope' in scope"))
         XCTAssertTrue(reported.contains("missing brace"))
         // One mistake repeats once per compilation its file takes part in, so duplicates are
@@ -4075,6 +4105,73 @@ await Harness.run([
         XCTAssertNil(WorkshopReload.stamp(ofFileAt: tmp.path))
     }),
 
+
+    ("claude-code: it is a provider in the catalogue, reachable only when signed in", {
+        // The point of it being here at all: "which model is answering" is the same question
+        // for a driven run as for any other, and answering it somewhere else would mean two
+        // model pickers that can disagree.
+        let empty = ModelsConfig(
+            providers: [], raw: .object([:]),
+            fileURL: URL(fileURLWithPath: "/nonexistent/models.json"), exists: false)
+        let signedOut = ModelCatalogBuilder.build(
+            config: empty, auth: nil, credentialed: [], preferences: ModelPreferences())
+        XCTAssertFalse(signedOut.reachable.contains { $0.id == "claude-code" })
+        XCTAssertTrue(signedOut.unreachable.contains { $0.id == "claude-code" },
+                      "configured-but-unusable is more useful to say than showing nothing")
+
+        // Reachability comes from the caller, because the credential lives in the `claude`
+        // binary's own keychain entry — not in auth.json, and not in a key expression.
+        let signedIn = ModelCatalogBuilder.build(
+            config: empty, auth: nil, credentialed: ["claude-code"],
+            preferences: ModelPreferences())
+        let provider = try XCTUnwrap(signedIn.reachable.first { $0.id == "claude-code" })
+        XCTAssertTrue(provider.isBuiltIn)
+        XCTAssertNil(provider.baseURL, "not an HTTP route")
+        XCTAssertNil(provider.apiKeyExpression, "Aviary never sees the credential")
+        XCTAssertEqual(provider.api, "claude-code-cli")
+        XCTAssertTrue(provider.hasStoredAuth)
+        XCTAssertEqual(provider.authKind, "claude.ai")
+
+        let ids = provider.models.map(\.id).sorted()
+        XCTAssertEqual(ids, ["haiku", "opus", "sonnet"], "Claude Code's own --model aliases")
+        let sonnet = try XCTUnwrap(provider.models.first { $0.id == "sonnet" })
+        XCTAssertEqual(sonnet.qualifiedID, "claude-code/sonnet")
+        XCTAssertEqual(sonnet.contextWindow, 1_000_000)
+        XCTAssertTrue(sonnet.reasoning)
+        // No prices, so `sessionsWithoutPricing` keeps meaning "no rates published" rather
+        // than "cost zero" — the true thing to say about a subscription run.
+        XCTAssertNil(sonnet.costInput)
+        XCTAssertEqual(sonnet.priced(Usage()).cost.total, 0)
+    }),
+
+    ("claude-code: its models order and disable like every other model", {
+        // The whole reason it belongs in the catalogue rather than in a picker of its own.
+        var preferences = ModelPreferences()
+        let empty = ModelsConfig(
+            providers: [], raw: .object([:]),
+            fileURL: URL(fileURLWithPath: "/nonexistent/models.json"), exists: false)
+        let catalog = ModelCatalogBuilder.build(
+            config: empty, auth: nil, credentialed: ["claude-code"],
+            preferences: preferences)
+        let haiku = try XCTUnwrap(catalog.find("claude-code/haiku"))
+        preferences.setEnabled(false, for: haiku)
+        let narrowed = ModelCatalogBuilder.build(
+            config: empty, auth: nil, credentialed: ["claude-code"],
+            preferences: preferences)
+        XCTAssertFalse(narrowed.enabled.contains { $0.qualifiedID == "claude-code/haiku" })
+        XCTAssertEqual(narrowed.disabledCount, 1)
+        // Disabling hides a model from pickers; it must not break reading back a session that
+        // already used it.
+        XCTAssertNotNil(narrowed.find("claude-code/haiku"))
+
+        // And pinning works on it like anything else.
+        preferences.pin([haiku])
+        let reordered = ModelCatalogBuilder.build(
+            config: empty, auth: nil, credentialed: ["claude-code"],
+            preferences: preferences)
+        XCTAssertEqual(reordered.models.first?.qualifiedID, "claude-code/haiku")
+    }),
+
     ("codex: the built-in model catalogue matches the harness's", {
         // Transcribed, not invented: a model id this client sends that no known harness sends
         // is an anomaly.
@@ -4100,4 +4197,6 @@ await Harness.run([
         let spark = try XCTUnwrap(provider.models.first { $0.id == "gpt-5.3-codex-spark" })
         XCTAssertEqual(spark.contextWindow, 128_000, "the one model with a smaller window")
     }),
-])
+]
+
+await Harness.run(cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6)

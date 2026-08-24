@@ -423,6 +423,35 @@ exactly the true thing to say. What *is* reported is the `rate_limit_event` fram
 `isUsingOverage` is the difference between the plan allowance and paying per token, and it is
 surfaced rather than inferred.
 
+### Claude Code is a provider in the catalogue
+
+It would have been easy to leave the driven engine's model choice where it started: a small
+`sonnet / opus / haiku` picker tucked inside the Engine card. That was wrong in a way worth
+naming, because the New Run sheet then showed **two** model pickers — the ordinary
+provider-and-model pair, still live and still ignored, and the real one below it. This app's own
+stated rule is that it never offers a control which would quietly do nothing.
+
+So `claude-code` is a provider in `BuiltInProviders`, alongside `openai-codex`. It has no
+`baseUrl` and no key expression, because it is not an HTTP route and Aviary never sees the
+credential — reachability comes from `claude auth status` and is passed into
+`ModelCatalogBuilder.build` through `credentialed`, the same channel a configured provider's
+resolved key uses. Its ids are Claude Code's own `--model` aliases rather than full model ids.
+
+What that buys, beyond one picker instead of two: it appears on the Models screen, it can be
+reordered, and it can be switched off — the same as everything else. "Which model is answering"
+is the same question for a driven run as for any other, and answering it in a separate place is
+what made the two pickers disagree.
+
+The engine still comes first, and the Model card is filtered by it: the driven engine offers only
+`claude-code` models, and the other two engines exclude them. Filtering rather than reordering,
+because the engine decides who makes the request — Claude Code holds its own credential and
+serves only Claude models, and neither of the other engines can drive Claude Code.
+
+One rendering trap this exposed: the Models screen labelled built-in providers from
+`auth.json`, which is where Codex keeps its credential. Claude Code's lives in the `claude`
+binary's own keychain entry, so a reachable provider rendered as signed-out. The label now comes
+from the catalogue's own spec.
+
 ### One assembly, two callers
 
 `ClaudeCodeSession.prepare` builds the whole thing — auth check, kernel, gated skills and

@@ -28,3 +28,4 @@
 {"at":"2026-08-24T03:47:10.262Z","event":"link","id":"wr-20260823-e772","session":"01a030f9-e90a-7106-a837-2f4522fe172b","v":1}
 {"v":1,"at":"2026-08-24T03:47:28.262Z","event":"status","id":"wr-20260823-e772","status":"building","note":"Inspecting the Cockpit and shared run composer before replacing the overview with active-session cards and detail.","by":"agent"}
 {"v":1,"at":"2026-08-24T03:51:49.652Z","event":"status","id":"wr-20260823-e772","status":"done","note":"Replaced Cockpit with a one-third ongoing-run rail and final New session card, plus a two-thirds shared chat/composer detail pane. Markdown now has a rendered live preview in the composer. Verified with just check and a Cockpit snapshot.","by":"agent"}
+{"v":1,"at":"2026-08-24T03:51:56.324Z","event":"link","id":"wr-20260823-e772","commit":"404a4f6"}

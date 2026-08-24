@@ -479,6 +479,54 @@ struct LauncherSheet: View {
                         }
                     }
 
+                    Card("Engine", symbol: "cpu") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Picker("", selection: Binding(
+                                get: { model.engineChoice },
+                                set: { model.engineChoice = $0 }))
+                            {
+                                ForEach(AppModel.Engine.allCases) { Text($0.label).tag($0) }
+                            }
+                            .pickerStyle(.segmented).labelsHidden()
+                            .onChange(of: model.engineChoice) { _, _ in
+                                // The two engines offer disjoint catalogues, so a selection
+                                // made under one is meaningless under the other. Re-seeded
+                                // rather than left alone, because a picker showing a provider
+                                // that is no longer in its own list renders blank.
+                                provider = providers.first ?? ""
+                                modelID = modelsForProvider.first?.id ?? ""
+                            }
+                            Text(engineExplanation)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            if model.engineChoice == .claudeCode {
+                                Divider().opacity(0.5)
+                                if let auth = model.claudeCodeAuth {
+                                    HStack(spacing: 6) {
+                                        Circle()
+                                            .fill(auth.isSubscription
+                                                ? Design.success : Design.warning)
+                                            .frame(width: 6, height: 6)
+                                        Text(auth.isSubscription
+                                            ? "\(auth.summary) — draws on the plan"
+                                            : "\(auth.summary) — bills metered API credit")
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                } else {
+                                    Text("No `claude` binary found, or it is not signed in. "
+                                        + "Install Claude Code and run `claude /login`.")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(Design.warning)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+
                     Card("Model", symbol: "cpu") {
                         VStack(alignment: .leading, spacing: 8) {
                             if model.pickerModels.isEmpty {
@@ -528,56 +576,6 @@ struct LauncherSheet: View {
                         }
                     }
 
-                    Card("Engine", symbol: "cpu") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Picker("", selection: Binding(
-                                get: { model.engineChoice },
-                                set: { model.engineChoice = $0 }))
-                            {
-                                ForEach(AppModel.Engine.allCases) { Text($0.label).tag($0) }
-                            }
-                            .pickerStyle(.segmented).labelsHidden()
-                            Text(engineExplanation)
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                                .fixedSize(horizontal: false, vertical: true)
-
-                            if model.engineChoice == .claudeCode {
-                                Divider().opacity(0.5)
-                                // Claude Code's own aliases rather than model ids, because
-                                // that is what its `--model` takes.
-                                Picker("Model", selection: Binding(
-                                    get: { model.claudeCodeModel },
-                                    set: { model.claudeCodeModel = $0 }))
-                                {
-                                    ForEach(["sonnet", "opus", "haiku"], id: \.self) {
-                                        Text($0).tag($0)
-                                    }
-                                }
-                                if let auth = model.claudeCodeAuth {
-                                    HStack(spacing: 6) {
-                                        Circle()
-                                            .fill(auth.isSubscription
-                                                ? Design.success : Design.warning)
-                                            .frame(width: 6, height: 6)
-                                        Text(auth.isSubscription
-                                            ? "\(auth.summary) — draws on the plan"
-                                            : "\(auth.summary) — bills metered API credit")
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                } else {
-                                    Text("No `claude` binary found, or it is not signed in. "
-                                        + "Install Claude Code and run `claude /login`.")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(Design.warning)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-                            }
-                        }
-                        .controlSize(.small)
-                    }
-
                     Card("Options", symbol: "slider.horizontal.3") {
                         VStack(alignment: .leading, spacing: 8) {
                             Toggle("Save the session to disk", isOn: $persistSession)
@@ -623,7 +621,10 @@ struct LauncherSheet: View {
                     if model.engineChoice == .claudeCode {
                         model.startClaudeCodeRun(
                             cwd: cwd.isEmpty ? model.defaultCwd : cwd,
-                            model: model.claudeCodeModel,
+                            // From the Model card, like every other engine. `claudeCodeModel`
+                            // is still where the choice is remembered between runs, which is
+                            // why it is written here rather than read.
+                            model: modelID.isEmpty ? model.claudeCodeModel : modelID,
                             // "off" is the picker's no-reasoning value; Claude Code has no such
                             // level, so it is expressed by omitting the flag entirely.
                             effort: thinking == "off" ? nil : thinking,
@@ -706,11 +707,26 @@ struct LauncherSheet: View {
     /// switcher and both follow your ordering.
     private var providers: [String] {
         var seen = Set<String>()
-        return model.pickerModels.compactMap { seen.insert($0.providerID).inserted ? $0.providerID : nil }
+        return offeredModels.compactMap {
+            seen.insert($0.providerID).inserted ? $0.providerID : nil
+        }
     }
 
     private var modelsForProvider: [ModelSpec] {
-        model.pickerModels.filter { $0.providerID == provider }
+        offeredModels.filter { $0.providerID == provider }
+    }
+
+    /// The models this engine can actually reach.
+    ///
+    /// Filtered rather than merely ordered, because the engine decides who makes the request.
+    /// Claude Code holds its own credential and only serves Claude models; the other two
+    /// engines call providers directly and cannot drive Claude Code. Offering the whole
+    /// catalogue under either would be offering a route that silently is not taken — which is
+    /// what this sheet did until the model picker and the engine picker were reconciled.
+    private var offeredModels: [ModelSpec] {
+        model.engineChoice == .claudeCode
+            ? model.pickerModels.filter { $0.providerID == "claude-code" }
+            : model.pickerModels.filter { $0.providerID != "claude-code" }
     }
 
     private func chooseDirectory() {
