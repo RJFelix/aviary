@@ -705,7 +705,29 @@ public actor Agent {
                 do {
                     let result = try await entry.client.callTool(
                         entry.tool.name, arguments: call.arguments)
-                    return (result.text, result.isError)
+                    var text = result.text
+                    if !result.images.isEmpty {
+                        if config.model.supportsImages {
+                            // The same queue `attach_image` uses, drained by the loop right
+                            // after this tool result — so a tool that answers with a
+                            // screenshot answers with the screenshot, not with a note saying
+                            // one existed.
+                            for image in result.images {
+                                pendingImages.append((image, "From \(call.name)."))
+                            }
+                            let plural = result.images.count == 1 ? "image" : "images"
+                            text += (text.isEmpty ? "" : "\n")
+                                + "[\(result.images.count) \(plural) attached below]"
+                        } else {
+                            // Degraded honestly rather than dropped: this model cannot see it,
+                            // and an agent that thinks it has been shown something it has not
+                            // will answer confidently about a picture it never received.
+                            text += (text.isEmpty ? "" : "\n")
+                                + "[\(result.images.count) image(s) returned, which "
+                                + "\(config.model.id) cannot read]"
+                        }
+                    }
+                    return (text, result.isError)
                 } catch {
                     return ("The \(entry.tool.server) MCP server failed: "
                         + error.localizedDescription, true)

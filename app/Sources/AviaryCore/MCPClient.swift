@@ -285,8 +285,31 @@ public actor MCPClient {
         throw lastError ?? MCPError.protocolError("initialize failed")
     }
 
+    /// What an MCP tool answered with.
+    ///
+    /// Images are separated from the text rather than flattened into it, because a tool that
+    /// returns a screenshot is returning the *answer*, and "[image content]" in a transcript
+    /// is a description of an answer nobody can see.
+    public struct CallResult: Sendable {
+        public var text: String
+        public var isError: Bool
+        public var images: [AttachedImage]
+        /// Blocks that arrived and could not be used, named so a caller can say so.
+        public var skipped: [String]
+
+        public init(
+            text: String, isError: Bool = false, images: [AttachedImage] = [],
+            skipped: [String] = []
+        ) {
+            self.text = text
+            self.isError = isError
+            self.images = images
+            self.skipped = skipped
+        }
+    }
+
     public func callTool(_ toolName: String, arguments: JSONValue, timeout: TimeInterval = 300)
-        async throws -> (text: String, isError: Bool)
+        async throws -> CallResult
     {
         let result = try await call("tools/call", params: .object([
             "name": .string(toolName),
@@ -295,15 +318,41 @@ public actor MCPClient {
         // Content is a list of typed blocks; text is what an agent can act on, and anything
         // else is named rather than dropped so a caller can see something arrived.
         let blocks = result?["content"]?.arrayValue ?? []
-        let text = blocks.compactMap { block -> String? in
+        var lines: [String] = []
+        var images: [AttachedImage] = []
+        var skipped: [String] = []
+        for block in blocks {
             switch block["type"]?.stringValue {
-            case "text": return block["text"]?.stringValue
-            case let other?: return "[\(other) content]"
-            default: return nil
+            case "text":
+                if let text = block["text"]?.stringValue { lines.append(text) }
+            case "image":
+                guard let data = block["data"]?.stringValue else {
+                    skipped.append("image without data")
+                    continue
+                }
+                let mime = block["mimeType"]?.stringValue ?? "image/png"
+                do {
+                    images.append(try AttachedImage.decode(
+                        base64: data, mimeType: mime,
+                        describedAs: "\(name)/\(toolName)"))
+                } catch {
+                    // Named, not dropped. A tool whose whole answer was a picture that could
+                    // not be decoded has effectively answered nothing, and the agent needs to
+                    // know that rather than read an empty result as "no findings".
+                    skipped.append("undecodable image (\(mime))")
+                }
+            case let other?:
+                skipped.append("\(other) content")
+            default:
+                break
             }
-        }.joined(separator: "\n")
+        }
         let isError = result?["isError"]?.boolValue ?? false
-        return (text.isEmpty ? "(no content)" : text, isError)
+        var text = lines.joined(separator: "\n")
+        if text.isEmpty && images.isEmpty {
+            text = skipped.isEmpty ? "(no content)" : "(" + skipped.joined(separator: ", ") + ")"
+        }
+        return CallResult(text: text, isError: isError, images: images, skipped: skipped)
     }
 
     public func stop() async {

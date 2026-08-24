@@ -361,6 +361,13 @@ Code and its era is not ours to choose. A request carrying modern `_meta` is ser
 an `initialize` selects handshake semantics. `resultType` and `serverInfo` are additive, so a
 legacy client ignores them rather than choking.
 
+An MCP tool that answers with a picture answers with the picture. Image blocks are decoded,
+scaled and re-encoded on the way in — an MCP server is somebody else's program, so the size and
+format of what it returns are its choice, not ours — and then queued onto the same path
+`attach_image` uses, so the loop drains them into the conversation right after the tool result.
+Against a model that cannot read images they degrade to a sentence saying so, because an agent
+that believes it was shown a screenshot will answer confidently about one it never received.
+
 Absent by choice: roots, sampling and elicitation — all three deprecated in this revision — so
 the client declares no capabilities and treats an `input_required` result as a readable error
 rather than an empty answer.

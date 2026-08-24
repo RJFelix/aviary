@@ -4911,7 +4911,8 @@ let casesMCPVersions: [Case] = [
         XCTAssertTrue(era.isModern, "server/discover answered, so no handshake was needed")
         XCTAssertEqual(era.version, "2026-07-28")
         XCTAssertEqual(await client.serverInfo?.contains("modern-fixture"), true)
-        XCTAssertEqual(tools.map(\.name).sorted(), ["needs_input", "whoami"])
+        XCTAssertEqual(tools.map(\.name).sorted(),
+                       ["broken_shot", "needs_input", "shot", "whoami"])
         // The freshness hint is recorded rather than discarded.
         XCTAssertEqual(await client.toolsTTL, 60)
 
@@ -4958,6 +4959,137 @@ let casesMCPVersions: [Case] = [
         let ok = try await client.callTool("echo", arguments: .object(["text": .string("hi")]))
         XCTAssertEqual(ok.text, "hi")
         await client.stop()
+    }),
+
+    ("mcp: a tool that answers with a picture answers with the picture", {
+        // "[image content]" in a transcript is a description of an answer nobody can see. The
+        // fixture returns a 2400x1200 PNG it generates itself, so this also exercises the
+        // client doing something about a size that is somebody else's choice.
+        guard let fixture = mcpFixture("mcp-modern.py") else {
+            print("      skipped: no modern fixture"); return
+        }
+        let client = MCPClient(
+            name: "modern", executable: "/usr/bin/env", arguments: ["python3", fixture])
+        _ = try await client.start(timeout: 20)
+
+        let shot = try await client.callTool("shot", arguments: .object([:]))
+        XCTAssertEqual(shot.text, "here is the screen", "text and image are separate")
+        XCTAssertEqual(shot.images.count, 1)
+        let image = try XCTUnwrap(shot.images.first)
+        XCTAssertEqual(max(image.width, image.height), AttachedImage.maxEdge,
+                       "scaled on the way in, like any other image")
+        XCTAssertNotNil(image.scaledFrom)
+        XCTAssertEqual(image.mimeType, "image/png")
+        XCTAssertTrue(image.path.contains("shot"), "labelled by where it came from")
+        XCTAssertTrue(shot.skipped.isEmpty)
+
+        // An image that will not decode is named, not dropped: a tool whose whole answer was
+        // a picture has answered nothing, and an empty result reads as "no findings".
+        let broken = try await client.callTool("broken_shot", arguments: .object([:]))
+        XCTAssertTrue(broken.images.isEmpty)
+        XCTAssertEqual(broken.skipped, ["undecodable image (image/png)"])
+        XCTAssertTrue(broken.text.contains("undecodable"),
+                      "and it reaches the agent, rather than reading as an empty answer")
+        await client.stop()
+    }),
+
+    ("mcp: the picture reaches the model, not a sentence about a picture", {
+        // The end-to-end claim, asserted against what actually went on the wire. Everything
+        // up to here proves the client decoded an image; only the outgoing request proves the
+        // model was shown one.
+        guard let fixture = mcpFixture("mcp-modern.py") else {
+            print("      skipped: no modern fixture"); return
+        }
+        guard let server = try FakeProviderServer(script: [
+            ["tool": ["name": "mcp__modern__shot", "arguments": [:]]],
+            ["text": "I can see it."],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        var visionModel = fakeModel()
+        visionModel.inputModalities = ["text", "image"]
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: visionModel)
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(
+                id: "fake", baseURL: server.baseURL, apiKey: "test-key"),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: visionModel, cwd: "/tmp", systemPrompt: "be brief"))
+
+        let client = MCPClient(
+            name: "modern", executable: "/usr/bin/env", arguments: ["python3", fixture])
+        let tools = try await client.start(timeout: 20)
+        await agent.addMCPTools(tools, from: client)
+        await agent.send("show me the screen")
+        await client.stop()
+
+        let sent = try server.recordedRequests()
+        XCTAssertEqual(sent.count, 2)
+        let messages = try XCTUnwrap(sent.last?["messages"]?.arrayValue)
+        // The image rides as its own user message after the tool result — the one shape all
+        // three provider wire formats accept.
+        let imageParts = messages.flatMap { message -> [JSONValue] in
+            (message["content"]?.arrayValue ?? []).filter {
+                $0["type"]?.stringValue == "image_url"
+            }
+        }
+        XCTAssertEqual(imageParts.count, 1, "exactly one picture reached the model")
+        let url = try XCTUnwrap(imageParts.first?["image_url"]?["url"]?.stringValue)
+        XCTAssertTrue(url.hasPrefix("data:image/png;base64,"), String(url.prefix(40)))
+        XCTAssertTrue(url.count > 1000, "and it is the image, not a placeholder")
+        // The tool result itself still says what happened, so the text alone is coherent.
+        let toolText = messages.compactMap { $0["content"]?.stringValue }
+            .first { $0.contains("here is the screen") }
+        XCTAssertTrue(toolText?.contains("1 image attached below") == true, toolText ?? "none")
+    }),
+
+    ("mcp: a model that cannot see is told so rather than shown nothing", {
+        // The failure this prevents is quiet: an agent that believes it was shown a screenshot
+        // will answer confidently about a picture it never received.
+        guard let fixture = mcpFixture("mcp-modern.py") else {
+            print("      skipped: no modern fixture"); return
+        }
+        guard let server = try FakeProviderServer(script: [
+            ["tool": ["name": "mcp__modern__shot", "arguments": [:]]],
+            ["text": "I cannot see it."],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        // fakeModel() declares no input modalities, so it cannot read images.
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(
+                id: "fake", baseURL: server.baseURL, apiKey: "test-key"),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "be brief"))
+        let client = MCPClient(
+            name: "modern", executable: "/usr/bin/env", arguments: ["python3", fixture])
+        await agent.addMCPTools(try await client.start(timeout: 20), from: client)
+        await agent.send("show me the screen")
+        await client.stop()
+
+        let messages = try XCTUnwrap(
+            try server.recordedRequests().last?["messages"]?.arrayValue)
+        let imageParts = messages.flatMap { message in
+            (message["content"]?.arrayValue ?? []).filter {
+                $0["type"]?.stringValue == "image_url"
+            }
+        }
+        XCTAssertTrue(imageParts.isEmpty, "no image is sent to a model that would reject it")
+        let toolText = messages.compactMap { $0["content"]?.stringValue }
+            .first { $0.contains("here is the screen") }
+        XCTAssertTrue(toolText?.contains("cannot read") == true, toolText ?? "none")
     }),
 
     ("mcp: the bridge answers both eras, because its client is not ours to choose", {

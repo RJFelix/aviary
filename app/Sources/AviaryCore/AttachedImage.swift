@@ -76,7 +76,30 @@ public struct AttachedImage: Sendable, Hashable {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
         else { throw Failure.unreadable(url.path) }
+        return try normalise(image, describedAs: url.path)
+    }
 
+    /// The same treatment for an image that arrives as bytes rather than a file.
+    ///
+    /// An MCP tool returns its image inline as base64, and it is somebody else's program: the
+    /// size and the format are both its choice, not ours. So it goes through exactly the path
+    /// a local file does — decoded, scaled if it is enormous, re-encoded into something every
+    /// provider accepts — rather than being forwarded on trust.
+    public static func decode(
+        base64: String, mimeType: String, describedAs label: String
+    ) throws -> AttachedImage {
+        guard let data = Data(base64Encoded: base64, options: .ignoreUnknownCharacters),
+              !data.isEmpty
+        else { throw Failure.unreadable(label) }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        else { throw Failure.unreadable(label) }
+        return try normalise(image, describedAs: label)
+    }
+
+    private static func normalise(
+        _ image: CGImage, describedAs label: String
+    ) throws -> AttachedImage {
         let original = (width: image.width, height: image.height)
         let longEdge = max(original.width, original.height)
         var rendered = image
@@ -93,14 +116,15 @@ public struct AttachedImage: Sendable, Hashable {
         let looksPhotographic = rendered.width * rendered.height > 640 * 640
             && image.alphaInfo == .none
         let type: UTType = looksPhotographic ? .jpeg : .png
-        guard let data = encode(rendered, as: type) else { throw Failure.unreadable(url.path) }
-        guard data.count <= maxEncodedBytes else { throw Failure.tooLarge(bytes: data.count) }
-
+        guard let encoded = encode(rendered, as: type) else { throw Failure.unreadable(label) }
+        guard encoded.count <= maxEncodedBytes else {
+            throw Failure.tooLarge(bytes: encoded.count)
+        }
         return AttachedImage(
             mimeType: type == .jpeg ? "image/jpeg" : "image/png",
-            base64: data.base64EncodedString(),
+            base64: encoded.base64EncodedString(),
             width: rendered.width, height: rendered.height,
-            byteCount: data.count, path: url.path,
+            byteCount: encoded.count, path: label,
             scaledFrom: rendered.width == original.width ? nil : original)
     }
 
