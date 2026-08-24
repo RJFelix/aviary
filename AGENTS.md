@@ -95,6 +95,12 @@ what it does; this file is how to work on it without relearning the traps.
   file, sees the same object, and skips the relink — so the executable keeps its mtime. Any
   test of "did a rebuild happen?" must change emitted code, not a comment. This cost two
   rounds of wrong diagnosis while building the workshop reload.
+- **The app declares its own `Section`.** `AppModel.swift` defines `enum Section` for
+  navigation, which shadows SwiftUI's `Section` inside the `Aviary` target. An unqualified
+  `Section { … }` in a `List` resolves to the enum and produces four rounds of unrelated
+  type-inference errors ("missing argument for parameter 'rawValue'", "Section conform to
+  CodingKeyRepresentable") that name everything except the actual cause. Write
+  `SwiftUI.Section`.
 - **Swift 5 language mode is deliberate** (`swiftSettings: [.swiftLanguageMode(.v5)]`).
   Strict concurrency checking on AppKit-adjacent code buys errors, not safety, at this stage.
 
