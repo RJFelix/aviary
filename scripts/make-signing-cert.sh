@@ -37,7 +37,10 @@
 #      dialog. Every build. And an unattended build — the workshop reload starts one — hangs
 #      instead of failing, leaving a half-written `.cstemp` in the bundle that makes every
 #      later signing attempt fail with "invalid or unsupported format for signature".
-#      It needs your login-keychain password, which is why this script has to ask.
+#      It needs your login-keychain password, which is why this script has to ask. The
+#      alternative, if you would rather not type it here: run a build and answer the dialog with
+#      **Always Allow** rather than Allow — "Allow" authorises one signature and changes
+#      nothing.
 #
 # Reversing it: delete "Aviary Local Signing" in Keychain Access. `bundle-app.sh` then falls
 # back to ad-hoc and the re-prompting returns.
@@ -89,53 +92,61 @@ security find-identity -v -p codesigning | grep -F "$NAME"
 
 # --- 4: the partition list ------------------------------------------------------------------
 
-# Attempted every run, not only on creation. An identity can be perfectly valid here and still
+# Attempted every run, not only on creation. An identity can be perfectly valid and still
 # demand a dialog for every signature — which looks completely healthy and hangs the next
-# build. `-A` on the import above is not a substitute: that ACL predates partition lists and
-# macOS consults both.
-signs_without_prompting() {
-    cp /usr/bin/true "$WORK/probe"
-    ( codesign --force --sign "$NAME" --identifier works.duckbill.probe "$WORK/probe" \
-        >/dev/null 2>&1 ) &
-    local pid=$! waited=0
-    while kill -0 "$pid" 2>/dev/null; do
-        if [ "$waited" -ge 40 ]; then
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-            return 1
-        fi
-        sleep 0.25
-        waited=$((waited + 1))
-    done
-    wait "$pid" 2>/dev/null || return 1
-    codesign -d -r- "$WORK/probe" 2>&1 | grep -q "certificate"
-}
-
-echo "==> Checking whether signing needs a dialog"
-if signs_without_prompting; then
-    echo "    It does not. Nothing to authorise."
+# unattended build. `-A` on the import above is not a substitute: that ACL predates partition
+# lists and macOS consults both.
+#
+# Set unconditionally, and NOT gated on a timing probe. Gating on one was the previous version's
+# bug: if the dialog appears and a human types their password inside the deadline, the probe
+# completes and is indistinguishable from no dialog having appeared. It then reports "nothing to
+# authorise" about a machine that will prompt on every build. Timing cannot tell those apart, so
+# it is not asked to.
+echo "==> Authorising codesign to use the key"
+echo "    Needs your login-keychain password — the one you log in with."
+printf "    Password: "
+read -rs KEYCHAIN_PASSWORD
+echo ""
+if security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+        -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null 2>&1; then
+    echo "    Set."
 else
-    echo "    It does. Authorising codesign to use the key."
-    echo "    This needs your login-keychain password — the one you log in with."
-    printf "    Password: "
-    read -rs KEYCHAIN_PASSWORD
-    echo ""
-    if ! security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
-            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null 2>&1; then
-        unset KEYCHAIN_PASSWORD
-        echo "    FAILED — wrong password, or the keychain is locked." >&2
-        echo "    Alternatively: run a build, and when the dialog appears choose" >&2
-        echo "    'Always Allow' rather than 'Allow'." >&2
-        exit 1
+    echo "    FAILED — wrong password, or the keychain is locked." >&2
+    echo "" >&2
+    echo "    Fallback that needs no password here: run 'just build', and when the dialog" >&2
+    echo "    appears choose **Always Allow**, not Allow. 'Allow' authorises that one" >&2
+    echo "    signature; 'Always Allow' adds codesign to the key permanently." >&2
+    exit 1
+fi
+unset KEYCHAIN_PASSWORD
+
+# Verified with a deliberately tight deadline. Two seconds is too fast for anyone to read a
+# dialog and type a password, so finishing inside it means no dialog was involved — which is
+# the property being checked, and the one a ten-second deadline could not establish.
+echo "==> Verifying that signing needs no dialog"
+cp /usr/bin/true "$WORK/probe"
+( codesign --force --sign "$NAME" --identifier works.duckbill.probe "$WORK/probe" \
+    >/dev/null 2>&1 ) &
+PROBE_PID=$!
+WAITED=0
+while kill -0 "$PROBE_PID" 2>/dev/null; do
+    if [ "$WAITED" -ge 8 ]; then
+        kill "$PROBE_PID" 2>/dev/null || true
+        wait "$PROBE_PID" 2>/dev/null || true
+        break
     fi
-    unset KEYCHAIN_PASSWORD
-    echo "==> Re-checking"
-    if signs_without_prompting; then
-        echo "    Signs with no prompt now, and names the certificate."
-    else
-        echo "    Still blocking. If a dialog is on screen, answer it with 'Always Allow'." >&2
-        exit 1
-    fi
+    sleep 0.25
+    WAITED=$((WAITED + 1))
+done
+if [ "$WAITED" -ge 8 ]; then
+    echo "    Still asking. If a dialog is on screen, answer it with 'Always Allow'." >&2
+    exit 1
+fi
+if codesign -d -r- "$WORK/probe" 2>&1 | grep -q "certificate"; then
+    echo "    Signed in under two seconds with no prompt."
+else
+    echo "    Signed, but the requirement does not name the certificate." >&2
+    exit 1
 fi
 
 echo ""
