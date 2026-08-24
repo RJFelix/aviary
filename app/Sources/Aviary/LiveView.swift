@@ -422,6 +422,10 @@ struct LauncherSheet: View {
     @State private var provider: String = ""
     @State private var modelID: String = ""
     @State private var thinking = "high"
+    /// Which engine to go back to when you leave `claude-code` behind. Remembered because
+    /// Harness and In-house are a real choice between themselves, and snapping to one of them
+    /// arbitrarily would silently change what a run is.
+    @State private var lastDirectEngine: AppModel.Engine = .inHouse
     @State private var persistSession = true
     @State private var noContextFiles = false
     @State private var recordPayloads = false
@@ -488,13 +492,18 @@ struct LauncherSheet: View {
                                 ForEach(AppModel.Engine.allCases) { Text($0.label).tag($0) }
                             }
                             .pickerStyle(.segmented).labelsHidden()
-                            .onChange(of: model.engineChoice) { _, _ in
-                                // The two engines offer disjoint catalogues, so a selection
-                                // made under one is meaningless under the other. Re-seeded
-                                // rather than left alone, because a picker showing a provider
-                                // that is no longer in its own list renders blank.
-                                provider = providers.first ?? ""
-                                modelID = modelsForProvider.first?.id ?? ""
+                            .onChange(of: model.engineChoice) { _, now in
+                                if now != .claudeCode { lastDirectEngine = now }
+                                // The engines offer disjoint catalogues, so a selection made
+                                // under one is meaningless under the other. Re-seeded rather
+                                // than left alone, because a picker showing a provider absent
+                                // from its own list renders blank.
+                                if !providers.contains(provider) {
+                                    provider = providers.first ?? ""
+                                }
+                                if !modelsForProvider.contains(where: { $0.id == modelID }) {
+                                    modelID = modelsForProvider.first?.id ?? ""
+                                }
                             }
                             Text(engineExplanation)
                                 .font(.system(size: 10))
@@ -539,7 +548,19 @@ struct LauncherSheet: View {
                                 Picker("Provider", selection: $provider) {
                                     ForEach(providers, id: \.self) { Text($0).tag($0) }
                                 }
-                                .onChange(of: provider) { _, _ in
+                                .onChange(of: provider) { _, now in
+                                    // Picking the provider sets the engine, because for this
+                                    // one they are the same fact: Claude Code *is* the thing
+                                    // that answers, so choosing it as a provider is choosing
+                                    // it as the engine. Making you say it twice — once here
+                                    // and once in the segment above — is what sent somebody
+                                    // hunting through the provider list for a route that was
+                                    // gated behind a control they had not touched.
+                                    if now == "claude-code" {
+                                        model.engineChoice = .claudeCode
+                                    } else if model.engineChoice == .claudeCode {
+                                        model.engineChoice = lastDirectEngine
+                                    }
                                     modelID = modelsForProvider.first?.id ?? ""
                                 }
                                 Picker("Model", selection: $modelID) {
@@ -666,11 +687,23 @@ struct LauncherSheet: View {
         .frame(width: 560, height: 640)
         .onAppear {
             if cwd.isEmpty { cwd = model.defaultCwd }
-            if provider.isEmpty {
-                provider = model.settings.defaultProvider ?? providers.first ?? ""
-            }
-            if modelID.isEmpty {
-                modelID = model.settings.defaultModel ?? modelsForProvider.first?.id ?? ""
+            if model.engineChoice != .claudeCode { lastDirectEngine = model.engineChoice }
+            // Seeded from the remembered engine, so reopening the sheet after a driven run
+            // does not show `litellm` above an engine segment that says Claude Code. The
+            // defaults in settings describe a provider route and cannot express this one.
+            if model.engineChoice == .claudeCode {
+                provider = "claude-code"
+                if !modelsForProvider.contains(where: { $0.id == modelID }) {
+                    modelID = model.claudeCodeModel
+                }
+            } else {
+                if provider.isEmpty || provider == "claude-code" {
+                    provider = model.settings.defaultProvider ?? providers.first ?? ""
+                }
+                if modelID.isEmpty
+                    || !modelsForProvider.contains(where: { $0.id == modelID }) {
+                    modelID = model.settings.defaultModel ?? modelsForProvider.first?.id ?? ""
+                }
             }
             thinking = model.settings.defaultThinkingLevel ?? "high"
         }
@@ -716,18 +749,18 @@ struct LauncherSheet: View {
         offeredModels.filter { $0.providerID == provider }
     }
 
-    /// The models this engine can actually reach.
+    /// Every reachable route, `claude-code` included, whichever engine is selected.
     ///
-    /// Filtered rather than merely ordered, because the engine decides who makes the request.
-    /// Claude Code holds its own credential and only serves Claude models; the other two
-    /// engines call providers directly and cannot drive Claude Code. Offering the whole
-    /// catalogue under either would be offering a route that silently is not taken — which is
-    /// what this sheet did until the model picker and the engine picker were reconciled.
-    private var offeredModels: [ModelSpec] {
-        model.engineChoice == .claudeCode
-            ? model.pickerModels.filter { $0.providerID == "claude-code" }
-            : model.pickerModels.filter { $0.providerID != "claude-code" }
-    }
+    /// It is deliberately *not* filtered by engine. Filtering was the first attempt and it was
+    /// wrong in a way that only shows up in use: `claude-code` was absent from the provider
+    /// list until you had already found the Engine segment and switched it, so somebody looking
+    /// for "Claude Code plus a Claude model" in the obvious place found four providers and
+    /// concluded the feature was missing.
+    ///
+    /// Picking it instead *sets* the engine — see the provider picker's `onChange`. The two
+    /// controls stay in step in both directions, and the engine segment remains because
+    /// Harness versus In-house is a real choice that no model selection expresses.
+    private var offeredModels: [ModelSpec] { model.pickerModels }
 
     private func chooseDirectory() {
         let panel = NSOpenPanel()
