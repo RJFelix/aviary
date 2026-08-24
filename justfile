@@ -11,6 +11,11 @@ default:
 build:
     ./scripts/bundle-app.sh release
 
+# Create the stable code-signing identity, so permission grants survive a rebuild.
+# Run once. Asks for your login password; see the script's header for what it changes.
+signing-cert:
+    ./scripts/make-signing-cert.sh
+
 # Build and launch
 run: build
     open {{build_dir}}/Aviary.app

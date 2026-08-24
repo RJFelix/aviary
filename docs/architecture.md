@@ -703,6 +703,38 @@ asked.
 construction — it runs while you are looking at something else, and its most likely failure is
 doing nothing at all, which has no symptom.
 
+### Why the app needs a real signing certificate
+
+Screen Recording is asked for once per *build* unless the app is signed with a certificate, and
+the reason is worth writing down because the symptom points away from the cause.
+
+`codesign --sign -` (ad-hoc) produces no certificate. macOS then has nothing stable to identify
+the app by and derives its designated requirement from the code itself:
+
+```
+# designated => cdhash H"65480ad2c9b405e95d5a884ae24486ebb69ebd96"
+```
+
+TCC stores that requirement next to the grant. Any rebuild changes the cdhash, the requirement
+stops matching, and macOS is right to treat it as an app it has never seen. Meanwhile System
+Settings still lists Aviary with its switch on — the row is keyed by bundle identifier, while
+the grant behind it is bound to a build that is gone. So the place you would go to fix it shows
+nothing wrong and offers nothing to change.
+
+`scripts/make-signing-cert.sh` creates a self-signed code-signing identity once; `bundle-app.sh`
+uses it when present and falls back to ad-hoc with a warning when not. With a certificate the
+requirement becomes `identifier "works.duckbill.aviary" and certificate leaf = H"..."`, which is
+identical for every build. `bundle-app.sh` prints the requirement on every build, because that
+one line is the difference between grants that persist and grants that do not.
+
+Two details that cost time: `codesign` refuses a self-signed certificate that is not trusted for
+code signing, so the trust step is not optional — and Apple's `security import` cannot read
+OpenSSL 3's default PKCS#12 encryption, failing with "MAC verification failed … (wrong
+password?)", which reads like a typo and is not one.
+
+This matters more since the workshop reload landed. That feature exists to rebuild the app more
+often, which means it multiplies exactly this prompt.
+
 ## Workshop capture ordering
 
 The screenshot attached to a request is taken when the compose panel is **asked for**, not

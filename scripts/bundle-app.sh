@@ -60,11 +60,33 @@ if command -v python3 >/dev/null 2>&1; then
         || echo "    (icon generation skipped)"
 fi
 
-echo "==> Signing (ad-hoc)"
-# Ad-hoc is enough for a locally built tool: it satisfies the loader and gives the bundle a
-# stable identity for TCC prompts. It is not distributable.
-codesign --force --sign - --identifier "$BUNDLE_ID" "$APP_DIR" >/dev/null 2>&1 \
-    || echo "    (codesign failed; the app will still run locally)"
+# Signing decides whether your permission grants survive a rebuild, which is not obvious and
+# cost a confusing afternoon before it was understood.
+#
+# Ad-hoc signing produces no certificate, so macOS derives the app's designated requirement
+# from the code itself — a literal `cdhash H"..."`. TCC stores that requirement with every
+# grant, so a rebuild invalidates Screen Recording and the app asks again, forever. With a
+# certificate the requirement is `identifier "..." and certificate leaf = H"..."`, which is
+# the same for every build.
+#
+# `scripts/make-signing-cert.sh` creates the identity. Absent, this still works — it just
+# reverts to the re-prompting behaviour, which is a nuisance and not a failure.
+SIGN_ID="Aviary Local Signing"
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_ID"; then
+    echo "==> Signing as '$SIGN_ID'"
+    codesign --force --sign "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP_DIR" >/dev/null 2>&1 \
+        || echo "    (signing failed; run scripts/make-signing-cert.sh, or ignore this)"
+else
+    echo "==> Signing (ad-hoc — permission prompts will return after every build)"
+    echo "    Run scripts/make-signing-cert.sh once to stop that."
+    codesign --force --sign - --identifier "$BUNDLE_ID" "$APP_DIR" >/dev/null 2>&1 \
+        || echo "    (codesign failed; the app will still run locally)"
+fi
+
+# Printed because it is the one line that says whether the fix took. A `cdhash` requirement
+# means grants die on the next build; a `certificate leaf` requirement means they survive.
+REQ="$(codesign -d -r- "$APP_DIR" 2>&1 | grep "designated =>" || true)"
+[ -n "$REQ" ] && echo "    ${REQ#\# }"
 
 SIZE="$(du -sh "$APP_DIR" | cut -f1)"
 echo "==> Done: $APP_DIR ($SIZE)"

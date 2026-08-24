@@ -68,6 +68,14 @@ what it does; this file is how to work on it without relearning the traps.
 - **Never resolve `claude` off `PATH` alone.** A terminal multiplexer or IDE integration
   commonly puts a shim there under `/var/folders/…/T/`, scoped to the session that made it.
   `ClaudeCode.locate` checks real install paths first and filters temp-dir shims.
+- **Ad-hoc signing makes every rebuild a different app to macOS.** With no certificate there
+  is nothing stable to identify the app by, so its designated requirement becomes a literal
+  `cdhash H"..."` of that build — and TCC stores that requirement with every permission you
+  grant. Rebuild and Screen Recording is asked for again, while System Settings still shows the
+  app switched on, because the row is keyed by bundle id and the grant behind it is bound to a
+  build that no longer exists. `scripts/make-signing-cert.sh` fixes it once; check with
+  `codesign -d -r- build/Aviary.app` — a `certificate leaf` requirement survives rebuilds, a
+  `cdhash` one does not.
 - **A comment-only Swift change produces a byte-identical binary.** llbuild recompiles the
   file, sees the same object, and skips the relink — so the executable keeps its mtime. Any
   test of "did a rebuild happen?" must change emitted code, not a comment. This cost two
