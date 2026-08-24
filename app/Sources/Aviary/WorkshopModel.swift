@@ -594,7 +594,7 @@ extension AppModel {
             add("Library", "Extensions", "\(library.extensions.count)")
         case .health:
             add("Health", "Daemon", daemon.health.label)
-            add("Health", "Socket", daemon.socketPath ?? "—")
+            add("Health", "Socket", daemon.socketPath)
             if let v = daemon.version { add("Health", "Daemon version", v) }
         }
 

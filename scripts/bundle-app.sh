@@ -72,21 +72,61 @@ fi
 # `scripts/make-signing-cert.sh` creates the identity. Absent, this still works — it just
 # reverts to the re-prompting behaviour, which is a nuisance and not a failure.
 SIGN_ID="Aviary Local Signing"
+
+# Signing runs under a deadline, and its errors are shown.
+#
+# Both details are here because their absence cost an hour. If the key's partition list is not
+# set, `codesign` does not fail — it blocks on a GUI authorisation dialog, forever. Unattended
+# (the workshop reload triggers builds) nobody answers it, so the build hangs holding a
+# half-written `.cstemp` inside the bundle, and every later signing attempt then fails with
+# "invalid or unsupported format for signature" pointing at that temp file. Meanwhile the
+# original error was invisible because the output was sent to /dev/null.
+sign_with_deadline() {
+    local seconds="$1"; shift
+    "$@" &
+    local pid=$!
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge "$((seconds * 5))" ]; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            find "$APP_DIR" -name "*.cstemp" -delete 2>/dev/null || true
+            echo "    codesign did not finish within ${seconds}s and was stopped." >&2
+            echo "    It was almost certainly waiting on a keychain dialog. Run" >&2
+            echo "    scripts/make-signing-cert.sh to authorise the key properly." >&2
+            return 1
+        fi
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+    wait "$pid"
+}
+
 if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_ID"; then
     echo "==> Signing as '$SIGN_ID'"
-    codesign --force --sign "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP_DIR" >/dev/null 2>&1 \
-        || echo "    (signing failed; run scripts/make-signing-cert.sh, or ignore this)"
+    sign_with_deadline 60 codesign --force --sign "$SIGN_ID" \
+        --identifier "$BUNDLE_ID" "$APP_DIR" \
+        || echo "    (signing failed; the app still runs, but permission grants will not persist)"
 else
     echo "==> Signing (ad-hoc — permission prompts will return after every build)"
     echo "    Run scripts/make-signing-cert.sh once to stop that."
-    codesign --force --sign - --identifier "$BUNDLE_ID" "$APP_DIR" >/dev/null 2>&1 \
+    sign_with_deadline 60 codesign --force --sign - --identifier "$BUNDLE_ID" "$APP_DIR" \
         || echo "    (codesign failed; the app will still run locally)"
 fi
 
-# Printed because it is the one line that says whether the fix took. A `cdhash` requirement
-# means grants die on the next build; a `certificate leaf` requirement means they survive.
+# Printed because it is the one line that says whether the fix took, and checked rather than
+# just shown: "it said it signed with the certificate" is not evidence, as the hang above
+# demonstrated.
 REQ="$(codesign -d -r- "$APP_DIR" 2>&1 | grep "designated =>" || true)"
-[ -n "$REQ" ] && echo "    ${REQ#\# }"
+if [ -n "$REQ" ]; then
+    echo "    ${REQ#\# }"
+    case "$REQ" in
+        *cdhash*)
+            echo "    ^ a code-hash requirement: macOS will treat the next build as a new app," >&2
+            echo "      so Screen Recording and any other grant will be asked for again." >&2
+            ;;
+    esac
+fi
 
 SIZE="$(du -sh "$APP_DIR" | cut -f1)"
 echo "==> Done: $APP_DIR ($SIZE)"
