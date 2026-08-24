@@ -112,6 +112,8 @@ public actor AgentRunner {
         await agent.observe { event in obs?(event) }
         await agent.setSpawnDelegate(Delegate(runner: self, parentSessionID: writer.sessionID))
         await agent.setMemory(settings.memory)
+        await agent.setArtifacts(
+            ArtifactStore(home: settings.home, sessionID: writer.sessionID))
         if !settings.hookPaths.isEmpty {
             let result = try? await host.loadHooks(settings.hookPaths)
             // A hook that failed to load is reported into the transcript rather than swallowed:
@@ -231,6 +233,11 @@ public actor AgentRunner {
             // Children remember too: a finding is no less true for having been discovered by
             // a delegate, and a child that cannot record one has to hand it back in prose.
             await child.setMemory(settings.memory)
+            // Under the child's own home, not the parent's — a child's transcript already lives
+            // there, and keeping its document beside it is what makes the tree recoverable from
+            // the filesystem alone.
+            await child.setArtifacts(
+                ArtifactStore(home: childHome, sessionID: writer.sessionID))
             register(hostSession: hostSession, agent: child)
 
             // A child's own events are not forwarded to the parent's observer: a fan-out of

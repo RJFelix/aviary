@@ -149,6 +149,21 @@ public enum Builtins {
                     + "instead of re-deriving it.",
                 requirement: .always, mechanism: .callback, isAvailable: true),
             Entry(
+                name: "artifact",
+                signature: "artifact(text, title=None, format='md')",
+                summary: "Write a report or document to a file instead of into the reply.",
+                bullet: "artifact(text, title=None, format='md') – write a document into this "
+                    + "session's artifacts directory. Formats: 'md', 'txt', 'html'. Returns "
+                    + "{'id', 'title', 'format', 'path', 'bytes'}, or a dict with an 'error' "
+                    + "key. Titles are slugified into filenames and never overwrite an "
+                    + "earlier artifact.",
+                note: "When you are asked for a report, a plan, a design doc or any other "
+                    + "extended piece of writing, write it with artifact() and keep your reply "
+                    + "to what it says, what it concludes and where it is. Several thousand "
+                    + "words pasted into the transcript is a document nobody can open, edit or "
+                    + "send on, and it is re-read into context on every turn after it.",
+                requirement: .always, mechanism: .callback, isAvailable: true),
+            Entry(
                 name: "remember",
                 signature: "remember(text, scope='project', days=None, tags=[])",
                 summary: "Record something worth having next time.",

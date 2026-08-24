@@ -133,6 +133,14 @@ public actor ClaudeCodeRun {
         }
     }
 
+    /// Record a machinery note in this run's transcript.
+    ///
+    /// For the kernel, which produces things worth recording — an artifact written — and must
+    /// not open a second handle onto a file that has exactly one writer.
+    public func note(_ text: String, customType: String) async {
+        try? await writer.appendNote(text, customType: customType)
+    }
+
     public func observe(_ observer: (@Sendable (Event) -> Void)?) {
         self.observer = observer
     }

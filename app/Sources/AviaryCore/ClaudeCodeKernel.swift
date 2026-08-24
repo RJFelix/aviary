@@ -13,6 +13,14 @@ public actor ClaudeCodeKernel {
     private let memory: MemoryStore?
     private let sessionFile: URL
     private let sessionID: String
+    /// Where `artifact` writes. Defaulted rather than required so the existing callers keep
+    /// compiling, but every real one passes it — a driven run that cannot write a document is
+    /// a driven run that is not an Aviary session.
+    private let artifacts: ArtifactStore?
+    /// How a note reaches the transcript. The writer belongs to `ClaudeCodeRun`, which is
+    /// constructed first and owns the file; the kernel produces events worth recording and has
+    /// no business opening a second handle onto the same JSONL.
+    private var appendNote: (@Sendable (String, String) async -> Void)?
     /// The first prompt of the run, recorded as provenance on anything remembered — "why does
     /// it believe that?" is unanswerable without it.
     private var firstPrompt: String?
@@ -24,13 +32,19 @@ public actor ClaudeCodeKernel {
 
     public init(
         host: RuntimeHost, hostSession: String, memory: MemoryStore?,
-        sessionFile: URL, sessionID: String
+        sessionFile: URL, sessionID: String, artifacts: ArtifactStore? = nil
     ) {
         self.host = host
         self.hostSession = hostSession
         self.memory = memory
         self.sessionFile = sessionFile
         self.sessionID = sessionID
+        self.artifacts = artifacts
+    }
+
+    /// Wire the kernel's notes into the run's transcript.
+    public func onNote(_ handler: (@Sendable (String, String) async -> Void)?) {
+        appendNote = handler
     }
 
     public func noteFirstPrompt(_ prompt: String) {
@@ -109,7 +123,8 @@ public actor ClaudeCodeKernel {
         }
     }
 
-    /// Serve a callback from inside the kernel — `remember`, `recall`, `conversation`.
+    /// Serve a callback from inside the kernel — `remember`, `recall`, `conversation`,
+    /// `artifact`.
     ///
     /// The same verbs the in-house engine serves, with one honest gap: `spawn` needs an
     /// `AgentRunner` to build a child agent, and a driven session has no runner. Refused with
@@ -164,6 +179,22 @@ public actor ClaudeCodeKernel {
                     "tags": .array(entry.tags.map { .string($0) }),
                 ])
             })])
+
+        case "artifact":
+            guard let artifacts else {
+                return .object(["error": .string(
+                    "This run has nowhere to write artifacts.")])
+            }
+            do {
+                let written = try artifacts.write(
+                    text: payload["text"]?.stringValue ?? "",
+                    title: payload["title"]?.stringValue,
+                    format: payload["format"]?.stringValue ?? "md")
+                await appendNote?(written.note.text, ArtifactNote.customType)
+                return written.payload
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
 
         case "conversation":
             // Read back out of the transcript Aviary is writing, rather than out of a message
