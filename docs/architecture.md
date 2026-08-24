@@ -721,16 +721,31 @@ Settings still lists Aviary with its switch on — the row is keyed by bundle id
 the grant behind it is bound to a build that is gone. So the place you would go to fix it shows
 nothing wrong and offers nothing to change.
 
-`scripts/make-signing-cert.sh` creates a self-signed code-signing identity once; `bundle-app.sh`
-uses it when present and falls back to ad-hoc with a warning when not. With a certificate the
-requirement becomes `identifier "works.duckbill.aviary" and certificate leaf = H"..."`, which is
-identical for every build. `bundle-app.sh` prints the requirement on every build, because that
-one line is the difference between grants that persist and grants that do not.
+`scripts/make-signing-cert.sh` creates a self-signed code-signing identity; `bundle-app.sh` uses
+it when present and falls back to ad-hoc with a warning when not. With a certificate the
+requirement becomes `identifier "works.duckbill.aviary" and certificate root = H"..."` — root
+rather than leaf, because a self-signed certificate is both — and that is identical for every
+build. `bundle-app.sh` prints the requirement on every build and calls out a `cdhash` one,
+because that single line is the difference between grants that persist and grants that do not.
 
-Two details that cost time: `codesign` refuses a self-signed certificate that is not trusted for
-code signing, so the trust step is not optional — and Apple's `security import` cannot read
-OpenSSL 3's default PKCS#12 encryption, failing with "MAC verification failed … (wrong
-password?)", which reads like a typo and is not one.
+**The partition list is the part that bites.** A certificate can be present, trusted, and listed
+by `security find-identity -v -p codesigning`, and signing can still be broken — because
+authorising *codesign to use the key* is a separate setting. Without it `codesign` does not
+fail; it blocks on a GUI password dialog. Interactively that is a nuisance; unattended, and the
+workshop reload starts unattended builds, it is a hang that leaves a half-written `.cstemp`
+inside the bundle, after which every signing attempt fails with "invalid or unsupported format
+for signature" naming that temp file — which reads like a corrupt bundle and is not.
+
+So the script proves its work by signing a throwaway binary under a deadline rather than
+trusting that a healthy-looking identity works, and it is idempotent in the way that matters: it
+repairs an existing identity instead of early-exiting on one, because the certificate and its
+authorisation fail independently and the second failure looks like success.
+
+Two smaller traps: `codesign` refuses a self-signed certificate that is not trusted for code
+signing, so the trust step is not optional; and Apple's `security import` cannot read OpenSSL 3's
+default PKCS#12 encryption, failing with "MAC verification failed … (wrong password?)", which
+reads like a typo and is not one. Pass `-keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg
+sha1`.
 
 This matters more since the workshop reload landed. That feature exists to rebuild the app more
 often, which means it multiplies exactly this prompt.
