@@ -7,12 +7,27 @@ struct AviaryApp: App {
     @State private var model = AppModel()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
+    /// When this process started, for the preview loop's own timing line.
+    nonisolated(unsafe) static let launchedAt = Date()
+
     init() {
+        _ = Self.launchedAt
         // Headless modes short-circuit before any scene is created, and exit.
         WireInspect.runIfRequested()
         Snapshot.runIfRequested()
         AgentCLI.runIfRequested()
         ClaudeCodeCLI.runIfRequested()
+    }
+
+    /// `Aviary --preview <section>` — one screen, opened fast, for a layout pass.
+    ///
+    /// Read here rather than in a headless mode because this one needs a window: it is the
+    /// same views the real app draws, just without the startup work that makes a relaunch feel
+    /// like a restart. `scripts/watch.sh` rebuilds and relaunches it on save.
+    private static var previewSection: Section? {
+        let args = ProcessInfo.processInfo.arguments
+        guard let i = args.firstIndex(of: "--preview"), i + 1 < args.count else { return nil }
+        return Section(rawValue: args[i + 1])
     }
 
     var body: some Scene {
@@ -22,7 +37,13 @@ struct AviaryApp: App {
                 // Wide enough that the three-pane screens always fit: a 280pt sidebar
                 // plus the 800pt the Sessions panes demand together.
                 .frame(minWidth: 1100, minHeight: 680)
-                .task { await model.bootstrap() }
+                .task {
+                    if let preview = Self.previewSection {
+                        model.bootstrapPreview(section: preview)
+                    } else {
+                        await model.bootstrap()
+                    }
+                }
         }
         .windowToolbarStyle(.unified(showsTitle: true))
         .defaultSize(width: 1420, height: 900)

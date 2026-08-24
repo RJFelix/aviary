@@ -269,6 +269,44 @@ final class AppModel {
 
     // MARK: Lifecycle
 
+    /// True when this process is a throwaway window for looking at one screen.
+    ///
+    /// Not a display mode — a *startup* mode. The full `bootstrap` costs about seven and a half
+    /// seconds before anything is on screen, and almost none of it is work a UI edit needs:
+    /// capturing the login shell's environment (`zsh -ilc`), scanning every transcript on disk,
+    /// discovering engines, probing the daemon, resolving every provider's key expression (one
+    /// of which shells out), starting Python hosts to read their capabilities, and asking
+    /// `claude auth status`. A preview skips all of it and opens in well under a second, which
+    /// is the difference between a feedback loop and a wait.
+    private(set) var isPreview = false
+
+    /// Enough state to draw a screen, and nothing that costs a subprocess.
+    func bootstrapPreview(section: Section) {
+        isPreview = true
+        self.section = section
+        // File reads only. Every one of these is cheap and several screens look empty without
+        // them, which would make the preview lie about layout.
+        settings = .load(home: home)
+        hideThinking = settings.hideThinkingBlock ?? false
+        auth = .load(home: home)
+        modelsConfig = .load(home: home, auth: auth)
+        modelPreferences = modelPreferencesStore.load()
+        repoRoot = EngineLocator.repoRoot()
+        board = WorkshopBoard.load(repoRoot: repoRoot)
+        // Built with no credentials resolved: the catalogue's *shape* is what a layout pass
+        // needs, and resolving keys is the single most expensive thing bootstrap does.
+        modelCatalog = ModelCatalogBuilder.build(
+            config: modelsConfig, auth: auth, credentialed: [], preferences: modelPreferences)
+        runtimeModels = modelCatalog.models
+        // The catalogue is read lazily by the Sessions screen, so a preview of it shows the
+        // real list without paying for a full rescan up front.
+        catalog = SessionCatalog(home: home)
+        // Printed because the whole justification for this mode is that it is fast, and a
+        // number you can watch is how you notice when it stops being.
+        let ms = Int(Date().timeIntervalSince(AviaryApp.launchedAt) * 1000)
+        FileHandle.standardError.write(Data("preview ready in \(ms)ms\n".utf8))
+    }
+
     func bootstrap() async {
         // Capture the login shell's environment before anything spawns a subprocess.
         // Without this the engine inherits launchd's environment and every

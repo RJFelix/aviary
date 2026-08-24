@@ -11,6 +11,16 @@ default:
 build:
     ./scripts/bundle-app.sh release
 
+# Rebuild and reopen one screen on every save. `just watch cockpit`
+# Uses --preview, which skips the ~7.5s of startup a UI edit does not need.
+watch section="cockpit":
+    ./scripts/watch.sh {{section}}
+
+# Open one screen once, without the startup work. `just preview models`
+preview section="cockpit":
+    cd {{app_dir}} && swift build --product Aviary
+    "{{app_dir}}/.build/debug/Aviary" --preview {{section}}
+
 # Create the stable code-signing identity, so permission grants survive a rebuild.
 # Run once. Asks for your login password; see the script's header for what it changes.
 signing-cert:
