@@ -71,7 +71,14 @@ struct RootView: View {
         case .usage:
             return "\(Fmt.tokens(model.analytics.total.totalTokens)) tokens across \(model.analytics.sessionCount) sessions"
         case .library:
-            return "\(model.library.skills.count) skills · \(model.library.prompts.count) prompts · \(model.library.extensions.count) extensions"
+            // Counted by what a run would get, not by what was found on disk: the engine
+            // bundle's own skills are loaded by that engine, never by Aviary.
+            let engineOnly = model.library.engineOnlySkills.count
+            let reachable = model.library.reachableSkills.count
+            return "\(reachable) skills"
+                + (engineOnly > 0 ? " · \(engineOnly) engine-only" : "")
+                + " · \(model.library.prompts.count) prompts"
+                + " · \(model.library.extensions.count) extensions"
         case .health:
             return model.daemon.health.label
         }

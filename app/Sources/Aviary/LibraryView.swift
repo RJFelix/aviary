@@ -108,6 +108,37 @@ struct LibraryView: View {
         }
     }
 
+    private struct SkillGroup {
+        var reach: SkillReach
+        var skills: [SkillEntry]
+    }
+
+    /// Split by which engines load them, because a single list implied the engine bundle's
+    /// own skills were available to an Aviary run. They never were — every run path passes
+    /// `enginePackageRoot: nil` — and they teach the harness's namespace, not Aviary's.
+    private var skillGroups: [SkillGroup] {
+        SkillReach.allCases.compactMap { reach in
+            let matching = skills.filter { $0.reach == reach }
+            return matching.isEmpty ? nil : SkillGroup(reach: reach, skills: matching)
+        }
+    }
+
+    @ViewBuilder
+    private func skillSectionHeader(_ group: SkillGroup) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(group.reach.label.uppercased())
+                .font(Design.sectionTitle).tracking(0.6)
+            if group.reach == .bundledEngineOnly {
+                // Kept to one line on purpose: a List section header will not grow, and the
+                // full explanation is a card in the detail pane.
+                Text("Loaded by that engine, not by Aviary — they teach its namespace.")
+                    .font(.system(size: 9.5)).foregroundStyle(.tertiary)
+                    .textCase(nil).lineLimit(1)
+            }
+        }
+        .padding(.bottom, 2)
+    }
+
     private var skillsPane: some View {
         HSplitView {
             Group {
@@ -120,12 +151,18 @@ struct LibraryView: View {
                             + "bundle. The Search paths tab shows every place Aviary looked.")
                 } else {
                     List(selection: $selectedSkill) {
-                        ForEach(skills) { s in
+                        ForEach(skillGroups, id: \.reach) { group in
+                        SwiftUI.Section(header: skillSectionHeader(group)) {
+                        ForEach(group.skills) { s in
                             VStack(alignment: .leading, spacing: 2) {
                                 HStack(spacing: 6) {
                                     Text(s.name).font(.system(size: 12, weight: .medium))
                                     if s.hasPythonBacking {
                                         Chip(text: "python", symbol: "cube", tint: Design.tool)
+                                    }
+                                    if s.reach == .bundledEngineOnly {
+                                        Chip(text: "engine", symbol: "shippingbox",
+                                             tint: Design.warning)
                                     }
                                     if let used = model.libraryUsage.skill(named: s.name),
                                        used.calls > 0
@@ -147,6 +184,8 @@ struct LibraryView: View {
                             }
                             .padding(.vertical, 3)
                             .tag(s)
+                        }
+                        }
                         }
                     }
                     .listStyle(.inset)
@@ -426,6 +465,8 @@ struct SkillDetail: View {
                     }
                     HStack(spacing: 5) {
                         Chip(text: skill.sourceLabel, tint: Design.accent)
+                        Chip(text: skill.reach.label,
+                             tint: skill.reach == .everyEngine ? Design.success : Design.warning)
                         Chip(text: "\(skill.bodyLength) chars", tint: .secondary)
                         if !skill.allowedTools.isEmpty {
                             Chip(text: skill.allowedTools.joined(separator: ", "),
@@ -436,6 +477,12 @@ struct SkillDetail: View {
                     Text(skill.url.path)
                         .font(Design.mono(9.5)).foregroundStyle(.tertiary)
                         .textSelection(.enabled)
+                }
+
+                Card("Who loads it", symbol: "shippingbox") {
+                    Text(skill.reach.explanation)
+                        .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Card("Reached for", symbol: "chart.bar.xaxis",

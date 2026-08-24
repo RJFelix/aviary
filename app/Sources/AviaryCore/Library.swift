@@ -55,6 +55,42 @@ public struct HarnessSettings: Sendable {
 
 // MARK: - Skills
 
+/// Which engines will actually load a skill.
+///
+/// Not a detail. The engine bundle's own skills are written for the harness's IPython
+/// namespace — `rlm_heartbeat.create`, `goal.create`, `compact.run` — and the harness loads
+/// them itself, where those names exist. Aviary's own engines never load them: all three run
+/// paths pass `enginePackageRoot: nil`, and a skill telling an Aviary agent to call
+/// `rlm_heartbeat.create` would be the exact inverse of an undescribed builtin.
+///
+/// So the two sets are both correct, for different runtimes, and the only thing that was wrong
+/// was a screen showing their union as one list.
+public enum SkillReach: String, Sendable, Hashable, CaseIterable {
+    /// Found in a project or user directory. Every engine reads these.
+    case everyEngine
+    /// Shipped inside the engine package, and loaded only by that engine.
+    case bundledEngineOnly
+
+    public var label: String {
+        switch self {
+        case .everyEngine: return "Every engine"
+        case .bundledEngineOnly: return "Bundled engine only"
+        }
+    }
+
+    public var explanation: String {
+        switch self {
+        case .everyEngine:
+            return "Read from a project or user skills directory, so an Aviary run describes "
+                + "it to the model when the gate selects it."
+        case .bundledEngineOnly:
+            return "Ships inside the engine package and is loaded by that engine itself. "
+                + "Aviary's own engines never see it — which is correct: these skills teach "
+                + "the harness's Python namespace, not Aviary's builtins."
+        }
+    }
+}
+
 /// A skill discovered on disk, with its frontmatter read.
 public struct SkillEntry: Sendable, Identifiable, Hashable {
     public var id: String { url.path }
@@ -67,6 +103,8 @@ public struct SkillEntry: Sendable, Identifiable, Hashable {
     public var bodyLength: Int
     public var hasPythonBacking: Bool
     public var allowedTools: [String]
+    /// Which engines load it. Set by discovery from the root it was found under.
+    public var reach: SkillReach = .everyEngine
 
     public var directory: URL {
         url.lastPathComponent == "SKILL.md" ? url.deletingLastPathComponent() : url
@@ -129,6 +167,10 @@ public struct Library: Sendable {
     public init() {}
 
     public var skills: [SkillEntry] = []
+    /// The skills an Aviary run can actually be given.
+    public var reachableSkills: [SkillEntry] { skills.filter { $0.reach == .everyEngine } }
+    /// Discovered, shown, and loaded only by the engine that ships them.
+    public var engineOnlySkills: [SkillEntry] { skills.filter { $0.reach == .bundledEngineOnly } }
     public var prompts: [PromptTemplate] = []
     public var extensions: [ExtensionEntry] = []
     public var packages: [PackageEntry] = []
@@ -138,31 +180,35 @@ public struct Library: Sendable {
         home: AgentHome,
         settings: HarnessSettings,
         projectRoot: URL?,
-        enginePackageRoot: URL?
+        enginePackageRoot: URL?,
+        /// Defaulted rather than derived inside, so a test can describe a whole machine.
+        /// Without the seam every test of discovery also reads whatever skills the person
+        /// running it happens to have installed, and asserts nothing reliable.
+        userHome: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> Library {
         var lib = Library()
         let fm = FileManager.default
-        let userHome = fm.homeDirectoryForCurrentUser
 
         // Skill roots, highest precedence first — mirrors the harness's documented order.
-        var skillRoots: [(URL, String, Int, Bool)] = []  // url, label, precedence, allowRootMD
+        // url, label, precedence, allowRootMD, reach
+        var skillRoots: [(URL, String, Int, Bool, SkillReach)] = []
         if let projectRoot {
             skillRoots.append((projectRoot.appending(path: ".prime/agent/skills"),
-                               "Project (.prime/agent/skills)", 0, true))
+                               "Project (.prime/agent/skills)", 0, true, .everyEngine))
             skillRoots.append((projectRoot.appending(path: ".agents/skills"),
-                               "Project (.agents/skills)", 1, false))
+                               "Project (.agents/skills)", 1, false, .everyEngine))
         }
-        skillRoots.append((home.skillsDir, "User (~/.prime/agent/skills)", 2, true))
+        skillRoots.append((home.skillsDir, "User (~/.prime/agent/skills)", 2, true, .everyEngine))
         skillRoots.append((userHome.appending(path: ".agents/skills"),
-                           "User (~/.agents/skills)", 3, false))
+                           "User (~/.agents/skills)", 3, false, .everyEngine))
         if let enginePackageRoot {
             skillRoots.append((enginePackageRoot.appending(path: "skills"),
-                               "Built-in (engine)", 9, true))
+                               "Built-in (engine)", 9, true, .bundledEngineOnly))
         }
 
-        for (root, label, precedence, allowRootMD) in skillRoots {
+        for (root, label, precedence, allowRootMD, reach) in skillRoots {
             let found = scanSkills(root: root, label: label, precedence: precedence,
-                                   allowRootMarkdown: allowRootMD)
+                                   allowRootMarkdown: allowRootMD, reach: reach)
             lib.skills += found
             lib.sources.append(LibrarySource(
                 label: "Skills — \(label)", url: root,
@@ -241,7 +287,8 @@ public struct Library: Sendable {
     }
 
     static func scanSkills(
-        root: URL, label: String, precedence: Int, allowRootMarkdown: Bool
+        root: URL, label: String, precedence: Int, allowRootMarkdown: Bool,
+        reach: SkillReach = .everyEngine
     ) -> [SkillEntry] {
         let fm = FileManager.default
         guard fm.fileExists(atPath: root.path) else { return [] }
@@ -251,7 +298,8 @@ public struct Library: Sendable {
         if let walker = fm.enumerator(at: root, includingPropertiesForKeys: nil,
                                      options: [.skipsHiddenFiles]) {
             for case let url as URL in walker where url.lastPathComponent == "SKILL.md" {
-                if let e = parseSkill(url: url, label: label, precedence: precedence) {
+                if let e = parseSkill(url: url, label: label, precedence: precedence,
+                                      reach: reach) {
                     out.append(e)
                 }
             }
@@ -262,7 +310,8 @@ public struct Library: Sendable {
                at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
         {
             for url in entries where url.pathExtension == "md" {
-                if let e = parseSkill(url: url, label: label, precedence: precedence) {
+                if let e = parseSkill(url: url, label: label, precedence: precedence,
+                                      reach: reach) {
                     out.append(e)
                 }
             }
@@ -270,7 +319,9 @@ public struct Library: Sendable {
         return out
     }
 
-    static func parseSkill(url: URL, label: String, precedence: Int) -> SkillEntry? {
+    static func parseSkill(
+        url: URL, label: String, precedence: Int, reach: SkillReach = .everyEngine
+    ) -> SkillEntry? {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
         let fm = Frontmatter.parse(text)
         let dir = url.deletingLastPathComponent()
@@ -291,7 +342,8 @@ public struct Library: Sendable {
             hasPythonBacking: hasPython,
             allowedTools: (fm.values["allowed-tools"] ?? fm.values["allowedTools"] ?? "")
                 .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty })
+                .filter { !$0.isEmpty },
+            reach: reach)
     }
 
     static func scanPrompts(root: URL, label: String) -> [PromptTemplate] {

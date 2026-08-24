@@ -4289,6 +4289,47 @@ let casesBuiltins: [Case] = [
             Builtins.description(ctx))
     }),
 
+    ("skills: what a run gets is not what the Library found", {
+        // The screen used to show one list of 22 and imply all of them were available. They
+        // were not: every run path passes `enginePackageRoot: nil`, so the engine bundle's
+        // own skills — which teach the harness's namespace, not Aviary's builtins — are
+        // discovered for display only. Both sets are correct; showing their union was not.
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-reach-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fm = FileManager.default
+        let project = dir.appending(path: "project", directoryHint: .isDirectory)
+        let engine = dir.appending(path: "engine", directoryHint: .isDirectory)
+        for path in ["project/.agents/skills/mine", "engine/skills/theirs"] {
+            try fm.createDirectory(
+                at: dir.appending(path: path, directoryHint: .isDirectory),
+                withIntermediateDirectories: true)
+        }
+        try "---\nname: mine\n---\nUse sh().".write(
+            to: dir.appending(path: "project/.agents/skills/mine/SKILL.md"),
+            atomically: true, encoding: .utf8)
+        try "---\nname: theirs\n---\nUse rlm_heartbeat.create().".write(
+            to: dir.appending(path: "engine/skills/theirs/SKILL.md"),
+            atomically: true, encoding: .utf8)
+
+        let home = AgentHome(root: dir.appending(path: "home", directoryHint: .isDirectory))
+        let settings = HarnessSettings.load(home: home)
+        let shown = Library.discover(
+            home: home, settings: settings, projectRoot: project, enginePackageRoot: engine,
+            userHome: dir.appending(path: "nobody", directoryHint: .isDirectory))
+        XCTAssertEqual(shown.skills.count, 2, "the Library sees both")
+        XCTAssertEqual(shown.reachableSkills.map(\.name), ["mine"])
+        XCTAssertEqual(shown.engineOnlySkills.map(\.name), ["theirs"])
+
+        // What a run actually discovers — the three run paths all pass nil.
+        let run = Library.discover(
+            home: home, settings: settings, projectRoot: project, enginePackageRoot: nil,
+            userHome: dir.appending(path: "nobody", directoryHint: .isDirectory))
+        XCTAssertEqual(run.skills.map(\.name), ["mine"])
+        XCTAssertTrue(run.engineOnlySkills.isEmpty,
+                      "an Aviary run must never be told about the harness's namespace")
+    }),
+
     ("builtins: the kernel binds every name the catalogue promises", {
         // The catalogue is Swift and the namespace is Python, so the invariant that made
         // `Builtins` worth writing — one list, no drift — stops at the language boundary
