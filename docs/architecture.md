@@ -1,5 +1,13 @@
 # Architecture
 
+> **The harness is gone.** Aviary ran on a vendored fork of Prime Agent — a Node CLI driven
+> over a JSON-RPC daemon — until 2026-08-24. Every capability that justified it was rebuilt
+> in-process one at a time (sessions, sub-agents, memory, skills, hooks, schedules, goals,
+> compaction, MCP, images, artifacts, mid-run model switching), and the fork, its daemon, its
+> supervisor surfaces and its 457MB checkout were removed together. Sections below that
+> describe a daemon, a worker, an ownership lease or a kernel pool are history, not behaviour.
+
+
 ## The split
 
 ```

@@ -62,8 +62,8 @@ struct RootView: View {
             return "\(model.board.openCount) open · \(model.board.workingCount) in progress · "
                 + "\(model.board.requests.count) total"
         case .live:
-            let working = model.liveSessions.filter(\.isWorking).count
-            return "\(model.liveSessions.count) live · \(working) working · \(model.runs.count) attached here"
+            let live = model.runs.filter { !$0.hasExited }
+            return "\(live.count) live · \(live.filter(\.isStreaming).count) working"
         case .flock:
             return "\(model.tree.allNodes.count) sub-agents · \(model.tree.runningCount) running"
         case .models:
@@ -80,7 +80,8 @@ struct RootView: View {
                 + " · \(model.library.prompts.count) prompts"
                 + " · \(model.library.extensions.count) extensions"
         case .health:
-            return model.daemon.health.label
+            return model.runtimeProbes.contains(where: \.ok)
+                ? "runtime ready" : "runtime unavailable"
         }
     }
 
@@ -178,7 +179,7 @@ struct SidebarView: View {
             set: { model.section = $0 ?? .cockpit }))
         {
             SwiftUI.Section {
-                ForEach(Section.allCases) { s in
+                ForEach(Section.visible) { s in
                     SidebarRow(section: s, badge: badge(for: s))
                         .tag(s)
                 }
@@ -229,7 +230,7 @@ struct SidebarView: View {
     private func badge(for s: Section) -> (String, Color)? {
         switch s {
         case .live:
-            let n = model.liveSessions.filter(\.isWorking).count
+            let n = model.runs.filter(\.isStreaming).count
             return n > 0 ? ("\(n)", Design.success) : nil
         case .sessions:
             return model.sessions.isEmpty ? nil : ("\(model.sessions.count)", .secondary)
@@ -240,11 +241,12 @@ struct SidebarView: View {
             let n = model.tree.runningCount
             return n > 0 ? ("\(n)", Design.agentMessage) : nil
         case .health:
-            switch model.daemon.health {
-            case .wedged: return ("!", Design.danger)
-            case .versionMismatch, .unknown: return ("!", Design.warning)
-            default: return nil
-            }
+            // Only shouts when the runtime has been probed and failed. An unprobed runtime is
+            // not a fault, and a badge that appeared at launch would be noise every time.
+            guard !model.runtimeProbes.isEmpty,
+                  !model.runtimeProbes.contains(where: \.ok)
+            else { return nil }
+            return ("!", Design.danger)
         default:
             return nil
         }
@@ -258,13 +260,13 @@ struct SidebarView: View {
                     .fill(healthColor)
                     .frame(width: 7, height: 7)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(model.engine?.kind.label ?? "No engine")
+                    Text("Aviary")
                         .font(.system(size: 10.5, weight: .medium))
                         .lineLimit(1)
-                    Text(model.engine?.version ?? "—")
+                    Text(model.runtimeProbes.first(where: \.ok)?.summary ?? "runtime unchecked")
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(.tertiary)
-                        .lineLimit(1)
+                        .lineLimit(1).truncationMode(.middle)
                 }
                 Spacer(minLength: 0)
                 // The loudest thing in the footer when it applies, because a stale bundle is
@@ -275,10 +277,10 @@ struct SidebarView: View {
                         .help("This app was \(model.buildStamp.summary). The checkout has "
                             + "\(behind) commit(s) since. Run `just build` and reopen it.")
                 }
-                if model.daemon.kernelCount > 0 {
-                    Chip(text: "\(model.daemon.kernelCount)", symbol: "cube",
-                         tint: Design.tool)
-                        .help("\(model.daemon.kernelCount) live IPython kernels")
+                let working = model.runs.filter(\.isStreaming).count
+                if working > 0 {
+                    Chip(text: "\(working)", symbol: "bolt.fill", tint: Design.success)
+                        .help("\(working) run(s) working")
                 }
             }
             .padding(.horizontal, 12)
@@ -288,12 +290,8 @@ struct SidebarView: View {
     }
 
     private var healthColor: Color {
-        switch model.daemon.health {
-        case .healthy: return Design.success
-        case .notRunning: return .secondary
-        case .wedged: return Design.danger
-        case .versionMismatch, .unknown: return Design.warning
-        }
+        if model.runtimeProbes.isEmpty { return .secondary }
+        return model.runtimeProbes.contains(where: \.ok) ? Design.success : Design.danger
     }
 }
 

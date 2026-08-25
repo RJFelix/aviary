@@ -143,7 +143,7 @@ struct CommandPaletteView: View {
 
         // Actions and navigation come first when the query is short — that's when the user
         // is reaching for a place, not searching for content.
-        for s in Section.allCases where q.isEmpty || s.title.lowercased().contains(q)
+        for s in Section.visible where q.isEmpty || s.title.lowercased().contains(q)
             || s.subtitle.lowercased().contains(q)
         {
             out.append(Entry(
@@ -244,12 +244,7 @@ struct CommandPaletteView: View {
                   symbol: "stethoscope", tint: Design.warning,
                   action: {
                       model.section = .health
-                      Task { await model.refreshDaemon() }
                   }),
-            Entry(kind: .action, title: "Force-shutdown the background service",
-                  subtitle: "Escalates to SIGKILL — the fix for a wedged supervisor",
-                  symbol: "power", tint: Design.danger,
-                  action: { Task { await model.shutdownDaemon(force: true) } }),
             Entry(kind: .action, title: "Toggle thinking blocks",
                   subtitle: model.hideThinking ? "Currently hidden" : "Currently shown",
                   symbol: "brain", tint: Design.thinking,

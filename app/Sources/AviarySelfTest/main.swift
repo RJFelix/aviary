@@ -5232,7 +5232,7 @@ let casesRepoRoot: [Case] = [
             atPath: root.appending(path: "runtime-hosts/python3/host.py").path))
         XCTAssertEqual(EngineLocator.rootMarker, "runtime-hosts/python3/host.py")
 
-        // A directory with a harness but no runtime host is not a root.
+        // A directory with the old marker but no runtime host is not a root.
         let fake = FileManager.default.temporaryDirectory
             .appending(path: "aviary-root-\(UUID().uuidString)", directoryHint: .isDirectory)
         defer { try? FileManager.default.removeItem(at: fake) }

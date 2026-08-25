@@ -95,7 +95,7 @@ struct AviaryCommands: Commands {
             Button("Rescan Sessions") { Task { await model.refreshCatalog() } }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Divider()
-            ForEach(Section.allCases) { s in
+            ForEach(Section.visible) { s in
                 Button(s.title) { model.section = s }
                     .keyboardShortcut(shortcutKey(for: s), modifiers: .command)
             }
@@ -150,8 +150,10 @@ extension Notification.Name {
 struct MenuBarLabel: View {
     @Environment(AppModel.self) private var model
 
+    /// Runs this process is holding, not sessions a supervisor claims to hold. With the
+    /// harness gone there is only one answer to "what is running", and it is in `runs`.
     private var working: Int {
-        model.liveSessions.filter(\.isWorking).count
+        model.runs.filter(\.isStreaming).count
     }
 
     var body: some View {
@@ -168,10 +170,10 @@ struct MenuBarContent: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        let live = model.liveSessions
+        let live = model.runs.filter { !$0.hasExited }
         Text(live.isEmpty
             ? "No live agents"
-            : "\(live.count) live · \(live.filter(\.isWorking).count) working")
+            : "\(live.count) live · \(live.filter(\.isStreaming).count) working")
 
         if !live.isEmpty {
             Divider()
@@ -180,19 +182,13 @@ struct MenuBarContent: View {
                     NSApp.activate(ignoringOtherApps: true)
                     model.section = .live
                 } label: {
-                    Text("\(s.isWorking ? "▶ " : "· ")\(s.displayName)")
+                    Text("\(s.isStreaming ? "▶ " : "· ")\(s.title)")
                 }
             }
         }
 
         Divider()
-        Text("Daemon: \(model.daemon.health.label)")
-        if model.daemon.kernelCount > 0 {
-            Text("\(model.daemon.kernelCount) IPython kernel\(model.daemon.kernelCount == 1 ? "" : "s")")
-        }
-        Divider()
         Button("Open Aviary") { NSApp.activate(ignoringOtherApps: true) }
-        Button("Refresh") { Task { await model.refreshDaemon() } }
         Divider()
         Button("Quit Aviary") { NSApp.terminate(nil) }
             .keyboardShortcut("q")

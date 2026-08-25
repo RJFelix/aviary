@@ -95,6 +95,11 @@ what it does; this file is how to work on it without relearning the traps.
   file, sees the same object, and skips the relink — so the executable keeps its mtime. Any
   test of "did a rebuild happen?" must change emitted code, not a comment. This cost two
   rounds of wrong diagnosis while building the workshop reload.
+- **There is no harness.** Aviary ran on a vendored Prime Agent fork until 2026-08-24. The
+  fork, `RPCClient`, `Daemon`, the supervisor surfaces and the `harness/` checkout are all
+  gone, and `harness/` is gitignored so a stray reinstall cannot creep back. Anything you find
+  that still mentions a daemon, a worker, an ownership lease or a kernel pool is stale prose,
+  not behaviour — fix it rather than working around it.
 - **There are three Aviary binaries, and only one of them is the app.** `swift build` makes
   `app/.build/debug/Aviary`, `just shot` renders from `app/.build/release/Aviary`, and the
   thing double-clicked is `build/Aviary.app`, produced by `just build`. Verifying a UI change

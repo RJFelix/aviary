@@ -96,8 +96,7 @@ enum Snapshot {
         model.stopPolling()
         log("indexed \(model.sessions.count) sessions, "
             + "\(model.tree.allNodes.count) sub-agents, "
-            + "\(model.runtimeModels.count) reachable models; "
-            + "daemon: \(model.daemon.health.label)")
+            + "\(model.runtimeModels.count) reachable models")
 
         // Give the transcript reader something real to draw.
         let chosen = sessionID.flatMap { id in model.sessions.first { $0.id == id } }
@@ -124,7 +123,7 @@ enum Snapshot {
             stage.forceDraw()
         }
 
-        let sections = Section.allCases.filter { only == nil || $0.rawValue == only }
+        let sections = Section.visible.filter { only == nil || $0.rawValue == only }
 
         // Two passes, and only the second one writes.
         //

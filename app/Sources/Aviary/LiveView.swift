@@ -637,11 +637,7 @@ struct LauncherFormBody: View {
                             Toggle("Skip AGENTS.md / CLAUDE.md discovery", isOn: $noContextFiles)
                             Divider().opacity(0.5)
                             Toggle("Record what's sent to the model", isOn: $recordPayloads)
-                            Text("Captures every provider request — system prompt, context "
-                                + "files, skill catalogue, tool schemas, messages — so the run "
-                                + "can show where its input tokens went. Writes them to a file "
-                                + "in Aviary's support directory, which is why it is off by "
-                                + "default.")
+                            Text(Self.recordPayloadsExplanation)
                                 .font(.system(size: 10))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -687,34 +683,19 @@ struct LauncherFormBody: View {
                         onStart()
                         return
                     }
-                    if model.engineChoice == .inHouse {
-                        model.startInHouseRun(
-                            cwd: cwd.isEmpty ? model.defaultCwd : cwd,
-                            providerID: provider.isEmpty ? nil : provider,
-                            modelID: modelID.isEmpty ? nil : modelID,
-                            prompt: prompt,
-                            recordPayloads: recordPayloads)
-                        onStart()
-                        return
-                    }
-                    model.startRun(
-                        config: RunConfiguration(
-                            cwd: cwd.isEmpty ? model.defaultCwd : cwd,
-                            provider: provider.isEmpty ? nil : provider,
-                            model: modelID.isEmpty ? nil : modelID,
-                            thinkingLevel: thinking,
-                            persistSession: persistSession,
-                            noContextFiles: noContextFiles,
-                            recordPayloads: recordPayloads
-                                && EngineLocator.wireLogExtension() != nil),
-                        firstPrompt: prompt.isEmpty ? nil : prompt)
+                    model.startInHouseRun(
+                        cwd: cwd.isEmpty ? model.defaultCwd : cwd,
+                        providerID: provider.isEmpty ? nil : provider,
+                        modelID: modelID.isEmpty ? nil : modelID,
+                        prompt: prompt,
+                        recordPayloads: recordPayloads)
                     onStart()
                 } label: {
                     Label("Start run", systemImage: "play.fill")
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.engine == nil && model.engineChoice == .harness)
+
             }
             .padding(14)
         }
@@ -752,14 +733,11 @@ struct LauncherFormBody: View {
         switch model.engineChoice {
         case .inHouse:
             return "Aviary's own agent loop, provider client and Python runtime host. No "
-                + "harness process and no Node. Skills are ranked against your prompt rather "
+                + "other process and no Node. Skills are ranked against your prompt rather "
                 + "than all sent, and the transcript is written in the same format so every "
                 + "other screen still reads it. Follow-ups continue in the same interpreter, "
                 + "so variables persist between prompts. Steering, payload recording and "
                 + "resuming a session all work."
-        case .harness:
-            return "The vendored Prime Agent harness over its RPC protocol. Still the "
-                + "default, and still what the daemon and kernel list are read from."
         case .claudeCode:
             return "Claude Code drives, and Aviary's kernel is the only tool it gets — its "
                 + "loop, its history, its stopping decision; your interpreter, your skills, "
@@ -769,6 +747,14 @@ struct LauncherFormBody: View {
                 + "conversation belongs to Claude Code and it will not accept a prepared one."
         }
     }
+
+    /// Hoisted out of the card's body: a multi-part string literal inside a ViewBuilder is
+    /// enough to push the type checker past its limit here, and it reports the failure on an
+    /// unrelated line when it does.
+    private static let recordPayloadsExplanation =
+        "Captures every provider request — system prompt, context files, skill catalogue, "
+        + "tool schemas, messages — so the run can show where its input tokens went. Writes "
+        + "them to a file in Aviary's support directory, which is why it is off by default."
 
     /// In catalogue order, de-duplicated by first appearance, so the picker agrees with the
     /// switcher and both follow your ordering.

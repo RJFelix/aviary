@@ -90,7 +90,8 @@ struct WorkshopView: View {
                 level: .danger,
                 title: "No Aviary checkout found",
                 message: "There is nowhere to keep the board, so requests cannot be filed. "
-                    + "Aviary looks for the repository containing harness/packages/coding-agent.")
+                    + "Aviary looks for the repository containing "
+                    + "runtime-hosts/python3/host.py.")
                 .padding(Design.gutter)
         } else if model.board.undeliveredCount > 0 {
             NoticeBanner(

@@ -202,63 +202,9 @@ private struct NewRunRailCard: View {
 
 // MARK: - Rows
 
-struct LiveSessionRow: View {
-    var session: LiveSession
-
-    var body: some View {
-        HStack(spacing: 8) {
-            if session.isWorking {
-                PulseDot(color: session.isSubagent ? Design.agentMessage : Design.success)
-            } else {
-                Circle().fill(Color.secondary.opacity(0.3)).frame(width: 7, height: 7)
-            }
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 5) {
-                    Text(session.displayName)
-                        .font(.system(size: 12, weight: .medium))
-                        .lineLimit(1)
-                    if session.isSubagent {
-                        Chip(text: "depth \(session.rlmDepth)", tint: Design.agentMessage)
-                    }
-                    if session.isCompacting {
-                        Chip(text: "compacting", tint: Design.warning)
-                    }
-                    if session.queuedCount > 0 {
-                        Chip(text: "\(session.queuedCount) queued", symbol: "tray.full",
-                             tint: Design.warning)
-                    }
-                }
-                HStack(spacing: 6) {
-                    if let m = session.modelLabel {
-                        Text(m).font(Design.mono(9.5)).foregroundStyle(.tertiary).lineLimit(1)
-                    }
-                    Text("\(session.messageCount) msgs")
-                        .font(.system(size: 9.5)).foregroundStyle(.tertiary)
-                    if !session.cwd.isEmpty {
-                        Text(URL(fileURLWithPath: session.cwd).lastPathComponent)
-                            .font(.system(size: 9.5)).foregroundStyle(.tertiary)
-                    }
-                }
-            }
-            Spacer(minLength: 6)
-            VStack(alignment: .trailing, spacing: 1) {
-                Text(session.activity)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(session.isWorking ? Design.success : .secondary)
-                Text(Fmt.ago(session.lastActivityAt))
-                    .font(.system(size: 9)).foregroundStyle(.tertiary)
-            }
-            if session.attachedClients > 0 {
-                Image(systemName: "person.fill")
-                    .font(.system(size: 8))
-                    .foregroundStyle(.tertiary)
-                    .help("\(session.attachedClients) attached client(s)")
-            }
-        }
-        .padding(.vertical, 6)
-        .contentShape(Rectangle())
-    }
-}
+// `LiveSessionRow` lived here: a row describing a session the harness daemon was holding,
+// with a lease, a worker and an attached-client count. Aviary runs its agents in-process, so
+// a live run is simply one of `runs` — `RunRailCard` above is the whole of it now.
 
 struct SessionRow: View {
     var session: SessionSummary

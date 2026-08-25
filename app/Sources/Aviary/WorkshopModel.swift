@@ -43,10 +43,8 @@ extension AppModel {
             return ("Agent idle, attached", Design.accent, true)
         }
         if let id = workshopSessionID {
-            if let live = liveSessions.first(where: { $0.sessionID == id }) {
-                return (live.isWorking ? "Agent working elsewhere" : "Session live, not attached",
-                        live.isWorking ? Design.success : Design.warning, true)
-            }
+            // No "running elsewhere" case any more: with the supervisor gone, a session is
+            // either one of this process's runs — handled above — or a file on disk.
             if sessions.contains(where: { $0.id == id }) {
                 return ("Session on disk, not running", .secondary, true)
             }
@@ -395,7 +393,7 @@ extension AppModel {
     ///
     /// The in-house engine needs no `engine` at all — that is the whole point of it — so this
     /// cannot just test for one.
-    var canRunWorkshopAgent: Bool { engineChoice != .harness || engine != nil }
+    var canRunWorkshopAgent: Bool { true }
 
     /// Which model the workshop agent runs on.
     ///
@@ -451,8 +449,6 @@ extension AppModel {
         switch engineChoice {
         case .claudeCode:
             return "claude-code/\(claudeCodeModel) (set in the engine picker)"
-        case .harness:
-            return "chosen by the harness"
         case .inHouse:
             guard let reference = workshopModelReference else {
                 return "no startable model configured"
@@ -490,12 +486,6 @@ extension AppModel {
                 // attaching to an existing session wants.
                 prompt: firstPrompt ?? "",
                 resume: resume, title: "Workshop")
-        case .harness:
-            var config = RunConfiguration(cwd: repoRoot.path, resume: resume)
-            // Nothing reads this yet. Kept as a marker so a hook can tell a workshop session
-            // from any other run without inspecting its prompt.
-            config.environmentOverrides["AVIARY_WORKSHOP"] = "1"
-            startRun(config: config, firstPrompt: firstPrompt)
         }
         workshopRunID = runs.last?.id
     }
@@ -592,10 +582,8 @@ extension AppModel {
 
         // What the app currently holds.
         add("State", "Sessions in catalog", "\(sessions.count)")
-        add("State", "Daemon", daemon.health.label)
-        add("State", "Live sessions", "\(liveSessions.count) (\(liveSessions.filter(\.isWorking).count) working)")
-        add("State", "Workers", "\(workers.count)")
-        if daemon.kernelCount > 0 { add("State", "IPython kernels", "\(daemon.kernelCount)") }
+        let live = runs.filter { !$0.hasExited }
+        add("State", "Live runs", "\(live.count) (\(live.filter(\.isStreaming).count) working)")
         add("State", "Sub-agents known", "\(tree.allNodes.count) (\(tree.runningCount) running)")
         add("State", "Attached runs", "\(runs.count)")
         if let lastRefresh {
@@ -663,9 +651,9 @@ extension AppModel {
             add("Library", "Prompts", "\(library.prompts.count)")
             add("Library", "Extensions", "\(library.extensions.count)")
         case .health:
-            add("Health", "Daemon", daemon.health.label)
-            add("Health", "Socket", daemon.socketPath)
-            if let v = daemon.version { add("Health", "Daemon version", v) }
+            for probe in runtimeProbes {
+                add("Health", "Runtime \(probe.variant)", probe.summary)
+            }
         }
 
         return WorkshopContext(
@@ -678,15 +666,15 @@ extension AppModel {
     /// being on screen, because a request can be filed from the menu with no window focused.
     private var sectionSubtitleForCapture: String {
         switch section {
-        case .cockpit: return engine.map { "\($0.kind.label) · \($0.version ?? "unknown")" } ?? "No engine"
+        case .cockpit: return "\(runs.filter { !$0.hasExited }.count) ongoing"
         case .sessions: return "\(filteredSessions.count) of \(sessions.count)"
-        case .live: return "\(liveSessions.count) live · \(runs.count) attached"
+        case .live: return "\(runs.count) attached"
         case .workshop: return "\(board.openCount) open · \(board.requests.count) total"
         case .flock: return "\(tree.allNodes.count) sub-agents"
         case .models: return "\(runtimeModels.count) reachable"
         case .usage: return Fmt.tokens(analytics.total.totalTokens) + " tokens"
         case .library: return "\(library.skills.count) skills"
-        case .health: return daemon.health.label
+        case .health: return runtimeProbes.contains(where: \.ok) ? "ready" : "runtime unavailable"
         }
     }
 

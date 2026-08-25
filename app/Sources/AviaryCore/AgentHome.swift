@@ -129,17 +129,13 @@ public struct EngineLocation: Sendable, Hashable, Identifiable {
 /// through the login shell — the global install lives under an asdf Node directory that a
 /// GUI process's inherited PATH does not contain.
 public enum EngineLocator {
-    /// Candidate locations for the fork's built CLI, relative to the repo root.
-    static let forkCLIRelative = "harness/packages/coding-agent/dist/bundle/cli.js"
-
     /// What makes a directory the Aviary repo root.
     ///
-    /// The runtime host, not the vendored harness. This used to look for
-    /// `harness/packages/coding-agent/package.json`, which quietly made *every* engine depend
-    /// on the bundled fork: the in-house and Claude-Code paths both locate `host.py` through
-    /// `repoRoot()`, so deleting the harness would have broken the two engines that never used
-    /// it. Keying on the thing actually needed is also self-validating — a root without a
-    /// runtime host is no use to any caller.
+    /// The runtime host. This used to look for the vendored harness's `package.json`, which
+    /// quietly made *every* engine depend on a fork neither of the surviving two used —
+    /// both locate `host.py` through `repoRoot()`, so removing the harness would have broken
+    /// them at once. Keying on the thing actually needed is also self-validating: a root
+    /// without a runtime host is no use to any caller.
     static let rootMarker = "runtime-hosts/python3/host.py"
 
     /// Walk up from a starting directory looking for the Aviary repo root.
@@ -167,24 +163,6 @@ public enum EngineLocator {
             found.append(EngineLocation(
                 kind: .custom, path: customPath, version: v,
                 note: "Set in Aviary settings"))
-        }
-
-        if let root = repoRoot() {
-            let cli = root.appending(path: forkCLIRelative)
-            if FileManager.default.fileExists(atPath: cli.path),
-               let node = await Shell.which("node")
-            {
-                // Prefer the declared version: launching the bundled CLI just to ask costs
-                // seconds and occasionally returns nothing at all, and the manifest next to
-                // it already knows the answer.
-                let declared = declaredVersion(
-                    packageJSON: root.appending(path: "harness/packages/coding-agent/package.json"))
-                var v = declared
-                if v == nil { v = await version(of: node, args: [cli.path]) }
-                found.append(EngineLocation(
-                    kind: .fork, path: node, leadingArguments: [cli.path], version: v,
-                    note: "Built from \(root.appending(path: "harness").path)"))
-            }
         }
 
         if let installed = await Shell.which("prime-agent") {

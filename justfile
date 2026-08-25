@@ -58,10 +58,6 @@ drive prompt *FLAGS:
     cd {{app_dir}} && swift build --product Aviary
     "{{app_dir}}/.build/debug/Aviary" --claude-code {{quote(prompt)}} {{FLAGS}}
 
-# Install dependencies and build the forked harness (the execution engine)
-build-engine:
-    cd harness && npm install && npm run build
-    @echo "engine → harness/packages/coding-agent/dist/bundle/cli.js"
 
 # Regenerate the app icon from scripts/make-icon.py
 icon:
@@ -72,15 +68,9 @@ icon:
 check: test compile
     @echo "ok"
 
-# Remove build output (keeps harness/node_modules)
+# Remove build output
 clean:
     rm -rf {{build_dir}} {{app_dir}}/.build
-
-# Kill a wedged harness daemon. --force escalates to SIGKILL; nothing is lost, transcripts
-# are on disk and the next launch reaps the poisoned ownership lease.
-daemon-reset:
-    prime-agent shutdown --force || true
-    prime-agent doctor --json || true
 
 # Drive a runtime host by hand. `just host` for the default, `just host python3-shared`.
 #

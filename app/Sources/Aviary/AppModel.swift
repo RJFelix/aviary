@@ -6,6 +6,15 @@ import AviaryCore
 enum Section: String, CaseIterable, Identifiable, Hashable {
     case cockpit, live, sessions, workshop, flock, models, usage, library, health
 
+    /// What the sidebar offers.
+    ///
+    /// Flock is kept and not shown. It drew the harness's world — a forest of sub-agent
+    /// sessions held by a supervisor — and that world is gone; the shape of the idea is worth
+    /// keeping, but it needs to describe what the in-house engine actually does before it
+    /// earns a place back. Hiding rather than deleting, because the argument for it was never
+    /// wrong, only its subject.
+    static var visible: [Section] { allCases.filter { $0 != .flock } }
+
     var id: String { rawValue }
 
     var title: String {
@@ -63,13 +72,14 @@ final class AppModel {
 
     var home: AgentHome = .default
     var engines: [EngineLocation] = []
+    /// The harness build Aviary used to drive.
+    ///
+    /// Kept only so the Health screen can still say what it found on disk, and so an existing
+    /// checkout is recognised. Nothing runs through it any more.
     var engine: EngineLocation? {
         didSet {
             guard engine != oldValue else { return }
-            let e = engine
-            Task { await inspector?.setEngine(e) }
-            UserDefaults.standard.set(e?.displayPath, forKey: "aviary.engine")
-            Task { await refreshDaemon() }
+            UserDefaults.standard.set(engine?.displayPath, forKey: "aviary.engine")
         }
     }
 
@@ -102,9 +112,10 @@ final class AppModel {
 
     // MARK: Live
 
-    var liveSessions: [LiveSession] = []
-    var daemon = DaemonStatus()
-    var workers: [WorkerDescriptor] = []
+    // The harness had a supervisor process holding sessions, a pool of kernels and a lease
+    // per session, and this is where their state used to live. Aviary's own engine runs its
+    // agents in-process and its interpreters in a runtime host it owns, so there is nothing
+    // to inspect and nothing to reconcile — a run is live because it is in `runs`.
     var tree = AgentTree()
     var lastRefresh: Date?
 
@@ -156,7 +167,6 @@ final class AppModel {
     /// honest — it is the decision you actually make when starting a run — as long as the
     /// picker says what the difference is.
     enum Engine: String, CaseIterable, Identifiable {
-        case harness
         case inHouse
         case claudeCode
 
@@ -164,7 +174,6 @@ final class AppModel {
 
         var label: String {
             switch self {
-            case .harness: return "Harness"
             case .inHouse: return "In-house"
             case .claudeCode: return "Claude Code"
             }
@@ -196,7 +205,8 @@ final class AppModel {
 
     /// Kept as a derived value so the several places that only care "is this the harness or
     /// not" need no change. A Claude-Code run is not the harness either.
-    var preferInHouseEngine: Bool { engineChoice != .harness }
+    /// Retained as a name several places still read. There is no other kind of engine now.
+    var preferInHouseEngine: Bool { true }
     var focusedRunID: UUID?
     /// Which Claude model a driven run asks for. An alias rather than a full id, because that
     /// is what Claude Code's `--model` takes and what its own docs use.
@@ -274,7 +284,6 @@ final class AppModel {
     }
 
     private var catalog: SessionCatalog?
-    private var inspector: DaemonInspector?
     private var pollTask: Task<Void, Never>?
     private var watcher: SessionWatcher?
 
@@ -335,7 +344,6 @@ final class AppModel {
             customPath: UserDefaults.standard.string(forKey: "aviary.customEnginePath"))
         let remembered = UserDefaults.standard.string(forKey: "aviary.engine")
         engine = engines.first { $0.displayPath == remembered } ?? engines.first
-        inspector = DaemonInspector(home: home, engine: engine)
 
         settings = .load(home: home)
         hideThinking = settings.hideThinkingBlock ?? false
@@ -365,10 +373,9 @@ final class AppModel {
 
     func refreshAll() async {
         async let a: Void = refreshCatalog()
-        async let b: Void = refreshDaemon()
         async let c: Void = refreshRuntimeModels()
         async let d: Void = refreshRuntimeProbes()
-        _ = await (a, b, c, d)
+        _ = await (a, c, d)
         refreshLibrary()
     }
 
@@ -386,28 +393,19 @@ final class AppModel {
         lastRefresh = Date()
     }
 
-    func refreshDaemon() async {
-        guard let inspector else { return }
-        daemon = await inspector.status()
-        liveSessions = await inspector.liveSessions()
-        workers = await inspector.workers()
-        annotateLiveState()
-    }
-
-    /// Fold daemon liveness into the catalog rows so a session's list entry knows it is
-    /// running. Two sources, one row — this is where they get reconciled.
+    /// Mark the catalog rows that belong to a run this process is holding.
+    ///
+    /// One source now, so there is nothing to reconcile: a session is live when Aviary is
+    /// running it. The harness needed two — an append-only daemon ledger and a writer-owned
+    /// artifact — and their disagreements were a standing source of wrong rows.
     private func annotateLiveState() {
-        let byID = Dictionary(liveSessions.map { ($0.sessionID, $0) }, uniquingKeysWith: { a, _ in a })
+        let running = Set(runs.filter { !$0.hasExited }.compactMap(\.sessionID))
+        let busy = Set(runs.filter { $0.isStreaming }.compactMap(\.sessionID))
         for i in sessions.indices {
-            if let live = byID[sessions[i].id] {
-                sessions[i].isLive = true
-                sessions[i].isBusy = live.isWorking
-                sessions[i].liveOperation = live.activity
-            } else if sessions[i].isLive {
-                sessions[i].isLive = false
-                sessions[i].isBusy = false
-                sessions[i].liveOperation = nil
-            }
+            let isLive = running.contains(sessions[i].id)
+            sessions[i].isLive = isLive
+            sessions[i].isBusy = isLive && busy.contains(sessions[i].id)
+            if !isLive { sessions[i].liveOperation = nil }
         }
     }
 
@@ -483,17 +481,9 @@ final class AppModel {
 
     func refreshLibrary() {
         let projectRoot = sessions.first.flatMap { $0.cwd.isEmpty ? nil : URL(fileURLWithPath: $0.cwd) }
-        let enginePackageRoot: URL? = {
-            guard let engine, let cli = engine.leadingArguments.first else { return nil }
-            // …/packages/coding-agent/dist/bundle/cli.js → …/packages/coding-agent
-            return URL(fileURLWithPath: cli)
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-        }()
         library = Library.discover(
             home: home, settings: settings,
-            projectRoot: projectRoot, enginePackageRoot: enginePackageRoot)
+            projectRoot: projectRoot, enginePackageRoot: nil)
         // Cheap, and only meaningful once a repo is known. Refreshed with the library rather
         // than polled: the answer only changes when somebody commits.
         if let root = EngineLocator.repoRoot() {
@@ -529,10 +519,10 @@ final class AppModel {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                let busy = self.liveSessions.contains(where: \.isWorking) || !self.runs.isEmpty
+                let busy = !self.runs.isEmpty
                 try? await Task.sleep(nanoseconds: busy ? 3_000_000_000 : 12_000_000_000)
                 guard !Task.isCancelled else { return }
-                await self.refreshDaemon()
+                self.annotateLiveState()
                 self.tree = AgentTreeReader.read(home: self.home)
             }
         }
@@ -757,26 +747,7 @@ final class AppModel {
 
     // MARK: Daemon actions
 
-    func shutdownDaemon(force: Bool) async {
-        guard let inspector else { return }
-        let result = await inspector.shutdown(force: force)
-        toast = Toast(
-            message: result?.best.trimmingCharacters(in: .whitespacesAndNewlines)
-                ?? "Shutdown command sent",
-            isError: !(result?.ok ?? false))
-        await refreshDaemon()
-    }
-
-    func repairDaemon() async {
-        guard let inspector else { return }
-        let result = await inspector.repair()
-        toast = Toast(
-            message: result?.best.trimmingCharacters(in: .whitespacesAndNewlines) ?? "doctor --fix ran",
-            isError: !(result?.ok ?? false))
-        await refreshDaemon()
-    }
-
-    // MARK: Runs
+// MARK: Runs
 
     /// Start an in-house run: Aviary's own loop, its own provider client, its own runtime
     /// host. No harness process and no Node.
@@ -793,7 +764,7 @@ final class AppModel {
         await run.setModel(resolved: resolved)
     }
 
-    func startInHouseRun(
+        func startInHouseRun(
         cwd: String, providerID: String?, modelID: String?, prompt: String,
         recordPayloads: Bool = false, resume: String? = nil, title: String? = nil
     ) {
@@ -856,29 +827,9 @@ final class AppModel {
                 cwd: cwd, model: claudeCodeModel, effort: nil, prompt: "", title: s.title)
             return
         }
-        if engineChoice == .inHouse {
-            startInHouseRun(
-                cwd: cwd, providerID: s.provider, modelID: s.model, prompt: "",
-                recordPayloads: recordPayloads, resume: s.id, title: s.title)
-            return
-        }
-        startRun(
-            config: RunConfiguration(
-                cwd: cwd, provider: s.provider, model: s.model, resume: s.id,
-                recordPayloads: recordPayloads),
-            firstPrompt: nil)
-    }
-
-    func startRun(config: RunConfiguration, firstPrompt: String?) {
-        guard let engine else {
-            toast = Toast(message: "No engine configured", isError: true)
-            return
-        }
-        let run = LiveRun(engine: engine, config: config)
-        runs.append(run)
-        focusedRunID = run.id
-        section = .live
-        Task { await run.start(firstPrompt: firstPrompt) }
+        startInHouseRun(
+            cwd: cwd, providerID: s.provider, modelID: s.model, prompt: "",
+            recordPayloads: recordPayloads, resume: s.id, title: s.title)
     }
 
     func closeRun(_ run: LiveRun) {
@@ -950,13 +901,9 @@ final class LiveRun: Identifiable {
     var wireLogURL: URL?
 
     private let builder = LiveTranscriptBuilder()
-    private var session = RPCSession()
-    private var pump: Task<Void, Never>?
 
-    /// Set when this run is Aviary's own rather than the harness's.
-    ///
-    /// One type with two backends rather than two types, because every view that renders a run
-    /// — the transcript, the token panel, the sidebar row — should not have to know which
+    /// One type with two backends rather than two types, because every view that renders a
+    /// run — the transcript, the token panel, the sidebar row — should not have to know which
     /// engine produced it. That is the same reason the file format is shared.
     private(set) var inHouse: InHouseDriver?
     var isInHouse: Bool { inHouse != nil }
@@ -1072,63 +1019,6 @@ final class LiveRun: Identifiable {
         return Fmt.contextShare(used: t, window: contextWindow)
     }
 
-    func start(firstPrompt: String?) async {
-        do {
-            let stream = try await session.start(engine: engine, config: config)
-            launchCommand = await session.launchCommand
-            pump = Task { [weak self] in
-                for await message in stream {
-                    await self?.ingest(message)
-                }
-                await self?.markExited()
-            }
-            await refreshState()
-            if let firstPrompt, !firstPrompt.isEmpty {
-                title = String(firstPrompt.prefix(60))
-                builder.appendLocalUserMessage(firstPrompt)
-                sync()
-                try await session.prompt(firstPrompt)
-            }
-        } catch {
-            errorBanner = error.localizedDescription
-            hasExited = true
-        }
-    }
-
-    private func ingest(_ message: RPCMessage) {
-        if case .stderr(let text) = message {
-            stderrTail.append(text)
-            if stderrTail.count > 200 { stderrTail.removeFirst(stderrTail.count - 200) }
-        }
-        if case .exited(let code, _) = message {
-            exitCode = code
-            hasExited = true
-        }
-        if builder.apply(message) { sync() }
-
-        // State-bearing events are worth a follow-up query: the engine's own view of the
-        // session (model, context usage) is authoritative and cheap to ask for.
-        if case .event(let type, _) = message, ["agent_end", "compaction_end"].contains(type) {
-            Task { await refreshState() }
-        }
-        // The extension appends on every provider request, so a turn boundary is the right
-        // moment to pick up new records.
-        if case .event(let type, _) = message,
-           ["message_end", "agent_end"].contains(type)
-        {
-            refreshWireLog()
-        }
-    }
-
-    private func sync() {
-        items = builder.items
-        isStreaming = builder.isStreaming
-        isCompacting = builder.isCompacting
-        usage = builder.usage
-        queuedSteering = builder.queued.steering
-        queuedFollowUps = builder.queued.followUps
-    }
-
     private func markExited() {
         hasExited = true
         isStreaming = false
@@ -1154,25 +1044,6 @@ final class LiveRun: Identifiable {
     var lastInputTokens: Int? {
         let inputs = items.compactMap { $0.usage?.input }.filter { $0 > 0 }
         return inputs.last
-    }
-
-    func refreshState() async {
-        guard !hasExited else { return }
-        if let state = try? await session.state() {
-            sessionID = state["sessionId"]?.stringValue ?? sessionID
-            sessionFile = state["sessionFile"]?.stringValue ?? sessionFile
-            if let m = state["model"] {
-                let p = m["provider"]?.stringValue
-                let id = m["id"]?.stringValue
-                modelLabel = [p, id].compactMap { $0 }.joined(separator: "/")
-                contextWindow = m["contextWindow"]?.intValue ?? contextWindow
-            }
-            thinkingLevel = state["thinkingLevel"]?.stringValue ?? thinkingLevel
-        }
-        if let stats = try? await session.stats() {
-            contextTokens = stats.path("contextUsage.tokens")?.intValue ?? contextTokens
-            contextWindow = stats.path("contextUsage.contextWindow")?.intValue ?? contextWindow
-        }
     }
 
     func send(_ text: String) async {
@@ -1214,42 +1085,33 @@ final class LiveRun: Identifiable {
             inHouse.send(text)
             return
         }
-        if title == "New run" { title = String(text.prefix(60)) }
-        builder.appendLocalUserMessage(text)
+        builder.appendNote("This run has no engine behind it.")
         sync()
-        do {
-            // While the agent is running, a plain prompt is rejected — it has to be
-            // explicitly queued. Steering is the useful default: it lands after the
-            // current tool calls finish, before the next model call.
-            if isStreaming {
-                try await session.prompt(text, streamingBehavior: "steer")
-            } else {
-                try await session.prompt(text)
-            }
-        } catch {
-            builder.appendNote("Could not send: \(error.localizedDescription)")
-            sync()
-        }
     }
 
+    /// Queue a message for after the current turn.
+    ///
+    /// The harness had a server-side queue for this. Aviary's own engine steers instead —
+    /// the message lands at the next turn boundary, which is the same guarantee without a
+    /// second place for a message to sit unacknowledged.
     func queueFollowUp(_ text: String) async {
-        do { try await session.followUp(text) } catch {
-            builder.appendNote("Could not queue: \(error.localizedDescription)")
-            sync()
-        }
+        await send(text)
     }
 
     func abort() {
-        if let claudeCode { claudeCode.stop(); return }
-        if let inHouse { inHouse.stop(); return }
-        Task { await session.abort() }
+        claudeCode?.stop()
+        inHouse?.stop()
     }
 
+    /// Compaction is automatic on Aviary's own engine — the agent summarises the middle of
+    /// the conversation when it passes a share of the context window, and records a marker.
+    /// There is nothing to trigger by hand, and a button that pretended otherwise would be
+    /// worse than its absence.
     func compact() async {
-        do { try await session.compact() } catch {
-            builder.appendNote("Compaction failed: \(error.localizedDescription)")
-            sync()
-        }
+        builder.appendNote(
+            "This engine compacts on its own when the conversation approaches the model's "
+                + "context window.")
+        sync()
     }
 
     /// Change the model this run answers with.
@@ -1280,29 +1142,17 @@ final class LiveRun: Identifiable {
             sync()
             return
         }
-        do {
-            try await session.setModel(
-                provider: resolved.model.providerID, model: resolved.model.id)
-            modelLabel = label
-            await refreshState()
-        } catch {
-            builder.appendNote("Could not switch model: \(error.localizedDescription)")
-            sync()
-        }
+        builder.appendNote("This run has no engine to switch.")
+        sync()
     }
 
     func setThinking(_ level: String) async {
-        do {
-            try await session.setThinkingLevel(level)
-            thinkingLevel = level
-        } catch {
-            builder.appendNote("Could not set thinking level: \(error.localizedDescription)")
-            sync()
-        }
+        // Recorded on the run so the menu reflects the choice; the in-house agent reads its
+        // effort from the model spec at each call, so this takes effect on the next turn.
+        thinkingLevel = level
     }
 
     func rename(_ name: String) async {
-        try? await session.setSessionName(name)
         title = name
     }
 
@@ -1318,8 +1168,7 @@ final class LiveRun: Identifiable {
             hasExited = true
             return
         }
-        pump?.cancel()
-        await session.stop()
+        inHouse?.stop()
         hasExited = true
     }
 }

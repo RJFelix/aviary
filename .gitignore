@@ -33,3 +33,7 @@ memory/
 
 # Agent worktrees are checkouts, not content.
 .claude/worktrees/
+
+# The vendored Prime Agent fork, removed 2026-08-24. Kept out by name so a stray
+# reinstall does not creep back into the tree.
+harness/

@@ -201,6 +201,10 @@ public struct Library: Sendable {
         skillRoots.append((home.skillsDir, "User (~/.prime/agent/skills)", 2, true, .everyEngine))
         skillRoots.append((userHome.appending(path: ".agents/skills"),
                            "User (~/.agents/skills)", 3, false, .everyEngine))
+        // `enginePackageRoot` described the vendored harness's own skills. The fork is gone,
+        // and with it the only source that was ever `bundledEngineOnly`. The parameter stays
+        // so a future bundled source has somewhere to go, and `SkillReach` stays because the
+        // distinction it draws is real whenever one exists.
         if let enginePackageRoot {
             skillRoots.append((enginePackageRoot.appending(path: "skills"),
                                "Built-in (engine)", 9, true, .bundledEngineOnly))
