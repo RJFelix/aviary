@@ -95,6 +95,15 @@ what it does; this file is how to work on it without relearning the traps.
   file, sees the same object, and skips the relink — so the executable keeps its mtime. Any
   test of "did a rebuild happen?" must change emitted code, not a comment. This cost two
   rounds of wrong diagnosis while building the workshop reload.
+- **There are three Aviary binaries, and only one of them is the app.** `swift build` makes
+  `app/.build/debug/Aviary`, `just shot` renders from `app/.build/release/Aviary`, and the
+  thing double-clicked is `build/Aviary.app`, produced by `just build`. Verifying a UI change
+  with the first two proves nothing about the third. This cost three rounds of fixes to one
+  menu, all judged against a bundle four hours older than the code that fixed it — and because
+  a missing rebuild is indistinguishable from a failed fix, the evidence pointed at the
+  diagnosis instead of the build. **Run `just build` before asking anyone to look at a UI
+  change.** The sidebar footer now shows an amber "N behind" chip when the checkout has moved
+  past the running bundle; if you see it in a screenshot, that is the first thing to fix.
 - **The app declares its own `Section`.** `AppModel.swift` defines `enum Section` for
   navigation, which shadows SwiftUI's `Section` inside the `Aviary` target. An unqualified
   `Section { … }` in a `List` resolves to the enum and produces four rounds of unrelated
