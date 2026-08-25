@@ -78,6 +78,14 @@ public actor AgentRunner {
 
     /// Run a root agent to completion. Returns its transcript so a caller can render it.
     /// Build the run and send its first prompt.
+    /// Children started in the background, by child id.
+    ///
+    /// Held on the runner rather than the agent because a child outlives the turn that started
+    /// it — that is the whole point — and the agent's turn loop is not where a thing that
+    /// outlives turns should live.
+    private var background: [String: Agent.ChildStatus] = [:]
+    private var backgroundTasks: [String: Task<Void, Never>] = [:]
+
     /// Live MCP servers, held so they can be stopped with the run that started them.
     private var mcpClients: [MCPClient] = []
 
@@ -124,6 +132,7 @@ public actor AgentRunner {
 
     /// Stop the servers this run started.
     public func stopMCPServers() async {
+        stopBackgroundChildren()
         let clients = mcpClients
         mcpClients.removeAll()
         for client in clients { await client.stop() }
@@ -259,10 +268,61 @@ public actor AgentRunner {
     /// its own transcript under the parent's artifacts directory, and its own ledger record so
     /// Flock draws it. What it is *not* is a fresh context — the prompt it gets is the whole
     /// brief, which is why the parent is told to write a self-contained one.
-    fileprivate func runChild(
+    /// Start a child and return its id immediately.
+    ///
+    /// The parent keeps its turn. Worth being clear about what that buys and costs: two agents
+    /// now write to the same runtime host concurrently, which is fine because the host gives
+    /// each session its own interpreter and its own GIL, and both append to their own
+    /// transcripts. What it does *not* buy is a notification — the parent finds out by asking
+    /// `children()`, because there is no way to interrupt a turn that is already running
+    /// without producing a conversation its provider rejects.
+    fileprivate func startBackgroundChild(
         prompt: String, name: String?, modelID: String?, depth: Int, parentSessionID: String
-    ) async -> (answer: String, isError: Bool, childID: String, name: String) {
+    ) -> (childID: String, name: String) {
         let childID = SubAgentRecorder.newChildID()
+        let label = name ?? childID
+        background[childID] = Agent.ChildStatus(
+            id: childID, name: label, state: "running", answer: nil)
+        backgroundTasks[childID] = Task { [weak self] in
+            guard let self else { return }
+            let result = await self.runChild(
+                prompt: prompt, name: name, modelID: modelID, depth: depth,
+                parentSessionID: parentSessionID, childID: childID)
+            await self.finishBackground(
+                childID: childID, name: result.name, answer: result.answer,
+                isError: result.isError)
+        }
+        return (childID, label)
+    }
+
+    private func finishBackground(
+        childID: String, name: String, answer: String, isError: Bool
+    ) {
+        background[childID] = Agent.ChildStatus(
+            id: childID, name: name, state: isError ? "failed" : "done", answer: answer)
+        backgroundTasks[childID] = nil
+    }
+
+    fileprivate func backgroundChildren() -> [Agent.ChildStatus] {
+        background.values.sorted { $0.id < $1.id }
+    }
+
+    /// Stop anything still running, when the run that started it is going away.
+    ///
+    /// A background child whose parent has exited has nobody to report to, and a runtime host
+    /// about to be torn down underneath it. Cancelled rather than left, because an orphan that
+    /// keeps spending tokens is the failure mode this whole feature could most easily add.
+    public func stopBackgroundChildren() {
+        for (_, task) in backgroundTasks { task.cancel() }
+        backgroundTasks.removeAll()
+    }
+
+    fileprivate func runChild(
+        prompt: String, name: String?, modelID: String?, depth: Int, parentSessionID: String,
+        childID preallocated: String? = nil
+    ) async -> (answer: String, isError: Bool, childID: String, name: String) {
+        // Passed in by the background path, which has already told the parent this id.
+        let childID = preallocated ?? SubAgentRecorder.newChildID()
         let label = name ?? childID
         let recorder = SubAgentRecorder(home: settings.home, parentSessionID: parentSessionID)
         let createdAt = Date()
@@ -362,12 +422,16 @@ public actor AgentRunner {
         let runner: AgentRunner
         let parentSessionID: String
 
-        func spawn(
+        func startBackground(
             prompt: String, name: String?, model: String?, depth: Int
-        ) async -> (answer: String, isError: Bool, childID: String, name: String) {
-            await runner.runChild(
+        ) async -> (childID: String, name: String) {
+            await runner.startBackgroundChild(
                 prompt: prompt, name: name, modelID: model, depth: depth,
                 parentSessionID: parentSessionID)
+        }
+
+        func children() async -> [Agent.ChildStatus] {
+            await runner.backgroundChildren()
         }
     }
 }

@@ -380,11 +380,13 @@ func test_batchTrashReportsIndividualFailures() async throws {
 /// A spawn delegate that should never be reached — used to prove the depth ceiling refuses
 /// before any child is created.
 struct RefusingDelegate: Agent.SpawnDelegate {
-    func spawn(
+    func startBackground(
         prompt: String, name: String?, model: String?, depth: Int
-    ) async -> (answer: String, isError: Bool, childID: String, name: String) {
-        ("a child should not have been started", true, "sub-none", "none")
+    ) async -> (childID: String, name: String) {
+        ("sub-none", "none")
     }
+
+    func children() async -> [Agent.ChildStatus] { [] }
 }
 
 
@@ -5218,6 +5220,88 @@ let casesMCPVersions: [Case] = [
 
 // MARK: - Changing a run's model
 
+let casesBackgroundSpawn: [Case] = [
+
+    ("spawn: one non-blocking primitive, and Python decides whether to wait", {
+        // The agent here writes Python rather than calling a sub-agent tool, so waiting is its
+        // script's decision. There is no blocking variant to conform to any more — the Swift
+        // side only knows how to start one and how to report on it.
+        final class Fake: Agent.SpawnDelegate, @unchecked Sendable {
+            let lock = NSLock()
+            var started: [String] = []
+            var finished = false
+
+            func startBackground(
+                prompt: String, name: String?, model: String?, depth: Int
+            ) async -> (childID: String, name: String) {
+                lock.lock(); started.append(prompt); lock.unlock()
+                return ("c-bg", name ?? "c-bg")
+            }
+
+            func children() async -> [Agent.ChildStatus] {
+                lock.lock(); let done = finished; lock.unlock()
+                return [Agent.ChildStatus(
+                    id: "c-bg", name: "researcher",
+                    state: done ? "done" : "running",
+                    answer: done ? "found it" : nil)]
+            }
+        }
+        let fake = Fake()
+        let bg = await fake.startBackground(
+            prompt: "research this", name: "researcher", model: nil, depth: 1)
+        XCTAssertEqual(bg.childID, "c-bg")
+
+        // Running: a state and no answer. This is what the Future's poller reads, and the
+        // absent key is what stops it resolving early.
+        let running = try XCTUnwrap(await fake.children().first)
+        XCTAssertEqual(running.state, "running")
+        XCTAssertNil(running.payload["answer"])
+
+        fake.lock.lock(); fake.finished = true; fake.lock.unlock()
+        let done = try XCTUnwrap(await fake.children().first)
+        XCTAssertEqual(done.state, "done")
+        XCTAssertEqual(done.payload["answer"]?.stringValue, "found it")
+    }),
+
+    ("spawn: the Future's watcher thread cannot be a daemon", {
+        // Found by a real run, not by reading: 3.12 sub-interpreters refuse daemon threads
+        // outright, and the model wrote a two-child fan-out the moment the API invited one.
+        // A non-daemon thread has to end by itself, so the deadline and the error branch are
+        // load-bearing rather than defensive.
+        guard let root = EngineLocator.repoRoot() else {
+            print("      skipped: no checkout"); return
+        }
+        let host = try String(
+            contentsOf: root.appending(path: "runtime-hosts/python3/host.py"), encoding: .utf8)
+        let watcher = try XCTUnwrap(host.range(of: "def __aviary_watch")).lowerBound
+        let tail = String(host[watcher...].prefix(2400))
+        XCTAssertTrue(tail.contains("_th.Thread(target=__aviary_watch)"))
+        XCTAssertFalse(tail.contains("daemon=True"),
+                       "a sub-interpreter refuses daemon threads")
+        XCTAssertTrue(tail.contains("deadline"), "it must be able to stop on its own")
+        XCTAssertTrue(tail.contains("set_exception"),
+                      "and resolve rather than hang when the host goes away")
+    }),
+
+    ("spawn: the description promises a Future, and children() is not in the namespace", {
+        let ctx = Builtins.Context(cwd: "/repo", canSpawn: true, spawnBudget: 2)
+        let text = Builtins.description(ctx)
+        XCTAssertTrue(text.contains("concurrent.futures.Future"))
+        XCTAssertTrue(text.contains(".result()"))
+        // `children` is how the Future's own thread polls. Binding it as well would describe
+        // a second way to do the same thing and charge for it on every request.
+        XCTAssertFalse(Builtins.names(.reference).contains("children"))
+        XCTAssertFalse(text.contains("children()"))
+        let entry = try XCTUnwrap(Builtins.all(.reference).first { $0.name == "spawn" })
+        XCTAssertTrue(entry.note?.contains("costs a model call") == true,
+                      "polling across turns is the expensive mistake and must be named")
+        // Still gated: no depth left, no name.
+        XCTAssertFalse(
+            Builtins.description(Builtins.Context(cwd: "/repo", canSpawn: false))
+                .contains("spawn("))
+    }),
+]
+
 let casesPeers: [Case] = [
 
     ("peers: a solo run is not told about a room with nobody in it", {
@@ -5606,4 +5690,5 @@ await Harness.run(
         + casesLibraryUsage + casesArtifact + casesAttachImage + casesMCPVersions
         + casesModelSwitch + casesMirrorChurn + casesBuildStamp
         + casesRepoRoot + casesAgentHome
-        + casesPeers + casesMCPSurface)
+        + casesPeers + casesMCPSurface
+        + casesBackgroundSpawn)

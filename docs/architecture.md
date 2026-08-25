@@ -148,6 +148,35 @@ giving up. The schema is now built from what the run can actually do — includi
 sub-agent depth remains — and there is a test asserting `spawn` is advertised only when it is
 possible.
 
+### spawn() is a Future, not a call
+
+`spawn(prompt)` returns a `concurrent.futures.Future` immediately. Waiting is `.result()`.
+
+There used to be a blocking primitive, and a background flag beside it. Both were the wrong
+shape for this product, and the reason is the whole thesis of the one-tool design: the agent is
+*writing Python*, not invoking a sub-agent tool. Whether to wait is a decision its script
+should make, not one the primitive makes for it. A Future says exactly that — and being the
+stdlib one, it brings `wait()`, `as_completed()`, `.done()` and `add_done_callback()` without
+this codebase implementing any of them. The API got smaller as it got more capable, and the
+tool description with it.
+
+The Futures live in the agent's namespace, which persists, so one started in an earlier cell is
+still there in the next.
+
+Two things a real run taught, neither visible from reading:
+
+**Sub-interpreters refuse daemon threads.** The Future is resolved by a watcher thread polling
+`children()`, and 3.12 rejects `daemon=True` with "daemon threads are disabled in this
+(sub)interpreter". So the thread must end by itself: it has a deadline, and it resolves with an
+exception if the host answers with an error. A non-daemon thread that never returned would hold
+up the interpreter's teardown.
+
+**Polling, not pushing.** Nothing can interrupt a turn already in flight without producing a
+conversation the provider rejects — the same constraint that makes steering land at turn
+boundaries. So the parent finds out by asking. The advice in the description matters for the
+same reason: wait inside one cell, where it costs seconds, rather than across turns, where each
+check costs a model call.
+
 ### Agents talking to each other
 
 `agents()` lists the other runs Aviary is holding; `message(to, text)` sends one a note.

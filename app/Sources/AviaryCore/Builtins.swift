@@ -202,17 +202,23 @@ public enum Builtins {
                 requirement: .memory, mechanism: .callback, isAvailable: ctx.hasMemory),
             Entry(
                 name: "spawn",
-                signature: "spawn(prompt, name=None)",
-                summary: "Run a sub-agent and block on its answer.",
-                bullet: "spawn(prompt, name=None) – run a sub-agent and wait for its answer. "
-                    + "Returns {'answer': str, 'name': str, 'id': str}, or a dict with an "
-                    + "'error' key. Blocking, so several spawns in one cell run one after "
-                    + "another; write them in separate cells if you want to interleave other "
-                    + "work. You may nest \(ctx.spawnBudget) more level(s).",
+                signature: "spawn(prompt, name=None, model=None)",
+                summary: "Start a sub-agent. Returns a Future you may choose to await.",
+                bullet: "spawn(prompt, name=None) – start a sub-agent and get back a "
+                    + "`concurrent.futures.Future` immediately. It does not block: call "
+                    + ".result() when you want its answer, .done() to look without waiting, "
+                    + "or concurrent.futures.wait()/as_completed() over several. You may nest "
+                    + "\(ctx.spawnBudget) more level(s).",
                 note: "A sub-agent starts with none of your context and returns only its final "
                     + "message, so the prompt must be self-contained and must say what to "
                     + "report back. Delegate genuinely separable work; doing it yourself is "
-                    + "usually cheaper.",
+                    + "usually cheaper.\n\nBecause it is a Future and not a blocking call, "
+                    + "you decide the shape: `spawn(a).result()` to wait for one, or start "
+                    + "several and collect them, or start one and keep working while it runs. "
+                    + "The Futures live in your namespace, so one started in an earlier cell "
+                    + "is still there in this one. Wait inside a single cell rather than across "
+                    + "turns — waiting in a cell costs seconds, waiting across turns costs a "
+                    + "model call each time.",
                 requirement: .spawn, mechanism: .callback, isAvailable: ctx.canSpawn),
             Entry(
                 name: "attach_image",

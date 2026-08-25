@@ -228,8 +228,65 @@ def __aviary_ask_app(kind, **payload):
 __aviary_ns["sh"] = __aviary_sh
 __aviary_ns["cwd"] = lambda: __aviary_state["cwd"]
 __aviary_ns["ask_app"] = __aviary_ask_app
-__aviary_ns["spawn"] = lambda prompt, name=None, model=None: __aviary_ask_app(
-    "spawn", prompt=prompt, name=name, model=model)
+def __aviary_spawn(prompt, name=None, model=None):
+    # Returns a real `concurrent.futures.Future`, not a bespoke handle.
+    #
+    # The agent here is *writing Python*, not calling a sub-agent tool, so whether to wait is
+    # its script's decision rather than the primitive's. A Future is the shape that says so —
+    # and being the stdlib one means `.result()`, `.done()`, `wait()`, `as_completed()` and
+    # `add_done_callback()` all work without this file implementing any of them.
+    #
+    # A blocking variant used to exist beside this. It is gone: `spawn(p).result()` is the
+    # blocking call, spelled by the caller.
+    import concurrent.futures as _cf
+    import threading as _th
+    import time as _time
+
+    started = __aviary_ask_app("spawn", prompt=prompt, name=name, model=model)
+    future = _cf.Future()
+    if not isinstance(started, dict) or "id" not in started:
+        future.set_result(started)
+        return future
+    child_id = started["id"]
+    future.aviary_id = child_id
+    future.aviary_name = started.get("name")
+
+    def __aviary_watch():
+        # Polls rather than being pushed to: nothing can interrupt a turn that is already
+        # running without producing a conversation the provider would reject, so the parent
+        # finds out by asking. One thread per child, and threads are cheap next to an agent.
+        deadline = _time.time() + 3600
+        while _time.time() < deadline:
+            rows = __aviary_ask_app("children")
+            if isinstance(rows, dict) and "error" in rows:
+                # The host is going away, or sub-agents were never enabled. Resolving with the
+                # error beats a thread that outlives the session waiting for an answer nobody
+                # is coming to give.
+                future.set_exception(RuntimeError(rows["error"]))
+                return
+            for row in rows or []:
+                if not isinstance(row, dict) or row.get("id") != child_id:
+                    continue
+                if row.get("state") == "running":
+                    break
+                if row.get("state") == "failed":
+                    future.set_exception(RuntimeError(row.get("answer") or "the sub-agent failed"))
+                else:
+                    future.set_result(row.get("answer") or "")
+                return
+            _time.sleep(0.5)
+        future.set_exception(RuntimeError("the sub-agent did not finish within an hour"))
+
+    # Not a daemon thread: 3.12 sub-interpreters refuse them outright
+    # ("daemon threads are disabled in this (sub)interpreter"), which a real run found the
+    # moment the model wrote the fan-out this API invites. So the thread has to end by itself,
+    # which is what the deadline and the error branch above are for — a non-daemon thread that
+    # never returns would hold up the interpreter's teardown.
+    _th.Thread(target=__aviary_watch).start()
+    return future
+
+
+__aviary_ns["spawn"] = __aviary_spawn
 __aviary_ns["conversation"] = lambda limit=40: __aviary_ask_app("conversation", limit=limit)
 __aviary_ns["remember"] = lambda text, scope="project", days=None, tags=None: __aviary_ask_app(
     "remember", text=text, scope=scope, days=days, tags=tags or [])

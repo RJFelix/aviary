@@ -161,12 +161,50 @@ public actor Agent {
         self.observer = observer
     }
 
+    /// One sub-agent, as the parent sees it while it is still going.
+    public struct ChildStatus: Sendable, Hashable {
+        public var id: String
+        public var name: String
+        /// `running`, `done`, or `failed`.
+        public var state: String
+        /// Present once it has finished.
+        public var answer: String?
+
+        public init(id: String, name: String, state: String, answer: String?) {
+            self.id = id
+            self.name = name
+            self.state = state
+            self.answer = answer
+        }
+
+        public var payload: JSONValue {
+            var out: [String: JSONValue] = [
+                "id": .string(id), "name": .string(name), "state": .string(state),
+            ]
+            if let answer { out["answer"] = .string(answer) }
+            return .object(out)
+        }
+    }
+
     /// Somebody who can run a child agent. Injected rather than built in, so a caller decides
     /// what a sub-agent costs, where it writes, and whether it is allowed at all.
+    ///
+    /// Non-blocking only, deliberately. There used to be a blocking variant beside this one,
+    /// and it was the wrong shape for this product: the agent is *writing Python*, not calling
+    /// a sub-agent tool, so waiting is something its script should decide rather than
+    /// something the primitive decides for it. `spawn()` hands Python a
+    /// `concurrent.futures.Future`, and `.result()` is how you wait — which also brings
+    /// `wait()`, `as_completed()` and every other stdlib idiom for free, none of which a
+    /// blocking call could have offered.
     public protocol SpawnDelegate: Sendable {
-        func spawn(
+        /// Start a child and return its id at once.
+        func startBackground(
             prompt: String, name: String?, model: String?, depth: Int
-        ) async -> (answer: String, isError: Bool, childID: String, name: String)
+        ) async -> (childID: String, name: String)
+
+        /// Every child this run has started, finished or not. Polled by the Future's own
+        /// thread rather than by the agent, so it is not in the namespace.
+        func children() async -> [ChildStatus]
     }
 
     public func setSpawnDelegate(_ delegate: SpawnDelegate?) {
@@ -275,6 +313,12 @@ public actor Agent {
     /// code and is blocked on the reply, so a refusal it can read beats a hang it cannot.
     public func serveCallback(kind: String, payload: JSONValue) async -> JSONValue {
         switch kind {
+        case "children":
+            guard let delegate = spawnDelegate else {
+                return .object(["error": .string("Sub-agents are not enabled for this run.")])
+            }
+            return .array(await delegate.children().map(\.payload))
+
         case "agents":
             guard let peerDelegate else {
                 return .object(["error": .string("This run has no peers to list.")])
@@ -336,19 +380,15 @@ public actor Agent {
                 return .object(["error": .string("spawn() needs a prompt.")])
             }
             let name = payload["name"]?.stringValue
-            let result = await delegate.spawn(
-                prompt: prompt, name: name, model: payload["model"]?.stringValue,
-                depth: config.depth + 1)
-            emit(.childFinished(
-                id: result.childID, name: result.name, answer: result.answer,
-                isError: result.isError))
-            var out: [String: JSONValue] = [
-                "answer": .string(result.answer),
-                "name": .string(result.name),
-                "id": .string(result.childID),
-            ]
-            if result.isError { out["error"] = .string(result.answer) }
-            return .object(out)
+            // Always non-blocking. Waiting is `.result()` on the Future the prelude hands
+            // back, which is Python's business rather than this callback's.
+            let started = await delegate.startBackground(
+                prompt: prompt, name: payload["name"]?.stringValue,
+                model: payload["model"]?.stringValue, depth: config.depth + 1)
+            return .object([
+                "id": .string(started.childID), "name": .string(started.name),
+                "state": .string("running"),
+            ])
 
         case "remember":
             guard let memory else {
