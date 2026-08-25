@@ -11,6 +11,7 @@ import AviaryCore
 /// the Sessions screen.
 struct WorkshopView: View {
     @Environment(AppModel.self) private var model
+    @State private var choosingWorkshopModel = false
 
     var body: some View {
         // Pinned to exactly the space the pane offers.
@@ -162,18 +163,6 @@ struct WorkshopView: View {
 
     /// Grouped by provider, from the same catalogue every other picker uses, so a model
     /// offered here is one a run can actually start.
-    private var workshopModelGroups: [(String, [ModelSpec])] {
-        var groups: [(String, [ModelSpec])] = []
-        for spec in model.pickerModels {
-            if let index = groups.firstIndex(where: { $0.0 == spec.providerID }) {
-                groups[index].1.append(spec)
-            } else {
-                groups.append((spec.providerID, [spec]))
-            }
-        }
-        return groups
-    }
-
     private var agentControls: some View {
         HStack(spacing: 8) {
             Button {
@@ -200,37 +189,10 @@ struct WorkshopView: View {
             // buttons gave this row an intrinsic width it could not shrink below, which is
             // half of why the sidebar was being crushed.
             Menu {
-                // The agent's model, where the agent is launched from. It used to be
-                // unsettable from here and silently took whatever sorted first in models.json,
-                // which is how the workshop spent weeks on a model nobody chose.
-                Menu("Agent model") {
-                    if !model.workshopModelIsSettableHere {
-                        Text("The workshop is on the "
-                            + "\(model.engineChoice.label) engine, which takes its model from "
-                            + "the engine picker in Live.")
-                        Divider()
-                    }
-                    Button {
-                        model.chosenWorkshopModel = nil
-                    } label: {
-                        Label("Follow my default", systemImage:
-                            model.chosenWorkshopModel == nil ? "checkmark" : "")
-                    }
-                    Divider()
-                    ForEach(workshopModelGroups, id: \.0) { provider, models in
-                        Menu(provider) {
-                            ForEach(models) { spec in
-                                Button {
-                                    model.chosenWorkshopModel = spec.qualifiedID
-                                } label: {
-                                    Label(spec.displayName, systemImage:
-                                        model.chosenWorkshopModel == spec.qualifiedID
-                                            ? "checkmark" : "")
-                                }
-                            }
-                        }
-                    }
-                }
+                // A panel, not a submenu: this menu is `.menuStyle(.borderlessButton)`, and a
+                // nested `Menu` under that style opens and closes itself on macOS. See
+                // `ModelChooserSheet`.
+                Button("Agent model…") { choosingWorkshopModel = true }
                 Text(model.workshopModelSummary)
                 Divider()
                 Button("Reload board from disk") { model.refreshBoard() }
@@ -262,6 +224,19 @@ struct WorkshopView: View {
                 Image(systemName: "ellipsis.circle")
             }
             .menuStyle(.borderlessButton)
+            .sheet(isPresented: $choosingWorkshopModel) {
+                ModelChooserSheet(
+                    title: "Workshop agent model",
+                    note: model.workshopModelIsSettableHere ? nil
+                        : "The workshop is on the \(model.engineChoice.label) engine, which "
+                            + "takes its model from the engine picker in Live. Choosing here "
+                            + "will not change what the agent runs on.",
+                    models: model.pickerModels,
+                    current: model.chosenWorkshopModel,
+                    clearTitle: "Follow my default",
+                    onClear: { model.chosenWorkshopModel = nil },
+                    onPick: { model.chosenWorkshopModel = $0.qualifiedID })
+            }
             .fixedSize()
         }
     }

@@ -381,14 +381,27 @@ struct RunOptionsMenu: View {
     var models: [ModelSpec]
     var hasExited: Bool
     var sessionFile: String?
+    @State private var choosingModel = false
 
     var body: some View {
         Menu {
             Button("Compact context now") { Task { await run.compact() } }
                 .disabled(hasExited)
             Divider()
-            modelMenu
-            thinkingMenu
+            Button("Change model…") { choosingModel = true }
+                .disabled(hasExited || models.isEmpty)
+            // Flat, not a submenu. Seven items inline cost less than a nested `Menu`, which
+            // does not work under `.menuStyle(.borderlessButton)` — see `ModelChooserSheet`.
+            Picker("Thinking level", selection: Binding(
+                get: { run.thinkingLevel ?? "off" },
+                set: { level in Task { await run.setThinking(level) } }))
+            {
+                ForEach(["off", "minimal", "low", "medium", "high", "xhigh", "max"], id: \.self) {
+                    Text($0).tag($0)
+                }
+            }
+            .pickerStyle(.inline)
+            .disabled(hasExited)
             Divider()
             Button("Copy launch command") {
                 NSPasteboard.general.clearContents()
@@ -407,50 +420,13 @@ struct RunOptionsMenu: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
+        // Attached to the menu, not inside its content: a sheet modifier on a view that only
+        // exists while the menu is open never gets the chance to present.
+        .sheet(isPresented: $choosingModel) {
+            RunSettingsSheet(run: run, models: models)
+        }
     }
 
-    @ViewBuilder
-    private var modelMenu: some View {
-        Menu("Switch model") {
-            ForEach(groupedModels, id: \.0) { provider, models in
-                Menu(provider) {
-                    ForEach(models) { m in
-                        Button(m.displayName) {
-                            Task { await model.switchModel(
-                                run: run, provider: provider, model: m.id) }
-                        }
-                    }
-                }
-            }
-        }
-        .disabled(hasExited || models.isEmpty)
-    }
-
-    /// Grouped for the switcher, in your order rather than alphabetically.
-    ///
-    /// Providers are ordered by where their first model sits, so pinning a model to the top
-    /// brings its provider with it instead of leaving the group buried under `a`-something.
-    private var groupedModels: [(String, [ModelSpec])] {
-        var groups: [(String, [ModelSpec])] = []
-        for m in models {
-            if let i = groups.firstIndex(where: { $0.0 == m.providerID }) {
-                groups[i].1.append(m)
-            } else {
-                groups.append((m.providerID, [m]))
-            }
-        }
-        return groups
-    }
-
-    @ViewBuilder
-    private var thinkingMenu: some View {
-        Menu("Thinking level") {
-            ForEach(["off", "minimal", "low", "medium", "high", "xhigh", "max"], id: \.self) { level in
-                Button(level) { Task { await run.setThinking(level) } }
-            }
-        }
-        .disabled(hasExited)
-    }
 }
 
 // MARK: - Launcher
