@@ -397,6 +397,29 @@ extension AppModel {
     /// cannot just test for one.
     var canRunWorkshopAgent: Bool { engineChoice != .harness || engine != nil }
 
+    /// Which model the workshop agent runs on.
+    ///
+    /// It has no model of its own — this is the configured default, the same one the launcher
+    /// offers. It used to name none at all, and `AgentCLI.resolve(nil)` means "the first model
+    /// of the first provider in models.json", both sorted by id. On a machine whose first
+    /// provider is a gateway that silently pinned the workshop agent to whatever sorted first
+    /// there, ignoring the default set in Preferences — and, because the Models screen's test
+    /// button defaults to that same first model, sending a test completion looked like it had
+    /// *moved* the agent. Nothing had been written; the two defaults simply agreed.
+    ///
+    /// `nil` falls back to the old behaviour, which is right when the default names something
+    /// this launcher cannot start. Both checks earn their place: the catalogue says the
+    /// provider has working credentials, and `AgentCLI.resolve` is what `startInHouseRun`
+    /// actually calls — it knows nothing about `claude-code`, which is a perfectly reachable
+    /// default and not an in-house route.
+    var workshopModelReference: String? {
+        guard let qualified = settings.defaultModelQualified,
+              modelCatalog.find(qualified) != nil,
+              AgentCLI.resolve(qualified, in: modelsConfig) != nil
+        else { return nil }
+        return qualified
+    }
+
     /// Open or resume the workshop session on whichever engine is selected.
     ///
     /// One launcher for both entry points. They each used to build a harness
@@ -415,7 +438,7 @@ extension AppModel {
                 prompt: firstPrompt ?? bootstrapPrompt(repoRoot: repoRoot), title: "Workshop")
         case .inHouse:
             startInHouseRun(
-                cwd: repoRoot.path, providerID: nil, modelID: nil,
+                cwd: repoRoot.path, providerID: nil, modelID: workshopModelReference,
                 // An in-house run with no prompt prepares and waits, which is exactly what
                 // attaching to an existing session wants.
                 prompt: firstPrompt ?? "",

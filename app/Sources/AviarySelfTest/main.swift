@@ -3102,6 +3102,61 @@ let cases4: [Case] = [
         XCTAssertFalse(isError)
     }),
 
+    ("models: a test completion is a diagnostic and moves no selection", {
+        // Reported as "sending a test completion to the gateway moves the workshop agent onto
+        // the gateway's first model". It does not: `ProviderTester` opens a socket and nothing
+        // else. What actually happened is that the workshop agent named no model at all, so it
+        // resolved to the first model of the first provider in models.json — which is also what
+        // the Models screen's test button defaults to. Two independent defaults agreeing looks
+        // exactly like one writing the other, so this pins the half that must stay inert: after
+        // a completed round trip, every file that could hold a selection is byte-identical.
+        guard let server = try FakeProviderServer(script: [["text": "ok"]])
+        else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+
+        let home = scratchHome()
+        try FileManager.default.createDirectory(at: home.root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home.root) }
+
+        try Data("""
+            {"defaultProvider":"openai-codex","defaultModel":"gpt-5.6-terra",
+             "recentModels":["openai-codex/gpt-5.6-terra"]}
+            """.utf8).write(to: home.settingsFile)
+        try Data("""
+            {"providers":{"gateway":{"baseUrl":"\(server.baseURL.absoluteString)/",
+             "apiKey":"sk-test","models":[{"id":"aaa-first"},{"id":"zzz-last"}]}}}
+            """.utf8).write(to: home.modelsFile)
+        let prefsStore = ModelPreferencesStore(
+            directory: home.root.appending(path: "prefs", directoryHint: .isDirectory))
+        prefsStore.save(ModelPreferences(order: ["gateway/zzz-last"]))
+
+        let watched = [home.settingsFile, home.modelsFile, prefsStore.fileURL]
+        let before = watched.map { FileManager.default.contents(atPath: $0.path) }
+
+        let config = ModelsConfig.load(home: home, auth: nil)
+        let provider = try XCTUnwrap(config.providers.first { $0.id == "gateway" })
+        // The button's own default, so the test sends what a click sends.
+        let result = await ProviderTester.test(provider: provider, model: provider.models.first)
+        XCTAssertEqual(result.httpStatus, 200, "the round trip has to have happened: \(result.detail)")
+        XCTAssertEqual(result.modelID, "aaa-first")
+
+        XCTAssertEqual(
+            watched.map { FileManager.default.contents(atPath: $0.path) }, before,
+            "a diagnostic wrote to disk")
+        // Said again through the readers, because a byte comparison would not catch a write
+        // that happened to reproduce the same bytes in a different file.
+        let settings = HarnessSettings.load(home: home)
+        XCTAssertEqual(settings.defaultProvider, "openai-codex")
+        XCTAssertEqual(settings.defaultModel, "gpt-5.6-terra")
+        XCTAssertEqual(settings.recentModels, ["openai-codex/gpt-5.6-terra"])
+        XCTAssertEqual(prefsStore.load().order, ["gateway/zzz-last"])
+        // And no models.json backup, which is how any write through `ModelsConfig.write`
+        // would announce itself.
+        let strays = try FileManager.default.contentsOfDirectory(atPath: home.root.path)
+            .filter { $0.hasPrefix("models.json.") }
+        XCTAssertTrue(strays.isEmpty, "unexpected: \(strays)")
+    }),
+
 ]
 
 let cases5: [Case] = [

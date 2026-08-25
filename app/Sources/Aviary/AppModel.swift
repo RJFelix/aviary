@@ -704,6 +704,16 @@ final class AppModel {
 
     // MARK: Provider testing
 
+    /// Send one throwaway completion and record what came back. Nothing else.
+    ///
+    /// A test completion is a diagnostic: it must not become a selection. Only
+    /// `testingProviders` and `providerTests` may be touched here, and `ProviderTester` writes
+    /// no file — there is a test pinning that, because this looked violated once. Sending a
+    /// test to the LiteLLM gateway appeared to move the workshop agent onto LiteLLM's first
+    /// model; in fact both sides independently defaulted to the same model (the test button
+    /// takes `provider.models.first`, and the workshop agent named no model at all, which
+    /// `AgentCLI.resolve` reads as the first model of the first provider in models.json). The
+    /// coincidence is gone — see `startWorkshopRun` — and this stays diagnostic-only.
     func testProvider(_ provider: ProviderSpec, model: ModelSpec?) async {
         testingProviders.insert(provider.id)
         let result = await ProviderTester.test(provider: provider, model: model)
