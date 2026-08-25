@@ -248,72 +248,13 @@ struct RunPane: View {
                 .tint(Design.danger)
             }
 
-            Menu {
-                Button("Compact context now") { Task { await run.compact() } }
-                    .disabled(run.hasExited)
-                Divider()
-                modelMenu
-                thinkingMenu
-                Divider()
-                Button("Copy launch command") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(run.launchCommand, forType: .string)
-                }
-                if let file = run.sessionFile {
-                    Button("Reveal transcript") {
-                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: file)])
-                    }
-                }
-                Divider()
-                Button("Close run", role: .destructive) { model.closeRun(run) }
-            } label: {
-                Image(systemName: "ellipsis.circle")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
+            RunOptionsMenu(
+                run: run,
+                models: model.pickerModels,
+                hasExited: run.hasExited,
+                sessionFile: run.sessionFile)
+                .equatable()
         }
-    }
-
-    @ViewBuilder
-    private var modelMenu: some View {
-        Menu("Switch model") {
-            ForEach(groupedModels, id: \.0) { provider, models in
-                Menu(provider) {
-                    ForEach(models) { m in
-                        Button(m.displayName) {
-                            Task { await run.setModel(provider: provider, model: m.id) }
-                        }
-                    }
-                }
-            }
-        }
-        .disabled(run.hasExited || model.pickerModels.isEmpty)
-    }
-
-    /// Grouped for the switcher, in your order rather than alphabetically.
-    ///
-    /// Providers are ordered by where their first model sits, so pinning a model to the top
-    /// brings its provider with it instead of leaving the group buried under `a`-something.
-    private var groupedModels: [(String, [ModelSpec])] {
-        var groups: [(String, [ModelSpec])] = []
-        for m in model.pickerModels {
-            if let i = groups.firstIndex(where: { $0.0 == m.providerID }) {
-                groups[i].1.append(m)
-            } else {
-                groups.append((m.providerID, [m]))
-            }
-        }
-        return groups
-    }
-
-    @ViewBuilder
-    private var thinkingMenu: some View {
-        Menu("Thinking level") {
-            ForEach(["off", "minimal", "low", "medium", "high", "xhigh", "max"], id: \.self) { level in
-                Button(level) { Task { await run.setThinking(level) } }
-            }
-        }
-        .disabled(run.hasExited)
     }
 
     private var composer: some View {
@@ -408,6 +349,109 @@ struct RunPane: View {
         let text = draft
         draft = ""
         Task { await run.send(text) }
+    }
+}
+
+/// The run's menu, in a view of its own so that an open submenu survives the run streaming.
+///
+/// Not tidiness. `LiveRun` is `@Observable`, and the in-house and driven engines both mirror
+/// their driver onto it from a 250ms loop that assigns every field *unconditionally* — the
+/// Observation setter notifies on every assignment whether or not the value changed, so an
+/// idle run invalidates `RunPane` four times a second forever. `RunPane` reads five of the
+/// mirrored fields (`items`, `isStreaming`, `hasExited`, `usage`, `errorBanner`), so while the
+/// menu lived in that body its content was rebuilt at 4Hz, and AppKit answers a rebuilt
+/// NSMenu by tearing down and re-presenting whichever submenu is open. Hovering "Switch
+/// model" flashed a submenu nothing could be clicked in.
+///
+/// So everything the menu *draws* arrives as a value and the comparison below decides when it
+/// is redrawn. The `run` is held for its actions only: reading an observable property of it in
+/// this body would re-open the same hole, and `launchCommand` is read inside a button's action
+/// rather than beside it for exactly that reason — observation tracks what a body reads, not
+/// what a closure will read later. The poll loop in `AppModel.startPolling` is not implicated;
+/// it touches daemon state this screen never reads.
+struct RunOptionsMenu: View, Equatable {
+    @Environment(AppModel.self) private var model
+    var run: LiveRun
+    var models: [ModelSpec]
+    var hasExited: Bool
+    var sessionFile: String?
+
+    /// `LiveRun` is a class and not `Equatable`; identity is the right test for it, and the
+    /// rest is what the menu puts on screen.
+    static func == (a: RunOptionsMenu, b: RunOptionsMenu) -> Bool {
+        a.run === b.run
+            && a.hasExited == b.hasExited
+            && a.sessionFile == b.sessionFile
+            && a.models == b.models
+    }
+
+    var body: some View {
+        Menu {
+            Button("Compact context now") { Task { await run.compact() } }
+                .disabled(hasExited)
+            Divider()
+            modelMenu
+            thinkingMenu
+            Divider()
+            Button("Copy launch command") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(run.launchCommand, forType: .string)
+            }
+            if let sessionFile {
+                Button("Reveal transcript") {
+                    NSWorkspace.shared.activateFileViewerSelecting(
+                        [URL(fileURLWithPath: sessionFile)])
+                }
+            }
+            Divider()
+            Button("Close run", role: .destructive) { model.closeRun(run) }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    @ViewBuilder
+    private var modelMenu: some View {
+        Menu("Switch model") {
+            ForEach(groupedModels, id: \.0) { provider, models in
+                Menu(provider) {
+                    ForEach(models) { m in
+                        Button(m.displayName) {
+                            Task { await run.setModel(provider: provider, model: m.id) }
+                        }
+                    }
+                }
+            }
+        }
+        .disabled(hasExited || models.isEmpty)
+    }
+
+    /// Grouped for the switcher, in your order rather than alphabetically.
+    ///
+    /// Providers are ordered by where their first model sits, so pinning a model to the top
+    /// brings its provider with it instead of leaving the group buried under `a`-something.
+    private var groupedModels: [(String, [ModelSpec])] {
+        var groups: [(String, [ModelSpec])] = []
+        for m in models {
+            if let i = groups.firstIndex(where: { $0.0 == m.providerID }) {
+                groups[i].1.append(m)
+            } else {
+                groups.append((m.providerID, [m]))
+            }
+        }
+        return groups
+    }
+
+    @ViewBuilder
+    private var thinkingMenu: some View {
+        Menu("Thinking level") {
+            ForEach(["off", "minimal", "low", "medium", "high", "xhigh", "max"], id: \.self) { level in
+                Button(level) { Task { await run.setThinking(level) } }
+            }
+        }
+        .disabled(hasExited)
     }
 }
 

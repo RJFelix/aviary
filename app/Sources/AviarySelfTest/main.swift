@@ -3157,6 +3157,35 @@ let cases4: [Case] = [
         XCTAssertTrue(strays.isEmpty, "unexpected: \(strays)")
     }),
 
+    ("catalog: a refresh hands a picker the same values, not merely the same names", {
+        // Underneath the flashing Live submenus. `RunOptionsMenu` refuses to rebuild its
+        // NSMenu while the models it draws compare equal, and `refreshRuntimeModels` rebuilds
+        // the catalogue from scratch every time it runs — so `ModelSpec` equality across two
+        // independent loads is the precondition the whole fix rests on. Names matching is not
+        // enough: one field that differs per load (a date, a resolved key, an identity) and
+        // the menu is rebuilt on every refresh again.
+        //
+        // It does not prove the submenu stays open. Nothing here can; that needs a mouse.
+        let home = scratchHome()
+        try FileManager.default.createDirectory(at: home.root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        try Data("""
+            {"providers":{
+              "zeta":{"apiKey":"sk-a","models":[{"id":"m2"},{"id":"m1"}]},
+              "alpha":{"apiKey":"sk-b","models":[{"id":"only"}]}}}
+            """.utf8).write(to: home.modelsFile)
+
+        let prefs = ModelPreferences(order: ["zeta/m2"])
+        func offered() -> [ModelSpec] {
+            ModelCatalogBuilder.build(
+                config: ModelsConfig.load(home: home, auth: nil), auth: nil,
+                credentialed: ["zeta", "alpha"], preferences: prefs).enabled
+        }
+        let first = offered(), second = offered()
+        XCTAssertEqual(first.map(\.qualifiedID), ["zeta/m2", "alpha/only", "zeta/m1"])
+        XCTAssertEqual(first, second, "two loads of one file disagree, so a picker rebuilds")
+    }),
+
 ]
 
 let cases5: [Case] = [
