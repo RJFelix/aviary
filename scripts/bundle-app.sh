@@ -28,6 +28,8 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/$BIN_NAME"
 
+BUILD_STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+BUILD_COMMIT="$(git -C "$(dirname "$0")/.." rev-parse --short HEAD 2>/dev/null || echo unknown)"
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -46,6 +48,12 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>NSSupportsAutomaticTermination</key><false/>
     <key>NSSupportsSuddenTermination</key><false/>
     <key>NSHumanReadableCopyright</key><string>Local build</string>
+    <!-- When this bundle was assembled, and from what. Stamped because "am I running my
+         change?" is otherwise unanswerable from inside the app, and getting it wrong costs
+         whole debugging sessions: three rounds of fixes to a menu were evaluated against a
+         bundle four hours older than the code that fixed it. -->
+    <key>AviaryBuildStamp</key><string>$BUILD_STAMP</string>
+    <key>AviaryBuildCommit</key><string>$BUILD_COMMIT</string>
     <!-- The app spawns the harness and reads the agent directory; it is deliberately
          not sandboxed. Sandboxing it would make the entire point impossible. -->
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>

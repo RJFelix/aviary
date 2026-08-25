@@ -5218,6 +5218,50 @@ let casesMCPVersions: [Case] = [
 
 // MARK: - Changing a run's model
 
+let casesBuildStamp: [Case] = [
+
+    ("build: the app can tell when the source has moved past it", {
+        // The failure this exists to prevent: three rounds of fixes to a menu were judged
+        // against a bundle four hours older than the code that fixed them. A correct fix and
+        // a missing rebuild look identical from the outside.
+        guard let root = EngineLocator.repoRoot() else {
+            print("      skipped: no checkout"); return
+        }
+        let head = BuildStamp(builtAt: Date(), commit: "HEAD")
+        XCTAssertNil(BuildStamp.commitsSinceBuild(repoRoot: root, stamp: head),
+                     "a build of HEAD is not behind anything")
+
+        // One commit back is one commit behind, which is the smallest true answer.
+        let previous = BuildStamp(builtAt: Date(), commit: "HEAD~1")
+        XCTAssertEqual(BuildStamp.commitsSinceBuild(repoRoot: root, stamp: previous), 1)
+
+        // A stamp that names nothing cannot be compared, and must not produce a warning that
+        // never clears.
+        let unstamped = BuildStamp(builtAt: nil, commit: nil)
+        XCTAssertFalse(unstamped.isStamped)
+        XCTAssertNil(BuildStamp.commitsSinceBuild(repoRoot: root, stamp: unstamped))
+        XCTAssertEqual(unstamped.summary, "unstamped build")
+
+        // A commit that does not exist is not "zero behind" — it is unanswerable.
+        let bogus = BuildStamp(builtAt: Date(), commit: "0000000")
+        XCTAssertNil(BuildStamp.commitsSinceBuild(repoRoot: root, stamp: bogus))
+    }),
+
+    ("build: the bundler stamps what it built and from where", {
+        // Asserted against the script rather than a rendered plist, so the two cannot drift
+        // without this failing.
+        guard let root = EngineLocator.repoRoot() else {
+            print("      skipped: no checkout"); return
+        }
+        let script = try String(
+            contentsOf: root.appending(path: "scripts/bundle-app.sh"), encoding: .utf8)
+        XCTAssertTrue(script.contains("AviaryBuildStamp"))
+        XCTAssertTrue(script.contains("AviaryBuildCommit"))
+        XCTAssertTrue(script.contains("rev-parse --short HEAD"),
+                      "the commit must come from git, not be typed in")
+    }),
+]
+
 let casesMirrorChurn: [Case] = [
 
     ("live: re-reading an unchanged transcript produces equal items", {
@@ -5351,4 +5395,4 @@ let casesModelSwitch: [Case] = [
 await Harness.run(
     cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
         + casesLibraryUsage + casesArtifact + casesAttachImage + casesMCPVersions
-        + casesModelSwitch + casesMirrorChurn)
+        + casesModelSwitch + casesMirrorChurn + casesBuildStamp)

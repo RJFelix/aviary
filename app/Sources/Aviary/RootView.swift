@@ -267,6 +267,14 @@ struct SidebarView: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
+                // The loudest thing in the footer when it applies, because a stale bundle is
+                // indistinguishable from a failed fix until somebody notices it.
+                if let behind = model.commitsBehind {
+                    Chip(text: "\(behind) behind", symbol: "exclamationmark.triangle.fill",
+                         tint: Design.warning, filled: true)
+                        .help("This app was \(model.buildStamp.summary). The checkout has "
+                            + "\(behind) commit(s) since. Run `just build` and reopen it.")
+                }
                 if model.daemon.kernelCount > 0 {
                     Chip(text: "\(model.daemon.kernelCount)", symbol: "cube",
                          tint: Design.tool)

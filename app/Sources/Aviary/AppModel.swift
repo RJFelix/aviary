@@ -124,6 +124,9 @@ final class AppModel {
     var pickerModels: [ModelSpec] { modelCatalog.enabled }
     var providerTests: [String: ProviderTestResult] = [:]
     var testingProviders: Set<String> = []
+    /// When this bundle was built, and how far the checkout has moved since.
+    let buildStamp = BuildStamp.fromBundle()
+    var commitsBehind: Int?
     var library = Library()
     /// What the agent finds already bound in its Python namespace, and which skills reference
     /// each name. The catalogue is static; the index is read off the skills on disk.
@@ -487,6 +490,11 @@ final class AppModel {
         library = Library.discover(
             home: home, settings: settings,
             projectRoot: projectRoot, enginePackageRoot: enginePackageRoot)
+        // Cheap, and only meaningful once a repo is known. Refreshed with the library rather
+        // than polled: the answer only changes when somebody commits.
+        if let root = EngineLocator.repoRoot() {
+            commitsBehind = BuildStamp.commitsSinceBuild(repoRoot: root, stamp: buildStamp)
+        }
         let names = Builtins.all(.reference).map(\.name)
         builtinIndex = SkillBuiltinIndex.build(skills: library.skills, builtins: names)
         rescanLibraryUsage(skills: library.skills, builtins: names)
