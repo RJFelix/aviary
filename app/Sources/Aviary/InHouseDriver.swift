@@ -25,11 +25,14 @@ final class InHouseDriver {
     var runtimeSummary: String?
     var skillsNote: String?
     var memoryNote: String?
+    /// Kept here rather than only on `LiveRun`, because after a switch the driver is the one
+    /// that knows what actually took effect.
+    var modelLabel: String?
 
     private let home: AgentHome
     private let cwd: String
-    private let model: ModelSpec
-    private let providerSpec: ProviderSpec
+    private var model: ModelSpec
+    private var providerSpec: ProviderSpec
     private var host: RuntimeHost?
     private var runner: AgentRunner?
     private var writer: SessionWriter?
@@ -169,6 +172,9 @@ final class InHouseDriver {
             streamingText = ""
             streamingThinking = ""
             reload()
+        case .modelChanged(let provider, let id):
+            modelLabel = "\(provider)/\(id)"
+            reload()
         case .goalExhausted, .toolStarted, .toolFinished, .compacted, .childStarted,
              .childFinished, .imageAttached:
             reload()
@@ -276,6 +282,25 @@ final class InHouseDriver {
             isStreaming = false
             reload()
         }
+    }
+
+    /// Change the model this run answers with, keeping the conversation and the interpreter.
+    ///
+    /// Routed through the same factory a launch uses, so a switch cannot reach a client a
+    /// launch would not have — that seam is exactly where the Codex 404 lived, and one factory
+    /// is the reason it cannot come back.
+    func switchModel(to spec: ModelSpec, providerSpec newSpec: ProviderSpec) async -> String? {
+        guard let agent else { return "This run has not started yet." }
+        let routed = await ChatProviderRouting.makeProvider(
+            spec: newSpec, model: spec, home: home)
+        guard case .success(let provider) = routed else {
+            if case .failure(let why) = routed { return why.localizedDescription }
+            return "Could not build a client for \(spec.qualifiedID)."
+        }
+        model = spec
+        providerSpec = newSpec
+        await agent.switchModel(to: spec, provider: provider)
+        return nil
     }
 
     func stop() {

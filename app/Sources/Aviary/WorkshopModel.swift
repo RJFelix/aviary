@@ -413,12 +413,59 @@ extension AppModel {
     /// actually calls — it knows nothing about `claude-code`, which is a perfectly reachable
     /// default and not an in-house route.
     var workshopModelReference: String? {
-        guard let qualified = settings.defaultModelQualified,
-              modelCatalog.find(qualified) != nil,
-              AgentCLI.resolve(qualified, in: modelsConfig) != nil
-        else { return nil }
-        return qualified
+        // An explicit choice wins over the global default. Stored as a qualified reference
+        // rather than a ModelSpec because the catalogue is rebuilt on every launch and a
+        // remembered object would be a stale copy of a row that may no longer exist.
+        for candidate in [chosenWorkshopModel, settings.defaultModelQualified] {
+            guard let qualified = candidate,
+                  modelCatalog.find(qualified) != nil,
+                  AgentCLI.resolve(qualified, in: modelsConfig) != nil
+            else { continue }
+            return qualified
+        }
+        return nil
     }
+
+    /// The model the workshop agent is set to, whether or not it is currently startable.
+    ///
+    /// Kept separate from `workshopModelReference` so the UI can show a choice that has gone
+    /// stale — a provider whose key was removed, a model dropped from the catalogue — instead
+    /// of silently falling back and leaving the picker showing something that is not what runs.
+    var chosenWorkshopModel: String? {
+        get { UserDefaults.standard.string(forKey: "aviary.workshopModel") }
+        set {
+            if let newValue {
+                UserDefaults.standard.set(newValue, forKey: "aviary.workshopModel")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "aviary.workshopModel")
+            }
+        }
+    }
+
+    /// What the workshop agent will actually start on, said in full.
+    ///
+    /// Engine-aware because the three engines take their model from three different places,
+    /// and a card that named the in-house choice while the workshop was running on Claude Code
+    /// would be a more confident version of the bug it exists to prevent.
+    var workshopModelSummary: String {
+        switch engineChoice {
+        case .claudeCode:
+            return "claude-code/\(claudeCodeModel) (set in the engine picker)"
+        case .harness:
+            return "chosen by the harness"
+        case .inHouse:
+            guard let reference = workshopModelReference else {
+                return "no startable model configured"
+            }
+            if let chosen = chosenWorkshopModel, chosen != reference {
+                return "\(reference) — \(chosen) is set but will not start"
+            }
+            return reference + (chosenWorkshopModel == nil ? " (your default)" : "")
+        }
+    }
+
+    /// Whether the model picker on this screen governs anything right now.
+    var workshopModelIsSettableHere: Bool { engineChoice == .inHouse }
 
     /// Open or resume the workshop session on whichever engine is selected.
     ///

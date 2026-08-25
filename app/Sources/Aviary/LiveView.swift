@@ -419,7 +419,8 @@ struct RunOptionsMenu: View, Equatable {
                 Menu(provider) {
                     ForEach(models) { m in
                         Button(m.displayName) {
-                            Task { await run.setModel(provider: provider, model: m.id) }
+                            Task { await model.switchModel(
+                                run: run, provider: provider, model: m.id) }
                         }
                     }
                 }

@@ -147,8 +147,31 @@ struct WorkshopView: View {
                 Text("opens on your first request")
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
             }
+            // On the card rather than only in the overflow menu. Which model is doing the
+            // self-improvement work is the single most consequential thing about this agent,
+            // and it spent weeks on one nobody had chosen precisely because nothing said so.
+            Text(model.workshopModelSummary)
+                .font(Design.mono(9.5))
+                .foregroundStyle(model.chosenWorkshopModel == nil
+                    ? AnyShapeStyle(.tertiary) : AnyShapeStyle(Design.accent))
+                .lineLimit(1).truncationMode(.middle)
+                .help("Set the agent's model from the ••• menu.")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Grouped by provider, from the same catalogue every other picker uses, so a model
+    /// offered here is one a run can actually start.
+    private var workshopModelGroups: [(String, [ModelSpec])] {
+        var groups: [(String, [ModelSpec])] = []
+        for spec in model.pickerModels {
+            if let index = groups.firstIndex(where: { $0.0 == spec.providerID }) {
+                groups[index].1.append(spec)
+            } else {
+                groups.append((spec.providerID, [spec]))
+            }
+        }
+        return groups
     }
 
     private var agentControls: some View {
@@ -177,6 +200,39 @@ struct WorkshopView: View {
             // buttons gave this row an intrinsic width it could not shrink below, which is
             // half of why the sidebar was being crushed.
             Menu {
+                // The agent's model, where the agent is launched from. It used to be
+                // unsettable from here and silently took whatever sorted first in models.json,
+                // which is how the workshop spent weeks on a model nobody chose.
+                Menu("Agent model") {
+                    if !model.workshopModelIsSettableHere {
+                        Text("The workshop is on the "
+                            + "\(model.engineChoice.label) engine, which takes its model from "
+                            + "the engine picker in Live.")
+                        Divider()
+                    }
+                    Button {
+                        model.chosenWorkshopModel = nil
+                    } label: {
+                        Label("Follow my default", systemImage:
+                            model.chosenWorkshopModel == nil ? "checkmark" : "")
+                    }
+                    Divider()
+                    ForEach(workshopModelGroups, id: \.0) { provider, models in
+                        Menu(provider) {
+                            ForEach(models) { spec in
+                                Button {
+                                    model.chosenWorkshopModel = spec.qualifiedID
+                                } label: {
+                                    Label(spec.displayName, systemImage:
+                                        model.chosenWorkshopModel == spec.qualifiedID
+                                            ? "checkmark" : "")
+                                }
+                            }
+                        }
+                    }
+                }
+                Text(model.workshopModelSummary)
+                Divider()
                 Button("Reload board from disk") { model.refreshBoard() }
                 if let run = model.workshopRun, !run.hasExited {
                     Button("Open the agent's transcript") {

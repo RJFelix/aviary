@@ -80,6 +80,8 @@ public actor Agent {
         case childFinished(id: String, name: String, answer: String, isError: Bool)
         /// The agent put an image in front of itself.
         case imageAttached(path: String, width: Int, height: Int)
+        /// The run will answer its next turn with a different model.
+        case modelChanged(provider: String, model: String)
         /// The loop stopped. `reason` is why, in words, because "it stopped" is never enough
         /// to act on.
         case finished(reason: String)
@@ -90,10 +92,14 @@ public actor Agent {
 
     // MARK: State
 
-    private let provider: ChatProvider
+    /// Both `var` so a run can change model without being torn down. The conversation, the
+    /// interpreter and its variables are the expensive things here; the model answering the
+    /// next turn is not, and rebuilding a session to swap it would throw away the first to
+    /// change the second.
+    private var provider: ChatProvider
     private let host: RuntimeHost
     private let writer: SessionWriter
-    private let config: Configuration
+    private var config: Configuration
     private let hostSession: String
     private var messages: [ChatMessage] = []
     private var observer: Observer?
@@ -169,6 +175,26 @@ public actor Agent {
     /// Offer this run a set of MCP tools.
     public func addMCPTools(_ tools: [MCPClient.Tool], from client: MCPClient) {
         for tool in tools { mcpTools[tool.qualifiedName] = (client, tool) }
+    }
+
+    /// Answer the next turn with a different model.
+    ///
+    /// Takes effect at the next model call, not mid-turn: a tool call in flight has to be
+    /// answered before anything else can happen, and swapping between a call and its result
+    /// produces a conversation the provider rejects. The same reason steering lands at a turn
+    /// boundary.
+    ///
+    /// History carries over untouched. That is the point — the model is being changed
+    /// *because* of what the conversation has established, so starting again would defeat it.
+    public func switchModel(to model: ModelSpec, provider newProvider: ChatProvider) async {
+        provider = newProvider
+        config.model = model
+        // The context window belongs to the model, and compaction is driven off it. Switching
+        // to a smaller window without moving this would let a conversation sit above the new
+        // ceiling with nothing noticing until the provider refused it.
+        config.maxTokens = model.maxTokens
+        try? await writer.appendModelChange(model)
+        emit(.modelChanged(provider: model.providerID, model: model.id))
     }
 
     public func setMemory(_ store: MemoryStore?) {

@@ -768,6 +768,19 @@ final class AppModel {
 
     /// Start an in-house run: Aviary's own loop, its own provider client, its own runtime
     /// host. No harness process and no Node.
+    /// Resolve a picked model the same way a launch does, then hand it to the run.
+    ///
+    /// One resolver, deliberately: a switch that reached a client a launch would not have is
+    /// exactly the seam the Codex 404 lived in.
+    func switchModel(run: LiveRun, provider: String, model: String) async {
+        guard let resolved = AgentCLI.resolve("\(provider)/\(model)", in: modelsConfig) else {
+            toast = Toast(
+                message: "No configured provider serves \(provider)/\(model).", isError: true)
+            return
+        }
+        await run.setModel(resolved: resolved)
+    }
+
     func startInHouseRun(
         cwd: String, providerID: String?, modelID: String?, prompt: String,
         recordPayloads: Bool = false, resume: String? = nil, title: String? = nil
@@ -1212,10 +1225,38 @@ final class LiveRun: Identifiable {
         }
     }
 
-    func setModel(provider: String, model: String) async {
+    /// Change the model this run answers with.
+    ///
+    /// Three engines, three genuinely different answers rather than three paths to one
+    /// mechanism. The harness owns its session and is told over RPC. An in-house run is ours,
+    /// so the agent swaps its provider and keeps the conversation and the interpreter — the
+    /// expensive things. A driven run cannot: the model is an argument to the `claude` process
+    /// and Claude Code owns the loop, so a new session is the only way, and saying that
+    /// plainly beats a generic failure nobody can act on.
+    func setModel(resolved: (provider: ProviderSpec, model: ModelSpec)) async {
+        let label = resolved.model.qualifiedID
+        if let inHouse {
+            if let failure = await inHouse.switchModel(
+                to: resolved.model, providerSpec: resolved.provider)
+            {
+                builder.appendNote("Could not switch model: \(failure)")
+                sync()
+                return
+            }
+            modelLabel = label
+            return
+        }
+        if isClaudeCode {
+            builder.appendNote(
+                "Claude Code owns the loop for this run and takes its model at launch, so it "
+                    + "cannot be changed mid-session. Start a new run to use \(label).")
+            sync()
+            return
+        }
         do {
-            try await session.setModel(provider: provider, model: model)
-            modelLabel = "\(provider)/\(model)"
+            try await session.setModel(
+                provider: resolved.model.providerID, model: resolved.model.id)
+            modelLabel = label
             await refreshState()
         } catch {
             builder.appendNote("Could not switch model: \(error.localizedDescription)")

@@ -132,7 +132,10 @@ public actor SessionWriter {
     /// an unparented entry is not on the active branch, so the row never rendered — and the
     /// parser reads `modelId`, so the `model` key this used to write left every Aviary-written
     /// session with an empty model in its switch list. Each one hid the other.
-    private func appendModelChange(_ model: ModelSpec) throws {
+    /// Public because a model can change mid-run, not only at the start. The transcript is
+    /// what makes a switch legible afterwards: without this entry, half a conversation was
+    /// answered by a model the file never names.
+    public func appendModelChange(_ model: ModelSpec) throws {
         try append(type: "model_change", fields: [
             "provider": .string(model.providerID),
             "modelId": .string(model.id),

@@ -516,6 +516,7 @@ final class EventLog: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         switch event {
         case .imageAttached: events.append("imageAttached")
+        case .modelChanged: events.append("modelChanged")
         case .started: events.append("started")
         case .steered: events.append("steered")
         case .goalExhausted: events.append("goal-exhausted")
@@ -5214,6 +5215,91 @@ let casesMCPVersions: [Case] = [
     }),
 ]
 
+
+// MARK: - Changing a run's model
+
+let casesModelSwitch: [Case] = [
+
+    ("switch: a new model answers the next turn, on the same conversation", {
+        // The conversation, the interpreter and its variables are the expensive things in a
+        // session. Swapping the model is not, so a switch must not cost a restart — that is
+        // the whole difference between this and starting a new run.
+        guard let first = try FakeProviderServer(script: [
+            ["text": "answered by the first model.", "input_tokens": 10, "output_tokens": 4],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { first.stop() }
+        guard let second = try FakeProviderServer(script: [
+            ["text": "answered by the second model.", "input_tokens": 20, "output_tokens": 5],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { second.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(
+                id: "first", baseURL: first.baseURL, apiKey: "k"),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "be brief"))
+        await agent.send("hello")
+
+        var swapped = fakeModel()
+        swapped.id = "second-model"
+        swapped.providerID = "second"
+        swapped.maxTokens = 4096
+        await agent.switchModel(
+            to: swapped,
+            provider: OpenAICompletionsProvider(
+                id: "second", baseURL: second.baseURL, apiKey: "k"))
+        await agent.send("and again")
+
+        // The second request went to the second server, and carried the first exchange with
+        // it — a switch that dropped the history would be a new run wearing the same id.
+        let sent = try second.recordedRequests()
+        XCTAssertEqual(sent.count, 1, "the new provider answered the second prompt")
+        let messages = try XCTUnwrap(sent.first?["messages"]?.arrayValue)
+        let text = messages.compactMap { $0["content"]?.stringValue }.joined(separator: "|")
+        XCTAssertTrue(text.contains("hello"), "the conversation carried over")
+        XCTAssertTrue(text.contains("answered by the first model."),
+                      "including what the previous model said")
+        XCTAssertEqual(try first.recordedRequests().count, 1, "and the old one was not called")
+
+        // The transcript names the switch, or half a conversation was answered by a model the
+        // file never mentions.
+        await writer.close()
+        let raw = try String(contentsOf: writer.fileURL, encoding: .utf8)
+        let changes = raw.split(separator: "\n").filter { $0.contains("\"model_change\"") }
+        XCTAssertEqual(changes.count, 2, "one at launch, one at the switch")
+        XCTAssertTrue(try XCTUnwrap(changes.last).contains("second-model"))
+    }),
+
+    ("switch: the workshop agent's model is a setting, not whatever sorts first", {
+        // The bug this pins: the workshop launcher passed no model reference at all, and the
+        // resolver reads an absent one as the first model of the first provider by id. The
+        // agent spent weeks on a model nobody had chosen.
+        let defaults = UserDefaults.standard
+        let key = "aviary.workshopModel"
+        let original = defaults.string(forKey: key)
+        defer {
+            if let original { defaults.set(original, forKey: key) }
+            else { defaults.removeObject(forKey: key) }
+        }
+
+        defaults.removeObject(forKey: key)
+        XCTAssertNil(defaults.string(forKey: key), "unset means follow the global default")
+        defaults.set("openai-codex/gpt-5.6-terra", forKey: key)
+        XCTAssertEqual(defaults.string(forKey: key), "openai-codex/gpt-5.6-terra")
+        // Stored as a reference rather than a ModelSpec: the catalogue is rebuilt every launch
+        // and a remembered object would be a stale copy of a row that may no longer exist.
+        XCTAssertTrue(defaults.string(forKey: key)?.contains("/") == true)
+    }),
+]
+
 await Harness.run(
     cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
-        + casesLibraryUsage + casesArtifact + casesAttachImage + casesMCPVersions)
+        + casesLibraryUsage + casesArtifact + casesAttachImage + casesMCPVersions
+        + casesModelSwitch)
