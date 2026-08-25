@@ -249,7 +249,8 @@ struct HealthView: View {
                     label: "PATH entries",
                     value: "\((ProcessEnvironment.shared.value("PATH") ?? "").split(separator: ":").count)")
                 DetailRow(label: "SHELL", value: ProcessEnvironment.shared.value("SHELL") ?? "—", mono: true)
-                DetailRow(label: "TMPDIR", value: AgentHome.socketDir.path, mono: true)
+                DetailRow(label: "TMPDIR", value: ProcessInfo.processInfo
+                    .environment["TMPDIR"] ?? NSTemporaryDirectory(), mono: true)
                 DetailRow(
                     label: "Variables",
                     value: "\(ProcessEnvironment.shared.snapshot.count) captured")

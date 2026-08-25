@@ -11,8 +11,24 @@ public struct AgentHome: Sendable, Hashable {
 
     public init(root: URL) { self.root = root }
 
-    /// `~/.prime/agent` — the default for a stock `prime-agent` install.
+    /// `~/.aviary` — Aviary's own data directory.
+    ///
+    /// It was `~/.prime/agent` while Aviary ran on a fork of Prime Agent and shared its
+    /// store. Flat rather than `~/.aviary/agent`: the nested level existed because the agent
+    /// was one of several things a `prime-agent` install kept, and there is no second thing
+    /// here.
+    ///
+    /// The move was a copy, not a rename — `~/.prime` is left intact. Transcripts are the only
+    /// durable record of everything the usage analytics, the sub-agent forest and the workshop
+    /// board's session links read, and a migration that turns out to be wrong should cost a
+    /// re-point rather than a history.
     public static var `default`: AgentHome {
+        AgentHome(root: FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: ".aviary", directoryHint: .isDirectory))
+    }
+
+    /// Where Aviary's data used to live, so the app can say so when the new home is empty.
+    public static var legacyPrimeHome: AgentHome {
         AgentHome(root: FileManager.default.homeDirectoryForCurrentUser
             .appending(path: ".prime/agent", directoryHint: .isDirectory))
     }
@@ -20,16 +36,15 @@ public struct AgentHome: Sendable, Hashable {
     public var sessionsDir: URL { root.appending(path: "sessions", directoryHint: .isDirectory) }
     public var artifactsDir: URL { root.appending(path: "session-artifacts", directoryHint: .isDirectory) }
     public var rlmLedgerDir: URL { root.appending(path: "rlm-ledger", directoryHint: .isDirectory) }
-    public var workersDir: URL { root.appending(path: "daemon-workers", directoryHint: .isDirectory) }
-    public var leasesDir: URL { root.appending(path: "session-leases", directoryHint: .isDirectory) }
-    public var logsDir: URL { root.appending(path: "logs", directoryHint: .isDirectory) }
-    public var kernelVenv: URL { root.appending(path: "kernel-venv", directoryHint: .isDirectory) }
+    // `workersDir`, `leasesDir`, `logsDir`, `kernelVenv` and `agentLog` were here. All five
+    // named directories the harness daemon owned — worker descriptors, ownership leases, its
+    // log, and the 297MB IPython venv it built. Nothing in Aviary read any of them by the time
+    // the fork was removed, and they were not carried into the new home.
 
     public var modelsFile: URL { root.appending(path: "models.json") }
     public var settingsFile: URL { root.appending(path: "settings.json") }
     public var authFile: URL { root.appending(path: "auth.json") }
     public var agentsFile: URL { root.appending(path: "AGENTS.md") }
-    public var agentLog: URL { logsDir.appending(path: "agent.jsonl") }
 
     public var promptsDir: URL { root.appending(path: "prompts", directoryHint: .isDirectory) }
     public var skillsDir: URL { root.appending(path: "skills", directoryHint: .isDirectory) }
@@ -40,23 +55,9 @@ public struct AgentHome: Sendable, Hashable {
         FileManager.default.fileExists(atPath: root.path)
     }
 
-    /// `$TMPDIR/prime-agent-<uid>` — where the supervisor and worker sockets live.
-    ///
-    /// Deliberately derived rather than read from a config file: the harness computes it the
-    /// same way, and a stale descriptor pointing at a previous boot's TMPDIR is exactly the
-    /// kind of thing that makes a daemon look alive when it isn't.
-    public static var socketDir: URL {
-        let tmp = ProcessInfo.processInfo.environment["TMPDIR"] ?? NSTemporaryDirectory()
-        let uid = getuid()
-        return URL(fileURLWithPath: tmp, isDirectory: true)
-            .appending(path: "prime-agent-\(uid)", directoryHint: .isDirectory)
-    }
-
-    public static var supervisorSocket: URL { socketDir.appending(path: "daemon.sock") }
-
-    public static var supervisorOwnersDir: URL {
-        socketDir.appending(path: "supervisor-owners", directoryHint: .isDirectory)
-    }
+    // The supervisor and worker socket paths were here — `$TMPDIR/prime-agent-<uid>`, the
+    // daemon socket and the ownership-owner directory inside it. Aviary runs its agents in
+    // this process and talks to its runtime host over a pipe, so there is no socket to name.
 
     public func sessionFile(id: String) -> URL {
         sessionsDir.appending(path: "\(id).jsonl")

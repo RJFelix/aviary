@@ -178,7 +178,9 @@ struct CommandPaletteView: View {
                     subtitle: "\(node.status) · \(node.modelLabel) · depth \(node.depth)",
                     symbol: "bird", tint: Design.agentMessage,
                     action: {
-                        model.section = .flock
+                        // Sessions, not Flock: a sub-agent's transcript opens beside its
+                        // parent's, which is where it means something.
+                        model.section = .sessions
                         Task { await model.loadChildTranscript(node: node) }
                     }))
                 if out.count > 160 { break }

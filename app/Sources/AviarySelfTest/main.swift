@@ -5218,6 +5218,44 @@ let casesMCPVersions: [Case] = [
 
 // MARK: - Changing a run's model
 
+let casesAgentHome: [Case] = [
+
+    ("home: the data directory is Aviary's own, and flat", {
+        // It was ~/.prime/agent while Aviary ran on a fork of Prime Agent and shared its
+        // store. The nested `agent` level existed because the agent was one of several things
+        // a prime-agent install kept; there is no second thing here.
+        XCTAssertEqual(AgentHome.default.root.lastPathComponent, ".aviary")
+        XCTAssertFalse(AgentHome.default.root.path.contains(".prime"))
+        // The old location is still nameable, so an empty new home can say where to look
+        // rather than reading as lost data.
+        XCTAssertTrue(AgentHome.legacyPrimeHome.root.path.hasSuffix(".prime/agent"))
+
+        // Everything a run needs hangs off the root, so re-pointing the root moves all of it.
+        let home = AgentHome(root: URL(fileURLWithPath: "/tmp/aviary-home-test"))
+        for path in [home.sessionsDir, home.artifactsDir, home.rlmLedgerDir, home.modelsFile,
+                     home.settingsFile, home.authFile, home.skillsDir, home.promptsDir] {
+            XCTAssertTrue(path.path.hasPrefix("/tmp/aviary-home-test/"), path.path)
+        }
+    }),
+
+    ("home: the migration carried what is read and left what is not", {
+        // Asserted against the real directories, because the point of the copy was to bring
+        // the live data and leave 297MB of the harness's IPython venv behind. If a future
+        // change starts reading one of the skipped paths, this fails and says so.
+        let home = AgentHome.default
+        guard home.exists else { print("      skipped: no data directory"); return }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.sessionsDir.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.artifactsDir.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.settingsFile.path))
+        for skipped in ["kernel-venv", "daemon-workers", "session-leases", "bin"] {
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath: home.root.appending(path: skipped).path),
+                "\(skipped) is the harness's, and nothing reads it")
+        }
+    }),
+]
+
 let casesRepoRoot: [Case] = [
 
     ("repoRoot: the marker is the runtime host, not the vendored harness", {
@@ -5426,4 +5464,4 @@ await Harness.run(
     cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
         + casesLibraryUsage + casesArtifact + casesAttachImage + casesMCPVersions
         + casesModelSwitch + casesMirrorChurn + casesBuildStamp
-        + casesRepoRoot)
+        + casesRepoRoot + casesAgentHome)

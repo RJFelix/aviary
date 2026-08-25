@@ -95,6 +95,11 @@ what it does; this file is how to work on it without relearning the traps.
   file, sees the same object, and skips the relink — so the executable keeps its mtime. Any
   test of "did a rebuild happen?" must change emitted code, not a comment. This cost two
   rounds of wrong diagnosis while building the workshop reload.
+- **The data directory is `~/.aviary`**, flat — sessions, session-artifacts, rlm-ledger,
+  settings.json, models.json, auth.json. It was `~/.prime/agent` until 2026-08-25. The move was
+  a **copy**: `~/.prime` is still there and untouched, and the harness's own directories
+  (`kernel-venv` at 297MB, `daemon-workers`, `session-leases`, `bin`, `logs`) were deliberately
+  not carried across because nothing reads them. A test asserts they stay absent.
 - **There is no harness.** Aviary ran on a vendored Prime Agent fork until 2026-08-24. The
   fork, `RPCClient`, `Daemon`, the supervisor surfaces and the `harness/` checkout are all
   gone, and `harness/` is gitignored so a stray reinstall cannot creep back. Anything you find
