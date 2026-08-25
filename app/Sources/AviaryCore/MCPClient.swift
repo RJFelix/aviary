@@ -554,3 +554,27 @@ public enum MCPConfiguration {
         return found
     }
 }
+
+/// What starting one MCP server turned out to reveal.
+///
+/// Separate from its configuration on purpose: the config is a fact about a file, this is a
+/// fact about a process, and conflating them is how a screen ends up claiming a server works
+/// because somebody wrote it down.
+public struct MCPProbe: Sendable, Hashable {
+    public var era: String?
+    public var serverInfo: String?
+    public var tools: [String]
+    public var error: String?
+    public var diagnostics: String
+
+    public init(
+        era: String?, serverInfo: String?, tools: [String], error: String?, diagnostics: String
+    ) {
+        self.era = era
+        self.serverInfo = serverInfo
+        self.tools = tools
+        self.error = error
+        self.diagnostics = diagnostics
+    }
+}
+

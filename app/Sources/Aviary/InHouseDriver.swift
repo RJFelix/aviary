@@ -51,11 +51,15 @@ final class InHouseDriver {
     private let recordPayloads: Bool
     /// An existing session to continue, or nil for a new one.
     private let resume: String?
+    /// Who else is running. Supplied by the app, because only it knows.
+    private let peerDelegate: Agent.PeerDelegate?
 
     init(
         home: AgentHome, cwd: String, model: ModelSpec, providerSpec: ProviderSpec,
-        recordPayloads: Bool = false, resume: String? = nil
+        recordPayloads: Bool = false, resume: String? = nil,
+        peerDelegate: Agent.PeerDelegate? = nil
     ) {
+        self.peerDelegate = peerDelegate
         self.recordPayloads = recordPayloads
         self.resume = resume
         self.home = home
@@ -125,7 +129,8 @@ final class InHouseDriver {
                     cwd: cwd, model: model, skills: gate.render(selection),
                     memory: memoryGate.render(recalled)),
                 memory: memory, recordPayloads: recordPayloads,
-                hookPaths: HookDiscovery.paths(repoRoot: repoRoot), resume: resume))
+                hookPaths: HookDiscovery.paths(repoRoot: repoRoot), resume: resume,
+                peerDelegate: peerDelegate))
         self.runner = runner
 
         await runner.observe { [weak self] event in

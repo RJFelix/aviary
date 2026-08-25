@@ -20,6 +20,7 @@ struct LibraryView: View {
     enum Tab: String, CaseIterable, Identifiable {
         case builtins = "Builtins"
         case skills = "Skills"
+        case mcp = "MCP"
         case prompts = "Prompts"
         case extensions = "Extensions"
         case packages = "Packages"
@@ -31,6 +32,7 @@ struct LibraryView: View {
             switch self {
             case .builtins: return "curlybraces"
             case .skills: return "wand.and.stars"
+            case .mcp: return "puzzlepiece.extension"
             case .prompts: return "text.badge.plus"
             case .extensions: return "puzzlepiece.extension"
             case .packages: return "shippingbox"
@@ -90,6 +92,7 @@ struct LibraryView: View {
         switch tab {
         case .builtins:
             BuiltinsPane(search: search, selected: $selectedBuiltin, window: $window)
+        case .mcp: MCPPane(search: search)
         case .skills: skillsPane
         case .prompts: promptsPane
         case .extensions: extensionsPane

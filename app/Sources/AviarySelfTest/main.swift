@@ -5218,6 +5218,147 @@ let casesMCPVersions: [Case] = [
 
 // MARK: - Changing a run's model
 
+let casesPeers: [Case] = [
+
+    ("peers: a solo run is not told about a room with nobody in it", {
+        // Every builtin is described on every request, so an empty capability is a standing
+        // token cost for nothing. The gate is the peer count, not whether the feature exists.
+        let alone = Builtins.description(Builtins.Context(cwd: "/repo"))
+        XCTAssertFalse(alone.contains("agents()"))
+        XCTAssertFalse(alone.contains("message("))
+        let accompanied = Builtins.description(
+            Builtins.Context(cwd: "/repo", peerCount: 2))
+        XCTAssertTrue(accompanied.contains("agents()"))
+        XCTAssertTrue(accompanied.contains("message(to, text)"))
+    }),
+
+    ("peers: the roster and delivery both run through the app, not the agent", {
+        // An agent that could enumerate runs itself would be reaching out of its own session.
+        // This is the same reason spawning is delegated.
+        final class Fake: Agent.PeerDelegate, @unchecked Sendable {
+            let peers: [Agent.Peer]
+            var delivered: [(String, String, String)] = []
+            init(peers: [Agent.Peer]) { self.peers = peers }
+            func peers(excluding sessionID: String) async -> [Agent.Peer] {
+                peers.filter { $0.session != sessionID }
+            }
+            func deliver(
+                to peer: String, text: String, from sessionID: String
+            ) async -> (session: String, error: String?) {
+                delivered.append((peer, text, sessionID))
+                return peer == "gone" ? ("", "No run matches 'gone'.") : (peer, nil)
+            }
+        }
+        let fake = Fake(peers: [
+            Agent.Peer(session: "s-2", title: "Workshop", model: "m", working: true,
+                       engine: "in-house"),
+        ])
+        let listed = await fake.peers(excluding: "s-1")
+        XCTAssertEqual(listed.map(\.session), ["s-2"])
+        // The payload the agent's Python actually receives.
+        let payload = try XCTUnwrap(listed.first).payload
+        XCTAssertEqual(payload["title"]?.stringValue, "Workshop")
+        XCTAssertEqual(payload["working"]?.boolValue, true)
+        XCTAssertEqual(payload["engine"]?.stringValue, "in-house")
+
+        let ok = await fake.deliver(to: "s-2", text: "hello", from: "s-1")
+        XCTAssertNil(ok.error)
+        XCTAssertEqual(ok.session, "s-2")
+        // A refusal is a payload the agent can read, not silence it has to time out on.
+        let bad = await fake.deliver(to: "gone", text: "hello", from: "s-1")
+        XCTAssertNotNil(bad.error)
+    }),
+
+    ("peers: the kernel binds both names, and the catalogue describes both", {
+        let ctx = Builtins.Context(cwd: "/repo", peerCount: 1)
+        for name in ["agents", "message"] {
+            XCTAssertTrue(Builtins.names(ctx).contains(name))
+        }
+        let entry = try XCTUnwrap(Builtins.all(.reference).first { $0.name == "message" })
+        XCTAssertEqual(entry.requirement, .peers)
+        XCTAssertEqual(entry.mechanism, .callback)
+        // The note is the load-bearing part: it says the message arrives at a turn boundary
+        // and reads like a person typed it, which is what stops it being used as an RPC.
+        XCTAssertTrue(entry.note?.contains("turn boundary") == true)
+    }),
+]
+
+let casesMCPSurface: [Case] = [
+
+    ("mcp: the configured servers are read with the library", {
+        // The config is a fact about a file and is always safe to show. What a server *is*
+        // needs it started, which is why probing is a button.
+        let config = try XCTUnwrap(JSONValue.parse(Data("""
+            {"mcpServers": {"notes": {"command": "npx", "args": ["-y", "notes-mcp"],
+                                      "env": {"TOKEN": "x"}}}}
+            """.utf8)))
+        let servers = MCPConfiguration.parse(config)
+        XCTAssertEqual(servers.count, 1)
+        let notes = try XCTUnwrap(servers.first)
+        XCTAssertEqual(notes.command, "npx")
+        XCTAssertEqual(notes.environment.keys.sorted(), ["TOKEN"])
+    }),
+
+    ("mcp: probing a real server fills the card, and a broken one explains itself", {
+        // The pane only displays an MCPProbe, so this drives the same sequence the button
+        // does — start, read, stop — against the strict fixture and against a package that
+        // does not exist. A snapshot cannot click, and the populated card is the interesting
+        // half of the screen.
+        guard let fixture = mcpFixture("mcp-modern.py") else {
+            print("      skipped: no modern fixture"); return
+        }
+        let good = MCPClient(
+            name: "fixture", executable: "/usr/bin/env", arguments: ["python3", fixture])
+        let tools = try await good.start(timeout: 20)
+        let ok = MCPProbe(
+            era: await good.era?.label, serverInfo: await good.serverInfo,
+            tools: tools.map(\.qualifiedName).sorted(), error: nil, diagnostics: "")
+        await good.stop()
+        XCTAssertNil(ok.error)
+        XCTAssertEqual(ok.era, "2026-07-28 (stateless)")
+        XCTAssertEqual(ok.serverInfo?.contains("modern-fixture"), true)
+        XCTAssertTrue(ok.tools.allSatisfy { $0.hasPrefix("mcp__fixture__") },
+                      "the card shows the namespaced names the model is actually given")
+        XCTAssertTrue(ok.tools.contains("mcp__fixture__whoami"))
+
+        let bad = MCPClient(
+            name: "broken", executable: "/usr/bin/env",
+            arguments: ["python3", "/nonexistent/not-a-server.py"])
+        var failure: MCPProbe?
+        do {
+            _ = try await bad.start(timeout: 8)
+        } catch {
+            failure = MCPProbe(
+                era: nil, serverInfo: nil, tools: [], error: error.localizedDescription,
+                diagnostics: String((await bad.diagnostics).suffix(600)))
+        }
+        await bad.stop()
+        let seen = try XCTUnwrap(failure)
+        XCTAssertNotNil(seen.error)
+        XCTAssertTrue(seen.tools.isEmpty)
+        XCTAssertNil(seen.era, "an unreachable server has no era to report")
+    }),
+
+    ("mcp: a probe records what it found, and a failure keeps its diagnostics", {
+        // The most common failure is the most boring one — an npx package never fetched on
+        // this machine — and its explanation is on the server's stderr, not in the error.
+        let ok = MCPProbe(
+            era: "2026-07-28 (stateless)", serverInfo: "notes 1",
+            tools: ["mcp__notes__search"], error: nil, diagnostics: "")
+        XCTAssertNil(ok.error)
+        XCTAssertEqual(ok.tools, ["mcp__notes__search"])
+
+        let bad = MCPProbe(
+            era: nil, serverInfo: nil, tools: [],
+            error: "Could not start the MCP server: launch failed",
+            diagnostics: "npm ERR! 404 Not Found")
+        XCTAssertNotNil(bad.error)
+        XCTAssertTrue(bad.diagnostics.contains("404"),
+                      "stderr is where the real reason lives")
+        XCTAssertTrue(bad.tools.isEmpty)
+    }),
+]
+
 let casesAgentHome: [Case] = [
 
     ("home: the data directory is Aviary's own, and flat", {
@@ -5464,4 +5605,5 @@ await Harness.run(
     cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
         + casesLibraryUsage + casesArtifact + casesAttachImage + casesMCPVersions
         + casesModelSwitch + casesMirrorChurn + casesBuildStamp
-        + casesRepoRoot + casesAgentHome)
+        + casesRepoRoot + casesAgentHome
+        + casesPeers + casesMCPSurface)

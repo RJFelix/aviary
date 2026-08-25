@@ -122,6 +122,7 @@ public actor Agent {
     private var compactions = 0
     /// How a child reports back to its parent, and who to notify.
     private var spawnDelegate: SpawnDelegate?
+    private var peerDelegate: PeerDelegate?
     /// MCP servers whose tools this run may call, keyed by the namespaced tool name the model
     /// sees. Namespaced because two servers may both offer `search`, and a bare name would
     /// make that collision silent.
@@ -172,6 +173,60 @@ public actor Agent {
         spawnDelegate = delegate
     }
 
+    /// One other run Aviary is holding.
+    public struct Peer: Sendable, Hashable {
+        public var session: String
+        public var title: String
+        public var model: String
+        public var working: Bool
+        public var engine: String
+
+        public init(
+            session: String, title: String, model: String, working: Bool, engine: String
+        ) {
+            self.session = session
+            self.title = title
+            self.model = model
+            self.working = working
+            self.engine = engine
+        }
+
+        public var payload: JSONValue {
+            .object([
+                "session": .string(session), "title": .string(title),
+                "model": .string(model), "working": .bool(working),
+                "engine": .string(engine),
+            ])
+        }
+    }
+
+    /// Somebody who knows what else is running and can deliver a message to it.
+    ///
+    /// Injected for the same reason spawning is: only the app knows what runs exist, and an
+    /// agent that could enumerate them for itself would be reaching out of its own session.
+    ///
+    /// Note what this is *not*. The harness had a daemon holding many sessions, so an agent
+    /// could message a parent or a sibling mid-flight. Aviary's `spawn()` blocks — a parent is
+    /// suspended while its child runs, so the two never act at once and there is no sibling to
+    /// talk to. What genuinely runs concurrently here is separate top-level runs, and that is
+    /// what these peers are.
+    public protocol PeerDelegate: Sendable {
+        func peers(excluding sessionID: String) async -> [Peer]
+        func deliver(to peer: String, text: String, from sessionID: String) async
+            -> (session: String, error: String?)
+    }
+
+    public func setPeerDelegate(_ delegate: PeerDelegate?) {
+        peerDelegate = delegate
+    }
+
+    /// How many peers there were when the tool description was last built.
+    ///
+    /// Cached rather than awaited inside `activeTools`, which is not async. Refreshed at each
+    /// turn boundary, so a run that opens beside this one is describable by the next request
+    /// rather than the next session.
+    private var peerCount = 0
+
     /// Offer this run a set of MCP tools.
     public func addMCPTools(_ tools: [MCPClient.Tool], from client: MCPClient) {
         for tool in tools { mcpTools[tool.qualifiedName] = (client, tool) }
@@ -220,6 +275,32 @@ public actor Agent {
     /// code and is blocked on the reply, so a refusal it can read beats a hang it cannot.
     public func serveCallback(kind: String, payload: JSONValue) async -> JSONValue {
         switch kind {
+        case "agents":
+            guard let peerDelegate else {
+                return .object(["error": .string("This run has no peers to list.")])
+            }
+            let found = await peerDelegate.peers(excluding: writer.sessionID)
+            return .array(found.map(\.payload))
+
+        case "message":
+            guard let peerDelegate else {
+                return .object(["error": .string("This run cannot message other runs.")])
+            }
+            guard let to = payload["to"]?.stringValue, !to.isEmpty else {
+                return .object(["error": .string("message() needs a `to`.")])
+            }
+            guard let text = payload["text"]?.stringValue,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else {
+                return .object(["error": .string("message() needs some text.")])
+            }
+            let outcome = await peerDelegate.deliver(
+                to: to, text: text, from: writer.sessionID)
+            if let error = outcome.error { return .object(["error": .string(error)]) }
+            return .object([
+                "delivered": .bool(true), "session": .string(outcome.session),
+            ])
+
         case "attach_image":
             guard config.model.supportsImages else {
                 return .object(["error": .string(
@@ -419,11 +500,11 @@ public actor Agent {
     /// codebase for it before giving up.
     public static func tools(
         cwd: String, canSpawn: Bool = false, spawnBudget: Int = 0, hasMemory: Bool = false,
-        supportsImages: Bool = false
+        supportsImages: Bool = false, peerCount: Int = 0
     ) -> [ChatTool] {
         let description = Builtins.description(Builtins.Context(
             cwd: cwd, hasMemory: hasMemory, canSpawn: canSpawn, spawnBudget: spawnBudget,
-            supportsImages: supportsImages))
+            supportsImages: supportsImages, peerCount: peerCount))
         return [ChatTool(
             name: "python",
             description: description,
@@ -446,7 +527,8 @@ public actor Agent {
             canSpawn: spawnDelegate != nil && config.depth < config.maxDepth,
             spawnBudget: max(0, config.maxDepth - config.depth),
             hasMemory: memory != nil,
-            supportsImages: config.model.supportsImages)
+            supportsImages: config.model.supportsImages,
+            peerCount: peerCount)
         // MCP tools are declared individually rather than behind one dispatcher, because a
         // model picks a tool by reading its schema and a single `call_mcp(name, args)` hides
         // every schema behind a string.
@@ -479,6 +561,12 @@ public actor Agent {
                 return
             }
             iterations += 1
+
+            // Refreshed per model call, so a run that opens beside this one is describable by
+            // the next request. Cheap: the app already holds the list.
+            if let peerDelegate {
+                peerCount = await peerDelegate.peers(excluding: writer.sessionID).count
+            }
 
             // The budget is checked before spending more of it, and the stop is recorded —
             // an agent that ran out of allowance and one that finished must not look alike.

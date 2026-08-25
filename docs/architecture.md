@@ -148,6 +148,26 @@ giving up. The schema is now built from what the run can actually do — includi
 sub-agent depth remains — and there is a test asserting `spawn` is advertised only when it is
 possible.
 
+### Agents talking to each other
+
+`agents()` lists the other runs Aviary is holding; `message(to, text)` sends one a note.
+
+Both are bound only when there *is* another run — `peerCount > 0`. Every builtin is described
+on every request, so advertising an empty room is a standing token cost for nothing, and a
+solo session pays none of it. The count is refreshed at each turn boundary, so a run opened
+beside this one is describable by the next request.
+
+What this is not: the harness had a daemon holding many sessions, so an agent could message a
+parent or a sibling mid-flight. Aviary's `spawn()` **blocks** — a parent is suspended while its
+child runs, so the two never act at once and there is no sibling to talk to. What genuinely
+runs concurrently here is separate top-level runs, and those are the peers.
+
+Delivery is steering, which is what makes it land at a turn boundary rather than between a tool
+call and its result — the shape a provider rejects. It arrives looking like something a person
+typed, attributed in the text, because the receiving agent has no other way to know who is
+talking. So it is a note to a colleague, not an RPC: a Claude-Code-driven run refuses it
+outright, since Claude Code owns its own turn boundary.
+
 ### Session lifecycle
 
 **Steering** queues a message that lands at the next turn boundary. Not mid-turn, and not
@@ -368,6 +388,16 @@ a reply without `supportedVersions` is treated as legacy no matter how successfu
 Code and its era is not ours to choose. A request carrying modern `_meta` is served statelessly;
 an `initialize` selects handshake semantics. `resultType` and `serverInfo` are additive, so a
 legacy client ignores them rather than choking.
+
+**The Library's MCP tab** keeps two kinds of fact visibly apart. Configuration is read from
+`settings.json` and is always true. Everything else — protocol era, tool list, whether the
+thing starts at all — is only knowable by *running* the server, which costs a child process and
+whatever that process decides to do on launch. So the config shows unasked and the rest is a
+button. It exists because a server that failed to start used to be invisible until you read a
+note in a transcript, and the commonest failure is the most boring one: an `npx` package never
+fetched on this machine, whose real explanation is on the server's stderr rather than in the
+error. Environment variable *names* are shown and values are not — a diagnostics screen that
+prints credentials is one you cannot screenshot.
 
 An MCP tool that answers with a picture answers with the picture. Image blocks are decoded,
 scaled and re-encoded on the way in — an MCP server is somebody else's program, so the size and

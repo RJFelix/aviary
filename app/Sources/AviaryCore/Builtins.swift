@@ -29,6 +29,8 @@ public enum Builtins {
         case spawn
         /// Only when the model on this run actually accepts images.
         case vision
+        /// Only when there is another live run to talk to.
+        case peers
 
         public var id: String { rawValue }
 
@@ -38,6 +40,7 @@ public enum Builtins {
             case .memory: return "With memory"
             case .spawn: return "With sub-agents"
             case .vision: return "With a vision model"
+            case .peers: return "With other live runs"
             }
         }
 
@@ -54,6 +57,10 @@ public enum Builtins {
             case .vision:
                 return "Bound only when the model's input modalities include images. Offering "
                     + "it to a text-only model would trade a provider error for a capability."
+            case .peers:
+                return "Bound only while another run is open beside this one. A solo session "
+                    + "has nobody to message, and describing the names anyway would cost "
+                    + "tokens on every request to advertise an empty room."
             }
         }
     }
@@ -113,23 +120,26 @@ public enum Builtins {
         public var canSpawn: Bool
         public var spawnBudget: Int
         public var supportsImages: Bool
+        /// How many *other* runs Aviary is holding right now.
+        public var peerCount: Int
 
         public init(
             cwd: String, hasMemory: Bool = false, canSpawn: Bool = false, spawnBudget: Int = 0,
-            supportsImages: Bool = false
+            supportsImages: Bool = false, peerCount: Int = 0
         ) {
             self.cwd = cwd
             self.hasMemory = hasMemory
             self.canSpawn = canSpawn
             self.spawnBudget = spawnBudget
             self.supportsImages = supportsImages
+            self.peerCount = peerCount
         }
 
         /// Everything switched on, for a reader who wants to see the whole shelf rather than
         /// one run's slice of it.
         public static let reference = Context(
             cwd: "<the session's working directory>", hasMemory: true, canSpawn: true,
-            spawnBudget: 1, supportsImages: true)
+            spawnBudget: 1, supportsImages: true, peerCount: 1)
     }
 
     /// Every builtin, in description order, each marked with whether this run has it.
@@ -217,6 +227,26 @@ public enum Builtins {
                     + "much as a page of text, so attach the one that decides the question "
                     + "rather than everything you have.",
                 requirement: .vision, mechanism: .callback, isAvailable: ctx.supportsImages),
+            Entry(
+                name: "agents",
+                signature: "agents()",
+                summary: "The other runs open beside this one.",
+                bullet: "agents() – the other runs open in Aviary right now, as a list of "
+                    + "{'session', 'title', 'model', 'working', 'engine'}. Yours is not in it.",
+                requirement: .peers, mechanism: .callback, isAvailable: ctx.peerCount > 0),
+            Entry(
+                name: "message",
+                signature: "message(to, text)",
+                summary: "Send a message to another run, delivered at its next turn boundary.",
+                bullet: "message(to, text) – send text to another run. `to` is a 'session' "
+                    + "from agents(), or a title that matches exactly one of them. Returns "
+                    + "{'delivered': True, 'session': …}, or a dict with an 'error' key.",
+                note: "It arrives in the other run as if a person had typed it, at that run's "
+                    + "next turn boundary — never mid-turn, because a message injected between "
+                    + "a tool call and its result makes a conversation its provider will "
+                    + "reject. So it is a note to a colleague, not a function call: say who "
+                    + "you are and what you want, because nothing else tells them.",
+                requirement: .peers, mechanism: .callback, isAvailable: ctx.peerCount > 0),
         ]
     }
 

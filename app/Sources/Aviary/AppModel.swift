@@ -139,6 +139,11 @@ final class AppModel {
     let buildStamp = BuildStamp.fromBundle()
     var commitsBehind: Int?
     var library = Library()
+    /// MCP servers as configured, read from settings.json with the library.
+    var mcpServers: [MCPConfiguration.Server] = []
+    /// What probing them found, by server name. Empty until somebody asks.
+    var mcpProbes: [String: MCPProbe] = [:]
+    var isProbingMCP = false
     /// What the agent finds already bound in its Python namespace, and which skills reference
     /// each name. The catalogue is static; the index is read off the skills on disk.
     var builtinIndex = SkillBuiltinIndex()
@@ -489,9 +494,41 @@ final class AppModel {
         if let root = EngineLocator.repoRoot() {
             commitsBehind = BuildStamp.commitsSinceBuild(repoRoot: root, stamp: buildStamp)
         }
+        mcpServers = MCPConfiguration.load(home: home)
         let names = Builtins.all(.reference).map(\.name)
         builtinIndex = SkillBuiltinIndex.build(skills: library.skills, builtins: names)
         rescanLibraryUsage(skills: library.skills, builtins: names)
+    }
+
+    /// Start each configured MCP server, read what it offers, and stop it again.
+    ///
+    /// A deliberate button rather than part of the library refresh. Starting a server means
+    /// spawning somebody else's program — commonly an `npx` invocation that will download a
+    /// package the first time — and doing that on every window refresh would be rude to the
+    /// machine and to whatever the server talks to.
+    func probeMCPServers() async {
+        guard !isProbingMCP else { return }
+        isProbingMCP = true
+        defer { isProbingMCP = false }
+        for server in mcpServers where server.enabled {
+            let client = MCPClient(
+                name: server.name, executable: server.command, arguments: server.arguments,
+                environment: server.environment)
+            do {
+                let tools = try await client.start(timeout: 30)
+                mcpProbes[server.name] = MCPProbe(
+                    era: await client.era?.label,
+                    serverInfo: await client.serverInfo,
+                    tools: tools.map(\.qualifiedName).sorted(),
+                    error: nil, diagnostics: "")
+            } catch {
+                mcpProbes[server.name] = MCPProbe(
+                    era: nil, serverInfo: nil, tools: [],
+                    error: error.localizedDescription,
+                    diagnostics: String((await client.diagnostics).suffix(600)))
+            }
+            await client.stop()
+        }
     }
 
     /// Read every transcript and count what got called.
@@ -751,6 +788,45 @@ final class AppModel {
 
     /// Start an in-house run: Aviary's own loop, its own provider client, its own runtime
     /// host. No harness process and no Node.
+    /// Runs Aviary is holding, for an agent asking who else is here.
+    ///
+    /// Exited runs are excluded: a message to something that has stopped would be accepted and
+    /// never read, which is worse than being refused.
+    func peerRuns(excluding sessionID: String) -> [LiveRun] {
+        runs.filter { !$0.hasExited && $0.sessionID != sessionID }
+    }
+
+    /// Deliver a message from one run into another.
+    ///
+    /// Matched on session id first, then on an exact title, because a title is what a person
+    /// sees and an id is what a transcript records. An ambiguous title is refused rather than
+    /// guessed — delivering to the wrong agent is silent and unrecoverable.
+    func deliverPeerMessage(
+        to reference: String, text: String, from sessionID: String
+    ) async -> (session: String, error: String?) {
+        let candidates = peerRuns(excluding: sessionID)
+        guard !candidates.isEmpty else {
+            return ("", "No other run is open.")
+        }
+        let byID = candidates.filter { $0.sessionID == reference }
+        let byTitle = candidates.filter { $0.title == reference }
+        let matches = byID.isEmpty ? byTitle : byID
+        guard let target = matches.first else {
+            let names = candidates.map { $0.sessionID ?? $0.title }.joined(separator: ", ")
+            return ("", "No run matches '\(reference)'. Open runs: \(names).")
+        }
+        guard matches.count == 1 else {
+            return ("", "'\(reference)' matches \(matches.count) runs. Use a session id.")
+        }
+        if target.isClaudeCode {
+            return ("", "\(target.title) is driven by Claude Code, which owns its turn "
+                + "boundary and will not accept an injected message.")
+        }
+        let from = runs.first { $0.sessionID == sessionID }?.title ?? "another agent"
+        await target.receive(text: text, from: from)
+        return (target.sessionID ?? target.title, nil)
+    }
+
     /// Resolve a picked model the same way a launch does, then hand it to the run.
     ///
     /// One resolver, deliberately: a switch that reached a client a launch would not have is
@@ -778,7 +854,8 @@ final class AppModel {
         let run = LiveRun(
             inHouse: InHouseDriver(
                 home: home, cwd: cwd, model: model, providerSpec: providerSpec,
-                recordPayloads: recordPayloads, resume: resume),
+                recordPayloads: recordPayloads, resume: resume,
+                peerDelegate: PeerBridge(model: self)),
             cwd: cwd, modelLabel: model.qualifiedID)
         if let title { run.title = title }
         runs.append(run)
@@ -870,6 +947,35 @@ final class AppModel {
 
 /// One attached agent run: an engine subprocess, its event stream, and the transcript
 /// built from it.
+/// Hands an agent the app's view of what else is running.
+///
+/// A separate type rather than a conformance on `AppModel`, because `PeerDelegate` is
+/// `Sendable` and reached from the runtime's callback thread, while `AppModel` is main-actor.
+/// The hop is explicit here instead of being scattered through the delegate methods.
+struct PeerBridge: Agent.PeerDelegate {
+    let model: AppModel
+
+    func peers(excluding sessionID: String) async -> [Agent.Peer] {
+        await MainActor.run {
+            model.peerRuns(excluding: sessionID).map { run in
+                Agent.Peer(
+                    session: run.sessionID ?? "",
+                    title: run.title,
+                    model: run.modelLabel ?? "unknown",
+                    working: run.isStreaming,
+                    engine: run.isClaudeCode ? "claude-code" : "in-house")
+            }
+            .filter { !$0.session.isEmpty }
+        }
+    }
+
+    func deliver(
+        to peer: String, text: String, from sessionID: String
+    ) async -> (session: String, error: String?) {
+        await model.deliverPeerMessage(to: peer, text: text, from: sessionID)
+    }
+}
+
 @Observable
 @MainActor
 final class LiveRun: Identifiable {
@@ -1111,6 +1217,27 @@ final class LiveRun: Identifiable {
         builder.appendNote(
             "This engine compacts on its own when the conversation approaches the model's "
                 + "context window.")
+        sync()
+    }
+
+    /// Take a message from another run.
+    ///
+    /// Delivered as steering, which is what makes it land at a turn boundary rather than
+    /// between a tool call and its result — the shape a provider rejects. Attributed in the
+    /// text itself, because the receiving agent has no other way to know who is talking: it
+    /// arrives in the conversation looking exactly like something a person typed.
+    func receive(text: String, from sender: String) async {
+        let attributed = "[message from \(sender)]\n\n" + text
+        if let inHouse {
+            if inHouse.isStreaming {
+                inHouse.steer(attributed)
+                queuedSteering = inHouse.pendingSteering
+            } else {
+                inHouse.send(attributed)
+            }
+            return
+        }
+        builder.appendNote("A message arrived but this run has no engine to take it.")
         sync()
     }
 
