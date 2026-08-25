@@ -973,6 +973,20 @@ final class LiveRun: Identifiable {
         self.title = "New run"
     }
 
+    /// Publish a value only when it actually differs.
+    ///
+    /// `@Observable` notifies on *assignment*, not on change. The mirror below copies the
+    /// driver's state every 250ms, so seven unconditional assignments meant every view reading
+    /// a run — the transcript, the token panel, the options menu — was invalidated four times
+    /// a second for as long as the run existed, whether or not anything had happened.
+    ///
+    /// That is what tore down an open NSMenu: AppKit answers a rebuilt menu by dismissing the
+    /// submenu and dropping the highlight on its parent row. Shielding the menu with
+    /// `EquatableView` was not enough, because the invalidation is upstream of it.
+    private func publish<T: Equatable>(_ value: T, to keyPath: ReferenceWritableKeyPath<LiveRun, T>) {
+        if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
+    }
+
     func startClaudeCode(prompt: String) {
         guard let claudeCode else { return }
         if !prompt.isEmpty { title = String(prompt.prefix(60)) }
@@ -982,13 +996,13 @@ final class LiveRun: Identifiable {
         // same reason all three write one transcript format.
         mirror = Task { [weak self] in
             while let self, !Task.isCancelled {
-                self.items = claudeCode.items
-                self.isStreaming = claudeCode.isStreaming
-                self.hasExited = claudeCode.hasExited
-                self.usage = claudeCode.usage
-                self.sessionID = claudeCode.sessionID
-                self.sessionFile = claudeCode.sessionFile?.path
-                self.errorBanner = claudeCode.errorBanner
+                self.publish(claudeCode.items, to: \.items)
+                self.publish(claudeCode.isStreaming, to: \.isStreaming)
+                self.publish(claudeCode.hasExited, to: \.hasExited)
+                self.publish(claudeCode.usage, to: \.usage)
+                self.publish(claudeCode.sessionID, to: \.sessionID)
+                self.publish(claudeCode.sessionFile?.path, to: \.sessionFile)
+                self.publish(claudeCode.errorBanner, to: \.errorBanner)
                 if claudeCode.hasExited { break }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
@@ -1003,13 +1017,14 @@ final class LiveRun: Identifiable {
         // `items`, `isStreaming` and `usage` keep working untouched.
         mirror = Task { [weak self] in
             while let self, !Task.isCancelled {
-                self.items = inHouse.items
-                self.isStreaming = inHouse.isStreaming
-                self.hasExited = inHouse.hasExited
-                self.usage = inHouse.usage
-                self.sessionID = inHouse.sessionID
-                self.sessionFile = inHouse.sessionFile?.path
-                self.errorBanner = inHouse.errorBanner
+                self.publish(inHouse.items, to: \.items)
+                self.publish(inHouse.isStreaming, to: \.isStreaming)
+                self.publish(inHouse.hasExited, to: \.hasExited)
+                self.publish(inHouse.usage, to: \.usage)
+                self.publish(inHouse.sessionID, to: \.sessionID)
+                self.publish(inHouse.sessionFile?.path, to: \.sessionFile)
+                self.publish(inHouse.errorBanner, to: \.errorBanner)
+                if let label = inHouse.modelLabel { self.publish(label, to: \.modelLabel) }
                 // Only stop mirroring once the run is genuinely finished. Idle-between-prompts
                 // is not finished — the interpreter and the conversation are still alive.
                 if inHouse.hasExited { break }

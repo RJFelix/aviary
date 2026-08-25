@@ -175,7 +175,24 @@ public struct ToolCall: Sendable, Hashable, Identifiable {
 /// A renderable transcript row. Deliberately not a 1:1 mapping of session entries: a
 /// tool call and its result are two entries but one thing a person wants to look at,
 /// and 1,800 `agent_status` entries are one thing (the latest status), not 1,800 rows.
-public struct TranscriptItem: Sendable, Identifiable {
+/// One image carried on a tool result.
+///
+/// A named struct rather than the tuple this used to be, so `TranscriptItem` can synthesise
+/// `Equatable`. That matters well beyond tidiness: without it the Live mirror had no way to
+/// ask "did anything actually change?" and re-published the whole transcript four times a
+/// second, which re-rendered every run's view — and tore down any menu that happened to be
+/// open at the time.
+public struct ToolResultImage: Sendable, Hashable {
+    public var mimeType: String
+    public var base64: String
+
+    public init(mimeType: String, base64: String) {
+        self.mimeType = mimeType
+        self.base64 = base64
+    }
+}
+
+public struct TranscriptItem: Sendable, Identifiable, Equatable {
     public enum Kind: Sendable {
         case user
         case assistant
@@ -202,7 +219,7 @@ public struct TranscriptItem: Sendable, Identifiable {
     /// Tool pairing.
     public var toolCall: ToolCall?
     public var toolResultText: String?
-    public var toolResultImages: [(mimeType: String, base64: String)] = []
+    public var toolResultImages: [ToolResultImage] = []
     public var toolIsError: Bool = false
     public var toolDetails: JSONValue?
     public var toolDuration: TimeInterval?
@@ -439,7 +456,7 @@ public enum SessionParser {
 
                     if let slot = pendingCalls[callID], t.items.indices.contains(slot) {
                         t.items[slot].toolResultText = Ansi.strip(textOut)
-                        t.items[slot].toolResultImages = images.map { (mimeType: $0.0, base64: $0.1) }
+                        t.items[slot].toolResultImages = images.map { ToolResultImage(mimeType: $0.0, base64: $0.1) }
                         t.items[slot].toolIsError = isError
                         t.items[slot].toolDetails = msg["details"]
                         if let started = callTimestamps[callID] {

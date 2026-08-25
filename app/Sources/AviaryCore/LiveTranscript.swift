@@ -136,7 +136,9 @@ public final class LiveTranscriptBuilder: @unchecked Sendable {
                 blocks.compactMap { if case .text(let s) = $0 { return s } else { return nil } }
                     .joined(separator: "\n"))
             items[idx].toolResultImages = blocks.compactMap { b in
-                if case .image(let m, let d) = b { return (mimeType: m, base64: d) } else { return nil }
+                if case .image(let m, let d) = b {
+                    return ToolResultImage(mimeType: m, base64: d)
+                } else { return nil }
             }
             items[idx].toolIsError = payload["isError"]?.boolValue ?? false
             items[idx].toolDetails = payload.path("result.details")

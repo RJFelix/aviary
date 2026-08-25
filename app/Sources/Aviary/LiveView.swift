@@ -253,7 +253,6 @@ struct RunPane: View {
                 models: model.pickerModels,
                 hasExited: run.hasExited,
                 sessionFile: run.sessionFile)
-                .equatable()
         }
     }
 
@@ -369,21 +368,19 @@ struct RunPane: View {
 /// rather than beside it for exactly that reason — observation tracks what a body reads, not
 /// what a closure will read later. The poll loop in `AppModel.startPolling` is not implicated;
 /// it touches daemon state this screen never reads.
-struct RunOptionsMenu: View, Equatable {
+/// The run's overflow menu, taking values rather than observing the run.
+///
+/// It was briefly wrapped in `EquatableView` to stop it being rebuilt. That did not work and
+/// made things worse — the root row lost its highlight as well as the submenu — because the
+/// invalidation was upstream: `LiveRun`'s mirror re-published its state every 250ms whether or
+/// not anything had changed, so the parent re-rendered regardless of what this view compared
+/// equal to. The fix belongs there, and the shield is gone rather than left as cargo.
+struct RunOptionsMenu: View {
     @Environment(AppModel.self) private var model
     var run: LiveRun
     var models: [ModelSpec]
     var hasExited: Bool
     var sessionFile: String?
-
-    /// `LiveRun` is a class and not `Equatable`; identity is the right test for it, and the
-    /// rest is what the menu puts on screen.
-    static func == (a: RunOptionsMenu, b: RunOptionsMenu) -> Bool {
-        a.run === b.run
-            && a.hasExited == b.hasExited
-            && a.sessionFile == b.sessionFile
-            && a.models == b.models
-    }
 
     var body: some View {
         Menu {

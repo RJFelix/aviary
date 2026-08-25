@@ -5218,6 +5218,55 @@ let casesMCPVersions: [Case] = [
 
 // MARK: - Changing a run's model
 
+let casesMirrorChurn: [Case] = [
+
+    ("live: re-reading an unchanged transcript produces equal items", {
+        // The precondition the whole no-flash fix rests on. LiveRun's mirror copies the
+        // driver's state every 250ms and now assigns only on change — but `@Observable`
+        // notifies on assignment, so if two parses of the same bytes ever compared unequal,
+        // the guard would never fire and every run's views would go back to being invalidated
+        // four times a second. Which is what tore down an open menu.
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-churn-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appending(path: "session.jsonl")
+        let lines = [
+            #"{"type":"session","id":"s","version":1,"timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp"}"#,
+            #"{"type":"message","id":"m1","timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#,
+            #"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"toolCall","name":"python","id":"t1","arguments":{"code":"1+1"}}]}}"#,
+            #"{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-08-20T10:00:03.000Z","message":{"role":"tool","toolCallId":"t1","content":[{"type":"text","text":"2"}]}}"#,
+        ]
+        try lines.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+
+        let first = try XCTUnwrap(SessionParser.parse(fileURL: file))
+        let second = try XCTUnwrap(SessionParser.parse(fileURL: file))
+        XCTAssertFalse(first.items.isEmpty)
+        XCTAssertEqual(first.items, second.items,
+                       "two parses of the same bytes must compare equal, or the guard is dead")
+
+        // And a real change is still seen, or the guard would freeze the transcript.
+        try (lines + [
+            #"{"type":"message","id":"m4","parentId":"m3","timestamp":"2026-08-20T10:00:04.000Z","message":{"role":"user","content":[{"type":"text","text":"again"}]}}"#
+        ]).joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+        let third = try XCTUnwrap(SessionParser.parse(fileURL: file))
+        XCTAssertNotEqual(first.items, third.items)
+    }),
+
+    ("live: an image on a tool result is a value, not a tuple", {
+        // Named so TranscriptItem can synthesise Equatable at all. A tuple field silently
+        // blocks synthesis, and the absence of Equatable is what made the mirror unable to
+        // ask whether anything had changed.
+        var item = TranscriptItem(id: "a", kind: .tool, timestamp: Date(timeIntervalSince1970: 0))
+        item.toolResultImages = [ToolResultImage(mimeType: "image/png", base64: "aGk=")]
+        var same = TranscriptItem(id: "a", kind: .tool, timestamp: Date(timeIntervalSince1970: 0))
+        same.toolResultImages = [ToolResultImage(mimeType: "image/png", base64: "aGk=")]
+        XCTAssertEqual(item, same)
+        same.toolResultImages = [ToolResultImage(mimeType: "image/png", base64: "different")]
+        XCTAssertNotEqual(item, same)
+    }),
+]
+
 let casesModelSwitch: [Case] = [
 
     ("switch: a new model answers the next turn, on the same conversation", {
@@ -5302,4 +5351,4 @@ let casesModelSwitch: [Case] = [
 await Harness.run(
     cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
         + casesLibraryUsage + casesArtifact + casesAttachImage + casesMCPVersions
-        + casesModelSwitch)
+        + casesModelSwitch + casesMirrorChurn)
