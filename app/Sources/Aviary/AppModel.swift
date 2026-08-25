@@ -185,7 +185,11 @@ final class AppModel {
            let choice = Engine(rawValue: raw) {
             return choice
         }
-        return UserDefaults.standard.bool(forKey: "aviary.inHouseEngine") ? .inHouse : .harness
+        // In-house is the default now. The harness fork is on its way out — it is 457MB of
+        // vendored Node whose remaining advantages over Aviary's own loop have been absorbed
+        // one at a time, and a default that still pointed at it meant the workshop agent was
+        // improving Aviary using somebody else's agent.
+        return .inHouse
     }() {
         didSet { UserDefaults.standard.set(engineChoice.rawValue, forKey: "aviary.engineChoice") }
     }

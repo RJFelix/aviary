@@ -132,11 +132,21 @@ public enum EngineLocator {
     /// Candidate locations for the fork's built CLI, relative to the repo root.
     static let forkCLIRelative = "harness/packages/coding-agent/dist/bundle/cli.js"
 
+    /// What makes a directory the Aviary repo root.
+    ///
+    /// The runtime host, not the vendored harness. This used to look for
+    /// `harness/packages/coding-agent/package.json`, which quietly made *every* engine depend
+    /// on the bundled fork: the in-house and Claude-Code paths both locate `host.py` through
+    /// `repoRoot()`, so deleting the harness would have broken the two engines that never used
+    /// it. Keying on the thing actually needed is also self-validating — a root without a
+    /// runtime host is no use to any caller.
+    static let rootMarker = "runtime-hosts/python3/host.py"
+
     /// Walk up from a starting directory looking for the Aviary repo root.
     public static func repoRoot(startingAt start: URL = URL(fileURLWithPath: Bundle.main.bundlePath)) -> URL? {
         var dir = start
         for _ in 0..<12 {
-            let marker = dir.appending(path: "harness/packages/coding-agent/package.json")
+            let marker = dir.appending(path: rootMarker)
             if FileManager.default.fileExists(atPath: marker.path) { return dir }
             let parent = dir.deletingLastPathComponent()
             if parent.path == dir.path { break }
@@ -145,7 +155,7 @@ public enum EngineLocator {
         // Development fallback: the conventional checkout location.
         let conventional = FileManager.default.homeDirectoryForCurrentUser.appending(path: "duckbill/aviary")
         if FileManager.default.fileExists(
-            atPath: conventional.appending(path: forkCLIRelative).path) { return conventional }
+            atPath: conventional.appending(path: rootMarker).path) { return conventional }
         return nil
     }
 

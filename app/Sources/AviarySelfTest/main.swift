@@ -5218,6 +5218,36 @@ let casesMCPVersions: [Case] = [
 
 // MARK: - Changing a run's model
 
+let casesRepoRoot: [Case] = [
+
+    ("repoRoot: the marker is the runtime host, not the vendored harness", {
+        // Both surviving engines locate host.py through repoRoot(), so keying it on the
+        // harness made them depend on a fork neither uses. Removing the harness would have
+        // broken in-house and Claude Code at once, which is the sort of coupling that only
+        // shows up the day you try to delete something.
+        guard let root = EngineLocator.repoRoot() else {
+            print("      skipped: no checkout"); return
+        }
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: root.appending(path: "runtime-hosts/python3/host.py").path))
+        XCTAssertEqual(EngineLocator.rootMarker, "runtime-hosts/python3/host.py")
+
+        // A directory with a harness but no runtime host is not a root.
+        let fake = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-root-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: fake) }
+        try FileManager.default.createDirectory(
+            at: fake.appending(path: "harness/packages/coding-agent", directoryHint: .isDirectory),
+            withIntermediateDirectories: true)
+        try "{}".write(
+            to: fake.appending(path: "harness/packages/coding-agent/package.json"),
+            atomically: true, encoding: .utf8)
+        let found = EngineLocator.repoRoot(startingAt: fake)
+        XCTAssertNotEqual(found?.path, fake.path,
+                          "a vendored harness alone must no longer identify a checkout")
+    }),
+]
+
 let casesBuildStamp: [Case] = [
 
     ("build: the app can tell when the source has moved past it", {
@@ -5395,4 +5425,5 @@ let casesModelSwitch: [Case] = [
 await Harness.run(
     cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
         + casesLibraryUsage + casesArtifact + casesAttachImage + casesMCPVersions
-        + casesModelSwitch + casesMirrorChurn + casesBuildStamp)
+        + casesModelSwitch + casesMirrorChurn + casesBuildStamp
+        + casesRepoRoot)
