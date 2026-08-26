@@ -373,9 +373,15 @@ public actor Agent {
             return .object(["ok": .bool(true)])
 
         case "notify":
-            guard let text = payload["text"]?.stringValue,
-                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            guard let raw = payload["text"]?.stringValue,
+                  !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else { return .object(["error": .string("notify() needs some text.")]) }
+            // Bounded here as well as in the prelude, because this is where the law actually
+            // lives: nothing unbounded enters a conversation. A message costs a model call and
+            // then becomes permanent context, re-sent on every later turn, so an unbounded one
+            // is a bill that keeps arriving. The prelude's limit keeps a megabyte off the
+            // callback channel; this one is what makes the guarantee true whatever calls it.
+            let text = Self.bounded(raw)
             if let selfDelegate {
                 await selfDelegate.deliverToSelf(sessionID: writer.sessionID, text: text)
             } else {
@@ -793,6 +799,17 @@ public actor Agent {
             + "Raise maxIterations, or narrow the task."
         try? await writer.appendNote(note)
         emit(.finished(reason: "iteration limit"))
+    }
+
+    /// The most a single delivered message may add to a conversation.
+    ///
+    /// Generous enough for a test summary or a stack trace, far short of a log file.
+    static let notifyLimit = 4000
+
+    static func bounded(_ text: String) -> String {
+        guard text.count > notifyLimit else { return text }
+        let head = String(text.prefix(notifyLimit))
+        return head + "\n\n[truncated by Aviary: \(text.count) characters in total]"
     }
 
     /// Hold the run open while work it asked to be told about is still going.

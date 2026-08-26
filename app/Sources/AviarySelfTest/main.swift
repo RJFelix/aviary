@@ -5335,6 +5335,83 @@ let casesDispatched: [Case] = [
     }),
 ]
 
+
+/// Counts and keeps what crossed into the conversation. Callbacks arrive on their own threads.
+final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seen: [String] = []
+
+    func record(_ text: String) {
+        lock.lock(); seen.append(text); lock.unlock()
+    }
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return seen.count }
+    var texts: [String] { lock.lock(); defer { lock.unlock() }; return seen }
+}
+
+let casesCrossingLaws: [Case] = [
+
+    ("crossing: notify is idempotent, so one event is one model call", {
+        // Two deliveries for one event is two model calls, which is the expensive kind of
+        // duplicate. Driven through the real prelude rather than asserted about the source.
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let counter = Counter()
+        await host.onCallback { _, kind, payload in
+            if kind == "notify" {
+                counter.record(payload["text"]?.stringValue ?? "")
+            }
+            return .object(["ok": .bool(true)])
+        }
+        let s = try await host.createSession(cwd: "/tmp")
+        _ = try await host.execute(
+            "job = sh('echo hi')\njob.result()\njob.notify()\njob.notify()\njob.notify()",
+            in: s)
+        // Give the delivery threads a moment; they are not daemons and resolve promptly.
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        XCTAssertEqual(counter.count, 1, "three notify() calls, one delivery")
+        // A label given later still lands, because updating it is not the same as re-arming.
+        XCTAssertTrue(counter.texts.first?.contains("hi") == true, counter.texts.first ?? "none")
+    }),
+
+    ("crossing: nothing unbounded enters a conversation", {
+        // sh('cat big').notify() used to put the whole file into the transcript, permanently,
+        // re-sent as context on every later turn.
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let counter = Counter()
+        await host.onCallback { _, kind, payload in
+            if kind == "notify" { counter.record(payload["text"]?.stringValue ?? "") }
+            return .object(["ok": .bool(true)])
+        }
+        let s = try await host.createSession(cwd: "/tmp")
+        _ = try await host.execute(
+            "job = sh('python3 -c \"print(chr(120) * 200000)\"')\n"
+                + "job.result()\njob.notify()", in: s)
+        try? await Task.sleep(nanoseconds: 2_500_000_000)
+        XCTAssertEqual(counter.count, 1)
+        let delivered = try XCTUnwrap(counter.texts.first)
+        XCTAssertTrue(delivered.count < 2_500,
+                      "200k characters must not cross: got \(delivered.count)")
+        XCTAssertTrue(delivered.contains("truncated"), "and it must say so")
+        XCTAssertTrue(delivered.contains(".result()"),
+                      "and say where the whole value still is")
+    }),
+
+    ("crossing: the boundary enforces the bound whatever calls it", {
+        // The prelude's limit keeps a megabyte off the callback channel. This one is what
+        // makes the guarantee true for any caller, including a future one.
+        let small = "already short"
+        XCTAssertEqual(Agent.bounded(small), small)
+        let big = String(repeating: "x", count: Agent.notifyLimit * 3)
+        let cut = Agent.bounded(big)
+        XCTAssertTrue(cut.count < Agent.notifyLimit + 120)
+        XCTAssertTrue(cut.contains("\(big.count) characters in total"))
+    }),
+]
+
 let casesWebSearch: [Case] = [
 
     ("web: the request uses the field names Parallel documents, nesting and all", {
@@ -5917,4 +5994,5 @@ await Harness.run(
         + casesModelSwitch + casesMirrorChurn + casesBuildStamp
         + casesRepoRoot + casesAgentHome
         + casesPeers + casesMCPSurface
-        + casesBackgroundSpawn + casesWebSearch + casesDispatched)
+        + casesBackgroundSpawn + casesWebSearch + casesDispatched
+        + casesCrossingLaws)

@@ -276,9 +276,25 @@ class _AviaryFuture(__import__("concurrent.futures", fromlist=["Future"]).Future
     """
 
     aviary_label = None
+    aviary_notified = False
+
+    #: What may cross into the conversation. Everything that lands there is a model call and
+    #: then permanent context, re-sent on every later turn, so the crossing is rationed at the
+    #: crossing rather than trusted to be small. `sh('cat big.log').notify()` was previously a
+    #: way to put a megabyte into a transcript forever.
+    aviary_notify_limit = 1500
 
     def notify(self, label=None):
-        self.aviary_label = label
+        """Deliver this result into the conversation when it finishes.
+
+        Idempotent: calling it twice registers one delivery, not two. Two deliveries would be
+        two model calls for one event, which is the expensive kind of duplicate.
+        """
+        if label is not None:
+            self.aviary_label = label
+        if self.aviary_notified:
+            return self
+        self.aviary_notified = True
         # Announced up front so the run knows not to finish on a promise: an agent that
         # dispatches and stops would otherwise end before its own answer arrived.
         _aviary_call_app("dispatched")
@@ -288,8 +304,17 @@ class _AviaryFuture(__import__("concurrent.futures", fromlist=["Future"]).Future
                 outcome = done.result()
             except Exception as exc:
                 outcome = "failed: %s" % (exc,)
+            text = outcome if isinstance(outcome, str) else repr(outcome)
+            limit = self.aviary_notify_limit
+            if len(text) > limit:
+                # The whole value is still on this Future, in a namespace that persists, so the
+                # message says how to reach the rest rather than carrying it.
+                text = (
+                    text[:limit]
+                    + "\n\n[truncated: %d characters in total. The whole value is still on "
+                      "the Future in your namespace — .result() has it.]" % (len(text),))
             name = self.aviary_label or "a background task"
-            _aviary_call_app("notify", text="[%s finished]\n\n%s" % (name, outcome))
+            _aviary_call_app("notify", text="[%s finished]\n\n%s" % (name, text))
 
         self.add_done_callback(__aviary_deliver)
         return self

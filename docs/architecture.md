@@ -193,6 +193,19 @@ Three things the agent can then do, which is the point:
 `.notify()` lives on the Future rather than as an argument to each builtin, so it composes: a
 builtin added later gets it for free.
 
+**Two laws hold at the crossing**, because the conversation is the expensive sort: a message
+costs a model call and then becomes permanent context, re-sent on every later turn.
+
+*Delivery is idempotent.* `f.notify()` twice registers one delivery. Two deliveries for one
+event is two model calls, which is the expensive kind of duplicate. A later call may update the
+label — that is not the same as re-arming.
+
+*Nothing unbounded crosses.* `sh('cat big.log').notify()` used to put the whole file into the
+transcript, forever. The prelude truncates at 1,500 characters and says how many there were,
+noting that the whole value is still on the Future in a namespace that persists; the callback
+boundary enforces its own cap on top, because that is where the law belongs rather than in the
+one caller that happens to respect it today.
+
 **The run will not finish on a promise.** A `.notify()` announces itself when registered, and
 the loop holds instead of ending while anything dispatched is outstanding — bounded, because a
 command that never returns must not turn a finished run into a hung one. The first live test of
