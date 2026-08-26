@@ -175,6 +175,44 @@ the saving is repaid the first time it *is* used, because reading a skill file c
 call and a tool result — break-even at roughly one search every ten requests. The bullets were
 cut by a third rather than moved.
 
+### Anything slow returns a Future
+
+`sh()`, `spawn()`, `search()` and `read_url()` all hand back a Future. The rule is latency, not
+plumbing: `remember`, `recall`, `artifact`, `agents` and `conversation` stay synchronous because
+they are technically-async-but-morally-sync, and `.result()` on them would be noise for no
+waiting saved.
+
+Three things the agent can then do, which is the point:
+
+1. **Wait** — `sh('make test').result()`.
+2. **Work while it runs** — start several, do something else in the same cell, collect.
+3. **Dispatch and be told later** — `sh('pytest -q').notify()`, then stop. The result is
+   delivered into the conversation as a message when it finishes, waking the run if it had
+   already ended.
+
+`.notify()` lives on the Future rather than as an argument to each builtin, so it composes: a
+builtin added later gets it for free.
+
+**The run will not finish on a promise.** A `.notify()` announces itself when registered, and
+the loop holds instead of ending while anything dispatched is outstanding — bounded, because a
+command that never returns must not turn a finished run into a hung one. The first live test of
+this ended two seconds before its own shell command answered, which is what the hold exists to
+prevent. The wait happens *before* the follow-up is taken, not after: the other order spends a
+whole model call re-asking an unchanged conversation on the way to noticing the message.
+
+Two traps found by running it rather than reading it:
+
+**Python mangles `__name` inside a class body.** `.notify()` died on
+`NameError: _AviaryFuture__aviary_ask_app`, because a double-underscore identifier referenced
+inside a class becomes `_ClassName__name`. The prelude aliases the callback helper without the
+underscores.
+
+**Persistence is a property of commands that have finished.** `sh('cd x')` then `sh('pwd')` no
+longer does what you expect unless both are awaited, because the second can start before the
+first has landed. Each command still *starts* from the cwd as of its own launch, which is
+deterministic; only the write-back races, and last-finisher-wins is the honest rule. The
+description spells the sequential idiom with `.result()` in it for exactly this reason.
+
 ### spawn() is a Future, not a call
 
 `spawn(prompt)` returns a `concurrent.futures.Future` immediately. Waiting is `.result()`.

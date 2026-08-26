@@ -156,7 +156,30 @@ __aviary_ns = globals()["__aviary_ns"]
 __aviary_state = globals()["__aviary_session_state"]
 
 
+__aviary_sh_lock = __import__("threading").Lock()
+
+
 def __aviary_sh(command, timeout=None):
+    # A Future, like spawn() and search(). A shell command is the commonest long-running thing
+    # an agent does — a test suite, a build, a clone — and making it await-or-not is what lets
+    # one cell start the slow thing and get on with reading code while it runs.
+    #
+    # `.result()` is the old blocking behaviour, spelled by the caller.
+    import threading as _th
+
+    future = _AviaryFuture()
+
+    def __aviary_run_sh():
+        try:
+            future.set_result(__aviary_sh_blocking(command, timeout=timeout))
+        except Exception as exc:
+            future.set_exception(exc)
+
+    _th.Thread(target=__aviary_run_sh).start()
+    return future
+
+
+def __aviary_sh_blocking(command, timeout=None):
     # Run a shell command whose working directory and environment persist.
     #
     # The measured reason this exists: 19.7% of cells in the corpus did working-directory
@@ -182,17 +205,21 @@ def __aviary_sh(command, timeout=None):
         raw = open(probe_path, "rb").read().decode("utf-8", "replace")
         _os.unlink(probe_path)
         parts = raw.split("\0")
-        if parts and parts[0]:
-            __aviary_state["cwd"] = parts[0]
-        base = dict(_os.environ)
-        for item in parts[1:]:
-            if "=" not in item:
-                continue
-            k, v = item.split("=", 1)
-            # Remember only what the command changed, so the session does not accumulate the
-            # whole inherited environment.
-            if base.get(k) != v and k not in ("_", "PWD", "SHLVL", "OLDPWD"):
-                __aviary_state["env"][k] = v
+        # Locked because commands can now overlap. Each one still *starts* from the cwd as of
+        # its own launch, which is deterministic; it is only the write-back that races, and
+        # last-finisher-wins is the honest rule. Await if you care which.
+        with __aviary_sh_lock:
+            if parts and parts[0]:
+                __aviary_state["cwd"] = parts[0]
+            base = dict(_os.environ)
+            for item in parts[1:]:
+                if "=" not in item:
+                    continue
+                k, v = item.split("=", 1)
+                # Remember only what the command changed, so the session does not accumulate
+                # the whole inherited environment.
+                if base.get(k) != v and k not in ("_", "PWD", "SHLVL", "OLDPWD"):
+                    __aviary_state["env"][k] = v
     except Exception:
         pass
     return {"stdout": proc.stdout, "stderr": proc.stderr, "status": proc.returncode}
@@ -228,6 +255,46 @@ def __aviary_ask_app(kind, **payload):
 __aviary_ns["sh"] = __aviary_sh
 __aviary_ns["cwd"] = lambda: __aviary_state["cwd"]
 __aviary_ns["ask_app"] = __aviary_ask_app
+# Aliased without the double underscore because Python mangles `__name` *inside a class body*
+# into `_ClassName__name`. The first live run of `.notify()` died on
+# `NameError: _AviaryFuture__aviary_ask_app`, which no amount of reading the class would have
+# shown.
+_aviary_call_app = __aviary_ask_app
+
+
+class _AviaryFuture(__import__("concurrent.futures", fromlist=["Future"]).Future):
+    """A Future that can also deliver its own result back into the conversation.
+
+    The third thing an agent wants from a slow operation, after "wait for it" and "do other
+    work and then collect it": start it, stop, and be told later. `.notify()` registers a
+    done-callback that sends the result to this same session as a message, which arrives at a
+    turn boundary exactly as a person's would — and wakes the agent if it had already stopped.
+
+    It lives on the Future rather than as an argument to each builtin so that it composes:
+    `sh('pytest -q').notify()`, `spawn(...).notify()` and `search(...).notify()` are the same
+    gesture, and a builtin added later gets it for free.
+    """
+
+    aviary_label = None
+
+    def notify(self, label=None):
+        self.aviary_label = label
+        # Announced up front so the run knows not to finish on a promise: an agent that
+        # dispatches and stops would otherwise end before its own answer arrived.
+        _aviary_call_app("dispatched")
+
+        def __aviary_deliver(done):
+            try:
+                outcome = done.result()
+            except Exception as exc:
+                outcome = "failed: %s" % (exc,)
+            name = self.aviary_label or "a background task"
+            _aviary_call_app("notify", text="[%s finished]\n\n%s" % (name, outcome))
+
+        self.add_done_callback(__aviary_deliver)
+        return self
+
+
 def __aviary_spawn(prompt, name=None, model=None):
     # Returns a real `concurrent.futures.Future`, not a bespoke handle.
     #
@@ -238,12 +305,11 @@ def __aviary_spawn(prompt, name=None, model=None):
     #
     # A blocking variant used to exist beside this. It is gone: `spawn(p).result()` is the
     # blocking call, spelled by the caller.
-    import concurrent.futures as _cf
     import threading as _th
     import time as _time
 
     started = __aviary_ask_app("spawn", prompt=prompt, name=name, model=model)
-    future = _cf.Future()
+    future = _AviaryFuture()
     if not isinstance(started, dict) or "id" not in started:
         future.set_result(started)
         return future
@@ -298,10 +364,9 @@ def __aviary_async(kind, **payload):
     # Unlike spawn there is nothing to poll: the callback itself blocks until Aviary answers,
     # so the thread runs it once and resolves. The thread exists only so the caller is not
     # blocked while it happens.
-    import concurrent.futures as _cf
     import threading as _th
 
-    future = _cf.Future()
+    future = _AviaryFuture()
 
     def __aviary_run():
         try:

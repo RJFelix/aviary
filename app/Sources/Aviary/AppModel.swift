@@ -952,8 +952,19 @@ final class AppModel {
 /// A separate type rather than a conformance on `AppModel`, because `PeerDelegate` is
 /// `Sendable` and reached from the runtime's callback thread, while `AppModel` is main-actor.
 /// The hop is explicit here instead of being scattered through the delegate methods.
-struct PeerBridge: Agent.PeerDelegate {
+struct PeerBridge: Agent.PeerDelegate, Agent.SelfDelegate {
     let model: AppModel
+
+    /// A background task reporting back to the run that started it.
+    ///
+    /// Routed through the run rather than the agent because the interesting case is work that
+    /// outlives its turn: by the time a test suite finishes, the loop that started it may have
+    /// stopped, and only the run can start it again.
+    func deliverToSelf(sessionID: String, text: String) async {
+        await MainActor.run {
+            model.runs.first { $0.sessionID == sessionID }
+        }?.receive(text: text, from: "your background task")
+    }
 
     func peers(excluding sessionID: String) async -> [Agent.Peer] {
         await MainActor.run {

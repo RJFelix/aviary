@@ -130,7 +130,8 @@ final class InHouseDriver {
                     memory: memoryGate.render(recalled)),
                 memory: memory, recordPayloads: recordPayloads,
                 hookPaths: HookDiscovery.paths(repoRoot: repoRoot), resume: resume,
-                peerDelegate: peerDelegate))
+                peerDelegate: peerDelegate,
+                selfDelegate: peerDelegate as? Agent.SelfDelegate))
         self.runner = runner
 
         await runner.observe { [weak self] event in
@@ -179,6 +180,9 @@ final class InHouseDriver {
             reload()
         case .modelChanged(let provider, let id):
             modelLabel = "\(provider)/\(id)"
+            reload()
+        case .awaitingDispatched(let count):
+            skillsNote = "waiting on \(count) dispatched task(s)"
             reload()
         case .goalExhausted, .toolStarted, .toolFinished, .compacted, .childStarted,
              .childFinished, .imageAttached:

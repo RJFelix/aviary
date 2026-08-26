@@ -29,6 +29,9 @@ public actor Agent {
         /// summarising requires sending what is being summarised, and a run that waits until
         /// it is nearly full cannot afford the call that would save it.
         public var compactAtContextShare: Double = 0.7
+        /// How long to hold a finished run open for work it dispatched with `.notify()`.
+        /// Generous on purpose: the case this exists for is a test suite.
+        public var dispatchedWorkTimeout: TimeInterval = 900
         /// How deep sub-agents may nest. A ceiling rather than a budget — recursion with no
         /// floor is the one failure mode that can spend without bound while nobody watches.
         public var maxDepth: Int = 3
@@ -82,6 +85,8 @@ public actor Agent {
         case imageAttached(path: String, width: Int, height: Int)
         /// The run will answer its next turn with a different model.
         case modelChanged(provider: String, model: String)
+        /// The run would have finished, but is holding for work it asked to be told about.
+        case awaitingDispatched(count: Int)
         /// The loop stopped. `reason` is why, in words, because "it stopped" is never enough
         /// to act on.
         case finished(reason: String)
@@ -123,6 +128,9 @@ public actor Agent {
     /// How a child reports back to its parent, and who to notify.
     private var spawnDelegate: SpawnDelegate?
     private var peerDelegate: PeerDelegate?
+    private var selfDelegate: SelfDelegate?
+    /// Tasks the agent asked to be told about and stopped waiting for.
+    private var dispatchedCount = 0
     /// MCP servers whose tools this run may call, keyed by the namespaced tool name the model
     /// sees. Namespaced because two servers may both offer `search`, and a bare name would
     /// make that collision silent.
@@ -205,6 +213,20 @@ public actor Agent {
         /// Every child this run has started, finished or not. Polled by the Future's own
         /// thread rather than by the agent, so it is not in the namespace.
         func children() async -> [ChildStatus]
+    }
+
+    /// Somebody who can put a message into *this* run's own conversation.
+    ///
+    /// Separate from the agent's own queue because of the case that matters: a shell command
+    /// that outlives the turn that started it. By the time it finishes the loop may have
+    /// exited, and a message queued on an agent that is no longer looping is a message nobody
+    /// reads. The app can restart the run; the agent cannot restart itself.
+    public protocol SelfDelegate: Sendable {
+        func deliverToSelf(sessionID: String, text: String) async
+    }
+
+    public func setSelfDelegate(_ delegate: SelfDelegate?) {
+        selfDelegate = delegate
     }
 
     public func setSpawnDelegate(_ delegate: SpawnDelegate?) {
@@ -344,6 +366,28 @@ public actor Agent {
             return .object([
                 "delivered": .bool(true), "session": .string(outcome.session),
             ])
+
+        case "dispatched":
+            // `.notify()` announcing itself, so the loop knows not to finish on a promise.
+            dispatchedCount += 1
+            return .object(["ok": .bool(true)])
+
+        case "notify":
+            guard let text = payload["text"]?.stringValue,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return .object(["error": .string("notify() needs some text.")]) }
+            if let selfDelegate {
+                await selfDelegate.deliverToSelf(sessionID: writer.sessionID, text: text)
+            } else {
+                // No app behind this run — a CLI session. A follow-up still lands, as long as
+                // the loop is alive to take it.
+                queueFollowUp(text)
+            }
+            // Decremented *after* the message is queued, never before. The waiter gives up
+            // when the count reaches zero with nothing waiting, so decrementing first opens a
+            // window where it sees exactly that and finishes the run a moment early.
+            dispatchedCount = max(0, dispatchedCount - 1)
+            return .object(["delivered": .bool(true)])
 
         case "search", "read_url":
             guard let key = WebSearch.configuredKey() else {
@@ -709,6 +753,15 @@ public actor Agent {
                 // Nothing more to do this turn — but a queued message means the run is not
                 // actually over, so continue rather than making the caller start again.
                 if !pendingSteering.isEmpty { continue }
+                // Work the agent dispatched with .notify() and then stopped waiting for. It
+                // asked to be told later, so finishing now would be finishing on a promise —
+                // the first live test of this ended the run two seconds before the shell
+                // command it had asked to hear about produced its answer.
+                //
+                // Waited for *before* the follow-up is taken, not after. The other order costs
+                // a whole model call: the loop would re-ask with an unchanged conversation,
+                // get the same answer, and only then notice the message waiting.
+                _ = await waitForDispatchedWork()
                 if let next = pendingFollowUps.first {
                     pendingFollowUps.removeFirst()
                     try? await writer.appendUser(next)
@@ -716,6 +769,7 @@ public actor Agent {
                     emit(.steered(next))
                     continue
                 }
+                if !pendingSteering.isEmpty { continue }
                 emit(.finished(reason: turn.stopReason ?? "stopped"))
                 return
             }
@@ -739,6 +793,28 @@ public actor Agent {
             + "Raise maxIterations, or narrow the task."
         try? await writer.appendNote(note)
         emit(.finished(reason: "iteration limit"))
+    }
+
+    /// Hold the run open while work it asked to be told about is still going.
+    ///
+    /// Returns true when something arrived, so the loop can take it. Bounded, because a
+    /// dispatched command that never ends must not turn a finished run into a hung one — and
+    /// the bound is generous because the case this exists for is a test suite.
+    private func waitForDispatchedWork() async -> Bool {
+        guard dispatchedCount > 0 else { return false }
+        emit(.awaitingDispatched(count: dispatchedCount))
+        let deadline = Date().addingTimeInterval(config.dispatchedWorkTimeout)
+        while Date() < deadline, !cancelled {
+            if !pendingSteering.isEmpty || !pendingFollowUps.isEmpty { return true }
+            if dispatchedCount == 0 { return !pendingFollowUps.isEmpty }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        if dispatchedCount > 0 {
+            try? await writer.appendNote(
+                "Stopped waiting for \(dispatchedCount) dispatched task(s) that had not "
+                    + "reported back.")
+        }
+        return !pendingFollowUps.isEmpty || !pendingSteering.isEmpty
     }
 
     /// Move anything `attach_image` queued into the conversation.

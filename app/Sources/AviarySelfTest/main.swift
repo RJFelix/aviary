@@ -519,6 +519,7 @@ final class EventLog: @unchecked Sendable {
         switch event {
         case .imageAttached: events.append("imageAttached")
         case .modelChanged: events.append("modelChanged")
+        case .awaitingDispatched: events.append("awaitingDispatched")
         case .started: events.append("started")
         case .steered: events.append("steered")
         case .goalExhausted: events.append("goal-exhausted")
@@ -986,20 +987,47 @@ let cases1: [Case] = [
         await host.stop()
     }),
 
-    ("runtimeHost: cd and export persist across calls", {
+    ("runtimeHost: cd and export persist across awaited calls", {
         // The measured 19.7%: cells doing working-directory bookkeeping by hand because
         // subprocess starts every child in the same place.
+        //
+        // `.result()` is load-bearing now that sh() is a Future. Persistence is a property of
+        // commands that have *finished*, and this is the test that says so: without the await
+        // the next call can start before the `cd` has landed. That is the price of being able
+        // to start a slow command and keep working, and it is why the description spells the
+        // sequential idiom with .result() in it.
         guard let host = try makeHost(.reference) else { return }
         _ = try await host.start()
         let s = try await host.createSession(cwd: "/usr")
-        _ = try await host.execute("sh('cd /usr/lib')", in: s)
+        _ = try await host.execute("sh('cd /usr/lib').result()", in: s)
         let where1 = try await host.execute("cwd()", in: s)
         XCTAssertEqual(where1.value, "'/usr/lib'")
-        let where2 = try await host.execute("sh('pwd')['stdout'].strip()", in: s)
+        let where2 = try await host.execute(
+            "sh('pwd').result()['stdout'].strip()", in: s)
         XCTAssertEqual(where2.value, "'/usr/lib'")
-        _ = try await host.execute("sh('export AVIARY_SUITE=7')", in: s)
-        let env = try await host.execute("sh('echo $AVIARY_SUITE')['stdout'].strip()", in: s)
+        _ = try await host.execute("sh('export AVIARY_SUITE=7').result()", in: s)
+        let env = try await host.execute(
+            "sh('echo $AVIARY_SUITE').result()['stdout'].strip()", in: s)
         XCTAssertEqual(env.value, "'7'")
+        await host.stop()
+    }),
+
+    ("runtimeHost: sh returns before the command does, and can be awaited later", {
+        // The whole point of the change: start the slow thing, do something else, collect.
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        let s = try await host.createSession(cwd: "/tmp")
+        // Started, not awaited — the cell returns while the command is still sleeping.
+        let started = try await host.execute(
+            "import time\nt0 = time.time()\njob = sh('sleep 1; echo late')\n"
+                + "round(time.time() - t0, 1) < 0.5", in: s)
+        XCTAssertEqual(started.value, "True", "sh() did not block")
+        // The Future is still in the namespace a cell later, and resolves to the output.
+        let collected = try await host.execute("job.result()['stdout'].strip()", in: s)
+        XCTAssertEqual(collected.value, "'late'")
+        // And it carries the deliver-later affordance every long builtin shares.
+        let hasNotify = try await host.execute("hasattr(job, 'notify')", in: s)
+        XCTAssertEqual(hasNotify.value, "True")
         await host.stop()
     }),
 
@@ -5220,6 +5248,93 @@ let casesMCPVersions: [Case] = [
 
 // MARK: - Changing a run's model
 
+let casesDispatched: [Case] = [
+
+    ("dispatch: a run does not finish on a promise it asked to be told about", {
+        // The third mode, end to end: start something slow, stop waiting, be told later. The
+        // first live run of this ended two seconds before its own shell command answered,
+        // which is what the hold exists to prevent.
+        guard let server = try FakeProviderServer(script: [
+            ["tool": ["name": "python", "arguments": [
+                "code": "sh('sleep 1; echo LATE').notify()"]]],
+            ["text": "started"],
+            ["text": "the task finished"],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        var config = Agent.Configuration(
+            model: fakeModel(), cwd: "/tmp", systemPrompt: "be brief")
+        config.dispatchedWorkTimeout = 30
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(
+                id: "fake", baseURL: server.baseURL, apiKey: "k"),
+            host: host, writer: writer, hostSession: hostSession, config: config)
+        // The channel the prelude's `.notify()` speaks over. Without it the announcement never
+        // reaches the agent and the run finishes exactly as it did before the fix — which is
+        // how the first version of this test silently passed nothing.
+        await host.onCallback { _, kind, payload in
+            await agent.serveCallback(kind: kind, payload: payload)
+        }
+
+        let log = EventLog()
+        await agent.observe { log.record($0) }
+        await agent.send("dispatch something slow")
+
+        // It held rather than finishing, and the third model call only happened because the
+        // notification came back and reopened the turn.
+        XCTAssertTrue(log.names.contains("awaitingDispatched"),
+                      "the run must announce that it is holding: \(log.names)")
+        // Three, not four: the hold happens before the follow-up is taken, so the run does
+        // not spend a model call re-asking an unchanged conversation on the way to noticing
+        // the message waiting for it.
+        XCTAssertEqual(try server.recordedRequests().count, 3,
+                       "a third call means the result was delivered and answered")
+        XCTAssertEqual(
+            log.names,
+            ["started", "turn", "tool:python", "tool-ok", "turn", "awaitingDispatched",
+             "steered", "turn", "finished:stop"])
+
+        // And it arrived in the conversation as a message, carrying the command's output.
+        await writer.close()
+        let parsed = try XCTUnwrap(SessionParser.parse(fileURL: writer.fileURL))
+        let delivered = parsed.items.contains { $0.plainText.contains("LATE") }
+        XCTAssertTrue(delivered, "the shell output should be in the transcript")
+    }),
+
+    ("dispatch: nothing dispatched, nothing to wait for", {
+        // The hold must not turn every ordinary run into one that pauses at the end.
+        guard let server = try FakeProviderServer(script: [
+            ["text": "done immediately"],
+        ]) else { print("      skipped: no fixture"); return }
+        defer { server.stop() }
+        guard let host = try makeHost(.reference) else { return }
+        _ = try await host.start()
+        defer { Task { await host.stop() } }
+        let home = scratchHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let hostSession = try await host.createSession(cwd: "/tmp")
+        let writer = try SessionWriter(home: home, cwd: "/tmp", model: fakeModel())
+        let agent = Agent(
+            provider: OpenAICompletionsProvider(
+                id: "fake", baseURL: server.baseURL, apiKey: "k"),
+            host: host, writer: writer, hostSession: hostSession,
+            config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "be brief"))
+        let log = EventLog()
+        await agent.observe { log.record($0) }
+        let started = Date()
+        await agent.send("just answer")
+        XCTAssertFalse(log.names.contains("awaitingDispatched"))
+        XCTAssertTrue(Date().timeIntervalSince(started) < 10, "it must not pause at the end")
+    }),
+]
+
 let casesWebSearch: [Case] = [
 
     ("web: the request uses the field names Parallel documents, nesting and all", {
@@ -5802,4 +5917,4 @@ await Harness.run(
         + casesModelSwitch + casesMirrorChurn + casesBuildStamp
         + casesRepoRoot + casesAgentHome
         + casesPeers + casesMCPSurface
-        + casesBackgroundSpawn + casesWebSearch)
+        + casesBackgroundSpawn + casesWebSearch + casesDispatched)

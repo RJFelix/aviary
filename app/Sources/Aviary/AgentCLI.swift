@@ -257,6 +257,8 @@ enum AgentCLI {
                 break  // shown in the GUI, noise in a terminal
             case .imageAttached(let path, let width, let height):
                 note("\n👁 \(path) (\(width)×\(height))")
+            case .awaitingDispatched(let count):
+                note("\n— holding for \(count) dispatched task(s)")
             case .modelChanged(let provider, let id):
                 note("\n— now answering with \(provider)/\(id)")
             case .toolStarted(_, _, let arguments):

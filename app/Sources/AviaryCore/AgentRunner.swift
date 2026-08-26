@@ -37,15 +37,20 @@ public actor AgentRunner {
         /// Who else is running, supplied by the app. Nil in a CLI run, where the two peer
         /// builtins are then not bound at all — which is right: there is nobody else there.
         public var peerDelegate: Agent.PeerDelegate?
+        /// Puts a message back into this run's own conversation, for work that outlives the
+        /// turn that started it.
+        public var selfDelegate: Agent.SelfDelegate?
 
         public init(
             home: AgentHome, cwd: String, model: ModelSpec, systemPrompt: String,
             maxDepth: Int = 3, maxIterations: Int = 40, childMaxIterations: Int = 20,
             memory: MemoryStore? = nil, recordPayloads: Bool = false, goal: Goal? = nil,
             hookPaths: [String] = [], resume: String? = nil,
-            peerDelegate: Agent.PeerDelegate? = nil
+            peerDelegate: Agent.PeerDelegate? = nil,
+            selfDelegate: Agent.SelfDelegate? = nil
         ) {
             self.peerDelegate = peerDelegate
+            self.selfDelegate = selfDelegate
             self.home = home
             self.cwd = cwd
             self.model = model
@@ -180,6 +185,7 @@ public actor AgentRunner {
         // nil and the two peer builtins simply are not bound — which is right: there is
         // nobody else there.
         await agent.setPeerDelegate(settings.peerDelegate)
+        await agent.setSelfDelegate(settings.selfDelegate)
         await agent.setSpawnDelegate(Delegate(runner: self, parentSessionID: writer.sessionID))
         await agent.setMemory(settings.memory)
         await agent.setArtifacts(

@@ -159,15 +159,22 @@ public enum Builtins {
                 name: "sh",
                 signature: "sh(command)",
                 summary: "Run a shell command whose working directory and environment persist.",
-                bullet: "sh(command)  – run a shell command. The working directory and "
-                    + "environment persist across calls, so `sh('cd subdir')` then `sh('pwd')` "
-                    + "does what you expect. Returns {'stdout', 'stderr', 'status'}.",
+                bullet: "sh(command)  – run a shell command. Returns a Future: .result() is "
+                    + "{'stdout', 'stderr', 'status'}. The working directory and environment "
+                    + "persist across calls, so `sh('cd subdir').result()` then "
+                    + "`sh('pwd').result()` does what you expect.",
                 requirement: .always, mechanism: .kernel, isAvailable: true),
             Entry(
                 name: "cwd",
                 signature: "cwd()",
                 summary: "Where the shell currently is.",
                 bullet: "cwd()        – the current working directory.",
+                note: "Anything that can take a while — sh(), spawn(), search(), read_url() — "
+                    + "returns a Future, so you choose. Call .result() to wait. Start several "
+                    + "and collect them if they are independent. Or call .notify() on one and "
+                    + "stop: its result is sent to you as a message when it finishes, even if "
+                    + "this turn has ended, which is how to run a long test suite without "
+                    + "sitting and watching it.",
                 requirement: .always, mechanism: .kernel, isAvailable: true),
             Entry(
                 name: "conversation",
