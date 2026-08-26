@@ -31,6 +31,8 @@ public enum Builtins {
         case vision
         /// Only when there is another live run to talk to.
         case peers
+        /// Only when a web search key is configured.
+        case web
 
         public var id: String { rawValue }
 
@@ -41,6 +43,7 @@ public enum Builtins {
             case .spawn: return "With sub-agents"
             case .vision: return "With a vision model"
             case .peers: return "With other live runs"
+            case .web: return "With web access"
             }
         }
 
@@ -61,6 +64,10 @@ public enum Builtins {
                 return "Bound only while another run is open beside this one. A solo session "
                     + "has nobody to message, and describing the names anyway would cost "
                     + "tokens on every request to advertise an empty room."
+            case .web:
+                return "Bound when PARALLEL_API_KEY is in the environment Aviary captured from "
+                    + "your login shell. No key, no names — rather than a capability that "
+                    + "exists right up until it is called."
             }
         }
     }
@@ -122,11 +129,14 @@ public enum Builtins {
         public var supportsImages: Bool
         /// How many *other* runs Aviary is holding right now.
         public var peerCount: Int
+        /// Whether a web search key is configured.
+        public var hasWeb: Bool
 
         public init(
             cwd: String, hasMemory: Bool = false, canSpawn: Bool = false, spawnBudget: Int = 0,
-            supportsImages: Bool = false, peerCount: Int = 0
+            supportsImages: Bool = false, peerCount: Int = 0, hasWeb: Bool = false
         ) {
+            self.hasWeb = hasWeb
             self.cwd = cwd
             self.hasMemory = hasMemory
             self.canSpawn = canSpawn
@@ -139,7 +149,7 @@ public enum Builtins {
         /// one run's slice of it.
         public static let reference = Context(
             cwd: "<the session's working directory>", hasMemory: true, canSpawn: true,
-            spawnBudget: 1, supportsImages: true, peerCount: 1)
+            spawnBudget: 1, supportsImages: true, peerCount: 1, hasWeb: true)
     }
 
     /// Every builtin, in description order, each marked with whether this run has it.
@@ -233,6 +243,26 @@ public enum Builtins {
                     + "much as a page of text, so attach the one that decides the question "
                     + "rather than everything you have.",
                 requirement: .vision, mechanism: .callback, isAvailable: ctx.supportsImages),
+            Entry(
+                name: "search",
+                signature: "search(objective, queries=None, mode='fast', n=10)",
+                summary: "Search the web. Returns a Future of ranked page excerpts.",
+                bullet: "search(objective, queries=None) – search the web. Returns a Future "
+                    + "like spawn(); .result() is a list of {'url', 'title', 'excerpts'}. "
+                    + "`objective` is what you want to find out, in a sentence.",
+                requirement: .web, mechanism: .callback, isAvailable: ctx.hasWeb),
+            Entry(
+                name: "read_url",
+                signature: "read_url(urls, objective=None, full=False)",
+                summary: "Pull the relevant part of pages you already have URLs for.",
+                bullet: "read_url(urls, objective=None, full=False) – read pages you have the "
+                    + "URLs of, PDFs and JS-rendered ones included. Future of "
+                    + "{'url', 'title', 'excerpts'} per URL, or {'url', 'error'}.",
+                note: "Search when you do not know the page, read_url when you do. Both are "
+                    + "Futures, so start several and collect them rather than waiting for "
+                    + "each. An `objective` returns only the relevant part; full=True spends "
+                    + "context on the rest of the page.",
+                requirement: .web, mechanism: .callback, isAvailable: ctx.hasWeb),
             Entry(
                 name: "agents",
                 signature: "agents()",

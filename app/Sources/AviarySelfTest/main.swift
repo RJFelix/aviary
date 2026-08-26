@@ -5220,6 +5220,117 @@ let casesMCPVersions: [Case] = [
 
 // MARK: - Changing a run's model
 
+let casesWebSearch: [Case] = [
+
+    ("web: the request uses the field names Parallel documents, nesting and all", {
+        // The expensive failure mode is a misspelled key: Parallel accepts the request,
+        // ignores the field, and the only symptom is slightly worse results. So the body is a
+        // pure function and the names are pinned here rather than discovered live.
+        let body = WebSearch.searchBody(
+            objective: "when was the UN founded", queries: ["UN founding date"],
+            mode: "fast", maxResults: 5, maxCharsPerResult: 1200,
+            includeDomains: ["un.org"], excludeDomains: ["example.com"],
+            afterDate: "2020-01-01")
+        XCTAssertEqual(body["objective"]?.stringValue, "when was the UN founded")
+        XCTAssertEqual(body["mode"]?.stringValue, "fast")
+        XCTAssertEqual(body["search_queries"]?.arrayValue?.count, 1)
+        // Optional settings are nested under advanced_settings, which is their shape not ours.
+        XCTAssertEqual(body.path("advanced_settings.max_results")?.intValue, 5)
+        XCTAssertEqual(
+            body.path("advanced_settings.excerpt_settings.max_chars_per_result")?.intValue,
+            1200)
+        XCTAssertEqual(
+            body.path("advanced_settings.source_policy.after_date")?.stringValue, "2020-01-01")
+        XCTAssertEqual(
+            body.path("advanced_settings.source_policy.include_domains")?.arrayValue?.count, 1)
+
+        // Nothing optional given, nothing sent — an empty advanced_settings would be noise.
+        let bare = WebSearch.searchBody(
+            objective: "x", queries: ["x"], mode: "fast", maxResults: nil,
+            maxCharsPerResult: nil, includeDomains: [], excludeDomains: [], afterDate: nil)
+        XCTAssertNil(bare["advanced_settings"])
+
+        // An unknown mode falls back rather than being sent through to be rejected.
+        let odd = WebSearch.searchBody(
+            objective: "x", queries: ["x"], mode: "ludicrous", maxResults: nil,
+            maxCharsPerResult: nil, includeDomains: [], excludeDomains: [], afterDate: nil)
+        XCTAssertEqual(odd["mode"]?.stringValue, "fast")
+    }),
+
+    ("web: a page read asks for excerpts unless the whole thing is wanted", {
+        let focused = WebSearch.extractBody(
+            urls: ["https://example.com/a"], objective: "the pricing", queries: [], full: false)
+        XCTAssertEqual(focused["urls"]?.arrayValue?.count, 1)
+        XCTAssertEqual(focused["full_content"]?.boolValue, false)
+        XCTAssertEqual(focused["objective"]?.stringValue, "the pricing")
+        XCTAssertNil(focused["search_queries"], "not sent when there are none")
+
+        let whole = WebSearch.extractBody(
+            urls: ["a", "b"], objective: nil, queries: ["price"], full: true)
+        XCTAssertEqual(whole["full_content"]?.boolValue, true)
+        XCTAssertEqual(whole["search_queries"]?.arrayValue?.count, 1)
+        XCTAssertNil(whole["objective"])
+    }),
+
+    ("web: replies are flattened to what an agent can act on", {
+        // Parallel's bookkeeping — search_id, session_id, usage — is not forwarded. Spending
+        // the agent's context on somebody else's telemetry buys nothing.
+        let reply = try XCTUnwrap(JSONValue.parse(Data("""
+            {"search_id": "s1", "session_id": "x", "usage": [{"name": "sku_search", "count": 1}],
+             "results": [{"url": "https://un.org/history", "title": "History",
+                          "publish_date": "1945-10-24", "excerpts": ["founded in 1945"]}]}
+            """.utf8)))
+        let flat = WebSearch.searchPayload(reply)
+        let rows = try XCTUnwrap(flat.arrayValue)
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0]["url"]?.stringValue, "https://un.org/history")
+        XCTAssertEqual(rows[0]["excerpts"]?.arrayValue?.count, 1)
+        XCTAssertEqual(rows[0]["published"]?.stringValue, "1945-10-24")
+        XCTAssertNil(rows[0]["search_id"])
+
+        // A URL that failed is reported in the list. A silently shorter list reads as "that
+        // page had nothing", which is a different fact from "that page could not be read".
+        let extracted = try XCTUnwrap(JSONValue.parse(Data("""
+            {"extract_id": "e1",
+             "results": [{"url": "https://a", "title": "A", "excerpts": ["x"],
+                          "full_content": "# A"}],
+             "errors": [{"url": "https://b", "message": "timed out"}]}
+            """.utf8)))
+        let out = try XCTUnwrap(WebSearch.extractPayload(extracted).arrayValue)
+        XCTAssertEqual(out.count, 2)
+        XCTAssertEqual(out[0]["content"]?.stringValue, "# A")
+        XCTAssertEqual(out[1]["url"]?.stringValue, "https://b")
+        XCTAssertEqual(out[1]["error"]?.stringValue, "timed out")
+    }),
+
+    ("web: no key, no names", {
+        // The alternative is a capability that exists right up until it is called.
+        XCTAssertNil(WebSearch.configuredKey(environment: [:]))
+        XCTAssertNil(WebSearch.configuredKey(environment: ["PARALLEL_API_KEY": "   "]))
+        XCTAssertEqual(WebSearch.configuredKey(environment: ["PARALLEL_API_KEY": "k"]), "k")
+
+        let without = Builtins.description(Builtins.Context(cwd: "/repo"))
+        XCTAssertFalse(without.contains("search("))
+        XCTAssertFalse(without.contains("read_url("))
+        let with = Builtins.description(Builtins.Context(cwd: "/repo", hasWeb: true))
+        XCTAssertTrue(with.contains("search(objective"))
+        XCTAssertTrue(with.contains("read_url("))
+        // Same Future shape as spawn, which is the point: one idiom for fan-out.
+        let entry = try XCTUnwrap(Builtins.all(.reference).first { $0.name == "search" })
+        XCTAssertTrue(entry.bullet.contains("Future"))
+    }),
+
+    ("web: the description names no vendor, so switching one is free", {
+        // The recommendation this was built on turns on being able to change provider by
+        // editing the request and nothing the model reads — no prompt-cache invalidation, no
+        // re-teaching. Leaking the vendor into the text is what would make that expensive.
+        let text = Builtins.description(Builtins.Context(cwd: "/repo", hasWeb: true))
+        for vendor in ["Parallel", "parallel.ai", "Brave", "Exa", "Tavily"] {
+            XCTAssertFalse(text.lowercased().contains(vendor.lowercased()), vendor)
+        }
+    }),
+]
+
 let casesBackgroundSpawn: [Case] = [
 
     ("spawn: one non-blocking primitive, and Python decides whether to wait", {
@@ -5691,4 +5802,4 @@ await Harness.run(
         + casesModelSwitch + casesMirrorChurn + casesBuildStamp
         + casesRepoRoot + casesAgentHome
         + casesPeers + casesMCPSurface
-        + casesBackgroundSpawn)
+        + casesBackgroundSpawn + casesWebSearch)

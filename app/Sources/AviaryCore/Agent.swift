@@ -345,6 +345,48 @@ public actor Agent {
                 "delivered": .bool(true), "session": .string(outcome.session),
             ])
 
+        case "search", "read_url":
+            guard let key = WebSearch.configuredKey() else {
+                return .object(["error": .string(
+                    "No \(WebSearch.keyVariable) in the environment, so web access is off.")])
+            }
+            let web = WebSearch(apiKey: key)
+            do {
+                if kind == "search" {
+                    let queries = (payload["queries"]?.arrayValue ?? [])
+                        .compactMap(\.stringValue)
+                    let objective = payload["objective"]?.stringValue
+                    guard !(objective ?? "").isEmpty || !queries.isEmpty else {
+                        return .object(["error": .string(
+                            "search() needs an objective, or some queries.")])
+                    }
+                    return try await web.search(
+                        objective: objective,
+                        // The objective doubles as the query when none is given: the API wants
+                        // at least one, and asking the model for both every time is friction
+                        // for a distinction it does not always have.
+                        queries: queries.isEmpty ? [objective ?? ""] : queries,
+                        mode: payload["mode"]?.stringValue ?? WebSearch.defaultMode,
+                        maxResults: payload["n"]?.intValue,
+                        maxCharsPerResult: payload["max_chars"]?.intValue,
+                        includeDomains: (payload["include"]?.arrayValue ?? [])
+                            .compactMap(\.stringValue),
+                        excludeDomains: (payload["exclude"]?.arrayValue ?? [])
+                            .compactMap(\.stringValue),
+                        afterDate: payload["after"]?.stringValue)
+                }
+                let urls = (payload["urls"]?.arrayValue ?? []).compactMap(\.stringValue)
+                guard !urls.isEmpty else {
+                    return .object(["error": .string("read_url() needs at least one URL.")])
+                }
+                return try await web.extract(
+                    urls: urls, objective: payload["objective"]?.stringValue,
+                    queries: (payload["queries"]?.arrayValue ?? []).compactMap(\.stringValue),
+                    full: payload["full"]?.boolValue ?? false)
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+
         case "attach_image":
             guard config.model.supportsImages else {
                 return .object(["error": .string(
@@ -540,11 +582,11 @@ public actor Agent {
     /// codebase for it before giving up.
     public static func tools(
         cwd: String, canSpawn: Bool = false, spawnBudget: Int = 0, hasMemory: Bool = false,
-        supportsImages: Bool = false, peerCount: Int = 0
+        supportsImages: Bool = false, peerCount: Int = 0, hasWeb: Bool = false
     ) -> [ChatTool] {
         let description = Builtins.description(Builtins.Context(
             cwd: cwd, hasMemory: hasMemory, canSpawn: canSpawn, spawnBudget: spawnBudget,
-            supportsImages: supportsImages, peerCount: peerCount))
+            supportsImages: supportsImages, peerCount: peerCount, hasWeb: hasWeb))
         return [ChatTool(
             name: "python",
             description: description,
@@ -568,7 +610,8 @@ public actor Agent {
             spawnBudget: max(0, config.maxDepth - config.depth),
             hasMemory: memory != nil,
             supportsImages: config.model.supportsImages,
-            peerCount: peerCount)
+            peerCount: peerCount,
+            hasWeb: WebSearch.configuredKey() != nil)
         // MCP tools are declared individually rather than behind one dispatcher, because a
         // model picks a tool by reading its schema and a single `call_mcp(name, args)` hides
         // every schema behind a string.

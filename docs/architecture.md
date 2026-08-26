@@ -148,6 +148,33 @@ giving up. The schema is now built from what the run can actually do — includi
 sub-agent depth remains — and there is a test asserting `spawn` is advertised only when it is
 possible.
 
+### Web access: search() and read_url()
+
+Both go to Parallel — `search` finds pages, `read_url` pulls the relevant part of pages whose
+URLs you already have, PDFs and JS-rendered ones included. Both are gated on
+`PARALLEL_API_KEY` being in the environment Aviary captured from the login shell: no key, no
+names, rather than a capability that exists right up until it is called.
+
+**The description names no vendor.** The model is told it gets `{'url', 'title', 'excerpts'}`
+and nothing about who produced them, so changing provider means editing the request built in
+`WebSearch.swift` and nothing the model reads — no prompt-cache invalidation, no re-teaching.
+Leaking `source_policy`, `freshness` and the rest into the text is precisely what would make a
+switch expensive, so those live in Swift as ordinary parameters.
+
+Request bodies are pure functions (`searchBody`, `extractBody`) so the field names are testable
+without a key or a network. That is deliberate: a misspelled key is *accepted*, silently
+ignored, and shows up as slightly worse results rather than as an error — the worst kind of bug
+to find live.
+
+**Why a builtin and not a skill.** A skill is described only when the gate selects it, so it
+would cost ~25 tokens a request instead of ~204 — measured, not estimated. Two things decide it
+the other way. The function has to be bound in the namespace either way, and a bound-but-
+undescribed name is the exact bug `Builtins` exists to prevent; a skill would describe it only
+when keyword scoring happened to fire, so a miss means a capability the agent cannot see. And
+the saving is repaid the first time it *is* used, because reading a skill file costs a model
+call and a tool result — break-even at roughly one search every ten requests. The bullets were
+cut by a third rather than moved.
+
 ### spawn() is a Future, not a call
 
 `spawn(prompt)` returns a `concurrent.futures.Future` immediately. Waiting is `.result()`.

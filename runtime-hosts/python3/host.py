@@ -54,7 +54,7 @@ PROTOCOL_VERSION = 2
 # how that contract quietly breaks.
 _AVIARY_INJECTED = frozenset({"sh", "cwd", "ask_app", "spawn", "conversation",
                               "remember", "recall", "artifact", "attach_image",
-                              "agents", "message"})
+                              "agents", "message", "search", "read_url"})
 
 # Callbacks in flight: a runtime asked Aviary for something and is blocked on the answer.
 #
@@ -287,6 +287,45 @@ def __aviary_spawn(prompt, name=None, model=None):
 
 
 __aviary_ns["spawn"] = __aviary_spawn
+
+
+def __aviary_async(kind, **payload):
+    # The same Future shape spawn() has, for the calls whose cost is latency rather than
+    # tokens. Search and page reads are the two places an agent most obviously wants to start
+    # several at once and collect them, and giving them the shape it already knows means it
+    # can — `[search(q) for q in questions]` and then read the results.
+    #
+    # Unlike spawn there is nothing to poll: the callback itself blocks until Aviary answers,
+    # so the thread runs it once and resolves. The thread exists only so the caller is not
+    # blocked while it happens.
+    import concurrent.futures as _cf
+    import threading as _th
+
+    future = _cf.Future()
+
+    def __aviary_run():
+        try:
+            answer = __aviary_ask_app(kind, **payload)
+        except Exception as exc:  # the callback channel itself failed
+            future.set_exception(exc)
+            return
+        if isinstance(answer, dict) and "error" in answer:
+            future.set_exception(RuntimeError(answer["error"]))
+        else:
+            future.set_result(answer)
+
+    _th.Thread(target=__aviary_run).start()
+    return future
+
+
+__aviary_ns["search"] = lambda objective, queries=None, mode="fast", n=10, **rest: (
+    __aviary_async(
+        "search", objective=objective, queries=list(queries or []), mode=mode, n=n, **rest))
+__aviary_ns["read_url"] = lambda urls, objective=None, full=False, **rest: (
+    __aviary_async(
+        "read_url",
+        urls=[urls] if isinstance(urls, str) else list(urls),
+        objective=objective, full=bool(full), **rest))
 __aviary_ns["conversation"] = lambda limit=40: __aviary_ask_app("conversation", limit=limit)
 __aviary_ns["remember"] = lambda text, scope="project", days=None, tags=None: __aviary_ask_app(
     "remember", text=text, scope=scope, days=days, tags=tags or [])
