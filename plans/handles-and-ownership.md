@@ -206,6 +206,94 @@ or by well-understood scheduled cleanup.
 The middle row is the only case where work dies without anyone deciding it should, which is
 why it needs recording rather than inferring.
 
+## Q5 resolved — one clock, derived
+
+Three options, and the framing turned out to be the defect.
+
+**A — the ceiling excludes queue time.** Guarantees delivery: anything that runs, reports. But
+the hold becomes unbounded in wall-clock, so a saturated scheduler can hold a run for an hour
+of queue plus its execution ceiling, keeping an interpreter and a runtime session alive
+throughout. That is exactly the property the ceiling existed to protect.
+
+**B — the hold distinguishes the states.** B1 (do not hold for queued work) reintroduces the
+silent loss. B2 (a second, longer ceiling) creates two timeouts that must agree, which is how
+the defect got in. B3 (hold, and *cancel* if the ceiling expires while still queued) is the
+good one: the failure becomes an explicit cancellation — "no capacity, cancelled, not lost" —
+and it costs nothing, because work that never started has nothing to lose.
+
+**The real defect is two independent clocks on one event.** The hold has its own ceiling and
+handles will have their own lifetimes from their scopes; any disagreement is a silent loss, and
+B2 makes that structural.
+
+**D10. The hold has no clock of its own.** Every handle takes a deadline from its scope, and the
+scheduler is obliged to bring every handle to a terminal state — done, failed or cancelled —
+within it. The run holds while it has any non-terminal handle it is waiting on, and that is
+guaranteed to end because terminalisation is guaranteed. One clock, derived rather than
+duplicated.
+
+The honest cost: run liveness now depends on a scheduler invariant actually holding. So keep a
+backstop — but as an **assertion**, generous and loudly logged as "the scheduler failed to
+terminalise", never as a routine timeout. A routine timeout hides that bug forever; an
+assertion surfaces it the first time.
+
+## Q6 resolved — automatic, and it needs a new arrow
+
+**D11. Re-attachment is automatic, and transfer should look like passing a reference.**
+
+Every crossing so far has been Value → Message: `notify` and `message` turn a value into text.
+Handing over a handle cannot be that, or the receiver gets text and still has to `attach`. To
+look like reference-passing, delivery must land in **both sorts at once** — text into the
+conversation *and* a binding into the receiving namespace. That is a Value → (Message × Value)
+arrow, and it is the first of its kind here. It is also the first time Aviary writes into an
+agent's namespace from outside, which is a real change in what a namespace is; deliberate under
+the scope model, a violation without it.
+
+**D12. Labels are the durable names.** Handles survive a run; variable names do not, because
+they lived in the interpreter that died. So `spawn(..., name='researcher')` rebinds as
+`researcher` on resume, and unlabelled work returns keyed by id — honest about having had no
+name to preserve. `name=` earns a second purpose beyond display, and the agent gains a reason
+to name things, which helps every surface that lists this work.
+
+## Timelines, not namespaces
+
+The scope model wants a better noun. A **namespace** is a set of bindings at a moment; a
+**timeline** is a sequence of events from which the bindings at any moment are derivable.
+Lifecycle becomes the central feature rather than an attribute, scopes become intervals,
+handles become entries, and forking is copying a prefix.
+
+**The timeline already exists.** It is the transcript: append-only JSONL, ordered, durable,
+already a *tree* via `parentId`. So this is not "add a timeline" — it is "promote the one you
+have to primary and make the namespace derived".
+
+**The obstacle is named in `docs/expansion.html`, with measurements.** The Python namespace is
+not a fold over the transcript; it is a side effect of executing it. That doc puts it exactly:
+*"the message tree forks and the image cannot"* — and measures the afterlife at **105 artifact
+directories, 58 MB of dill, median 16 saved names, max 185, zero garbage collection**. Its
+"Checkpoint rail" entry proposes giving the image the branching the transcript already has, and
+names the hard part: *"an old image under a new transcript must move together or declare the
+mismatch out loud."*
+
+**But the algebra we have just built supplies the seam.** The impure operations are exactly the
+ones that go through callbacks — `sh`, `spawn`, `search`, `read_url`, `ask` — and their results
+are already recorded in the transcript. So replay need not re-execute them:
+
+> **Replay the code; serve recorded results for the callbacks.**
+
+That is record/replay, with the callback boundary as the impurity boundary. It makes replay
+faithful without dill, makes forking a prefix copy, and makes transferring a session between
+devices a matter of shipping the JSONL. The namespace stops being a 58 MB artifact to move and
+becomes a cache to rebuild.
+
+**Q7.** What escapes the seam? `time`, `random`, threads, and any socket the agent opens
+directly rather than through `sh`. Faithful replay would need those pinned or declared
+non-deterministic. How much does that matter in practice, given the agent is told to work
+through the builtins?
+
+**Q8.** The same doc counted forks in 80 real sessions: *"Median one real leaf, zero forks."*
+Nobody branched. That is a real argument against building for branching — tempered by the fact
+that forking was awkward in the harness, and availability shapes use. Worth re-counting on
+Aviary's own sessions before investing.
+
 ## Still open
 
 - **Q5.** The hold versus the queue. A run is held open while dispatched work is outstanding,
