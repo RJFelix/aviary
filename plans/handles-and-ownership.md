@@ -159,12 +159,64 @@ Contained, mostly renaming:
 500 chunks is currently 500 threads and 500 concurrent requests. The bound has to be ours
 because the agent cannot know the endpoint's concurrency. Is the pool per-provider, or global?
 
-## Open questions, collected
+## Answers, 2026-08-26
 
-- **Q1** Revocable handles — needed only for mutually distrusting agents. Probably not now.
-- **Q2** Survival across an Aviary restart: persist finished results, mark running work
-  cancelled on load?
-- **Q3** `ask()` pool: per-provider or global?
-- **Q4** Should `attach` to *running* work owned by a dead run succeed? Under D1 Aviary owns
-  it, so the run dying need not kill it — but then a fan-out survives the window that started
-  it, which is either the feature or the orphanage depending on `cancel_after`.
+**Q1 — no revocation.** Agreed. Two reasons, and the second generalises: untrusted agents would
+need a wholly different set of primitives, so *mutual trust is a stated precondition of this
+design, not an oversight*. And revocation-as-signal ("I revoke your handle, which means X") is
+overloading absence to carry meaning — if you want to signal, signal. **D6. Do not encode
+intent in the withdrawal of a capability.**
+
+**Q2 — lifetime belongs to a scope, not to a handle.** The eventual model is a tree of
+namespaces with their own scope and duration, with handle lifetimes attached to their
+namespace's lifecycle. That is better than D3's per-handle clocks: it is region-based rather
+than object-based, so a fan-out can be given a child scope and discarded wholesale. D3 survives
+as the degenerate case — scope = session — which keeps it forward-compatible. Larger design,
+deliberately deferred.
+
+**Q3 — globally managed.** `ask()` is a request Aviary *may* fulfil; when, whether, and in what
+order is the runtime's to decide. There is a global ceiling because of physics, but how it is
+allocated across sessions and workstreams is policy — priority, fair share, or first-come —
+and it is the driver's to set. This is the same law as H4 appearing a second time: **the agent
+proposes, Aviary disposes.**
+
+Two consequences:
+
+- **D7. `queued` is a distinct state from `running`.** A Future can be outstanding without
+  having started, so latency is no longer a property of the work alone.
+- **D8. Priority is inferred from the elimination form, not declared.** Awaited work is
+  blocking a cell; dispatched work said it could wait. `.result()` versus `.notify()` is a
+  scheduling signal at zero API cost, and an honest one — the agent revealed the preference by
+  acting on it rather than asserting it.
+
+**Q4 — a dying run does not kill its work.** It may schedule it for reaping, but survival must
+not be forbidden: runs die for many reasons, resuming them is normal, and work that completes
+during the dead period is work saved rather than lost. The distinction is **stopping versus
+destroying** — a session may stop or die freely, but is only *destroyed* at the driver's option
+or by well-understood scheduled cleanup.
+
+**D9. Three levels of death**, which the earlier sketch collapsed into two:
+
+| | in-process work | handles |
+|---|---|---|
+| Run stops | continues | live |
+| Aviary exits | gone (the process was in it) | persist, marked `cancelled: aviary exited` |
+| Session destroyed | cancelled deliberately | reaped, with a timestamp |
+
+The middle row is the only case where work dies without anyone deciding it should, which is
+why it needs recording rather than inferring.
+
+## Still open
+
+- **Q5.** The hold versus the queue. A run is held open while dispatched work is outstanding,
+  bounded by a timeout. With D7, work can be outstanding *and not started*, so a scheduler
+  under load could let the hold expire on work that never ran — silently converting "tell me
+  later" into "never told". Either the ceiling excludes queue time, or the hold needs to
+  distinguish the two states.
+- **Q6.** Resuming a run that stopped while its work continued: does it re-attach automatically,
+  or does the agent have to be handed its own handles back? Automatic is friendlier; explicit
+  is honest about the fact that the namespace holding the Futures is gone.
+
+## Original questions (all answered above)
+
+Q1 revocation · Q2 restart survival · Q3 `ask()` pool · Q4 attach to work whose run died.
