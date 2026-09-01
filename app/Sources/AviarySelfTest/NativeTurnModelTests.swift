@@ -48,7 +48,7 @@ func test_nativeAgentRecordsTurnPrefixesAndEffectiveModelSwitch() async throws {
             id: "first", baseURL: firstServer.baseURL, apiKey: "test-key"),
         host: host, writer: writer, hostSession: hostSession,
         config: .init(model: initialModel, cwd: "/tmp", systemPrompt: "brief"),
-        nativeJournal: bundle)
+        nativeJournal: bundle, contextBodyStore: ContextBodyStore(home: home))
 
     _ = try await bundle.commitInput(
         text: "first", deliveryMode: .delivered,

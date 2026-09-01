@@ -159,6 +159,7 @@ public actor RunJournalBundle {
     private let actor: TimelineActor
     private let sessionWriter: TimelineJournalWriter
     private let workWriter: TimelineJournalWriter
+    private let contextBodyStore: ContextBodyStore
     private var sessionCursor: JournalCursor?
     private var workCursor: JournalCursor?
     private var sessionEventCount: Int
@@ -173,6 +174,9 @@ public actor RunJournalBundle {
     private var activeTurn: TurnRef?
     private var activeRun: RunRef?
     private var lastMessage: EventRef?
+    /// The journal, not the request builder, owns cumulative carriage accounting. Values are
+    /// scoped by Run so a cold reducer and a reopened writer make the same claim.
+    private var contextDeliveredBytesByRun: [String: Int]
     private var healthState: RunJournalBundleHealth = .healthy
     private var failedJournal: JournalRef?
     private var isClosed = false
@@ -184,6 +188,7 @@ public actor RunJournalBundle {
         sessionJournal: JournalRef, workJournal: JournalRef,
         sessionAttachment: SessionAttachmentRef, run: RunRef,
         actor: TimelineActor,
+        contextBodyStore: ContextBodyStore,
         sessionWriter: TimelineJournalWriter, workWriter: TimelineJournalWriter,
         sessionCursor: JournalCursor?, workCursor: JournalCursor?,
         sessionEventCount: Int, workEventCount: Int, hostOrder: Int,
@@ -191,7 +196,8 @@ public actor RunJournalBundle {
         commands: [String: WorkCommandSnapshot] = [:],
         commandAcceptedRefs: [String: EventRef] = [:], permits: [String: EffectPermit] = [:],
         activeTurn: TurnRef? = nil, activeRun: RunRef? = nil,
-        lastMessage: EventRef? = nil
+        lastMessage: EventRef? = nil,
+        contextDeliveredBytesByRun: [String: Int] = [:]
     ) {
         self.session = session
         self.work = work
@@ -201,6 +207,7 @@ public actor RunJournalBundle {
         self.sessionAttachment = sessionAttachment
         self.run = run
         self.actor = actor
+        self.contextBodyStore = contextBodyStore
         self.sessionWriter = sessionWriter
         self.workWriter = workWriter
         self.sessionCursor = sessionCursor
@@ -216,6 +223,7 @@ public actor RunJournalBundle {
         self.activeTurn = activeTurn
         self.activeRun = activeRun
         self.lastMessage = lastMessage
+        self.contextDeliveredBytesByRun = contextDeliveredBytesByRun
     }
 
     /// Open the one native journal pair owned by an existing launch identity.
@@ -359,6 +367,7 @@ public actor RunJournalBundle {
             sessionJournal: configuration.sessionJournal, workJournal: configuration.workJournal,
             sessionAttachment: sessionAttachment, run: run,
             actor: actor,
+            contextBodyStore: ContextBodyStore(home: home),
             sessionWriter: sessionWriter, workWriter: workWriter,
             sessionCursor: nil, workCursor: nil, sessionEventCount: 0, workEventCount: 0,
             hostOrder: 0, activeRun: run)
@@ -478,6 +487,7 @@ public actor RunJournalBundle {
                 sessionJournal: configuration.sessionJournal, workJournal: configuration.workJournal,
                 sessionAttachment: sessionAttachment, run: run,
                 actor: actor,
+                contextBodyStore: ContextBodyStore(home: home),
                 sessionWriter: sessionWriter, workWriter: workWriter,
                 sessionCursor: sessionCursor, workCursor: workCursor,
                 sessionEventCount: sessionEvents.count, workEventCount: workEvents.count,
@@ -493,7 +503,9 @@ public actor RunJournalBundle {
                 activeTurn: workState.activeTurn, activeRun: run,
                 lastMessage: sessionState.semanticTip ?? sessionState.messageHistory.last.map {
                     EventRef(journal: configuration.sessionJournal, eventID: $0.eventID)
-                })
+                },
+                contextDeliveredBytesByRun:
+                    sessionState.contextCumulativeDeliveredBytesByRun ?? [:])
             do {
                 try await bundle.appendRunStarted(modelID: modelID ?? workState.modelID)
                 return bundle
@@ -525,6 +537,13 @@ public actor RunJournalBundle {
     public var latestSessionCursor: JournalCursor? { sessionCursor }
     public var latestWorkCursor: JournalCursor? { workCursor }
     public var latestHostOrder: Int { hostOrder }
+    public var activeRunContextDeliveredBytes: Int {
+        guard let activeRun else { return 0 }
+        return contextDeliveredBytesByRun[activeRun.runID] ?? 0
+    }
+    public func contextDeliveredBytes(for run: RunRef) -> Int {
+        contextDeliveredBytesByRun[run.runID] ?? 0
+    }
 
     /// Return the command state that is currently durable in Work.
     ///
@@ -951,13 +970,42 @@ public actor RunJournalBundle {
         }
     }
 
+    /// Append a context crossing and the provider action it authorizes as one semantic unit.
+    /// The Session event is written first, then the Work action carries both a causal reference
+    /// and an evidence edge back to it. A caller must retain the returned permit until the
+    /// provider request has settled.
+    public func prepareModelCrossing(
+        manifest: ContextManifest,
+        action: ActionRef = ActionRef(UUID().uuidString.lowercased()),
+        kind: ActionKind,
+        intent: String = "Request the next model response",
+        target: String? = nil
+    ) async throws -> EffectPermit {
+        try await withSemanticGate {
+            try self.ensureUsable()
+            try self.ensureRunActive()
+            guard kind == .provider || kind == .compactionProvider else {
+                throw RunJournalBundleError.invalidOperation(
+                    "a model crossing requires a provider action kind")
+            }
+            let contextCommit = try await self.appendContextManifestLocked(manifest)
+            return try await self.beginActionLocked(
+                action: action, kind: kind, intent: intent, target: target, scope: "run",
+                metadata: ["request_id": .string(manifest.requestID)],
+                causedBy: contextCommit.eventRef,
+                links: [TimelineLink(kind: .derivedFrom, target: contextCommit.eventRef)])
+        }
+    }
+
     private func beginActionLocked(
         action: ActionRef,
         kind: ActionKind,
         intent: String,
         target: String?,
         scope: String?,
-        metadata: [String: JSONValue]
+        metadata: [String: JSONValue],
+        causedBy: EventRef? = nil,
+        links: [TimelineLink] = []
     ) async throws -> EffectPermit {
         try ensureUsable()
         guard activeRun != nil else {
@@ -980,9 +1028,10 @@ public actor RunJournalBundle {
         if let scope { payload["scope"] = .string(scope) }
         if !metadata.isEmpty { payload["metadata"] = .object(metadata) }
         let intentCommit = try await appendWork(TimelineEventDraft(
-            hostSequence: nextHostOrder(), work: work, workHost: workHost,
+            hostSequence: nextHostOrder(), causedByEventID: causedBy,
+            work: work, workHost: workHost,
             run: activeRun, action: action, type: TimelineEventType.actionIntent,
-            declaredDomains: [.work, .externalEffects], payload: .object(payload)))
+            declaredDomains: [.work, .externalEffects], links: links, payload: .object(payload)))
         let startedCommit = try await appendWork(TimelineEventDraft(
             hostSequence: nextHostOrder(), causedByEventID: intentCommit.eventRef,
             parentActivityID: intentCommit.eventRef,
@@ -1135,6 +1184,63 @@ public actor RunJournalBundle {
                     "summary_bytes": .number(Double(summary.utf8.count)),
                 ])))
         }
+    }
+
+    /// Record the exact bounded metadata for the next model request before crossing the
+    /// provider boundary. Bodies remain in their owning timeline/artifact store; this event
+    /// carries only stable identities, provenance, hashes, measured sizes, and omissions.
+    @discardableResult
+    public func commitContextManifest(
+        _ manifest: ContextManifest
+    ) async throws -> TimelineJournalCommit {
+        try await withSemanticGate {
+            try self.ensureUsable()
+            try self.ensureRunActive()
+            return try await self.appendContextManifestLocked(manifest)
+        }
+    }
+
+    private func appendContextManifestLocked(
+        _ manifest: ContextManifest
+    ) async throws -> TimelineJournalCommit {
+        guard let activeRun else {
+            throw RunJournalBundleError.invalidOperation(
+                "cannot assemble model context without an active Run")
+        }
+        do {
+            try manifest.validate(
+                authority: sessionJournal,
+                previousCumulativeDeliveredBytes:
+                    contextDeliveredBytesByRun[activeRun.runID],
+                requireRetainedBodies: true)
+            // Reference metadata is only a claim. Resolve every body from the store owned by
+            // this bundle and verify its digest and length before the Session may say the
+            // crossing is reconstructable or a Work permit can escape.
+            for component in manifest.components {
+                _ = try contextBodyStore.read(component.bodyReference!)
+            }
+        } catch {
+            throw RunJournalBundleError.invalidOperation(
+                "context manifest or retained body is invalid: \(error.localizedDescription)")
+        }
+        let commit = try await appendSession(TimelineEventDraft(
+            hostSequence: nextHostOrder(), session: session,
+            work: work, workHost: workHost, run: activeRun,
+            type: TimelineEventType.contextAssembled,
+            declaredDomains: [.session, .context], payload: .object([
+                "manifest_id": .string(manifest.manifestID),
+                "request_id": .string(manifest.requestID),
+                "model_id": .string(manifest.modelID),
+                "schema_version": .number(Double(manifest.schemaVersion)),
+                "measured_by": .string(manifest.measuredBy),
+                "measured_bytes": .number(Double(manifest.measuredBytes)),
+                "delivered_bytes": .number(Double(manifest.deliveredBytes)),
+                "cumulative_delivered_bytes": .number(Double(manifest.cumulativeDeliveredBytes)),
+                "components": .array(manifest.components.map(encodeTimelineValue)),
+                "omissions": .array(manifest.omissions.map(encodeTimelineValue)),
+            ])))
+        contextDeliveredBytesByRun[activeRun.runID] = manifest.cumulativeDeliveredBytes
+        return commit
     }
 
     /// End the current run only after all actions and turns are terminal. Cursor advancement is a

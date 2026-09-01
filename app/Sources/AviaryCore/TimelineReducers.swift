@@ -26,6 +26,35 @@ public struct WorkReducer: Sendable {
             recordUnknown(event)
             return
         }
+        // Child lifecycle records are the source of truth for Flock's child rows.  They must
+        // carry the parent's Work identity explicitly; otherwise a reader can accept the
+        // event into the parent's reducer while a canonical projection silently drops it.  If
+        // the producer includes the optional parent Session/Run fields, they must agree with
+        // the typed envelope too.  Do this before the general identity fields below are copied
+        // so a foreign record cannot overwrite the reducer's established Work identity while
+        // being quarantined.
+        if event.type == TimelineEventType.childLifecycle {
+            guard let expectedWork = snapshot.work,
+                  let eventWork = event.work,
+                  eventWork == expectedWork else {
+                quarantine(event, reason: "child lifecycle Work ownership is missing or mismatched")
+                return
+            }
+            if let parentSessionID = event.payload["parent_session_id"]?.stringValue {
+                guard let eventSession = event.session,
+                      eventSession.sessionID == parentSessionID else {
+                    quarantine(event, reason: "child lifecycle parent Session does not match envelope")
+                    return
+                }
+            }
+            if let parentRunID = event.payload["parent_run_id"]?.stringValue {
+                guard let eventRun = event.run,
+                      eventRun.runID == parentRunID else {
+                    quarantine(event, reason: "child lifecycle parent Run does not match envelope")
+                    return
+                }
+            }
+        }
         if let work = event.work { snapshot.work = work }
         if let host = event.workHost { snapshot.workHost = host }
         if isExecutionMutation(event.type) && isTerminalLifecycle {
@@ -634,7 +663,43 @@ public struct SessionReducer: Sendable {
                 quarantine(event, reason: "context component manifest is malformed")
                 return
             }
+            let contextManifest = decodeContextManifest(event.payload, components: components)
+            if event.payload["manifest_id"] != nil && contextManifest == nil {
+                quarantine(event, reason: "context crossing metadata is malformed")
+                return
+            }
+            if let contextManifest {
+                guard let run = event.run,
+                      let work = event.work,
+                      let workHost = event.workHost,
+                      work.workHostID == workHost.workHostID,
+                      !run.runID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !work.workID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !work.workHostID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !workHost.workHostID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    quarantine(
+                        event,
+                        reason: "context crossing is missing or mismatches Work, Work Host, or Run identity")
+                    return
+                }
+                do {
+                    try contextManifest.validate(
+                        authority: event.journal,
+                        previousCumulativeDeliveredBytes:
+                            snapshot.contextCumulativeDeliveredBytesByRun?[run.runID],
+                        requireRetainedBodies: true)
+                } catch {
+                    quarantine(
+                        event,
+                        reason: "context crossing failed canonical validation: \(error.localizedDescription)")
+                    return
+                }
+                var totals = snapshot.contextCumulativeDeliveredBytesByRun ?? [:]
+                totals[run.runID] = contextManifest.cumulativeDeliveredBytes
+                snapshot.contextCumulativeDeliveredBytesByRun = totals
+            }
             snapshot.contextComponents = components
+            snapshot.contextManifest = contextManifest
             snapshot.contextBoundaryEventID = event.eventID
         case TimelineEventType.compaction:
             guard let summary = event.payload["summary"]?.stringValue,
@@ -833,4 +898,29 @@ private func decodeContextComponents(_ payload: JSONValue) -> [ContextComponent]
         return component
     }
     return decoded.count == values.count ? decoded : nil
+}
+
+private func decodeContextManifest(
+    _ payload: JSONValue, components: [ContextComponent]
+) -> ContextManifest? {
+    guard let manifestID = payload["manifest_id"]?.stringValue,
+          let requestID = payload["request_id"]?.stringValue,
+          let modelID = payload["model_id"]?.stringValue,
+          let measuredBy = payload["measured_by"]?.stringValue,
+          let schemaVersion = payload["schema_version"]?.intValue,
+          let measuredBytes = payload["measured_bytes"]?.intValue,
+          let deliveredBytes = payload["delivered_bytes"]?.intValue,
+          let cumulativeDeliveredBytes = payload["cumulative_delivered_bytes"]?.intValue,
+          let omissionValues = payload["omissions"]?.arrayValue else { return nil }
+    let omissions: [ContextManifestOmission] = omissionValues.compactMap {
+        decodeTimelineValue($0)
+    }
+    guard omissions.count == omissionValues.count else { return nil }
+    let manifest = ContextManifest(
+        schemaVersion: schemaVersion, manifestID: manifestID, requestID: requestID,
+        modelID: modelID, measuredBy: measuredBy, components: components,
+        omissions: omissions, cumulativeDeliveredBytes: cumulativeDeliveredBytes)
+    guard manifest.measuredBytes == measuredBytes,
+          manifest.deliveredBytes == deliveredBytes else { return nil }
+    return manifest
 }

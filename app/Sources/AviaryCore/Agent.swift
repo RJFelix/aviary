@@ -126,6 +126,7 @@ public actor Agent {
     private var provider: ChatProvider
     private let host: RuntimeHost
     private let writer: SessionWriter
+    private let contextBodyStore: ContextBodyStore?
     /// The canonical Session/Work producer for native runs. The legacy writer remains an
     /// explicit presentation adapter until every reader consumes Timeline v2 directly.
     private let nativeJournal: RunJournalBundle?
@@ -160,6 +161,8 @@ public actor Agent {
     /// how full the context is, and an exact one — unlike counting characters.
     private var lastInputTokens = 0
     private var compactions = 0
+    /// Monotonic identity for native context crossings in this Run.
+    private var modelRequestOrdinal = 0
     /// How a child reports back to its parent, and who to notify.
     private var spawnDelegate: SpawnDelegate?
     private var peerDelegate: PeerDelegate?
@@ -190,12 +193,14 @@ public actor Agent {
     public init(
         provider: ChatProvider, host: RuntimeHost, writer: SessionWriter,
         hostSession: String, config: Configuration,
-        nativeJournal: RunJournalBundle? = nil
+        nativeJournal: RunJournalBundle? = nil,
+        contextBodyStore: ContextBodyStore? = nil
     ) {
         self.provider = provider
         self.host = host
         self.writer = writer
         self.nativeJournal = nativeJournal
+        self.contextBodyStore = contextBodyStore
         self.hostSession = hostSession
         self.config = config
         // A defensive filter rather than a precondition: a stale system prompt from a previous
@@ -1075,6 +1080,74 @@ public actor Agent {
         }
     }
 
+    /// Retain what the next provider request will receive, then durably append its Session
+    /// manifest and causally linked Work action before returning an effect permit.
+    private func prepareModelCrossing(
+        for request: ChatRequest,
+        purpose: String,
+        kind: ActionKind,
+        intent: String
+    ) async -> EffectPermit? {
+        guard let nativeJournal else { return nil }
+        guard let contextBodyStore else {
+            latchNativeJournalFailure(
+                "the \(purpose) context crossing",
+                NativeJournalFailure(detail: "The retained context body store is unavailable."))
+            return nil
+        }
+        let ordinal = modelRequestOrdinal
+        let priorDeliveredBytes = await nativeJournal.activeRunContextDeliveredBytes
+        let requestID = "\(nativeJournal.run.runID):\(purpose):\(ordinal)"
+        let baseManifest: ContextManifest
+        do {
+            baseManifest = try ContextManifest.build(
+                request: request, manifestID: requestID, requestID: requestID,
+                priorDeliveredBytes: priorDeliveredBytes)
+        } catch {
+            latchNativeJournalFailure("encoding the \(purpose) context", error)
+            return nil
+        }
+        var bodyReferences: [String: TimelineBodyReference] = [:]
+        do {
+            // The first component per message is in message order; the final optional
+            // component is the tool schema. Retain the full source bytes before the manifest
+            // event can make the provider crossing look reconstructable.
+            for (index, message) in request.messages.enumerated() {
+                guard index < baseManifest.components.count else { continue }
+                let component = baseManifest.components[index]
+                let reference = try contextBodyStore.retain(
+                    try ContextManifest.bodyData(for: message),
+                    authority: nativeJournal.sessionJournal,
+                    mediaType: "application/vnd.aviary.chat-message+json")
+                bodyReferences[component.sourceID] = reference
+            }
+            if !request.tools.isEmpty, let component = baseManifest.components.last {
+                let reference = try contextBodyStore.retain(
+                    try ContextManifest.toolsData(for: request.tools),
+                    authority: nativeJournal.sessionJournal,
+                    mediaType: "application/vnd.aviary.tool-schema-manifest+json")
+                bodyReferences[component.sourceID] = reference
+            }
+        } catch {
+            latchNativeJournalFailure("retaining the \(purpose) context body", error)
+            return nil
+        }
+        do {
+            let manifest = try ContextManifest.build(
+                request: request, manifestID: requestID, requestID: requestID,
+                bodyReferences: bodyReferences,
+                priorDeliveredBytes: priorDeliveredBytes)
+            let permit = try await nativeJournal.prepareModelCrossing(
+                manifest: manifest, kind: kind, intent: intent,
+                target: config.model.qualifiedID)
+            modelRequestOrdinal += 1
+            return permit
+        } catch {
+            latchNativeJournalFailure("the \(purpose) context crossing", error)
+            return nil
+        }
+    }
+
     /// Notes are themselves a crossing into the durable session. A failed hook or artifact
     /// annotation must not be treated as cosmetic: continuing to the next runtime effect would
     /// leave an unrecorded action in the transcript.
@@ -1463,9 +1536,9 @@ public actor Agent {
             ])
 
         var summary = ""
-        let permit = await beginNativeAction(
-            kind: .compactionProvider, intent: "Compact the conversation with the provider",
-            target: config.model.qualifiedID)
+        let permit = await prepareModelCrossing(
+            for: ask, purpose: "compaction", kind: .compactionProvider,
+            intent: "Compact the conversation with the provider")
         do { try requireNativePermit(permit, for: "compaction provider") }
         catch { return }
         do {
@@ -1549,9 +1622,9 @@ public actor Agent {
             maxTokens: config.maxTokens,
             reasoningEffort: config.reasoningEffort)
 
-        let permit = await beginNativeAction(
-            kind: .provider, intent: "Request the next agent response",
-            target: config.model.qualifiedID)
+        let permit = await prepareModelCrossing(
+            for: request, purpose: "model", kind: .provider,
+            intent: "Request the next agent response")
         try requireNativePermit(permit, for: "provider")
         var turn = Turn()
         var streamFailure: Error?

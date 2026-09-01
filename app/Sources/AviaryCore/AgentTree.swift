@@ -60,6 +60,65 @@ public struct AgentTree: Sendable {
     public var runningCount: Int { allNodes.filter(\.isRunning).count }
 }
 
+/// The bounded canonical projection that Flock can consume while the richer legacy tree is
+/// still backed by `rlm-subagents.jsonl`.  A canonical child row deliberately contains only
+/// facts present on the Work journal: it has no fabricated transcript URL, model, attention, or
+/// session identity.  Those are separate Session/Work projections and must not be inferred from
+/// a child id or from an unaligned read.
+public struct CanonicalFlockNode: Codable, Hashable, Sendable, Identifiable {
+    public let childID: String
+    public let name: String?
+    public let state: String
+    public let parentSession: SessionRef?
+    public let parentWork: WorkRef
+    public let parentRun: RunRef?
+    public let source: EventRef
+
+    public var id: String { childID }
+
+    public init(childID: String, name: String?, state: String,
+                parentSession: SessionRef?, parentWork: WorkRef,
+                parentRun: RunRef?, source: EventRef) {
+        self.childID = childID
+        self.name = name
+        self.state = state
+        self.parentSession = parentSession
+        self.parentWork = parentWork
+        self.parentRun = parentRun
+        self.source = source
+    }
+}
+
+/// A source-qualified, exact-tip projection for the Flock reader.
+public struct CanonicalFlockProjection: Codable, Hashable, Sendable {
+    /// Identity is nil when the supplied snapshot cannot establish a canonical Work owner;
+    /// unavailable output must not manufacture an "unknown" host or journal.
+    public let journal: JournalRef?
+    public let work: WorkRef?
+    public let workHost: WorkHostRef?
+    public let cursor: JournalCursor?
+    public let nodes: [CanonicalFlockNode]
+    public let isAvailable: Bool
+    public let integrityValid: Bool
+    public let unknownEventRefs: [EventRef]
+    public let unavailableReason: String?
+
+    public init(journal: JournalRef?, work: WorkRef?, workHost: WorkHostRef?,
+                cursor: JournalCursor?, nodes: [CanonicalFlockNode], isAvailable: Bool,
+                integrityValid: Bool, unknownEventRefs: [EventRef] = [],
+                unavailableReason: String? = nil) {
+        self.journal = journal
+        self.work = work
+        self.workHost = workHost
+        self.cursor = cursor
+        self.nodes = nodes
+        self.isAvailable = isAvailable
+        self.integrityValid = integrityValid
+        self.unknownEventRefs = unknownEventRefs
+        self.unavailableReason = unavailableReason
+    }
+}
+
 /// Reads the sub-agent topology out of the harness's own bookkeeping.
 ///
 /// Two sources record it and they disagree in useful ways: `rlm-ledger/*.jsonl` is an
@@ -68,6 +127,74 @@ public struct AgentTree: Sendable {
 /// text. Aviary reads the per-session files as primary — they are the ones that get
 /// updated — and folds in ledger edges the artifacts missed.
 public enum AgentTreeReader {
+    /// Project child lifecycle records for Flock only when the supplied Work read is an exact,
+    /// canonical append-chain ending at the supplied reducer snapshot. Stale, divergent,
+    /// foreign, tailed, or corrupt reads are visible as unavailable and yield no child rows;
+    /// this prevents Flock from turning a partial host view into a false lifecycle.
+    public static func canonicalProjection(
+        work: WorkSnapshot, read: TimelineJournalReadResult
+    ) -> CanonicalFlockProjection {
+        guard let journal = work.journal, let workRef = work.work,
+              let host = work.workHost,
+              case .work(let journalWork) = journal.owner,
+              journalWork == workRef,
+              journal.authority.authorityID == host.workHostID,
+              host == WorkHostRef(workRef.workHostID),
+              read.records.isEmpty == false,
+              read.quarantinedSuffix == nil, read.truncatedTail == nil,
+              read.records.allSatisfy({
+                  $0.event.journal == journal
+                      && ($0.event.work == nil || $0.event.work == workRef)
+                      && ($0.event.workHost == nil || $0.event.workHost == host)
+              }),
+              read.records.first?.event.sequence == 1,
+              read.records.first?.event.previousEventID == nil,
+              read.records.dropFirst().enumerated().allSatisfy({ offset, record in
+                  let previous = read.records[offset].event
+                  return record.event.sequence == previous.sequence + 1
+                      && record.event.previousEventID == previous.eventID
+              }),
+              Set(read.records.map { $0.event.eventID }).count == read.records.count,
+              let last = read.records.last,
+              work.lastEventID == last.event.eventID,
+              work.lastSequence == last.event.sequence,
+              work.structuralIntegrityValid, work.semanticProjectionValid
+        else {
+            return CanonicalFlockProjection(
+                journal: work.journal, work: work.work,
+                workHost: work.workHost,
+                cursor: nil, nodes: [], isAvailable: false, integrityValid: false,
+                unavailableReason: "Work read is not an exact canonical reducer tip")
+        }
+
+        var latest: [String: CanonicalFlockNode] = [:]
+        for event in read.records.map(\.event) where event.type == TimelineEventType.childLifecycle {
+            guard let childID = event.payload["child_id"]?.stringValue,
+                  let state = event.payload["state"]?.stringValue,
+                  !childID.isEmpty, !state.isEmpty,
+                  let eventWork = event.work, eventWork == workRef,
+                  (event.payload["parent_session_id"]?.stringValue == nil
+                      || event.payload["parent_session_id"]?.stringValue == event.session?.sessionID),
+                  (event.payload["parent_run_id"]?.stringValue == nil
+                      || event.payload["parent_run_id"]?.stringValue == event.run?.runID)
+        else { continue }
+            latest[childID] = CanonicalFlockNode(
+                childID: childID, name: event.payload["name"]?.stringValue, state: state,
+                parentSession: event.session, parentWork: workRef,
+                parentRun: event.run,
+                source: EventRef(journal: journal, eventID: event.eventID))
+        }
+        let cursor = JournalCursor(journal: journal, eventID: last.event.eventID,
+                                   sequence: last.event.sequence)
+        return CanonicalFlockProjection(
+            journal: journal, work: workRef, workHost: host, cursor: cursor,
+            nodes: latest.values.sorted { $0.childID < $1.childID },
+            isAvailable: true, integrityValid: true,
+            unknownEventRefs: work.unknownEvents.map {
+                EventRef(journal: $0.event.journal, eventID: $0.event.eventID)
+            })
+    }
+
     public static func read(home: AgentHome) -> AgentTree {
         var nodes: [String: AgentNode] = [:]         // childId -> node
         var childSessionToParent: [String: String] = [:]  // child session id -> parent session id

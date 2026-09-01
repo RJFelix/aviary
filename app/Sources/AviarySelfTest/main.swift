@@ -6361,6 +6361,12 @@ let casesPhase1Timeline: [Case] = [
     ("phase1 census: linked fixture reports canonical state planes", {
         try test_readerCensusFixtureProjectsCorePlanes()
     }),
+    ("phase1 census: canonical Flock rejects unaligned or foreign Work", {
+        try test_readerCensusFlockRejectsUnalignedOrForeignWork()
+    }),
+    ("phase1 census: malformed child ownership cannot be silently omitted", {
+        try test_readerCensusRejectsMalformedChildOwnershipInsteadOfOmittingIt()
+    }),
     ("phase1 census: indeterminate actions override authored attention", {
         try test_readerCensusIndeterminateActionOverridesAuthoredAttention()
     }),
@@ -6378,6 +6384,36 @@ let casesPhase1Timeline: [Case] = [
     }),
     ("phase1 census: manifest and retained bodies round-trip", {
         try test_readerCensusManifestAndRetainedBodiesRoundTrip()
+    }),
+]
+
+let casesContextManifest: [Case] = [
+    ("phase1 context: manifest is stable measured and secret safe", {
+        try test_contextManifestIsStableMeasuredAndSecretSafe()
+    }),
+    ("phase1 context: contradictory body metadata is omitted", {
+        try test_contextManifestRejectsContradictoryBodyMetadata()
+    }),
+    ("phase1 context: crossing verifies bodies and exact cumulative totals", {
+        try await test_contextCrossingRejectsMissingRetainedBodyAndFalseCumulativeClaims()
+    }),
+    ("phase1 context: cold replay applies canonical manifest validation", {
+        try test_contextManifestColdReplayUsesCanonicalValidationAndRunScopedTotals()
+    }),
+    ("phase1 context: cold reopen restores per-Run context totals", {
+        try await test_runJournalBundleRestoresPerRunContextTotalsOnColdReopen()
+    }),
+    ("phase1 context: bundle persists metadata before provider requests", {
+        try await test_runJournalBundlePersistsContextManifestWithoutBodyText()
+    }),
+    ("phase1 context: Work action failure cannot issue a provider permit", {
+        try await test_contextWorkIntentFailureCannotIssueProviderPermit()
+    }),
+    ("phase1 context: manifest and causal action precede provider invocation", {
+        try await test_contextManifestAndCausalActionAreDurableBeforeProviderCall()
+    }),
+    ("phase1 context: manifest failure prevents provider call", {
+        try await test_contextManifestFailurePreventsProviderCall()
     }),
 ]
 
@@ -6470,7 +6506,7 @@ await Harness.run(
         + casesPeers + casesMCPSurface
         + casesBackgroundSpawn + casesWebSearch + casesDispatched
         + casesCrossingLaws + casesPhase0SessionControl + casesPhase1Timeline
-        + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
+        + casesContextManifest + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal
         + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel
         + casesNativeIndeterminateEffects + casesChildLifecycle

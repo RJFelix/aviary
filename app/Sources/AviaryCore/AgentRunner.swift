@@ -327,7 +327,8 @@ public actor AgentRunner {
                     reasoningEffort: settings.reasoningEffort,
                 maxDepth: settings.maxDepth, depth: 0, goal: settings.goal,
                 resumedHistory: replay.messages),
-            nativeJournal: settings.nativeJournal)
+            nativeJournal: settings.nativeJournal,
+            contextBodyStore: ContextBodyStore(home: settings.home))
 
         let obs = observer
         await agent.observe { event in obs?(event) }

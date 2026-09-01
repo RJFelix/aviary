@@ -38,7 +38,7 @@ func test_nativeQueuedSteerCancellationProducesNotDeliveredOutcome() async throw
         provider: provider, host: host, writer: writer,
         hostSession: identity.workID,
         config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "brief"),
-        nativeJournal: bundle)
+        nativeJournal: bundle, contextBodyStore: ContextBodyStore(home: home))
     let sendTask = Task {
         await agent.send("hold") { delivery in
             switch delivery {

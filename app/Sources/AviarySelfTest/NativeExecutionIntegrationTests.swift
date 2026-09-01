@@ -394,7 +394,7 @@ func test_nativeExecutionAgentProviderPythonAndConversationReduceFromDisk() asyn
             id: "fake", baseURL: server.baseURL, apiKey: "test-key"),
         host: host, writer: writer, hostSession: hostSession,
         config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "be brief"),
-        nativeJournal: bundle)
+        nativeJournal: bundle, contextBodyStore: ContextBodyStore(home: home))
     await agent.enableHooks(true)
 
     let outcome = await agent.send("what is six times seven?")
@@ -559,7 +559,7 @@ func test_nativeExecutionCompactionProviderHasTerminalReceipt() async throws {
         provider: OpenAICompletionsProvider(id: "fake", baseURL: server.baseURL, apiKey: nil),
         host: host, writer: writer, hostSession: hostSession,
         config: .init(model: model, cwd: "/tmp", systemPrompt: "sys", maxIterations: 12),
-        nativeJournal: bundle)
+        nativeJournal: bundle, contextBodyStore: ContextBodyStore(home: home))
     await agent.send("do six things")
     try await writer.closeChecked()
     try await host.destroySession(hostSession)

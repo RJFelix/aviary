@@ -193,7 +193,7 @@ func test_nativeProviderDoesNotRunWhenIntentCannotBeCommitted() async throws {
             id: "fake", baseURL: server.baseURL, apiKey: "test-key"),
         host: host, writer: writer, hostSession: hostSession,
         config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "brief"),
-        nativeJournal: bundle)
+        nativeJournal: bundle, contextBodyStore: ContextBodyStore(home: home))
     await bundle.injectWriterFailure(.beforeWrite, in: .work)
 
     guard case .failed = await agent.send("do not call") else {
@@ -225,7 +225,7 @@ func test_nativeOutcomeFailureStopsAfterOneEffectAndRequiresRecovery() async thr
     let agent = Agent(
         provider: provider, host: host, writer: writer, hostSession: hostSession,
         config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "brief"),
-        nativeJournal: bundle)
+        nativeJournal: bundle, contextBodyStore: ContextBodyStore(home: home))
 
     guard case .failed = await agent.send("one call") else {
         XCTFail("an unrecordable provider outcome must fail the run")

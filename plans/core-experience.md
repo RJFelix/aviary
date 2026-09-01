@@ -1,6 +1,6 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0 and Timeline v2 foundations implemented, phases not complete
+Status: implementation in progress; Phase 0 and Phase 1 live-producer foundations implemented, phases not complete
 Date: 2026-08-31
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
@@ -25,27 +25,29 @@ events, and quarantines malformed or truncated suffixes without overstating the 
 versioned Reader Census fixture exercises branching, compaction, model change, queued input, child
 completion, late steering, indeterminate actions, unknown events, legacy input, retained bodies, and
 malformed/truncated tails across linked Session and Work journals. It truthfully marks the
-remaining native Catalog consumers, Flock, notifications, search, and service recovery as not yet
-wired to the new projections.
+remaining native Catalog consumers, the production Flock UI, notifications, search, and service
+recovery as not yet wired to the new projections. A source-qualified canonical Flock adapter now
+joins the Census separately from that still-legacy UI consumer.
 
 A canonical catalog adapter now projects authority-qualified Session identities and attached Work
 at independently verified requested/observed cursors. Only attached, exactly aligned Work with
 valid structural and semantic reducer projections can lend the catalog lifecycle, model,
 attention, or action facts; unavailable, stale, ahead, divergent, detached, and corrupt Work
-remain visible without those facts. The Reader Census registers this canonical projection, and the Sessions list
-now consumes a typed projection boundary. The on-disk `SessionCatalog` scanner remains an explicit
-legacy adapter until native Session journals replace it; Flock, notifications, search, and service
-recovery remain unwired to the canonical projection. Work rows separately report whether a supplied
-journal read is absent, exact, stale, ahead, foreign, divergent, or invalid; `journalIntegrityValid`
+remain visible without those facts. The Reader Census registers this canonical projection, and the
+Sessions list now consumes a typed projection boundary. The on-disk `SessionCatalog` scanner remains
+an explicit legacy adapter until native Session journals replace it; the Flock UI, notifications,
+search, and service recovery remain unwired to the canonical projection. Work rows separately report
+whether a supplied journal read is absent, exact, stale, ahead, foreign, divergent, or invalid; `journalIntegrityValid`
 is nil only when no read was supplied and is false for every supplied non-exact or tailed read.
 
-The production legacy-session path now records and synchronizes a complete command-intent record
-before GUI or CLI dispatch, latches ambiguous writer failures, and blocks later model, Python, MCP,
-process, or child effects. End retains a deliberately degraded local teardown permit so journal
-failure cannot strand resources. Writer setup precedes provider/runtime/process setup; normal and
-failed terminal publication follows quiescence, runtime cleanup, and checked writer close. This is a
-bridge into the existing single transcript, not the native split Session/Work writer, complete
-per-action audit denominator, or out-of-process Work service promised by later phases.
+The production GUI and CLI paths now open the native paired Session/Work bundle before Start
+admission and carry that exact bundle through `SessionCommandController`, `AgentRunner`, and
+`Agent`. Native Work acceptance is authority; the legacy transcript is a downstream compatibility
+projection, so a later projection failure cannot rewrite an accepted command as rejected. Exact
+causal cursors survive admission, and accepted commands end in delivered, not-delivered, or
+indeterminate delivery receipts with first-terminal-wins concurrency semantics. Journal ambiguity
+latches the run and blocks later effects. End retains a deliberately degraded local teardown permit
+so journal failure cannot strand resources.
 
 The native producer foundation now includes a locked, synchronizing single-journal writer and a
 paired `RunJournalBundle` for one Session journal plus one Work journal. Fresh creation opens both
@@ -60,27 +62,46 @@ non-reentrant semantic gate prevents concurrent callers from reusing a host orde
 identity/lifecycle checks while the actor awaits disk I/O. The pair deliberately does not claim a
 cross-file transaction.
 
-This native bundle is not yet the live execution path. It has not been passed through the GUI, CLI,
-`SessionCommandController`, `AgentRunner`, or `Agent`, and the provider, Python, MCP, hook, callback,
-web, peer, child, memory, artifact, and image dispatch sites do not yet obtain its effect permits.
-The current production path therefore remains the durable legacy command-intent bridge above; no
-per-action audit or GUI-survival claim is implied by the native producer tests.
+The live in-house path obtains native effect permits for provider and compaction requests, Python,
+MCP, hooks and callbacks, runtime creation/teardown, web/search/extract, peer and self delivery,
+memory, artifacts, images, and child dispatch. Transport loss after a possible effect is recorded as
+`indeterminate_effect` with unsafe retry rather than a generic failure. Runtime callback admission
+closes and drains before teardown; child running and terminal lifecycle records keep parent
+provenance; and canceled callers cannot prevent action, Run, or checked-close terminal records.
+This preserves Aviary's intentional capability-first, unsandboxed Python posture: hooks can govern
+Aviary-dispatched calls but are not described as a containment or security boundary.
+
+Every in-house provider and compaction request now crosses one native preparation boundary. Aviary
+first retains the full semantic `ChatRequest` components in a content-addressed body store, then
+appends a metadata-only `context.assembled` Session event, then appends the causally linked provider
+action intent/start on Work, and only then invokes the provider. Components carry stable content and
+per-request inclusion identities, source authority where known, hashes, a named semantic byte
+measurement basis, delivered/full sizes, explicit truncation and omissions, and cumulative bytes for
+the Run. The body file, directory hierarchy, and rename are synchronized before the journal crossing;
+the bundle resolves and verifies every referenced body, owns exact per-Run cumulative totals, and
+restores those totals from cold reduction. Live and cold paths share overflow-safe manifest and
+Work/Work Host/Run provenance validation. Manifest or Work-action failure returns no effect permit.
+Reducers and Reader Census retain the latest complete manifest without copying bodies or inspecting
+Python `repr` values.
 
 The Apple Swift 6.3.3 compiler accepts the SDK emitted by Apple Swift 6.3.2; the compatibility probe
-now configures its own writable module cache and succeeds both directly and through every gate. At
-this checkpoint, the full suite passes 353 cases / 3,060 assertions in 36.13 seconds and `just
-compile` is clean. The last visual gate before this nonvisual producer slice rendered all 8
-canonical screens. The versioned 100,000-event benchmark reads and reduces a 46,766,700-byte input
-in 5.71 seconds on the checkpoint machine. The focused paired-bundle suite passes 13 cases / 142
-assertions. Independent Sol seam review found no remaining must-fix writer/bundle blocker after
-adversarial concurrency, reopen, prefix, and delivery review.
+configures its own writable module cache and succeeds both directly and through every gate. At this
+checkpoint, the full suite passes 400 cases / 3,559 assertions in 45.20 seconds and `just compile`
+is clean. Phase 1 passes 109 cases / 1,630 assertions. The versioned 100,000-event benchmark reads
+and reduces a 46,766,700-byte input in 5.588 seconds on the checkpoint machine (generation 0.899
+seconds). The last visual gate before this nonvisual producer slice rendered all 8 canonical screens.
+Final Sol review found no remaining must-fix issue after body durability, cumulative restoration,
+live/cold manifest parity, and Flock child-ownership findings were remediated.
 
 Phase 0 still owes real VoiceOver/keyboard UI automation and broader driver focus/race proof. Phase 1
-still owes wiring the native producers through every real execution/effect boundary and completing
-consumer migrations, plus actual disk-full and permission fault reachability and a measured peak-RSS
-budget. The 100,000-event benchmark fixes an encoded-input and read/reduce baseline, but does not
-claim incremental rendering or bounded peak memory. The out-of-process Work Host, GUI-independent
-survival, and remote multi-client ownership remain Phase 3 rather than being implied here.
+still owes canonical consumer migrations; decomposing flattened system-prompt sources and preserving
+their event provenance; native cold resume from the retained context snapshot; independent native
+Work bundles for children; actual disk-full and permission fault reachability; and a measured
+peak-RSS budget. The semantic component measure is deliberately not claimed to be provider-specific
+HTTP wire size. The 100,000-event benchmark fixes an encoded-input and read/reduce baseline, but does
+not claim incremental rendering or bounded peak memory. The out-of-process Work Host,
+GUI-independent process survival, and remote multi-client ownership remain Phase 3 rather than being
+implied here.
 
 ## Outcome
 

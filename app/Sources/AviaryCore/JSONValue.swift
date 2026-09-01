@@ -110,7 +110,12 @@ extension JSONValue {
     }
 
     public var intValue: Int? {
-        guard let d = doubleValue else { return nil }
+        guard let d = doubleValue, d.isFinite, d.rounded() == d else { return nil }
+        // `Double(Int.max)` rounds up to the first unrepresentable Int on 64-bit targets.
+        // Keep the upper bound exclusive so adversarial JSON is rejected rather than trapping
+        // inside the numeric conversion before a reducer can quarantine the event.
+        let upperExclusive = -Double(Int.min)
+        guard d >= Double(Int.min), d < upperExclusive else { return nil }
         return Int(d)
     }
 

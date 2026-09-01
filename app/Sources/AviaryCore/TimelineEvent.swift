@@ -1329,6 +1329,12 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
     public var messages: [SessionMessageSnapshot] = []
     public var messageHistory: [SessionMessageSnapshot] = []
     public var contextComponents: [ContextComponent] = []
+    /// The latest complete provider-bound context crossing. Legacy fixtures may carry only
+    /// `contextComponents`; a nil value therefore means "older projection," not "no context."
+    public var contextManifest: ContextManifest?
+    /// Authoritative context-carriage totals, scoped by Run. Optional preserves decoding of
+    /// snapshots created before cumulative manifests existed.
+    public var contextCumulativeDeliveredBytesByRun: [String: Int]?
     public var contextBoundaryEventID: String?
     /// The latest compaction summary is a durable context projection, not merely an unknown
     /// event retained for a future reader.

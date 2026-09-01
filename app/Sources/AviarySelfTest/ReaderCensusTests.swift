@@ -53,6 +53,19 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertTrue(report.workStructuralIntegrityValid)
     XCTAssertTrue(report.sessionSemanticProjectionValid)
     XCTAssertTrue(report.workSemanticProjectionValid)
+    let flock = try XCTUnwrap(report.canonicalFlock)
+    XCTAssertTrue(flock.isAvailable)
+    XCTAssertTrue(flock.integrityValid)
+    XCTAssertEqual(flock.work, WorkRef(workHostID: "census-host", workID: "census-work"))
+    XCTAssertEqual(flock.workHost, WorkHostRef("census-host"))
+    XCTAssertEqual(flock.cursor?.eventID, "w21")
+    XCTAssertEqual(flock.nodes.map(\.childID), ["child-1"])
+    XCTAssertEqual(flock.nodes[0].state, "completed")
+    XCTAssertNil(flock.nodes[0].name, "fixture omits a display name; Flock must not invent one")
+    XCTAssertEqual(flock.nodes[0].source.eventID, "w19")
+    XCTAssertEqual(report.registeredConsumers, [
+        "canonical SessionCatalog projection", "canonical Flock adapter",
+    ])
     XCTAssertTrue(report.assemblerReady)
     XCTAssertEqual(report.visibleMessageIDs, ["s6", "s7", "s10", "s11"])
     XCTAssertEqual(report.activeTip?.eventID, "s11")
@@ -105,7 +118,7 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(report.unknownReferences.count, 1)
     XCTAssertEqual(report.unknownReferences[0].eventID, "missing-activity")
     XCTAssertEqual(report.intentionallyUnwiredConsumers, [
-        "legacy SessionCatalog scanner (native timeline consumer pending)", "Flock", "notifications", "search", "service recovery",
+        "legacy SessionCatalog scanner (native timeline consumer pending)", "Flock UI (canonical projection adoption pending)", "notifications", "search", "service recovery",
     ])
 
     let workEvents = ReaderCensus.read(
@@ -152,6 +165,82 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(
         Set(duplicateReport.unknownEventRefs.map { $0.journal }),
         Set([censusSessionJournal, censusWorkJournal]))
+}
+
+func test_readerCensusFlockRejectsUnalignedOrForeignWork() throws {
+    let workData = try ReaderCensusFixtureFiles.data("work.jsonl")
+    let fullRead = ReaderCensus.read(workData, journal: censusWorkJournal)
+    let snapshot = WorkReducer.reduce(fullRead.records.map(\.event))
+
+    let staleRead = ReaderCensus.read(
+        prefixLines(workData, count: 18), journal: censusWorkJournal)
+    let stale = AgentTreeReader.canonicalProjection(work: snapshot, read: staleRead)
+    XCTAssertFalse(stale.isAvailable)
+    XCTAssertFalse(stale.integrityValid)
+    XCTAssertTrue(stale.nodes.isEmpty)
+    XCTAssertNil(stale.cursor)
+
+    let foreignJournal = JournalRef.work(
+        WorkRef(workHostID: "other-host", workID: "other-work"), journalID: "other-journal")
+    let foreignRead = ReaderCensus.read(workData, journal: foreignJournal)
+    let foreign = AgentTreeReader.canonicalProjection(work: snapshot, read: foreignRead)
+    XCTAssertFalse(foreign.isAvailable)
+    XCTAssertTrue(foreign.nodes.isEmpty)
+
+    var mismatched = snapshot
+    mismatched.workHost = WorkHostRef("other-host")
+    let mismatchedProjection = AgentTreeReader.canonicalProjection(
+        work: mismatched, read: fullRead)
+    XCTAssertFalse(mismatchedProjection.isAvailable)
+    XCTAssertTrue(mismatchedProjection.nodes.isEmpty)
+}
+
+func test_readerCensusRejectsMalformedChildOwnershipInsteadOfOmittingIt() throws {
+    let original = try ReaderCensusFixtureFiles.data("work.jsonl")
+    let childPrefix = "\"work\":{\"workHostID\":\"census-host\",\"workID\":\"census-work\"},\"payload\":{\"child_id\":\"child-1\""
+
+    func assertUnavailable(_ data: Data, structural: Bool = false) throws {
+        let read = ReaderCensus.read(data, journal: censusWorkJournal)
+        let snapshot = WorkReducer.reduce(read.records.map(\.event))
+        if structural {
+            XCTAssertFalse(snapshot.structuralIntegrityValid)
+        } else {
+            XCTAssertFalse(snapshot.semanticProjectionValid)
+        }
+        XCTAssertTrue(snapshot.childStates["child-1"] == nil)
+        let projection = AgentTreeReader.canonicalProjection(work: snapshot, read: read)
+        XCTAssertFalse(projection.isAvailable)
+        XCTAssertTrue(projection.nodes.isEmpty)
+    }
+
+    let missingWork = Data(String(decoding: original, as: UTF8.self)
+        .replacingOccurrences(of: childPrefix,
+                              with: "\"payload\":{\"child_id\":\"child-1\"")
+        .utf8)
+    try assertUnavailable(missingWork)
+
+    let foreignWork = Data(String(decoding: original, as: UTF8.self)
+        .replacingOccurrences(
+            of: childPrefix,
+            with: "\"work\":{\"workHostID\":\"other-host\",\"workID\":\"other-work\"},\"payload\":{\"child_id\":\"child-1\"")
+        .utf8)
+    try assertUnavailable(foreignWork, structural: true)
+
+    let parentSessionMismatch = Data(String(decoding: original, as: UTF8.self)
+        .replacingOccurrences(
+            of: childPrefix,
+            with: "\"work\":{\"workHostID\":\"census-host\",\"workID\":\"census-work\"},\"session\":{\"sessionID\":\"census-session\"},\"payload\":{\"child_id\":\"child-1\",\"parent_session_id\":\"other-session\""
+        )
+        .utf8)
+    try assertUnavailable(parentSessionMismatch)
+
+    let parentRunMismatch = Data(String(decoding: original, as: UTF8.self)
+        .replacingOccurrences(
+            of: childPrefix,
+            with: "\"work\":{\"workHostID\":\"census-host\",\"workID\":\"census-work\"},\"run\":{\"runID\":\"run-1\"},\"payload\":{\"child_id\":\"child-1\",\"parent_run_id\":\"other-run\""
+        )
+        .utf8)
+    try assertUnavailable(parentRunMismatch)
 }
 
 func test_readerCensusIndeterminateActionOverridesAuthoredAttention() throws {

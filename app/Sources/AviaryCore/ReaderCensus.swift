@@ -12,6 +12,7 @@ public struct ReaderCensusManifest: Codable, Hashable, Sendable {
     public let legacyJournal: String
     public let retainedBodies: [String]
     public let malformedVariants: [String]
+    public let registeredConsumers: [String]
     public let intentionallyUnwiredConsumers: [String]
 
     public init(
@@ -23,6 +24,7 @@ public struct ReaderCensusManifest: Codable, Hashable, Sendable {
         legacyJournal: String,
         retainedBodies: [String] = [],
         malformedVariants: [String] = [],
+        registeredConsumers: [String] = [],
         intentionallyUnwiredConsumers: [String] = []
     ) {
         self.schemaVersion = schemaVersion
@@ -33,6 +35,7 @@ public struct ReaderCensusManifest: Codable, Hashable, Sendable {
         self.legacyJournal = legacyJournal
         self.retainedBodies = retainedBodies
         self.malformedVariants = malformedVariants
+        self.registeredConsumers = registeredConsumers
         self.intentionallyUnwiredConsumers = intentionallyUnwiredConsumers
     }
 }
@@ -93,6 +96,8 @@ public struct ReaderCensusContextComponent: Codable, Hashable, Sendable {
     public let fullByteCount: Int?
     public let bodyReference: TimelineBodyReference?
     public let digest: String?
+    public let tokenCount: Int?
+    public let tokenizer: String?
     public let omitted: Bool
 
     public init(component: ContextComponent) {
@@ -108,6 +113,8 @@ public struct ReaderCensusContextComponent: Codable, Hashable, Sendable {
         fullByteCount = component.fullByteCount
         bodyReference = component.bodyReference
         digest = component.digest
+        tokenCount = component.tokenCount
+        tokenizer = component.tokenizer
         omitted = component.omitted
     }
 }
@@ -148,6 +155,9 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
     public let contextInclusionIDs: [String]
     public let omittedContextIDs: [String]
     public let contextComponents: [ReaderCensusContextComponent]
+    /// Latest complete production crossing metadata. Nil is allowed for older fixtures that
+    /// predate the provider-bound manifest fields while still carrying components.
+    public let contextManifest: ContextManifest?
     public let compactionSummary: String?
     public let recovery: [ReaderCensusRecovery]
     public let authoredAttention: SessionAttention
@@ -170,6 +180,11 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
     /// Canonical SessionCatalog-shaped projection. The legacy disk scanner remains separately
     /// listed in `intentionallyUnwiredConsumers` until its callers move to this value.
     public let canonicalSessionCatalog: CanonicalSessionCatalogSummary?
+    /// Canonical Flock child projection. It is nil when no Work page was supplied; a supplied
+    /// stale, foreign, divergent, tailed, or corrupt page remains an unavailable projection and
+    /// cannot contribute lifecycle rows.
+    public let canonicalFlock: CanonicalFlockProjection?
+    public let registeredConsumers: [String]
     public let intentionallyUnwiredConsumers: [String]
 
     /// Compatibility projection for older consumers. Equal event IDs from different journals
@@ -187,7 +202,8 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         sessionSemanticProjectionValid: Bool, workSemanticProjectionValid: Bool,
         sessionTailBytes: Int, workTailBytes: Int,
         visibleMessageIDs: [String], contextInclusionIDs: [String], omittedContextIDs: [String],
-        contextComponents: [ReaderCensusContextComponent], compactionSummary: String?,
+        contextComponents: [ReaderCensusContextComponent],
+        contextManifest: ContextManifest? = nil, compactionSummary: String?,
         recovery: [ReaderCensusRecovery], authoredAttention: SessionAttention,
         attention: SessionAttention,
         outstandingActionIDs: [String], indeterminateActionIDs: [String],
@@ -198,6 +214,8 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         unknownEventRefs: [EventRef], unknownDomains: [TimelineDomain], unknownReferenceIDs: [String],
         unknownReferences: [EventRef],
         assemblerReady: Bool, canonicalSessionCatalog: CanonicalSessionCatalogSummary? = nil,
+        canonicalFlock: CanonicalFlockProjection? = nil,
+        registeredConsumers: [String] = [],
         intentionallyUnwiredConsumers: [String]
     ) {
         self.projectionRulesVersion = projectionRulesVersion
@@ -217,6 +235,7 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         self.contextInclusionIDs = contextInclusionIDs
         self.omittedContextIDs = omittedContextIDs
         self.contextComponents = contextComponents
+        self.contextManifest = contextManifest
         self.compactionSummary = compactionSummary
         self.recovery = recovery
         self.authoredAttention = authoredAttention
@@ -236,6 +255,8 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         self.unknownReferences = unknownReferences
         self.assemblerReady = assemblerReady
         self.canonicalSessionCatalog = canonicalSessionCatalog
+        self.canonicalFlock = canonicalFlock
+        self.registeredConsumers = registeredConsumers
         self.intentionallyUnwiredConsumers = intentionallyUnwiredConsumers
     }
 }
@@ -244,8 +265,12 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
 /// locations are not part of the protocol and must not leak into a report.
 public enum ReaderCensus {
     private static let defaultIntentionallyUnwiredConsumers = [
-        "legacy SessionCatalog scanner (native timeline consumer pending)", "Flock", "notifications", "search",
+        "legacy SessionCatalog scanner (native timeline consumer pending)",
+        "Flock UI (canonical projection adoption pending)", "notifications", "search",
         "service recovery",
+    ]
+    private static let defaultRegisteredConsumers = [
+        "canonical SessionCatalog projection", "canonical Flock adapter",
     ]
     public static func read(
         _ data: Data,
@@ -309,6 +334,7 @@ public enum ReaderCensus {
         return report(
             sessionRead: sessionRead, workRead: workRead,
             sessionJournal: sessionJournal, workJournal: workJournal,
+            registeredConsumers: manifest?.registeredConsumers ?? defaultRegisteredConsumers,
             intentionallyUnwiredConsumers: manifest?.intentionallyUnwiredConsumers
                 ?? defaultIntentionallyUnwiredConsumers)
     }
@@ -318,6 +344,9 @@ public enum ReaderCensus {
         workRead: TimelineJournalReadResult,
         sessionJournal: JournalRef,
         workJournal: JournalRef,
+        registeredConsumers: [String] = [
+            "canonical SessionCatalog projection", "canonical Flock adapter",
+        ],
         intentionallyUnwiredConsumers: [String] = []
     ) -> ReaderCensusReport {
         let sessionEvents = sessionRead.records.map(\.event)
@@ -385,6 +414,9 @@ public enum ReaderCensus {
         let canonicalSessionCatalog = SessionCatalog.summarizeCanonical(
             session: session, works: workCursor == nil ? [] : [work], cursors: assemblyCursors,
             sessionRead: sessionRead, workReads: workReads)
+        let canonicalFlock = workRead.records.isEmpty
+            ? nil
+            : AgentTreeReader.canonicalProjection(work: work, read: workRead)
 
         let allEvents = sessionEvents + workEvents
         let allEventRefs = Set(allEvents.map { EventRef(journal: $0.journal, eventID: $0.eventID) })
@@ -459,6 +491,7 @@ public enum ReaderCensus {
             contextInclusionIDs: contextInclusions,
             omittedContextIDs: omittedContext,
             contextComponents: contextComponents,
+            contextManifest: session.contextManifest,
             compactionSummary: session.compactionSummary,
             recovery: session.recovery.map {
                 ReaderCensusRecovery(journal: sessionJournal, coverage: $0)
@@ -484,9 +517,11 @@ public enum ReaderCensus {
                         return $0.journal.stableKey < $1.journal.stableKey
                     }
                     return $0.eventID < $1.eventID
-                },
+            },
             assemblerReady: assemblerReady,
             canonicalSessionCatalog: canonicalSessionCatalog,
+            canonicalFlock: canonicalFlock,
+            registeredConsumers: registeredConsumers,
             intentionallyUnwiredConsumers: intentionallyUnwiredConsumers)
     }
 }
