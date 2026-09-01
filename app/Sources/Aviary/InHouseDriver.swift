@@ -38,6 +38,16 @@ final class InHouseDriver {
     private var host: RuntimeHost?
     private var runner: AgentRunner?
     private var writer: SessionWriter?
+    /// Canonical Session/Work history for this execution attempt. The legacy writer above is a
+    /// temporary presentation adapter for the current transcript parser, not a second authority.
+    private var nativeJournal: RunJournalBundle?
+    private enum NativeRunTeardownState: Equatable {
+        case open
+        case finishing
+        case closed
+    }
+    private var nativeRunTeardownState: NativeRunTeardownState = .open
+    private var runtimeHostStopped = false
     private var watcher: SessionWatcher?
     private var task: Task<Void, Never>?
     private var eventPump: Task<Void, Never>?
@@ -72,6 +82,7 @@ final class InHouseDriver {
     private let commandController: SessionCommandController
     private let actorID: String
     private var activeTurnCommandID: String?
+    private var startCommandID: String?
     private var initialPromptCommandID: String?
     /// A user-requested end can arrive while provider/runtime preparation is suspended. Every
     /// post-await boundary checks this before publishing newly-created live resources.
@@ -142,13 +153,31 @@ final class InHouseDriver {
             hasExited = true
             return
         }
-        let start = await commandController.admitAndCommit(
-            .start(prompt: prompt), actorID: actorID)
-        guard case .accepted(let admittedStart) = start else {
-            reject(start, operation: "start")
+        guard let writer = self.writer else {
+            errorBanner = "The session journal was not opened."
+            hasExited = true
+            return
+        }
+        guard await installNativeJournalIfAppropriate(legacyWriter: writer) else {
+            try? await writer.closeChecked()
+            hasExited = true
+            return
+        }
+        let startReceipt = await commandController.admitAndCommitReceipt(
+            .start(prompt: prompt), actorID: actorID,
+            causalCursor: await nativeJournal?.latestWorkCursor)
+        guard case .accepted(let admittedStart) = startReceipt.admission else {
+            reject(startReceipt.admission, operation: "start")
             await finishFailedLaunch()
             return
         }
+        guard !startReceipt.isAcceptedButUndelivered else {
+            errorBanner = "Start was accepted by Work but could not cross the presentation "
+                + "journal: \(startReceipt.delivery.detail ?? "unknown projection failure")"
+            await finishFailedLaunch()
+            return
+        }
+        startCommandID = admittedStart.commandID
         initialPromptDelivered = false
         initialPromptCommandID = prompt.isEmpty ? nil : admittedStart.commandID
         commandNotice = nil
@@ -169,8 +198,31 @@ final class InHouseDriver {
         }
         // The same factory `--agent` uses. Two switch statements over the same api enum is
         // what let the GUI send Codex traffic to the completions client and 404.
+        let providerPermit = await beginNativeEffect(
+            kind: .provider, intent: "Resolve credentials and construct the chat provider",
+            target: model.qualifiedID)
+        guard nativeJournal == nil || providerPermit != nil else {
+            _ = await commandController.markFailed(commandID: admittedStart.commandID)
+            await finishFailedLaunch()
+            return
+        }
         let routed = await ChatProviderRouting.makeProvider(
             spec: providerSpec, model: model, home: home)
+        let providerRecorded: Bool
+        switch routed {
+        case .success:
+            providerRecorded = await finishNativeEffect(
+                providerPermit, state: .succeeded, retrySafety: .unknown)
+        case .failure:
+            providerRecorded = await finishNativeEffect(
+                providerPermit, state: .failed, retrySafety: .unknown,
+                failureKind: .infrastructure)
+        }
+        guard providerRecorded else {
+            _ = await commandController.markFailed(commandID: admittedStart.commandID)
+            await finishFailedLaunch()
+            return
+        }
         guard !terminationRequested else {
             await finishFailedLaunch()
             return
@@ -187,17 +239,37 @@ final class InHouseDriver {
         let script = repoRoot.appending(path: "runtime-hosts/python3/host.py")
         let host = RuntimeHost(executable: "/usr/bin/env", arguments: ["python3", script.path])
         self.host = host
+        let runtimePermit = await beginNativeEffect(
+            kind: .runtime, intent: "Start the Python runtime host", target: script.path)
+        guard nativeJournal == nil || runtimePermit != nil else {
+            _ = await commandController.markFailed(commandID: admittedStart.commandID)
+            await finishFailedLaunch()
+            return
+        }
         do {
             runtimeSummary = try await host.start().summary
+            guard await finishNativeEffect(
+                runtimePermit, state: .succeeded, retrySafety: .unsafe)
+            else {
+                await stopRuntimeHost(host)
+                _ = await commandController.markFailed(commandID: admittedStart.commandID)
+                await finishFailedLaunch()
+                return
+            }
             if terminationRequested {
-                await host.stop()
+                await stopRuntimeHost(host)
                 await finishFailedLaunch()
                 return
             }
         } catch {
+            _ = await finishNativeEffect(
+                runtimePermit,
+                state: error is CancellationError ? .canceled : .failed,
+                retrySafety: .unknown,
+                failureKind: error is CancellationError ? .cancellation : .infrastructure)
             // `RuntimeHost.start` may fail after launching its child but before the ready
             // handshake. The driver still owns that partially started process.
-            await host.stop()
+            await stopRuntimeHost(host)
             if terminationRequested {
                 await finishFailedLaunch()
                 return
@@ -232,7 +304,7 @@ final class InHouseDriver {
 
         guard let writer = self.writer else {
             errorBanner = "The session journal was not opened."
-            await host.stop()
+            await stopRuntimeHost(host)
             _ = await commandController.markFailed(commandID: admittedStart.commandID)
             await finishFailedLaunch()
             return
@@ -250,7 +322,8 @@ final class InHouseDriver {
                 hookPaths: HookDiscovery.paths(repoRoot: repoRoot), resume: resume,
                 peerDelegate: peerDelegate,
                 selfDelegate: peerDelegate as? Agent.SelfDelegate,
-                identity: identity, reasoningEffort: reasoningEffort, writer: writer))
+                identity: identity, reasoningEffort: reasoningEffort, writer: writer,
+                nativeJournal: nativeJournal))
         self.runner = runner
 
         let (events, eventContinuation) = AsyncStream<Agent.Event>.makeStream(
@@ -299,13 +372,38 @@ final class InHouseDriver {
                 beginLiveTurn()
                 activeTurnCommandID = admittedStart.commandID
                 guard !terminationRequested, !Task.isCancelled else {
+                    _ = await commandController.recordNotDelivered(
+                        commandID: admittedStart.commandID,
+                        reason: "the run ended before initial prompt delivery")
+                    startCommandID = nil
                     await agent.cancel()
                     return
                 }
-                let outcome = await agent.send(prompt)
+                let outcome = await agent.send(prompt) { [weak self] delivery in
+                    guard let self else { return }
+                    switch delivery {
+                    case .delivered:
+                        _ = await self.commandController.recordDelivered(
+                            commandID: admittedStart.commandID)
+                    case .notDelivered(let reason):
+                        _ = await self.commandController.recordNotDelivered(
+                            commandID: admittedStart.commandID, reason: reason)
+                    case .notAttempted, .queued, .indeterminate:
+                        break
+                    }
+                }
                 await settle(outcome, commandID: admittedStart.commandID)
+                startCommandID = nil
                 activeTurnCommandID = nil
             } else {
+                guard await commandController.recordDelivered(
+                    commandID: admittedStart.commandID)
+                else {
+                    errorBanner = "The prepared Start command could not record delivery."
+                    await finishFailedLaunch()
+                    return
+                }
+                startCommandID = nil
                 _ = await commandController.acknowledgeTurnFinished(
                     commandID: admittedStart.commandID)
             }
@@ -315,7 +413,7 @@ final class InHouseDriver {
             // Preparation can fail after the host has started (for example, SessionWriter
             // setup), so stop it even when the run was concurrently asked to terminate.
             await runner.stopMCPServers()
-            await host.stop()
+            await stopRuntimeHost(host)
             if terminationRequested {
                 await finishFailedLaunch()
                 return
@@ -429,12 +527,155 @@ final class InHouseDriver {
             "Could not " + operation + ": " + String(describing: reason) + ".")
     }
 
+    /// Install Timeline v2 before Start is admitted. A legacy-only resumed conversation stays
+    /// legacy-only for this attempt: creating a native pair at its tail would make a cold reader
+    /// see a deceptively complete history. Once a pair exists, one-sided or corrupt state is a
+    /// launch error rather than an invitation to manufacture the missing half.
+    private func installNativeJournalIfAppropriate(legacyWriter: SessionWriter) async -> Bool {
+        do {
+            guard let bridge = try await NativeSessionCommandJournal.openForLaunch(
+                home: home, identity: identity, legacyProjection: legacyWriter,
+                actorID: actorID, modelID: model.qualifiedID,
+                resumingLegacySession: resume != nil)
+            else { return true }
+            guard await commandController.installJournalBeforeAdmission(bridge) else {
+                _ = try? await bridge.nativeJournal.finishRun(
+                    outcome: .failed, detail: "command journal authority was already admitted")
+                try? await bridge.nativeJournal.closeChecked()
+                throw RunJournalBundleError.invalidConfiguration(
+                    "command journal authority was already admitted")
+            }
+            nativeJournal = bridge.nativeJournal
+            return true
+        } catch {
+            errorBanner = "Could not open the canonical Session/Work journal: "
+                + error.localizedDescription
+            return false
+        }
+    }
+
+    private func beginNativeEffect(
+        kind: ActionKind, intent: String, target: String? = nil,
+        metadata: [String: JSONValue] = [:]
+    ) async -> EffectPermit? {
+        guard let nativeJournal else { return nil }
+        do {
+            return try await nativeJournal.beginAction(
+                kind: kind, intent: intent, target: target, scope: "run", metadata: metadata)
+        } catch {
+            if errorBanner == nil {
+                errorBanner = "Could not record the \(kind.rawValue) action start: "
+                    + error.localizedDescription
+            }
+            return nil
+        }
+    }
+
+    private func finishNativeEffect(
+        _ permit: EffectPermit?, state: ActionExecutionState,
+        retrySafety: ActionRetrySafety, failureKind: ActionFailureKind? = nil
+    ) async -> Bool {
+        guard let nativeJournal else { return true }
+        guard let permit else { return false }
+        do {
+            _ = try await nativeJournal.finishAction(
+                permit, state: state, retrySafety: retrySafety, failureKind: failureKind)
+            return true
+        } catch {
+            if errorBanner == nil {
+                errorBanner = "Could not record the \(permit.kind.rawValue) action outcome: "
+                    + error.localizedDescription
+            }
+            return false
+        }
+    }
+
+    /// Runtime teardown is still allowed after journal failure, because cleanup must not be
+    /// held hostage by its audit path. While the journal is healthy it is an ordinary typed
+    /// action; the idempotent guard also prevents failed-launch and End paths from stopping the
+    /// same child process twice.
+    private func stopRuntimeHost(_ host: RuntimeHost?) async {
+        guard let host, !runtimeHostStopped else { return }
+        runtimeHostStopped = true
+        let permit = await beginNativeEffect(
+            kind: .runtime, intent: "Stop the Python runtime host")
+        await host.stop()
+        if permit != nil {
+            _ = await finishNativeEffect(
+                permit, state: .succeeded, retrySafety: .idempotent)
+        }
+    }
+
+    /// Establish the callback-side quiescence boundary before any delegate, MCP, runtime, or
+    /// journal teardown. Runtime callbacks are independent tasks; waiting only for Agent.send
+    /// does not prove that their effects and action outcomes have settled.
+    private func drainRuntimeCallbacks(_ host: RuntimeHost?) async -> Bool {
+        guard let host else { return true }
+        do {
+            try await host.closeCallbackAdmissionAndWait()
+            return true
+        } catch {
+            if errorBanner == nil {
+                errorBanner = "A runtime callback did not settle cleanly before teardown: "
+                    + error.localizedDescription
+            }
+            return false
+        }
+    }
+
+    /// Close the native pair exactly once after every owned effect has quiesced. If a prior
+    /// append failed, closing preserves its last durable prefix without pretending the Run has a
+    /// known terminal outcome.
+    private func finishNativeRun(
+        outcome: RunTerminalOutcome, detail: String? = nil
+    ) async {
+        guard nativeRunTeardownState == .open, let nativeJournal else { return }
+        nativeRunTeardownState = .finishing
+        if case .healthy = await nativeJournal.status.health {
+            do {
+                _ = try await nativeJournal.finishRun(outcome: outcome, detail: detail)
+            } catch {
+                if errorBanner == nil {
+                    errorBanner = "Could not record the native Run outcome: "
+                        + error.localizedDescription
+                }
+                // A healthy bundle can still refuse a semantic finish while a command is
+                // settling. Leave it open so that receipt can complete and teardown can retry.
+                if case .healthy = await nativeJournal.status.health {
+                    nativeRunTeardownState = .open
+                    return
+                }
+            }
+        }
+        do {
+            try await nativeJournal.closeChecked()
+        } catch {
+            if errorBanner == nil {
+                errorBanner = "The canonical Session/Work journal close was not confirmed: "
+                    + error.localizedDescription
+            }
+        }
+        // Bundle close is terminal even when it reports a partial close: it releases everything
+        // it can and latches the exact durable prefix for recovery.
+        nativeRunTeardownState = .closed
+    }
+
     /// Setup can fail before a runtime session exists. Still drive the same terminal lifecycle
     /// as a normal End and close the launch-boundary writer, so a rejected start cannot leave a
     /// zombie LiveRun in the UI.
     private func finishFailedLaunch() async {
+        let canceledByUser = terminationRequested
         terminationRequested = true
-        let ending = await commandController.admitAndCommit(.endRun, actorID: actorID)
+        if let startCommandID {
+            _ = await commandController.recordNotDelivered(
+                commandID: startCommandID,
+                reason: canceledByUser ? "the user ended the run before Start delivery" :
+                    (errorBanner ?? "launch failed before Start delivery"))
+            self.startCommandID = nil
+        }
+        let ending = await commandController.admitAndCommit(
+            .endRun, actorID: actorID,
+            causalCursor: await nativeJournal?.latestWorkCursor)
         let endCommand: AdmittedSessionCommand?
         if case .accepted(let admitted) = ending {
             endCommand = await commandController.awaitDispatch(commandID: admitted.commandID)
@@ -442,15 +683,21 @@ final class InHouseDriver {
             endCommand = nil
         }
         if let endCommand {
-            _ = await commandController.acknowledgeDispatched(commandID: endCommand.commandID)
+            _ = await commandController.acknowledgeDelivered(commandID: endCommand.commandID)
         }
         scheduler?.cancel()
         eventPump?.cancel()
         watcher?.stop()
+        await host?.closeCallbackAdmission()
         await agent?.cancel()
         await agent?.waitUntilQuiescent()
+        _ = await drainRuntimeCallbacks(host)
         await runner?.stopMCPServers()
-        await host?.stop()
+        await stopRuntimeHost(host)
+        await finishNativeRun(
+            outcome: canceledByUser ? .canceled : .failed,
+            detail: canceledByUser ? "ended by the user during launch" :
+                (errorBanner ?? "launch did not complete"))
         do {
             try await writer?.closeChecked()
         } catch {
@@ -547,37 +794,61 @@ final class InHouseDriver {
     /// usable while the agent works, which is the whole point of steering.
     func steer(_ text: String, sourceID: String? = nil) async -> SessionCommandReceipt {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let admission = await commandController.admitAndCommit(
-            .steer(text: text), actorID: sourceID ?? actorID)
+        let committed = await commandController.admitAndCommitReceipt(
+            .steer(text: text), actorID: sourceID ?? actorID,
+            causalCursor: await nativeJournal?.latestWorkCursor)
+        let admission = committed.admission
         guard case .accepted(let admitted) = admission else {
             reject(admission, operation: "steer")
-            return SessionCommandReceipt(admission: admission)
+            return committed
         }
+        guard !committed.isAcceptedButUndelivered else { return committed }
         commandNotice = nil
         guard await commandController.awaitDispatch(commandID: admitted.commandID) != nil else {
+            let reason = "dispatch ownership was unavailable before steering reached the agent"
             errorBanner = "The steer command lost its dispatch turn."
+            let terminal = await commandController.recordNotDelivered(
+                commandID: admitted.commandID, reason: reason)
             return SessionCommandReceipt(
                 admission: admission,
-                delivery: .indeterminate(reason: "dispatch ownership was unavailable"))
+                delivery: terminal ? .notDelivered(reason: reason)
+                    : .indeterminate(reason: "the not-delivered receipt was unavailable"))
         }
         guard let agent else {
+            let reason = "the run is still starting"
             commandNotice = .warning("Could not steer: the run is still starting.")
+            _ = await commandController.recordNotDelivered(
+                commandID: admitted.commandID, reason: reason)
             _ = await commandController.acknowledgeDispatched(commandID: admitted.commandID)
             return SessionCommandReceipt(
-                admission: admission,
-                delivery: .notDelivered(reason: "the run is still starting"))
+                admission: admission, delivery: .notDelivered(reason: reason))
         }
         commandNotice = nil
         // Publish the optimistic pending row before yielding to the Agent actor. The Agent can
         // reach the next turn boundary immediately after accepting this request and emit
         // `.steered`; that event must always find the row to acknowledge.
         pendingSteering.append(text)
-        let didSteer = await agent.steer(text)
+        let didSteer = await agent.steer(text) { [weak self] delivery in
+            guard let self else { return }
+            switch delivery {
+            case .delivered:
+                _ = await self.commandController.recordDelivered(
+                    commandID: admitted.commandID)
+            case .notDelivered(let reason):
+                _ = await self.commandController.recordNotDelivered(
+                    commandID: admitted.commandID, reason: reason)
+            case .notAttempted, .queued, .indeterminate:
+                break
+            }
+        }
         _ = await commandController.acknowledgeDispatched(commandID: admitted.commandID)
         guard didSteer else {
             if let index = pendingSteering.firstIndex(of: text) {
                 pendingSteering.remove(at: index)
             }
+            _ = await commandController.recordNotDelivered(
+                commandID: admitted.commandID,
+                reason: "the active send already finished")
             commandNotice = .warning("Could not steer: the active send already finished.")
             return SessionCommandReceipt(
                 admission: admission,
@@ -594,36 +865,60 @@ final class InHouseDriver {
         _ text: String, sourceID: String? = nil
     ) async -> SessionCommandReceipt {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let admission = await commandController.admitAndCommit(
-            .queueFollowUp(text: text), actorID: sourceID ?? actorID)
+        let committed = await commandController.admitAndCommitReceipt(
+            .queueFollowUp(text: text), actorID: sourceID ?? actorID,
+            causalCursor: await nativeJournal?.latestWorkCursor)
+        let admission = committed.admission
         guard case .accepted(let admitted) = admission else {
             reject(admission, operation: "queue follow-up")
-            return SessionCommandReceipt(admission: admission)
+            return committed
         }
+        guard !committed.isAcceptedButUndelivered else { return committed }
         commandNotice = nil
         guard await commandController.awaitDispatch(commandID: admitted.commandID) != nil else {
+            let reason = "dispatch ownership was unavailable before the follow-up reached the agent"
             errorBanner = "The queue follow-up command lost its dispatch turn."
+            let terminal = await commandController.recordNotDelivered(
+                commandID: admitted.commandID, reason: reason)
             return SessionCommandReceipt(
                 admission: admission,
-                delivery: .indeterminate(reason: "dispatch ownership was unavailable"))
+                delivery: terminal ? .notDelivered(reason: reason)
+                    : .indeterminate(reason: "the not-delivered receipt was unavailable"))
         }
         guard let agent else {
+            let reason = "the run is still starting"
             commandNotice = .warning("Could not queue follow-up: the run is still starting.")
+            _ = await commandController.recordNotDelivered(
+                commandID: admitted.commandID, reason: reason)
             _ = await commandController.acknowledgeDispatched(commandID: admitted.commandID)
             return SessionCommandReceipt(
-                admission: admission,
-                delivery: .notDelivered(reason: "the run is still starting"))
+                admission: admission, delivery: .notDelivered(reason: reason))
         }
         commandNotice = nil
         // As with steering, put the row in the UI before crossing the actor boundary so a
         // fast completion cannot emit an acknowledgement before the row exists.
         pendingFollowUps.append(text)
-        let didQueue = await agent.queueFollowUp(text)
+        let didQueue = await agent.queueFollowUp(text) { [weak self] delivery in
+            guard let self else { return }
+            switch delivery {
+            case .delivered:
+                _ = await self.commandController.recordDelivered(
+                    commandID: admitted.commandID)
+            case .notDelivered(let reason):
+                _ = await self.commandController.recordNotDelivered(
+                    commandID: admitted.commandID, reason: reason)
+            case .notAttempted, .queued, .indeterminate:
+                break
+            }
+        }
         _ = await commandController.acknowledgeDispatched(commandID: admitted.commandID)
         guard didQueue else {
             if let index = pendingFollowUps.firstIndex(of: text) {
                 pendingFollowUps.remove(at: index)
             }
+            _ = await commandController.recordNotDelivered(
+                commandID: admitted.commandID,
+                reason: "the active send already finished")
             commandNotice = .warning(
                 "Could not queue follow-up: the active send already finished.")
             return SessionCommandReceipt(
@@ -649,22 +944,31 @@ final class InHouseDriver {
     func cancel(
         scope: SessionCancellationScope, sourceID: String? = nil
     ) async -> SessionCommandReceipt {
-        let admission = await commandController.admitAndCommit(
-            .cancel(scope: scope), actorID: sourceID ?? actorID)
+        let committed = await commandController.admitAndCommitReceipt(
+            .cancel(scope: scope), actorID: sourceID ?? actorID,
+            causalCursor: await nativeJournal?.latestWorkCursor)
+        let admission = committed.admission
         guard case .accepted(let admitted) = admission else {
             reject(admission, operation: "cancel")
-            return SessionCommandReceipt(admission: admission)
+            return committed
         }
+        guard !committed.isAcceptedButUndelivered else { return committed }
         commandNotice = nil
         guard await commandController.awaitDispatch(commandID: admitted.commandID) != nil else {
+            let reason = "dispatch ownership was unavailable before cancellation reached the agent"
             errorBanner = "The cancellation command lost its dispatch turn."
+            let terminal = await commandController.recordNotDelivered(
+                commandID: admitted.commandID, reason: reason)
             return SessionCommandReceipt(
                 admission: admission,
-                delivery: .indeterminate(reason: "dispatch ownership was unavailable"))
+                delivery: terminal ? .notDelivered(reason: reason)
+                    : .indeterminate(reason: "the not-delivered receipt was unavailable"))
         }
         guard let agent else {
             let reason = "the run is not attached to an agent"
             commandNotice = .warning("Could not cancel: \(reason).")
+            _ = await commandController.recordNotDelivered(
+                commandID: admitted.commandID, reason: reason)
             _ = await commandController.acknowledgeDispatched(commandID: admitted.commandID)
             _ = await commandController.markFailed(commandID: admitted.commandID)
             return SessionCommandReceipt(
@@ -675,10 +979,21 @@ final class InHouseDriver {
             // a defensive failure keeps a future engine change from claiming cancellation.
             let reason = "the agent does not implement this cancellation scope"
             commandNotice = .warning("Could not cancel: \(reason).")
+            _ = await commandController.recordNotDelivered(
+                commandID: admitted.commandID, reason: reason)
             _ = await commandController.acknowledgeCancellation(commandID: admitted.commandID)
             _ = await commandController.acknowledgeDispatched(commandID: admitted.commandID)
             return SessionCommandReceipt(
                 admission: admission, delivery: .notDelivered(reason: reason))
+        }
+        guard await commandController.recordDelivered(commandID: admitted.commandID) else {
+            await agent.waitUntilQuiescent()
+            _ = await commandController.acknowledgeDispatched(commandID: admitted.commandID)
+            commandNotice = .warning(
+                "Cancellation reached the agent, but its delivery receipt is indeterminate.")
+            return SessionCommandReceipt(
+                admission: admission,
+                delivery: .indeterminate(reason: "the cancellation receipt was unavailable"))
         }
         await agent.waitUntilQuiescent()
         let acknowledged = await commandController.acknowledgeCancellation(
@@ -749,35 +1064,67 @@ final class InHouseDriver {
     /// variables.
     func send(_ prompt: String, sourceID: String? = nil) async -> SessionCommandReceipt {
         let prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        let admission = await commandController.admitAndCommit(
-            .send(prompt: prompt), actorID: sourceID ?? actorID)
+        let committed = await commandController.admitAndCommitReceipt(
+            .send(prompt: prompt), actorID: sourceID ?? actorID,
+            causalCursor: await nativeJournal?.latestWorkCursor)
+        let admission = committed.admission
         guard case .accepted(let admitted) = admission else {
             reject(admission, operation: "send")
-            return SessionCommandReceipt(admission: admission)
+            return committed
         }
+        guard !committed.isAcceptedButUndelivered else { return committed }
         commandNotice = nil
         guard await commandController.awaitDispatch(commandID: admitted.commandID) != nil else {
+            let reason = "dispatch ownership was unavailable before the prompt reached the agent"
             errorBanner = "The send command lost its dispatch turn."
+            let terminal = await commandController.recordNotDelivered(
+                commandID: admitted.commandID, reason: reason)
             return SessionCommandReceipt(
                 admission: admission,
-                delivery: .indeterminate(reason: "dispatch ownership was unavailable"))
+                delivery: terminal ? .notDelivered(reason: reason)
+                    : .indeterminate(reason: "the not-delivered receipt was unavailable"))
         }
         guard let agent else {
+            let reason = "the run is still starting"
             commandNotice = .warning("Could not send: the run is still starting.")
+            _ = await commandController.recordNotDelivered(
+                commandID: admitted.commandID, reason: reason)
             _ = await commandController.acknowledgeDispatched(commandID: admitted.commandID)
             _ = await commandController.markFailed(commandID: admitted.commandID)
             return SessionCommandReceipt(
-                admission: admission,
-                delivery: .notDelivered(reason: "the run is still starting"))
+                admission: admission, delivery: .notDelivered(reason: reason))
         }
         commandNotice = nil
         beginLiveTurn()
-            isStreaming = true
+        isStreaming = true
         activeTurnCommandID = admitted.commandID
+        let deliveryController = commandController
         let delivery: SessionCommandDelivery = await withCheckedContinuation { continuation in
             task = Task { [weak self] in
                 let outcome = await agent.send(prompt) { delivery in
-                    continuation.resume(returning: delivery)
+                    switch delivery {
+                    case .notDelivered(let reason):
+                        guard await deliveryController.recordNotDelivered(
+                            commandID: admitted.commandID, reason: reason)
+                        else {
+                            continuation.resume(returning: .indeterminate(
+                                reason: "the not-delivered receipt was unavailable"))
+                            return
+                        }
+                        continuation.resume(returning: delivery)
+                        return
+                    case .delivered:
+                        guard await deliveryController.recordDelivered(
+                            commandID: admitted.commandID)
+                        else {
+                            continuation.resume(returning: .indeterminate(
+                                reason: "the delivery receipt was unavailable"))
+                            return
+                        }
+                        continuation.resume(returning: delivery)
+                    case .notAttempted, .queued, .indeterminate:
+                        continuation.resume(returning: delivery)
+                    }
                 }
                 guard let self else { return }
                 await self.settle(outcome, commandID: admitted.commandID)
@@ -799,6 +1146,12 @@ final class InHouseDriver {
     func switchModel(to spec: ModelSpec, providerSpec newSpec: ProviderSpec) async -> String? {
         guard let agent else { return "This run has not started yet." }
         guard let writer else { return "The session journal is unavailable." }
+        let permit = await beginNativeEffect(
+            kind: .provider, intent: "Resolve and construct a replacement chat provider",
+            target: spec.qualifiedID)
+        guard nativeJournal == nil || permit != nil else {
+            return errorBanner ?? "The canonical Work journal refused the model switch."
+        }
         let routed = await ModelSwitchCoordinator.prepare(
             writer: writer, model: spec, provider: newSpec,
             makeProvider: { model, provider in
@@ -810,6 +1163,18 @@ final class InHouseDriver {
                     return .failure(ModelSwitchCoordinator.Failure(why.localizedDescription))
                 }
             })
+        let providerRecorded: Bool
+        switch routed {
+        case .success:
+            providerRecorded = await finishNativeEffect(
+                permit, state: .succeeded, retrySafety: .unknown)
+        case .failure:
+            providerRecorded = await finishNativeEffect(
+                permit, state: .failed, retrySafety: .unknown, failureKind: .task)
+        }
+        guard providerRecorded else {
+            return errorBanner ?? "The model-switch provider outcome could not be recorded."
+        }
         guard case .success(let provider) = routed else {
             if case .failure(let why) = routed { return why.message }
             return "Could not build a client for \(spec.qualifiedID)."
@@ -823,7 +1188,9 @@ final class InHouseDriver {
     }
 
     func stop() async {
-        let admission = await commandController.admitAndCommit(.endRun, actorID: actorID)
+        let admission = await commandController.admitAndCommit(
+            .endRun, actorID: actorID,
+            causalCursor: await nativeJournal?.latestWorkCursor)
         guard case .accepted(let admitted) = admission else {
             reject(admission, operation: "end run")
             return
@@ -831,7 +1198,9 @@ final class InHouseDriver {
         terminationRequested = true
         guard await commandController.awaitDispatch(commandID: admitted.commandID) != nil
         else { return }
+        _ = await commandController.recordDelivered(commandID: admitted.commandID)
         scheduler?.cancel()
+        await host?.closeCallbackAdmission()
         let activeTask = task
         // Cancellation is a request to the Agent, while Task cancellation only helps at
         // cooperative suspension points. Await both the driver task and the Agent's explicit
@@ -840,6 +1209,7 @@ final class InHouseDriver {
         activeTask?.cancel()
         await activeTask?.value
         await agent?.waitUntilQuiescent()
+        let callbacksDrained = await drainRuntimeCallbacks(host)
         eventPump?.cancel()
         watcher?.stop()
         if let turnID = liveTurnID, let messageID = liveMessageID {
@@ -851,13 +1221,18 @@ final class InHouseDriver {
         }
         let host = self.host
         let runner = self.runner
+        await runner?.stopMCPServers()
+        await stopRuntimeHost(host)
+        await finishNativeRun(
+            outcome: callbacksDrained ? .canceled : .indeterminate,
+            detail: callbacksDrained ? "ended by the user" :
+                (errorBanner ?? "a runtime callback did not settle before teardown"))
         do {
             try await self.writer?.closeChecked()
         } catch {
             self.errorBanner = "The session journal close was not confirmed: \(error.localizedDescription)"
         }
-        await runner?.stopMCPServers()
-        await host?.stop()
+        _ = await commandController.acknowledgeDispatched(commandID: admitted.commandID)
         _ = await commandController.acknowledgeEnd(commandID: admitted.commandID)
         hasExited = true
         isStreaming = false

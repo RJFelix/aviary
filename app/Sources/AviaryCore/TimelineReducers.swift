@@ -224,7 +224,8 @@ public struct WorkReducer: Sendable {
             }
             snapshot.childStates[childID] = state
         case TimelineEventType.commandAccepted, TimelineEventType.commandRejected,
-             TimelineEventType.commandDelivered:
+             TimelineEventType.commandDelivered, TimelineEventType.commandNotDelivered,
+             TimelineEventType.commandDeliveryIndeterminate:
             guard let command = event.command, let state = commandState(for: event.type),
                   let hostSequence = event.hostSequence,
                   command.client == event.client,
@@ -234,10 +235,29 @@ public struct WorkReducer: Sendable {
                 quarantine(event, reason: "command delivery event is missing command identity")
                 return
             }
+            if state == .accepted || state == .rejected {
+                // Admission receipts describe the exact Work state observed by the caller.
+                // A cursor without an event identity is deliberately represented by no cause;
+                // once it has an identity, the event reference must retain its journal too.
+                guard event.causedByEventID == causalEventRef(for: command) else {
+                    quarantine(event, reason: "command admission cause does not match its cursor")
+                    return
+                }
+            }
             if let existing = snapshot.commands[command.commandID] {
                 guard existing.command == command else {
                     quarantine(event, reason: "command id conflicts across clients or attachments")
                     return
+                }
+                if state == .delivered || state == .notDelivered || state == .indeterminate {
+                    // Delivery is only meaningful as a receipt for this command's durable
+                    // acceptance event. The event ref is retained in the snapshot so this
+                    // remains enforceable when reduction resumes from an earlier prefix.
+                    guard existing.state == .accepted,
+                          event.causedByEventID == existing.acceptanceEventRef else {
+                        quarantine(event, reason: "command delivery cause does not match acceptance")
+                        return
+                    }
                 }
                 if existing.state == state {
                     let sameProvenance: Bool
@@ -245,7 +265,7 @@ public struct WorkReducer: Sendable {
                     case .accepted, .rejected:
                         sameProvenance = existing.acceptanceActor == event.actor
                             && existing.acceptanceIdempotencyKey == event.idempotencyKey
-                    case .delivered:
+                    case .delivered, .notDelivered, .indeterminate:
                         sameProvenance = existing.deliveryActor == event.actor
                             && existing.deliveryIdempotencyKey == event.idempotencyKey
                     }
@@ -256,25 +276,30 @@ public struct WorkReducer: Sendable {
                     // Idempotent duplicate: retain the first receipt and its provenance.
                     return
                 }
-                guard existing.state == .accepted && state == .delivered else {
+                guard existing.state == .accepted,
+                      state == .delivered || state == .notDelivered || state == .indeterminate
+                else {
                     quarantine(event, reason: "illegal command receipt transition")
                     return
                 }
                 snapshot.commands[command.commandID] = WorkCommandSnapshot(
-                    command: existing.command, state: .delivered,
+                    command: existing.command, state: state,
                     acceptanceActor: existing.acceptanceActor,
                     acceptanceHostSequence: existing.acceptanceHostSequence,
                     acceptanceIdempotencyKey: existing.acceptanceIdempotencyKey,
+                    acceptanceEventRef: existing.acceptanceEventRef,
+                    deliveryEventRef: EventRef(journal: event.journal, eventID: event.eventID),
                     deliveryActor: event.actor, deliveryHostSequence: hostSequence,
                     deliveryIdempotencyKey: event.idempotencyKey)
                 return
-            } else if state == .delivered {
-                quarantine(event, reason: "command delivered before acceptance")
+            } else if state == .delivered || state == .notDelivered || state == .indeterminate {
+                quarantine(event, reason: "command delivery outcome appeared before acceptance")
                 return
             }
             snapshot.commands[command.commandID] = WorkCommandSnapshot(
                 command: command, state: state, actor: event.actor,
-                hostSequence: hostSequence, idempotencyKey: event.idempotencyKey)
+                hostSequence: hostSequence, idempotencyKey: event.idempotencyKey,
+                acceptanceEventRef: EventRef(journal: event.journal, eventID: event.eventID))
         case TimelineEventType.hostOrderObserved:
             break
         default:
@@ -453,8 +478,15 @@ public struct WorkReducer: Sendable {
         case TimelineEventType.commandAccepted: return .accepted
         case TimelineEventType.commandRejected: return .rejected
         case TimelineEventType.commandDelivered: return .delivered
+        case TimelineEventType.commandNotDelivered: return .notDelivered
+        case TimelineEventType.commandDeliveryIndeterminate: return .indeterminate
         default: return nil
         }
+    }
+
+    private func causalEventRef(for command: CommandRef) -> EventRef? {
+        guard let cursor = command.causalCursor, let eventID = cursor.eventID else { return nil }
+        return EventRef(journal: cursor.journal, eventID: eventID)
     }
 
     private func validCausalCursor(_ cursor: JournalCursor?, receiptSequence: Int) -> Bool {

@@ -188,25 +188,125 @@ enum AgentCLI {
             fail("Could not open the session journal: \(error.localizedDescription)")
         }
 
+        // Do not manufacture a native tail for a legacy-only resumed transcript. Once either
+        // Timeline v2 journal exists, however, the pair is mandatory and validated as one
+        // Session/Work attachment before Start can be admitted.
+        let nativeBridge: NativeSessionCommandJournal?
+        do {
+            nativeBridge = try await NativeSessionCommandJournal.openForLaunch(
+                home: home, identity: identity, legacyProjection: writer,
+                actorID: "cli", modelID: model.qualifiedID,
+                resumingLegacySession: resume != nil)
+        } catch {
+            try? await writer.closeChecked()
+            fail("Could not open the canonical Session/Work journal: "
+                + error.localizedDescription)
+        }
+        let nativeJournal = nativeBridge?.nativeJournal
+        let commandJournal: any SessionCommandJournal
+        if let nativeBridge {
+            commandJournal = nativeBridge
+        } else {
+            commandJournal = writer
+        }
+
         let commandController = SessionCommandController(
-            identity: identity, capabilities: Agent.inHouseCommandCapabilities, writer: writer)
+            identity: identity, capabilities: Agent.inHouseCommandCapabilities,
+            journal: commandJournal)
+        var admittedStartCommandID: String?
+
+        func beginNativeEffect(
+            kind: ActionKind, intent: String, target: String? = nil,
+            metadata: [String: JSONValue] = [:]
+        ) async -> EffectPermit? {
+            guard let nativeJournal else { return nil }
+            return try? await nativeJournal.beginAction(
+                kind: kind, intent: intent, target: target, scope: "run", metadata: metadata)
+        }
+
+        func finishNativeEffect(
+            _ permit: EffectPermit?, state: ActionExecutionState,
+            retrySafety: ActionRetrySafety, failureKind: ActionFailureKind? = nil
+        ) async -> Bool {
+            guard let nativeJournal else { return true }
+            guard let permit else { return false }
+            do {
+                _ = try await nativeJournal.finishAction(
+                    permit, state: state, retrySafety: retrySafety, failureKind: failureKind)
+                return true
+            } catch {
+                note("warning: canonical action outcome was not confirmed: "
+                    + error.localizedDescription)
+                return false
+            }
+        }
 
         /// End is admitted before cleanup so even a failed launch has a durable terminal
         /// command when the journal is healthy; if the journal is wedged, the controller's
         /// degraded End permit still releases local resources.
-        func endAndCleanup(runner: AgentRunner? = nil, host: RuntimeHost? = nil) async {
-            let ending = await commandController.admitAndCommit(.endRun, actorID: "cli")
+        func endAndCleanup(
+            runner: AgentRunner? = nil, host: RuntimeHost? = nil,
+            outcome: RunTerminalOutcome, detail: String? = nil
+        ) async {
+            var terminalOutcome = outcome
+            var terminalDetail = detail
+            if let admittedStartCommandID {
+                _ = await commandController.recordNotDelivered(
+                    commandID: admittedStartCommandID,
+                    reason: detail ?? "the CLI run ended before Start delivery")
+            }
+            let ending = await commandController.admitAndCommit(
+                .endRun, actorID: "cli",
+                causalCursor: await nativeJournal?.latestWorkCursor)
             let endCommand: AdmittedSessionCommand?
             if case .accepted(let admittedEnd) = ending,
                await commandController.awaitDispatch(commandID: admittedEnd.commandID) != nil
             {
-                _ = await commandController.acknowledgeDispatched(commandID: admittedEnd.commandID)
+                _ = await commandController.acknowledgeDelivered(
+                    commandID: admittedEnd.commandID)
                 endCommand = admittedEnd
             } else {
                 endCommand = nil
             }
+            if let host {
+                do {
+                    try await host.closeCallbackAdmissionAndWait()
+                } catch {
+                    let callbackFailure =
+                        "a runtime callback did not settle cleanly before teardown: "
+                        + error.localizedDescription
+                    note("warning: " + callbackFailure)
+                    terminalOutcome = .indeterminate
+                    terminalDetail = callbackFailure
+                }
+            }
             await runner?.stopMCPServers()
-            await host?.stop()
+            if let host {
+                let stopPermit = await beginNativeEffect(
+                    kind: .runtime, intent: "Stop the Python runtime host")
+                await host.stop()
+                if stopPermit != nil {
+                    _ = await finishNativeEffect(
+                        stopPermit, state: .succeeded, retrySafety: .idempotent)
+                }
+            }
+            if let nativeJournal {
+                if case .healthy = await nativeJournal.status.health {
+                    do {
+                        _ = try await nativeJournal.finishRun(
+                            outcome: terminalOutcome, detail: terminalDetail)
+                    } catch {
+                        note("warning: native Run outcome was not confirmed: "
+                            + error.localizedDescription)
+                    }
+                }
+                do {
+                    try await nativeJournal.closeChecked()
+                } catch {
+                    note("warning: canonical journal close was not confirmed: "
+                        + error.localizedDescription)
+                }
+            }
             do {
                 try await writer.closeChecked()
             } catch {
@@ -218,26 +318,47 @@ enum AgentCLI {
         }
 
         // Commit and dispatch the start intent before provider construction or RuntimeHost.start.
-        let startAdmission = await commandController.admitAndCommit(
-            .start(prompt: prompt), actorID: "cli", commandID: "cli-start")
-        guard case .accepted(let startCommand) = startAdmission else {
-            await endAndCleanup()
+        let startCursor = await nativeJournal?.latestWorkCursor
+        let startReceipt = await commandController.admitAndCommitReceipt(
+            .start(prompt: prompt), actorID: "cli",
+            commandID: SessionCommandController.cliStartCommandID(for: identity),
+            causalCursor: startCursor)
+        guard case .accepted(let startCommand) = startReceipt.admission else {
+            await endAndCleanup(outcome: .failed, detail: "Start was not durably admitted")
             fail("The CLI start command could not be durably admitted.")
         }
+        admittedStartCommandID = startCommand.commandID
+        if startReceipt.isAcceptedButUndelivered {
+            let detail = startReceipt.delivery.detail ?? "canonical delivery was not confirmed"
+            await endAndCleanup(outcome: .indeterminate, detail: detail)
+            fail("The CLI start command was accepted but not delivered: \(detail)")
+        }
         guard await commandController.awaitDispatch(commandID: startCommand.commandID) != nil else {
-            await endAndCleanup()
+            await endAndCleanup(outcome: .failed, detail: "Start lost its dispatch turn")
             fail("The CLI start command lost its dispatch turn.")
         }
         _ = await commandController.acknowledgeDispatched(commandID: startCommand.commandID)
 
         // The same factory the GUI uses. Two switch statements over the same api enum is how
         // the GUI ended up sending Codex traffic to the completions client and getting a 404.
+        let providerPermit = await beginNativeEffect(
+            kind: .provider, intent: "Resolve credentials and construct the chat provider",
+            target: model.qualifiedID)
+        guard nativeJournal == nil || providerPermit != nil else {
+            await endAndCleanup(
+                outcome: .indeterminate,
+                detail: "canonical provider action permit was unavailable")
+            fail("The canonical Work journal refused provider construction.")
+        }
         let routed = await ChatProviderRouting.makeProvider(
             spec: providerSpec, model: model, home: home,
             resolveSecret: { await resolvedSecret($0) })
         guard case .success(let provider) = routed else {
+            _ = await finishNativeEffect(
+                providerPermit, state: .failed, retrySafety: .unknown,
+                failureKind: .infrastructure)
             if case .failure(let why) = routed {
-                await endAndCleanup()
+                await endAndCleanup(outcome: .failed, detail: why.localizedDescription)
                 fail(why.localizedDescription)
             }
             return
@@ -248,20 +369,51 @@ enum AgentCLI {
             // a format guess is how a working setup gets called broken.
             if !key.ok { note("credentials: \(key.explanation)") }
         }
+        guard await finishNativeEffect(
+            providerPermit, state: .succeeded, retrySafety: .unknown)
+        else {
+            await endAndCleanup(
+                outcome: .indeterminate,
+                detail: "provider construction outcome was not recorded")
+            fail("The canonical Work journal could not record provider construction.")
+        }
 
         // 2. The runtime host.
         let hostScript = repoRoot.appending(path: "runtime-hosts/\(variant)/host.py")
         guard FileManager.default.fileExists(atPath: hostScript.path) else {
-            await endAndCleanup()
+            await endAndCleanup(outcome: .failed, detail: "runtime host script is missing")
             fail("No runtime host at \(hostScript.path)")
         }
         let host = RuntimeHost(executable: "/usr/bin/env", arguments: ["python3", hostScript.path])
+        let runtimePermit = await beginNativeEffect(
+            kind: .runtime, intent: "Start the Python runtime host", target: hostScript.path)
+        guard nativeJournal == nil || runtimePermit != nil else {
+            await endAndCleanup(
+                host: host, outcome: .indeterminate,
+                detail: "canonical runtime action permit was unavailable")
+            fail("The canonical Work journal refused runtime startup.")
+        }
         let capabilities: RuntimeHost.Capabilities
         do {
             capabilities = try await host.start()
         } catch {
-            await endAndCleanup(host: host)
+            _ = await finishNativeEffect(
+                runtimePermit,
+                state: error is CancellationError ? .canceled : .failed,
+                retrySafety: .unknown,
+                failureKind: error is CancellationError ? .cancellation : .infrastructure)
+            await endAndCleanup(
+                host: host, outcome: .failed,
+                detail: "runtime host failed to start: \(error.localizedDescription)")
             fail("Could not start the runtime host: \(error.localizedDescription)")
+        }
+        guard await finishNativeEffect(
+            runtimePermit, state: .succeeded, retrySafety: .unsafe)
+        else {
+            await endAndCleanup(
+                host: host, outcome: .indeterminate,
+                detail: "runtime startup outcome was not recorded")
+            fail("The canonical Work journal could not record runtime startup.")
         }
         if !quiet {
             note("runtime \(capabilities.summary) · session isolation "
@@ -308,7 +460,8 @@ enum AgentCLI {
                            timeBudget: minutes.map { $0 * 60 })
                     : nil,
                 hookPaths: HookDiscovery.paths(repoRoot: repoRoot),
-                resume: resume, identity: identity, writer: writer))
+                resume: resume, identity: identity, writer: writer,
+                nativeJournal: nativeJournal))
 
         await runner.observe { event in
             switch event {
@@ -361,19 +514,40 @@ enum AgentCLI {
             let (_, agent) = try await runner.prepare()
             guard await commandController.acknowledgePreparation(commandID: startCommand.commandID)
             else {
-                await endAndCleanup(runner: runner, host: host)
+                await endAndCleanup(
+                    runner: runner, host: host, outcome: .failed,
+                    detail: "Start preparation was not acknowledged")
                 fail("The CLI start command was not acknowledged.")
             }
-            let outcome = await agent.send(prompt)
+            let outcome = await agent.send(prompt) { delivery in
+                switch delivery {
+                case .delivered:
+                    _ = await commandController.recordDelivered(
+                        commandID: startCommand.commandID)
+                case .notDelivered(let reason):
+                    _ = await commandController.recordNotDelivered(
+                        commandID: startCommand.commandID, reason: reason)
+                case .notAttempted, .queued, .indeterminate:
+                    break
+                }
+            }
+            let runOutcome: RunTerminalOutcome
+            let runDetail: String?
             switch outcome {
             case .completed:
                 _ = await commandController.acknowledgeTurnFinished(
                     commandID: startCommand.commandID)
+                runOutcome = .completed
+                runDetail = nil
             case .failed(let detail):
                 note("agent failed: \(detail)")
                 _ = await commandController.markFailed(commandID: startCommand.commandID)
+                runOutcome = .failed
+                runDetail = detail
             case .cancelled:
                 note("agent cancelled; ending run")
+                runOutcome = .canceled
+                runDetail = "agent canceled"
             }
             let total = await agent.totalUsage
             if !quiet {
@@ -381,10 +555,13 @@ enum AgentCLI {
                     + (total.cacheHitRate.map { String(format: " · %.0f%% cached", $0 * 100) } ?? ""))
                 note("transcript \(writer.fileURL.path)")
             }
-            await endAndCleanup(runner: runner, host: host)
+            await endAndCleanup(
+                runner: runner, host: host, outcome: runOutcome, detail: runDetail)
         } catch {
             note("could not start: \(error.localizedDescription)")
-            await endAndCleanup(runner: runner, host: host)
+            await endAndCleanup(
+                runner: runner, host: host, outcome: .failed,
+                detail: error.localizedDescription)
         }
     }
 

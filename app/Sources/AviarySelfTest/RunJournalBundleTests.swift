@@ -27,6 +27,12 @@ private func bundleTestHome() throws -> AgentHome {
     return AgentHome(root: root)
 }
 
+private func persistBundleTestHost(_ home: AgentHome, expected: String? = nil) throws -> String {
+    let host = try home.requirePersistedWorkHostID()
+    if let expected { XCTAssertEqual(host, expected) }
+    return host
+}
+
 private func makeBundle(
     home: AgentHome, runID: String = "run-1",
     failurePlan: (session: TimelineJournalWriter.FailurePlan,
@@ -87,6 +93,80 @@ func test_runJournalBundleFreshGenesisAndExactAssembly() async throws {
     try await bundle.closeChecked()
 }
 
+func test_runJournalBundleExecutionOpenCreatesThenReopensTheMirroredAttachment() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let hostID = try persistBundleTestHost(home)
+    let firstIdentity = SessionWorkIdentity(
+        sessionID: "execution-session",
+        work: WorkRef(workHostID: hostID, workID: "execution-work"),
+        runID: "execution-run-1")
+    let first = try await RunJournalBundle.openForExecution(
+        home: home, identity: firstIdentity, actorID: "gui-one", modelID: "model-one",
+        makeAttachmentID: { "execution-attachment" })
+    XCTAssertEqual(first.sessionAttachment, SessionAttachmentRef("execution-attachment"))
+    _ = try await first.finishRun()
+    try await first.closeChecked()
+
+    let secondIdentity = SessionWorkIdentity(
+        sessionID: firstIdentity.sessionID, work: firstIdentity.work,
+        runID: "execution-run-2")
+    let second = try await RunJournalBundle.openForExecution(
+        home: home, identity: secondIdentity, actorID: "cli-two", modelID: "model-two",
+        makeAttachmentID: { "must-not-replace" })
+    XCTAssertEqual(second.sessionAttachment, SessionAttachmentRef("execution-attachment"))
+    XCTAssertEqual(second.run, RunRef("execution-run-2"))
+    let sessionEvents = try bundleEvents(
+        home, second.sessionJournal,
+        home.timelineV2SessionJournalURL(SessionRef(firstIdentity.sessionID)))
+    XCTAssertEqual(
+        sessionEvents.filter { $0.type == TimelineEventType.sessionAttached }.count, 1)
+    let workEvents = try bundleEvents(
+        home, second.workJournal, home.timelineV2WorkJournalURL(firstIdentity.work))
+    XCTAssertEqual(
+        workEvents.filter { $0.type == TimelineEventType.workCreated }.count, 1)
+    XCTAssertEqual(workEvents.last?.type, TimelineEventType.runStarted)
+    XCTAssertEqual(workEvents.last?.run, RunRef("execution-run-2"))
+    try await second.closeChecked()
+}
+
+func test_runJournalBundleExecutionOpenRefusesForeignAuthorityAndIncompletePair() async throws {
+    let foreignHome = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: foreignHome.root) }
+    let persisted = try persistBundleTestHost(foreignHome)
+    do {
+        _ = try await RunJournalBundle.openForExecution(
+            home: foreignHome,
+            identity: SessionWorkIdentity(
+                sessionID: "foreign-session",
+                work: WorkRef(workHostID: persisted + "-foreign", workID: "foreign-work"),
+                runID: "foreign-run"),
+            actorID: "gui")
+        XCTFail("a launch identity from another Work Host must be refused")
+    } catch let error as RunJournalBundleError {
+        if case .invalidConfiguration = error { } else { XCTFail("wrong authority error: \(error)") }
+    }
+
+    let partialHome = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: partialHome.root) }
+    let partialHost = try persistBundleTestHost(partialHome)
+    let identity = SessionWorkIdentity(
+        sessionID: "partial-session",
+        work: WorkRef(workHostID: partialHost, workID: "partial-work"),
+        runID: "partial-run")
+    let sessionURL = partialHome.timelineV2SessionJournalURL(SessionRef(identity.sessionID))
+    try FileManager.default.createDirectory(
+        at: sessionURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    XCTAssertTrue(FileManager.default.createFile(atPath: sessionURL.path, contents: Data()))
+    do {
+        _ = try await RunJournalBundle.openForExecution(
+            home: partialHome, identity: identity, actorID: "gui")
+        XCTFail("one native journal without its counterpart must be refused")
+    } catch let error as RunJournalBundleError {
+        if case .missingCounterpart = error { } else { XCTFail("wrong partial-pair error: \(error)") }
+    }
+}
+
 func test_runJournalBundleInputAndAssistantTipsRemainOneVisibleChain() async throws {
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
@@ -107,6 +187,9 @@ func test_runJournalBundleInputAndAssistantTipsRemainOneVisibleChain() async thr
     let first = try await bundle.commitInput(text: "first", deliveryMode: .delivered, command: command1)
     XCTAssertEqual(first.count, 4)
     _ = try await bundle.commitAssistantMessage("answer-1")
+    _ = try await bundle.commitCompaction(
+        summary: "first exchange established the answer", tokensBefore: 1_200,
+        droppedMessages: 2)
     _ = try await bundle.finishTurn(TurnRef("turn-1"))
 
     _ = try await bundle.startTurn(TurnRef("turn-2"))
@@ -122,6 +205,7 @@ func test_runJournalBundleInputAndAssistantTipsRemainOneVisibleChain() async thr
     let reduced = SessionReducer.reduce(events)
     XCTAssertTrue(reduced.structuralIntegrityValid && reduced.semanticProjectionValid)
     XCTAssertEqual(reduced.messages.map(\.text), ["first", "answer-1", "second", "answer-2"])
+    XCTAssertEqual(reduced.compactionSummary, "first exchange established the answer")
     XCTAssertEqual(reduced.semanticTip?.eventID, reduced.messages.last?.eventID)
     let workEvents = try bundleEvents(home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
     let work = WorkReducer.reduce(workEvents)
@@ -164,6 +248,33 @@ func test_runJournalBundleQueuedDeliveryUsesOriginalReceiptAndNoSecondInput() as
         _ = try await bundle.commitInput(text: "duplicate", deliveryMode: .queued, command: command)
         XCTFail("a command identity must not be accepted twice")
     } catch { }
+    try await bundle.closeChecked()
+}
+
+func test_runJournalBundleNonConversationalCommandDoesNotCreateAUserMessage() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let bundle = try await makeBundle(home: home)
+    let command = CommandRef(commandID: "end-command", client: ClientRef("gui"))
+    let accepted = try await bundle.commitCommand(
+        label: "end_run", deliveryMode: .queued, command: command,
+        metadata: ["scope": .string("run")])
+    XCTAssertEqual(accepted.count, 1)
+    _ = try await bundle.markCommandDelivered(commandID: command.commandID)
+
+    let sessionEvents = try bundleEvents(
+        home, bundle.sessionJournal, home.timelineV2SessionJournalURL(bundleTestSession))
+    XCTAssertEqual(sessionEvents.filter { $0.type == TimelineEventType.inputAccepted }.count, 0)
+    let workEvents = try bundleEvents(
+        home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
+    let receipt = try XCTUnwrap(workEvents.first(where: {
+        $0.type == TimelineEventType.commandAccepted && $0.command?.commandID == command.commandID
+    }))
+    XCTAssertEqual(receipt.payload["command_kind"]?.stringValue, "end_run")
+    XCTAssertEqual(receipt.payload["scope"]?.stringValue, "run")
+    let reduced = WorkReducer.reduce(workEvents)
+    XCTAssertEqual(reduced.commands[command.commandID]?.state, .delivered)
+    XCTAssertTrue(reduced.structuralIntegrityValid && reduced.semanticProjectionValid)
     try await bundle.closeChecked()
 }
 
@@ -243,6 +354,7 @@ func test_runJournalBundleSemanticGateSerializesConcurrentMutations() async thro
     }
     XCTAssertEqual(inputResults.filter { $0 }.count, 1)
     XCTAssertEqual(inputResults.filter { !$0 }.count, 1)
+    _ = try await bundle.markCommandDelivered(commandID: "concurrent-command")
 
     let actionResults = await withTaskGroup(of: EffectPermit?.self, returning: [EffectPermit?].self) { group in
         for _ in 0..<2 {
@@ -287,13 +399,21 @@ func test_runJournalBundleSemanticGateSerializesConcurrentMutations() async thro
     try await bundle.closeChecked()
 }
 
-func test_runJournalBundleQueuedCommandCanDeliverAfterFinishedRunReopen() async throws {
+func test_runJournalBundleQueuedCommandMustTerminalizeBeforeFinishedRunReopen() async throws {
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
     let bundle = try await makeBundle(home: home, runID: "queued-run")
     _ = try await bundle.commitInput(
         text: "deliver later", deliveryMode: .queued,
         command: CommandRef(commandID: "deliver-later"))
+    do {
+        _ = try await bundle.finishRun()
+        XCTFail("a Run must not finish while an accepted command has no delivery outcome")
+    } catch let error as RunJournalBundleError {
+        XCTAssertEqual(error, .unfinishedCommands(["deliver-later"]))
+    }
+    _ = try await bundle.markCommandNotDelivered(
+        commandID: "deliver-later", reason: "the active turn ended before delivery")
     _ = try await bundle.finishRun()
     try await bundle.closeChecked()
 
@@ -301,13 +421,13 @@ func test_runJournalBundleQueuedCommandCanDeliverAfterFinishedRunReopen() async 
         home: home, session: bundleTestSession, work: bundleTestWork, workHost: bundleTestHost,
         sessionAuthority: bundleTestAuthority, sessionAttachment: bundleTestAttachment,
         run: RunRef("delivery-run"), actor: bundleTestActor)
-    _ = try await reopened.markCommandDelivered(commandID: "deliver-later")
     let workEvents = try bundleEvents(home, reopened.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
     let reduced = WorkReducer.reduce(workEvents)
     XCTAssertTrue(reduced.structuralIntegrityValid && reduced.semanticProjectionValid)
-    XCTAssertEqual(reduced.commands["deliver-later"]?.state, .delivered)
+    XCTAssertEqual(reduced.commands["deliver-later"]?.state, .notDelivered)
     XCTAssertEqual(workEvents.filter { $0.type == TimelineEventType.commandAccepted }.count, 1)
-    XCTAssertEqual(workEvents.filter { $0.type == TimelineEventType.commandDelivered }.count, 1)
+    XCTAssertEqual(workEvents.filter { $0.type == TimelineEventType.commandDelivered }.count, 0)
+    XCTAssertEqual(workEvents.filter { $0.type == TimelineEventType.commandNotDelivered }.count, 1)
     let sessionEvents = try bundleEvents(
         home, reopened.sessionJournal, home.timelineV2SessionJournalURL(bundleTestSession))
     XCTAssertEqual(sessionEvents.filter { $0.type == TimelineEventType.inputAccepted }.count, 1)
@@ -606,4 +726,26 @@ func test_runJournalBundleCheckedCloseReportsPartialClose() async throws {
         sessionAuthority: bundleTestAuthority, sessionAttachment: bundleTestAttachment,
         run: RunRef("run-after-close"), actor: bundleTestActor)
     try await reopened.closeChecked()
+}
+
+func test_runJournalBundleCanceledTaskStillFinishesAndCloses() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let bundle = try await makeBundle(home: home)
+
+    let teardown = Task {
+        // Cancellation wakes this suspension while leaving the task's cancellation flag set.
+        // Terminal journal operations must still cross their semantic gate afterward.
+        try? await Task.sleep(nanoseconds: 30_000_000_000)
+        _ = try await bundle.finishRun(outcome: .canceled, detail: "pre-canceled teardown")
+        try await bundle.closeChecked()
+    }
+    teardown.cancel()
+    try await teardown.value
+
+    let workEvents = try bundleEvents(
+        home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
+    XCTAssertEqual(workEvents.last?.type, TimelineEventType.runFinished)
+    XCTAssertEqual(workEvents.last?.payload["state"]?.stringValue, RunTerminalOutcome.canceled.rawValue)
+    XCTAssertEqual((await bundleStatus(bundle)).health, .closed)
 }

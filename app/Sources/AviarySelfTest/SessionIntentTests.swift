@@ -8,6 +8,186 @@ private func intentIdentity() -> SessionWorkIdentity {
         runID: "intent-run")
 }
 
+private enum CommandJournalTestError: Error, Sendable {
+    case delivery
+}
+
+private actor RecordingSessionCommandJournal: SessionCommandJournal {
+    private(set) var intents: [SessionCommandIntent] = []
+    private(set) var deliveries: [(SessionCommandIntent, Date)] = []
+    private var failNextDelivery = false
+
+    func commitIntent(_ intent: SessionCommandIntent) async throws {
+        intents.append(intent)
+    }
+
+    func markDelivered(_ intent: SessionCommandIntent, at timestamp: Date) async throws {
+        if failNextDelivery {
+            failNextDelivery = false
+            throw CommandJournalTestError.delivery
+        }
+        deliveries.append((intent, timestamp))
+    }
+
+    func failDeliveryOnce() {
+        failNextDelivery = true
+    }
+}
+
+private actor HeldDeliverySessionCommandJournal: SessionCommandJournal {
+    private(set) var deliveryStarted = false
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func commitIntent(_ intent: SessionCommandIntent) async throws {}
+
+    func markDelivered(_ intent: SessionCommandIntent, at timestamp: Date) async throws {
+        deliveryStarted = true
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func releaseDelivery() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+func test_sessionCommandControllerJournalSeamPreservesIdentityAndDeliveryBoundaries() async throws {
+    let identity = intentIdentity()
+    let journal = RecordingSessionCommandJournal()
+    let controller = SessionCommandController(identity: identity, journal: journal)
+    let admittedAt = Date(timeIntervalSince1970: 123)
+    let deliveredAt = Date(timeIntervalSince1970: 456)
+
+    let result = await controller.admitAndCommit(
+        .start(prompt: "hello"), actorID: "gui", commandID: "start", timestamp: admittedAt)
+    guard case .accepted(let admitted) = result else {
+        XCTFail("the supplied command journal should admit and commit start")
+        return
+    }
+    let intents = await journal.intents
+    XCTAssertEqual(intents.count, 1)
+    XCTAssertEqual(intents.first?.identity, identity)
+    XCTAssertEqual(intents.first?.commandID, admitted.commandID)
+    XCTAssertEqual(intents.first?.sequence, admitted.sequence)
+    XCTAssertEqual(intents.first?.timestamp, admittedAt)
+    XCTAssertTrue((await journal.deliveries).isEmpty, "admission must not claim delivery")
+
+    XCTAssertEqual(await controller.awaitDispatch(commandID: admitted.commandID)?.commandID, "start")
+    // Start's dispatch permit covers setup; its actual input delivery is acknowledged later.
+    XCTAssertTrue(await controller.acknowledgeDispatched(commandID: admitted.commandID))
+    XCTAssertTrue(await controller.recordDelivered(commandID: admitted.commandID, timestamp: deliveredAt))
+    XCTAssertTrue(
+        await controller.recordDelivered(commandID: admitted.commandID, timestamp: deliveredAt),
+        "delivery receipt retries are idempotent")
+    let deliveries = await journal.deliveries
+    XCTAssertEqual(deliveries.count, 1)
+    XCTAssertEqual(deliveries.first?.0.identity, identity)
+    XCTAssertEqual(deliveries.first?.0.commandID, admitted.commandID)
+    XCTAssertEqual(deliveries.first?.1, deliveredAt)
+}
+
+func test_sessionCommandControllerInstallsLaunchJournalOnlyBeforeAdmission() async throws {
+    let first = RecordingSessionCommandJournal()
+    let replacement = RecordingSessionCommandJournal()
+    let controller = SessionCommandController(identity: intentIdentity(), journal: first)
+
+    XCTAssertTrue(await controller.installJournalBeforeAdmission(replacement))
+    let result = await controller.admitAndCommit(
+        .start(prompt: "hello"), actorID: "gui", commandID: "start")
+    guard case .accepted = result else {
+        XCTFail("the replacement journal should admit Start")
+        return
+    }
+    XCTAssertTrue((await first.intents).isEmpty)
+    XCTAssertEqual((await replacement.intents).map(\.commandID), ["start"])
+    XCTAssertFalse(
+        await controller.installJournalBeforeAdmission(first),
+        "journal authority cannot change after admission begins")
+}
+
+func test_sessionCommandControllerJournalDeliveryFailureFailsClosedAfterCrossing() async throws {
+    let journal = RecordingSessionCommandJournal()
+    let controller = SessionCommandController(identity: intentIdentity(), journal: journal)
+    _ = await controller.admitAndCommit(.start(prompt: "run"), actorID: "gui", commandID: "start")
+    XCTAssertEqual(await controller.awaitDispatch(commandID: "start")?.commandID, "start")
+    await journal.failDeliveryOnce()
+
+    XCTAssertFalse(await controller.acknowledgeDelivered(commandID: "start"))
+    XCTAssertEqual(await controller.state, .failed)
+    XCTAssertTrue(await controller.isJournalUnavailable)
+    XCTAssertFalse(
+        await controller.acknowledgeDispatched(commandID: "start"),
+        "a failed delivery receipt still releases the crossed dispatch owner")
+
+    // End remains the only local teardown permit after an ambiguous native delivery write.
+    let ending = await controller.admitAndCommit(.endRun, actorID: "gui", commandID: "end")
+    guard case .accepted(let end) = ending else {
+        XCTFail("End should remain available for teardown")
+        return
+    }
+    XCTAssertEqual(await controller.awaitDispatch(commandID: end.commandID)?.commandID, end.commandID)
+    XCTAssertTrue(await controller.acknowledgeDelivered(commandID: end.commandID))
+    XCTAssertTrue(await controller.acknowledgeEnd(commandID: end.commandID))
+    XCTAssertEqual(await controller.state, .ended)
+}
+
+func test_sessionCommandControllerDeliveryWaitersHonorTheFirstTerminalOutcome() async throws {
+    let journal = HeldDeliverySessionCommandJournal()
+    let controller = SessionCommandController(identity: intentIdentity(), journal: journal)
+    let receipt = await controller.admitAndCommitReceipt(
+        .start(prompt: "held"), actorID: "gui", commandID: "held-delivery")
+    guard case .accepted(let admitted) = receipt.admission else {
+        XCTFail("the held command should be admitted")
+        return
+    }
+
+    let delivered = Task {
+        await controller.recordDelivered(commandID: admitted.commandID)
+    }
+    for _ in 0..<100 where !(await journal.deliveryStarted) {
+        await Task.yield()
+    }
+    XCTAssertTrue(await journal.deliveryStarted, "delivery journal call should be held")
+
+    // This waiter races the in-flight delivery, but it must not inherit delivery's success.
+    let notDelivered = Task {
+        await controller.recordNotDelivered(
+            commandID: admitted.commandID, reason: "a competing terminal report")
+    }
+    await journal.releaseDelivery()
+
+    XCTAssertTrue(await delivered.value)
+    XCTAssertFalse(await notDelivered.value)
+    XCTAssertEqual(
+        await controller.receipt(for: admitted.commandID)?.delivery,
+        .delivered(referenceID: nil))
+}
+
+func test_sessionWriterCanBePassedThroughCommandJournalSeam() async throws {
+    let home = scratchHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let identity = intentIdentity()
+    let writer = try SessionWriter(home: home, cwd: "/tmp", model: nil, identity: identity)
+    let controller = SessionCommandController(identity: identity, journal: writer)
+
+    let result = await controller.admitAndCommit(
+        .start(prompt: "legacy"), actorID: "gui", commandID: "start",
+        timestamp: Date(timeIntervalSince1970: 123))
+    guard case .accepted(let admitted) = result else {
+        XCTFail("SessionWriter must remain a command journal")
+        return
+    }
+    XCTAssertEqual(await controller.awaitDispatch(commandID: admitted.commandID)?.commandID, "start")
+    XCTAssertTrue(await controller.acknowledgeDelivered(commandID: admitted.commandID))
+    try await writer.closeChecked()
+
+    let raw = try String(contentsOf: writer.fileURL, encoding: .utf8)
+    XCTAssertTrue(raw.contains("\"customType\":\"aviary.command-intent.v1\""))
+    XCTAssertTrue(raw.contains("\"commandID\":\"start\""))
+}
+
 func test_sessionWriterCommandIntentIsRawReadableButConversationHidden() async throws {
     let home = scratchHome()
     defer { try? FileManager.default.removeItem(at: home.root) }

@@ -115,6 +115,7 @@ public actor Agent {
     }
 
     public typealias Observer = @Sendable (Event) -> Void
+    public typealias InputDeliveryObserver = @Sendable (SessionCommandDelivery) async -> Void
 
     // MARK: State
 
@@ -125,6 +126,9 @@ public actor Agent {
     private var provider: ChatProvider
     private let host: RuntimeHost
     private let writer: SessionWriter
+    /// The canonical Session/Work producer for native runs. The legacy writer remains an
+    /// explicit presentation adapter until every reader consumes Timeline v2 directly.
+    private let nativeJournal: RunJournalBundle?
     private var config: Configuration
     private let hostSession: String
     private var messages: [ChatMessage] = []
@@ -144,8 +148,12 @@ public actor Agent {
     /// lands at the next turn boundary — not mid-turn, because a tool call already in flight
     /// has to be answered before the model can be told anything. A follow-up is "and then do
     /// this", and waits for the run to settle.
-    private var pendingSteering: [String] = []
-    private var pendingFollowUps: [String] = []
+    private struct QueuedInput: Sendable {
+        let text: String
+        let onDelivery: InputDeliveryObserver?
+    }
+    private var pendingSteering: [QueuedInput] = []
+    private var pendingFollowUps: [QueuedInput] = []
 
     public private(set) var totalUsage = Usage()
     /// The last input-token count the provider reported. The cheapest available measure of
@@ -181,11 +189,13 @@ public actor Agent {
 
     public init(
         provider: ChatProvider, host: RuntimeHost, writer: SessionWriter,
-        hostSession: String, config: Configuration
+        hostSession: String, config: Configuration,
+        nativeJournal: RunJournalBundle? = nil
     ) {
         self.provider = provider
         self.host = host
         self.writer = writer
+        self.nativeJournal = nativeJournal
         self.hostSession = hostSession
         self.config = config
         // A defensive filter rather than a precondition: a stale system prompt from a previous
@@ -235,14 +245,21 @@ public actor Agent {
     /// `wait()`, `as_completed()` and every other stdlib idiom for free, none of which a
     /// blocking call could have offered.
     public protocol SpawnDelegate: Sendable {
-        /// Start a child and return its id at once.
+        /// The admission result is explicit: only `.running` means the runner created the
+        /// background task. `.refused` is a real, explainable outcome rather than an id that
+        /// makes the model believe a child exists when admission was closed.
         func startBackground(
             prompt: String, name: String?, model: String?, depth: Int
-        ) async -> (childID: String, name: String)
+        ) async -> SpawnStartResult
 
         /// Every child this run has started, finished or not. Polled by the Future's own
         /// thread rather than by the agent, so it is not in the namespace.
         func children() async -> [ChildStatus]
+    }
+
+    public enum SpawnStartResult: Hashable, Sendable {
+        case running(childID: String, name: String)
+        case refused(name: String, reason: String)
     }
 
     /// Somebody who can put a message into *this* run's own conversation.
@@ -336,22 +353,31 @@ public actor Agent {
     @discardableResult
     public func switchModel(to model: ModelSpec, provider newProvider: ChatProvider) async -> Bool {
         guard await requireJournal("model switch") else { return false }
+        if let nativeJournal {
+            do {
+                _ = try await nativeJournal.changeModel(model.qualifiedID)
+            } catch {
+                latchNativeJournalFailure("the model switch", error)
+                return false
+            }
+        }
+
+        // Once Timeline v2 has accepted the change it is the authority for the effective model.
+        // Apply the in-memory state before updating the legacy presentation so a projection
+        // failure cannot leave canonical history claiming a model that the live Agent never
+        // adopted. The run will fail closed at the next effect boundary if that projection is
+        // unavailable, but the accepted change itself remains truthful.
+        provider = newProvider
+        config.model = model
+        config.maxTokens = model.maxTokens
         do {
-            // The model-change row is the durable antecedent of changing provider/config. If it
-            // cannot be recorded, leave the live agent on its existing model rather than allowing
-            // an effective switch that a resumed reader cannot explain.
             try await writer.appendModelChange(model)
         } catch {
             journalFailureDetail = "Could not record the model switch: \(error.localizedDescription)"
+            emit(.modelChanged(provider: model.providerID, model: model.id))
             emit(.failed(journalFailureDetail!))
-            return false
+            return nativeJournal != nil
         }
-        provider = newProvider
-        config.model = model
-        // The context window belongs to the model, and compaction is driven off it. Switching
-        // to a smaller window without moving this would let a conversation sit above the new
-        // ceiling with nothing noticing until the provider refused it.
-        config.maxTokens = model.maxTokens
         emit(.modelChanged(provider: model.providerID, model: model.id))
         return true
     }
@@ -408,8 +434,18 @@ public actor Agent {
             else {
                 return .object(["error": .string("message() needs some text.")])
             }
+            let permit = await beginNativeAction(
+                kind: .peerDelivery, intent: "Deliver a message to a peer", target: to)
+            do { try requireNativePermit(permit, for: "peer delivery") }
+            catch { return .object(["error": .string(error.localizedDescription)]) }
             let outcome = await peerDelegate.deliver(
                 to: to, text: text, from: writer.sessionID)
+            guard await finishNativeAction(
+                permit, state: outcome.error == nil ? .succeeded : .failed,
+                retrySafety: .unsafe, failureKind: outcome.error == nil ? nil : .task) else {
+                return .object(["error": .string(
+                    journalFailureDetail ?? "The peer-delivery outcome could not be recorded.")])
+            }
             if let error = outcome.error { return .object(["error": .string(error)]) }
             return .object([
                 "delivered": .bool(true), "session": .string(outcome.session),
@@ -430,22 +466,34 @@ public actor Agent {
             // is a bill that keeps arriving. The prelude's limit keeps a megabyte off the
             // callback channel; this one is what makes the guarantee true whatever calls it.
             let text = Self.bounded(raw)
+            // Every exit after accepting the callback settles the matching dispatched promise,
+            // including a journal-permit failure. Otherwise an unavailable journal can strand
+            // the agent forever waiting on a notification it correctly refused to deliver.
+            defer { dispatchedCount = max(0, dispatchedCount - 1) }
+            let permit = await beginNativeAction(
+                kind: .selfDelivery, intent: "Deliver a notification to this session",
+                target: writer.sessionID)
+            do { try requireNativePermit(permit, for: "self delivery") }
+            catch { return .object(["error": .string(error.localizedDescription)]) }
             var deliveryError: String?
+            let delivered: Bool
             if let selfDelegate {
-                let delivered = await selfDelegate.deliverToSelf(
+                delivered = await selfDelegate.deliverToSelf(
                     sessionID: writer.sessionID, text: text, from: writer.sessionID)
-                if !delivered {
-                    deliveryError = "The session did not accept the notification."
-                }
             } else {
                 // No app behind this run — a CLI session. A follow-up still lands, as long as
                 // the loop is alive to take it.
-                queueFollowUp(text)
+                delivered = queueFollowUp(text)
             }
-            // Decremented *after* the message is queued, never before. The waiter gives up
-            // when the count reaches zero with nothing waiting, so decrementing first opens a
-            // window where it sees exactly that and finishes the run a moment early.
-            dispatchedCount = max(0, dispatchedCount - 1)
+            guard await finishNativeAction(
+                permit, state: delivered ? .succeeded : .failed,
+                retrySafety: .unsafe, failureKind: delivered ? nil : .task) else {
+                return .object(["error": .string(
+                    journalFailureDetail ?? "The self-delivery outcome could not be recorded.")])
+            }
+            if !delivered {
+                deliveryError = "The session did not accept the notification."
+            }
             if let deliveryError {
                 return .object(["delivered": .bool(false), "error": .string(deliveryError)])
             }
@@ -457,16 +505,20 @@ public actor Agent {
                     "No \(WebSearch.keyVariable) in the environment, so web access is off.")])
             }
             let web = WebSearch(apiKey: key)
-            do {
-                if kind == "search" {
-                    let queries = (payload["queries"]?.arrayValue ?? [])
-                        .compactMap(\.stringValue)
-                    let objective = payload["objective"]?.stringValue
-                    guard !(objective ?? "").isEmpty || !queries.isEmpty else {
-                        return .object(["error": .string(
-                            "search() needs an objective, or some queries.")])
-                    }
-                    return try await web.search(
+            if kind == "search" {
+                let queries = (payload["queries"]?.arrayValue ?? [])
+                    .compactMap(\.stringValue)
+                let objective = payload["objective"]?.stringValue
+                guard !(objective ?? "").isEmpty || !queries.isEmpty else {
+                    return .object(["error": .string(
+                        "search() needs an objective, or some queries.")])
+                }
+                let permit = await beginNativeAction(
+                    kind: .webSearch, intent: "Search the web", target: "web.search")
+                do { try requireNativePermit(permit, for: "web search") }
+                catch { return .object(["error": .string(error.localizedDescription)]) }
+                do {
+                    let result = try await web.search(
                         objective: objective,
                         // The objective doubles as the query when none is given: the API wants
                         // at least one, and asking the model for both every time is friction
@@ -480,16 +532,42 @@ public actor Agent {
                         excludeDomains: (payload["exclude"]?.arrayValue ?? [])
                             .compactMap(\.stringValue),
                         afterDate: payload["after"]?.stringValue)
+                        guard await finishNativeAction(
+                            permit, state: .succeeded, retrySafety: .unsafe) else {
+                            return .object(["error": .string(
+                                journalFailureDetail ?? "The web-search outcome could not be recorded.")])
+                        }
+                        return result
+                    } catch {
+                        _ = await finishNativeAction(
+                            permit, state: .failed, retrySafety: .unsafe,
+                            failureKind: .infrastructure)
+                        return .object(["error": .string(error.localizedDescription)])
                 }
-                let urls = (payload["urls"]?.arrayValue ?? []).compactMap(\.stringValue)
-                guard !urls.isEmpty else {
-                    return .object(["error": .string("read_url() needs at least one URL.")])
-                }
-                return try await web.extract(
+            }
+            let urls = (payload["urls"]?.arrayValue ?? []).compactMap(\.stringValue)
+            guard !urls.isEmpty else {
+                return .object(["error": .string("read_url() needs at least one URL.")])
+            }
+            let permit = await beginNativeAction(
+                kind: .webExtract, intent: "Extract content from web pages", target: "web.extract")
+            do { try requireNativePermit(permit, for: "web extraction") }
+            catch { return .object(["error": .string(error.localizedDescription)]) }
+            do {
+                let result = try await web.extract(
                     urls: urls, objective: payload["objective"]?.stringValue,
                     queries: (payload["queries"]?.arrayValue ?? []).compactMap(\.stringValue),
                     full: payload["full"]?.boolValue ?? false)
+                guard await finishNativeAction(
+                    permit, state: .succeeded, retrySafety: .unsafe) else {
+                    return .object(["error": .string(
+                        journalFailureDetail ?? "The web-extract outcome could not be recorded.")])
+                }
+                return result
             } catch {
+                _ = await finishNativeAction(
+                    permit, state: .failed, retrySafety: .unsafe,
+                    failureKind: .infrastructure)
                 return .object(["error": .string(error.localizedDescription)])
             }
 
@@ -502,8 +580,17 @@ public actor Agent {
             guard let path = payload["path"]?.stringValue, !path.isEmpty else {
                 return .object(["error": .string("attach_image() needs a path.")])
             }
+            let permit = await beginNativeAction(
+                kind: .imageRead, intent: "Read an image for the model", target: path)
+            do { try requireNativePermit(permit, for: "image read") }
+            catch { return .object(["error": .string(error.localizedDescription)]) }
             do {
                 let image = try AttachedImage.read(path: path)
+                guard await finishNativeAction(
+                    permit, state: .succeeded, retrySafety: .safe) else {
+                    return .object(["error": .string(
+                        journalFailureDetail ?? "The image-read outcome could not be recorded.")])
+                }
                 // Queued rather than returned: an image has to reach the model as a content
                 // block in the conversation, and a tool result is text. The loop drains this
                 // straight after the result that produced it, so the picture arrives with the
@@ -511,6 +598,8 @@ public actor Agent {
                 pendingImages.append((image, payload["note"]?.stringValue))
                 return image.summary
             } catch {
+                _ = await finishNativeAction(
+                    permit, state: .failed, retrySafety: .safe, failureKind: .task)
                 return .object(["error": .string(error.localizedDescription)])
             }
 
@@ -539,13 +628,38 @@ public actor Agent {
             let name = payload["name"]?.stringValue
             // Always non-blocking. Waiting is `.result()` on the Future the prelude hands
             // back, which is Python's business rather than this callback's.
+            let permit = await beginNativeAction(
+                kind: .child, intent: "Start a child agent", target: name ?? "child",
+                metadata: ["depth": .number(Double(config.depth + 1))])
+            do { try requireNativePermit(permit, for: "child start") }
+            catch { return .object(["error": .string(error.localizedDescription)]) }
             let started = await delegate.startBackground(
                 prompt: prompt, name: name,
                 model: payload["model"]?.stringValue, depth: config.depth + 1)
-            return .object([
-                "id": .string(started.childID), "name": .string(started.name),
-                "state": .string("running"),
-            ])
+            switch started {
+            case .running(let childID, let childName):
+                guard await finishNativeAction(
+                    permit, state: .succeeded, retrySafety: .unsafe) else {
+                    return .object(["error": .string(
+                        journalFailureDetail ?? "The child-start outcome could not be recorded.")])
+                }
+                return .object([
+                    "id": .string(childID), "name": .string(childName),
+                    "state": .string("running"),
+                ])
+            case .refused(let refusedName, let reason):
+                let detail = "Child \(refusedName.debugDescription) was not started: \(reason)"
+                guard await finishNativeAction(
+                    permit, state: .canceled, retrySafety: .safe,
+                    failureKind: .policy) else {
+                    return .object(["error": .string(
+                        journalFailureDetail ?? "The refused child-start outcome could not be recorded.")])
+                }
+                return .object([
+                    "name": .string(refusedName), "state": .string("refused"),
+                    "error": .string(detail),
+                ])
+            }
 
         case "remember":
             guard let memory else {
@@ -570,14 +684,29 @@ public actor Agent {
                 // Provenance, because the harness recorded none and "why does it think that?"
                 // was unanswerable. The prompt that produced the belief is the answer.
                 provenance: firstPrompt)
+            let permit = await beginNativeAction(
+                kind: .memory, intent: "Write a memory entry", target: scope.rawValue)
+            do { try requireNativePermit(permit, for: "memory write") }
+            catch { return .object(["error": .string(error.localizedDescription)]) }
             do {
                 try memory.append(entry, sessionID: writer.sessionID)
+                guard await finishNativeAction(
+                    permit, state: .succeeded, retrySafety: .unsafe) else {
+                    return .object(["error": .string(
+                        journalFailureDetail ?? "The memory-write outcome could not be recorded.")])
+                }
                 // Recorded in the transcript too, so a reader sees the agent deciding to
                 // believe something at the moment it decided.
-                try? await writer.appendNote(
+                guard await appendJournalNote(
                     "Remembered (\(scope.rawValue)): \(text)", customType: "aviary.memory")
+                else {
+                    return .object(["error": .string(
+                        journalFailureDetail ?? "The memory note could not be recorded.")])
+                }
                 return .object(["id": .string(entry.id), "scope": .string(scope.rawValue)])
             } catch {
+                _ = await finishNativeAction(
+                    permit, state: .failed, retrySafety: .unsafe, failureKind: .infrastructure)
                 return .object(["error": .string(error.localizedDescription)])
             }
 
@@ -607,17 +736,32 @@ public actor Agent {
                 return .object(["error": .string(
                     "This run has nowhere to write artifacts.")])
             }
+            let permit = await beginNativeAction(
+                kind: .artifact, intent: "Write an artifact", target: payload["title"]?.stringValue)
+            do { try requireNativePermit(permit, for: "artifact write") }
+            catch { return .object(["error": .string(error.localizedDescription)]) }
             do {
                 let written = try artifacts.write(
                     text: payload["text"]?.stringValue ?? "",
                     title: payload["title"]?.stringValue,
                     format: payload["format"]?.stringValue ?? "md")
+                guard await finishNativeAction(
+                    permit, state: .succeeded, retrySafety: .unsafe) else {
+                    return .object(["error": .string(
+                        journalFailureDetail ?? "The artifact-write outcome could not be recorded.")])
+                }
                 // Recorded in the transcript as well as returned, because the return value is
                 // read once by the model and the transcript is what a person opens tomorrow.
-                try? await writer.appendNote(
+                guard await appendJournalNote(
                     written.note.text, customType: ArtifactNote.customType)
+                else {
+                    return .object(["error": .string(
+                        journalFailureDetail ?? "The artifact note could not be recorded.")])
+                }
                 return written.payload
             } catch {
+                _ = await finishNativeAction(
+                    permit, state: .failed, retrySafety: .unsafe, failureKind: .infrastructure)
                 return .object(["error": .string(error.localizedDescription)])
             }
 
@@ -696,29 +840,33 @@ public actor Agent {
     /// the model can be told anything, and injecting a message between a call and its result
     /// produces a conversation the provider rejects.
     @discardableResult
-    public func steer(_ text: String) -> Bool {
+    public func steer(
+        _ text: String, onInputDelivery: InputDeliveryObserver? = nil
+    ) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         // A freshly prepared CLI agent may stage input before its first send. After a turn has
         // ever run, accepting while quiescent would strand the message until some unrelated
         // future send, so only an active generation may accept it.
         let hasConsumer = activeSendCount > 0 || firstPrompt == nil
         guard !trimmed.isEmpty, hasConsumer, !cancelled else { return false }
-        pendingSteering.append(trimmed)
+        pendingSteering.append(QueuedInput(text: trimmed, onDelivery: onInputDelivery))
         return true
     }
 
     /// Queue a prompt for after this run settles.
     @discardableResult
-    public func queueFollowUp(_ text: String) -> Bool {
+    public func queueFollowUp(
+        _ text: String, onInputDelivery: InputDeliveryObserver? = nil
+    ) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasConsumer = activeSendCount > 0 || firstPrompt == nil
         guard !trimmed.isEmpty, hasConsumer, !cancelled else { return false }
-        pendingFollowUps.append(trimmed)
+        pendingFollowUps.append(QueuedInput(text: trimmed, onDelivery: onInputDelivery))
         return true
     }
 
     public var queued: (steering: [String], followUps: [String]) {
-        (pendingSteering, pendingFollowUps)
+        (pendingSteering.map(\.text), pendingFollowUps.map(\.text))
     }
 
     /// The conversation so far, for a caller that wants to fork or inspect it.
@@ -804,7 +952,15 @@ public actor Agent {
     private func recordOutcome(
         _ state: TranscriptOutcome.State, detail: String? = nil
     ) async {
-        _ = try? await writer.appendOutcome(state: state, detail: detail.map(Self.bounded))
+        do {
+            _ = try await writer.appendOutcome(state: state, detail: detail.map(Self.bounded))
+        } catch {
+            if journalFailureDetail == nil {
+                journalFailureDetail = "Could not record the terminal session outcome: "
+                    + error.localizedDescription
+                emit(.failed(journalFailureDetail!))
+            }
+        }
     }
 
     /// Check the journal immediately before a model, tool, callback, or child effect. The
@@ -812,10 +968,111 @@ public actor Agent {
     /// promise that the next fsync will succeed.
     private func requireJournal(_ effect: String) async -> Bool {
         guard journalFailureDetail == nil else { return false }
-        if case .healthy = await writer.writerHealth { return true }
-        journalFailureDetail = "The session journal became unavailable before \(effect)."
+        guard case .healthy = await writer.writerHealth else {
+            journalFailureDetail = "The legacy session projection became unavailable before \(effect)."
+            emit(.failed(journalFailureDetail!))
+            return false
+        }
+        if let nativeJournal {
+            guard case .healthy = await nativeJournal.status.health else {
+                journalFailureDetail = "The canonical Session/Work journal became unavailable before \(effect)."
+                emit(.failed(journalFailureDetail!))
+                return false
+            }
+        }
+        return true
+    }
+
+    private struct NativeJournalFailure: LocalizedError {
+        let detail: String
+        var errorDescription: String? { detail }
+    }
+
+    private func latchNativeJournalFailure(_ operation: String, _ error: Error) {
+        guard journalFailureDetail == nil else { return }
+        journalFailureDetail = "Could not record \(operation) in the canonical Work journal: "
+            + error.localizedDescription
         emit(.failed(journalFailureDetail!))
-        return false
+    }
+
+    private func beginNativeAction(
+        kind: ActionKind, intent: String, target: String? = nil,
+        metadata: [String: JSONValue] = [:]
+    ) async -> EffectPermit? {
+        guard let nativeJournal else { return nil }
+        do {
+            return try await nativeJournal.beginAction(
+                kind: kind, intent: intent, target: target, scope: "run", metadata: metadata)
+        } catch {
+            latchNativeJournalFailure("the \(kind.rawValue) action start", error)
+            return nil
+        }
+    }
+
+    private func finishNativeAction(
+        _ permit: EffectPermit?, state: ActionExecutionState,
+        retrySafety: ActionRetrySafety, failureKind: ActionFailureKind? = nil
+    ) async -> Bool {
+        guard let nativeJournal else { return true }
+        guard let permit else { return false }
+        do {
+            _ = try await nativeJournal.finishAction(
+                permit, state: state, retrySafety: retrySafety, failureKind: failureKind)
+            return true
+        } catch {
+            latchNativeJournalFailure("the \(permit.kind.rawValue) action outcome", error)
+            return false
+        }
+    }
+
+    /// Bracket one admitted user instruction with the canonical turn lifecycle. The helper
+    /// awaits the terminal record before `send` returns; an asynchronous `defer` would let the
+    /// launcher publish Run completion while the turn was still active on disk.
+    private func withNativeTurn(
+        _ operation: () async -> SendOutcome
+    ) async -> SendOutcome {
+        guard let nativeJournal else { return await operation() }
+        let turn = TurnRef(UUID().uuidString.lowercased())
+        do {
+            _ = try await nativeJournal.startTurn(turn)
+        } catch {
+            latchNativeJournalFailure("the turn start", error)
+            return .failed(journalFailureDetail ?? error.localizedDescription)
+        }
+
+        let outcome = await operation()
+        switch outcome {
+        case .completed:
+            break
+        case .cancelled:
+            await refusePendingInputs(reason: "the active turn was canceled before delivery")
+        case .failed(let detail):
+            await refusePendingInputs(reason: "the active turn failed before delivery: \(detail)")
+        }
+        do {
+            _ = try await nativeJournal.finishTurn(turn)
+        } catch {
+            latchNativeJournalFailure("the turn outcome", error)
+            return .failed(journalFailureDetail ?? error.localizedDescription)
+        }
+        return outcome
+    }
+
+    private func refusePendingInputs(reason: String) async {
+        let queued = pendingSteering + pendingFollowUps
+        pendingSteering.removeAll()
+        pendingFollowUps.removeAll()
+        for input in queued {
+            await input.onDelivery?(.notDelivered(reason: reason))
+        }
+    }
+
+    private func requireNativePermit(_ permit: EffectPermit?, for effect: String) throws {
+        guard nativeJournal == nil || permit != nil else {
+            throw NativeJournalFailure(
+                detail: journalFailureDetail
+                    ?? "The canonical Work journal refused the \(effect) effect.")
+        }
     }
 
     /// Notes are themselves a crossing into the durable session. A failed hook or artifact
@@ -836,24 +1093,24 @@ public actor Agent {
     @discardableResult
     public func send(
         _ prompt: String,
-        onInputDelivery: (@Sendable (SessionCommandDelivery) -> Void)? = nil
+        onInputDelivery: InputDeliveryObserver? = nil
     ) async -> SendOutcome {
         activeSendCount += 1
         defer { finishSend() }
         guard await requireJournal("user input") else {
-            onInputDelivery?(.notDelivered(reason: journalFailureDetail!))
+            await onInputDelivery?(.notDelivered(reason: journalFailureDetail!))
             return .failed(journalFailureDetail!)
         }
         guard !Task.isCancelled else {
             await recordOutcome(.cancelled, detail: "cancelled before the input was recorded")
-            onInputDelivery?(.notDelivered(reason: "cancelled before the input was recorded"))
+            await onInputDelivery?(.notDelivered(reason: "cancelled before the input was recorded"))
             emit(.finished(reason: "cancelled"))
             return .cancelled
         }
         if cancelNextSend {
             cancelNextSend = false
             await recordOutcome(.cancelled, detail: "cancelled before the input was recorded")
-            onInputDelivery?(.notDelivered(reason: "cancelled before the input was recorded"))
+            await onInputDelivery?(.notDelivered(reason: "cancelled before the input was recorded"))
             emit(.finished(reason: "cancelled"))
             return .cancelled
         }
@@ -866,18 +1123,22 @@ public actor Agent {
         } catch {
             let detail = "Could not record the user message: \(error.localizedDescription)"
             await recordOutcome(.failed, detail: detail)
-            onInputDelivery?(.notDelivered(reason: detail))
+            await onInputDelivery?(.notDelivered(reason: detail))
             emit(.failed(detail))
             return .failed(detail)
         }
-        onInputDelivery?(.delivered(referenceID: inputID))
+        await onInputDelivery?(.delivered(referenceID: inputID))
+        guard await requireJournal("the first model call after input delivery") else {
+            return .failed(journalFailureDetail!)
+        }
         emit(.inputCommitted(id: inputID))
         messages.append(.user(prompt))
 
-        var iterations = 0
-        while iterations < config.maxIterations {
+        return await withNativeTurn {
+            var iterations = 0
+            while iterations < config.maxIterations {
             if cancelled || Task.isCancelled {
-                try? await writer.appendNote("Stopped at your request.")
+                _ = await appendJournalNote("Stopped at your request.")
                 await recordOutcome(.cancelled, detail: "Stopped at your request.")
                 emit(.finished(reason: "cancelled"))
                 return .cancelled
@@ -895,7 +1156,9 @@ public actor Agent {
             if let goal = config.goal {
                 let status = goal.status(spent: totalUsage.totalTokens)
                 if status.isFinished, let note = goal.exhaustionNote(status) {
-                    try? await writer.appendNote(note, customType: "aviary.goal")
+                    guard await appendJournalNote(note, customType: "aviary.goal") else {
+                        return .failed(journalFailureDetail ?? "The goal outcome could not be recorded.")
+                    }
                     emit(.goalExhausted(note))
                     emit(.finished(reason: "goal budget"))
                     return .completed
@@ -906,20 +1169,32 @@ public actor Agent {
             if !pendingSteering.isEmpty {
                 let messagesToInject = pendingSteering
                 pendingSteering.removeAll()
-                for text in messagesToInject {
+                for (index, queuedInput) in messagesToInject.enumerated() {
+                    let text = queuedInput.text
                     if cancelled || Task.isCancelled {
+                        let reason = "the active turn was canceled before steering delivery"
+                        for refused in messagesToInject[index...] {
+                            await refused.onDelivery?(.notDelivered(reason: reason))
+                        }
                         await recordOutcome(.cancelled, detail: "Stopped at your request.")
                         emit(.finished(reason: "cancelled"))
                         return .cancelled
                     }
                     do {
-                        _ = try await writer.appendUser(text)
+                        let inputID = try await writer.appendUser(text)
+                        await queuedInput.onDelivery?(.delivered(referenceID: inputID))
                     } catch {
                         let detail =
                             "Could not record steering input: \(error.localizedDescription)"
+                        for refused in messagesToInject[index...] {
+                            await refused.onDelivery?(.notDelivered(reason: detail))
+                        }
                         await recordOutcome(.failed, detail: detail)
                         emit(.failed(detail))
                         return .failed(detail)
+                    }
+                    guard await requireJournal("the model call after steering delivery") else {
+                        return .failed(journalFailureDetail!)
                     }
                     messages.append(.user(text))
                     emit(.steered(text))
@@ -941,13 +1216,13 @@ public actor Agent {
                 turn = try await runTurn()
             } catch {
                 if cancelled || Task.isCancelled {
-                    try? await writer.appendNote("Stopped at your request.")
+                    _ = await appendJournalNote("Stopped at your request.")
                     await recordOutcome(.cancelled, detail: "Stopped at your request.")
                     emit(.finished(reason: "cancelled"))
                     return .cancelled
                 }
                 let detail = error.localizedDescription
-                try? await writer.appendNote("The model call failed: \(detail)")
+                _ = await appendJournalNote("The model call failed: \(detail)")
                 await recordOutcome(.failed, detail: detail)
                 emit(.failed(detail))
                 return .failed(detail)
@@ -956,7 +1231,7 @@ public actor Agent {
             // A provider can ignore task cancellation. Once it returns, honor the durable
             // cancellation flag before recording output or beginning any tool action.
             if cancelled || Task.isCancelled {
-                try? await writer.appendNote("Stopped at your request.")
+                _ = await appendJournalNote("Stopped at your request.")
                 await recordOutcome(.cancelled, detail: "Stopped at your request.")
                 emit(.finished(reason: "cancelled"))
                 return .cancelled
@@ -964,6 +1239,9 @@ public actor Agent {
 
             let messageID: String
             do {
+                if let nativeJournal, !turn.text.isEmpty {
+                    _ = try await nativeJournal.commitAssistantMessage(turn.text)
+                }
                 messageID = try await writer.appendAssistant(
                     text: turn.text, thinking: turn.thinking, toolCalls: turn.toolCalls,
                     usage: turn.usage, stopReason: turn.stopReason)
@@ -1002,7 +1280,7 @@ public actor Agent {
                 // get the same answer, and only then notice the message waiting.
                 _ = await waitForDispatchedWork()
                 if cancelled || Task.isCancelled {
-                    try? await writer.appendNote("Stopped at your request.")
+                    _ = await appendJournalNote("Stopped at your request.")
                     await recordOutcome(.cancelled, detail: "Stopped at your request.")
                     emit(.finished(reason: "cancelled"))
                     return .cancelled
@@ -1010,16 +1288,21 @@ public actor Agent {
                 if let next = pendingFollowUps.first {
                     pendingFollowUps.removeFirst()
                     do {
-                        _ = try await writer.appendUser(next)
+                        let inputID = try await writer.appendUser(next.text)
+                        await next.onDelivery?(.delivered(referenceID: inputID))
                     } catch {
                         let detail =
                             "Could not record queued input: \(error.localizedDescription)"
+                        await next.onDelivery?(.notDelivered(reason: detail))
                         await recordOutcome(.failed, detail: detail)
                         emit(.failed(detail))
                         return .failed(detail)
                     }
-                    messages.append(.user(next))
-                    emit(.steered(next))
+                    guard await requireJournal("the model call after follow-up delivery") else {
+                        return .failed(journalFailureDetail!)
+                    }
+                    messages.append(.user(next.text))
+                    emit(.steered(next.text))
                     continue
                 }
                 if !pendingSteering.isEmpty { continue }
@@ -1029,7 +1312,7 @@ public actor Agent {
 
             for call in turn.toolCalls {
                 if cancelled || Task.isCancelled {
-                    try? await writer.appendNote("Stopped before the next tool action.")
+                    _ = await appendJournalNote("Stopped before the next tool action.")
                     await recordOutcome(.cancelled, detail: "Stopped before the next tool action.")
                     emit(.finished(reason: "cancelled"))
                     return .cancelled
@@ -1051,17 +1334,21 @@ public actor Agent {
                 messages.append(ChatMessage(role: .tool, content: [
                     .toolResult(id: call.id, name: call.name, text: output, isError: isError),
                 ]))
-                await drainPendingImages()
+                guard await drainPendingImages() else {
+                    return .failed(
+                        journalFailureDetail ?? "An attached image could not be recorded.")
+                }
             }
         }
 
         // Hitting the ceiling is a real outcome, not a silent stop: the transcript says so,
         // because a run that quietly stopped looks identical to one that finished.
-        let note = "Stopped after \(config.maxIterations) model calls without finishing. "
-            + "Raise maxIterations, or narrow the task."
-        try? await writer.appendNote(note)
-        emit(.finished(reason: "iteration limit"))
-        return .completed
+            let note = "Stopped after \(config.maxIterations) model calls without finishing. "
+                + "Raise maxIterations, or narrow the task."
+            _ = await appendJournalNote(note)
+            emit(.finished(reason: "iteration limit"))
+            return .completed
+        }
     }
 
     /// The most a single delivered message may add to a conversation.
@@ -1090,7 +1377,7 @@ public actor Agent {
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
         if dispatchedCount > 0 {
-            try? await writer.appendNote(
+            _ = await appendJournalNote(
                 "Stopped waiting for \(dispatchedCount) dispatched task(s) that had not "
                     + "reported back.")
         }
@@ -1103,8 +1390,8 @@ public actor Agent {
     /// three providers accept: Anthropic allows images inside a tool result, the OpenAI
     /// completions shape does not, and a capability that works on two routes out of three is
     /// worse than one that works everywhere.
-    private func drainPendingImages() async {
-        guard !pendingImages.isEmpty else { return }
+    private func drainPendingImages() async -> Bool {
+        guard !pendingImages.isEmpty else { return true }
         let queued = pendingImages
         pendingImages.removeAll()
         for (image, note) in queued {
@@ -1114,10 +1401,19 @@ public actor Agent {
                 + "[\(image.path) — \(image.width)×\(image.height)]"))
             content.append(.image(mimeType: image.mimeType, base64: image.base64))
             messages.append(ChatMessage(role: .user, content: content))
-            try? await writer.appendImage(
-                mimeType: image.mimeType, base64: image.base64, path: image.path, note: caption)
+            do {
+                try await writer.appendImage(
+                    mimeType: image.mimeType, base64: image.base64,
+                    path: image.path, note: caption)
+            } catch {
+                journalFailureDetail = "Could not record an attached image: "
+                    + error.localizedDescription
+                emit(.failed(journalFailureDetail!))
+                return false
+            }
             emit(.imageAttached(path: image.path, width: image.width, height: image.height))
         }
+        return true
     }
 
     // MARK: Compaction
@@ -1167,29 +1463,64 @@ public actor Agent {
             ])
 
         var summary = ""
+        let permit = await beginNativeAction(
+            kind: .compactionProvider, intent: "Compact the conversation with the provider",
+            target: config.model.qualifiedID)
+        do { try requireNativePermit(permit, for: "compaction provider") }
+        catch { return }
         do {
             for try await event in provider.stream(ask) {
                 if case .textDelta(let t) = event { summary += t }
             }
         } catch {
+            guard await finishNativeAction(
+                permit, state: error is CancellationError ? .canceled : .failed,
+                retrySafety: .unknown,
+                failureKind: error is CancellationError ? .cancellation : .infrastructure) else {
+                return
+            }
             // A failed compaction must not end the run: the next model call may still fit,
             // and if it does not, the provider's own error is a clearer thing to show than a
             // summariser's.
-            try? await writer.appendNote(
+            _ = await appendJournalNote(
                 "Could not compact the conversation: \(error.localizedDescription)")
             return
         }
-        guard !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            _ = await finishNativeAction(
+                permit, state: .failed, retrySafety: .unsafe, failureKind: .task)
+            return
+        }
+        guard await finishNativeAction(permit, state: .succeeded, retrySafety: .unsafe) else {
+            return
+        }
 
         let before = lastInputTokens
+        if let nativeJournal {
+            do {
+                _ = try await nativeJournal.commitCompaction(
+                    summary: summary, tokensBefore: before, droppedMessages: middle.count)
+            } catch {
+                latchNativeJournalFailure("the context compaction", error)
+                return
+            }
+        }
         messages = Array(head)
             + [ChatMessage(role: .user, content: [.text(
                 "[Earlier work, compacted]\n\n" + summary)])]
             + Array(tail)
         compactions += 1
         lastInputTokens = 0
-        try? await writer.appendCompaction(
-            summary: summary, tokensBefore: before, droppedMessages: middle.count)
+        do {
+            try await writer.appendCompaction(
+                summary: summary, tokensBefore: before, droppedMessages: middle.count)
+        } catch {
+            journalFailureDetail = "Could not record the legacy compaction projection: "
+                + error.localizedDescription
+            emit(.compacted(before: before, after: messages.count, summary: summary))
+            emit(.failed(journalFailureDetail!))
+            return
+        }
         emit(.compacted(before: before, after: messages.count, summary: summary))
     }
 
@@ -1218,26 +1549,49 @@ public actor Agent {
             maxTokens: config.maxTokens,
             reasoningEffort: config.reasoningEffort)
 
+        let permit = await beginNativeAction(
+            kind: .provider, intent: "Request the next agent response",
+            target: config.model.qualifiedID)
+        try requireNativePermit(permit, for: "provider")
         var turn = Turn()
-        for try await event in provider.stream(request) {
-            switch event {
-            case .textDelta(let t):
-                turn.text += t
-                emit(.textDelta(t))
-            case .thinkingDelta(let t):
-                turn.thinking += t
-                emit(.thinkingDelta(t))
-            case .toolCall(let id, let name, let arguments):
-                turn.toolCalls.append((id: id, name: name, arguments: arguments))
-            case .requestBody(let payload):
-                record(payload)
-            case .usage(let u):
-                // Priced here rather than at display time, so the transcript carries dollars
-                // and every screen that reads it agrees without re-deriving them.
-                turn.usage = config.model.priced(u)
-            case .done(let reason):
-                turn.stopReason = reason
+        var streamFailure: Error?
+        do {
+            for try await event in provider.stream(request) {
+                switch event {
+                case .textDelta(let t):
+                    turn.text += t
+                    emit(.textDelta(t))
+                case .thinkingDelta(let t):
+                    turn.thinking += t
+                    emit(.thinkingDelta(t))
+                case .toolCall(let id, let name, let arguments):
+                    turn.toolCalls.append((id: id, name: name, arguments: arguments))
+                case .requestBody(let payload):
+                    record(payload)
+                case .usage(let u):
+                    // Priced here rather than at display time, so the transcript carries dollars
+                    // and every screen that reads it agrees without re-deriving them.
+                    turn.usage = config.model.priced(u)
+                case .done(let reason):
+                    turn.stopReason = reason
+                }
             }
+        } catch {
+            streamFailure = error
+        }
+        if let streamFailure {
+            let recorded = await finishNativeAction(
+                permit, state: .indeterminateEffect,
+                retrySafety: .unsafe, failureKind: .indeterminateEffect)
+            guard recorded else {
+                throw NativeJournalFailure(
+                    detail: journalFailureDetail ?? "The provider outcome could not be recorded.")
+            }
+            throw streamFailure
+        }
+        guard await finishNativeAction(permit, state: .succeeded, retrySafety: .unsafe) else {
+            throw NativeJournalFailure(
+                detail: journalFailureDetail ?? "The provider outcome could not be recorded.")
         }
         return turn
     }
@@ -1258,6 +1612,11 @@ public actor Agent {
         }
         if call.name != "python" {
             if let entry = mcpTools[call.name] {
+                let permit = await beginNativeAction(
+                    kind: .mcp, intent: "Call an MCP tool", target: call.name,
+                    metadata: ["server": .string(entry.tool.server)])
+                do { try requireNativePermit(permit, for: "MCP tool") }
+                catch { return (error.localizedDescription, true) }
                 do {
                     let result = try await entry.client.callTool(
                         entry.tool.name, arguments: call.arguments)
@@ -1283,8 +1642,21 @@ public actor Agent {
                                 + "\(config.model.id) cannot read]"
                         }
                     }
+                    let recorded = await finishNativeAction(
+                        permit, state: result.isError ? .failed : .succeeded,
+                        retrySafety: .unknown,
+                        failureKind: result.isError ? .task : nil)
+                    guard recorded else {
+                        return (journalFailureDetail ?? "The MCP outcome could not be recorded.", true)
+                    }
                     return (text, result.isError)
                 } catch {
+                    let recorded = await finishNativeAction(
+                        permit, state: .indeterminateEffect, retrySafety: .unsafe,
+                        failureKind: .indeterminateEffect)
+                    if !recorded {
+                        return (journalFailureDetail ?? "The MCP outcome could not be recorded.", true)
+                    }
                     return ("The \(entry.tool.server) MCP server failed: "
                         + error.localizedDescription, true)
                 }
@@ -1300,36 +1672,78 @@ public actor Agent {
         // A hook may block this call or rewrite it. Hooks mediate calls Aviary dispatches, but
         // they are not a security boundary: Python can perform file, process, socket, and
         // network effects directly. Aviary intentionally accepts that no-sandbox contract here.
-        if hooksEnabled,
-           let decision = await host.callHook("before_tool", payload: .object([
-               "name": .string(call.name),
-               "code": .string(code),
-               "session": .string(hostSession),
-           ]))
-        {
-            if decision["block"]?.boolValue == true {
-                let reason = decision["reason"]?.stringValue
-                    ?? "A hook blocked this. Try a different approach."
-                _ = await appendJournalNote(
-                    "A hook blocked a tool call: \(reason)", customType: "aviary.hook")
-                return (reason, true)
-            }
-            if let rewritten = decision["code"]?.stringValue, rewritten != code {
-                // Recorded, because a rewritten call that looks like the agent's own would
-                // make the transcript lie about what ran.
-                guard await appendJournalNote(
-                    "A hook rewrote a tool call.", customType: "aviary.hook") else {
-                    return (
-                        journalFailureDetail ?? "The session journal is unavailable; stop this run.",
-                        true)
+        if hooksEnabled {
+            let permit = await beginNativeAction(
+                kind: .hook, intent: "Invoke the before-tool hook", target: hostSession,
+                metadata: ["event": .string("before_tool")])
+            do { try requireNativePermit(permit, for: "hook") }
+            catch { return (error.localizedDescription, true) }
+            let decision: JSONValue?
+            do {
+                decision = try await host.callHook("before_tool", payload: .object([
+                    "name": .string(call.name),
+                    "code": .string(code),
+                    "session": .string(hostSession),
+                ]))
+            } catch {
+                let recorded = await finishNativeAction(
+                    permit, state: .indeterminateEffect, retrySafety: .unsafe,
+                    failureKind: .indeterminateEffect)
+                guard recorded else {
+                    return (journalFailureDetail ?? "The hook outcome could not be recorded.", true)
                 }
-                code = rewritten
+                return (
+                    "The before-tool hook could not be reached; Python was not started: "
+                        + error.localizedDescription,
+                    true)
+            }
+            guard await finishNativeAction(
+                permit, state: .succeeded, retrySafety: .unsafe) else {
+                return (journalFailureDetail ?? "The hook outcome could not be recorded.", true)
+            }
+            if let decision {
+                if decision["block"]?.boolValue == true {
+                    let reason = decision["reason"]?.stringValue
+                        ?? "A hook blocked this. Try a different approach."
+                    guard await appendJournalNote(
+                        "A hook blocked a tool call: \(reason)", customType: "aviary.hook") else {
+                        return (journalFailureDetail ?? "The hook note could not be recorded.", true)
+                    }
+                    return (reason, true)
+                }
+                if let rewritten = decision["code"]?.stringValue, rewritten != code {
+                    // Recorded, because a rewritten call that looks like the agent's own would
+                    // make the transcript lie about what ran.
+                    guard await appendJournalNote(
+                        "A hook rewrote a tool call.", customType: "aviary.hook") else {
+                        return (
+                            journalFailureDetail ?? "The session journal is unavailable; stop this run.",
+                            true)
+                    }
+                    code = rewritten
+                }
             }
         }
+        let permit = await beginNativeAction(
+            kind: .python, intent: "Execute one Python cell", target: hostSession)
+        do { try requireNativePermit(permit, for: "Python") }
+        catch { return (error.localizedDescription, true) }
         do {
             let result = try await host.execute(code, in: hostSession)
+            let recorded = await finishNativeAction(
+                permit, state: result.failed ? .failed : .succeeded,
+                retrySafety: .unsafe, failureKind: result.failed ? .task : nil)
+            guard recorded else {
+                return (journalFailureDetail ?? "The Python outcome could not be recorded.", true)
+            }
             return (Self.render(result), result.failed)
         } catch {
+            let recorded = await finishNativeAction(
+                permit, state: .indeterminateEffect, retrySafety: .unsafe,
+                failureKind: .indeterminateEffect)
+            if !recorded {
+                return (journalFailureDetail ?? "The Python outcome could not be recorded.", true)
+            }
             return ("The runtime host could not run that: \(error.localizedDescription)", true)
         }
     }

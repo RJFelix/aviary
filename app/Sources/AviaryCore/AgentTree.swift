@@ -23,7 +23,9 @@ public struct AgentNode: Sendable, Identifiable, Hashable {
 
     public var isRunning: Bool { status == "running" || status == "active" }
     public var isFailed: Bool { status == "failed" || status == "error" }
-    public var isComplete: Bool { status == "completed" || status == "done" }
+    public var isComplete: Bool {
+        status == "completed" || status == "done" || status == "canceled"
+    }
 
     public var duration: TimeInterval { max(0, updatedAt.timeIntervalSince(createdAt)) }
 

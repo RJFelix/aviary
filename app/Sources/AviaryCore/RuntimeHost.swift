@@ -16,6 +16,11 @@ import Foundation
 /// which is exactly when you want to read what happened.
 public actor RuntimeHost {
 
+    /// Lets a callback handler re-enter the host's lifecycle without waiting on its own task.
+    /// A handler may ask the owner to close admission; that call can drain every *other*
+    /// callback, while this callback continues to its protocol response and then completes.
+    @TaskLocal private static var activeCallbackID: Int?
+
     // MARK: Types
 
     public struct Capabilities: Sendable, Hashable {
@@ -90,7 +95,7 @@ public actor RuntimeHost {
     /// than as a hang.
     public typealias CallbackHandler = @Sendable (
         _ session: String, _ kind: String, _ payload: JSONValue
-    ) async -> JSONValue
+    ) async throws -> JSONValue
 
     // MARK: State
 
@@ -103,6 +108,17 @@ public actor RuntimeHost {
     private var readyContinuation: CheckedContinuation<Capabilities, Error>?
     private var outputHandler: OutputHandler?
     private var callbackHandler: CallbackHandler?
+    /// Callback admission is closed before a run's durable journals are closed. Events already
+    /// admitted continue to run, but a callback arriving after the boundary is refused and can
+    /// never touch the owner's state.
+    private var callbackAdmissionOpen = true
+    private var nextCallbackID = 0
+    private var callbackTasks: [Int: Task<Void, Error>] = [:]
+    private var callbackErrors: [Error] = []
+    /// Responses to callbacks rejected after admission closes do not run application effects,
+    /// but remain tracked so shutdown does not race their protocol reply.
+    private var nextCallbackResponseID = 0
+    private var callbackResponseTasks: [Int: Task<Void, Never>] = [:]
     private var stderrTail: [String] = []
     /// One consumer for stdout. A Task per line can enter this actor out of wire order even
     /// though actor mutation itself is serialized; deltas, replies, and callbacks must retain
@@ -111,6 +127,12 @@ public actor RuntimeHost {
 
     public private(set) var capabilities: Capabilities?
     public private(set) var isRunning = false
+
+    /// Whether newly received runtime callbacks may start their application-side effect.
+    public var isCallbackAdmissionOpen: Bool { callbackAdmissionOpen }
+
+    /// Number of admitted callback effects that have not yet been observed as complete.
+    public var activeCallbackCount: Int { callbackTasks.count }
 
     public init(executable: String, arguments: [String]) {
         self.executable = executable
@@ -137,6 +159,10 @@ public actor RuntimeHost {
             if let capabilities { return capabilities }
             throw HostError.notRunning
         }
+        // A RuntimeHost may be restarted after a clean stop. A stopped instance starts a new
+        // callback admission epoch; no callback from the prior process is retained.
+        callbackAdmissionOpen = true
+        callbackErrors.removeAll()
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: executable)
@@ -228,6 +254,19 @@ public actor RuntimeHost {
 
     /// Ask the host to stop, then make sure it did.
     public func stop() async {
+        // The process may emit a callback between the caller deciding to stop and the shutdown
+        // request being handled. Close admission first, then wait for effects already admitted,
+        // so the shutdown response cannot race a callback's journal writes.
+        closeCallbackAdmission()
+        do {
+            try await waitUntilCallbacksQuiescent()
+        } catch {
+            // `stop` predates the throwing drain API and remains a cleanup operation. Preserve
+            // the failure in diagnostics; owners that need typed failure must call the throwing
+            // drain seam before closing their journal.
+            stderrTail.append("callback failed during shutdown: \(error.localizedDescription)\n")
+        }
+        await waitForCallbackResponses()
         guard isRunning, let p = process else { return }
         _ = try? await send("shutdown", timeout: 5)
         try? stdin?.close()
@@ -256,14 +295,52 @@ public actor RuntimeHost {
                 readyContinuation?.resume(returning: caps)
                 readyContinuation = nil
             case "callback":
-                // Served on a detached task: the handler may take minutes (a sub-agent is a
-                // whole agent run), and blocking the reader would stop every other session's
-                // events from being delivered.
                 let rid = v["rid"]?.stringValue ?? ""
                 let kind = v["kind"]?.stringValue ?? ""
                 let payload = v["payload"] ?? .object([:])
                 let session = v["session"]?.stringValue ?? ""
-                Task { await self.serveCallback(rid: rid, kind: kind, payload: payload, session: session) }
+                guard callbackAdmissionOpen else {
+                    // Admission is a one-way lifecycle boundary. The host is normally already
+                    // stopping here, so do not run an application callback merely to answer an
+                    // event that arrived after the owner closed its journal. The protocol still
+                    // gets an explicit refusal, avoiding a blocked runtime request.
+                    nextCallbackResponseID += 1
+                    let responseID = nextCallbackResponseID
+                    let task = Task { [weak self] in
+                        guard let self else { return }
+                        do {
+                            _ = try await self.send("callback.result", [
+                                "rid": .string(rid),
+                                "result": .object([
+                                    "error": .string(
+                                        "This runtime callback was refused after admission closed."),
+                                ]),
+                            ], timeout: 30)
+                        } catch {
+                            await self.callbackResponseFailed(responseID, error: error)
+                        }
+                        await self.callbackResponseFinished(responseID)
+                    }
+                    callbackResponseTasks[responseID] = task
+                    return
+                }
+                nextCallbackID += 1
+                let callbackID = nextCallbackID
+                let task = Task { [weak self] in
+                    guard let self else { return }
+                    var failure: Error?
+                    do {
+                        try await Self.$activeCallbackID.withValue(callbackID) {
+                            try await self.serveCallback(
+                                rid: rid, kind: kind, payload: payload, session: session)
+                        }
+                    } catch {
+                        failure = error
+                    }
+                    await self.callbackFinished(callbackID, error: failure)
+                    if let failure { throw failure }
+                }
+                callbackTasks[callbackID] = task
             case "output":
                 outputHandler?(
                     v["session"]?.stringValue ?? "",
@@ -296,6 +373,10 @@ public actor RuntimeHost {
 
     private func handleExit() {
         isRunning = false
+        // A dead runtime cannot legitimately originate another application effect. Existing
+        // callbacks remain tracked and drainable; anything still queued on the output pump is
+        // refused by the same admission boundary used for orderly shutdown.
+        callbackAdmissionOpen = false
         outputPump?.cancel()
         outputPump = nil
         let error = HostError.notRunning
@@ -370,12 +451,87 @@ public actor RuntimeHost {
         callbackHandler = handler
     }
 
+    /// Stop admitting new callback effects. This is intentionally separate from process stop so
+    /// an owner can close admission, drain callbacks, and then close a native journal while
+    /// retaining control over the rest of teardown.
+    public func closeCallbackAdmission() {
+        callbackAdmissionOpen = false
+    }
+
+    /// Wait for all callbacks admitted before `closeCallbackAdmission()` to finish.
+    ///
+    /// Callers must close admission first. If admission remains open, a callback can arrive
+    /// after this actor observes an empty task set and the caller has no quiescence boundary.
+    /// The combined method below performs both operations atomically. Handler and response
+    /// transport errors are rethrown after every admitted task has been awaited. If a callback
+    /// handler itself re-enters this method, its own task is excluded to avoid self-deadlock; it
+    /// still must finish its protocol response before the caller can observe full quiescence.
+    public func waitUntilCallbacksQuiescent() async throws {
+        var firstError: Error?
+        let currentCallbackID = Self.activeCallbackID
+        while true {
+            let tasks = callbackTasks
+                .filter { $0.key != currentCallbackID }
+                .map(\.value)
+            if tasks.isEmpty { break }
+            for task in tasks {
+                do {
+                    try await task.value
+                } catch {
+                    firstError = firstError ?? error
+                }
+            }
+        }
+        if let callbackError = callbackErrors.first {
+            firstError = firstError ?? callbackError
+        }
+        callbackErrors.removeAll()
+        if let firstError { throw firstError }
+    }
+
+    /// Atomically close callback admission and drain all callbacks already in flight.
+    public func closeCallbackAdmissionAndWait() async throws {
+        closeCallbackAdmission()
+        try await waitUntilCallbacksQuiescent()
+    }
+
+    private func callbackFinished(_ id: Int, error: Error?) {
+        callbackTasks.removeValue(forKey: id)
+        if let error { callbackErrors.append(error) }
+    }
+
+    private func callbackResponseFailed(_ id: Int, error: Error) {
+        stderrTail.append("callback \(id) refusal response failed: \(error.localizedDescription)\n")
+    }
+
+    private func callbackResponseFinished(_ id: Int) {
+        callbackResponseTasks.removeValue(forKey: id)
+    }
+
+    private func waitForCallbackResponses() async {
+        while !callbackResponseTasks.isEmpty {
+            let tasks = Array(callbackResponseTasks.values)
+            for task in tasks { await task.value }
+        }
+    }
+
     private func serveCallback(
         rid: String, kind: String, payload: JSONValue, session: String
-    ) async {
+    ) async throws {
         let result: JSONValue
         if let callbackHandler {
-            result = await callbackHandler(session, kind, payload)
+            do {
+                result = try await callbackHandler(session, kind, payload)
+            } catch {
+                // Keep the protocol live for the runtime's blocked request, while preserving the
+                // typed handler failure for waitUntilCallbacksQuiescent(). If even this response
+                // cannot be delivered, that transport error is also propagated by the task.
+                _ = try await send("callback.result", [
+                    "rid": .string(rid),
+                    "result": .object(["error": .string(error.localizedDescription)]),
+                ], timeout: 30)
+                throw error
+            }
         } else {
             // An honest refusal rather than a timeout. A runtime whose client serves no
             // callbacks should learn that immediately, in words the agent can act on.
@@ -383,7 +539,7 @@ public actor RuntimeHost {
                 "error": .string("This client does not serve \(kind) requests."),
             ])
         }
-        _ = try? await send("callback.result", [
+        _ = try await send("callback.result", [
             "rid": .string(rid), "result": result,
         ], timeout: 30)
     }
@@ -465,8 +621,8 @@ public actor RuntimeHost {
     /// handled it.
     public func callHook(
         _ event: String, payload: JSONValue, timeout: TimeInterval = 60
-    ) async -> JSONValue? {
-        guard let data = try? await send("hook.call", [
+    ) async throws -> JSONValue? {
+        guard let data = try await send("hook.call", [
             "event": .string(event), "payload": payload,
         ], timeout: timeout) else { return nil }
         return (data["handled"]?.boolValue ?? false) ? data : nil

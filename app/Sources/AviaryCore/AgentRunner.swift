@@ -42,6 +42,9 @@ public actor AgentRunner {
         /// writer-before-runtime ordering enforceable: the runner must never silently open a
         /// second handle for the same Work.
         public var writer: SessionWriter?
+        /// The exact native Session/Work producer opened by the launch boundary. The runner
+        /// borrows it for the root Agent; the driver or CLI retains teardown ownership.
+        public var nativeJournal: RunJournalBundle?
 
         /// Who else is running, supplied by the app. Nil in a CLI run, where the two peer
         /// builtins are then not bound at all — which is right: there is nobody else there.
@@ -59,7 +62,8 @@ public actor AgentRunner {
             selfDelegate: Agent.SelfDelegate? = nil,
             identity: SessionWorkIdentity? = nil,
             reasoningEffort: String? = nil,
-            writer: SessionWriter? = nil
+            writer: SessionWriter? = nil,
+            nativeJournal: RunJournalBundle? = nil
         ) {
             self.peerDelegate = peerDelegate
             self.selfDelegate = selfDelegate
@@ -78,6 +82,7 @@ public actor AgentRunner {
             self.resume = resume
             self.identity = identity
             self.writer = writer
+            self.nativeJournal = nativeJournal
         }
     }
 
@@ -105,6 +110,10 @@ public actor AgentRunner {
     /// outlives turns should live.
     private var background: [String: Agent.ChildStatus] = [:]
     private var backgroundTasks: [String: Task<Void, Never>] = [:]
+    /// Cancellation is explicit runner state as well as a Task flag. Awaiting an actor method
+    /// can resume on a different task context, so the flag alone is not a reliable record of
+    /// why a child settled.
+    private var cancellationRequested: Set<String> = []
 
     /// Live MCP servers, held so they can be stopped with the run that started them.
     private var mcpClients: [MCPClient] = []
@@ -112,6 +121,35 @@ public actor AgentRunner {
     /// re-entered awaiting existing child tasks. This remains closed for the lifetime of the
     /// runner, which is also the lifetime of its host resources.
     private var backgroundAdmissionClosed = false
+
+    private func beginNativeAction(
+        kind: ActionKind, intent: String, target: String? = nil,
+        metadata: [String: JSONValue] = [:]
+    ) async throws -> EffectPermit? {
+        guard let journal = settings.nativeJournal else { return nil }
+        return try await journal.beginAction(
+            kind: kind, intent: intent, target: target, scope: "run", metadata: metadata)
+    }
+
+    private func requireNativePermit(_ permit: EffectPermit?, kind: ActionKind) throws {
+        guard settings.nativeJournal == nil || permit != nil else {
+            throw RunJournalBundleError.unavailable(
+                "the canonical Work journal refused the \(kind.rawValue) effect")
+        }
+    }
+
+    private func finishNativeAction(
+        _ permit: EffectPermit?, state: ActionExecutionState,
+        retrySafety: ActionRetrySafety, failureKind: ActionFailureKind? = nil
+    ) async throws {
+        guard let journal = settings.nativeJournal else { return }
+        guard let permit else {
+            throw RunJournalBundleError.unavailable(
+                "the canonical Work journal did not issue an effect permit")
+        }
+        _ = try await journal.finishAction(
+            permit, state: state, retrySafety: retrySafety, failureKind: failureKind)
+    }
 
     struct MCPReport {
         var client: MCPClient?
@@ -126,7 +164,7 @@ public actor AgentRunner {
     /// machine, and a run that refuses to start because a note-taking integration is broken is
     /// a worse outcome than a run without that integration. So each is reported into the
     /// transcript and the rest continue.
-    private func startMCPServers() async -> [MCPReport] {
+    private func startMCPServers() async throws -> [MCPReport] {
         let configured = MCPConfiguration.load(home: settings.home).filter(\.enabled)
         guard !configured.isEmpty else { return [] }
         var reports: [MCPReport] = []
@@ -134,24 +172,40 @@ public actor AgentRunner {
             let client = MCPClient(
                 name: server.name, executable: server.command, arguments: server.arguments,
                 environment: server.environment)
+            let permit = try await beginNativeAction(
+                kind: .mcp, intent: "Start and discover an MCP server", target: server.name,
+                metadata: ["executable": .string(server.command)])
+            try requireNativePermit(permit, kind: .mcp)
+            let tools: [MCPClient.Tool]
             do {
-                let tools = try await client.start()
-                mcpClients.append(client)
-                let era = await client.era
-                reports.append(
-                    MCPReport(
-                    client: client, tools: tools,
-                    note: "MCP · \(server.name): \(tools.count) tool(s) over "
-                        + "\(era?.label ?? "an unknown protocol")"))
-            } catch {
+                tools = try await client.start()
+            } catch let startupError {
                 await client.stop()
+                try await finishNativeAction(
+                    permit, state: .failed, retrySafety: .unknown,
+                    failureKind: .infrastructure)
                 let diagnostics = await client.diagnostics
                 reports.append(
                     MCPReport(
                     client: nil, tools: [],
-                    note: "MCP · \(server.name) did not start: \(error.localizedDescription)"
+                    note: "MCP · \(server.name) did not start: \(startupError.localizedDescription)"
                         + (diagnostics.isEmpty ? "" : "\n" + String(diagnostics.suffix(400)))))
+                continue
             }
+            do {
+                try await finishNativeAction(
+                    permit, state: .succeeded, retrySafety: .unsafe)
+            } catch {
+                await client.stop()
+                throw error
+            }
+            mcpClients.append(client)
+            let era = await client.era
+            reports.append(
+                MCPReport(
+                client: client, tools: tools,
+                note: "MCP · \(server.name): \(tools.count) tool(s) over "
+                    + "\(era?.label ?? "an unknown protocol")"))
         }
         return reports
     }
@@ -165,7 +219,17 @@ public actor AgentRunner {
         await stopBackgroundChildren()
         let clients = mcpClients
         mcpClients.removeAll()
-        for client in clients { await client.stop() }
+        for client in clients {
+            // Shutdown is a cleanup effect: record it when the canonical journal is healthy,
+            // but never leave the external process alive merely because that journal failed.
+            let permit = try? await beginNativeAction(
+                kind: .mcp, intent: "Stop an MCP server", target: client.name)
+            await client.stop()
+            if let permit {
+                try? await finishNativeAction(
+                    permit, state: .succeeded, retrySafety: .idempotent)
+            }
+        }
     }
 
     public func run(prompt: String) async throws -> (writer: SessionWriter, agent: Agent) {
@@ -225,7 +289,26 @@ public actor AgentRunner {
         guard case .healthy = await writer.writerHealth else {
             throw SessionWriter.WriterError.unavailable("The session journal is unavailable.")
         }
-        let hostSession = try await host.createSession(id: runtimeSessionID, cwd: settings.cwd)
+        let runtimePermit = try await beginNativeAction(
+            kind: .runtime, intent: "Create the Work's Python namespace",
+            target: runtimeSessionID, metadata: ["cwd": .string(settings.cwd)])
+        try requireNativePermit(runtimePermit, kind: .runtime)
+        let hostSession: String
+        do {
+            hostSession = try await host.createSession(id: runtimeSessionID, cwd: settings.cwd)
+        } catch {
+            try await finishNativeAction(
+                runtimePermit, state: .failed, retrySafety: .unknown,
+                failureKind: .infrastructure)
+            throw error
+        }
+        do {
+            try await finishNativeAction(
+                runtimePermit, state: .succeeded, retrySafety: .unsafe)
+        } catch {
+            await host.destroySessionQuietly(hostSession)
+            throw error
+        }
         hostSessionForCleanup = hostSession
         // Replay is read-only and happens after the writer is reserved, so every subsequent
         // runtime/provider/MCP effect has one exact durable antecedent.
@@ -243,7 +326,8 @@ public actor AgentRunner {
                 maxIterations: settings.maxIterations, maxTokens: settings.model.maxTokens,
                     reasoningEffort: settings.reasoningEffort,
                 maxDepth: settings.maxDepth, depth: 0, goal: settings.goal,
-                resumedHistory: replay.messages))
+                resumedHistory: replay.messages),
+            nativeJournal: settings.nativeJournal)
 
         let obs = observer
         await agent.observe { event in obs?(event) }
@@ -257,16 +341,36 @@ public actor AgentRunner {
         await agent.setArtifacts(
             ArtifactStore(home: settings.home, sessionID: writer.sessionID))
         if !settings.hookPaths.isEmpty {
-            let result = try? await host.loadHooks(settings.hookPaths)
+            let hookPermit = try await beginNativeAction(
+                kind: .hook, intent: "Load runtime hooks", target: hostSession,
+                metadata: ["count": .number(Double(settings.hookPaths.count))])
+            try requireNativePermit(hookPermit, kind: .hook)
+            let result: (
+                loaded: [(path: String, events: [String])],
+                failed: [(path: String, detail: String)]
+            )
+            do {
+                result = try await host.loadHooks(settings.hookPaths)
+            } catch let loadError {
+                try await finishNativeAction(
+                    hookPermit, state: .failed, retrySafety: .unknown,
+                    failureKind: .infrastructure)
+                throw loadError
+            }
+            try await finishNativeAction(
+                hookPermit,
+                state: result.failed.isEmpty ? .succeeded : .failed,
+                retrySafety: .unsafe,
+                failureKind: result.failed.isEmpty ? nil : .task)
             // A hook that failed to load is reported into the transcript rather than swallowed:
             // silently absent and deliberately doing nothing are indistinguishable, and the
             // difference matters when the hook was supposed to be blocking something.
-            for failure in result?.failed ?? [] {
+            for failure in result.failed {
                 try await writer.appendNote(
                     "A hook failed to load: \(failure.path)\n\(failure.detail)",
                     customType: "aviary.hook")
             }
-            if let loaded = result?.loaded, !loaded.isEmpty {
+            if !result.loaded.isEmpty {
                 await agent.enableHooks(true)
             }
         }
@@ -277,7 +381,7 @@ public actor AgentRunner {
         // MCP servers from settings.json. Started here rather than at app launch because a
         // server is a child process holding credentials, and the honest lifetime for that is
         // the run that asked for it.
-        for report in await startMCPServers() {
+        for report in try await startMCPServers() {
             try await writer.appendNote(report.note, customType: "aviary.mcp")
             if let client = report.client, !report.tools.isEmpty {
                 await agent.addMCPTools(report.tools, from: client)
@@ -358,14 +462,26 @@ public actor AgentRunner {
     /// without producing a conversation its provider rejects.
     fileprivate func startBackgroundChild(
         prompt: String, name: String?, modelID: String?, depth: Int, parentSessionID: String
-    ) -> (childID: String, name: String) {
-        let childID = SubAgentRecorder.newChildID()
-        let label = name ?? childID
+    ) async -> Agent.SpawnStartResult {
+        let label = name ?? "child"
         guard !backgroundAdmissionClosed else {
-            background[childID] = Agent.ChildStatus(
-                id: childID, name: label, state: "failed",
-                answer: "The run is stopping; no background child was started.")
-            return (childID, label)
+            return .refused(
+                name: label, reason: "The run is stopping; background child admission is closed.")
+        }
+
+        let childID = SubAgentRecorder.newChildID()
+        if let journal = settings.nativeJournal {
+            do {
+                // This is the admission boundary. In particular, do not create the Task until
+                // the parent has durable evidence that this child is running.
+                try await journal.recordChildLifecycle(
+                    childID: childID, name: label, state: .running)
+            } catch {
+                return .refused(
+                    name: label,
+                    reason: "The canonical child lifecycle could not be recorded: "
+                        + error.localizedDescription)
+            }
         }
         background[childID] = Agent.ChildStatus(
             id: childID, name: label, state: "running", answer: nil)
@@ -374,19 +490,58 @@ public actor AgentRunner {
             let result = await self.runChild(
                 prompt: prompt, name: name, modelID: modelID, depth: depth,
                 parentSessionID: parentSessionID, childID: childID)
+            let taskCanceled = Task.isCancelled
+            let runnerCanceled = await self.wasCancellationRequested(childID)
+            let lifecycle: ChildLifecycleState = (taskCanceled || runnerCanceled)
+                ? .canceled
+                : (result.isError ? .failed : .done)
             await self.finishBackground(
                 childID: childID, name: result.name, answer: result.answer,
-                isError: result.isError)
+                lifecycle: lifecycle, sessionFile: result.sessionFile,
+                prompt: prompt, depth: depth, parentSessionID: parentSessionID,
+                createdAt: result.createdAt)
         }
-        return (childID, label)
+        return .running(childID: childID, name: label)
     }
 
     private func finishBackground(
-        childID: String, name: String, answer: String, isError: Bool
-    ) {
+        childID: String, name: String, answer: String, lifecycle: ChildLifecycleState,
+        sessionFile: URL?, prompt: String, depth: Int, parentSessionID: String,
+        createdAt: Date
+    ) async {
+        var finalLifecycle = lifecycle
+        var finalAnswer = answer
+        if let journal = settings.nativeJournal {
+            do {
+                try await journal.recordChildLifecycle(
+                    childID: childID, name: name, state: lifecycle)
+            } catch {
+                // A settled child is not a successful child until its terminal record is
+                // durable. The bundle latches itself here; keep both projections non-successful.
+                finalLifecycle = .failed
+                finalAnswer = "The child \(childID) settled as \(lifecycle.rawValue), but its "
+                    + "terminal lifecycle could not be recorded: "
+                    + error.localizedDescription
+            }
+        }
+
+        // Keep the legacy Flock ledger behind the canonical terminal boundary. This avoids a
+        // completed legacy row when a native terminal append fails.
+        if let sessionFile {
+            let recorder = SubAgentRecorder(home: settings.home, parentSessionID: parentSessionID)
+            try? recorder.record(
+                childID: childID, name: name, sessionFile: sessionFile, prompt: prompt,
+                spawnCode: "", depth: depth, maxDepth: settings.maxDepth,
+                status: finalLifecycle == .done ? "completed" : finalLifecycle.rawValue,
+                provider: settings.model.providerID, model: settings.model.id,
+                createdAt: createdAt)
+        }
         background[childID] = Agent.ChildStatus(
-            id: childID, name: name, state: isError ? "failed" : "done", answer: answer)
+            id: childID, name: name,
+            state: finalLifecycle == .done ? "done" : finalLifecycle.rawValue,
+            answer: finalAnswer)
         backgroundTasks[childID] = nil
+        cancellationRequested.remove(childID)
     }
 
     fileprivate func backgroundChildren() -> [Agent.ChildStatus] {
@@ -407,16 +562,26 @@ public actor AgentRunner {
         // self-await.
         while !backgroundTasks.isEmpty {
             let tasks = Array(backgroundTasks.values)
+            for childID in backgroundTasks.keys {
+                cancellationRequested.insert(childID)
+            }
             for task in tasks { task.cancel() }
             for task in tasks { await task.value }
         }
         backgroundTasks.removeAll()
     }
 
+    private func wasCancellationRequested(_ childID: String) -> Bool {
+        cancellationRequested.contains(childID)
+    }
+
     fileprivate func runChild(
         prompt: String, name: String?, modelID: String?, depth: Int, parentSessionID: String,
         childID preallocated: String? = nil
-    ) async -> (answer: String, isError: Bool, childID: String, name: String) {
+    ) async -> (
+        answer: String, isError: Bool, childID: String, name: String, sessionFile: URL?,
+        createdAt: Date
+    ) {
         // Passed in by the background path, which has already told the parent this id.
         let childID = preallocated ?? SubAgentRecorder.newChildID()
         let label = name ?? childID
@@ -432,7 +597,7 @@ public actor AgentRunner {
         } catch {
             return (
                 "Could not create the child's directory: \(error.localizedDescription)",
-                true, childID, label
+                true, childID, label, childDir.appending(path: "failed.jsonl"), createdAt
             )
         }
 
@@ -452,14 +617,9 @@ public actor AgentRunner {
             writer = try SessionWriter(
                 home: childHome, cwd: settings.cwd, model: model, identity: childIdentity)
         } catch {
-            try? recorder.record(
-                childID: childID, name: label,
-                sessionFile: childDir.appending(path: "failed.jsonl"), prompt: prompt,
-                spawnCode: "", depth: depth, maxDepth: settings.maxDepth, status: "failed",
-                provider: model.providerID, model: model.id, createdAt: createdAt)
             return (
                 "The sub-agent could not open its session journal: \(error.localizedDescription)",
-                true, childID, label
+                true, childID, label, childDir.appending(path: "failed.jsonl"), createdAt
             )
         }
 
@@ -520,29 +680,18 @@ public actor AgentRunner {
             } else {
                 terminalAnswer = failed ? "The sub-agent produced no answer." : answer
             }
-            try? recorder.record(
-                childID: childID, name: label, sessionFile: writer.fileURL, prompt: prompt,
-                spawnCode: "", depth: depth, maxDepth: settings.maxDepth,
-                status: failed ? "failed" : "completed",
-                provider: model.providerID, model: model.id, createdAt: createdAt)
-
             return (
                 terminalAnswer,
-                failed, childID, label
+                failed, childID, label, writer.fileURL, createdAt
             )
         } catch {
             try? await writer.closeChecked()
             if let hostSession {
                 await host.destroySessionQuietly(hostSession)
             }
-            try? recorder.record(
-                childID: childID, name: label,
-                sessionFile: childDir.appending(path: "failed.jsonl"), prompt: prompt,
-                spawnCode: "", depth: depth, maxDepth: settings.maxDepth, status: "failed",
-                provider: model.providerID, model: model.id, createdAt: createdAt)
             return (
                 "The sub-agent could not start: \(error.localizedDescription)",
-                true, childID, label
+                true, childID, label, writer.fileURL, createdAt
             )
         }
     }
@@ -572,7 +721,7 @@ public actor AgentRunner {
 
         func startBackground(
             prompt: String, name: String?, model: String?, depth: Int
-        ) async -> (childID: String, name: String) {
+        ) async -> Agent.SpawnStartResult {
             await runner.startBackgroundChild(
                 prompt: prompt, name: name, modelID: model, depth: depth,
                 parentSessionID: parentSessionID)

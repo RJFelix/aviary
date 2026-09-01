@@ -464,7 +464,8 @@ func test_timelineProjectsCommandReceiptsAndRejectsHostReordering() throws {
                                 command: command)
     let delivered = reducerEvent(TimelineEventType.commandDelivered, id: "q2", sequence: 2,
                                  journal: reducerWorkJournal, hostSequence: 11, previous: "q1", client: command.client,
-                                 command: command)
+                                 command: command,
+                                 causedBy: EventRef(journal: reducerWorkJournal, eventID: accepted.eventID))
     let reordered = reducerEvent(TimelineEventType.commandRejected, id: "q3", sequence: 3,
                                  journal: reducerWorkJournal, hostSequence: 10, previous: "q2", client: command.client,
                                  command: command)
@@ -501,7 +502,8 @@ func test_timelineJournalAuthorityAndCommandReceiptProvenance() throws {
                                 command: command)
     let delivered = reducerEvent(TimelineEventType.commandDelivered, id: "p2", sequence: 2,
                                  journal: reducerWorkJournal, hostSequence: 21, previous: "p1", client: command.client,
-                                 command: command)
+                                 command: command,
+                                 causedBy: EventRef(journal: reducerWorkJournal, eventID: accepted.eventID))
     var reducer = WorkReducer()
     reducer.apply(accepted)
     reducer.apply(delivered)
@@ -511,7 +513,8 @@ func test_timelineJournalAuthorityAndCommandReceiptProvenance() throws {
 
     let duplicateDelivery = reducerEvent(TimelineEventType.commandDelivered, id: "p2-retry", sequence: 3,
                                          journal: reducerWorkJournal, hostSequence: 22, previous: "p2",
-                                         client: command.client, command: command)
+                                         client: command.client, command: command,
+                                         causedBy: EventRef(journal: reducerWorkJournal, eventID: accepted.eventID))
     reducer.apply(duplicateDelivery)
     XCTAssertEqual(reducer.snapshot.commands[command.commandID]?.deliveryHostSequence, 21)
 
@@ -522,6 +525,128 @@ func test_timelineJournalAuthorityAndCommandReceiptProvenance() throws {
     reducer.apply(conflictEvent)
     XCTAssertFalse(reducer.snapshot.semanticProjectionValid)
     XCTAssertEqual(reducer.snapshot.commands[command.commandID]?.acceptanceHostSequence, 20)
+}
+
+func test_timelineCommandReceiptsRequireExactCausalReferencesAndRetainThem() throws {
+    let root = reducerEvent(TimelineEventType.workCreated, id: "causal-root", sequence: 1,
+                            journal: reducerWorkJournal, work: reducerWork,
+                            workHost: WorkHostRef(reducerWork.workHostID))
+    let rootRef = EventRef(journal: reducerWorkJournal, eventID: root.eventID)
+    let cursor = JournalCursor(journal: reducerWorkJournal, eventID: root.eventID, sequence: 1)
+    let command = CommandRef(commandID: "causal-command", client: ClientRef("causal-client"),
+                             causalCursor: cursor)
+    let accepted = reducerEvent(TimelineEventType.commandAccepted, id: "causal-accepted", sequence: 2,
+                                journal: reducerWorkJournal, hostSequence: 10, previous: root.eventID,
+                                client: command.client, command: command, causedBy: rootRef)
+
+    var prefixReducer = WorkReducer()
+    prefixReducer.apply(root)
+    prefixReducer.apply(accepted)
+    XCTAssertTrue(prefixReducer.snapshot.semanticProjectionValid)
+    let acceptance = try XCTUnwrap(prefixReducer.snapshot.commands[command.commandID])
+    XCTAssertEqual(acceptance.acceptanceEventRef, EventRef(
+        journal: reducerWorkJournal, eventID: accepted.eventID))
+    XCTAssertNil(acceptance.deliveryEventRef)
+
+    // The acceptance reference survives reduction from a previously materialized prefix.
+    let delivered = reducerEvent(TimelineEventType.commandDelivered, id: "causal-delivered", sequence: 3,
+                                 journal: reducerWorkJournal, hostSequence: 11,
+                                 previous: accepted.eventID, client: command.client,
+                                 command: command, causedBy: acceptance.acceptanceEventRef)
+    let incrementallyReduced = WorkReducer.reduce([delivered], initial: prefixReducer.snapshot)
+    XCTAssertTrue(incrementallyReduced.semanticProjectionValid)
+    XCTAssertEqual(incrementallyReduced.commands[command.commandID]?.state, .delivered)
+    XCTAssertEqual(incrementallyReduced.commands[command.commandID]?.acceptanceEventRef,
+                   acceptance.acceptanceEventRef)
+    XCTAssertEqual(incrementallyReduced.commands[command.commandID]?.deliveryEventRef,
+                   EventRef(journal: reducerWorkJournal, eventID: delivered.eventID))
+
+    // Every terminal delivery outcome must name that same durable acceptance event.
+    let outcomes: [(String, CommandDeliveryState)] = [
+        (TimelineEventType.commandDelivered, .delivered),
+        (TimelineEventType.commandNotDelivered, .notDelivered),
+        (TimelineEventType.commandDeliveryIndeterminate, .indeterminate),
+    ]
+    for (index, outcome) in outcomes.enumerated() {
+        var reducer = WorkReducer(snapshot: prefixReducer.snapshot)
+        let event = reducerEvent(outcome.0, id: "causal-outcome-\(index)", sequence: 3,
+                                 journal: reducerWorkJournal, hostSequence: 20 + index,
+                                 previous: accepted.eventID, client: command.client,
+                                 command: command, causedBy: acceptance.acceptanceEventRef)
+        reducer.apply(event)
+        XCTAssertTrue(reducer.snapshot.semanticProjectionValid)
+        XCTAssertEqual(reducer.snapshot.commands[command.commandID]?.state, outcome.1)
+        XCTAssertEqual(reducer.snapshot.commands[command.commandID]?.deliveryEventRef,
+                       EventRef(journal: reducerWorkJournal, eventID: event.eventID))
+    }
+
+    // A rejected admission is also required to describe exactly the cursor it observed.
+    let rejectedCommand = CommandRef(commandID: "causal-rejected", client: command.client,
+                                      causalCursor: cursor)
+    let rejected = reducerEvent(TimelineEventType.commandRejected, id: "causal-rejected-receipt",
+                                sequence: 2, journal: reducerWorkJournal, hostSequence: 30,
+                                previous: root.eventID, client: rejectedCommand.client,
+                                command: rejectedCommand, causedBy: rootRef)
+    var rejectedReducer = WorkReducer()
+    rejectedReducer.apply(root)
+    rejectedReducer.apply(rejected)
+    XCTAssertTrue(rejectedReducer.snapshot.semanticProjectionValid)
+    XCTAssertEqual(rejectedReducer.snapshot.commands[rejectedCommand.commandID]?.state, .rejected)
+    XCTAssertEqual(rejectedReducer.snapshot.commands[rejectedCommand.commandID]?.acceptanceEventRef,
+                   EventRef(journal: reducerWorkJournal, eventID: rejected.eventID))
+
+    let badCauses: [(String, EventRef?)] = [
+        ("nil", nil),
+        ("wrong-event", EventRef(journal: reducerWorkJournal, eventID: "not-the-root")),
+        ("wrong-journal", EventRef(journal: reducerSessionJournal, eventID: root.eventID)),
+    ]
+    for admissionType in [TimelineEventType.commandAccepted, TimelineEventType.commandRejected] {
+        for (index, badCause) in badCauses.enumerated() {
+            let badCommand = CommandRef(
+                commandID: "bad-\(admissionType)-\(index)", client: command.client,
+                causalCursor: cursor)
+            let badEvent = reducerEvent(
+                admissionType, id: "bad-admission-\(admissionType)-\(index)", sequence: 2,
+                journal: reducerWorkJournal, hostSequence: 40 + index,
+                previous: root.eventID, client: badCommand.client, command: badCommand,
+                causedBy: badCause.1)
+            var reducer = WorkReducer()
+            reducer.apply(root)
+            reducer.apply(badEvent)
+            XCTAssertFalse(reducer.snapshot.semanticProjectionValid,
+                           "bad \(admissionType) cause \(badCause.0) must be quarantined")
+            XCTAssertNil(reducer.snapshot.commands[badCommand.commandID])
+        }
+    }
+
+    // A cursor with no durable event identity permits no cause, but never an invented one.
+    let nilCursor = JournalCursor(journal: reducerWorkJournal, sequence: 0)
+    let nilCursorCommand = CommandRef(commandID: "nil-cursor-command", client: command.client,
+                                      causalCursor: nilCursor)
+    let nilCursorAccepted = reducerEvent(
+        TimelineEventType.commandAccepted, id: "nil-cursor-accepted", sequence: 1,
+        journal: reducerWorkJournal, hostSequence: 50, client: nilCursorCommand.client,
+        command: nilCursorCommand)
+    var nilCursorReducer = WorkReducer()
+    nilCursorReducer.apply(nilCursorAccepted)
+    XCTAssertTrue(nilCursorReducer.snapshot.semanticProjectionValid)
+    XCTAssertEqual(nilCursorReducer.snapshot.commands[nilCursorCommand.commandID]?.state, .accepted)
+
+    // Missing, wrong-event, and wrong-journal delivery causes all fail closed, including when
+    // the reducer starts from a snapshot that already contains the valid acceptance.
+    for (index, badCause) in badCauses.enumerated() {
+        var reducer = WorkReducer(snapshot: prefixReducer.snapshot)
+        let badDelivery = reducerEvent(
+            TimelineEventType.commandDelivered, id: "bad-delivery-\(index)", sequence: 3,
+            journal: reducerWorkJournal, hostSequence: 60 + index,
+            previous: accepted.eventID, client: command.client, command: command,
+            causedBy: badCause.1)
+        reducer.apply(badDelivery)
+        XCTAssertFalse(reducer.snapshot.semanticProjectionValid,
+                       "bad delivery cause \(badCause.0) must be quarantined")
+        XCTAssertEqual(reducer.snapshot.commands[command.commandID]?.state, .accepted)
+        XCTAssertNil(reducer.snapshot.commands[command.commandID]?.deliveryEventRef)
+    }
 }
 
 func test_timelineWorkTerminalLifecycleIsImmutableAndRequiresQuiescence() {

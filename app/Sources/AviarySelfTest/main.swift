@@ -472,8 +472,8 @@ func test_archiveRoundTripsWithoutTouchingTranscript() async throws {
 struct RefusingDelegate: Agent.SpawnDelegate {
     func startBackground(
         prompt: String, name: String?, model: String?, depth: Int
-    ) async -> (childID: String, name: String) {
-        ("sub-none", "none")
+    ) async -> Agent.SpawnStartResult {
+        .refused(name: name ?? "none", reason: "test refusal")
     }
 
     func children() async -> [Agent.ChildStatus] { [] }
@@ -2709,19 +2709,19 @@ let cases3: [Case] = [
         XCTAssertEqual(result.loaded.first?.events, ["on_before_tool"],
                        "a hook declares itself by defining on_<event>; nothing to register")
 
-        let blocked = await host.callHook("before_tool", payload: .object([
+        let blocked = try await host.callHook("before_tool", payload: .object([
             "code": .string("do something forbidden"),
         ]))
         XCTAssertEqual(blocked?["block"]?.boolValue, true)
         XCTAssertTrue((blocked?["reason"]?.stringValue ?? "").contains("Try the other thing"))
 
-        let rewritten = await host.callHook("before_tool", payload: .object([
+        let rewritten = try await host.callHook("before_tool", payload: .object([
             "code": .string("widen this"),
         ]))
         XCTAssertTrue((rewritten?["code"]?.stringValue ?? "").contains("widened = True"))
 
         // An event no hook handles returns nil, so the loop pays nothing for it.
-        let ignored = await host.callHook("after_response", payload: .object([:]))
+        let ignored = try await host.callHook("after_response", payload: .object([:]))
         XCTAssertNil(ignored)
     }),
 
@@ -2757,7 +2757,7 @@ let cases3: [Case] = [
         XCTAssertEqual(result.loaded.count, 1)
 
         // The throwing hook does not block, does not crash, and the host still serves.
-        let decision = await host.callHook("before_tool", payload: .object([
+        let decision = try await host.callHook("before_tool", payload: .object([
             "code": .string("anything"),
         ]))
         XCTAssertNil(decision, "a hook that raised decided nothing")
@@ -2786,7 +2786,7 @@ let cases3: [Case] = [
 
         let session = try await host.createSession(cwd: "/tmp")
         _ = try await host.execute("secret_value = 'hunter2'", in: session)
-        let decision = await host.callHook("before_tool", payload: .object([
+        let decision = try await host.callHook("before_tool", payload: .object([
             "code": .string("x"), "session": .string(session),
         ]))
         XCTAssertEqual(decision?["saw"]?.boolValue, false,
@@ -5711,9 +5711,9 @@ let casesBackgroundSpawn: [Case] = [
 
             func startBackground(
                 prompt: String, name: String?, model: String?, depth: Int
-            ) async -> (childID: String, name: String) {
+            ) async -> Agent.SpawnStartResult {
                 lock.withLock { started.append(prompt) }
-                return ("c-bg", name ?? "c-bg")
+                return .running(childID: "c-bg", name: name ?? "c-bg")
             }
 
             func children() async -> [Agent.ChildStatus] {
@@ -5727,7 +5727,12 @@ let casesBackgroundSpawn: [Case] = [
         let fake = Fake()
         let bg = await fake.startBackground(
             prompt: "research this", name: "researcher", model: nil, depth: 1)
-        XCTAssertEqual(bg.childID, "c-bg")
+        guard case .running(let childID, let childName) = bg else {
+            XCTFail("the fake runner should admit the child")
+            return
+        }
+        XCTAssertEqual(childID, "c-bg")
+        XCTAssertEqual(childName, "researcher")
 
         // Running: a state and no answer. This is what the Future's poller reads, and the
         // absent key is what stops it resolving early.
@@ -6227,6 +6232,21 @@ let casesPhase0SessionControl: [Case] = [
     ("phase1 bridge: controller commits intent and fails closed", {
         try await test_sessionCommandControllerCommitsIntentAndFailsClosedOnAmbiguity()
     }),
+    ("phase1 bridge: command-journal seam preserves admission and delivery boundaries", {
+        try await test_sessionCommandControllerJournalSeamPreservesIdentityAndDeliveryBoundaries()
+    }),
+    ("phase1 bridge: launch journal installs only before admission", {
+        try await test_sessionCommandControllerInstallsLaunchJournalOnlyBeforeAdmission()
+    }),
+    ("phase1 bridge: delivery-journal failure fails closed after crossing", {
+        try await test_sessionCommandControllerJournalDeliveryFailureFailsClosedAfterCrossing()
+    }),
+    ("phase1 bridge: concurrent delivery outcomes honor the first terminal receipt", {
+        try await test_sessionCommandControllerDeliveryWaitersHonorTheFirstTerminalOutcome()
+    }),
+    ("phase1 bridge: SessionWriter remains the legacy command journal", {
+        try await test_sessionWriterCanBePassedThroughCommandJournalSeam()
+    }),
     ("phase1 bridge: journal failure releases queued dispatch waiters", {
         try await test_sessionCommandControllerFailsQueuedWaitersWhenIntentCommitLatchesJournal()
     }),
@@ -6277,6 +6297,9 @@ let casesPhase1Timeline: [Case] = [
     }),
     ("phase1: journal authority and command receipt provenance cannot disagree", {
         try test_timelineJournalAuthorityAndCommandReceiptProvenance()
+    }),
+    ("phase1: command receipts require exact causal references", {
+        try test_timelineCommandReceiptsRequireExactCausalReferencesAndRetainThem()
     }),
     ("phase1: terminal Work is immutable and requires quiescence", {
         test_timelineWorkTerminalLifecycleIsImmutableAndRequiresQuiescence()
@@ -6389,11 +6412,20 @@ let casesRunJournalBundle: [Case] = [
     ("phase1 bundle: paired native genesis and exact assembly", {
         try await test_runJournalBundleFreshGenesisAndExactAssembly()
     }),
+    ("phase1 bundle: execution identity creates then reopens one attachment", {
+        try await test_runJournalBundleExecutionOpenCreatesThenReopensTheMirroredAttachment()
+    }),
+    ("phase1 bundle: execution identity refuses foreign and partial authority", {
+        try await test_runJournalBundleExecutionOpenRefusesForeignAuthorityAndIncompletePair()
+    }),
     ("phase1 bundle: input and assistant tips retain the visible chain", {
         try await test_runJournalBundleInputAndAssistantTipsRemainOneVisibleChain()
     }),
     ("phase1 bundle: queued delivery preserves the accepted command", {
         try await test_runJournalBundleQueuedDeliveryUsesOriginalReceiptAndNoSecondInput()
+    }),
+    ("phase1 bundle: non-conversation commands do not become chat messages", {
+        try await test_runJournalBundleNonConversationalCommandDoesNotCreateAUserMessage()
     }),
     ("phase1 bundle: every action kind receives a post-start permit", {
         try await test_runJournalBundleAllActionKindsPermitOnlyAfterDurableStart()
@@ -6404,8 +6436,8 @@ let casesRunJournalBundle: [Case] = [
     ("phase1 bundle: semantic gate serializes concurrent mutations", {
         try await test_runJournalBundleSemanticGateSerializesConcurrentMutations()
     }),
-    ("phase1 bundle: queued delivery survives finished-run reopen", {
-        try await test_runJournalBundleQueuedCommandCanDeliverAfterFinishedRunReopen()
+    ("phase1 bundle: queued command terminalizes before finished-run reopen", {
+        try await test_runJournalBundleQueuedCommandMustTerminalizeBeforeFinishedRunReopen()
     }),
     ("phase1 bundle: terminal run outcomes remain typed", {
         try await test_runJournalBundleTerminalRunOutcomesRemainTyped()
@@ -6425,6 +6457,9 @@ let casesRunJournalBundle: [Case] = [
     ("phase1 bundle: checked close reports a partial close", {
         try await test_runJournalBundleCheckedCloseReportsPartialClose()
     }),
+    ("phase1 bundle: canceled teardown still finishes and closes", {
+        try await test_runJournalBundleCanceledTaskStillFinishesAndCloses()
+    }),
 ]
 
 await Harness.run(
@@ -6435,4 +6470,8 @@ await Harness.run(
         + casesPeers + casesMCPSurface
         + casesBackgroundSpawn + casesWebSearch + casesDispatched
         + casesCrossingLaws + casesPhase0SessionControl + casesPhase1Timeline
-        + casesTimelineWriter + casesRunJournalBundle)
+        + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
+        + casesNativeEffectFailure + casesNativeLaunchJournal
+        + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel
+        + casesNativeIndeterminateEffects + casesChildLifecycle
+        + casesCommandDeliveryOutcome)

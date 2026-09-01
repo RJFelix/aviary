@@ -107,6 +107,8 @@ public enum CommandDeliveryState: String, Codable, Hashable, Sendable {
     case accepted
     case rejected
     case delivered
+    case notDelivered = "not_delivered"
+    case indeterminate
 }
 
 public struct WorkCommandSnapshot: Codable, Hashable, Sendable {
@@ -114,6 +116,12 @@ public struct WorkCommandSnapshot: Codable, Hashable, Sendable {
     public var state: CommandDeliveryState
     /// Acceptance and delivery are separate provenance facts. A delivery receipt must never
     /// replace the actor/order that admitted the command.
+    ///
+    /// These are durable event identities, rather than just host metadata. Keeping them in the
+    /// projection lets an incremental reducer validate a later delivery receipt even when the
+    /// acceptance event was consumed in an earlier reduction pass.
+    public let acceptanceEventRef: EventRef?
+    public let deliveryEventRef: EventRef?
     public let acceptanceActor: TimelineActor
     public let acceptanceHostSequence: Int
     public let acceptanceIdempotencyKey: String?
@@ -122,16 +130,21 @@ public struct WorkCommandSnapshot: Codable, Hashable, Sendable {
     public let deliveryIdempotencyKey: String?
 
     /// Compatibility projections for early consumers.
+    public var acceptanceEvent: EventRef? { acceptanceEventRef }
+    public var deliveryEvent: EventRef? { deliveryEventRef }
     public var actor: TimelineActor { deliveryActor ?? acceptanceActor }
     public var hostSequence: Int { deliveryHostSequence ?? acceptanceHostSequence }
     public var idempotencyKey: String? { deliveryIdempotencyKey ?? acceptanceIdempotencyKey }
 
     public init(command: CommandRef, state: CommandDeliveryState, actor: TimelineActor,
                 hostSequence: Int, idempotencyKey: String? = nil,
+                acceptanceEventRef: EventRef? = nil, deliveryEventRef: EventRef? = nil,
                 deliveryActor: TimelineActor? = nil, deliveryHostSequence: Int? = nil,
                 deliveryIdempotencyKey: String? = nil) {
         self.command = command
         self.state = state
+        self.acceptanceEventRef = acceptanceEventRef
+        self.deliveryEventRef = deliveryEventRef
         self.acceptanceActor = actor
         self.acceptanceHostSequence = hostSequence
         self.acceptanceIdempotencyKey = idempotencyKey
@@ -143,10 +156,13 @@ public struct WorkCommandSnapshot: Codable, Hashable, Sendable {
     public init(command: CommandRef, state: CommandDeliveryState,
                 acceptanceActor: TimelineActor, acceptanceHostSequence: Int,
                 acceptanceIdempotencyKey: String? = nil,
+                acceptanceEventRef: EventRef? = nil, deliveryEventRef: EventRef? = nil,
                 deliveryActor: TimelineActor? = nil, deliveryHostSequence: Int? = nil,
                 deliveryIdempotencyKey: String? = nil) {
         self.command = command
         self.state = state
+        self.acceptanceEventRef = acceptanceEventRef
+        self.deliveryEventRef = deliveryEventRef
         self.acceptanceActor = acceptanceActor
         self.acceptanceHostSequence = acceptanceHostSequence
         self.acceptanceIdempotencyKey = acceptanceIdempotencyKey
@@ -469,6 +485,8 @@ public enum TimelineEventType {
     public static let commandAccepted = "command.accepted"
     public static let commandRejected = "command.rejected"
     public static let commandDelivered = "command.delivered"
+    public static let commandNotDelivered = "command.not_delivered"
+    public static let commandDeliveryIndeterminate = "command.delivery_indeterminate"
     public static let hostOrderObserved = "host.order_observed"
 }
 
@@ -867,7 +885,8 @@ public struct TimelineEvent: Codable, Hashable, Sendable {
         TimelineEventType.compaction, TimelineEventType.modelChanged,
         TimelineEventType.decision, TimelineEventType.artifact, TimelineEventType.childLifecycle,
         TimelineEventType.commandAccepted, TimelineEventType.commandRejected,
-        TimelineEventType.commandDelivered, TimelineEventType.hostOrderObserved,
+        TimelineEventType.commandDelivered, TimelineEventType.commandNotDelivered,
+        TimelineEventType.commandDeliveryIndeterminate, TimelineEventType.hostOrderObserved,
     ]
 
     private enum CodingKeys: String, CodingKey {
