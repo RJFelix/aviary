@@ -41,6 +41,7 @@ final class InHouseDriver {
     /// Canonical Session/Work history for this execution attempt. The legacy writer above is a
     /// temporary presentation adapter for the current transcript parser, not a second authority.
     private var nativeJournal: RunJournalBundle?
+    private var nativeResumeSeed: NativeColdResumeResult?
     private enum NativeRunTeardownState: Equatable {
         case open
         case finishing
@@ -323,7 +324,7 @@ final class InHouseDriver {
                 peerDelegate: peerDelegate,
                 selfDelegate: peerDelegate as? Agent.SelfDelegate,
                 identity: identity, reasoningEffort: reasoningEffort, writer: writer,
-                nativeJournal: nativeJournal))
+                nativeJournal: nativeJournal, nativeResumeSeed: nativeResumeSeed))
         self.runner = runner
 
         let (events, eventContinuation) = AsyncStream<Agent.Event>.makeStream(
@@ -546,6 +547,7 @@ final class InHouseDriver {
                     "command journal authority was already admitted")
             }
             nativeJournal = bridge.nativeJournal
+            nativeResumeSeed = bridge.resumeSeed
             return true
         } catch {
             errorBanner = "Could not open the canonical Session/Work journal: "

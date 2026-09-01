@@ -203,6 +203,7 @@ enum AgentCLI {
                 + error.localizedDescription)
         }
         let nativeJournal = nativeBridge?.nativeJournal
+        let nativeResumeSeed = nativeBridge?.resumeSeed
         let commandJournal: any SessionCommandJournal
         if let nativeBridge {
             commandJournal = nativeBridge
@@ -461,7 +462,7 @@ enum AgentCLI {
                     : nil,
                 hookPaths: HookDiscovery.paths(repoRoot: repoRoot),
                 resume: resume, identity: identity, writer: writer,
-                nativeJournal: nativeJournal))
+                nativeJournal: nativeJournal, nativeResumeSeed: nativeResumeSeed))
 
         await runner.observe { event in
             switch event {

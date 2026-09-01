@@ -45,6 +45,10 @@ public actor AgentRunner {
         /// The exact native Session/Work producer opened by the launch boundary. The runner
         /// borrows it for the root Agent; the driver or CLI retains teardown ownership.
         public var nativeJournal: RunJournalBundle?
+        /// Immutable history captured by the native launch boundary before Start admission.
+        /// Supplying a native journal for a cold resume without this seed is an error; the
+        /// runner must never reread a later tip containing the new prompt or fall back to legacy.
+        public var nativeResumeSeed: NativeColdResumeResult?
 
         /// Who else is running, supplied by the app. Nil in a CLI run, where the two peer
         /// builtins are then not bound at all — which is right: there is nobody else there.
@@ -63,7 +67,8 @@ public actor AgentRunner {
             identity: SessionWorkIdentity? = nil,
             reasoningEffort: String? = nil,
             writer: SessionWriter? = nil,
-            nativeJournal: RunJournalBundle? = nil
+            nativeJournal: RunJournalBundle? = nil,
+            nativeResumeSeed: NativeColdResumeResult? = nil
         ) {
             self.peerDelegate = peerDelegate
             self.selfDelegate = selfDelegate
@@ -83,6 +88,7 @@ public actor AgentRunner {
             self.identity = identity
             self.writer = writer
             self.nativeJournal = nativeJournal
+            self.nativeResumeSeed = nativeResumeSeed
         }
     }
 
@@ -286,6 +292,52 @@ public actor AgentRunner {
         let writerForCleanup: SessionWriter? = writer
         var hostSessionForCleanup: String?
         do {
+            // Choose replay before the runtime namespace is created. Native history was captured
+            // at the locked pre-Start boundary and is authoritative; a missing seed or malformed
+            // pinned instruction set is a hard recovery error, never an invitation to consult the
+            // legacy presentation transcript.
+            var replay = SessionReplay()
+            var systemPrompt = settings.systemPrompt
+            var expectedResumeTools: [ChatTool]?
+            var nativeResumeNote: String?
+            if settings.resume != nil {
+                if settings.nativeJournal != nil {
+                    guard let seed = settings.nativeResumeSeed else {
+                        throw RunJournalBundleError.invalidConfiguration(
+                            "native cold resume is missing its pre-Start replay seed")
+                    }
+                    guard seed.pinnedMessages.count == 1,
+                          seed.pinnedMessages[0].role == .system,
+                          seed.pinnedMessages[0].content.count == 1,
+                          case .text(let retainedSystemPrompt) = seed.pinnedMessages[0].content[0]
+                    else {
+                        throw RunJournalBundleError.invalidConfiguration(
+                            "native cold resume requires one retained text system instruction")
+                    }
+                    replay.messages = seed.messages
+                    replay.lastModel = seed.modelID
+                    systemPrompt = retainedSystemPrompt
+                    expectedResumeTools = seed.tools
+                    nativeResumeNote =
+                        "Native cold resume reconstructed the durable timeline and "
+                        + "prior effective model context. The Python namespace and background "
+                        + "Futures/Handles were not restored; memory/artifact/repository state and "
+                        + "external effects remain unknown."
+                } else {
+                    guard settings.nativeResumeSeed == nil else {
+                        throw RunJournalBundleError.invalidConfiguration(
+                            "a native resume seed was supplied without its native journal authority")
+                    }
+                    replay =
+                        SessionResume.replay(
+                            fileURL: settings.home.sessionFile(id: settings.resume!))
+                        ?? SessionReplay()
+                }
+            } else if settings.nativeResumeSeed != nil {
+                throw RunJournalBundleError.invalidConfiguration(
+                    "a fresh run cannot consume a native cold-resume seed")
+            }
+
         guard case .healthy = await writer.writerHealth else {
             throw SessionWriter.WriterError.unavailable("The session journal is unavailable.")
         }
@@ -310,23 +362,15 @@ public actor AgentRunner {
             throw error
         }
         hostSessionForCleanup = hostSession
-        // Replay is read-only and happens after the writer is reserved, so every subsequent
-        // runtime/provider/MCP effect has one exact durable antecedent.
-        var replay = SessionReplay()
-        if let resume = settings.resume {
-                replay =
-                    SessionResume.replay(fileURL: settings.home.sessionFile(id: resume))
-                    ?? SessionReplay()
-        }
-
         let agent = Agent(
             provider: provider, host: host, writer: writer, hostSession: hostSession,
             config: .init(
-                model: settings.model, cwd: settings.cwd, systemPrompt: settings.systemPrompt,
+                model: settings.model, cwd: settings.cwd, systemPrompt: systemPrompt,
                 maxIterations: settings.maxIterations, maxTokens: settings.model.maxTokens,
                     reasoningEffort: settings.reasoningEffort,
                 maxDepth: settings.maxDepth, depth: 0, goal: settings.goal,
-                resumedHistory: replay.messages),
+                resumedHistory: replay.messages,
+                expectedResumeTools: expectedResumeTools),
             nativeJournal: settings.nativeJournal,
             contextBodyStore: ContextBodyStore(home: settings.home))
 
@@ -397,11 +441,11 @@ public actor AgentRunner {
         // Recorded in the transcript, not just shown once in the UI: a resumed run whose
         // history was altered should still say so when the session is read back tomorrow.
         if settings.resume != nil {
-            var note = "Resumed: picked up \(replay.turnCount) prior turn(s)."
+            var note = replay.messages.isEmpty
+                ? "Resumed, but no prior conversation could be replayed from this session."
+                : "Resumed: picked up \(replay.turnCount) prior turn(s)."
             if let caveat = replay.caveat { note += " " + caveat + "." }
-            if replay.messages.isEmpty {
-                note = "Resumed, but no prior conversation could be replayed from this session."
-            }
+            if let nativeResumeNote { note += " " + nativeResumeNote }
             try await writer.appendNote(note, customType: "aviary.resume")
         }
 

@@ -1,5 +1,18 @@
 import Foundation
 
+private enum NativeResumeCompatibilityError: LocalizedError {
+    case toolSchemaChanged(expected: [String], actual: [String])
+
+    var errorDescription: String? {
+        switch self {
+        case .toolSchemaChanged(let expected, let actual):
+            return "Native cold resume refused because the available tool schemas changed "
+                + "(expected: \(expected.joined(separator: ", ")); "
+                + "actual: \(actual.joined(separator: ", ")))."
+        }
+    }
+}
+
 /// The agent loop, in-house.
 ///
 /// Send the conversation and the tool schema; stream back text, thinking and tool calls;
@@ -55,12 +68,17 @@ public actor Agent {
         /// Must not contain a system message; the agent builds its own from the current skills
         /// and context files, which is the point of resuming rather than replaying.
         public var resumedHistory: [ChatMessage] = []
+        /// On the first request after a native cold resume, the currently installed tool set
+        /// must equal the retained schema exactly. A code/MCP capability drift is a recovery
+        /// boundary, not permission to send a subtly different request under a “resumed” label.
+        public var expectedResumeTools: [ChatTool]?
 
         public init(
             model: ModelSpec, cwd: String, systemPrompt: String,
             maxIterations: Int = 40, maxTokens: Int? = nil, reasoningEffort: String? = nil,
             compactAtContextShare: Double = 0.7, maxDepth: Int = 3, depth: Int = 0,
-            goal: Goal? = nil, resumedHistory: [ChatMessage] = []
+            goal: Goal? = nil, resumedHistory: [ChatMessage] = [],
+            expectedResumeTools: [ChatTool]? = nil
         ) {
             self.model = model
             self.cwd = cwd
@@ -73,6 +91,7 @@ public actor Agent {
             self.depth = depth
             self.goal = goal
             self.resumedHistory = resumedHistory
+            self.expectedResumeTools = expectedResumeTools
         }
     }
 
@@ -1310,10 +1329,18 @@ public actor Agent {
                 return .cancelled
             }
 
+            var assistantContent: [ChatContent] = []
+            if !turn.text.isEmpty { assistantContent.append(.text(turn.text)) }
+            for call in turn.toolCalls {
+                assistantContent.append(
+                    .toolCall(id: call.id, name: call.name, arguments: call.arguments))
+            }
+
             let messageID: String
             do {
-                if let nativeJournal, !turn.text.isEmpty {
-                    _ = try await nativeJournal.commitAssistantMessage(turn.text)
+                if let nativeJournal, !assistantContent.isEmpty {
+                    _ = try await nativeJournal.commitAssistantMessage(
+                        ChatMessage(role: .assistant, content: assistantContent))
                 }
                 messageID = try await writer.appendAssistant(
                     text: turn.text, thinking: turn.thinking, toolCalls: turn.toolCalls,
@@ -1331,12 +1358,6 @@ public actor Agent {
             emit(.turnFinished(
                 messageID: messageID, usage: turn.usage, stopReason: turn.stopReason))
 
-            var assistantContent: [ChatContent] = []
-            if !turn.text.isEmpty { assistantContent.append(.text(turn.text)) }
-            for call in turn.toolCalls {
-                assistantContent.append(
-                    .toolCall(id: call.id, name: call.name, arguments: call.arguments))
-            }
             messages.append(ChatMessage(role: .assistant, content: assistantContent))
 
             if turn.toolCalls.isEmpty {
@@ -1615,10 +1636,20 @@ public actor Agent {
             messagesForTurn[0] = .system(
                 first.plainText + "\n\n" + goal.briefing(spent: totalUsage.totalTokens))
         }
+        let tools = activeTools
+        if let expected = config.expectedResumeTools {
+            guard tools == expected else {
+                throw NativeResumeCompatibilityError.toolSchemaChanged(
+                    expected: expected.map(\.name), actual: tools.map(\.name))
+            }
+            // Equality has been proved at the first provider boundary. Later changes are
+            // ordinary live context changes and receive their own manifest before dispatch.
+            config.expectedResumeTools = nil
+        }
         let request = ChatRequest(
             model: config.model.id,
             messages: messagesForTurn,
-            tools: activeTools,
+            tools: tools,
             maxTokens: config.maxTokens,
             reasoningEffort: config.reasoningEffort)
 

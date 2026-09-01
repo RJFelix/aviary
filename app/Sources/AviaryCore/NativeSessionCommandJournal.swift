@@ -10,11 +10,15 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
     public nonisolated let identity: SessionWorkIdentity
     public nonisolated let nativeJournal: RunJournalBundle
     public nonisolated let legacyProjection: SessionWriter
+    /// Immutable native history captured after the journal pair is locked and before the new
+    /// Start command can append its prompt. Nil for fresh runs and legacy-only resumes.
+    public nonisolated let resumeSeed: NativeColdResumeResult?
 
     public init(
         identity: SessionWorkIdentity,
         nativeJournal: RunJournalBundle,
-        legacyProjection: SessionWriter
+        legacyProjection: SessionWriter,
+        resumeSeed: NativeColdResumeResult? = nil
     ) throws {
         guard nativeJournal.session == SessionRef(identity.sessionID),
               nativeJournal.work == identity.work,
@@ -26,6 +30,7 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
         self.identity = identity
         self.nativeJournal = nativeJournal
         self.legacyProjection = legacyProjection
+        self.resumeSeed = resumeSeed
     }
 
     /// Open the canonical launch journal when this execution has a complete native history.
@@ -52,14 +57,67 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
             home: home, identity: identity, actorID: actorID, actorKind: actorKind,
             modelID: modelID)
         do {
+            let resumeSeed = try resumingLegacySession
+                ? captureResumeSeed(home: home, identity: identity, bundle: bundle)
+                : nil
+            if let resumeSeed {
+                _ = try await bundle.recordRecoveryCoverage(resumeSeed.coverage)
+            }
             return try NativeSessionCommandJournal(
-                identity: identity, nativeJournal: bundle, legacyProjection: legacyProjection)
+                identity: identity, nativeJournal: bundle,
+                legacyProjection: legacyProjection, resumeSeed: resumeSeed)
         } catch {
             _ = try? await bundle.finishRun(
-                outcome: .failed, detail: "native command journal installation failed")
+                outcome: .failed,
+                detail: "native cold-resume validation or command journal installation failed")
             try? await bundle.closeChecked()
             throw error
         }
+    }
+
+    /// `openForExecution` has locked both files and appended exactly one `run.started` record for
+    /// the replacement Run. Remove that marker from the replay view: it is the new attempt, not
+    /// prior history. The Session side has not changed, and its attachment cursor must identify
+    /// the exact prior Work tip accepted by `NativeColdResume`.
+    private static func captureResumeSeed(
+        home: AgentHome, identity: SessionWorkIdentity, bundle: RunJournalBundle
+    ) throws -> NativeColdResumeResult {
+        let actor = TimelineActor(actorID: "native-resume-reader", kind: "work-host")
+        let sessionRead = TimelineJournalReader.read(
+            try Data(contentsOf: home.timelineV2SessionJournalURL(sessionID: identity.sessionID)),
+            journal: bundle.sessionJournal, actor: actor,
+            hostRecordedAt: Date(timeIntervalSince1970: 0))
+        let completeWorkRead = TimelineJournalReader.read(
+            try Data(contentsOf: home.timelineV2WorkJournalURL(identity.work)),
+            journal: bundle.workJournal, actor: actor,
+            hostRecordedAt: Date(timeIntervalSince1970: 0))
+        guard completeWorkRead.quarantinedSuffix == nil,
+              completeWorkRead.truncatedTail == nil,
+              let replacementStart = completeWorkRead.records.last,
+              replacementStart.event.type == TimelineEventType.runStarted,
+              replacementStart.event.run == RunRef(identity.runID) else {
+            throw RunJournalBundleError.invalidJournal(
+                journal: bundle.workJournal,
+                reason: "the locked Work journal does not end at the replacement Run marker")
+        }
+        let priorWorkRecords = Array(completeWorkRead.records.dropLast())
+        guard let priorWorkTip = priorWorkRecords.last?.event,
+              let sessionTip = sessionRead.records.last?.event else {
+            throw RunJournalBundleError.invalidJournal(
+                journal: bundle.workJournal,
+                reason: "the prior Session/Work replay prefix is empty")
+        }
+        let priorWorkRead = TimelineJournalReadResult(records: priorWorkRecords)
+        return try NativeColdResume.resume(
+            sessionRead: sessionRead,
+            expectedSessionCursor: JournalCursor(
+                journal: bundle.sessionJournal, eventID: sessionTip.eventID,
+                sequence: sessionTip.sequence),
+            workRead: priorWorkRead,
+            expectedWorkCursor: JournalCursor(
+                journal: bundle.workJournal, eventID: priorWorkTip.eventID,
+                sequence: priorWorkTip.sequence),
+            bodyStore: ContextBodyStore(home: home))
     }
 
     public func commitIntent(_ intent: SessionCommandIntent) async throws {

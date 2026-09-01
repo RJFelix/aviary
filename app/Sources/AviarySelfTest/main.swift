@@ -6417,6 +6417,33 @@ let casesContextManifest: [Case] = [
     }),
 ]
 
+let casesNativeColdResume: [Case] = [
+    ("phase1 native resume: producer context reports six-plane coverage", {
+        try await test_nativeColdResumeReconstructsProducerContextAndReportsCoverage()
+    }),
+    ("phase1 native resume: exact user suffix is appended after boundary", {
+        try await test_nativeColdResumeAcceptsExactUserSuffixAfterBoundary()
+    }),
+    ("phase1 native resume: missing message or tool bodies refuse", {
+        try await test_nativeColdResumeRefusesMissingOrCorruptMessageAndToolBodies()
+    }),
+    ("phase1 native resume: stale cursors and tails refuse", {
+        try await test_nativeColdResumeRefusesStaleCursorAndTailedRead()
+    }),
+    ("phase1 native resume: assistant structure must be provable", {
+        try await test_nativeColdResumeRefusesTextOnlyOrDanglingStructuredAssistant()
+    }),
+    ("phase1 native resume: action gaps and compaction crossings refuse", {
+        try await test_nativeColdResumeRefusesPostBoundaryActionAndCompactionCrossing()
+    }),
+    ("phase1 native resume: pre-Start seed wins over legacy and sends prompt once", {
+        try await test_nativeLaunchCapturesPreStartSeedAndRunnerNeverFallsBackToLegacy()
+    }),
+    ("phase1 native resume: corrupt seed refuses before commands or runtime effects", {
+        try await test_nativeLaunchRefusesUnavailableSeedBeforeCommandOrRuntimeEffect()
+    }),
+]
+
 let casesTimelineWriter: [Case] = [
     ("phase1 writer: fresh appendBatch bytes, reducer, and reopen", {
         try await test_timelineJournalWriterFreshBatchReopenAndReducer()
@@ -6506,7 +6533,7 @@ await Harness.run(
         + casesPeers + casesMCPSurface
         + casesBackgroundSpawn + casesWebSearch + casesDispatched
         + casesCrossingLaws + casesPhase0SessionControl + casesPhase1Timeline
-        + casesContextManifest + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
+        + casesContextManifest + casesNativeColdResume + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal
         + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel
         + casesNativeIndeterminateEffects + casesChildLifecycle

@@ -814,7 +814,7 @@ public struct SessionReducer: Sendable {
 
     private mutating func rebuildVisibleMessages() {
         guard let tip = snapshot.semanticTip else {
-            snapshot.messages = snapshot.messageHistory
+            snapshot.messages = snapshot.messageHistory.filter(isPresentationVisible)
             return
         }
         let byID = Dictionary(uniqueKeysWithValues: snapshot.messageHistory.map { ($0.eventID, $0) })
@@ -823,10 +823,18 @@ public struct SessionReducer: Sendable {
         var visited: Set<String> = []
         while let ref = current, visited.insert(ref.eventID).inserted {
             guard let message = byID[ref.eventID] else { break }
-            visible.append(message)
+            if isPresentationVisible(message) { visible.append(message) }
             current = message.conversationParent
         }
         snapshot.messages = visible.reversed()
+    }
+
+    /// A tool-only assistant event is part of the model-visible conversation chain and must
+    /// remain in `messageHistory`, but it has no human-visible text row. The legacy renderer
+    /// already presents its tool call/result separately; filtering only the visible projection
+    /// keeps native/legacy chat parity without discarding recovery provenance.
+    private func isPresentationVisible(_ message: SessionMessageSnapshot) -> Bool {
+        message.role != ChatRole.assistant.rawValue || !message.text.isEmpty
     }
 
     private func validateConversationTip(_ tip: EventRef) -> Bool {

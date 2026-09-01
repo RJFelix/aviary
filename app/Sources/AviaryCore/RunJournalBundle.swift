@@ -956,6 +956,42 @@ public actor RunJournalBundle {
             ])))
     }
 
+    /// Persist the complete six-plane recovery claim before the resumed run can dispatch work.
+    /// The evidence cursor remains the exact source prefix; this event belongs to the replacement
+    /// Run and must not rewrite that historical boundary.
+    public func recordRecoveryCoverage(
+        _ coverage: RecoveryCoverage
+    ) async throws -> TimelineJournalCommit {
+        try await withSemanticGate {
+            try self.ensureUsable()
+            try self.ensureRunActive()
+            guard RecoveryPlane.allCases.allSatisfy({ coverage.planes[$0] != nil }) else {
+                throw RunJournalBundleError.invalidOperation(
+                    "recovery coverage must report every state plane")
+            }
+            var payload: [String: JSONValue] = [
+                "operation": .string(coverage.operation.rawValue),
+                "planes": .object(Dictionary(uniqueKeysWithValues:
+                    RecoveryPlane.allCases.map { plane in
+                        (plane.rawValue, .string(coverage.planes[plane]!.rawValue))
+                    })),
+                "caveats": .array(coverage.caveats.map(JSONValue.string)),
+            ]
+            if let evidence = coverage.evidence {
+                payload["evidence"] = encodeTimelineValue(evidence)
+            }
+            if let cursor = coverage.evidenceCursor {
+                payload["evidence_cursor"] = encodeTimelineValue(cursor)
+            }
+            return try await self.appendSession(TimelineEventDraft(
+                hostSequence: self.nextHostOrder(), session: self.session,
+                work: self.work, workHost: self.workHost, run: self.activeRun,
+                type: TimelineEventType.recoveryCoverage,
+                declaredDomains: [.session, .work, .context, .runtime, .externalEffects],
+                payload: .object(payload)))
+        }
+    }
+
     public func beginAction(
         action: ActionRef = ActionRef(UUID().uuidString.lowercased()),
         kind: ActionKind,
@@ -1134,19 +1170,57 @@ public actor RunJournalBundle {
         }
     }
 
-    /// Commit the assistant message first, then explicitly select it as the Session tip.
+    /// Commit a legacy text-only assistant message first, then explicitly select it as the
+    /// Session tip. New provider paths should use the structured overload so a tool call or
+    /// image cannot disappear at the cold-resume boundary.
     public func commitAssistantMessage(_ text: String) async throws -> [TimelineJournalCommit] {
-        try await withSemanticGate { try await self.commitAssistantMessageLocked(text) }
+        try await commitAssistantMessage(ChatMessage(role: .assistant, content: [.text(text)]))
     }
 
-    private func commitAssistantMessageLocked(_ text: String) async throws -> [TimelineJournalCommit] {
+    /// Commit the exact provider-visible assistant content. The retained body is published before
+    /// the Session event, so a durable `message.committed` never claims reconstructable structured
+    /// content whose bytes are unavailable.
+    public func commitAssistantMessage(
+        _ message: ChatMessage
+    ) async throws -> [TimelineJournalCommit] {
+        try await withSemanticGate { try await self.commitAssistantMessageLocked(message) }
+    }
+
+    private func commitAssistantMessageLocked(
+        _ message: ChatMessage
+    ) async throws -> [TimelineJournalCommit] {
         try ensureUsable()
         try ensureRunActive()
+        guard message.role == .assistant else {
+            throw RunJournalBundleError.invalidOperation(
+                "committed assistant content must have the assistant role")
+        }
+        let body = try ContextManifest.bodyData(for: message)
+        let bodyReference = try contextBodyStore.retain(
+            body, authority: sessionJournal,
+            mediaType: "application/vnd.aviary.chat-message+json")
+        let text = message.content.compactMap { content -> String? in
+            guard case .text(let value) = content else { return nil }
+            return value
+        }.joined()
+        let contentKinds = message.content.map { content -> JSONValue in
+            switch content {
+            case .text: return .string("text")
+            case .thinking: return .string("thinking")
+            case .toolCall: return .string("tool_call")
+            case .toolResult: return .string("tool_result")
+            case .image: return .string("image")
+            }
+        }
         let message = try await appendSession(TimelineEventDraft(
             hostSequence: nextHostOrder(), conversationParent: lastMessage,
             session: session, run: activeRun,
             type: TimelineEventType.messageCommitted, declaredDomains: [.session],
-            payload: .object(["role": .string("assistant"), "text": .string(text)])))
+            payload: .object([
+                "role": .string("assistant"), "text": .string(text),
+                "content_kinds": .array(contentKinds),
+                "message_body_ref": encodeTimelineValue(bodyReference),
+            ])))
         lastMessage = message.eventRef
         let tip = try await appendSession(TimelineEventDraft(
             hostSequence: nextHostOrder(), causedByEventID: message.eventRef,

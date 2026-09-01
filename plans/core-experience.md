@@ -84,19 +84,34 @@ Work/Work Host/Run provenance validation. Manifest or Work-action failure return
 Reducers and Reader Census retain the latest complete manifest without copying bodies or inspecting
 Python `repr` values.
 
+Native cold resume now captures an immutable replay seed while the canonical Session/Work pair is
+locked and before the replacement Start command can append its prompt. The seed requires exact
+Session and Work tip cursors, the mirrored attachment at that Work tip, a causally linked and
+terminal ordinary provider action, every retained message and tool-schema body, and a complete
+sendable conversation tail. It rejects compaction-provider boundaries, unknown body media, missing
+or corrupt bodies, stale or tailed reads, unrepresented post-boundary actions, dangling tool calls,
+and text-only assistant rows that cannot prove tool-call absence. Native authority never silently
+falls back to the legacy transcript. The replacement Run records the six-plane recovery matrix;
+the runner restores retained pinned instructions, verifies the live tool schemas before the first
+provider call, uses a fresh Python namespace, and reports Futures/Handles as lost and repository,
+artifact/memory, and external-effect coverage as unknown. Structured assistant bodies are retained
+before their Session events, while tool-only assistant events remain in model history without
+creating an empty visible chat row.
+
 The Apple Swift 6.3.3 compiler accepts the SDK emitted by Apple Swift 6.3.2; the compatibility probe
 configures its own writable module cache and succeeds both directly and through every gate. At this
-checkpoint, the full suite passes 400 cases / 3,559 assertions in 45.20 seconds and `just compile`
-is clean. Phase 1 passes 109 cases / 1,630 assertions. The versioned 100,000-event benchmark reads
-and reduces a 46,766,700-byte input in 5.588 seconds on the checkpoint machine (generation 0.899
+checkpoint, the full suite passes 408 cases / 3,631 assertions in 45.92 seconds and `just compile`
+is clean. Phase 1 passes 117 cases / 1,702 assertions. The versioned 100,000-event benchmark reads
+and reduces a 46,766,700-byte input in 5.558 seconds on the checkpoint machine (generation 0.869
 seconds). The last visual gate before this nonvisual producer slice rendered all 8 canonical screens.
-Final Sol review found no remaining must-fix issue after body durability, cumulative restoration,
-live/cold manifest parity, and Flock child-ownership findings were remediated.
+Final Sol review found no remaining must-fix issue after exact cursor/attachment authority,
+provider-action causality, exhaustive retained-body decoding, structured assistant replay, and
+pre-Start capture/cleanup findings were remediated.
 
 Phase 0 still owes real VoiceOver/keyboard UI automation and broader driver focus/race proof. Phase 1
 still owes canonical consumer migrations; decomposing flattened system-prompt sources and preserving
-their event provenance; native cold resume from the retained context snapshot; independent native
-Work bundles for children; actual disk-full and permission fault reachability; and a measured
+their event provenance; independent native Work bundles for children; actual disk-full and
+permission fault reachability; and a measured
 peak-RSS budget. The semantic component measure is deliberately not claimed to be provider-specific
 HTTP wire size. The 100,000-event benchmark fixes an encoded-input and read/reduce baseline, but does
 not claim incremental rendering or bounded peak memory. The out-of-process Work Host,
