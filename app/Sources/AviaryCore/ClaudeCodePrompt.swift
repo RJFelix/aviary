@@ -9,7 +9,10 @@ import Foundation
 /// their absence. So this says plainly that there is one tool, that it is a real interpreter,
 /// and that the interpreter is how you do the things those tools would have done.
 public enum ClaudeCodePrompt {
-    public static func build(cwd: String, skills: String = "", memory: String = "") -> String {
+    public static func build(
+        cwd: String, skills: String = "", memory: String = "",
+        includeContextFiles: Bool = true
+    ) -> String {
         var lines = [
             "You are a coding agent working in \(cwd) on a macOS machine.",
             "",
@@ -42,7 +45,7 @@ public enum ClaudeCodePrompt {
         // discovery — which `--setting-sources ""` switches off, and deliberately: that
         // mechanism also pulls in the *developer's* global CLAUDE.md, plugins and connectors,
         // which is 80k+ tokens of somebody else's environment.
-        for name in ["AGENTS.md", "CLAUDE.md"] {
+        for name in includeContextFiles ? ["AGENTS.md", "CLAUDE.md"] : [] {
             let url = URL(fileURLWithPath: cwd).appending(path: name)
             if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
                 lines.append("")

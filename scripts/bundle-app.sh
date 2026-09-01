@@ -16,6 +16,12 @@ APP_DIR="$ROOT/build/Aviary.app"
 BIN_NAME="Aviary"
 BUNDLE_ID="works.duckbill.aviary"
 VERSION="0.1.0"
+MODULE_CACHE="$ROOT/app/.build/module-cache"
+
+"$ROOT/scripts/check-swift-toolchain.sh"
+mkdir -p "$MODULE_CACHE"
+export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE"
+export SWIFT_MODULECACHE_PATH="$MODULE_CACHE"
 
 echo "==> Building ($CONFIG)"
 cd "$ROOT/app"

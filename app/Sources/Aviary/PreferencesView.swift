@@ -111,9 +111,9 @@ struct PreferencesView: View {
     private var defaultsTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                Card("Written to the harness's settings.json", symbol: "doc.badge.gearshape") {
+                Card("Written to Aviary's settings.json", symbol: "doc.badge.gearshape") {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("These are the harness's own defaults, shared with the CLI. "
+                        Text("These defaults are shared with Aviary's command-line agent. "
                             + "Aviary edits the file in place and preserves every key it does "
                             + "not manage.")
                             .font(.system(size: 11)).foregroundStyle(.secondary)
@@ -227,8 +227,7 @@ struct PreferencesView: View {
                                     key: "hideThinkingBlock", value: .bool(newValue))
                                 model.settings = .load(home: model.home)
                             }))
-                        Text("Shared with the harness's own `hideThinkingBlock` setting, so the "
-                            + "TUI and Aviary agree.")
+                        Text("Stored as `hideThinkingBlock` so historical and live readers agree.")
                             .font(.system(size: 10)).foregroundStyle(.tertiary)
                         Divider().opacity(0.5)
                         Toggle("Show the inspector pane", isOn: Binding(
@@ -308,7 +307,9 @@ struct PreferencesView: View {
                         + "injection framework, and there is no Xcode here to hang one off. "
                         + "What makes it feel like a reload instead of a restart is that the "
                         + "build has already happened and the app comes back on the screen "
-                        + "you were on, with the workshop agent reattached.")
+                        + "you were on. The workshop conversation reopens in a new runtime; "
+                        + "Claude Code starts a fresh driven session rather than reattaching "
+                        + "its prior process.")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -328,17 +329,17 @@ struct PreferencesView: View {
                         .foregroundStyle(Design.accent)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Aviary").font(.system(size: 21, weight: .semibold))
-                        Text("A native macOS front end for the Prime Agent harness")
+                        Text("A native workspace for capable local agents")
                             .font(.system(size: 11.5)).foregroundStyle(.secondary)
                     }
                 }
 
                 Card("How it fits together", symbol: "square.stack.3d.up") {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Aviary reads the harness's state directly — transcripts, the "
-                            + "spawn ledger, worker descriptors, models.json — and drives live "
-                            + "runs over the harness's documented RPC protocol. There is no "
-                            + "bridge service and no port to keep alive.")
+                        Text("Aviary owns its session journals, model catalog, Python runtime "
+                            + "hosts, and in-house agent loop. Claude Code can also drive the "
+                            + "same runtime. Work is currently held by this app process; the "
+                            + "planned Work Host split will make that ownership independent.")
                             .font(.system(size: 11.5))
                             .fixedSize(horizontal: false, vertical: true)
                         Divider().opacity(0.5)
@@ -361,6 +362,14 @@ struct PreferencesView: View {
                         bullet("Backs up models.json before every write.")
                         bullet("Moves deleted sessions to the Trash; never unlinks a transcript.")
                     }
+                }
+
+                Card("Trust model", symbol: "exclamationmark.shield") {
+                    Text("Agent Python is intentionally full capability: it can affect files, "
+                        + "processes, sockets, and networks directly. Tool hooks can review or "
+                        + "rewrite named calls, but they are not a complete sandbox boundary.")
+                        .font(.system(size: 11.5))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(14)

@@ -25,6 +25,7 @@ struct SessionsView: View {
 
     enum Filter: String, CaseIterable {
         case all = "All"
+        case archived = "Archived"
         case live = "Live"
         case substantial = "Substantial"
         case withSubagents = "Fan-outs"
@@ -70,7 +71,8 @@ struct SessionsView: View {
                 Task { await model.trashSelectedSessions() }
             }
         } message: {
-            Text("The selected transcripts and their artifacts move to macOS Trash. They are not permanently deleted.")
+            Text("Aviary will move each selected transcript and its artifacts to macOS Trash. "
+                + "Any partial failure is reported; nothing is permanently deleted.")
         }
     }
 
@@ -147,7 +149,7 @@ struct SessionsView: View {
                 // A Set binding is the native macOS multi-selection contract: Shift selects
                 // a range and Command adds/removes rows. Keep the focused transcript separate
                 // so selecting a batch never starts several expensive transcript reads.
-                List(selection: Binding(
+                    List(selection: Binding(
                     get: { model.selectedSessionIDs },
                     set: { ids in
                         selectedItem = nil
@@ -155,7 +157,9 @@ struct SessionsView: View {
                     }))
                 {
                     ForEach(rows) { s in
-                        SessionRow(session: s)
+                        SessionRow(
+                            session: s,
+                            canonical: model.canonicalCatalogProjections[s.id])
                             .tag(s.id)
                             .contextMenu { contextMenu(for: s) }
                     }
@@ -169,7 +173,9 @@ struct SessionsView: View {
 
     private var selectionActions: some View {
         let selected = model.selectedSessions
-        let containsLive = selected.contains(where: \.isLive)
+        let containsLive = selected.contains {
+            $0.isCanonicalOnly || $0.isLive || model.hasLiveWork(forSession: $0.id)
+        }
         return HStack(spacing: 6) {
             Label("\(selected.count) selected", systemImage: "checkmark.circle.fill")
                 .font(.system(size: 10.5, weight: .medium))
@@ -178,15 +184,23 @@ struct SessionsView: View {
             Menu {
                 Button("Copy session IDs") { copySessionIDs(selected) }
                 Button("Reveal transcripts in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting(selected.map(\.fileURL))
+                    NSWorkspace.shared.activateFileViewerSelecting(
+                        selected.compactMap(\.fileURL))
                 }
+                .disabled(selected.allSatisfy(\.isCanonicalOnly))
                 Divider()
+                let allArchived = selected.allSatisfy(\.isArchived)
+                Button(allArchived ? "Restore from Archive" : "Archive selected") {
+                    Task { await model.setSessionsArchived(selected, archived: !allArchived) }
+                }
+                .disabled(model.isArchivingSessions || selected.contains(where: \.isCanonicalOnly))
                 Button("Move \(selected.count) to Trash…", role: .destructive) {
                     confirmTrashSelection = true
                 }
                 .disabled(containsLive || model.isTrashingSessions)
                 if containsLive {
-                    Text("Deselect live sessions before moving this selection to the Trash.")
+                    Text("Native canonical rows are observe-only; deselect them and any live "
+                        + "sessions before moving legacy transcripts to the Trash.")
                 }
             } label: {
                 Label("Actions", systemImage: "ellipsis.circle")
@@ -208,19 +222,47 @@ struct SessionsView: View {
     private var rows: [SessionSummary] {
         var out = model.filteredSessions
         switch filter {
-        case .all: break
-        case .live: out = out.filter(\.isLive)
+        case .all: out = out.filter { !$0.isArchived }
+        case .archived: out = out.filter(\.isArchived)
+        case .live:
+            // A canonical row is live only when its aligned Work projection proves that fact.
+            // Invalid/missing canonical state remains unknown and must not be treated as idle
+            // (or silently promoted into this filter) from compatibility sentinels.
+            out = out.filter { session in
+                guard let canonical = model.canonicalCatalogProjections[session.id] else {
+                    return session.isLive
+                }
+                guard canonical.sessionStructuralIntegrityValid,
+                      canonical.sessionSemanticProjectionValid
+                else { return false }
+                return canonical.work.contains {
+                    $0.canProjectExecution && $0.lifecycle == .active
+                }
+            }
         case .substantial: out = out.filter(\.isSubstantial)
         case .withSubagents: out = out.filter { $0.childCount > 0 }
         case .errors: out = out.filter { $0.counts.toolErrors > 0 }
         }
         switch sortOrder {
-        case .recent: out.sort { $0.updatedAt > $1.updatedAt }
-        case .tokens: out.sort { $0.usage.totalTokens > $1.usage.totalTokens }
-        case .cost: out.sort { $0.usage.cost.total > $1.usage.cost.total }
-        case .length: out.sort { $0.counts.assistant > $1.counts.assistant }
+        case .recent: out.sort {
+            if $0.isCanonicalOnly != $1.isCanonicalOnly { return !$0.isCanonicalOnly }
+            return $0.updatedAt > $1.updatedAt
+        }
+        case .tokens: out.sort {
+            if $0.isCanonicalOnly != $1.isCanonicalOnly { return !$0.isCanonicalOnly }
+            return $0.usage.totalTokens > $1.usage.totalTokens
+        }
+        case .cost: out.sort {
+            if $0.isCanonicalOnly != $1.isCanonicalOnly { return !$0.isCanonicalOnly }
+            return $0.usage.cost.total > $1.usage.cost.total
+        }
+        case .length: out.sort {
+            if $0.isCanonicalOnly != $1.isCanonicalOnly { return !$0.isCanonicalOnly }
+            return $0.counts.assistant > $1.counts.assistant
+        }
         case .project: out.sort {
-            ($0.projectName, $1.updatedAt) < ($1.projectName, $0.updatedAt) }
+            if $0.isCanonicalOnly != $1.isCanonicalOnly { return !$0.isCanonicalOnly }
+            return ($0.projectName, $1.updatedAt) < ($1.projectName, $0.updatedAt) }
         }
         return out
     }
@@ -228,11 +270,15 @@ struct SessionsView: View {
     @ViewBuilder
     private func contextMenu(for s: SessionSummary) -> some View {
         Button("Reveal transcript in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting([s.fileURL])
+            if let url = s.fileURL {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            }
         }
+        .disabled(s.isCanonicalOnly)
         Button("Open working directory") {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: s.cwd)])
         }
+        .disabled(s.isCanonicalOnly || s.cwd.isEmpty)
         Button("Copy session id") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(s.id, forType: .string)
@@ -246,11 +292,16 @@ struct SessionsView: View {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(command, forType: .string)
         }
+        .disabled(s.isCanonicalOnly)
         Divider()
         Button("Continue this session in a new run") {
             model.continueSession(s)
         }
-        .disabled(s.isLive)
+        .disabled(s.isCanonicalOnly || s.isLive || model.hasLiveWork(forSession: s.id))
+        Button(s.isArchived ? "Restore from Archive" : "Archive session") {
+            Task { await model.setSessionsArchived([s], archived: !s.isArchived) }
+        }
+        .disabled(model.isArchivingSessions || s.isCanonicalOnly)
         Divider()
         let targets = model.selectedSessionIDs.contains(s.id) ? model.selectedSessions : [s]
         Button(targets.count == 1 ? "Move to Trash…" : "Move \(targets.count) selected to Trash…",
@@ -262,7 +313,11 @@ struct SessionsView: View {
             }
             confirmTrashSelection = true
         }
-        .disabled(targets.contains(where: \.isLive) || model.isTrashingSessions)
+        .disabled(
+            targets.contains {
+                $0.isCanonicalOnly || $0.isLive || model.hasLiveWork(forSession: $0.id)
+            }
+                || model.isTrashingSessions)
     }
 
     // MARK: Transcript
@@ -286,12 +341,18 @@ struct SessionsView: View {
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let selected = model.selectedSession, selected.isCanonicalOnly {
+                EmptyStateView(
+                    symbol: "point.3.connected.trianglepath.dotted",
+                    title: "Canonical session selected",
+                    message: "This row is backed by an authority-qualified projection. Its "
+                        + "legacy transcript and runtime context are not available in this GUI.")
             } else {
                 EmptyStateView(
                     symbol: "bubble.left.and.text.bubble.right",
                     title: "Pick a session",
                     message: "Aviary reads the transcript files directly, so this works even "
-                        + "when the background service is down.")
+                        + "when no Work is currently running.")
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) { transcriptSearchBar }
@@ -353,6 +414,13 @@ struct TranscriptHeader: View {
                     Chip(text: state,
                          tint: state == "active" ? Design.success : .secondary)
                 }
+                if let outcome = transcript.outcome {
+                    Chip(
+                        text: outcome.state.rawValue,
+                        symbol: outcome.state == .failed
+                            ? "exclamationmark.triangle.fill" : "stop.circle.fill",
+                        tint: outcome.state == .failed ? Design.danger : Design.warning)
+                }
                 if model.selectedSession?.isBusy == true {
                     HStack(spacing: 4) {
                         PulseDot()
@@ -364,7 +432,7 @@ struct TranscriptHeader: View {
                 if transcript.unparsedLines > 0 {
                     Chip(text: "\(transcript.unparsedLines) unreadable lines",
                          symbol: "exclamationmark.triangle", tint: Design.warning)
-                        .help("Aviary could not parse these entries — likely a harness format "
+                        .help("Aviary could not parse these entries — likely a session format "
                             + "change. Everything else rendered normally.")
                 }
             }
@@ -374,6 +442,13 @@ struct TranscriptHeader: View {
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+            }
+
+            if let outcome = transcript.outcome, let detail = outcome.detail, !detail.isEmpty {
+                NoticeBanner(
+                    level: outcome.state == .failed ? .danger : .warning,
+                    title: outcome.state == .failed ? "Run failed" : "Run cancelled",
+                    message: detail)
             }
 
             HStack(spacing: 5) {
@@ -431,13 +506,20 @@ struct SessionInspector: View {
                     itemCard(item)
                 }
                 if let s = model.selectedSession {
-                    sessionCard(s)
-                    usageCard(s)
+                    if s.isCanonicalOnly,
+                       let canonical = model.canonicalCatalogProjections[s.id] {
+                        canonicalSessionCard(canonical)
+                    } else {
+                        sessionCard(s)
+                        usageCard(s)
+                    }
                 }
                 if let t = model.transcript {
                     if !t.modelChanges.isEmpty { modelChangesCard(t) }
                 }
-                wireCard
+                if model.selectedSession?.isCanonicalOnly != true {
+                    wireCard
+                }
                 if let kernel = model.kernelState {
                     kernelCard(kernel)
                 }
@@ -541,7 +623,7 @@ struct SessionInspector: View {
             .sheet(isPresented: $showRaw) {
                 RawPayloadSheet(records: model.selectedSessionWire)
             }
-        } else if let session = model.selectedSession {
+        } else if let session = model.selectedSession, !session.isCanonicalOnly {
             Card("What was sent", symbol: "arrow.up.doc") {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("No provider payloads were recorded for this session, so its input "
@@ -558,12 +640,12 @@ struct SessionInspector: View {
                             .font(.system(size: 11))
                     }
                     .buttonStyle(.bordered).controlSize(.small)
-                    .disabled(session.isLive
+                    .disabled((session.isLive || model.hasLiveWork(forSession: session.id))
                         || (!model.preferInHouseEngine
                             && EngineLocator.wireLogExtension() == nil))
-                    Text("Resumes this session in a new run with recording on. The next turn's "
-                        + "payload will include the same system prompt and context this "
-                        + "session has been using.")
+                    Text("Replays this conversation in a new runtime with recording on. The next "
+                        + "turn records a newly assembled payload from current instructions, "
+                        + "context files, memory, skills, and tools.")
                         .font(.system(size: 9.5)).foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -644,15 +726,70 @@ struct SessionInspector: View {
                 Divider().opacity(0.5)
                 HStack(spacing: 10) {
                     Button("Reveal") {
-                        NSWorkspace.shared.activateFileViewerSelecting([s.fileURL])
+                        if let url = s.fileURL {
+                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                        }
                     }
                     .buttonStyle(.link).font(.system(size: 10.5))
+                    .disabled(s.isCanonicalOnly)
                     Button("Continue") {
                         model.continueSession(s)
                     }
                     .buttonStyle(.link).font(.system(size: 10.5))
-                    .disabled(s.isLive)
+                    .disabled(s.isCanonicalOnly || s.isLive || model.hasLiveWork(forSession: s.id))
                     Spacer()
+                }
+            }
+        }
+    }
+
+    private func canonicalSessionCard(_ c: CanonicalSessionCatalogSummary) -> some View {
+        Card("Canonical session", symbol: "point.3.connected.trianglepath.dotted") {
+            VStack(alignment: .leading, spacing: 6) {
+                DetailRow(label: "Identity", value: c.id, mono: true)
+                DetailRow(label: "Lifecycle", value: c.lifecycle.rawValue)
+                DetailRow(label: "Attention", value: c.effectiveAttention?.rawValue ?? "unknown")
+                DetailRow(label: "Model", value: c.modelIDs.isEmpty
+                          ? "unknown" : c.modelIDs.joined(separator: ", "))
+                Divider().opacity(0.5)
+                Text("Work projection")
+                    .font(.system(size: 11, weight: .semibold))
+                if c.work.isEmpty {
+                    DetailRow(label: "Status", value: c.sessionSemanticProjectionValid
+                              ? "no attached Work" : "unknown (legacy semantics)")
+                    DetailRow(label: "Liveness", value: c.sessionSemanticProjectionValid
+                              ? "not running" : "unknown")
+                } else {
+                    let exact = c.work.filter(\.canProjectExecution)
+                    DetailRow(
+                        label: "Liveness",
+                        value: exact.isEmpty ? "unknown" : (exact.contains {
+                            $0.lifecycle == .active
+                        } ? "active" : "not active"))
+                    ForEach(c.work) { work in
+                        VStack(alignment: .leading, spacing: 2) {
+                            DetailRow(label: "Host", value: work.workHost.workHostID, mono: true)
+                            DetailRow(label: "Availability",
+                                      value: work.canProjectExecution && work.isAvailable
+                                          ? "available" : "unknown")
+                            DetailRow(label: "Execution",
+                                      value: work.canProjectExecution
+                                          ? work.execution.rawValue : "unknown")
+                        }
+                    }
+                }
+                if !c.unknownDomains.isEmpty {
+                    Text("Unknown domains: "
+                        + c.unknownDomains.map(\.rawValue).sorted().joined(separator: ", "))
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !c.corruptionReasons.isEmpty {
+                    Text(c.corruptionReasons.joined(separator: "\n"))
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(Design.warning)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
@@ -714,8 +851,8 @@ struct SessionInspector: View {
     private func kernelCard(_ kernel: KernelState) -> some View {
         Card("IPython kernel", symbol: "cube.fill") {
             VStack(alignment: .leading, spacing: 6) {
-                Text("The harness's only tool is a Python kernel, so this namespace is the "
-                    + "agent's working memory.")
+                Text("Aviary's agent works through a Python runtime, so this namespace is "
+                    + "part of its accessible working state.")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)

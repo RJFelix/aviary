@@ -17,10 +17,12 @@ public actor ClaudeCodeKernel {
     /// compiling, but every real one passes it — a driven run that cannot write a document is
     /// a driven run that is not an Aviary session.
     private let artifacts: ArtifactStore?
+    private let writer: SessionWriter?
     /// How a note reaches the transcript. The writer belongs to `ClaudeCodeRun`, which is
     /// constructed first and owns the file; the kernel produces events worth recording and has
     /// no business opening a second handle onto the same JSONL.
-    private var appendNote: (@Sendable (String, String) async -> Void)?
+    private var appendNote: (@Sendable (String, String) async -> Bool)?
+    private var onJournalFailure: (@Sendable (String) async -> Void)?
     /// The first prompt of the run, recorded as provenance on anything remembered — "why does
     /// it believe that?" is unanswerable without it.
     private var firstPrompt: String?
@@ -32,7 +34,8 @@ public actor ClaudeCodeKernel {
 
     public init(
         host: RuntimeHost, hostSession: String, memory: MemoryStore?,
-        sessionFile: URL, sessionID: String, artifacts: ArtifactStore? = nil
+        sessionFile: URL, sessionID: String, artifacts: ArtifactStore? = nil,
+        writer: SessionWriter? = nil
     ) {
         self.host = host
         self.hostSession = hostSession
@@ -40,11 +43,28 @@ public actor ClaudeCodeKernel {
         self.sessionFile = sessionFile
         self.sessionID = sessionID
         self.artifacts = artifacts
+        self.writer = writer
     }
 
     /// Wire the kernel's notes into the run's transcript.
     public func onNote(_ handler: (@Sendable (String, String) async -> Void)?) {
+        guard let handler else {
+            appendNote = nil
+            return
+        }
+        let checked: @Sendable (String, String) async -> Bool = { text, customType in
+            await handler(text, customType)
+            return true
+        }
+        appendNote = checked
+    }
+
+    public func onCheckedNote(_ handler: (@Sendable (String, String) async -> Bool)?) {
         appendNote = handler
+    }
+
+    public func onJournalFailure(_ handler: (@Sendable (String) async -> Void)?) {
+        onJournalFailure = handler
     }
 
     public func noteFirstPrompt(_ prompt: String) {
@@ -94,6 +114,10 @@ public actor ClaudeCodeKernel {
             return KernelBridge.Result(
                 text: "The `code` argument is required and must not be empty.", isError: true)
         }
+        guard await checkWriter() else {
+            return KernelBridge.Result(
+                text: "The Aviary session journal is unavailable; stop this run.", isError: true)
+        }
         do {
             let result = try await host.execute(code, in: hostSession)
             hostFailures = 0
@@ -134,6 +158,14 @@ public actor ClaudeCodeKernel {
         }
     }
 
+    private func checkWriter() async -> Bool {
+        guard let writer else { return true }
+        if case .healthy = await writer.writerHealth { return true }
+        let detail = "The Aviary session journal became unavailable."
+        await onJournalFailure?(detail)
+        return false
+    }
+
     /// Serve a callback from inside the kernel — `remember`, `recall`, `conversation`,
     /// `artifact`.
     ///
@@ -142,6 +174,10 @@ public actor ClaudeCodeKernel {
     /// a reason rather than silently absent, because agent code that calls `spawn()` and hangs
     /// is worse than agent code that is told no.
     public func serveCallback(kind: String, payload: JSONValue) async -> JSONValue {
+        guard await checkWriter() else {
+            return .object(["error": .string(
+                "The Aviary session journal is unavailable; stop this run.")])
+        }
         switch kind {
         case "attach_image":
             guard let path = payload["path"]?.stringValue, !path.isEmpty else {
@@ -150,10 +186,13 @@ public actor ClaudeCodeKernel {
             do {
                 let image = try AttachedImage.read(path: path)
                 pendingImages.append(image)
-                await appendNote?(
+                if let ok = await appendNote?(
                     "Looked at \(URL(fileURLWithPath: image.path).lastPathComponent) "
                         + "(\(image.width)×\(image.height))",
-                    "aviary.image")
+                    "aviary.image"), !ok
+                {
+                    await onJournalFailure?("could not record attached image")
+                }
                 return image.summary
             } catch {
                 return .object(["error": .string(error.localizedDescription)])
@@ -217,7 +256,9 @@ public actor ClaudeCodeKernel {
                     text: payload["text"]?.stringValue ?? "",
                     title: payload["title"]?.stringValue,
                     format: payload["format"]?.stringValue ?? "md")
-                await appendNote?(written.note.text, ArtifactNote.customType)
+                if let ok = await appendNote?(written.note.text, ArtifactNote.customType), !ok {
+                    await onJournalFailure?("could not record artifact")
+                }
                 return written.payload
             } catch {
                 return .object(["error": .string(error.localizedDescription)])

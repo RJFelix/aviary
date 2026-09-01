@@ -131,7 +131,13 @@ public enum WireLog {
     }
 
     public static func path(forRun id: UUID) -> URL {
-        directory.appending(path: "run-\(id.uuidString).jsonl")
+        path(forRun: id.uuidString)
+    }
+
+    /// Stable path for the run identity carried by the session. The UUID overload remains for
+    /// legacy callers, while new runs keep the same run id in their wire-log filename.
+    public static func path(forRun id: String) -> URL {
+        directory.appending(path: "run-\(id).jsonl")
     }
 
     /// Maps recorded logs to the sessions they belong to.

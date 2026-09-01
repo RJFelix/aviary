@@ -14,6 +14,8 @@ public actor AgentRunner {
         public var cwd: String
         public var model: ModelSpec
         public var systemPrompt: String
+        /// The user-selected reasoning level for provider routes that support it.
+        public var reasoningEffort: String?
         public var maxDepth: Int
         public var maxIterations: Int
         /// Children get a tighter ceiling than their parent. A delegated task is meant to be
@@ -33,6 +35,13 @@ public actor AgentRunner {
         /// An existing session id to continue. The run appends to that transcript and picks up
         /// its conversation; nil starts a new session.
         public var resume: String?
+        /// Preallocated identity bundle. Nil keeps existing callers source-compatible; prepare()
+        /// resolves it before creating a runtime session.
+        public var identity: SessionWorkIdentity?
+        /// The exact journal opened by the launch boundary. Supplying it is what makes the
+        /// writer-before-runtime ordering enforceable: the runner must never silently open a
+        /// second handle for the same Work.
+        public var writer: SessionWriter?
 
         /// Who else is running, supplied by the app. Nil in a CLI run, where the two peer
         /// builtins are then not bound at all — which is right: there is nobody else there.
@@ -47,7 +56,10 @@ public actor AgentRunner {
             memory: MemoryStore? = nil, recordPayloads: Bool = false, goal: Goal? = nil,
             hookPaths: [String] = [], resume: String? = nil,
             peerDelegate: Agent.PeerDelegate? = nil,
-            selfDelegate: Agent.SelfDelegate? = nil
+            selfDelegate: Agent.SelfDelegate? = nil,
+            identity: SessionWorkIdentity? = nil,
+            reasoningEffort: String? = nil,
+            writer: SessionWriter? = nil
         ) {
             self.peerDelegate = peerDelegate
             self.selfDelegate = selfDelegate
@@ -55,6 +67,7 @@ public actor AgentRunner {
             self.cwd = cwd
             self.model = model
             self.systemPrompt = systemPrompt
+            self.reasoningEffort = reasoningEffort
             self.maxDepth = maxDepth
             self.maxIterations = maxIterations
             self.childMaxIterations = childMaxIterations
@@ -63,6 +76,8 @@ public actor AgentRunner {
             self.goal = goal
             self.hookPaths = hookPaths
             self.resume = resume
+            self.identity = identity
+            self.writer = writer
         }
     }
 
@@ -93,6 +108,10 @@ public actor AgentRunner {
 
     /// Live MCP servers, held so they can be stopped with the run that started them.
     private var mcpClients: [MCPClient] = []
+    /// Once teardown starts, no callback may admit another background child while the actor is
+    /// re-entered awaiting existing child tasks. This remains closed for the lifetime of the
+    /// runner, which is also the lifetime of its host resources.
+    private var backgroundAdmissionClosed = false
 
     struct MCPReport {
         var client: MCPClient?
@@ -119,14 +138,16 @@ public actor AgentRunner {
                 let tools = try await client.start()
                 mcpClients.append(client)
                 let era = await client.era
-                reports.append(MCPReport(
+                reports.append(
+                    MCPReport(
                     client: client, tools: tools,
                     note: "MCP · \(server.name): \(tools.count) tool(s) over "
                         + "\(era?.label ?? "an unknown protocol")"))
             } catch {
                 await client.stop()
                 let diagnostics = await client.diagnostics
-                reports.append(MCPReport(
+                reports.append(
+                    MCPReport(
                     client: nil, tools: [],
                     note: "MCP · \(server.name) did not start: \(error.localizedDescription)"
                         + (diagnostics.isEmpty ? "" : "\n" + String(diagnostics.suffix(400)))))
@@ -137,7 +158,11 @@ public actor AgentRunner {
 
     /// Stop the servers this run started.
     public func stopMCPServers() async {
-        stopBackgroundChildren()
+        // Children are part of the run's effect lifetime too. Cancelling the unstructured Task
+        // without awaiting it lets a provider/tool call continue while the host and its MCP
+        // clients are being dismantled. End must not be published until every child has
+        // observed cancellation and returned.
+        await stopBackgroundChildren()
         let clients = mcpClients
         mcpClients.removeAll()
         for client in clients { await client.stop() }
@@ -155,20 +180,60 @@ public actor AgentRunner {
     /// there and then waits for what you want to say next, which is not the same as sending an
     /// empty prompt — an empty user turn is a real turn, and some routes reject it.
     public func prepare() async throws -> (writer: SessionWriter, agent: Agent) {
-        let hostSession = try await host.createSession(cwd: settings.cwd)
-
-        // Replay before opening the writer, so a session that cannot be read does not leave a
-        // `model_change` appended to it.
-        var replay = SessionReplay()
+        // Resolve once, before the runtime/provider boundary. Legacy headers supply the Work
+        // identity when available; otherwise this home owns a durable host id and gets a
+        // deterministic legacy Work id for the resumed session.
+        let identity =
+            settings.identity
+            ?? settings.resume.flatMap {
+                SessionWriter.recoverIdentity(home: settings.home, sessionID: $0)
+            }
+            ?? SessionWorkIdentity.allocate(
+                workHostID: settings.home.workHostID,
+                sessionID: settings.resume ?? SessionWriter.newSessionID())
+        // A cold resume reuses the durable session/Work identity but must not claim the old
+        // Python namespace. The same RuntimeHost may still hold the live namespace from the
+        // previous run, and `session.create` correctly rejects reopening it. A fresh runtime
+        // id per run makes the survival boundary explicit: only a deliberate live-host
+        // reattach may reuse `identity.workID`.
+        // Open or adopt the journal before creating a runtime session. A runtime namespace is
+        // an external effect; if the durable antecedent cannot be established, no Python work
+        // may become reachable.
         let writer: SessionWriter
-        if let resume = settings.resume {
-            replay = SessionResume.replay(fileURL: settings.home.sessionFile(id: resume))
-                ?? SessionReplay()
+        if let supplied = settings.writer {
+            writer = supplied
+        } else if let resume = settings.resume {
             writer = try SessionWriter(
-                home: settings.home, resuming: resume, cwd: settings.cwd, model: settings.model)
+                home: settings.home, resuming: resume, cwd: settings.cwd,
+                model: settings.model, identity: identity)
         } else {
             writer = try SessionWriter(
-                home: settings.home, cwd: settings.cwd, model: settings.model)
+                home: settings.home, cwd: settings.cwd, model: settings.model,
+                identity: identity)
+        }
+
+        let runtimeSessionID =
+            settings.resume == nil
+            ? identity.workID
+            : identity.workID + "-run-" + identity.runID
+
+        // Every operation after the journal open is covered by one cleanup boundary. A failed
+        // replay/runtime/agent assembly must not leave an invisible Python namespace behind.
+        let writerForCleanup: SessionWriter? = writer
+        var hostSessionForCleanup: String?
+        do {
+        guard case .healthy = await writer.writerHealth else {
+            throw SessionWriter.WriterError.unavailable("The session journal is unavailable.")
+        }
+        let hostSession = try await host.createSession(id: runtimeSessionID, cwd: settings.cwd)
+        hostSessionForCleanup = hostSession
+        // Replay is read-only and happens after the writer is reserved, so every subsequent
+        // runtime/provider/MCP effect has one exact durable antecedent.
+        var replay = SessionReplay()
+        if let resume = settings.resume {
+                replay =
+                    SessionResume.replay(fileURL: settings.home.sessionFile(id: resume))
+                    ?? SessionReplay()
         }
 
         let agent = Agent(
@@ -176,6 +241,7 @@ public actor AgentRunner {
             config: .init(
                 model: settings.model, cwd: settings.cwd, systemPrompt: settings.systemPrompt,
                 maxIterations: settings.maxIterations, maxTokens: settings.model.maxTokens,
+                    reasoningEffort: settings.reasoningEffort,
                 maxDepth: settings.maxDepth, depth: 0, goal: settings.goal,
                 resumedHistory: replay.messages))
 
@@ -196,7 +262,7 @@ public actor AgentRunner {
             // silently absent and deliberately doing nothing are indistinguishable, and the
             // difference matters when the hook was supposed to be blocking something.
             for failure in result?.failed ?? [] {
-                try? await writer.appendNote(
+                try await writer.appendNote(
                     "A hook failed to load: \(failure.path)\n\(failure.detail)",
                     customType: "aviary.hook")
             }
@@ -205,14 +271,14 @@ public actor AgentRunner {
             }
         }
         if settings.recordPayloads {
-            await agent.recordPayloads(to: WireLog.path(forRun: UUID()))
+                await agent.recordPayloads(to: WireLog.path(forRun: identity.runID))
         }
 
         // MCP servers from settings.json. Started here rather than at app launch because a
         // server is a child process holding credentials, and the honest lifetime for that is
         // the run that asked for it.
         for report in await startMCPServers() {
-            try? await writer.appendNote(report.note, customType: "aviary.mcp")
+            try await writer.appendNote(report.note, customType: "aviary.mcp")
             if let client = report.client, !report.tools.isEmpty {
                 await agent.addMCPTools(report.tools, from: client)
             }
@@ -220,7 +286,7 @@ public actor AgentRunner {
 
         // Route the runtime's callbacks to this agent. One host serves many sessions, so the
         // handler dispatches on the host-session id rather than assuming a single agent.
-        await register(hostSession: hostSession, agent: agent)
+            register(hostSession: hostSession, agent: agent)
         await installCallbackHandler()
 
         // Recorded in the transcript, not just shown once in the UI: a resumed run whose
@@ -231,10 +297,18 @@ public actor AgentRunner {
             if replay.messages.isEmpty {
                 note = "Resumed, but no prior conversation could be replayed from this session."
             }
-            try? await writer.appendNote(note, customType: "aviary.resume")
+            try await writer.appendNote(note, customType: "aviary.resume")
         }
 
         return (writer, agent)
+        } catch {
+            await writerForCleanup?.close()
+            await stopMCPServers()
+            if let hostSessionForCleanup {
+                await host.destroySessionQuietly(hostSessionForCleanup)
+            }
+            throw error
+        }
     }
 
     // MARK: Callback routing
@@ -287,6 +361,12 @@ public actor AgentRunner {
     ) -> (childID: String, name: String) {
         let childID = SubAgentRecorder.newChildID()
         let label = name ?? childID
+        guard !backgroundAdmissionClosed else {
+            background[childID] = Agent.ChildStatus(
+                id: childID, name: label, state: "failed",
+                answer: "The run is stopping; no background child was started.")
+            return (childID, label)
+        }
         background[childID] = Agent.ChildStatus(
             id: childID, name: label, state: "running", answer: nil)
         backgroundTasks[childID] = Task { [weak self] in
@@ -318,8 +398,18 @@ public actor AgentRunner {
     /// A background child whose parent has exited has nobody to report to, and a runtime host
     /// about to be torn down underneath it. Cancelled rather than left, because an orphan that
     /// keeps spending tokens is the failure mode this whole feature could most easily add.
-    public func stopBackgroundChildren() {
-        for (_, task) in backgroundTasks { task.cancel() }
+    public func stopBackgroundChildren() async {
+        backgroundAdmissionClosed = true
+        // Drain rather than snapshot once. The actor is re-entrant while awaiting a child, so a
+        // callback can otherwise enqueue a nested child after the first snapshot. Admission is
+        // closed above, and each loop waits for the handles that already exist before checking
+        // again. This method is called by the driver, never by a child task, so it cannot
+        // self-await.
+        while !backgroundTasks.isEmpty {
+            let tasks = Array(backgroundTasks.values)
+            for task in tasks { task.cancel() }
+            for task in tasks { await task.value }
+        }
         backgroundTasks.removeAll()
     }
 
@@ -340,18 +430,43 @@ public actor AgentRunner {
             try FileManager.default.createDirectory(
                 at: childDir, withIntermediateDirectories: true)
         } catch {
-            return ("Could not create the child's directory: \(error.localizedDescription)",
-                    true, childID, label)
+            return (
+                "Could not create the child's directory: \(error.localizedDescription)",
+                true, childID, label
+            )
         }
 
         // A child writes into its own directory rather than the flat sessions dir, which is
         // what makes the tree recoverable from the filesystem alone.
         let childHome = AgentHome(root: childDir)
+        let childIdentity = SessionWorkIdentity.allocate(
+            workHostID: settings.identity?.workHostID ?? settings.home.workHostID,
+            sessionID: SessionWriter.newSessionID())
         let model = settings.model
 
+        // Reserve the child's durable antecedent before allocating a Python namespace. A child
+        // is a real Work of its own; creating a host session first would leave an unjournaled
+        // interpreter behind if SessionWriter setup failed.
+        let writer: SessionWriter
         do {
-            let hostSession = try await host.createSession(cwd: settings.cwd)
-            let writer = try SessionWriter(home: childHome, cwd: settings.cwd, model: model)
+            writer = try SessionWriter(
+                home: childHome, cwd: settings.cwd, model: model, identity: childIdentity)
+        } catch {
+            try? recorder.record(
+                childID: childID, name: label,
+                sessionFile: childDir.appending(path: "failed.jsonl"), prompt: prompt,
+                spawnCode: "", depth: depth, maxDepth: settings.maxDepth, status: "failed",
+                provider: model.providerID, model: model.id, createdAt: createdAt)
+            return (
+                "The sub-agent could not open its session journal: \(error.localizedDescription)",
+                true, childID, label
+            )
+        }
+
+        var hostSession: String?
+        do {
+            hostSession = try await host.createSession(
+                id: childIdentity.workID, cwd: settings.cwd)
             try recorder.record(
                 childID: childID, name: label, sessionFile: writer.fileURL, prompt: prompt,
                 spawnCode: "spawn(\(prompt.debugDescription))", depth: depth,
@@ -359,10 +474,11 @@ public actor AgentRunner {
                 provider: model.providerID, model: model.id, createdAt: createdAt)
 
             let child = Agent(
-                provider: provider, host: host, writer: writer, hostSession: hostSession,
+                provider: provider, host: host, writer: writer, hostSession: hostSession!,
                 config: .init(
                     model: model, cwd: settings.cwd,
-                    systemPrompt: Self.childPrompt(base: settings.systemPrompt, depth: depth,
+                    systemPrompt: Self.childPrompt(
+                        base: settings.systemPrompt, depth: depth,
                                                    maxDepth: settings.maxDepth),
                     maxIterations: settings.childMaxIterations, maxTokens: model.maxTokens,
                     maxDepth: settings.maxDepth, depth: depth))
@@ -375,7 +491,7 @@ public actor AgentRunner {
             // the filesystem alone.
             await child.setArtifacts(
                 ArtifactStore(home: childHome, sessionID: writer.sessionID))
-            register(hostSession: hostSession, agent: child)
+            register(hostSession: hostSession!, agent: child)
 
             // A child's own events are not forwarded to the parent's observer: a fan-out of
             // eight would make the parent's stream unreadable. The child's transcript is on
@@ -383,25 +499,51 @@ public actor AgentRunner {
             await child.send(prompt)
 
             let answer = await child.lastAssistantText
-            let failed = answer.isEmpty
+            var teardownFailure: String?
+            do {
+                try await writer.closeChecked()
+            } catch {
+                teardownFailure = "The sub-agent journal could not be closed: "
+                    + error.localizedDescription
+            }
+            do {
+                try await host.destroySession(hostSession!)
+            } catch {
+                let detail = "The sub-agent runtime could not be destroyed: "
+                    + error.localizedDescription
+                teardownFailure = [teardownFailure, detail].compactMap { $0 }.joined(separator: " ")
+            }
+            let failed = answer.isEmpty || teardownFailure != nil
+            let terminalAnswer: String
+            if let teardownFailure {
+                terminalAnswer = teardownFailure
+            } else {
+                terminalAnswer = failed ? "The sub-agent produced no answer." : answer
+            }
             try? recorder.record(
                 childID: childID, name: label, sessionFile: writer.fileURL, prompt: prompt,
                 spawnCode: "", depth: depth, maxDepth: settings.maxDepth,
                 status: failed ? "failed" : "completed",
                 provider: model.providerID, model: model.id, createdAt: createdAt)
-            await writer.close()
-            await host.destroySessionQuietly(hostSession)
 
-            return (failed ? "The sub-agent produced no answer." : answer,
-                    failed, childID, label)
+            return (
+                terminalAnswer,
+                failed, childID, label
+            )
         } catch {
+            try? await writer.closeChecked()
+            if let hostSession {
+                await host.destroySessionQuietly(hostSession)
+            }
             try? recorder.record(
                 childID: childID, name: label,
                 sessionFile: childDir.appending(path: "failed.jsonl"), prompt: prompt,
                 spawnCode: "", depth: depth, maxDepth: settings.maxDepth, status: "failed",
                 provider: model.providerID, model: model.id, createdAt: createdAt)
-            return ("The sub-agent could not start: \(error.localizedDescription)",
-                    true, childID, label)
+            return (
+                "The sub-agent could not start: \(error.localizedDescription)",
+                true, childID, label
+            )
         }
     }
 

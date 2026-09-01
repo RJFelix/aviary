@@ -17,6 +17,12 @@ SECTION="${1:-cockpit}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/app/.build/debug/Aviary"
 PID=""
+MODULE_CACHE="$ROOT/app/.build/module-cache"
+
+"$ROOT/scripts/check-swift-toolchain.sh" || exit $?
+mkdir -p "$MODULE_CACHE"
+export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE"
+export SWIFT_MODULECACHE_PATH="$MODULE_CACHE"
 
 # Polling rather than fswatch or entr: neither is installed here, and adding a Homebrew
 # dependency to a loop whose whole point is convenience is a poor trade. `find -newer` against a

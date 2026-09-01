@@ -2,6 +2,7 @@
 
 app_dir := justfile_directory() / "app"
 build_dir := justfile_directory() / "build"
+module_cache := app_dir / ".build" / "module-cache"
 
 [private]
 default:
@@ -18,7 +19,8 @@ watch section="cockpit":
 
 # Open one screen once, without the startup work. `just preview models`
 preview section="cockpit":
-    cd {{app_dir}} && swift build --product Aviary
+    ./scripts/check-swift-toolchain.sh
+    cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} swift build --product Aviary
     "{{app_dir}}/.build/debug/Aviary" --preview {{section}}
 
 # Create the stable code-signing identity, so permission grants survive a rebuild.
@@ -32,30 +34,40 @@ run: build
 
 # Build the app binary only, no bundle (fast inner loop)
 compile:
-    cd {{app_dir}} && swift build --product Aviary
+    ./scripts/check-swift-toolchain.sh
+    cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} swift build --product Aviary
 
 # Run the core test suite. Not `swift test`: a Command Line Tools toolchain ships no
 # XCTest, so the suite is an executable. See app/Sources/AviarySelfTest/Harness.swift.
 test:
-    cd {{app_dir}} && swift run AviarySelfTest
+    ./scripts/check-swift-toolchain.sh
+    cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} swift run AviarySelfTest
+
+# Reproduce the versioned 100,000-event Timeline v2 scale baseline.
+timeline-benchmark:
+    ./scripts/check-swift-toolchain.sh
+    cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} AVIARY_SELFTEST_FILTER="Timeline v2 100k baseline" swift run AviarySelfTest
 
 # Render every screen to build/shots/ without a display server
 shots:
-    cd {{app_dir}} && swift build -c release --product Aviary
+    ./scripts/check-swift-toolchain.sh
+    cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} swift build -c release --product Aviary
     mkdir -p {{build_dir}}/shots
     "{{app_dir}}/.build/release/Aviary" --snapshot {{build_dir}}/shots --width 1600 --height 1000
     @echo "→ {{build_dir}}/shots"
 
 # Render one screen. `just shot sessions` or `just shot cockpit --bare`
 shot section *FLAGS:
-    cd {{app_dir}} && swift build -c release --product Aviary
+    ./scripts/check-swift-toolchain.sh
+    cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} swift build -c release --product Aviary
     mkdir -p {{build_dir}}/shots
     "{{app_dir}}/.build/release/Aviary" --snapshot {{build_dir}}/shots --only {{section}} --width 1600 --height 1000 {{FLAGS}}
 
 # One driven Claude Code session in a terminal. `just drive "count the swift files"`
 # Shares ClaudeCodeSession.prepare with the GUI, so this exercises the same path a window does.
 drive prompt *FLAGS:
-    cd {{app_dir}} && swift build --product Aviary
+    ./scripts/check-swift-toolchain.sh
+    cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} swift build --product Aviary
     "{{app_dir}}/.build/debug/Aviary" --claude-code {{quote(prompt)}} {{FLAGS}}
 
 
@@ -85,4 +97,5 @@ host variant="python3":
 
 # Compare every bundled host against the same protocol checks
 hosts:
-    cd {{app_dir}} && swift run AviarySelfTest 2>&1 | grep -E "runtimeHost|cases,"
+    ./scripts/check-swift-toolchain.sh
+    cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} swift run AviarySelfTest 2>&1 | grep -E "runtimeHost|cases,"

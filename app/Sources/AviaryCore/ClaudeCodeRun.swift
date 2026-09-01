@@ -29,11 +29,14 @@ public actor ClaudeCodeRun {
         /// the Claude Code history are two different records of the same conversation, and
         /// resuming one without the other is a real (if lopsided) thing to want.
         public var resumeAviarySession: String?
+        /// Preallocated identity bundle, resolved before Claude Code or the runtime starts.
+        public var identity: SessionWorkIdentity?
 
         public init(
             home: AgentHome, cwd: String, model: String, systemPrompt: String,
             effort: String? = nil, bridgeExecutable: String,
-            resumeClaudeSession: String? = nil, resumeAviarySession: String? = nil
+            resumeClaudeSession: String? = nil, resumeAviarySession: String? = nil,
+            identity: SessionWorkIdentity? = nil
         ) {
             self.home = home
             self.cwd = cwd
@@ -43,6 +46,7 @@ public actor ClaudeCodeRun {
             self.bridgeExecutable = bridgeExecutable
             self.resumeClaudeSession = resumeClaudeSession
             self.resumeAviarySession = resumeAviarySession
+            self.identity = identity
         }
     }
 
@@ -50,10 +54,15 @@ public actor ClaudeCodeRun {
         case started(aviarySession: String)
         /// Claude Code's own session id, needed to resume it later.
         case claudeSession(String)
+        /// A user input crossed both the journal and Claude stdin boundaries.
+        case inputCommitted(id: String)
         case textDelta(String)
         case thinkingDelta(String)
         case toolStarted(name: String)
         case toolFinished(name: String, isError: Bool)
+        /// One assistant message is durable. A driven turn may contain several of these,
+        /// separated by tool calls, before the overall turn finishes.
+        case messageCommitted(id: String)
         case turnFinished
         case rateLimit(ClaudeCode.Frame.RateLimit)
         /// Something worth a banner: a leaked API key, a missing tool, a denied call.
@@ -65,6 +74,7 @@ public actor ClaudeCodeRun {
     public enum RunError: LocalizedError {
         case noBinary
         case launchFailed(String)
+        case deliveryFailed(String)
 
         public var errorDescription: String? {
             switch self {
@@ -73,6 +83,8 @@ public actor ClaudeCodeRun {
                     + "once, and Aviary will find it."
             case .launchFailed(let detail):
                 return "Could not start Claude Code: \(detail)"
+            case .deliveryFailed(let detail):
+                return "Could not deliver input to Claude Code: \(detail)"
             }
         }
     }
@@ -84,6 +96,9 @@ public actor ClaudeCodeRun {
 
     private var process: Process?
     private var stdin: FileHandle?
+    /// One consumer for stdout. Spawning a Task per line lets later frames enter the actor
+    /// before earlier ones, which can put tool results above calls or finish a turn early.
+    private var outputPump: Task<Void, Never>?
     /// Claude Code's session id, learned from `system/init` and needed to resume.
     public private(set) var claudeSessionID: String?
     public private(set) var totalUsage = Usage()
@@ -97,6 +112,13 @@ public actor ClaudeCodeRun {
     /// Frame types this version does not model, counted so a protocol change is visible as a
     /// number rather than as silence.
     public private(set) var unmodelledFrames: [String: Int] = [:]
+    /// The first terminal outcome recorded for this run. Keeping this guard in the run actor
+    /// prevents End-after-failure from rewriting a truthful failure as cancellation.
+    private var recordedOutcome: TranscriptOutcome.State?
+    /// True after stdin delivery and until Claude Code reports a result for that turn. Process
+    /// status zero is not success when the protocol ended before that acknowledgement.
+    private var pendingTurnResult = false
+    private var journalFailureDetail: String?
 
     /// Blocks of the assistant message currently being assembled.
     ///
@@ -115,21 +137,36 @@ public actor ClaudeCodeRun {
     // actor for a value that was fixed at init would only invite a deadlock.
     public nonisolated var sessionID: String { writer.sessionID }
     public nonisolated var fileURL: URL { writer.fileURL }
+    /// The launch boundary can reserve this exact writer before runtime/process setup.
+    public nonisolated var sessionWriter: SessionWriter { writer }
 
-    public init(settings: Settings, bridge: KernelBridge) throws {
+    public init(
+        settings: Settings, bridge: KernelBridge, writer suppliedWriter: SessionWriter? = nil
+    ) throws {
         self.settings = settings
         self.bridge = bridge
+        let identity = settings.identity
+            ?? settings.resumeAviarySession.flatMap {
+                SessionWriter.recoverIdentity(home: settings.home, sessionID: $0)
+            }
+            ?? SessionWorkIdentity.allocate(
+                workHostID: settings.home.workHostID,
+                sessionID: settings.resumeAviarySession ?? SessionWriter.newSessionID())
         // Recorded as the model that answered, with `claude-code` as the provider. Naming the
         // provider after the *client* rather than after Anthropic is deliberate: which client
         // Anthropic sees is exactly what decides whether a run draws on the plan or on metered
         // credit, so it is the distinction worth carrying into the ledger.
         let spec = Self.modelSpec(for: settings.model)
-        if let resume = settings.resumeAviarySession {
+        if let suppliedWriter {
+            self.writer = suppliedWriter
+        } else if let resume = settings.resumeAviarySession {
             self.writer = try SessionWriter(
-                home: settings.home, resuming: resume, cwd: settings.cwd, model: spec)
+                home: settings.home, resuming: resume, cwd: settings.cwd, model: spec,
+                identity: identity)
         } else {
             self.writer = try SessionWriter(
-                home: settings.home, cwd: settings.cwd, model: spec)
+                home: settings.home, cwd: settings.cwd, model: spec,
+                identity: identity)
         }
     }
 
@@ -137,8 +174,52 @@ public actor ClaudeCodeRun {
     ///
     /// For the kernel, which produces things worth recording — an artifact written — and must
     /// not open a second handle onto a file that has exactly one writer.
-    public func note(_ text: String, customType: String) async {
-        try? await writer.appendNote(text, customType: customType)
+    @discardableResult
+    public func note(_ text: String, customType: String) async -> Bool {
+        do {
+            try await writer.appendNote(text, customType: customType)
+            return true
+        } catch {
+            await journalFailure(error.localizedDescription)
+            return false
+        }
+    }
+
+    public func writerIsHealthy() async -> Bool {
+        if case .healthy = await writer.writerHealth { return true }
+        return false
+    }
+
+    /// Fail closed after a journal error: the driven process must not continue making model,
+    /// Python, MCP, or stdin effects against a transcript that can no longer record them.
+    public func journalFailure(_ detail: String) async {
+        guard journalFailureDetail == nil else { return }
+        journalFailureDetail = detail
+        if process?.isRunning == true {
+            process?.terminate()
+        } else if process == nil {
+            isFinished = true
+        }
+    }
+
+    private func requireWriter(_ effect: String) async -> Bool {
+        guard journalFailureDetail == nil else { return false }
+        if case .healthy = await writer.writerHealth { return true }
+        await journalFailure("The session journal became unavailable before \(effect).")
+        return false
+    }
+
+    /// Persist the run's terminal state before its journal closes. This is public so the driver
+    /// can classify a failed input crossing, while the actor keeps duplicate outcome writes
+    /// from racing result, exit, and teardown callbacks.
+    @discardableResult
+    public func recordOutcome(
+        _ state: TranscriptOutcome.State, detail: String? = nil
+    ) async -> String? {
+        guard recordedOutcome == nil else { return nil }
+        recordedOutcome = state
+        return try? await writer.appendOutcome(
+            state: state, detail: detail.map(Self.bounded))
     }
 
     public func observe(_ observer: (@Sendable (Event) -> Void)?) {
@@ -149,8 +230,21 @@ public actor ClaudeCodeRun {
 
     /// Start Claude Code and send the first prompt.
     public func start(prompt: String) async throws {
-        guard let binary = await ClaudeCode.locate() else { throw RunError.noBinary }
-        let endpoint = try await bridge.start()
+        guard await requireWriter("Claude Code startup") else {
+            throw RunError.launchFailed(journalFailureDetail ?? "the session journal is unavailable")
+        }
+        guard let binary = await ClaudeCode.locate() else {
+            let error = RunError.noBinary
+            await recordOutcome(.failed, detail: error.localizedDescription)
+            throw error
+        }
+        let endpoint: KernelBridge.Endpoint
+        do {
+            endpoint = try await bridge.start()
+        } catch {
+            await recordOutcome(.failed, detail: error.localizedDescription)
+            throw error
+        }
 
         let invocation = ClaudeCode.Invocation(
             model: settings.model,
@@ -182,11 +276,23 @@ public actor ClaudeCodeRun {
         process.standardError = errPipe
 
         let framer = LineFramer()
-        outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        let (outputLines, outputContinuation) = AsyncStream<Data>.makeStream(
+            bufferingPolicy: .unbounded)
+        outputPump = Task { [weak self] in
+            for await line in outputLines {
+                guard let self else { return }
+                await self.ingest(line: line)
+            }
+        }
+        outPipe.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
-            guard !chunk.isEmpty else { handle.readabilityHandler = nil; return }
+            guard !chunk.isEmpty else {
+                handle.readabilityHandler = nil
+                outputContinuation.finish()
+                return
+            }
             for line in framer.feed(chunk) {
-                Task { await self?.ingest(line: line) }
+                outputContinuation.yield(line)
             }
         }
         errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -200,18 +306,38 @@ public actor ClaudeCodeRun {
             Task { await self?.handleExit(status: p.terminationStatus) }
         }
 
+        guard await requireWriter("Claude Code process launch") else {
+            await bridge.stop()
+            throw RunError.launchFailed(journalFailureDetail ?? "the session journal is unavailable")
+        }
         do { try process.run() } catch {
+            outputContinuation.finish()
+            outputPump?.cancel()
+            outputPump = nil
+            await recordOutcome(.failed, detail: error.localizedDescription)
             throw RunError.launchFailed(error.localizedDescription)
         }
         self.process = process
         self.stdin = inPipe.fileHandleForWriting
 
         emit(.started(aviarySession: writer.sessionID))
-        try? await writer.appendNote(
+        guard await note(
             "Driven by Claude Code. The loop, the history and the stopping decision are Claude "
                 + "Code's; the kernel is Aviary's, reached over an MCP bridge.",
-            customType: "aviary.claude-code")
-        await send(prompt)
+            customType: "aviary.claude-code") else {
+            throw RunError.launchFailed(
+                journalFailureDetail ?? "the session journal is unavailable")
+        }
+        if !prompt.isEmpty {
+            let delivery = await send(prompt)
+            guard delivery.isDelivered else {
+                if case .notDelivered = delivery {
+                    await recordOutcome(
+                        .failed, detail: delivery.detail ?? "input delivery was not confirmed")
+                }
+                throw RunError.deliveryFailed(delivery.detail ?? "input delivery was not confirmed")
+            }
+        }
     }
 
     /// Queue another prompt in the same session.
@@ -220,9 +346,30 @@ public actor ClaudeCodeRun {
     /// one starts a fresh turn against the history it already holds. Only `user` lines are
     /// honoured — an `assistant` line is silently discarded, which is the finding that makes
     /// this a driven session rather than a transport.
-    public func send(_ prompt: String) async {
-        guard !prompt.isEmpty, let stdin else { return }
-        try? await writer.appendUser(prompt)
+    public func send(_ prompt: String) async -> SessionCommandDelivery {
+        guard !prompt.isEmpty else {
+            return .notDelivered(reason: "the input is empty")
+        }
+        // A user message starts a new parser projection and therefore a new terminal-outcome
+        // window. Keep the guard per turn: a prior completed turn must not suppress the next
+        // turn's failure or cancellation marker.
+        recordedOutcome = nil
+        guard await requireWriter("Claude Code stdin") else {
+            return .notDelivered(reason: journalFailureDetail ?? "the session journal is unavailable")
+        }
+        guard let stdin, process?.isRunning == true else {
+            await recordOutcome(.failed, detail: "the driven process is not accepting input")
+            return .notDelivered(reason: "the driven process is not accepting input")
+        }
+        let inputID: String
+        do {
+            inputID = try await writer.appendUser(prompt)
+        } catch {
+            let detail = "the journal rejected the user message: \(error.localizedDescription)"
+            await recordOutcome(.failed, detail: detail)
+            return .notDelivered(
+                reason: detail)
+        }
         let line = JSONValue.object([
             "type": .string("user"),
             "message": .object([
@@ -234,9 +381,32 @@ public actor ClaudeCodeRun {
         ])
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
-        guard var data = try? encoder.encode(line) else { return }
+        let encoded: Data
+        do {
+            encoded = try encoder.encode(line)
+        } catch {
+            let detail =
+                "the stream-json input could not be encoded: \(error.localizedDescription)"
+            await recordOutcome(.failed, detail: detail)
+            return .notDelivered(
+                reason: detail)
+        }
+        var data = encoded
         data.append(UInt8(ascii: "\n"))
-        try? stdin.write(contentsOf: data)
+        do {
+            try stdin.write(contentsOf: data)
+        } catch {
+            _ = await note(
+                "Aviary could not confirm whether Claude Code received the preceding user "
+                    + "message because its stdin write failed: "
+                    + error.localizedDescription,
+                customType: "aviary.claude-code-delivery-failure")
+            return .indeterminate(
+                reason: "stdin write failed; delivery is unknown: \(error.localizedDescription)")
+        }
+        pendingTurnResult = true
+        emit(.inputCommitted(id: inputID))
+        return .delivered(referenceID: inputID)
     }
 
     /// Say that no more prompts are coming.
@@ -250,7 +420,7 @@ public actor ClaudeCodeRun {
         stdin = nil
     }
 
-    public func stop() async {
+    public func stop(cancelActiveTurn: Bool = false) async {
         // Order matters, and so does verifying. Closing stdin is the polite ending — Claude
         // Code finishes the turn in flight and exits, leaving no unresolved tool call in its
         // own history. But SIGTERM is a request, not an outcome: a `claude` that does not
@@ -262,6 +432,9 @@ public actor ClaudeCodeRun {
         // might call taken away. Tearing the kernel down while the caller is still alive is
         // what produced twenty-six consecutive "the runtime host is not running" results in a
         // real session.
+        if cancelActiveTurn && !isFinished {
+            await recordOutcome(.cancelled, detail: "Claude Code run ended by request")
+        }
         isFinished = true
         try? stdin?.close()
         stdin = nil
@@ -280,7 +453,11 @@ public actor ClaudeCodeRun {
         self.process = nil
 
         await bridge.stop()
-        await writer.close()
+        do {
+            try await writer.closeChecked()
+        } catch {
+            await journalFailure("The session journal close was not confirmed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: Frames
@@ -297,7 +474,7 @@ public actor ClaudeCodeRun {
             return FileHandle(forWritingAtPath: path)
         }() else { return }
         defer { try? handle.close() }
-        try? handle.seekToEnd()
+        _ = try? handle.seekToEnd()
         var data = line
         data.append(UInt8(ascii: "\n"))
         try? handle.write(contentsOf: data)
@@ -312,7 +489,7 @@ public actor ClaudeCodeRun {
             emit(.claudeSession(info.sessionID))
             if let complaint = info.complaint(expecting: Self.toolNames) {
                 emit(.warning(complaint))
-                try? await writer.appendNote(complaint, customType: "aviary.claude-code")
+                _ = await note(complaint, customType: "aviary.claude-code")
             }
 
         case .textDelta(let text):
@@ -348,10 +525,14 @@ public actor ClaudeCodeRun {
             // it — otherwise the transcript shows an answer above its question.
             await flushTurn()
             let name = pendingToolNames.removeValue(forKey: id) ?? "python"
-            try? await writer.appendToolResult(
-                id: id, name: name, text: text, isError: isError)
+            do {
+                try await writer.appendToolResult(
+                    id: id, name: name, text: text, isError: isError)
+            } catch {
+                await journalFailure("Could not record Claude Code's tool result: \(error.localizedDescription)")
+                return
+            }
             emit(.toolFinished(name: Self.display(tool: name), isError: isError))
-            emit(.turnFinished)
 
         case .rateLimit(let limit):
             lastRateLimit = limit
@@ -361,7 +542,7 @@ public actor ClaudeCodeRun {
                 // allowance is spent and the run is now costing money per token.
                 let note = "This run is drawing on extra usage, not the plan allowance."
                 emit(.warning(note))
-                try? await writer.appendNote(note, customType: "aviary.claude-code")
+                _ = await self.note(note, customType: "aviary.claude-code")
             }
 
         case .result(let result):
@@ -377,12 +558,15 @@ public actor ClaudeCodeRun {
                     + ", which this run does not allow. It will have answered around the "
                     + "refusal rather than stopping."
                 emit(.warning(note))
-                try? await writer.appendNote(note, customType: "aviary.claude-code")
+                _ = await self.note(note, customType: "aviary.claude-code")
             }
             if result.isError {
                 let detail = result.apiErrorStatus ?? result.text
-                emit(.failed(detail.isEmpty ? "Claude Code reported a failure." : detail))
+                let failure = detail.isEmpty ? "Claude Code reported a failure." : detail
+                await recordOutcome(.failed, detail: failure)
+                emit(.failed(failure))
             }
+            pendingTurnResult = false
             emit(.turnFinished)
 
         case .retry(let category, let detail):
@@ -392,7 +576,7 @@ public actor ClaudeCodeRun {
                 let note = "Claude Code's login is not working (\(category)). "
                     + "Run `claude /login`."
                 emit(.warning(note))
-                try? await writer.appendNote(note, customType: "aviary.claude-code")
+                _ = await self.note(note, customType: "aviary.claude-code")
                 return
             }
             // Everything else is noted in the transcript but not banner-worthy. A retry that
@@ -401,7 +585,7 @@ public actor ClaudeCodeRun {
             retries += 1
             let described = [category, detail]
                 .filter { !$0.isEmpty }.joined(separator: ": ")
-            try? await writer.appendNote(
+            _ = await note(
                 "Claude Code retried a request" + (described.isEmpty ? "." : " — " + described),
                 customType: "aviary.claude-code")
 
@@ -428,9 +612,17 @@ public actor ClaudeCodeRun {
                 pendingToolNames[id] = Self.display(tool: name)
             }
         }
-        try? await writer.appendAssistant(
-            text: text, thinking: thinking, toolCalls: calls,
-            usage: openUsage, stopReason: openStopReason)
+        do {
+            let messageID = try await writer.appendAssistant(
+                text: text, thinking: thinking, toolCalls: calls,
+                usage: openUsage, stopReason: openStopReason)
+            emit(.messageCommitted(id: messageID))
+        } catch {
+            let detail = "Could not record Claude Code's message: \(error.localizedDescription)"
+            await recordOutcome(.failed, detail: detail)
+            emit(.failed(detail))
+            await journalFailure(detail)
+        }
         if let usage = openUsage { totalUsage = totalUsage + usage }
         openMessageID = nil
         openBlocks = []
@@ -449,16 +641,25 @@ public actor ClaudeCodeRun {
     public var diagnostics: String { stderrTail.joined(separator: "\n") }
 
     private func handleExit(status: Int32) async {
+        if let outputPump { await outputPump.value }
+        outputPump = nil
         await flushTurn()
         await bridge.stop()
-        if status != 0 && !isFinished {
-            let detail = stderrTail.suffix(3).joined(separator: "\n")
-            emit(.failed(detail.isEmpty
-                ? "Claude Code exited with status \(status)."
-                : "Claude Code exited with status \(status): \(detail)"))
+        if !isFinished,
+           let failure = Self.exitFailure(
+               status: status, pendingTurnResult: pendingTurnResult,
+               diagnostics: stderrTail.suffix(3).joined(separator: "\n"))
+        {
+            await recordOutcome(.failed, detail: failure)
+            emit(.failed(failure))
         }
+        pendingTurnResult = false
         isFinished = true
-        await writer.close()
+        do {
+            try await writer.closeChecked()
+        } catch {
+            await journalFailure("The session journal close was not confirmed: \(error.localizedDescription)")
+        }
         emit(.finished)
     }
 
@@ -467,6 +668,28 @@ public actor ClaudeCodeRun {
     }
 
     // MARK: Names
+
+    /// Protocol-aware process-exit classification, kept independently testable. A clean
+    /// process status only means the executable exited normally; it does not complete an
+    /// input whose result frame never arrived.
+    static func exitFailure(
+        status: Int32, pendingTurnResult: Bool, diagnostics: String
+    ) -> String? {
+        guard status != 0 || pendingTurnResult else { return nil }
+        if status == 0 {
+            return "Claude Code exited before completing the active turn."
+        }
+        return diagnostics.isEmpty
+            ? "Claude Code exited with status \(status)."
+            : "Claude Code exited with status \(status): \(diagnostics)"
+    }
+
+    /// Keep provider diagnostics useful without allowing a failed response body to turn the
+    /// durable outcome marker into an unbounded transcript entry.
+    private static func bounded(_ text: String) -> String {
+        guard text.count > 4000 else { return text }
+        return String(text.prefix(4000)) + "\n\n[truncated by Aviary]"
+    }
 
     /// The tools a driven run offers. One, deliberately: the kernel can already do anything a
     /// file-editing tool could, and every additional schema is context spent describing a
@@ -483,7 +706,7 @@ public actor ClaudeCodeRun {
     /// in the stream is documented as a client-side estimate — so pricing them at list would
     /// invent spending. `sessionsWithoutPricing` already means "no rates published", which is
     /// exactly the true thing to say here.
-    static func modelSpec(for model: String) -> ModelSpec {
+    public static func modelSpec(for model: String) -> ModelSpec {
         let contextWindow: Int? = {
             switch model {
             case "sonnet", "claude-sonnet-5": return 1_000_000

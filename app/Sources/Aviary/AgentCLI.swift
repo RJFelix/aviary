@@ -149,50 +149,9 @@ enum AgentCLI {
             fail("Could not find the Aviary checkout, so there is no runtime host to run.")
         }
 
-        // 1. A model, and the provider that serves it.
-        let auth = AuthInfo.load(home: home)
-        let config = ModelsConfig.load(home: home, auth: auth)
-        guard let (providerSpec, model) = resolve(modelRef, in: config, auth: auth) else {
-            let available = (config.providers + [BuiltInProviders.openAICodex()])
-                .flatMap { p in p.models.map { "\(p.id)/\($0.id)" } }
-            fail("No such model. Configured: \(available.prefix(12).joined(separator: ", "))")
-        }
-        // The same factory the GUI uses. Two switch statements over the same api enum is how
-        // the GUI ended up sending Codex traffic to the completions client and getting a 404.
-        let routed = await ChatProviderRouting.makeProvider(
-            spec: providerSpec, model: model, home: home,
-            resolveSecret: { await resolvedSecret($0) })
-        guard case .success(let provider) = routed else {
-            if case .failure(let why) = routed { fail(why.localizedDescription) }
-            return
-        }
-        if providerSpec.api != "openai-codex-responses" {
-            let key = await ApiKeyResolver.resolve(providerSpec.apiKeyExpression)
-            // Non-blocking: a provider may legitimately need no key, and refusing to start on
-            // a format guess is how a working setup gets called broken.
-            if !key.ok { note("credentials: \(key.explanation)") }
-        }
-
-        // 2. The runtime host.
-        let hostScript = repoRoot.appending(path: "runtime-hosts/\(variant)/host.py")
-        guard FileManager.default.fileExists(atPath: hostScript.path) else {
-            fail("No runtime host at \(hostScript.path)")
-        }
-        let host = RuntimeHost(executable: "/usr/bin/env", arguments: ["python3", hostScript.path])
-        let capabilities: RuntimeHost.Capabilities
-        do {
-            capabilities = try await host.start()
-        } catch {
-            fail("Could not start the runtime host: \(error.localizedDescription)")
-        }
-        if !quiet {
-            note("runtime \(capabilities.summary) · session isolation "
-                + (capabilities.has("perSessionGIL") ? "on" : "off"))
-        }
-
-        // 3. A runner, which owns session creation, sub-agents and the callback wiring.
-        // A prompt template, if the prompt is a slash command. Expanded before anything else
-        // reads the prompt, so skills and memory rank against what will actually be sent.
+        // Expand before resolving or starting anything. The durable start command must carry
+        // the exact prompt the agent will receive, not the slash-command spelling that invoked
+        // it.
         let expander = PromptExpander(
             templates: Library.discover(
                 home: home, settings: HarnessSettings.load(home: home),
@@ -208,6 +167,108 @@ enum AgentCLI {
             note("template /\(template.name) → \(Fmt.bytes(prompt.count))")
         }
 
+        // 1. A model, and the provider that serves it.
+        let auth = AuthInfo.load(home: home)
+        let config = ModelsConfig.load(home: home, auth: auth)
+        guard let (providerSpec, model) = resolve(modelRef, in: config, auth: auth) else {
+            let available = (config.providers + [BuiltInProviders.openAICodex()])
+                .flatMap { p in p.models.map { "\(p.id)/\($0.id)" } }
+            fail("No such model. Configured: \(available.prefix(12).joined(separator: ", "))")
+        }
+        let identity = RunConfiguration(
+            cwd: cwd, provider: providerSpec.id, model: model.id, resume: resume)
+            .resolvedIdentity(home: home)
+        let writer: SessionWriter
+        do {
+            writer = try resume.map {
+                try SessionWriter(
+                    home: home, resuming: $0, cwd: cwd, model: model, identity: identity)
+            } ?? SessionWriter(home: home, cwd: cwd, model: model, identity: identity)
+        } catch {
+            fail("Could not open the session journal: \(error.localizedDescription)")
+        }
+
+        let commandController = SessionCommandController(
+            identity: identity, capabilities: Agent.inHouseCommandCapabilities, writer: writer)
+
+        /// End is admitted before cleanup so even a failed launch has a durable terminal
+        /// command when the journal is healthy; if the journal is wedged, the controller's
+        /// degraded End permit still releases local resources.
+        func endAndCleanup(runner: AgentRunner? = nil, host: RuntimeHost? = nil) async {
+            let ending = await commandController.admitAndCommit(.endRun, actorID: "cli")
+            let endCommand: AdmittedSessionCommand?
+            if case .accepted(let admittedEnd) = ending,
+               await commandController.awaitDispatch(commandID: admittedEnd.commandID) != nil
+            {
+                _ = await commandController.acknowledgeDispatched(commandID: admittedEnd.commandID)
+                endCommand = admittedEnd
+            } else {
+                endCommand = nil
+            }
+            await runner?.stopMCPServers()
+            await host?.stop()
+            do {
+                try await writer.closeChecked()
+            } catch {
+                note("warning: session journal close was not confirmed: \(error.localizedDescription)")
+            }
+            if let endCommand {
+                _ = await commandController.acknowledgeEnd(commandID: endCommand.commandID)
+            }
+        }
+
+        // Commit and dispatch the start intent before provider construction or RuntimeHost.start.
+        let startAdmission = await commandController.admitAndCommit(
+            .start(prompt: prompt), actorID: "cli", commandID: "cli-start")
+        guard case .accepted(let startCommand) = startAdmission else {
+            await endAndCleanup()
+            fail("The CLI start command could not be durably admitted.")
+        }
+        guard await commandController.awaitDispatch(commandID: startCommand.commandID) != nil else {
+            await endAndCleanup()
+            fail("The CLI start command lost its dispatch turn.")
+        }
+        _ = await commandController.acknowledgeDispatched(commandID: startCommand.commandID)
+
+        // The same factory the GUI uses. Two switch statements over the same api enum is how
+        // the GUI ended up sending Codex traffic to the completions client and getting a 404.
+        let routed = await ChatProviderRouting.makeProvider(
+            spec: providerSpec, model: model, home: home,
+            resolveSecret: { await resolvedSecret($0) })
+        guard case .success(let provider) = routed else {
+            if case .failure(let why) = routed {
+                await endAndCleanup()
+                fail(why.localizedDescription)
+            }
+            return
+        }
+        if providerSpec.api != "openai-codex-responses" {
+            let key = await ApiKeyResolver.resolve(providerSpec.apiKeyExpression)
+            // Non-blocking: a provider may legitimately need no key, and refusing to start on
+            // a format guess is how a working setup gets called broken.
+            if !key.ok { note("credentials: \(key.explanation)") }
+        }
+
+        // 2. The runtime host.
+        let hostScript = repoRoot.appending(path: "runtime-hosts/\(variant)/host.py")
+        guard FileManager.default.fileExists(atPath: hostScript.path) else {
+            await endAndCleanup()
+            fail("No runtime host at \(hostScript.path)")
+        }
+        let host = RuntimeHost(executable: "/usr/bin/env", arguments: ["python3", hostScript.path])
+        let capabilities: RuntimeHost.Capabilities
+        do {
+            capabilities = try await host.start()
+        } catch {
+            await endAndCleanup(host: host)
+            fail("Could not start the runtime host: \(error.localizedDescription)")
+        }
+        if !quiet {
+            note("runtime \(capabilities.summary) · session isolation "
+                + (capabilities.has("perSessionGIL") ? "on" : "off"))
+        }
+
+        // 3. A runner, which owns session creation, sub-agents and the callback wiring.
         // Skills, gated. The harness sent all 68 on every request — 62.7% of input tokens on
         // a trivial run — so this is the one place worth doing differently rather than
         // faithfully.
@@ -247,7 +308,7 @@ enum AgentCLI {
                            timeBudget: minutes.map { $0 * 60 })
                     : nil,
                 hookPaths: HookDiscovery.paths(repoRoot: repoRoot),
-                resume: resume))
+                resume: resume, identity: identity, writer: writer))
 
         await runner.observe { event in
             switch event {
@@ -270,7 +331,7 @@ enum AgentCLI {
                     .joined(separator: "\n")
                 note((isError ? "✗ " : "◂ ") + "\n\(head)"
                     + (output.split(separator: "\n").count > 12 ? "\n  …" : ""))
-            case .turnFinished(let usage, _):
+            case .turnFinished(_, let usage, _):
                 if let usage, !quiet {
                     note("  · \(Fmt.tokens(usage.input)) in / \(Fmt.tokens(usage.output)) out"
                         + (usage.reasoning.map { " / \(Fmt.tokens($0)) reasoning" } ?? ""))
@@ -291,23 +352,40 @@ enum AgentCLI {
                 note("\n↻ \(text.prefix(70))")
             case .started(let session):
                 if !quiet { note("session \(session) · \(model.qualifiedID) · \(cwd)") }
+            case .inputCommitted:
+                break
             }
         }
 
         do {
-            let (writer, agent) = try await runner.run(prompt: prompt)
+            let (_, agent) = try await runner.prepare()
+            guard await commandController.acknowledgePreparation(commandID: startCommand.commandID)
+            else {
+                await endAndCleanup(runner: runner, host: host)
+                fail("The CLI start command was not acknowledged.")
+            }
+            let outcome = await agent.send(prompt)
+            switch outcome {
+            case .completed:
+                _ = await commandController.acknowledgeTurnFinished(
+                    commandID: startCommand.commandID)
+            case .failed(let detail):
+                note("agent failed: \(detail)")
+                _ = await commandController.markFailed(commandID: startCommand.commandID)
+            case .cancelled:
+                note("agent cancelled; ending run")
+            }
             let total = await agent.totalUsage
             if !quiet {
                 note("total \(Fmt.tokens(total.totalTokens)) tokens"
                     + (total.cacheHitRate.map { String(format: " · %.0f%% cached", $0 * 100) } ?? ""))
                 note("transcript \(writer.fileURL.path)")
             }
-            await writer.close()
+            await endAndCleanup(runner: runner, host: host)
         } catch {
             note("could not start: \(error.localizedDescription)")
+            await endAndCleanup(runner: runner, host: host)
         }
-        await runner.stopMCPServers()
-        await host.stop()
     }
 
     // MARK: Helpers
@@ -393,7 +471,8 @@ final class Atomic: @unchecked Sendable {
 /// this.
 enum SystemPrompt {
     static func build(
-        cwd: String, model: ModelSpec, skills: String = "", memory: String = ""
+        cwd: String, model: ModelSpec, skills: String = "", memory: String = "",
+        includeContextFiles: Bool = true
     ) -> String {
         var lines = [
             "You are a coding agent working in \(cwd) on a macOS machine.",
@@ -422,7 +501,7 @@ enum SystemPrompt {
         }
         // Project instructions, if the working directory has any. Read at start rather than
         // discovered per turn, so the cost is visible and paid once.
-        for name in ["AGENTS.md", "CLAUDE.md"] {
+        for name in includeContextFiles ? ["AGENTS.md", "CLAUDE.md"] : [] {
             let url = URL(fileURLWithPath: cwd).appending(path: name)
             if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
                 lines.append("")

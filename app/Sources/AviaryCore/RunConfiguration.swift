@@ -12,6 +12,9 @@ public struct RunConfiguration: Sendable, Hashable {
     public var thinkingLevel: String?
     /// Session id or path to resume. Nil starts fresh.
     public var resume: String?
+    /// Preallocated session/Work/run identities. Nil preserves legacy call sites; callers that
+    /// are about to launch should resolve this once, before starting a provider or runtime host.
+    public var identity: SessionWorkIdentity?
     public var persistSession: Bool = true
     /// Skip AGENTS.md / CLAUDE.md discovery.
     public var noContextFiles: Bool = false
@@ -37,19 +40,40 @@ public struct RunConfiguration: Sendable, Hashable {
         recordPayloads: Bool = false,
         wireLogPath: String? = nil,
         environmentOverrides: [String: String] = [:],
-        extraArguments: [String] = []
+        extraArguments: [String] = [],
+        identity: SessionWorkIdentity? = nil
     ) {
         self.cwd = cwd
         self.provider = provider
         self.model = model
         self.thinkingLevel = thinkingLevel
         self.resume = resume
+        self.identity = identity
         self.persistSession = persistSession
         self.noContextFiles = noContextFiles
         self.recordPayloads = recordPayloads
         self.wireLogPath = wireLogPath
         self.environmentOverrides = environmentOverrides
         self.extraArguments = extraArguments
+    }
+
+    /// Resolve the identity once at the launch boundary.
+    ///
+    /// A supplied identity wins. A legacy resume recovers the Work fields from its session
+    /// header when present, or receives a deterministic legacy Work identity; fresh runs use the
+    /// durable host id for this AgentHome. The returned value should be passed unchanged through
+    /// every core object in the run. This is allocation, not a launch registry: concurrent
+    /// resumes still require the session controller/service layer to coordinate writers.
+    public func resolvedIdentity(home: AgentHome) -> SessionWorkIdentity {
+        if let identity { return identity }
+        if let resume,
+           let recovered = SessionWriter.recoverIdentity(home: home, sessionID: resume)
+        {
+            return recovered
+        }
+        return SessionWorkIdentity.allocate(
+            workHostID: home.workHostID,
+            sessionID: resume ?? SessionWriter.newSessionID())
     }
 
     func arguments(engine: EngineLocation) -> [String] {

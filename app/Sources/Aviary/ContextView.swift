@@ -269,8 +269,6 @@ struct SegmentTextSheet: View {
     }
 }
 
-extension PayloadSegment: @retroactive Identifiable {}
-
 // MARK: - Raw payload
 
 struct RawPayloadSheet: View {

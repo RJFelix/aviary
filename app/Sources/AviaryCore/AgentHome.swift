@@ -1,4 +1,23 @@
 import Foundation
+import CryptoKit
+import Darwin
+
+public enum AgentHomeError: LocalizedError, Equatable, Sendable {
+    case workHostIDNotPersisted
+    case workHostIDUnavailable(String)
+    case invalidPersistedWorkHostID
+
+    public var errorDescription: String? {
+        switch self {
+        case .workHostIDNotPersisted:
+            return "This AgentHome has no persisted Work Host identity."
+        case .workHostIDUnavailable(let reason):
+            return "The Work Host identity could not be persisted: \(reason)"
+        case .invalidPersistedWorkHostID:
+            return "The persisted Work Host identity is invalid."
+        }
+    }
+}
 
 /// Every path Aviary reads or writes under the harness's state directory.
 ///
@@ -43,13 +62,294 @@ public struct AgentHome: Sendable, Hashable {
 
     public var modelsFile: URL { root.appending(path: "models.json") }
     public var settingsFile: URL { root.appending(path: "settings.json") }
+    /// Reversible catalog organization. Archiving never moves or rewrites a transcript.
+    public var archivedSessionsFile: URL { root.appending(path: "archived-sessions.json") }
     public var authFile: URL { root.appending(path: "auth.json") }
+    /// Stable identity for the Work Host represented by this AgentHome.
+    ///
+    /// It is intentionally a non-secret local record. A future remote host will supply its own
+    /// value over the service protocol; local WorkRefs must not all say merely "local".
+    public var workHostIDFile: URL {
+        root.appending(path: "work-host-id", directoryHint: .notDirectory)
+    }
+
+    /// Load or create the durable Work Host identity for this home.
+    ///
+    /// A stable lock plus synchronized temporary-file publication is used as a create-if-absent
+    /// race guard: a second GUI/process that opens the same home reads the winner's id rather than
+    /// replacing it. If the home cannot be written, return a process-local fallback and let the
+    /// caller surface that degraded durability rather than pretending it is a globally stable host.
+    public var workHostID: String {
+        if case .valid(let existing) = Self.persistedWorkHostIDState(from: workHostIDFile) {
+            return existing
+        }
+        do {
+            return try createPersistedWorkHostID()
+        } catch {
+            // Keep the degraded value stable for this home even when persistence is unavailable;
+            // two accesses must not make one process look like two Work Hosts.
+            return "host-unpersisted-\(String(UInt(bitPattern: root.path.hashValue), radix: 16))"
+        }
+    }
+
+    /// Return the Work Host identity only when a value has been durably created and can be read
+    /// back from this home. Unlike workHostID, this API never returns the process-local
+    /// hashValue fallback and is therefore the only suitable source for native authority.
+    public func requirePersistedWorkHostID() throws -> String {
+        switch Self.readPersistedWorkHostIDWithRetry(from: workHostIDFile) {
+        case .valid(let existing):
+            return existing
+        case .malformed:
+            throw AgentHomeError.invalidPersistedWorkHostID
+        case .missing:
+            return try createPersistedWorkHostID()
+        }
+    }
+
+    /// The persisted authority as a typed identity.
+    public func requirePersistedWorkHost() throws -> WorkHostRef {
+        WorkHostRef(try requirePersistedWorkHostID())
+    }
+
+    /// Read the persisted id without manufacturing a fallback. This is useful for diagnostics
+    /// that need to distinguish an empty/uninitialised home from a host that is ready to own Work.
+    public var persistedWorkHostID: String? {
+        if case .valid(let value) = Self.persistedWorkHostIDState(from: workHostIDFile) {
+            return value
+        }
+        return nil
+    }
+
+    private enum PersistedWorkHostIDState {
+        case missing
+        case malformed
+        case valid(String)
+    }
+
+    private var workHostIDLockFile: URL {
+        root.appending(path: "work-host-id.lock", directoryHint: .notDirectory)
+    }
+
+    private static func persistedWorkHostIDState(from url: URL) -> PersistedWorkHostIDState {
+        guard let existing = try? String(contentsOf: url, encoding: .utf8) else {
+            return FileManager.default.fileExists(atPath: url.path) ? .malformed : .missing
+        }
+        let trimmed = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("\n"), !trimmed.contains("\r") else {
+            return .malformed
+        }
+        return .valid(trimmed)
+    }
+
+    /// A competing first-use caller can observe the exclusive file while its winner is still
+    /// writing the short record. Give that in-process/cross-process race a bounded read-back
+    /// window; a missing or permanently malformed record still fails explicitly.
+    private static func readPersistedWorkHostIDWithRetry(from url: URL) -> PersistedWorkHostIDState {
+        var lastState = PersistedWorkHostIDState.missing
+        for attempt in 0..<20 {
+            let state = persistedWorkHostIDState(from: url)
+            if case .valid = state { return state }
+            lastState = state
+            if attempt < 19 { Thread.sleep(forTimeInterval: 0.001) }
+        }
+        return lastState
+    }
+
+    /// Serialize first-use creation and publish a complete, synchronized record without ever
+    /// replacing an existing authority. The temporary file is linked into place atomically;
+    /// a crash can leave an orphan temp file, but cannot leave the authority file half-written.
+    private func createPersistedWorkHostID() throws -> String {
+        try withWorkHostIDLock {
+            switch Self.persistedWorkHostIDState(from: workHostIDFile) {
+            case .valid(let existing):
+                return existing
+            case .malformed:
+                throw AgentHomeError.invalidPersistedWorkHostID
+            case .missing:
+                break
+            }
+
+            do {
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            } catch {
+                throw AgentHomeError.workHostIDUnavailable(error.localizedDescription)
+            }
+
+            let generated = "host-\(UUID().uuidString.lowercased())"
+            let temporary = root.appending(
+                path: ".work-host-id-\(UUID().uuidString.lowercased()).tmp",
+                directoryHint: .notDirectory)
+            defer { try? FileManager.default.removeItem(at: temporary) }
+
+            guard FileManager.default.createFile(
+                atPath: temporary.path, contents: nil,
+                attributes: [.posixPermissions: NSNumber(value: Int16(0o600))]) else {
+                throw AgentHomeError.workHostIDUnavailable("could not create temporary identity")
+            }
+            let temporaryHandle: FileHandle
+            do {
+                temporaryHandle = try FileHandle(forWritingTo: temporary)
+                try temporaryHandle.write(contentsOf: Data((generated + "\n").utf8))
+                try temporaryHandle.synchronize()
+                try temporaryHandle.close()
+            } catch {
+                throw AgentHomeError.workHostIDUnavailable(error.localizedDescription)
+            }
+
+            let linkResult = temporary.path.withCString { source in
+                workHostIDFile.path.withCString { destination in
+                    Darwin.link(source, destination)
+                }
+            }
+            guard linkResult == 0 else {
+                let code = errno
+                if code == EEXIST {
+                    if case .valid(let existing) = Self.persistedWorkHostIDState(from: workHostIDFile) {
+                        return existing
+                    }
+                    throw AgentHomeError.invalidPersistedWorkHostID
+                }
+                throw AgentHomeError.workHostIDUnavailable(
+                    "could not publish identity: \(String(cString: strerror(code)))")
+            }
+
+            guard case .valid(let persisted) = Self.persistedWorkHostIDState(from: workHostIDFile) else {
+                throw AgentHomeError.workHostIDUnavailable("the published identity could not be read back")
+            }
+            return persisted
+        }
+    }
+
+    private func withWorkHostIDLock<T>(_ body: () throws -> T) throws -> T {
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        } catch {
+            throw AgentHomeError.workHostIDUnavailable(error.localizedDescription)
+        }
+
+        let descriptor = workHostIDLockFile.path.withCString {
+            Darwin.open($0, O_RDWR | O_CREAT | O_EXLOCK, S_IRUSR | S_IWUSR)
+        }
+        guard descriptor >= 0 else {
+            throw AgentHomeError.workHostIDUnavailable(
+                "could not lock authority creation: \(String(cString: strerror(errno)))")
+        }
+        let lock = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? lock.close() }
+        return try body()
+    }
     public var agentsFile: URL { root.appending(path: "AGENTS.md") }
 
     public var promptsDir: URL { root.appending(path: "prompts", directoryHint: .isDirectory) }
     public var skillsDir: URL { root.appending(path: "skills", directoryHint: .isDirectory) }
     public var extensionsDir: URL { root.appending(path: "extensions", directoryHint: .isDirectory) }
     public var agentProfilesDir: URL { root.appending(path: "agents", directoryHint: .isDirectory) }
+
+    // MARK: Timeline v2 locators
+
+    /// Timeline v2 deliberately has its own tree. These URLs are locators only; the journal
+    /// owner and authority remain encoded in JournalRef, not inferred from a path.
+    public var timelineV2Dir: URL {
+        root.appending(path: "timeline-v2", directoryHint: .isDirectory)
+    }
+
+    public var timelineV2Root: URL { timelineV2Dir }
+
+    public var timelineV2SessionsDir: URL {
+        timelineV2Dir.appending(path: "sessions", directoryHint: .isDirectory)
+    }
+
+    public var timelineV2WorkHostsDir: URL {
+        timelineV2Dir.appending(path: "work-hosts", directoryHint: .isDirectory)
+    }
+
+    /// Persistent advisory locks live outside owner directories. If a journal directory is
+    /// renamed or replaced, the same owner still resolves to the same lock inode.
+    public var timelineV2LocksDir: URL {
+        timelineV2Dir.appending(path: "locks", directoryHint: .isDirectory)
+    }
+
+    /// Return the lock-file locator for the data path's collision domain.
+    ///
+    /// Data locators intentionally omit Session authority and journal ID, so those values must
+    /// not create a second lock namespace. An identity mismatch is instead rejected when a
+    /// non-empty journal is read. Work identity includes its Work Host because bare Work IDs are
+    /// not globally unique.
+    public func timelineV2JournalLockURL(for journal: JournalRef) -> URL {
+        let ownerKey: String
+        let kind: TimelineJournalKind
+        switch journal.owner {
+        case .session(let session):
+            kind = .session
+            ownerKey = "session\u{00}\(session.sessionID.utf8.count):\(session.sessionID)"
+        case .work(let work):
+            kind = .work
+            ownerKey = "work\u{00}\(work.workHostID.utf8.count):\(work.workHostID)"
+                + "\u{00}\(work.workID.utf8.count):\(work.workID)"
+        }
+        let digest = SHA256.hash(data: Data(ownerKey.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return timelineV2LocksDir
+            .appending(path: kind.rawValue, directoryHint: .isDirectory)
+            .appending(path: "\(digest).lock", directoryHint: .notDirectory)
+    }
+
+    /// Encode a caller-controlled id as one path component. Safe, common ids remain readable;
+    /// every other byte is hex-encoded behind a reserved prefix, so slash, dot-dot, NUL, and
+    /// Unicode normalization cannot escape or alias a directory.
+    public static func timelineV2PathComponent(_ value: String) -> String {
+        let bytes = Array(value.utf8)
+        guard !bytes.isEmpty else { return "~empty" }
+        let safe = bytes.allSatisfy { byte in
+            (byte >= 0x41 && byte <= 0x5A)
+                || (byte >= 0x61 && byte <= 0x7A)
+                || (byte >= 0x30 && byte <= 0x39)
+                || byte == 0x2D || byte == 0x5F
+        }
+        if safe { return value }
+        return "~" + bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    public func timelineV2SessionJournalURL(sessionID: String) -> URL {
+        timelineV2SessionsDir
+            .appending(path: Self.timelineV2PathComponent(sessionID),
+                       directoryHint: .isDirectory)
+            .appending(path: "journal.jsonl", directoryHint: .notDirectory)
+    }
+
+    public func timelineV2SessionJournalURL(_ session: SessionRef) -> URL {
+        timelineV2SessionJournalURL(sessionID: session.sessionID)
+    }
+
+    public func timelineV2WorkJournalURL(workHostID: String, workID: String) -> URL {
+        timelineV2WorkHostsDir
+            .appending(path: Self.timelineV2PathComponent(workHostID),
+                       directoryHint: .isDirectory)
+            .appending(path: "works", directoryHint: .isDirectory)
+            .appending(path: Self.timelineV2PathComponent(workID),
+                       directoryHint: .isDirectory)
+            .appending(path: "journal.jsonl", directoryHint: .notDirectory)
+    }
+
+    public func timelineV2WorkJournalURL(_ work: WorkRef) -> URL {
+        timelineV2WorkJournalURL(workHostID: work.workHostID, workID: work.workID)
+    }
+
+    /// Native Work creation must use this throwing locator so an unwritable home cannot silently
+    /// turn a process-local hash into journal authority.
+    public func timelineV2WorkJournalURL(workID: String) throws -> URL {
+        let hostID = try requirePersistedWorkHostID()
+        return timelineV2WorkJournalURL(workHostID: hostID, workID: workID)
+    }
+
+    public func timelineV2SessionJournal(sessionID: String) -> URL {
+        timelineV2SessionJournalURL(sessionID: sessionID)
+    }
+
+    public func timelineV2WorkJournal(workHostID: String, workID: String) -> URL {
+        timelineV2WorkJournalURL(workHostID: workHostID, workID: workID)
+    }
 
     public var exists: Bool {
         FileManager.default.fileExists(atPath: root.path)

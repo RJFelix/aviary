@@ -21,6 +21,7 @@ public enum ClaudeCodeSession {
         public var runtimeSummary: String
         /// Things true before the first token — a login that bills metered credit, say.
         public var warnings: [String]
+        public var identity: SessionWorkIdentity
     }
 
     public enum SetupError: LocalizedError {
@@ -53,17 +54,58 @@ public enum ClaudeCodeSession {
     /// sent — the caller starts it, because a GUI wants to attach an observer first.
     public static func prepare(
         home: AgentHome, cwd: String, model: String, effort: String?,
-        bridgeExecutable: String, firstPrompt: String, bridge: KernelBridge
+        bridgeExecutable: String, firstPrompt: String, bridge: KernelBridge,
+        resumeAviarySession: String? = nil,
+        identity requestedIdentity: SessionWorkIdentity? = nil,
+        noContextFiles: Bool = false,
+        writer suppliedWriter: SessionWriter? = nil
     ) async throws -> Prepared {
         guard let repoRoot = EngineLocator.repoRoot() else { throw SetupError.noCheckout }
-        guard let auth = await ClaudeCode.authStatus() else { throw SetupError.noBinary }
-        guard auth.loggedIn else { throw SetupError.notSignedIn }
+        // Resolve before booting either the runtime or Claude Code. Legacy headers contribute
+        // their Work identity; a resumed attempt always gets a fresh run id.
+        let identity =
+            requestedIdentity
+            ?? resumeAviarySession.flatMap {
+                SessionWriter.recoverIdentity(home: home, sessionID: $0)
+            }
+            ?? SessionWorkIdentity.allocate(
+                workHostID: home.workHostID,
+                sessionID: resumeAviarySession ?? SessionWriter.newSessionID())
+        let writer: SessionWriter
+        do {
+            if let suppliedWriter {
+                writer = suppliedWriter
+            } else if let resumeAviarySession {
+                writer = try SessionWriter(
+                    home: home, resuming: resumeAviarySession, cwd: cwd,
+                    model: ClaudeCodeRun.modelSpec(for: model), identity: identity)
+            } else {
+                writer = try SessionWriter(
+                    home: home, cwd: cwd, model: ClaudeCodeRun.modelSpec(for: model),
+                    identity: identity)
+            }
+        } catch {
+            throw SetupError.sessionFileFailed(error.localizedDescription)
+        }
+        guard case .healthy = await writer.writerHealth else {
+            await writer.close()
+            throw SetupError.sessionFileFailed("The session journal is unavailable.")
+        }
+        guard let auth = await ClaudeCode.authStatus() else {
+            await writer.close()
+            throw SetupError.noBinary
+        }
+        guard auth.loggedIn else {
+            await writer.close()
+            throw SetupError.notSignedIn
+        }
 
         var warnings: [String] = []
         if !auth.isSubscription {
             // Worth saying before the run rather than after: an API-key login works perfectly
             // and removes the only reason to drive Claude Code instead of calling the model.
-            warnings.append("This login is not a subscription one, so this run bills metered "
+            warnings.append(
+                "This login is not a subscription one, so this run bills metered "
                 + "API credit rather than the plan.")
         }
 
@@ -75,8 +117,13 @@ public enum ClaudeCodeSession {
         let hostSession: String
         do {
             runtimeSummary = try await host.start().summary
-            hostSession = try await host.createSession(cwd: cwd)
+            hostSession = try await host.createSession(id: identity.workID, cwd: cwd)
         } catch {
+            // The host is owned by this prepared session. If startup or session creation fails,
+            // no caller can attach to it later, so close the process before surfacing setup
+            // failure. A failed create has no returned id to destroy.
+            await host.stop()
+            await writer.close()
             throw SetupError.runtimeFailed(error.localizedDescription)
         }
 
@@ -89,14 +136,18 @@ public enum ClaudeCodeSession {
             projectRoot: URL(fileURLWithPath: cwd), enginePackageRoot: nil)
         let gate = SkillGate()
         let selection = gate.select(skills: library.skills, prompt: firstPrompt, cwd: cwd)
-        let skillsNote = library.skills.isEmpty ? nil
+        let skillsNote =
+            library.skills.isEmpty
+            ? nil
             : "\(selection.included.count) of \(library.skills.count) skills described"
                 + " · \(Fmt.bytes(selection.savedCharacters)) saved"
 
         let memory = MemoryStore(repoRoot: repoRoot, home: home, cwd: cwd)
         let memoryGate = MemoryGate()
         let recalled = memoryGate.select(memory.load(sessionID: nil), prompt: firstPrompt)
-        let memoryNote = recalled.totalAvailable == 0 ? nil
+        let memoryNote =
+            recalled.totalAvailable == 0
+            ? nil
             : "\(recalled.included.count) memories recalled"
 
         let run: ClaudeCodeRun
@@ -106,21 +157,32 @@ public enum ClaudeCodeSession {
                     home: home, cwd: cwd, model: model,
                     systemPrompt: ClaudeCodePrompt.build(
                         cwd: cwd, skills: gate.render(selection),
-                        memory: memoryGate.render(recalled)),
-                    effort: effort, bridgeExecutable: bridgeExecutable),
-                bridge: bridge)
+                        memory: memoryGate.render(recalled),
+                        includeContextFiles: !noContextFiles),
+                    effort: effort, bridgeExecutable: bridgeExecutable,
+                    resumeAviarySession: resumeAviarySession, identity: identity),
+                bridge: bridge, writer: writer)
         } catch {
+            // `ClaudeCodeRun` creates the Aviary SessionWriter. If that setup fails after the
+            // runtime namespace exists, tear down both sides before returning the error.
+            await host.destroySessionQuietly(hostSession)
+            await host.stop()
+            await writer.close()
             throw SetupError.sessionFileFailed(error.localizedDescription)
         }
 
         let kernel = ClaudeCodeKernel(
             host: host, hostSession: hostSession, memory: memory,
             sessionFile: run.fileURL, sessionID: run.sessionID,
-            artifacts: ArtifactStore(home: home, sessionID: run.sessionID))
+            artifacts: ArtifactStore(home: home, sessionID: run.sessionID),
+            writer: writer)
         await kernel.setCwdHint(cwd)
         await kernel.noteFirstPrompt(firstPrompt)
-        await kernel.onNote { text, customType in
+        await kernel.onCheckedNote { text, customType in
             await run.note(text, customType: customType)
+        }
+        await kernel.onJournalFailure { detail in
+            await run.journalFailure(detail)
         }
         await bridge.offer([await kernel.tool()])
         // `remember`, `recall`, `conversation` and `artifact` come from inside the interpreter,
@@ -135,6 +197,6 @@ public enum ClaudeCodeSession {
         return Prepared(
             run: run, kernel: kernel, host: host, auth: auth,
             skillsNote: skillsNote, memoryNote: memoryNote,
-            runtimeSummary: runtimeSummary, warnings: warnings)
+            runtimeSummary: runtimeSummary, warnings: warnings, identity: identity)
     }
 }

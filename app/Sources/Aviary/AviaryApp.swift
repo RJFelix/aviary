@@ -1,6 +1,6 @@
-import SwiftUI
 import AppKit
 import AviaryCore
+import SwiftUI
 
 @main
 struct AviaryApp: App {
@@ -8,7 +8,7 @@ struct AviaryApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     /// When this process started, for the preview loop's own timing line.
-    nonisolated(unsafe) static let launchedAt = Date()
+    static let launchedAt = Date()
 
     init() {
         _ = Self.launchedAt
@@ -31,13 +31,14 @@ struct AviaryApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("Aviary") {
+        WindowGroup("Aviary", id: "main") {
             RootView()
                 .environment(model)
                 // Wide enough that the three-pane screens always fit: a 280pt sidebar
                 // plus the 800pt the Sessions panes demand together.
                 .frame(minWidth: 1100, minHeight: 680)
                 .task {
+                    delegate.prepareForTermination = { await model.stopAllWork() }
                     if let preview = Self.previewSection {
                         model.bootstrapPreview(section: preview)
                     } else {
@@ -64,8 +65,26 @@ struct AviaryApp: App {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    var prepareForTermination: (() async -> Void)?
+    private var terminationTask: Task<Void, Never>?
+
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
+
+    /// AppKit's terminate request is synchronous, while Work teardown is not. Returning
+    /// `terminateLater` keeps the process alive until Claude Code, the runtime host, session
+    /// writers, and their readers have actually quiesced. This is intentionally not invoked
+    /// for last-window close: that event has no user intent to end Work.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let prepareForTermination else { return .terminateNow }
+        guard terminationTask == nil else { return .terminateLater }
+        terminationTask = Task { @MainActor in
+            await prepareForTermination()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
 }
 
 // MARK: - Menus
@@ -106,7 +125,9 @@ struct AviaryCommands: Commands {
                 model.showInspector.toggle()
             }
             .keyboardShortcut("i", modifiers: [.command, .option])
-            Toggle("Hide Thinking Blocks", isOn: Binding(
+            Toggle(
+                "Hide Thinking Blocks",
+                isOn: Binding(
                 get: { model.hideThinking },
                 set: { model.hideThinking = $0 }))
         }
@@ -151,9 +172,9 @@ struct MenuBarLabel: View {
     @Environment(AppModel.self) private var model
 
     /// Runs this process is holding, not sessions a supervisor claims to hold. With the
-    /// harness gone there is only one answer to "what is running", and it is in `runs`.
+    /// harness gone there is only one answer to "what is running": attached plus detached Work.
     private var working: Int {
-        model.runs.filter(\.isStreaming).count
+        model.workRuns.filter(\.isStreaming).count
     }
 
     var body: some View {
@@ -168,10 +189,12 @@ struct MenuBarLabel: View {
 
 struct MenuBarContent: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        let live = model.runs.filter { !$0.hasExited }
-        Text(live.isEmpty
+        let live = model.workRuns.filter { !$0.hasExited }
+        Text(
+            live.isEmpty
             ? "No live agents"
             : "\(live.count) live · \(live.filter(\.isStreaming).count) working")
 
@@ -179,8 +202,14 @@ struct MenuBarContent: View {
             Divider()
             ForEach(live.prefix(12)) { s in
                 Button {
-                    NSApp.activate(ignoringOtherApps: true)
+                    if model.detachedRuns.contains(where: { $0.id == s.id }) {
+                        model.reattachRun(s)
+                    } else {
+                        model.focusedRunID = s.id
                     model.section = .live
+                    }
+                    openWindow(id: "main")
+                    NSApp.activate(ignoringOtherApps: true)
                 } label: {
                     Text("\(s.isStreaming ? "▶ " : "· ")\(s.title)")
                 }
@@ -188,7 +217,10 @@ struct MenuBarContent: View {
         }
 
         Divider()
-        Button("Open Aviary") { NSApp.activate(ignoringOtherApps: true) }
+        Button("Open Aviary") {
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
         Divider()
         Button("Quit Aviary") { NSApp.terminate(nil) }
             .keyboardShortcut("q")

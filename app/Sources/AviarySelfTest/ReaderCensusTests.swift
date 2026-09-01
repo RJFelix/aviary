@@ -1,0 +1,335 @@
+import Foundation
+import CryptoKit
+@testable import AviaryCore
+
+private enum ReaderCensusFixtureFiles {
+    static var root: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appending(path: "Fixtures/ReaderCensus")
+    }
+
+    static func data(_ name: String) throws -> Data {
+        try Data(contentsOf: root.appending(path: name))
+    }
+
+    static func manifest() throws -> ReaderCensusManifest {
+        try JSONDecoder().decode(ReaderCensusManifest.self, from: data("manifest.json"))
+    }
+}
+
+private let censusSessionJournal = JournalRef.session(
+    SessionRef("census-session"), journalID: "session-journal",
+    authority: TimelineAuthorityRef("session-authority"))
+private let censusWorkJournal = JournalRef.work(
+    WorkRef(workHostID: "census-host", workID: "census-work"), journalID: "work-journal")
+
+private func prefixLines(_ data: Data, count: Int) -> Data {
+    var result = Data()
+    for line in data.split(separator: 0x0A).prefix(count) {
+        result.append(contentsOf: line)
+        result.append(0x0A)
+    }
+    return result
+}
+
+func test_readerCensusFixtureProjectsCorePlanes() throws {
+    let manifest = try ReaderCensusFixtureFiles.manifest()
+    let report = ReaderCensus.report(
+        sessionData: try ReaderCensusFixtureFiles.data(manifest.sessionJournal),
+        sessionJournal: censusSessionJournal,
+        workData: try ReaderCensusFixtureFiles.data(manifest.workJournal),
+        workJournal: censusWorkJournal,
+        manifest: manifest)
+
+    XCTAssertEqual(report.projectionRulesVersion, 1)
+    XCTAssertEqual(report.sessionCommittedEventIDs.count, 20)
+    XCTAssertEqual(report.workCommittedEventIDs.count, 21)
+    XCTAssertTrue(report.sessionIntegrityValid)
+    XCTAssertTrue(report.workIntegrityValid)
+    XCTAssertTrue(report.sessionStructuralIntegrityValid)
+    XCTAssertTrue(report.workStructuralIntegrityValid)
+    XCTAssertTrue(report.sessionSemanticProjectionValid)
+    XCTAssertTrue(report.workSemanticProjectionValid)
+    XCTAssertTrue(report.assemblerReady)
+    XCTAssertEqual(report.visibleMessageIDs, ["s6", "s7", "s10", "s11"])
+    XCTAssertEqual(report.activeTip?.eventID, "s11")
+    XCTAssertEqual(report.contextInclusionIDs, ["include-pinned", "include-artifact"])
+    XCTAssertEqual(report.omittedContextIDs, ["omit-history"])
+    XCTAssertEqual(report.contextComponents.count, 3)
+    XCTAssertEqual(report.compactionSummary,
+                   "Earlier inspection was compacted; preserve the selected branch.")
+    XCTAssertEqual(report.contextComponents[1].deliveryMode, .manifest)
+    XCTAssertEqual(report.contextComponents[1].bodyReference?.referenceID, "artifact-large")
+    XCTAssertEqual(report.contextComponents[1].fullByteCount, 109)
+    XCTAssertEqual(
+        report.contextComponents[1].digest,
+        "sha256:d20df9c3095aae2a5f655826b2e5cf5ccc95a4e44dc42d5f355c97eda0770da1")
+    XCTAssertEqual(
+        report.contextComponents[1].bodyReference?.digest,
+        report.contextComponents[1].digest)
+    XCTAssertEqual(report.contextComponents[1].bodyReference?.byteCount, 109)
+    XCTAssertEqual(
+        Set(report.contextComponents.compactMap { $0.bodyReference?.referenceID }),
+        Set(["artifact-large", "tool-result"]))
+    XCTAssertEqual(report.contextComponents[2].fullByteCount, 63)
+    XCTAssertEqual(
+        report.contextComponents[2].digest,
+        "sha256:f7423ed89ecf634efc2cbe26e719d08e53fd49888c41af2547b378740a5d7fe8")
+    XCTAssertEqual(report.authoredAttention, .review)
+    XCTAssertEqual(report.attention, .error)
+    XCTAssertEqual(report.outstandingActionIDs, ["action-incomplete"])
+    XCTAssertEqual(report.indeterminateActionIDs, ["action-indeterminate"])
+    XCTAssertEqual(report.outstandingHandleIDs, ["handle-background"])
+    XCTAssertTrue(report.outstandingCommandIDs.isEmpty)
+    XCTAssertEqual(report.childStates, ["child-1": "completed"])
+    XCTAssertEqual(report.modelIDs, ["model-v1", "model-v2"])
+    XCTAssertEqual(report.runIDs, ["run-1"])
+    XCTAssertEqual(report.recovery.count, 1)
+    XCTAssertEqual(report.recovery[0].journal, censusWorkJournal)
+    XCTAssertEqual(report.recovery[0].coverage.planes[.runtimeNamespace], .lost)
+    XCTAssertEqual(report.attachments.count, 6)
+    XCTAssertEqual(
+        report.attachments.filter { $0.journal == censusSessionJournal }.count, 4)
+    XCTAssertEqual(
+        report.attachments.filter { $0.journal == censusWorkJournal }.count, 2)
+    XCTAssertTrue(report.unknownEventIDs.contains("w21"))
+    XCTAssertEqual(report.unknownEventRefs.count, 2)
+    XCTAssertEqual(
+        Set(report.unknownEventRefs.map { $0.journal }),
+        Set([censusSessionJournal, censusWorkJournal]))
+    XCTAssertTrue(report.unknownDomains.contains(.runtime))
+    XCTAssertEqual(report.unknownReferenceIDs, ["missing-activity"])
+    XCTAssertEqual(report.unknownReferences.count, 1)
+    XCTAssertEqual(report.unknownReferences[0].eventID, "missing-activity")
+    XCTAssertEqual(report.intentionallyUnwiredConsumers, [
+        "legacy SessionCatalog scanner (native timeline consumer pending)", "Flock", "notifications", "search", "service recovery",
+    ])
+
+    let workEvents = ReaderCensus.read(
+        try ReaderCensusFixtureFiles.data("work.jsonl"), journal: censusWorkJournal)
+        .records.map(\.event)
+    XCTAssertEqual(workEvents.first { $0.eventID == "w14" }?.payload["command_kind"]?.stringValue, "queue")
+    XCTAssertEqual(workEvents.first { $0.eventID == "w14" }?.payload["delivery_mode"]?.stringValue, "queued")
+    XCTAssertEqual(workEvents.first { $0.eventID == "w15" }?.payload["command_kind"]?.stringValue, "steer")
+    XCTAssertEqual(workEvents.first { $0.eventID == "w15" }?.payload["late"]?.boolValue, true)
+    XCTAssertEqual(workEvents.first { $0.eventID == "w11" }?.payload["action_kind"]?.stringValue, "tool")
+    XCTAssertEqual(workEvents.first { $0.eventID == "w11" }?.payload["tool_name"]?.stringValue, "shell")
+
+    // Every retained body named by the manifest is addressable by a context body reference, and
+    // the locator's measured bytes/digest agree with the actual retained bytes.
+    let manifestBodyReferences = Set(report.contextComponents.compactMap { $0.bodyReference?.referenceID })
+    XCTAssertTrue(manifestBodyReferences.isSuperset(of: ["artifact-large", "tool-result"]))
+    let manifestBodyByReference = [
+        "artifact-large": "bodies/large-artifact.json",
+        "tool-result": "bodies/tool-result.txt",
+    ]
+    XCTAssertEqual(Set(manifest.retainedBodies), Set(manifestBodyByReference.values))
+    for (referenceID, path) in manifestBodyByReference {
+        let body = try ReaderCensusFixtureFiles.data(path)
+        let component = try XCTUnwrap(report.contextComponents.first {
+            $0.bodyReference?.referenceID == referenceID
+        })
+        XCTAssertEqual(component.bodyReference?.byteCount, body.count)
+        XCTAssertEqual(component.fullByteCount, body.count)
+        let digest = SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(component.bodyReference?.digest, "sha256:\(digest)")
+    }
+
+    // Bare IDs are only a compatibility view: the same event ID can legitimately occur in
+    // separate journals and must remain distinguishable in the canonical report.
+    let duplicateSessionData = Data(String(
+        decoding: try ReaderCensusFixtureFiles.data("session.jsonl"), as: UTF8.self)
+        .replacingOccurrences(of: "\"event_id\":\"s20\"", with: "\"event_id\":\"w21\"")
+        .utf8)
+    let duplicateReport = ReaderCensus.report(
+        sessionData: duplicateSessionData, sessionJournal: censusSessionJournal,
+        workData: try ReaderCensusFixtureFiles.data("work.jsonl"), workJournal: censusWorkJournal)
+    XCTAssertEqual(duplicateReport.unknownEventRefs.map(\.eventID), ["w21", "w21"])
+    XCTAssertEqual(duplicateReport.unknownEventIDs, ["w21"])
+    XCTAssertEqual(
+        Set(duplicateReport.unknownEventRefs.map { $0.journal }),
+        Set([censusSessionJournal, censusWorkJournal]))
+}
+
+func test_readerCensusIndeterminateActionOverridesAuthoredAttention() throws {
+    let original = try ReaderCensusFixtureFiles.data("session.jsonl")
+    let altered = Data(String(decoding: original, as: UTF8.self)
+        .replacingOccurrences(of: "\"attention\":\"review\"", with: "\"attention\":\"none\"")
+        .utf8)
+    let report = ReaderCensus.report(
+        sessionData: altered, sessionJournal: censusSessionJournal,
+        workData: try ReaderCensusFixtureFiles.data("work.jsonl"), workJournal: censusWorkJournal)
+    XCTAssertEqual(report.authoredAttention, .none)
+    XCTAssertEqual(report.attention, .error)
+    XCTAssertEqual(report.indeterminateActionIDs, ["action-indeterminate"])
+}
+
+func test_readerCensusRejectsContradictoryRetainedBodyMetadata() throws {
+    let original = try ReaderCensusFixtureFiles.data("session.jsonl")
+    let altered = Data(String(decoding: original, as: UTF8.self)
+        .replacingOccurrences(
+            of: "\"byte_count\":109,\"digest\":\"sha256:d20df9c3095aae2a5f655826b2e5cf5ccc95a4e44dc42d5f355c97eda0770da1\"",
+            with: "\"byte_count\":109,\"digest\":\"sha256:contradictory\"")
+        .utf8)
+    let report = ReaderCensus.report(
+        sessionData: altered, sessionJournal: censusSessionJournal,
+        workData: try ReaderCensusFixtureFiles.data("work.jsonl"), workJournal: censusWorkJournal)
+    XCTAssertFalse(report.sessionSemanticProjectionValid)
+    XCTAssertFalse(report.sessionIntegrityValid)
+    XCTAssertTrue(report.workSemanticProjectionValid)
+}
+
+func test_readerCensusIncrementalChunksMatchWholeRead() throws {
+    let sessionData = try ReaderCensusFixtureFiles.data("session.jsonl")
+    let workData = try ReaderCensusFixtureFiles.data("work.jsonl")
+    let wholeSession = ReaderCensus.read(sessionData, journal: censusSessionJournal)
+    let wholeWork = ReaderCensus.read(workData, journal: censusWorkJournal)
+    let chunkSizes = [1, 2, 7, 3, 19, 5, 11]
+    let incrementalSession = ReaderCensus.readIncrementally(
+        sessionData, journal: censusSessionJournal, chunkSizes: chunkSizes)
+    let incrementalWork = ReaderCensus.readIncrementally(
+        workData, journal: censusWorkJournal, chunkSizes: chunkSizes)
+
+    XCTAssertEqual(
+        incrementalSession.records.map { $0.event.eventID },
+        wholeSession.records.map { $0.event.eventID })
+    XCTAssertEqual(
+        incrementalWork.records.map { $0.event.eventID },
+        wholeWork.records.map { $0.event.eventID })
+    XCTAssertNil(incrementalSession.quarantinedSuffix)
+    XCTAssertNil(incrementalSession.truncatedTail)
+    XCTAssertNil(incrementalWork.quarantinedSuffix)
+    XCTAssertNil(incrementalWork.truncatedTail)
+
+    let wholeReport = ReaderCensus.report(
+        sessionRead: wholeSession, workRead: wholeWork,
+        sessionJournal: censusSessionJournal, workJournal: censusWorkJournal)
+    let incrementalReport = ReaderCensus.report(
+        sessionRead: incrementalSession, workRead: incrementalWork,
+        sessionJournal: censusSessionJournal, workJournal: censusWorkJournal)
+    XCTAssertEqual(incrementalReport, wholeReport)
+
+    // A fixed seed gives reproducible coverage while exercising boundaries that tend to split
+    // inside JSON strings, escaped values, and nested references.
+    for seed in 1...8 {
+        let schedule = (0..<9).map { ((seed * 31 + $0 * 17) % 23) + 1 }
+        let session = ReaderCensus.readIncrementally(
+            sessionData, journal: censusSessionJournal, chunkSizes: schedule)
+        let work = ReaderCensus.readIncrementally(
+            workData, journal: censusWorkJournal, chunkSizes: schedule)
+        XCTAssertEqual(session.records.map { $0.event.eventID }, wholeSession.records.map { $0.event.eventID })
+        XCTAssertEqual(work.records.map { $0.event.eventID }, wholeWork.records.map { $0.event.eventID })
+        XCTAssertEqual(session.truncatedTail?.rawBytes.count, wholeSession.truncatedTail?.rawBytes.count)
+        XCTAssertEqual(work.truncatedTail?.rawBytes.count, wholeWork.truncatedTail?.rawBytes.count)
+    }
+
+    // Prefixes model a remote reader that has only fetched part of either journal. Both reader
+    // modes must agree on committed bytes, reduced snapshots, and the assembled report.
+    for step in 1...11 {
+        let sessionPrefix = Data(sessionData.prefix(max(1, sessionData.count * step / 12)))
+        let workPrefix = Data(workData.prefix(max(1, workData.count * step / 12)))
+        let wholeSessionPrefix = ReaderCensus.read(sessionPrefix, journal: censusSessionJournal)
+        let incrementalSessionPrefix = ReaderCensus.readIncrementally(
+            sessionPrefix, journal: censusSessionJournal, chunkSizes: [2, 5, 13])
+        let wholePrefix = ReaderCensus.read(workPrefix, journal: censusWorkJournal)
+        let incrementalPrefix = ReaderCensus.readIncrementally(
+            workPrefix, journal: censusWorkJournal, chunkSizes: [2, 5, 13])
+        XCTAssertEqual(
+            incrementalSessionPrefix.records.map { $0.event.eventID },
+            wholeSessionPrefix.records.map { $0.event.eventID })
+        XCTAssertEqual(
+            SessionReducer.reduce(incrementalSessionPrefix.records.map { $0.event }),
+            SessionReducer.reduce(wholeSessionPrefix.records.map { $0.event }))
+        XCTAssertEqual(
+            incrementalPrefix.records.map { $0.event.eventID },
+            wholePrefix.records.map { $0.event.eventID })
+        XCTAssertEqual(
+            WorkReducer.reduce(incrementalPrefix.records.map { $0.event }),
+            WorkReducer.reduce(wholePrefix.records.map { $0.event }))
+        XCTAssertEqual(incrementalPrefix.truncatedTail?.rawBytes.count, wholePrefix.truncatedTail?.rawBytes.count)
+        XCTAssertEqual(incrementalPrefix.quarantinedSuffix?.rawBytes.count, wholePrefix.quarantinedSuffix?.rawBytes.count)
+        XCTAssertEqual(
+            ReaderCensus.report(
+                sessionRead: incrementalSessionPrefix, workRead: incrementalPrefix,
+                sessionJournal: censusSessionJournal, workJournal: censusWorkJournal),
+            ReaderCensus.report(
+                sessionRead: wholeSessionPrefix, workRead: wholePrefix,
+                sessionJournal: censusSessionJournal, workJournal: censusWorkJournal))
+    }
+
+    // Session has already recorded a cursor for Work w21 while the remote Work page ends at w20.
+    // The assembler must not silently substitute the older Work cursor and claim attachment.
+    let delayedSession = ReaderCensus.read(
+        prefixLines(sessionData, count: 19), journal: censusSessionJournal)
+    let delayedWork = ReaderCensus.read(
+        prefixLines(workData, count: 20), journal: censusWorkJournal)
+    let delayedReport = ReaderCensus.report(
+        sessionRead: delayedSession, workRead: delayedWork,
+        sessionJournal: censusSessionJournal, workJournal: censusWorkJournal)
+    XCTAssertFalse(delayedReport.assemblerReady)
+
+    // A Session prefix with no active Work attachment is a complete assembly in its own right;
+    // the absence of a Work page must not make every early/session-only projection look broken.
+    let unattachedSession = ReaderCensus.read(
+        prefixLines(sessionData, count: 1), journal: censusSessionJournal)
+    let unavailableWork = ReaderCensus.read(
+        Data(), journal: censusWorkJournal)
+    let unattachedReport = ReaderCensus.report(
+        sessionRead: unattachedSession, workRead: unavailableWork,
+        sessionJournal: censusSessionJournal, workJournal: censusWorkJournal)
+    XCTAssertTrue(unattachedReport.assemblerReady)
+}
+
+func test_readerCensusMalformedAndTruncatedTailsStayVisible() throws {
+    let malformed = try ReaderCensus.read(
+        ReaderCensusFixtureFiles.data("variants/work-malformed.jsonl"), journal: censusWorkJournal)
+    XCTAssertEqual(malformed.records.map { $0.event.eventID }, ["w1"])
+    XCTAssertNotNil(malformed.quarantinedSuffix)
+    XCTAssertNil(malformed.truncatedTail)
+
+    // This fixture deliberately has no final newline: the last record is a transport-truncated
+    // tail under the real byte reader contract and must not be treated as committed.
+    let truncatedBytes = try ReaderCensusFixtureFiles.data("variants/work-truncated.jsonl")
+    XCTAssertTrue(truncatedBytes.last != 0x0A, "truncated fixture must be unterminated")
+    let truncated = ReaderCensus.read(truncatedBytes, journal: censusWorkJournal)
+    XCTAssertEqual(truncated.records.map { $0.event.eventID }, ["w1"])
+    XCTAssertNotNil(truncated.truncatedTail)
+    XCTAssertNil(truncated.quarantinedSuffix)
+}
+
+func test_readerCensusLegacyJournalKeepsSyntheticIdentity() throws {
+    let journal = JournalRef.session(
+        SessionRef("legacy-census"), journalID: "legacy-journal",
+        authority: TimelineAuthorityRef("legacy-authority"))
+    let result = ReaderCensus.read(
+        try ReaderCensusFixtureFiles.data("legacy.jsonl"), journal: journal)
+    XCTAssertEqual(result.records.count, 2)
+    XCTAssertTrue(result.records.allSatisfy { $0.event.provenance == .legacyAdapted })
+    XCTAssertTrue(result.records[0].event.eventID.hasPrefix("legacy:"))
+    XCTAssertEqual(result.records[0].legacyRawID, "legacy-census")
+    XCTAssertNil(result.truncatedTail)
+    XCTAssertNil(result.quarantinedSuffix)
+}
+
+func test_readerCensusManifestAndRetainedBodiesRoundTrip() throws {
+    let manifest = try ReaderCensusFixtureFiles.manifest()
+    let roundTrip = try JSONDecoder().decode(
+        ReaderCensusManifest.self, from: JSONEncoder().encode(manifest))
+    XCTAssertEqual(roundTrip, manifest)
+    for path in manifest.retainedBodies {
+        let body = try ReaderCensusFixtureFiles.data(path)
+        XCTAssertFalse(body.isEmpty)
+        let expected: (Int, String)
+        if path.hasSuffix("large-artifact.json") {
+            expected = (109, "d20df9c3095aae2a5f655826b2e5cf5ccc95a4e44dc42d5f355c97eda0770da1")
+        } else {
+            expected = (63, "f7423ed89ecf634efc2cbe26e719d08e53fd49888c41af2547b378740a5d7fe8")
+        }
+        XCTAssertEqual(body.count, expected.0)
+        XCTAssertEqual(
+            SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined(), expected.1)
+    }
+}

@@ -40,12 +40,37 @@ enum ClaudeCodeCLI {
         let home = AgentHome.default
 
         let bridge = KernelBridge()
+        let identity = RunConfiguration(
+            cwd: cwd, provider: "claude-code", model: model, thinkingLevel: effort)
+            .resolvedIdentity(home: home)
+        let writer: SessionWriter
+        do {
+            writer = try SessionWriter(
+                home: home, cwd: cwd, model: ClaudeCodeRun.modelSpec(for: model), identity: identity)
+        } catch {
+            AgentCLI.fail("Could not open the session journal: \(error.localizedDescription)")
+        }
+        let commandController = SessionCommandController(
+            identity: identity, writer: writer)
+        let startAdmission = await commandController.admitAndCommit(
+            .start(prompt: prompt), actorID: "cli", commandID: "cli-start")
+        guard case .accepted(let startCommand) = startAdmission else {
+            await finishFailedLaunch(commandController: commandController, writer: writer)
+            AgentCLI.fail("The Claude Code start command could not be durably admitted.")
+        }
+        guard await commandController.awaitDispatch(commandID: startCommand.commandID) != nil else {
+            await finishFailedLaunch(commandController: commandController, writer: writer)
+            AgentCLI.fail("The Claude Code start command lost its dispatch turn.")
+        }
+        _ = await commandController.acknowledgeDispatched(commandID: startCommand.commandID)
         let prepared: ClaudeCodeSession.Prepared
         do {
             prepared = try await ClaudeCodeSession.prepare(
                 home: home, cwd: cwd, model: model, effort: effort,
-                bridgeExecutable: CommandLine.arguments[0], firstPrompt: prompt, bridge: bridge)
+                bridgeExecutable: CommandLine.arguments[0], firstPrompt: prompt, bridge: bridge,
+                identity: identity, writer: writer)
         } catch {
+            await finishFailedLaunch(commandController: commandController, writer: writer)
             AgentCLI.fail(error.localizedDescription)
         }
         let run = prepared.run
@@ -63,6 +88,8 @@ enum ClaudeCodeCLI {
                 if !quiet { note("session \(session) · claude-code/\(model) · \(cwd)") }
             case .claudeSession(let id):
                 if !quiet { note("claude session \(id)") }
+            case .inputCommitted:
+                break
             case .textDelta(let text):
                 FileHandle.standardOutput.write(Data(text.utf8))
             case .thinkingDelta:
@@ -77,19 +104,41 @@ enum ClaudeCodeCLI {
                 note("! \(text)")
             case .failed(let detail):
                 note("\n— failed: \(detail)")
-            case .turnFinished, .finished:
+            case .messageCommitted, .turnFinished, .finished:
                 break
             }
         }
 
+        var endCommand: AdmittedSessionCommand?
         do {
+            guard await commandController.acknowledgePreparation(commandID: startCommand.commandID)
+            else {
+                throw NSError(
+                    domain: "Aviary.ClaudeCodeCLI", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "The start command was not acknowledged."])
+            }
             try await run.start(prompt: prompt)
+            // The initial user message has crossed Claude's stdin boundary at this point. Make
+            // End the durable next owner before closing stdin, so the controller truthfully stays
+            // in `.ending` while Claude finishes its final turn.
+            let endAdmission = await commandController.admitAndCommit(.endRun, actorID: "cli")
+            guard case .accepted(let admitted) = endAdmission,
+                  let dispatch = await commandController.awaitDispatch(commandID: admitted.commandID)
+            else {
+                throw NSError(
+                    domain: "Aviary.ClaudeCodeCLI", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "The End command was not dispatchable."])
+            }
+            endCommand = dispatch
+            _ = await commandController.acknowledgeDispatched(commandID: dispatch.commandID)
             // One prompt, so tell Claude Code that immediately. Without it the process waits
             // on stdin forever and a `--claude-code` invocation never returns.
             await run.finishInput()
         } catch {
             note("could not start: \(error.localizedDescription)")
-            await prepared.host.stop()
+            await finishFailedLaunch(
+                commandController: commandController, writer: writer,
+                run: run, host: prepared.host, cancelActiveTurn: true)
             return
         }
 
@@ -111,9 +160,35 @@ enum ClaudeCodeCLI {
         }
         await run.stop()
         await prepared.host.stop()
+        if let endCommand {
+            _ = await commandController.acknowledgeEnd(commandID: endCommand.commandID)
+        }
     }
 
     private static func note(_ text: String) {
         FileHandle.standardError.write(Data((text + "\n").utf8))
+    }
+
+    private static func finishFailedLaunch(
+        commandController: SessionCommandController, writer: SessionWriter,
+        run: ClaudeCodeRun? = nil, host: RuntimeHost? = nil,
+        cancelActiveTurn: Bool = false
+    ) async {
+        let ending = await commandController.admitAndCommit(.endRun, actorID: "cli")
+        let endCommand: AdmittedSessionCommand?
+        if case .accepted(let admitted) = ending {
+            endCommand = await commandController.awaitDispatch(commandID: admitted.commandID)
+        } else {
+            endCommand = nil
+        }
+        if let endCommand {
+            _ = await commandController.acknowledgeDispatched(commandID: endCommand.commandID)
+        }
+        await run?.stop(cancelActiveTurn: cancelActiveTurn)
+        await host?.stop()
+        try? await writer.closeChecked()
+        if let endCommand {
+            _ = await commandController.acknowledgeEnd(commandID: endCommand.commandID)
+        }
     }
 }

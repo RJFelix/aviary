@@ -1,6 +1,6 @@
-import SwiftUI
 import AppKit
 import AviaryCore
+import SwiftUI
 
 /// Filing a request, capturing what Aviary looked like, and handing it to the agent.
 ///
@@ -33,7 +33,7 @@ extension AppModel {
     /// The run servicing the board, if one is attached in this app.
     var workshopRun: LiveRun? {
         guard let workshopRunID else { return nil }
-        return runs.first { $0.id == workshopRunID }
+        return workRuns.first { $0.id == workshopRunID }
     }
 
     /// What to tell the user about the agent's availability, in one line.
@@ -69,7 +69,8 @@ extension AppModel {
     func openCapturePanel() {
         guard !capturePanelOpen, !isCapturingShot else { return }
         pendingContext = captureContext()
-        guard draftIncludesShot, let window = NSApp.keyWindow
+        guard draftIncludesShot,
+            let window = NSApp.keyWindow
             ?? NSApp.windows.first(where: { $0.isVisible })
         else {
             capturePanelOpen = true
@@ -126,7 +127,11 @@ extension AppModel {
         Task { await submitRequestAsync(title: rawTitle, body: rawBody, kind: kind) }
     }
 
-    private func submitRequestAsync(title rawTitle: String, body rawBody: String, kind: WorkshopKind) async {
+    private func submitRequestAsync(
+        title rawTitle: String, body rawBody: String, kind: WorkshopKind
+    )
+        async
+    {
         let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = rawBody.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty || !body.isEmpty else { return }
@@ -148,7 +153,9 @@ extension AppModel {
 
         do {
             try WorkshopLog.append(
-                WorkshopEvent(event: "created", id: id, fields: [
+                WorkshopEvent(
+                    event: "created", id: id,
+                    fields: [
                     "title": .string(title),
                     "body": .string(body),
                     "kind": .string(kind.rawValue),
@@ -187,44 +194,66 @@ extension AppModel {
         // Already attached here: the run knows whether it is mid-turn, and a follow-up is
         // the honest verb for "when you are next idle".
         if let run = workshopRun, !run.hasExited {
-            if run.isStreaming {
-                await run.queueFollowUp(message)
-                show("Queued \(request.id) — the agent will pick it up after this turn.")
+            let wasStreaming = run.isStreaming
+            let receipt: SessionCommandReceipt
+            if wasStreaming {
+                receipt = await run.queueFollowUp(message)
             } else {
-                await run.send(message)
-                show("Sent \(request.id) to the workshop agent.")
+                receipt = await run.send(message)
             }
+            guard receipt.wasHandedOff else {
+                let detail = receipt.delivery.detail ?? "the Work did not accept the input"
+                recordAttachedHandoff(
+                    request.id, note: "Delivery was not confirmed: \(detail)")
+                show(
+                    "Filed \(request.id), but delivery was not confirmed. The request remains open.",
+                    isError: true)
+                return
+            }
+            if receipt.isQueued {
+                // Queue ownership is real, but it is not durable input delivery. Leave the
+                // request open; when the agent consumes the prompt it can claim the card using
+                // the request envelope it received.
+                recordAttachedHandoff(
+                    request.id,
+                    note: "Queued to the attached workshop Work; awaiting agent acknowledgement.")
+                show("Queued \(request.id). It remains open until the agent acknowledges it.")
+                return
+            }
+            show("Sent \(request.id) to the workshop agent.")
             markDelivered(request.id, session: run.sessionID)
             return
         }
 
         guard canRunWorkshopAgent else {
-            show("Filed \(request.id). No engine configured, so it was not delivered.", isError: true)
+            show(
+                "Filed \(request.id). No engine configured, so it was not delivered.", isError: true
+            )
             return
         }
 
         // Nothing attached. Resume the remembered session, or open a new one, and
         // deliver as the first prompt.
         let resume = workshopSessionID
-        let first = resume == nil
+        let first =
+            resume == nil
             ? bootstrapPrompt(repoRoot: repoRoot) + "\n\n---\n\n" + message
             : message
 
         startWorkshopRun(repoRoot: repoRoot, resume: resume, firstPrompt: first)
         section = .workshop
 
-        // Wait for the engine to prove it is alive before claiming the request was
-        // delivered. The first real request was recorded as delivered *and* claimed while
-        // the engine had already exited 1 — the board said an agent had it, nothing had it,
-        // and the only evidence was a line in the harness's own log. A delivery that cannot
-        // fail visibly is worse than no delivery.
-        if await engineProvedAlive() {
+        // Wait for Work to acknowledge the first input at its durable delivery seam before
+        // claiming the request. Allocating a session proves only preparation: a process may
+        // fail between that point and recording/writing the message.
+        if await initialRequestWasDelivered() {
             markDelivered(request.id, session: workshopRun?.sessionID)
             let id = request.id
             Task { await trackSession(for: id) }
-            show(resume == nil
+            show(
+                resume == nil
                 ? "Opened a workshop session and sent \(request.id)."
-                : "Resumed the workshop session and sent \(request.id).")
+                : "Reopened the workshop conversation in a new runtime and sent \(request.id).")
         } else {
             recordDeliveryFailure(request.id)
         }
@@ -250,7 +279,9 @@ extension AppModel {
         try? WorkshopLog.append(
             WorkshopEvent(event: "delivered", id: id, fields: fields), repoRoot: repoRoot)
         try? WorkshopLog.append(
-            WorkshopEvent(event: "status", id: id, fields: [
+            WorkshopEvent(
+                event: "status", id: id,
+                fields: [
                 "status": .string(WorkshopStatus.claimed.rawValue),
                 "note": .string("Handed to the workshop agent."),
                 "by": .string("aviary"),
@@ -259,18 +290,21 @@ extension AppModel {
         refreshBoard()
     }
 
-    /// True once the engine has answered with a session id; false if it exited first.
+    /// True only when the first prompt crossed the driver's durable delivery seam.
     ///
-    /// A session id is the cheapest available proof of life: it only exists after the engine
-    /// has booted node, resolved its model and answered `get_state`.
-    private func engineProvedAlive() async -> Bool {
+    /// Session allocation, process preparation, and input delivery are deliberately separate
+    /// outcomes. This prevents Workshop from claiming a request whose Work exists but never
+    /// received the request.
+    private func initialRequestWasDelivered() async -> Bool {
         for _ in 0..<60 {
             guard let run = workshopRun else { return false }
-            if let sid = run.sessionID, !sid.isEmpty { return true }
-            if run.hasExited { return false }
+            if run.initialPromptDelivered { return true }
+            if run.hasExited || run.errorBanner != nil || run.commandState == .failed {
+                return false
+            }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
-        return workshopRun?.hasExited == false
+        return false
     }
 
     /// Leave the request open, and write down why it did not get through.
@@ -281,26 +315,46 @@ extension AppModel {
     private func recordDeliveryFailure(_ id: String) {
         guard let repoRoot else { return }
         let run = workshopRun
-        let stderr = (run?.stderrTail ?? []).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+        let stderr = (run?.stderrTail ?? []).joined().trimmingCharacters(
+            in: .whitespacesAndNewlines)
         let code = run?.exitCode.map { "exit \($0)" } ?? "no exit code"
         let banner = run?.errorBanner
         let detail = [banner, stderr.isEmpty ? nil : String(stderr.suffix(1200))]
             .compactMap { $0 }.joined(separator: "\n")
 
-        var lines = ["Delivery failed — the engine did not start (\(code)). The request is still open."]
+        var lines = [
+            "Delivery failed — the engine did not start (\(code)). The request is still open."
+        ]
         if let remedy = Workshop.remedy(for: detail) { lines.append(remedy) }
         if !detail.isEmpty { lines.append("Engine output:\n\(detail)") }
 
         try? WorkshopLog.append(
-            WorkshopEvent(event: "note", id: id, fields: [
+            WorkshopEvent(
+                event: "note", id: id,
+                fields: [
                 "text": .string(lines.joined(separator: "\n\n")),
                 "by": .string("aviary"),
             ]),
             repoRoot: repoRoot)
         refreshBoard()
-        show(Workshop.remedy(for: detail)
+        show(
+            Workshop.remedy(for: detail)
             ?? "Filed \(id), but the engine did not start (\(code)). See the note on the card.",
             isError: true)
+    }
+
+    /// Record an attached-Work handoff without pretending queue ownership is delivery.
+    private func recordAttachedHandoff(_ id: String, note: String) {
+        guard let repoRoot else { return }
+        try? WorkshopLog.append(
+            WorkshopEvent(
+                event: "note", id: id,
+                fields: [
+                    "text": .string(note),
+                    "by": .string("aviary"),
+                ]),
+            repoRoot: repoRoot)
+        refreshBoard()
     }
 
     /// Follow a freshly-launched run until the engine reports its session id, then link it.
@@ -316,8 +370,10 @@ extension AppModel {
             if let sid = workshopRun?.sessionID, !sid.isEmpty {
                 workshopSessionID = sid
                 try? WorkshopLog.append(
-                    WorkshopEvent(event: "link", id: requestID, fields: [
-                        "session": .string(sid),
+                    WorkshopEvent(
+                        event: "link", id: requestID,
+                        fields: [
+                            "session": .string(sid)
                     ]),
                     repoRoot: repoRoot)
                 refreshBoard()
@@ -349,7 +405,9 @@ extension AppModel {
     func addNote(_ text: String, to request: WorkshopRequest) {
         guard let repoRoot, !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         try? WorkshopLog.append(
-            WorkshopEvent(event: "note", id: request.id, fields: [
+            WorkshopEvent(
+                event: "note", id: request.id,
+                fields: [
                 "text": .string(text), "by": .string("you"),
             ]),
             repoRoot: repoRoot)
@@ -358,8 +416,10 @@ extension AppModel {
 
     /// Amend request text without ever rewriting the original event or its captured context.
     /// A later `edited` event is the board's durable, reviewable source of truth.
-    func updateRequest(_ request: WorkshopRequest, title rawTitle: String, body rawBody: String,
-                       kind: WorkshopKind) {
+    func updateRequest(
+        _ request: WorkshopRequest, title rawTitle: String, body rawBody: String,
+        kind: WorkshopKind
+    ) {
         guard let repoRoot else { return }
         let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = rawBody.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -373,7 +433,9 @@ extension AppModel {
         }
         do {
             try WorkshopLog.append(
-                WorkshopEvent(event: "edited", id: request.id, fields: [
+                WorkshopEvent(
+                    event: "edited", id: request.id,
+                    fields: [
                     "title": .string(title),
                     "body": .string(body),
                     "kind": .string(kind.rawValue),
@@ -463,7 +525,7 @@ extension AppModel {
     /// Whether the model picker on this screen governs anything right now.
     var workshopModelIsSettableHere: Bool { engineChoice == .inHouse }
 
-    /// Open or resume the workshop session on whichever engine is selected.
+    /// Open or cold-reopen the workshop conversation on whichever engine is selected.
     ///
     /// One launcher for both entry points. They each used to build a harness
     /// `RunConfiguration` directly, which is why the workshop agent was always the harness even
@@ -494,8 +556,12 @@ extension AppModel {
     func attachWorkshopSession() {
         guard let repoRoot, canRunWorkshopAgent else { return }
         if let run = workshopRun, !run.hasExited {
-            focusedRunID = run.id
-            section = .live
+            if detachedRuns.contains(where: { $0.id == run.id }) {
+                reattachRun(run)
+            } else {
+                focusedRunID = run.id
+                section = .live
+            }
             return
         }
         startWorkshopRun(
@@ -582,7 +648,7 @@ extension AppModel {
 
         // What the app currently holds.
         add("State", "Sessions in catalog", "\(sessions.count)")
-        let live = runs.filter { !$0.hasExited }
+        let live = workRuns.filter { !$0.hasExited }
         add("State", "Live runs", "\(live.count) (\(live.filter(\.isStreaming).count) working)")
         add("State", "Sub-agents known", "\(tree.allNodes.count) (\(tree.runningCount) running)")
         add("State", "Attached runs", "\(runs.count)")
@@ -603,8 +669,12 @@ extension AppModel {
                 add("Selected session", "Title", s.title)
                 add("Selected session", "Project", s.projectName)
                 add("Selected session", "Working dir", s.cwd)
-                add("Selected session", "Model", [s.provider, s.model].compactMap { $0 }.joined(separator: "/"))
-                add("Selected session", "Live", s.isLive ? (s.isBusy ? "yes, working" : "yes, idle") : "no")
+                add(
+                    "Selected session", "Model",
+                    [s.provider, s.model].compactMap { $0 }.joined(separator: "/"))
+                add(
+                    "Selected session", "Live",
+                    s.isLive ? (s.isBusy ? "yes, working" : "yes, idle") : "no")
                 if let t = transcript {
                     add("Selected session", "Transcript rows", "\(t.items.count)")
                 }
@@ -620,19 +690,26 @@ extension AppModel {
                 add("Focused run", "Title", run.title)
                 add("Focused run", "Model", run.modelLabel ?? "—")
                 add("Focused run", "Streaming", run.isStreaming ? "yes" : "no")
-                add("Focused run", "Exited", run.hasExited ? "yes (code \(run.exitCode.map(String.init) ?? "?"))" : "no")
+                add(
+                    "Focused run", "Exited",
+                    run.hasExited ? "yes (code \(run.exitCode.map(String.init) ?? "?"))" : "no")
                 add("Focused run", "Transcript rows", "\(run.items.count)")
                 add("Focused run", "Session id", run.sessionID ?? "not yet assigned")
                 add("Focused run", "Working dir", run.config.cwd)
                 if let e = run.errorBanner { add("Focused run", "Error banner", e) }
                 if let c = run.contextTokens {
-                    add("Focused run", "Context", "\(Fmt.tokens(c)) of \(run.contextWindow.map(Fmt.tokens) ?? "?")")
+                    add(
+                        "Focused run", "Context",
+                        "\(Fmt.tokens(c)) of \(run.contextWindow.map(Fmt.tokens) ?? "?")")
                 }
             } else {
                 add("Live", "Attached runs", "none")
             }
         case .workshop:
-            add("Workshop", "Board", "\(board.openCount) open · \(board.workingCount) in progress · \(board.doneCount) done")
+            add(
+                "Workshop", "Board",
+                "\(board.openCount) open · \(board.workingCount) in progress · \(board.doneCount) done"
+            )
             add("Workshop", "Agent", workshopSessionState.label)
             if let s = selectedRequest { add("Workshop", "Selected request", s.id) }
         case .flock:
@@ -642,7 +719,9 @@ extension AppModel {
             add("Models", "Reachable", "\(runtimeModels.count)")
             add("Models", "Configured providers", "\(modelsConfig.providers.count)")
             let failed = providerTests.filter { !$0.value.ok }.keys.sorted()
-            if !failed.isEmpty { add("Models", "Failing provider tests", failed.joined(separator: ", ")) }
+            if !failed.isEmpty {
+                add("Models", "Failing provider tests", failed.joined(separator: ", "))
+            }
         case .usage:
             add("Usage", "Sessions counted", "\(analytics.sessionCount)")
             add("Usage", "Total tokens", Fmt.tokens(analytics.total.totalTokens))
@@ -666,9 +745,11 @@ extension AppModel {
     /// being on screen, because a request can be filed from the menu with no window focused.
     private var sectionSubtitleForCapture: String {
         switch section {
-        case .cockpit: return "\(runs.filter { !$0.hasExited }.count) ongoing"
-        case .sessions: return "\(filteredSessions.count) of \(sessions.count)"
-        case .live: return "\(runs.count) attached"
+        case .cockpit: return "\(workRuns.filter { !$0.hasExited }.count) ongoing"
+        case .sessions:
+            let archived = sessions.filter(\.isArchived).count
+            return "\(sessions.count - archived) current · \(archived) archived"
+        case .live: return "\(runs.count) attached · \(detachedRuns.count) detached"
         case .workshop: return "\(board.openCount) open · \(board.requests.count) total"
         case .flock: return "\(tree.allNodes.count) sub-agents"
         case .models: return "\(runtimeModels.count) reachable"
@@ -682,7 +763,9 @@ extension AppModel {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
         let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String
         return [v, b.map { "(\($0))" }].compactMap { $0 }.joined(separator: " ")
-            .isEmpty ? "development build" : [v, b.map { "(\($0))" }].compactMap { $0 }.joined(separator: " ")
+            .isEmpty
+            ? "development build"
+            : [v, b.map { "(\($0))" }].compactMap { $0 }.joined(separator: " ")
     }
 
     /// Write an already-captured image to `workshop/shots/`, returning the name relative to
@@ -728,14 +811,14 @@ extension AppModel {
     /// finished it is usually still attached and holding a live interpreter — and that is
     /// exactly the moment you want to reload. So the price is stated and the choice is yours.
     var reloadCost: String? {
-        let streaming = runs.filter { $0.isStreaming && !$0.hasExited }
-        let attached = runs.filter { !$0.hasExited }
+        let streaming = workRuns.filter { $0.isStreaming && !$0.hasExited }
+        let retained = workRuns.filter { !$0.hasExited }
         if !streaming.isEmpty {
             return "\(streaming.count) run\(streaming.count == 1 ? "" : "s") still working — "
                 + "relaunching stops \(streaming.count == 1 ? "it" : "them") mid-turn"
         }
-        if !attached.isEmpty {
-            return "\(attached.count) attached run\(attached.count == 1 ? "" : "s") will end; "
+        if !retained.isEmpty {
+            return "\(retained.count) live run\(retained.count == 1 ? "" : "s") will end; "
                 + "the transcript survives, the interpreter's variables do not"
         }
         return nil
@@ -743,6 +826,15 @@ extension AppModel {
 
     /// Write down where we are, then replace the process.
     func reloadNow() {
+        guard !reloadInProgress else { return }
+        reloadInProgress = true
+        Task { await reloadAfterStoppingWork() }
+    }
+
+    /// Relaunch only after every in-process Work object has reached its teardown boundary.
+    /// `Reloader.relaunch` terminates the application synchronously, so launching detached
+    /// cleanup tasks here would orphan exactly the runtime children this path promises to end.
+    private func reloadAfterStoppingWork() async {
         let defaults = UserDefaults.standard
         defaults.set(section.rawValue, forKey: Restore.section)
         defaults.set(selectedRequestID, forKey: Restore.request)
@@ -754,9 +846,11 @@ extension AppModel {
         // Runs are stopped rather than left to die with the process, so each one closes its
         // session file and its runtime host exits cleanly. A killed host leaves a kernel
         // process behind and a transcript with no final entry.
-        for run in runs { Task { await run.stop() } }
+        await stopAllWork()
 
         if !reloader.relaunch() {
+            reloadInProgress = false
+            acceptsNewWork = true
             toast = Toast(
                 message: "Could not work out how to relaunch this copy of Aviary. "
                     + "Rebuild with `just build` and reopen.",
@@ -780,14 +874,17 @@ extension AppModel {
         guard Date().timeIntervalSince1970 - stamp < Restore.validFor else { return }
 
         if let raw = defaults.string(forKey: Restore.section),
-           let restored = Section(rawValue: raw) {
+            let restored = Section(rawValue: raw)
+        {
             section = restored
         }
         if let id = defaults.string(forKey: Restore.request) { selectedRequestID = id }
         let shouldAttach = defaults.bool(forKey: Restore.attach)
-        toast = Toast(message: "Reloaded" + (shouldAttach ? " — reattaching the agent" : ""))
+        toast = Toast(
+            message: "Reloaded"
+                + (shouldAttach ? " — reopening the workshop session in a new runtime" : ""))
         guard shouldAttach, workshopSessionID != nil else { return }
-        // After the board and the engine list exist, or attaching has nothing to attach to.
+        // After the board and engine list exist, cold continuation has what it needs to start.
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 400_000_000)
             attachWorkshopSession()

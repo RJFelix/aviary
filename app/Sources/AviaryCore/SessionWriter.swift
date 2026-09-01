@@ -7,7 +7,7 @@ import Foundation
 /// mean either duplicating all of that or losing it. So an in-house run produces files
 /// indistinguishable from a harness run, and every existing screen works on day one.
 ///
-/// Append-only, one JSON object per line, flushed per entry. A run that dies mid-turn leaves a
+/// Append-only, one complete JSON object per line. A run that dies mid-turn leaves a
 /// readable transcript up to that point rather than a truncated object — which matters because
 /// the moment you most want to read a transcript is right after something went wrong.
 public actor SessionWriter {
@@ -15,10 +15,81 @@ public actor SessionWriter {
     // making a caller await an actor hop for a value that can never change is friction with
     // no safety behind it.
     public nonisolated let sessionID: String
+    public nonisolated let identity: SessionWorkIdentity
     public nonisolated let fileURL: URL
     private let handle: FileHandle
     private var lastEntryID: String?
     private var entryCount = 0
+    private var failurePlan: FailurePlan
+    private var health: WriterHealth = .healthy
+    private var isClosed = false
+    private var intentCommitGate: IntentCommitGate? = nil
+
+    /// A deterministic test seam for holding an intent before its append. Production writers
+    /// never install one; it lets controller tests exercise a GUI End arriving while a prior
+    /// commit is genuinely in flight rather than relying on scheduler timing.
+    public actor IntentCommitGate {
+        private var released = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        public init() {}
+
+        public func wait() async {
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                if released {
+                    continuation.resume()
+                } else {
+                    waiters.append(continuation)
+                }
+            }
+        }
+
+        public func release() {
+            guard !released else { return }
+            released = true
+            for waiter in waiters {
+                waiter.resume()
+            }
+            waiters.removeAll()
+        }
+    }
+
+    public enum FailurePoint: String, Sendable, Hashable, CaseIterable {
+        case beforeWrite
+        case partialWrite
+        case afterWriteBeforeSync
+    }
+
+    /// A one-shot deterministic seam for proving that write and sync ambiguity fail closed.
+    /// Production callers leave this at `.none`; tests can inject one failure at construction.
+    public struct FailurePlan: Sendable, Hashable {
+        public var point: FailurePoint?
+
+        public init(point: FailurePoint? = nil) { self.point = point }
+
+        public static let none = FailurePlan()
+    }
+
+    public enum WriterHealth: Sendable, Hashable {
+        case healthy
+        case failed(reason: String)
+        case closed
+    }
+
+    public enum WriterError: LocalizedError, Sendable, Equatable {
+        case unavailable(String)
+        case injected(FailurePoint)
+        case closed
+
+        public var errorDescription: String? {
+            switch self {
+            case .unavailable(let reason): return "Session journal unavailable: \(reason)"
+            case .injected(let point): return "Injected Session journal failure at \(point.rawValue)."
+            case .closed: return "Session journal is closed."
+            }
+        }
+    }
 
     /// Short ids, like the harness writes. Long enough to not collide within a session, short
     /// enough to read in a diff.
@@ -56,22 +127,48 @@ public actor SessionWriter {
     /// `parentId`, and the parser walks the active branch backwards from the *last* line — so a
     /// resumed run whose first entry has no parent orphans the entire prior conversation. The
     /// transcript would show only the new turns and look perfectly well-formed doing it.
-    public init(home: AgentHome, resuming sessionID: String, cwd: String, model: ModelSpec?) throws {
-        self.sessionID = sessionID
-        self.fileURL = home.sessionFile(id: sessionID)
+    public init(
+        home: AgentHome, resuming sessionID: String, cwd: String, model: ModelSpec?,
+        identity requestedIdentity: SessionWorkIdentity? = nil,
+        failurePlan: FailurePlan = .none
+    ) throws {
+        let identity = Self.resumeIdentity(
+            home: home, sessionID: sessionID, requested: requestedIdentity)
+        self.identity = identity
+        self.sessionID = identity.sessionID
+        self.fileURL = home.sessionFile(id: identity.sessionID)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             throw ResumeFailure.noSuchSession(sessionID)
         }
         handle = try FileHandle(forWritingTo: fileURL)
         try handle.seekToEnd()
+        self.failurePlan = failurePlan
 
+        // A previous process may have died after writing only part of a JSONL entry. Preserve
+        // that evidence, but terminate the malformed record before appending the next one; an
+        // otherwise valid run_start would be concatenated onto the fragment and become unreadable.
+        try Self.quarantinePartialTail(of: fileURL, handle: handle)
         let tail = Self.tailEntry(of: fileURL)
         lastEntryID = tail.id
         entryCount = tail.count
 
+        // A resumed run gets a new run id while keeping the session and Work ids. This is an
+        // ignored-by-legacy-readers record, but gives future reducers a durable run boundary.
+        try Self.append(
+            type: "run_start", fields: [
+            "runId": .string(identity.runID),
+            "workHostId": .string(identity.workHostID),
+            "workId": .string(identity.workID),
+            ], handle: handle, lastEntryID: &lastEntryID, entryCount: &entryCount,
+            failurePlan: &self.failurePlan)
+
         // A model_change is written when resuming with a model, because a resumed run may use
         // a different one and the transcript already renders switches.
-        if let model { try appendModelChange(model) }
+        if let model {
+            try Self.appendModelChange(
+                model, handle: handle, lastEntryID: &lastEntryID, entryCount: &entryCount,
+                failurePlan: &self.failurePlan)
+        }
     }
 
     /// The id of the last entry in an existing session, and how many entries it holds.
@@ -94,8 +191,26 @@ public actor SessionWriter {
         return (lastID, count)
     }
 
-    public init(home: AgentHome, sessionID: String? = nil, cwd: String, model: ModelSpec?) throws {
-        let sid = sessionID ?? Self.newSessionID()
+    private static func quarantinePartialTail(of url: URL, handle: FileHandle) throws {
+        guard let data = FileManager.default.contents(atPath: url.path),
+              !data.isEmpty,
+              data.last != UInt8(ascii: "\n")
+        else { return }
+        try handle.write(contentsOf: Data([UInt8(ascii: "\n")]))
+        try handle.synchronize()
+    }
+
+    public init(
+        home: AgentHome, sessionID: String? = nil, cwd: String, model: ModelSpec?,
+        identity suppliedIdentity: SessionWorkIdentity? = nil,
+        failurePlan: FailurePlan = .none
+    ) throws {
+        let identity = suppliedIdentity
+            ?? SessionWorkIdentity.allocate(
+                workHostID: home.workHostID,
+                sessionID: sessionID ?? Self.newSessionID())
+        let sid = identity.sessionID
+        self.identity = identity
         self.sessionID = sid
         self.fileURL = home.sessionFile(id: sid)
         try FileManager.default.createDirectory(
@@ -105,6 +220,7 @@ public actor SessionWriter {
         }
         handle = try FileHandle(forWritingTo: fileURL)
         try handle.seekToEnd()
+        self.failurePlan = failurePlan
 
         // The header is written immediately, unlike the harness — which defers file creation
         // until the first assistant message and so leaves a failed run with no transcript at
@@ -116,14 +232,67 @@ public actor SessionWriter {
             "timestamp": .string(Self.stamp()),
             "cwd": .string(cwd),
             "writer": .string("aviary"),
+            "workHostId": .string(identity.workHostID),
+            "workId": .string(identity.workID),
+            "runId": .string(identity.runID),
         ]
         if let model {
             header["model"] = .object([
                 "id": .string(model.id), "provider": .string(model.providerID),
             ])
         }
-        try writeRaw(.object(header))
-        if let model { try appendModelChange(model) }
+        try Self.writeRaw(.object(header), handle: handle, entryCount: &entryCount,
+                          failurePlan: &self.failurePlan)
+        if let model {
+            try Self.appendModelChange(
+                model, handle: handle, lastEntryID: &lastEntryID, entryCount: &entryCount,
+                failurePlan: &self.failurePlan)
+        }
+    }
+
+    /// Recover Work identity from a session header, synthesizing stable legacy Work fields when
+    /// old files predate them. A fresh run id is always allocated: this describes the resumed
+    /// attempt, not the historical attempt that wrote the header.
+    public static func recoverIdentity(
+        home: AgentHome, sessionID: String
+    ) -> SessionWorkIdentity? {
+        let url = home.sessionFile(id: sessionID)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let header = firstHeader(of: url)
+        let host = header?["workHostId"]?.stringValue
+            ?? header?["workHostID"]?.stringValue
+            ?? home.workHostID
+        let work = header?["workId"]?.stringValue
+            ?? header?["workID"]?.stringValue
+            ?? "legacy-work-\(sessionID)"
+        return SessionWorkIdentity.allocate(
+            workHostID: host, sessionID: sessionID, workID: work)
+    }
+
+    private static func resumeIdentity(
+        home: AgentHome, sessionID: String, requested: SessionWorkIdentity?
+    ) -> SessionWorkIdentity {
+        if let requested, requested.sessionID == sessionID { return requested }
+        if let recovered = recoverIdentity(home: home, sessionID: sessionID) {
+            return recovered
+        }
+        if let requested {
+            return SessionWorkIdentity(
+                sessionID: sessionID, work: requested.work, runID: requested.runID)
+        }
+        return SessionWorkIdentity.allocate(
+            workHostID: home.workHostID, sessionID: sessionID,
+            workID: "legacy-work-\(sessionID)")
+    }
+
+    private static func firstHeader(of url: URL) -> JSONValue? {
+        guard let data = FileManager.default.contents(atPath: url.path),
+              let line = data.split(separator: UInt8(ascii: "\n"), maxSplits: 1)
+                .first,
+              let value = JSONValue.parse(Data(line)),
+              value["type"]?.stringValue == "session"
+        else { return nil }
+        return value
     }
 
     /// Record which model is answering from here on.
@@ -149,31 +318,91 @@ public actor SessionWriter {
     }
 
     private func writeRaw(_ value: JSONValue) throws {
+        try Self.writeRaw(value, handle: handle, entryCount: &entryCount,
+                          failurePlan: &failurePlan)
+    }
+
+    private static func writeRaw(
+        _ value: JSONValue, handle: FileHandle, entryCount: inout Int,
+        failurePlan: inout FailurePlan
+    ) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
         var data = try encoder.encode(value)
         data.append(UInt8(ascii: "\n"))
+        if failurePlan.point == .beforeWrite {
+            failurePlan.point = nil
+            throw WriterError.injected(.beforeWrite)
+        }
+        if failurePlan.point == .partialWrite {
+            failurePlan.point = nil
+            let prefixLength = max(1, data.count / 2)
+            try handle.write(contentsOf: data.prefix(prefixLength))
+            throw WriterError.injected(.partialWrite)
+        }
         try handle.write(contentsOf: data)
+        if failurePlan.point == .afterWriteBeforeSync {
+            failurePlan.point = nil
+            throw WriterError.injected(.afterWriteBeforeSync)
+        }
+        try handle.synchronize()
         entryCount += 1
     }
 
     /// Append an entry, threading `parentId` so the file is the entry *tree* the parser walks.
     @discardableResult
     private func append(type: String, fields: [String: JSONValue]) throws -> String {
+        guard !isClosed else { throw WriterError.closed }
+        guard case .healthy = health else {
+            if case .failed(let reason) = health { throw WriterError.unavailable(reason) }
+            throw WriterError.closed
+        }
+        do {
+            return try Self.append(
+                type: type, fields: fields, handle: handle,
+                lastEntryID: &lastEntryID, entryCount: &entryCount,
+                failurePlan: &failurePlan)
+        } catch {
+            health = .failed(reason: error.localizedDescription)
+            throw error
+        }
+    }
+
+    @discardableResult
+    private static func append(
+        type: String, fields: [String: JSONValue], handle: FileHandle,
+        lastEntryID: inout String?, entryCount: inout Int,
+        failurePlan: inout FailurePlan
+    ) throws -> String {
         let id = Self.newEntryID()
         var obj = fields
         obj["type"] = .string(type)
         obj["id"] = .string(id)
         obj["timestamp"] = .string(Self.stamp())
         if let lastEntryID { obj["parentId"] = .string(lastEntryID) }
-        try writeRaw(.object(obj))
+        try writeRaw(.object(obj), handle: handle, entryCount: &entryCount,
+                     failurePlan: &failurePlan)
         lastEntryID = id
         return id
     }
 
+    private static func appendModelChange(
+        _ model: ModelSpec, handle: FileHandle,
+        lastEntryID: inout String?, entryCount: inout Int,
+        failurePlan: inout FailurePlan
+    ) throws {
+        try append(
+            type: "model_change", fields: [
+                "provider": .string(model.providerID),
+                "modelId": .string(model.id),
+            ], handle: handle, lastEntryID: &lastEntryID, entryCount: &entryCount,
+            failurePlan: &failurePlan)
+    }
+
     // MARK: Messages
 
-    public func appendUser(_ text: String) throws {
+    @discardableResult
+    public func appendUser(_ text: String) throws -> String {
         try append(type: "message", fields: [
             "message": .object([
                 "role": .string("user"),
@@ -209,7 +438,7 @@ public actor SessionWriter {
     public func appendAssistant(
         text: String, thinking: String, toolCalls: [(id: String, name: String, arguments: JSONValue)],
         usage: Usage?, stopReason: String?
-    ) throws {
+    ) throws -> String {
         var blocks: [JSONValue] = []
         if !thinking.isEmpty {
             blocks.append(.object(["type": .string("thinking"), "thinking": .string(thinking)]))
@@ -256,7 +485,7 @@ public actor SessionWriter {
             message["usage"] = .object(u)
         }
         if let stopReason { message["stopReason"] = .string(stopReason) }
-        try append(type: "message", fields: ["message": .object(message)])
+        return try append(type: "message", fields: ["message": .object(message)])
     }
 
     public func appendToolResult(
@@ -271,6 +500,75 @@ public actor SessionWriter {
         ]
         if let details { message["details"] = details }
         try append(type: "message", fields: ["message": .object(message)])
+    }
+
+    /// Persist a terminal run outcome independently of assistant messages. A provider can fail
+    /// before producing one, and cancellation can happen before the first token; a typed marker
+    /// lets cold readers recover that truth without fabricating a model row.
+    @discardableResult
+    public func appendOutcome(
+        state: TranscriptOutcome.State, detail: String? = nil
+    ) throws -> String {
+        var fields: [String: JSONValue] = [
+            "customType": .string("aviary.outcome"),
+            "role": .string("custom"),
+            "outcomeState": .string(state.rawValue),
+        ]
+        if let detail, !detail.isEmpty {
+            fields["detail"] = .string(detail)
+            fields["content"] = .array([
+                .object(["type": .string("text"), "text": .string(detail)]),
+            ])
+        }
+        return try append(type: "custom_message", fields: fields)
+    }
+
+    /// Persist the controller's admission before an engine crosses into work. This uses the
+    /// legacy session JSONL deliberately: old readers ignore the hidden custom record, while a
+    /// raw reader can recover the complete intent and its controller ordering.
+    @discardableResult
+    public func appendCommandIntent(
+        commandID: String,
+        command: SessionCommand,
+        identity: SessionWorkIdentity,
+        actorID: String,
+        controllerSequence: Int,
+        previousState: SessionCommandState,
+        state: SessionCommandState,
+        timestamp: Date = Date()
+    ) async throws -> String {
+        if let intentCommitGate {
+            await intentCommitGate.wait()
+        }
+        var commandFields: [String: JSONValue] = ["kind": .string(command.label)]
+        switch command {
+        case .start(let prompt), .send(let prompt):
+            commandFields["value"] = .string(prompt)
+        case .steer(let text), .queueFollowUp(let text):
+            commandFields["value"] = .string(text)
+        case .cancel(let scope):
+            commandFields["scope"] = .string(scope.rawValue)
+        case .endRun:
+            break
+        }
+        return try append(type: "custom_message", fields: [
+            "customType": .string("aviary.command-intent.v1"),
+            "role": .string("custom"),
+            "hidden": .bool(true),
+            "commandID": .string(commandID),
+            "command": .object(commandFields),
+            "identity": .object([
+                "sessionID": .string(identity.sessionID),
+                "workHostID": .string(identity.workHostID),
+                "workID": .string(identity.workID),
+                "runID": .string(identity.runID),
+            ]),
+            "actorID": .string(actorID),
+            "controllerSequence": .number(Double(controllerSequence)),
+            "previousState": .string(previousState.rawValue),
+            "state": .string(state.rawValue),
+            "intentTimestamp": .string(Self.stamp(timestamp)),
+        ])
     }
 
     /// A note from the machinery rather than from either party — a launch failure, a budget
@@ -302,7 +600,36 @@ public actor SessionWriter {
 
     public var count: Int { entryCount }
 
+    public var writerHealth: WriterHealth { health }
+
+    /// Test/diagnostic seam for exercising a specific next write boundary after construction.
+    /// It is deliberately one-shot; normal callers never need to set it.
+    public func injectFailure(_ point: FailurePoint?) {
+        failurePlan.point = point
+    }
+
+    /// Install or clear the deterministic intent-commit gate used by focused controller tests.
+    public func installIntentCommitGate(_ gate: IntentCommitGate?) {
+        intentCommitGate = gate
+    }
+
+    /// Checked close for teardown paths that must surface a sync/close failure. `close()` below
+    /// remains as a source-compatible best-effort shim for existing callers until drivers adopt
+    /// this boundary.
+    public func closeChecked() throws {
+        guard !isClosed else { return }
+        do {
+            try handle.synchronize()
+            try handle.close()
+            isClosed = true
+            health = .closed
+        } catch {
+            health = .failed(reason: error.localizedDescription)
+            throw error
+        }
+    }
+
     public func close() {
-        try? handle.close()
+        try? closeChecked()
     }
 }

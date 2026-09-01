@@ -11,6 +11,14 @@ import Foundation
 /// Written as an actor with a callback rather than returning a value, because a run is watched
 /// while it happens. The same events drive a live view and a test.
 public actor Agent {
+    /// Cancellation scopes implemented by this engine. The loop observes the request at safe
+    /// boundaries; it does not expose provider-stream or current-action interruption.
+    public static let supportedCancellationScopes: Set<SessionCancellationScope> = [.agentLoop]
+    /// The single capability declaration shared by the in-house driver and its controller.
+    public static let inHouseCommandCapabilities = SessionCommandCapabilities(
+        supportsSteering: true,
+        supportsQueuedFollowUps: true,
+        cancellationScopes: supportedCancellationScopes)
 
     // MARK: Configuration
 
@@ -70,13 +78,18 @@ public actor Agent {
 
     public enum Event: Sendable {
         case started(session: String)
+        /// The user input was durably appended. The id is the writer's canonical entry id,
+        /// not a provider request id, so callers can prove startup delivery and reconcile it.
+        case inputCommitted(id: String)
         /// A queued message was taken up. Emitted so a UI can stop showing it as pending.
         case steered(String)
         case textDelta(String)
         case thinkingDelta(String)
         case toolStarted(id: String, name: String, arguments: JSONValue)
         case toolFinished(id: String, name: String, output: String, isError: Bool)
-        case turnFinished(usage: Usage?, stopReason: String?)
+        /// One assistant message is durable. The entry id lets a live projection retain its
+        /// streaming row until the parser has observed exactly that committed message.
+        case turnFinished(messageID: String, usage: Usage?, stopReason: String?)
         case compacted(before: Int, after: Int, summary: String)
         case goalExhausted(String)
         case childStarted(id: String, name: String, prompt: String)
@@ -90,6 +103,14 @@ public actor Agent {
         /// The loop stopped. `reason` is why, in words, because "it stopped" is never enough
         /// to act on.
         case finished(reason: String)
+        case failed(String)
+    }
+
+    /// Terminal result of one admitted prompt. Events remain the presentation stream; this
+    /// value is the command owner's non-racy acknowledgement path.
+    public enum SendOutcome: Sendable, Equatable {
+        case completed
+        case cancelled
         case failed(String)
     }
 
@@ -109,6 +130,12 @@ public actor Agent {
     private var messages: [ChatMessage] = []
     private var observer: Observer?
     private var cancelled = false
+    /// A cancellation can arrive in the hand-off window after the driver admits a turn but
+    /// before `send` has entered this actor. Preserve it for that next send instead of losing
+    /// it when the normal per-send reset runs.
+    private var cancelNextSend = false
+    private var activeSendCount = 0
+    private var quiescenceWaiters: [CheckedContinuation<Void, Never>] = []
     /// The prompt that opened the run, kept for memory provenance.
     private var firstPrompt: String?
     /// Messages to inject before the next model call, and after the run finishes.
@@ -148,6 +175,9 @@ public actor Agent {
     private var wireLogURL: URL?
     /// Whether any hooks are loaded. Checked so a run with none pays nothing for the feature.
     private var hooksEnabled = false
+    /// Once the append-only journal is unhealthy, continuing would create effects with no
+    /// durable antecedent. Keep the failure local and fail closed at every effect boundary.
+    private var journalFailureDetail: String?
 
     public init(
         provider: ChatProvider, host: RuntimeHost, writer: SessionWriter,
@@ -222,7 +252,9 @@ public actor Agent {
     /// exited, and a message queued on an agent that is no longer looping is a message nobody
     /// reads. The app can restart the run; the agent cannot restart itself.
     public protocol SelfDelegate: Sendable {
-        func deliverToSelf(sessionID: String, text: String) async
+        func deliverToSelf(
+            sessionID: String, text: String, from sourceSessionID: String
+        ) async -> Bool
     }
 
     public func setSelfDelegate(_ delegate: SelfDelegate?) {
@@ -301,15 +333,27 @@ public actor Agent {
     ///
     /// History carries over untouched. That is the point — the model is being changed
     /// *because* of what the conversation has established, so starting again would defeat it.
-    public func switchModel(to model: ModelSpec, provider newProvider: ChatProvider) async {
+    @discardableResult
+    public func switchModel(to model: ModelSpec, provider newProvider: ChatProvider) async -> Bool {
+        guard await requireJournal("model switch") else { return false }
+        do {
+            // The model-change row is the durable antecedent of changing provider/config. If it
+            // cannot be recorded, leave the live agent on its existing model rather than allowing
+            // an effective switch that a resumed reader cannot explain.
+            try await writer.appendModelChange(model)
+        } catch {
+            journalFailureDetail = "Could not record the model switch: \(error.localizedDescription)"
+            emit(.failed(journalFailureDetail!))
+            return false
+        }
         provider = newProvider
         config.model = model
         // The context window belongs to the model, and compaction is driven off it. Switching
         // to a smaller window without moving this would let a conversation sit above the new
         // ceiling with nothing noticing until the provider refused it.
         config.maxTokens = model.maxTokens
-        try? await writer.appendModelChange(model)
         emit(.modelChanged(provider: model.providerID, model: model.id))
+        return true
     }
 
     public func setMemory(_ store: MemoryStore?) {
@@ -334,6 +378,10 @@ public actor Agent {
     /// Answers with an `error` key rather than throwing, always: the agent asked a question in
     /// code and is blocked on the reply, so a refusal it can read beats a hang it cannot.
     public func serveCallback(kind: String, payload: JSONValue) async -> JSONValue {
+        guard await requireJournal("callback \(kind)") else {
+            return .object(["error": .string(
+                journalFailureDetail ?? "The session journal is unavailable; stop this run.")])
+        }
         switch kind {
         case "children":
             guard let delegate = spawnDelegate else {
@@ -382,8 +430,13 @@ public actor Agent {
             // is a bill that keeps arriving. The prelude's limit keeps a megabyte off the
             // callback channel; this one is what makes the guarantee true whatever calls it.
             let text = Self.bounded(raw)
+            var deliveryError: String?
             if let selfDelegate {
-                await selfDelegate.deliverToSelf(sessionID: writer.sessionID, text: text)
+                let delivered = await selfDelegate.deliverToSelf(
+                    sessionID: writer.sessionID, text: text, from: writer.sessionID)
+                if !delivered {
+                    deliveryError = "The session did not accept the notification."
+                }
             } else {
                 // No app behind this run — a CLI session. A follow-up still lands, as long as
                 // the loop is alive to take it.
@@ -393,6 +446,9 @@ public actor Agent {
             // when the count reaches zero with nothing waiting, so decrementing first opens a
             // window where it sees exactly that and finishes the run a moment early.
             dispatchedCount = max(0, dispatchedCount - 1)
+            if let deliveryError {
+                return .object(["delivered": .bool(false), "error": .string(deliveryError)])
+            }
             return .object(["delivered": .bool(true)])
 
         case "search", "read_url":
@@ -459,6 +515,10 @@ public actor Agent {
             }
 
         case "spawn":
+            guard await requireJournal("child start") else {
+                return .object(["error": .string(
+                    journalFailureDetail ?? "The session journal is unavailable; stop this run.")])
+            }
             guard let delegate = spawnDelegate else {
                 return .object(["error": .string("Sub-agents are not enabled for this run.")])
             }
@@ -471,11 +531,16 @@ public actor Agent {
             guard !prompt.isEmpty else {
                 return .object(["error": .string("spawn() needs a prompt.")])
             }
+            if let rejection = Self.childModelRejection(
+                requested: payload["model"]?.stringValue, parent: config.model)
+            {
+                return .object(["error": .string(rejection)])
+            }
             let name = payload["name"]?.stringValue
             // Always non-blocking. Waiting is `.result()` on the Future the prelude hands
             // back, which is Python's business rather than this callback's.
             let started = await delegate.startBackground(
-                prompt: prompt, name: payload["name"]?.stringValue,
+                prompt: prompt, name: name,
                 model: payload["model"]?.stringValue, depth: config.depth + 1)
             return .object([
                 "id": .string(started.childID), "name": .string(started.name),
@@ -575,8 +640,54 @@ public actor Agent {
         }
     }
 
+    /// This runner currently owns one already-resolved provider. Accept naming that same model,
+    /// but reject a different child route explicitly instead of silently running the parent model.
+    static func childModelRejection(requested: String?, parent: ModelSpec) -> String? {
+        guard let requested = requested?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !requested.isEmpty,
+              requested != parent.id,
+              requested != parent.qualifiedID
+        else { return nil }
+        return "This run cannot route a child to \(requested). Omit model to use "
+            + "\(parent.qualifiedID), or start that child from a run configured for the requested model."
+    }
+
     public func cancel() {
         cancelled = true
+    }
+
+    /// Request the narrow cancellation scope this agent can actually provide.
+    ///
+    /// The agent checks this flag at model/action boundaries and after a provider returns. It
+    /// cannot interrupt a provider stream or an already-running Python action, so those scopes
+    /// remain explicit unsupported capabilities at the driver/controller boundary.
+    @discardableResult
+    public func requestCancellation(_ scope: SessionCancellationScope) -> Bool {
+        guard Self.supportedCancellationScopes.contains(scope) else { return false }
+        if activeSendCount > 0 { cancelled = true }
+        else if firstPrompt == nil { cancelNextSend = true }
+        else { return false }
+        return true
+    }
+
+    /// Wait until all currently admitted sends have returned. A request in the pre-entry handoff
+    /// window also waits for that next send to observe the preserved cancellation flag. This is
+    /// deliberately separate from `cancel()`: a cancellation request may only stop before the
+    /// next tool action, and the driver must not close the writer or runtime while a
+    /// cancellation-insensitive model call is still unwinding.
+    public func waitUntilQuiescent() async {
+        guard activeSendCount > 0 || cancelNextSend else { return }
+        await withCheckedContinuation { continuation in
+            quiescenceWaiters.append(continuation)
+        }
+    }
+
+    private func finishSend() {
+        activeSendCount = max(0, activeSendCount - 1)
+        guard activeSendCount == 0 else { return }
+        let waiters = quiescenceWaiters
+        quiescenceWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
     }
 
     /// Change course at the next turn boundary.
@@ -584,17 +695,26 @@ public actor Agent {
     /// Queued rather than applied immediately: a tool call in flight must be answered before
     /// the model can be told anything, and injecting a message between a call and its result
     /// produces a conversation the provider rejects.
-    public func steer(_ text: String) {
+    @discardableResult
+    public func steer(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        // A freshly prepared CLI agent may stage input before its first send. After a turn has
+        // ever run, accepting while quiescent would strand the message until some unrelated
+        // future send, so only an active generation may accept it.
+        let hasConsumer = activeSendCount > 0 || firstPrompt == nil
+        guard !trimmed.isEmpty, hasConsumer, !cancelled else { return false }
         pendingSteering.append(trimmed)
+        return true
     }
 
     /// Queue a prompt for after this run settles.
-    public func queueFollowUp(_ text: String) {
+    @discardableResult
+    public func queueFollowUp(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        let hasConsumer = activeSendCount > 0 || firstPrompt == nil
+        guard !trimmed.isEmpty, hasConsumer, !cancelled else { return false }
         pendingFollowUps.append(trimmed)
+        return true
     }
 
     public var queued: (steering: [String], followUps: [String]) {
@@ -678,20 +798,89 @@ public actor Agent {
 
     // MARK: Running
 
+    /// Record a terminal state for readers that reopen the session after this send returns.
+    /// Failure/cancellation is not guaranteed to have an assistant row, so this marker is a
+    /// separate durable projection rather than a synthetic transcript message.
+    private func recordOutcome(
+        _ state: TranscriptOutcome.State, detail: String? = nil
+    ) async {
+        _ = try? await writer.appendOutcome(state: state, detail: detail.map(Self.bounded))
+    }
+
+    /// Check the journal immediately before a model, tool, callback, or child effect. The
+    /// writer's health is deliberately authoritative; a successful earlier append is not a
+    /// promise that the next fsync will succeed.
+    private func requireJournal(_ effect: String) async -> Bool {
+        guard journalFailureDetail == nil else { return false }
+        if case .healthy = await writer.writerHealth { return true }
+        journalFailureDetail = "The session journal became unavailable before \(effect)."
+        emit(.failed(journalFailureDetail!))
+        return false
+    }
+
+    /// Notes are themselves a crossing into the durable session. A failed hook or artifact
+    /// annotation must not be treated as cosmetic: continuing to the next runtime effect would
+    /// leave an unrecorded action in the transcript.
+    private func appendJournalNote(_ text: String, customType: String = "aviary.note") async -> Bool {
+        do {
+            try await writer.appendNote(text, customType: customType)
+            return true
+        } catch {
+            journalFailureDetail = "Could not record a session note: \(error.localizedDescription)"
+            emit(.failed(journalFailureDetail!))
+            return false
+        }
+    }
+
     /// Send a prompt and run until the model stops calling tools.
-    public func send(_ prompt: String) async {
+    @discardableResult
+    public func send(
+        _ prompt: String,
+        onInputDelivery: (@Sendable (SessionCommandDelivery) -> Void)? = nil
+    ) async -> SendOutcome {
+        activeSendCount += 1
+        defer { finishSend() }
+        guard await requireJournal("user input") else {
+            onInputDelivery?(.notDelivered(reason: journalFailureDetail!))
+            return .failed(journalFailureDetail!)
+        }
+        guard !Task.isCancelled else {
+            await recordOutcome(.cancelled, detail: "cancelled before the input was recorded")
+            onInputDelivery?(.notDelivered(reason: "cancelled before the input was recorded"))
+            emit(.finished(reason: "cancelled"))
+            return .cancelled
+        }
+        if cancelNextSend {
+            cancelNextSend = false
+            await recordOutcome(.cancelled, detail: "cancelled before the input was recorded")
+            onInputDelivery?(.notDelivered(reason: "cancelled before the input was recorded"))
+            emit(.finished(reason: "cancelled"))
+            return .cancelled
+        }
         cancelled = false
         emit(.started(session: writer.sessionID))
         if firstPrompt == nil { firstPrompt = prompt }
-        try? await writer.appendUser(prompt)
+        let inputID: String
+        do {
+            inputID = try await writer.appendUser(prompt)
+        } catch {
+            let detail = "Could not record the user message: \(error.localizedDescription)"
+            await recordOutcome(.failed, detail: detail)
+            onInputDelivery?(.notDelivered(reason: detail))
+            emit(.failed(detail))
+            return .failed(detail)
+        }
+        onInputDelivery?(.delivered(referenceID: inputID))
+        emit(.inputCommitted(id: inputID))
         messages.append(.user(prompt))
 
         var iterations = 0
         while iterations < config.maxIterations {
-            if cancelled {
+            if cancelled || Task.isCancelled {
                 try? await writer.appendNote("Stopped at your request.")
+                await recordOutcome(.cancelled, detail: "Stopped at your request.")
                 emit(.finished(reason: "cancelled"))
-                return
+                return .cancelled
             }
             iterations += 1
 
@@ -709,7 +898,7 @@ public actor Agent {
                     try? await writer.appendNote(note, customType: "aviary.goal")
                     emit(.goalExhausted(note))
                     emit(.finished(reason: "goal budget"))
-                    return
+                    return .completed
                 }
             }
 
@@ -718,7 +907,20 @@ public actor Agent {
                 let messagesToInject = pendingSteering
                 pendingSteering.removeAll()
                 for text in messagesToInject {
-                    try? await writer.appendUser(text)
+                    if cancelled || Task.isCancelled {
+                        await recordOutcome(.cancelled, detail: "Stopped at your request.")
+                        emit(.finished(reason: "cancelled"))
+                        return .cancelled
+                    }
+                    do {
+                        _ = try await writer.appendUser(text)
+                    } catch {
+                        let detail =
+                            "Could not record steering input: \(error.localizedDescription)"
+                        await recordOutcome(.failed, detail: detail)
+                        emit(.failed(detail))
+                        return .failed(detail)
+                    }
                     messages.append(.user(text))
                     emit(.steered(text))
                 }
@@ -726,26 +928,57 @@ public actor Agent {
 
             // Before the call, not after: compaction needs room to run, and discovering the
             // window is full at the moment of sending is discovering it too late.
+            guard await requireJournal("model call") else {
+                return .failed(journalFailureDetail!)
+            }
             await compactIfNeeded()
+            guard await requireJournal("model call") else {
+                return .failed(journalFailureDetail!)
+            }
 
             let turn: Turn
             do {
                 turn = try await runTurn()
             } catch {
+                if cancelled || Task.isCancelled {
+                    try? await writer.appendNote("Stopped at your request.")
+                    await recordOutcome(.cancelled, detail: "Stopped at your request.")
+                    emit(.finished(reason: "cancelled"))
+                    return .cancelled
+                }
                 let detail = error.localizedDescription
                 try? await writer.appendNote("The model call failed: \(detail)")
+                await recordOutcome(.failed, detail: detail)
                 emit(.failed(detail))
-                return
+                return .failed(detail)
             }
 
-            try? await writer.appendAssistant(
-                text: turn.text, thinking: turn.thinking, toolCalls: turn.toolCalls,
-                usage: turn.usage, stopReason: turn.stopReason)
+            // A provider can ignore task cancellation. Once it returns, honor the durable
+            // cancellation flag before recording output or beginning any tool action.
+            if cancelled || Task.isCancelled {
+                try? await writer.appendNote("Stopped at your request.")
+                await recordOutcome(.cancelled, detail: "Stopped at your request.")
+                emit(.finished(reason: "cancelled"))
+                return .cancelled
+            }
+
+            let messageID: String
+            do {
+                messageID = try await writer.appendAssistant(
+                    text: turn.text, thinking: turn.thinking, toolCalls: turn.toolCalls,
+                    usage: turn.usage, stopReason: turn.stopReason)
+            } catch {
+                let detail = "Could not record the assistant message: \(error.localizedDescription)"
+                await recordOutcome(.failed, detail: detail)
+                emit(.failed(detail))
+                return .failed(detail)
+            }
             if let usage = turn.usage {
                 totalUsage += usage
                 if usage.input > 0 { lastInputTokens = usage.input + usage.cacheRead }
             }
-            emit(.turnFinished(usage: turn.usage, stopReason: turn.stopReason))
+            emit(.turnFinished(
+                messageID: messageID, usage: turn.usage, stopReason: turn.stopReason))
 
             var assistantContent: [ChatContent] = []
             if !turn.text.isEmpty { assistantContent.append(.text(turn.text)) }
@@ -768,23 +1001,52 @@ public actor Agent {
                 // a whole model call: the loop would re-ask with an unchanged conversation,
                 // get the same answer, and only then notice the message waiting.
                 _ = await waitForDispatchedWork()
+                if cancelled || Task.isCancelled {
+                    try? await writer.appendNote("Stopped at your request.")
+                    await recordOutcome(.cancelled, detail: "Stopped at your request.")
+                    emit(.finished(reason: "cancelled"))
+                    return .cancelled
+                }
                 if let next = pendingFollowUps.first {
                     pendingFollowUps.removeFirst()
-                    try? await writer.appendUser(next)
+                    do {
+                        _ = try await writer.appendUser(next)
+                    } catch {
+                        let detail =
+                            "Could not record queued input: \(error.localizedDescription)"
+                        await recordOutcome(.failed, detail: detail)
+                        emit(.failed(detail))
+                        return .failed(detail)
+                    }
                     messages.append(.user(next))
                     emit(.steered(next))
                     continue
                 }
                 if !pendingSteering.isEmpty { continue }
                 emit(.finished(reason: turn.stopReason ?? "stopped"))
-                return
+                return .completed
             }
 
             for call in turn.toolCalls {
+                if cancelled || Task.isCancelled {
+                    try? await writer.appendNote("Stopped before the next tool action.")
+                    await recordOutcome(.cancelled, detail: "Stopped before the next tool action.")
+                    emit(.finished(reason: "cancelled"))
+                    return .cancelled
+                }
+                guard await requireJournal("tool \(call.name)") else {
+                    return .failed(journalFailureDetail!)
+                }
                 emit(.toolStarted(id: call.id, name: call.name, arguments: call.arguments))
                 let (output, isError) = await execute(call)
-                try? await writer.appendToolResult(
-                    id: call.id, name: call.name, text: output, isError: isError)
+                do {
+                    try await writer.appendToolResult(
+                        id: call.id, name: call.name, text: output, isError: isError)
+                } catch {
+                    journalFailureDetail = "Could not record the tool result: \(error.localizedDescription)"
+                    emit(.failed(journalFailureDetail!))
+                    return .failed(journalFailureDetail!)
+                }
                 emit(.toolFinished(id: call.id, name: call.name, output: output, isError: isError))
                 messages.append(ChatMessage(role: .tool, content: [
                     .toolResult(id: call.id, name: call.name, text: output, isError: isError),
@@ -799,6 +1061,7 @@ public actor Agent {
             + "Raise maxIterations, or narrow the task."
         try? await writer.appendNote(note)
         emit(.finished(reason: "iteration limit"))
+        return .completed
     }
 
     /// The most a single delivered message may add to a conversation.
@@ -990,6 +1253,9 @@ public actor Agent {
     private func execute(
         _ call: (id: String, name: String, arguments: JSONValue)
     ) async -> (String, Bool) {
+        guard await requireJournal("tool \(call.name)") else {
+            return (journalFailureDetail ?? "The session journal is unavailable; stop this run.", true)
+        }
         if call.name != "python" {
             if let entry = mcpTools[call.name] {
                 do {
@@ -1031,9 +1297,9 @@ public actor Agent {
         guard var code = call.arguments["code"]?.stringValue, !code.isEmpty else {
             return ("The `python` tool needs a non-empty `code` argument.", true)
         }
-        // A hook may block this call or rewrite it. Because `ipython` is the only tool, a
-        // single hook here is a complete permission system — and it can edit the code rather
-        // than only veto it, which is the difference between a gate and a wall.
+        // A hook may block this call or rewrite it. Hooks mediate calls Aviary dispatches, but
+        // they are not a security boundary: Python can perform file, process, socket, and
+        // network effects directly. Aviary intentionally accepts that no-sandbox contract here.
         if hooksEnabled,
            let decision = await host.callHook("before_tool", payload: .object([
                "name": .string(call.name),
@@ -1044,15 +1310,19 @@ public actor Agent {
             if decision["block"]?.boolValue == true {
                 let reason = decision["reason"]?.stringValue
                     ?? "A hook blocked this. Try a different approach."
-                try? await writer.appendNote(
+                _ = await appendJournalNote(
                     "A hook blocked a tool call: \(reason)", customType: "aviary.hook")
                 return (reason, true)
             }
             if let rewritten = decision["code"]?.stringValue, rewritten != code {
                 // Recorded, because a rewritten call that looks like the agent's own would
                 // make the transcript lie about what ran.
-                try? await writer.appendNote(
-                    "A hook rewrote a tool call.", customType: "aviary.hook")
+                guard await appendJournalNote(
+                    "A hook rewrote a tool call.", customType: "aviary.hook") else {
+                    return (
+                        journalFailureDetail ?? "The session journal is unavailable; stop this run.",
+                        true)
+                }
                 code = rewritten
             }
         }
@@ -1108,7 +1378,7 @@ public actor Agent {
         // full disk should not produce one error per model call.
         guard let handle = try? FileHandle(forWritingTo: wireLogURL) else { return }
         defer { try? handle.close() }
-        try? handle.seekToEnd()
+        _ = try? handle.seekToEnd()
         try? handle.write(contentsOf: data)
     }
 

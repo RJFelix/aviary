@@ -36,6 +36,37 @@ func test_parsesLinearSessionWithToolPairing() throws {
     XCTAssertEqual(tool.toolDuration, 1)
 }
 
+func test_recognizesCurrentAndLegacyPythonToolNames() {
+    let arguments = JSONValue.object(["code": .string("print(1)")])
+    XCTAssertEqual(ToolCall(id: "new", name: "python", arguments: arguments).pythonCode, "print(1)")
+    XCTAssertEqual(ToolCall(id: "old", name: "ipython", arguments: arguments).pythonCode, "print(1)")
+    XCTAssertNil(ToolCall(id: "other", name: "shell", arguments: arguments).pythonCode)
+}
+
+func test_rejectsUnsupportedChildModelInsteadOfSilentlyUsingParent() {
+    let parent = fakeModel()
+    XCTAssertNil(Agent.childModelRejection(requested: nil, parent: parent))
+    XCTAssertNil(Agent.childModelRejection(requested: parent.id, parent: parent))
+    XCTAssertNil(Agent.childModelRejection(requested: parent.qualifiedID, parent: parent))
+    let rejection = Agent.childModelRejection(requested: "other/model", parent: parent)
+    XCTAssertTrue(rejection?.contains("cannot route a child") == true)
+    XCTAssertTrue(rejection?.contains(parent.qualifiedID) == true)
+}
+
+func test_claudePromptCanTruthfullySkipProjectContextFiles() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appending(path: "aviary-context-\(UUID().uuidString)", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try "unique project instruction".write(
+        to: directory.appending(path: "AGENTS.md"), atomically: true, encoding: .utf8)
+
+    let included = ClaudeCodePrompt.build(cwd: directory.path)
+    let skipped = ClaudeCodePrompt.build(cwd: directory.path, includeContextFiles: false)
+    XCTAssertTrue(included.contains("unique project instruction"))
+    XCTAssertFalse(skipped.contains("unique project instruction"))
+}
+
 func test_rendersOnlyTheActiveBranch() throws {
     // Two children of a1: the abandoned branch (b1) and the live one (c1, c2).
     // The active path is the chain from the LAST written entry back to the root.
@@ -372,6 +403,65 @@ func test_batchTrashReportsIndividualFailures() async throws {
     XCTAssertNotNil(result.failures[summary.id])
 }
 
+/// A moved transcript plus an artifact failure is a partial success, never a clean success or
+/// a retryable catalog row whose transcript no longer exists.
+func test_batchTrashReportsArtifactPartialFailure() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "aviary-partial-trash-test-\(UUID().uuidString)", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let home = AgentHome(root: root)
+    try FileManager.default.createDirectory(at: home.sessionsDir, withIntermediateDirectories: true)
+    let file = home.sessionFile(id: "partial-session")
+    try Data(
+        #"{"type":"session","version":3,"id":"header","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp"}"#.utf8
+    ).write(to: file)
+    let artifacts = home.artifacts(forSession: "partial-session")
+    try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
+    try Data("keep me".utf8).write(to: artifacts.appending(path: "result.txt"))
+    let summary = try XCTUnwrap(SessionCatalog.summarize(fileURL: file))
+
+    let catalog = SessionCatalog(home: home) { url in
+        if url.standardizedFileURL == artifacts.standardizedFileURL {
+            throw NSError(domain: "AviarySelfTest", code: 73,
+                          userInfo: [NSLocalizedDescriptionKey: "artifact move denied"])
+        }
+        try FileManager.default.removeItem(at: url)
+    }
+    let result = await catalog.trash(sessions: [summary])
+    XCTAssertTrue(result.trashedIDs.contains(summary.id))
+    XCTAssertTrue(result.failures.isEmpty)
+    XCTAssertTrue(result.partialFailures[summary.id]?.contains("artifact move denied") == true)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: artifacts.path))
+}
+
+/// Archive is reversible catalog state, not transcript mutation or deletion.
+func test_archiveRoundTripsWithoutTouchingTranscript() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "aviary-archive-test-\(UUID().uuidString)", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let home = AgentHome(root: root)
+    try FileManager.default.createDirectory(at: home.sessionsDir, withIntermediateDirectories: true)
+    let file = home.sessionFile(id: "session-one")
+    let jsonl = [
+        #"{"type":"session","version":3,"id":"header","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/tmp"}"#,
+        #"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":"hi"}}"#,
+    ].joined(separator: "\n")
+    try Data(jsonl.utf8).write(to: file)
+    let original = try Data(contentsOf: file)
+
+    let catalog = SessionCatalog(home: home)
+    try await catalog.setArchived(true, sessionIDs: ["session-one"])
+    var rows = await catalog.scan()
+    XCTAssertTrue(try XCTUnwrap(rows.first).isArchived)
+    XCTAssertEqual(try Data(contentsOf: file), original)
+
+    try await catalog.setArchived(false, sessionIDs: ["session-one"])
+    rows = await catalog.scan()
+    XCTAssertFalse(try XCTUnwrap(rows.first).isArchived)
+    XCTAssertEqual(try Data(contentsOf: file), original)
+}
+
 // MARK: - Runner
 
 
@@ -521,6 +611,7 @@ final class EventLog: @unchecked Sendable {
         case .modelChanged: events.append("modelChanged")
         case .awaitingDispatched: events.append("awaitingDispatched")
         case .started: events.append("started")
+        case .inputCommitted: events.append("inputCommitted")
         case .steered: events.append("steered")
         case .goalExhausted: events.append("goal-exhausted")
         case .textDelta(let t): text += t
@@ -538,6 +629,65 @@ final class EventLog: @unchecked Sendable {
 
     var names: [String] { lock.lock(); defer { lock.unlock() }; return events }
     var assistantText: String { lock.lock(); defer { lock.unlock() }; return text }
+}
+
+/// A provider that deliberately ignores Agent cancellation until the test releases it with a
+/// tool call. This pins the boundary after a provider returns: End must still prevent the tool
+/// from touching a runtime that teardown is about to close.
+final class CancellationIgnoringToolProvider: ChatProvider, @unchecked Sendable {
+    let id = "cancellation-ignoring"
+    private let lock = NSLock()
+    private var continuation: AsyncThrowingStream<ChatEvent, Error>.Continuation?
+
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+        AsyncThrowingStream { continuation in
+            lock.lock()
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+
+    var hasStarted: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return continuation != nil
+    }
+
+    func releaseTool(code: String) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.yield(.toolCall(
+            id: "late-tool", name: "python",
+            arguments: .object(["code": .string(code)])))
+        continuation?.yield(.done(stopReason: "tool_use"))
+        continuation?.finish()
+    }
+}
+
+/// A provider whose suspended stream throws `CancellationError` when its consumer task is
+/// cancelled, matching the normal cooperative URLSession/provider path.
+final class CooperativeCancellationProvider: ChatProvider, @unchecked Sendable {
+    let id = "cooperative-cancellation"
+    private let lock = NSLock()
+    private var started = false
+
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+        AsyncThrowingStream(unfolding: { [self] in
+            markStarted()
+            try await Task.sleep(nanoseconds: 60_000_000_000)
+            return .done(stopReason: "stop")
+        })
+    }
+
+    private func markStarted() {
+        lock.lock(); started = true; lock.unlock()
+    }
+
+    var hasStarted: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return started
+    }
 }
 
 // MARK: - Runtime host test helpers
@@ -593,6 +743,15 @@ typealias Case = (String, () async throws -> Void)
 
 let cases0: [Case] = [
     ("parsesLinearSessionWithToolPairing", { try test_parsesLinearSessionWithToolPairing() }),
+    ("recognizesCurrentAndLegacyPythonToolNames", {
+        test_recognizesCurrentAndLegacyPythonToolNames()
+    }),
+    ("rejectsUnsupportedChildModelInsteadOfSilentlyUsingParent", {
+        test_rejectsUnsupportedChildModelInsteadOfSilentlyUsingParent()
+    }),
+    ("claudePromptCanTruthfullySkipProjectContextFiles", {
+        try test_claudePromptCanTruthfullySkipProjectContextFiles()
+    }),
     ("rendersOnlyTheActiveBranch", { try test_rendersOnlyTheActiveBranch() }),
     ("collapsesAgentStatusToLatestOnly", { try test_collapsesAgentStatusToLatestOnly() }),
     ("survivesUnknownEntryTypesAndBadLines", { try test_survivesUnknownEntryTypesAndBadLines() }),
@@ -618,6 +777,12 @@ let cases0: [Case] = [
     ("attributesContextFileBodyToItsFile", { test_attributesContextFileBodyToItsFile() }),
     ("sessionIdentityIsTheFilenameNotTheHeaderField", { try test_sessionIdentityIsTheFilenameNotTheHeaderField() }),
     ("batchTrashReportsIndividualFailures", { try await test_batchTrashReportsIndividualFailures() }),
+    ("batchTrashReportsArtifactPartialFailure", {
+        try await test_batchTrashReportsArtifactPartialFailure()
+    }),
+    ("archiveRoundTripsWithoutTouchingTranscript", {
+        try await test_archiveRoundTripsWithoutTouchingTranscript()
+    }),
 
     ("workshop: fold builds a request from a created event", {
         let line = #"{"v":1,"at":"2026-08-21T10:00:00.000Z","event":"created","id":"wr-1","title":"Fix the thing","body":"detail","kind":"bug"}"#
@@ -1092,8 +1257,14 @@ let cases2: [Case] = [
         _ = try await shared.start()
         let s1 = try await ref.createSession()
         let s2 = try await shared.createSession()
-        let onRef = try await ref.execute("import numpy", in: s1)
         let onShared = try await shared.execute("import numpy; int(numpy.arange(4).sum())", in: s2)
+        if onShared.exception?.contains("No module named 'numpy'") == true {
+            print("      skipped: numpy is not installed for the active Python")
+            await ref.stop()
+            await shared.stop()
+            return
+        }
+        let onRef = try await ref.execute("import numpy", in: s1)
         if onRef.exception == nil {
             print("      NOTE: numpy now imports in a sub-interpreter — the shared host may be redundant")
         } else {
@@ -1252,7 +1423,7 @@ let cases2: [Case] = [
         await agent.observe { log.record($0) }
         await agent.send("what is six times seven?")
 
-        XCTAssertEqual(log.names, ["started", "thinking", "turn", "tool:python", "tool-ok",
+        XCTAssertEqual(log.names, ["started", "inputCommitted", "thinking", "turn", "tool:python", "tool-ok",
                                    "turn", "finished:stop"])
         XCTAssertEqual(log.assistantText, "The answer is 42.")
 
@@ -2370,11 +2541,15 @@ let cases3: [Case] = [
             config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s"))
         await agent.queueFollowUp("and now the second thing")
         await agent.send("the first thing")
+        let acceptedAfterReturn = await agent.queueFollowUp("too late for that generation")
         await writer.close()
         XCTAssertEqual(try server.recordedRequests().count, 2,
                        "the follow-up produced a second model call in the same run")
         let queued = await agent.queued
         XCTAssertTrue(queued.followUps.isEmpty, "and the queue drained")
+        XCTAssertFalse(
+            acceptedAfterReturn,
+            "a quiescent agent rejects input that the completed generation cannot consume")
     }),
 
     ("goals: the budget is stated to the agent and enforced against it", {
@@ -5298,7 +5473,7 @@ let casesDispatched: [Case] = [
                        "a third call means the result was delivered and answered")
         XCTAssertEqual(
             log.names,
-            ["started", "turn", "tool:python", "tool-ok", "turn", "awaitingDispatched",
+            ["started", "inputCommitted", "turn", "tool:python", "tool-ok", "turn", "awaitingDispatched",
              "steered", "turn", "finished:stop"])
 
         // And it arrived in the conversation as a message, carrying the command's output.
@@ -5537,12 +5712,12 @@ let casesBackgroundSpawn: [Case] = [
             func startBackground(
                 prompt: String, name: String?, model: String?, depth: Int
             ) async -> (childID: String, name: String) {
-                lock.lock(); started.append(prompt); lock.unlock()
+                lock.withLock { started.append(prompt) }
                 return ("c-bg", name ?? "c-bg")
             }
 
             func children() async -> [Agent.ChildStatus] {
-                lock.lock(); let done = finished; lock.unlock()
+                let done = lock.withLock { finished }
                 return [Agent.ChildStatus(
                     id: "c-bg", name: "researcher",
                     state: done ? "done" : "running",
@@ -5560,7 +5735,7 @@ let casesBackgroundSpawn: [Case] = [
         XCTAssertEqual(running.state, "running")
         XCTAssertNil(running.payload["answer"])
 
-        fake.lock.lock(); fake.finished = true; fake.lock.unlock()
+        fake.lock.withLock { fake.finished = true }
         let done = try XCTUnwrap(await fake.children().first)
         XCTAssertEqual(done.state, "done")
         XCTAssertEqual(done.payload["answer"]?.stringValue, "found it")
@@ -5986,6 +6161,270 @@ let casesModelSwitch: [Case] = [
         // and a remembered object would be a stale copy of a row that may no longer exist.
         XCTAssertTrue(defaults.string(forKey: key)?.contains("/") == true)
     }),
+    ("switch: a failed journal blocks provider resolution before its effects", {
+        try await test_modelSwitchCoordinatorFailsClosedBeforeProviderResolution()
+    }),
+]
+
+let casesPhase0SessionControl: [Case] = [
+    ("phase0: session/work/run identities remain distinct", {
+        try test_sessionWorkIdentityAllocatesIndependentStableReferences()
+    }),
+    ("phase0: commands are admitted and acknowledged in one order", {
+        try await test_sessionCommandControllerSerializesAdmissionAndAcknowledgements()
+    }),
+    ("phase0: duplicate dispatch waiters execute exactly once", {
+        try await test_sessionCommandControllerDispatchIsExactlyOnceForDuplicateWaiters()
+    }),
+    ("phase0: stale command failures cannot corrupt newer lifecycle state", {
+        try await test_sessionCommandControllerIgnoresStaleFailureAfterNewerSendOrEnd()
+    }),
+    ("phase0: failed preparation destroys its runtime session", {
+        try await test_agentRunnerDestroysRuntimeSessionWhenWriterSetupFails()
+    }),
+    ("phase0: cancellation-insensitive providers cannot execute late tools", {
+        try await test_agentCancellationWaitsForProviderAndPreventsLateToolExecution()
+    }),
+    ("phase0: cooperative provider cancellation is not a failure", {
+        try await test_cooperativeProviderCancellationIsNotReportedAsFailure()
+    }),
+    ("phase0: Claude input requires a live stdin delivery boundary", {
+        try await test_claudeInputWithoutLiveStdinIsRejected()
+    }),
+    ("phase0: cancellation requires a declared capability", {
+        try await test_sessionCommandControllerRequiresDeclaredCancellationCapability()
+    }),
+    ("phase0: steer and queue require declared capabilities", {
+        try await test_sessionCommandControllerRequiresDeclaredSteeringAndQueues()
+    }),
+    ("phase0: control contract matrix covers engines, lifecycle, and action scope", {
+        try await test_sessionCommandControllerCoversTheControlContractMatrix()
+    }),
+    ("phase0: the local Work Host identity is durable", {
+        try test_agentHomeWorkHostIdentityIsDurable()
+    }),
+    ("phase0: session headers preserve Work identity across resume", {
+        try await test_sessionWriterPersistsAndRecoversIdentityWithoutChangingLegacyShape()
+    }),
+    ("phase0: assistant commit acknowledgement names the durable row", {
+        try await test_sessionWriterReturnsTheDurableAssistantIdentity()
+    }),
+    ("phase0: live overlays converge without duplicate rows", {
+        try LiveTranscriptOverlaySelfTests.run()
+    }),
+    ("phase0: Claude terminal outcomes survive cold reload", {
+        try await ClaudeCodeOutcomeSelfTests.run()
+    }),
+    ("phase0: scripted adapter turn preserves queue, steer, cancel, and reload semantics", {
+        try await Phase0InteractionSelfTests.run()
+    }),
+    ("phase1 bridge: command intent stays raw-readable and conversation-hidden", {
+        try await test_sessionWriterCommandIntentIsRawReadableButConversationHidden()
+    }),
+    ("phase1 bridge: writer failures latch across every ambiguous boundary", {
+        try await test_sessionWriterLatchesBeforePartialAndPostWriteSyncFailures()
+    }),
+    ("phase1 bridge: controller commits intent and fails closed", {
+        try await test_sessionCommandControllerCommitsIntentAndFailsClosedOnAmbiguity()
+    }),
+    ("phase1 bridge: journal failure releases queued dispatch waiters", {
+        try await test_sessionCommandControllerFailsQueuedWaitersWhenIntentCommitLatchesJournal()
+    }),
+    ("phase1 bridge: End bypasses a held intent commit and remains terminal", {
+        try await test_sessionCommandControllerEndBypassesHeldCommitAndStaysEnded()
+    }),
+    ("phase1 bridge: superseded End permits cannot dispatch after teardown", {
+        try await test_sessionCommandControllerLateEndCannotDispatchAfterNewerEndCompletes()
+    }),
+    ("phase1 bridge: resume quarantines an unterminated partial journal tail", {
+        try await test_sessionWriterResumeQuarantinesPartialTailBeforeNewRun()
+    }),
+    ("phase1 bridge: End remains dispatchable across every journal ambiguity", {
+        try await test_sessionCommandControllerEndIntentFailuresRemainTeardownPermits()
+    }),
+    ("phase1 bridge: held steer and queue commits preserve lifecycle acknowledgements", {
+        try await test_sessionCommandControllerLifecycleAckSurvivesHeldSteerAndQueueCommit()
+    }),
+    ("phase1 bridge: late non-End commit failure remains terminal", {
+        try await test_sessionCommandControllerHeldSteerFailureAfterTurnFinishMarksFailed()
+    }),
+]
+
+let casesPhase1Timeline: [Case] = [
+    ("phase1: linked Session and Work reducers preserve distinct identities", {
+        try test_timelineReducersLinkSessionsAndWork()
+    }),
+    ("phase1: timeline order, evidence links, and suffix quarantine are deterministic", {
+        try test_timelineReducerTracksCausalOrderAndBoundsLinks()
+    }),
+    ("phase1: unknown events and legacy identities remain inspectable", {
+        try test_timelineReducersPreserveUnknownEventsAndLegacyIdentity()
+    }),
+    ("phase1: live and cold timeline prefixes reduce identically", {
+        try test_timelineReducersLiveAndColdPrefixEquivalence()
+    }),
+    ("phase1: one Session supports many Work attachments with isolated detach", {
+        try test_timelineSessionSupportsManyAttachmentsAndDetachIsolation()
+    }),
+    ("phase1: journal reader preserves bytes, legacy provenance, and tail status", {
+        try test_timelineJournalReaderPreservesBytesAndLegacyTailSemantics()
+    }),
+    ("phase1: action, context, terminality, and semantic tips are validated", {
+        try test_timelineValidatesActionLifecycleContextAndSemanticTip()
+    }),
+    ("phase1: concurrent command receipts preserve host order and retry identity", {
+        try test_timelineProjectsCommandReceiptsAndRejectsHostReordering()
+    }),
+    ("phase1: journal authority and command receipt provenance cannot disagree", {
+        try test_timelineJournalAuthorityAndCommandReceiptProvenance()
+    }),
+    ("phase1: terminal Work is immutable and requires quiescence", {
+        test_timelineWorkTerminalLifecycleIsImmutableAndRequiresQuiescence()
+    }),
+    ("phase1: Timeline v2 100k baseline", {
+        try test_timelineV2HundredThousandBaseline()
+    }),
+    ("phase1: Timeline v2 adversarial incremental equivalence", {
+        try test_timelineV2IncrementalAdversarialEquivalence()
+    }),
+    ("phase1 catalog: canonical rows preserve attached Work truth", {
+        try test_canonicalSessionCatalogPreservesAttachedWorkIdentityAndTruth()
+    }),
+    ("phase1 catalog: detached active Work remains unprojected", {
+        try test_canonicalSessionCatalogDoesNotProjectDetachedActiveWork()
+    }),
+    ("phase1 catalog: corrupt active Work remains unprojected", {
+        try test_canonicalSessionCatalogDoesNotProjectCorruptActiveWork()
+    }),
+    ("phase1 catalog: production scan crosses explicit legacy projection boundary", {
+        try await test_sessionCatalogScanUsesExplicitLegacyProjectionBoundary()
+    }),
+    ("phase1 catalog: legacy projection does not invent Work or attention", {
+        try test_legacyProjectionDoesNotInventWorkOrEffectiveAttention()
+    }),
+    ("phase1 catalog: canonical-only rows survive list display adaptation", {
+        try test_canonicalOnlyProjectionSurvivesListDisplayAdapter()
+    }),
+    ("phase1 catalog: untitled legacy rows stay searchable", {
+        try test_untitledLegacyProjectionRemainsNonblankAndSearchable()
+    }),
+    ("phase1 catalog: duplicate projection ids are explicit", {
+        try test_duplicateProjectionIDsAreReportedWithoutTrapping()
+    }),
+    ("phase1 catalog: delayed remote Work remains visible", {
+        try test_canonicalSessionCatalogDoesNotHideDelayedRemoteWork()
+    }),
+    ("phase1 catalog: cursor misalignment hides unproven Work state", {
+        try test_canonicalSessionCatalogSeparatesCursorAlignmentAndHidesUnalignedWork()
+    }),
+    ("phase1 catalog: attached Work identity must agree across projections", {
+        try test_canonicalSessionCatalogRequiresAllAttachedWorkIdentitiesToAgree()
+    }),
+    ("phase1 catalog: read integrity requires an exact canonical Work read", {
+        try test_canonicalSessionCatalogOnlyReportsExactCanonicalWorkReads()
+    }),
+    ("phase1 catalog: duplicate event IDs preserve reducer truth", {
+        try test_canonicalSessionCatalogRetainsReducerDuplicateTruthWithoutTrapping()
+    }),
+    ("phase1 catalog: Session snapshot and read cursors must align", {
+        try test_canonicalSessionCatalogCorrelatesSessionSnapshotAndReadCursors()
+    }),
+    ("phase1 catalog: authority qualifies identity and rejects owner mismatch", {
+        try test_canonicalSessionCatalogQualifiesSessionIDsAndRejectsOwnerMismatch()
+    }),
+    ("phase1 census: canonical SessionCatalog projection is registered", {
+        try test_readerCensusRegistersCanonicalSessionCatalogProjection()
+    }),
+    ("phase1 census: linked fixture reports canonical state planes", {
+        try test_readerCensusFixtureProjectsCorePlanes()
+    }),
+    ("phase1 census: indeterminate actions override authored attention", {
+        try test_readerCensusIndeterminateActionOverridesAuthoredAttention()
+    }),
+    ("phase1 census: retained-body evidence must match the actual artifact", {
+        try test_readerCensusRejectsContradictoryRetainedBodyMetadata()
+    }),
+    ("phase1 census: incremental byte chunks match whole reads", {
+        try test_readerCensusIncrementalChunksMatchWholeRead()
+    }),
+    ("phase1 census: malformed and truncated tails remain visible", {
+        try test_readerCensusMalformedAndTruncatedTailsStayVisible()
+    }),
+    ("phase1 census: legacy records retain synthetic durable identity", {
+        try test_readerCensusLegacyJournalKeepsSyntheticIdentity()
+    }),
+    ("phase1 census: manifest and retained bodies round-trip", {
+        try test_readerCensusManifestAndRetainedBodiesRoundTrip()
+    }),
+]
+
+let casesTimelineWriter: [Case] = [
+    ("phase1 writer: fresh appendBatch bytes, reducer, and reopen", {
+        try await test_timelineJournalWriterFreshBatchReopenAndReducer()
+    }),
+    ("phase1 writer: draft identity and evidence validation", {
+        try await test_timelineJournalWriterValidatesIdentityAndEvidenceBeforeWriting()
+    }),
+    ("phase1 writer: invalid journals are refused without repair", {
+        try await test_timelineJournalWriterRefusesEmptyLegacyForeignCorruptAndNoncontiguousReopen()
+    }),
+    ("phase1 writer: lock and failure boundaries fail closed", {
+        try await test_timelineJournalWriterLocksAndLatchesEveryFailureBoundary()
+    }),
+    ("phase1 writer: owner lock survives data path replacement", {
+        try await test_timelineJournalWriterOwnerLockSurvivesJournalPathReplacement()
+    }),
+    ("phase1 writer: empty fresh crash window recovers", {
+        try await test_timelineJournalWriterReopensEmptyAfterFreshCrashWindow()
+    }),
+    ("phase1 writer: JournalRef construction fails safely", {
+        try test_timelineJournalRefPublicConstructionCannotTrap()
+    }),
+    ("phase1 writer: deterministic seams and persisted authority", {
+        try await test_timelineJournalWriterDeterministicSeamsAndAgentHomeAuthority()
+    }),
+]
+
+let casesRunJournalBundle: [Case] = [
+    ("phase1 bundle: paired native genesis and exact assembly", {
+        try await test_runJournalBundleFreshGenesisAndExactAssembly()
+    }),
+    ("phase1 bundle: input and assistant tips retain the visible chain", {
+        try await test_runJournalBundleInputAndAssistantTipsRemainOneVisibleChain()
+    }),
+    ("phase1 bundle: queued delivery preserves the accepted command", {
+        try await test_runJournalBundleQueuedDeliveryUsesOriginalReceiptAndNoSecondInput()
+    }),
+    ("phase1 bundle: every action kind receives a post-start permit", {
+        try await test_runJournalBundleAllActionKindsPermitOnlyAfterDurableStart()
+    }),
+    ("phase1 bundle: reopen retains single-use action identities", {
+        try await test_runJournalBundleReopenRetainsSingleUseActionIdentities()
+    }),
+    ("phase1 bundle: semantic gate serializes concurrent mutations", {
+        try await test_runJournalBundleSemanticGateSerializesConcurrentMutations()
+    }),
+    ("phase1 bundle: queued delivery survives finished-run reopen", {
+        try await test_runJournalBundleQueuedCommandCanDeliverAfterFinishedRunReopen()
+    }),
+    ("phase1 bundle: terminal run outcomes remain typed", {
+        try await test_runJournalBundleTerminalRunOutcomesRemainTyped()
+    }),
+    ("phase1 bundle: partial prefixes latch and refuse permits", {
+        try await test_runJournalBundlePartialPrefixesLatchAndRefusePermits()
+    }),
+    ("phase1 bundle: outcome failure metadata and retry remain truthful", {
+        try await test_runJournalBundleOutcomeFailureRequiresMetadataButCanContinue()
+    }),
+    ("phase1 bundle: reopen, counterpart, and active-writer checks", {
+        try await test_runJournalBundleReopenNPlusOneAndRefusesIncompletePairsOrActiveWriters()
+    }),
+    ("phase1 bundle: reopen continues from semantic tip", {
+        try await test_runJournalBundleReopenContinuesFromSemanticTipNotPhysicalTail()
+    }),
+    ("phase1 bundle: checked close reports a partial close", {
+        try await test_runJournalBundleCheckedCloseReportsPartialClose()
+    }),
 ]
 
 await Harness.run(
@@ -5995,4 +6434,5 @@ await Harness.run(
         + casesRepoRoot + casesAgentHome
         + casesPeers + casesMCPSurface
         + casesBackgroundSpawn + casesWebSearch + casesDispatched
-        + casesCrossingLaws)
+        + casesCrossingLaws + casesPhase0SessionControl + casesPhase1Timeline
+        + casesTimelineWriter + casesRunJournalBundle)

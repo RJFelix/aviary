@@ -1,6 +1,6 @@
-import SwiftUI
-import Observation
 import AviaryCore
+import Observation
+import SwiftUI
 
 /// Top-level navigation destinations.
 enum Section: String, CaseIterable, Identifiable, Hashable {
@@ -55,7 +55,7 @@ enum Section: String, CaseIterable, Identifiable, Hashable {
         case .models: return "Providers and routes"
         case .usage: return "Tokens and cost"
         case .library: return "Skills, prompts, extensions"
-        case .health: return "Daemon and processes"
+        case .health: return "Runtime and processes"
         }
     }
 }
@@ -89,6 +89,13 @@ final class AppModel {
     // MARK: Catalog
 
     var sessions: [SessionSummary] = []
+    /// Canonical catalog projections keyed by the displayed row id. Legacy rows use the filename
+    /// stem, while native rows use their authority-qualified id; artifact, kernel, and live-run
+    /// joins still use the separate local compatibility identity until native journals land.
+    var canonicalCatalogProjections: [String: CanonicalSessionCatalogSummary] = [:]
+    /// Projection ids reported more than once in one catalog refresh. Keep the first stable row
+    /// for display and surface the conflict instead of trapping or silently replacing it.
+    var canonicalCatalogProjectionConflicts: [String] = []
     var isScanning = false
     var scanProgress: (done: Int, total: Int) = (0, 0)
     var catalogError: String?
@@ -101,6 +108,10 @@ final class AppModel {
     var selectedSessionID: String?
     var selectedSessionIDs: Set<String> = []
     var isTrashingSessions = false
+    /// Session identities reserved by an in-flight Trash operation. Resume admission checks
+    /// this set so no new writer can appear after the liveness check yields to the catalog actor.
+    private var sessionsBeingTrashed: Set<String> = []
+    var isArchivingSessions = false
     var transcript: Transcript?
     var transcriptSessionID: String?
     var isLoadingTranscript = false
@@ -113,9 +124,10 @@ final class AppModel {
     // MARK: Live
 
     // The harness had a supervisor process holding sessions, a pool of kernels and a lease
-    // per session, and this is where their state used to live. Aviary's own engine runs its
-    // agents in-process and its interpreters in a runtime host it owns, so there is nothing
-    // to inspect and nothing to reconcile — a run is live because it is in `runs`.
+    // per session, and this is where their state used to live. Aviary's own engine still has
+    // an in-process driver, but the durable Work identity and command controller now belong to
+    // the session seam; `runs` is only this GUI's current attachment, not proof that Work ends
+    // when this collection changes.
     var tree = AgentTree()
     var lastRefresh: Date?
 
@@ -163,6 +175,38 @@ final class AppModel {
     // MARK: Runs
 
     var runs: [LiveRun] = []
+    /// Work retained by this process after its chat view is detached.
+    ///
+    /// This is an in-process bridge toward the Work Host split, not a durability claim: an app
+    /// process exit still ends these runs until the out-of-process host exists.
+    var detachedRuns: [LiveRun] = []
+
+    var workRuns: [LiveRun] { runs + detachedRuns }
+
+    /// One process-wide quiescence barrier for reload and ordinary application termination.
+    ///
+    /// A second shutdown request must join the first rather than observe `LiveRun.isEnding`,
+    /// return early, and let the process disappear while the original cleanup is still waiting
+    /// on Claude Code or its runtime child. Window close does not call this; it merely removes
+    /// the GUI attachment and leaves Work alive in this process.
+    private var workShutdownTask: Task<Void, Never>?
+    var reloadInProgress = false
+    var acceptsNewWork = true
+
+    func stopAllWork() async {
+        acceptsNewWork = false
+        if let workShutdownTask {
+            await workShutdownTask.value
+            return
+        }
+        let work = workRuns
+        let task = Task { @MainActor in
+            for run in work { await run.stop() }
+        }
+        workShutdownTask = task
+        await task.value
+        workShutdownTask = nil
+    }
 
     /// Which engine a new run uses.
     ///
@@ -196,7 +240,8 @@ final class AppModel {
         // remembered engine *path*, and writing this over it would leave `bootstrap()` unable
         // to match the saved engine and silently falling back to the first one discovered.
         if let raw = UserDefaults.standard.string(forKey: "aviary.engineChoice"),
-           let choice = Engine(rawValue: raw) {
+            let choice = Engine(rawValue: raw)
+        {
             return choice
         }
         // In-house is the default now. The harness fork is on its way out — it is 457MB of
@@ -204,7 +249,8 @@ final class AppModel {
         // one at a time, and a default that still pointed at it meant the workshop agent was
         // improving Aviary using somebody else's agent.
         return .inHouse
-    }() {
+    }()
+    {
         didSet { UserDefaults.standard.set(engineChoice.rawValue, forKey: "aviary.engineChoice") }
     }
 
@@ -215,7 +261,8 @@ final class AppModel {
     var focusedRunID: UUID?
     /// Which Claude model a driven run asks for. An alias rather than a full id, because that
     /// is what Claude Code's `--model` takes and what its own docs use.
-    var claudeCodeModel: String = UserDefaults.standard.string(forKey: "aviary.claudeCodeModel")
+    var claudeCodeModel: String =
+        UserDefaults.standard.string(forKey: "aviary.claudeCodeModel")
         ?? "sonnet"
     {
         didSet { UserDefaults.standard.set(claudeCodeModel, forKey: "aviary.claudeCodeModel") }
@@ -387,12 +434,23 @@ final class AppModel {
     func refreshCatalog() async {
         guard let catalog else { return }
         isScanning = true
-        let found = await catalog.scan { [weak self] done, total in
+        let entries = await catalog.scanEntries { [weak self] done, total in
             Task { @MainActor in self?.scanProgress = (done, total) }
         }
+        let projectionIndex = SessionCatalogProjectionIndex(entries: entries)
+        canonicalCatalogProjections = projectionIndex.canonicalByID
+        canonicalCatalogProjectionConflicts = projectionIndex.duplicateIDs
+        catalogError = projectionIndex.duplicateIDs.isEmpty
+            ? nil
+            : "Duplicate canonical catalog ids: " + projectionIndex.duplicateIDs.joined(separator: ", ")
+        // The index owns first-seen identity deduplication. Feeding all adapted entries directly
+        // to the list would give SwiftUI duplicate tags and make selection nondeterministic.
+        let found = projectionIndex.displaySummaries
         sessions = found
         tree = AgentTreeReader.read(home: home)
-        analytics = UsageAnalytics.build(from: found)
+        // Native canonical-only rows are not legacy transcript accounting inputs. Keep them in
+        // the list, but do not turn their observe-only zero counters into analytics evidence.
+        analytics = UsageAnalytics.build(from: found.filter { !$0.isCanonicalOnly })
         isScanning = false
         annotateLiveState()
         lastRefresh = Date()
@@ -404,8 +462,8 @@ final class AppModel {
     /// running it. The harness needed two — an append-only daemon ledger and a writer-owned
     /// artifact — and their disagreements were a standing source of wrong rows.
     private func annotateLiveState() {
-        let running = Set(runs.filter { !$0.hasExited }.compactMap(\.sessionID))
-        let busy = Set(runs.filter { $0.isStreaming }.compactMap(\.sessionID))
+        let running = Set(workRuns.filter { !$0.hasExited }.compactMap(\.sessionID))
+        let busy = Set(workRuns.filter { $0.isStreaming }.compactMap(\.sessionID))
         for i in sessions.indices {
             let isLive = running.contains(sessions[i].id)
             sessions[i].isLive = isLive
@@ -434,7 +492,8 @@ final class AppModel {
             config: modelsConfig, auth: auth, credentialed: credentialed,
             preferences: modelPreferences)
         runtimeModels = modelCatalog.models
-        runtimeModelsError = modelCatalog.models.isEmpty
+        runtimeModelsError =
+            modelCatalog.models.isEmpty
             ? (modelsConfig.exists
                 ? "No provider has working credentials. Check the API keys in models.json."
                 : "No models.json, and no built-in provider is logged in.")
@@ -485,7 +544,9 @@ final class AppModel {
     }
 
     func refreshLibrary() {
-        let projectRoot = sessions.first.flatMap { $0.cwd.isEmpty ? nil : URL(fileURLWithPath: $0.cwd) }
+        let projectRoot = sessions.first.flatMap {
+            $0.cwd.isEmpty ? nil : URL(fileURLWithPath: $0.cwd)
+        }
         library = Library.discover(
             home: home, settings: settings,
             projectRoot: projectRoot, enginePackageRoot: nil)
@@ -556,7 +617,7 @@ final class AppModel {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                let busy = !self.runs.isEmpty
+                let busy = !self.workRuns.isEmpty
                 try? await Task.sleep(nanoseconds: busy ? 3_000_000_000 : 12_000_000_000)
                 guard !Task.isCancelled else { return }
                 self.annotateLiveState()
@@ -612,8 +673,23 @@ final class AppModel {
     }
 
     func loadTranscript(for session: SessionSummary) async {
+        guard !session.isCanonicalOnly else {
+            transcript = nil
+            transcriptSessionID = nil
+            kernelState = nil
+            selectedSessionWire = []
+            isLoadingTranscript = false
+            return
+        }
         isLoadingTranscript = true
-        let url = session.fileURL
+        guard let url = session.fileURL else {
+            transcript = nil
+            transcriptSessionID = nil
+            kernelState = nil
+            selectedSessionWire = []
+            isLoadingTranscript = false
+            return
+        }
         let id = session.id
         let parsed = await Task.detached(priority: .userInitiated) {
             SessionParser.parse(fileURL: url)
@@ -684,7 +760,7 @@ final class AppModel {
         let q = sessionSearch.trimmingCharacters(in: .whitespaces).lowercased()
         guard !q.isEmpty else { return sessions }
         return sessions.filter { s in
-            s.title.lowercased().contains(q)
+            catalogTitle(for: s).lowercased().contains(q)
                 || s.firstPrompt.lowercased().contains(q)
                 || s.lastAssistantText.lowercased().contains(q)
                 || s.projectName.lowercased().contains(q)
@@ -692,6 +768,17 @@ final class AppModel {
                 || (s.provider?.lowercased().contains(q) ?? false)
                 || s.id.lowercased().contains(q)
         }
+    }
+
+    /// The list's title/search projection comes from the canonical boundary when available. The
+    /// legacy summary remains the compatibility fallback, and local identity is never replaced
+    /// by the canonical authority-qualified journal id.
+    func catalogTitle(for session: SessionSummary) -> String {
+        if let projected = canonicalCatalogProjections[session.id]?.title,
+           !projected.isEmpty {
+            return projected
+        }
+        return session.title
     }
 
     var selectedSession: SessionSummary? {
@@ -702,6 +789,15 @@ final class AppModel {
         sessions.filter { selectedSessionIDs.contains($0.id) }
     }
 
+    /// Authoritative in-process liveness at an action boundary. Catalog annotations refresh
+    /// on a timer and can lag a newly allocated Work identity by several seconds.
+    func hasLiveWork(forSession sessionID: String) -> Bool {
+        workRuns.contains {
+            !$0.hasExited
+                && ($0.config.identity?.sessionID == sessionID || $0.sessionID == sessionID)
+        }
+    }
+
     /// Batch deletion deliberately shares the single-item Trash path. It moves each transcript
     /// and its artifacts to macOS Trash, never unlinks history, and refuses a mixed selection
     /// containing a live session instead of quietly deleting only some of it.
@@ -709,13 +805,23 @@ final class AppModel {
         guard let catalog, !isTrashingSessions else { return }
         let targets = selectedSessions
         guard !targets.isEmpty else { return }
-        guard !targets.contains(where: \.isLive) else {
-            show("Stop or deselect live sessions before moving the selection to the Trash.", isError: true)
+        guard !targets.contains(where: {
+            $0.isCanonicalOnly || $0.isLive || hasLiveWork(forSession: $0.id)
+        }) else {
+            show(
+                "Native canonical rows are observe-only here; stop or deselect live sessions "
+                    + "before moving legacy transcripts to the Trash.",
+                isError: true)
             return
         }
 
         isTrashingSessions = true
-        defer { isTrashingSessions = false }
+        let targetIDs = Set(targets.map(\.id))
+        sessionsBeingTrashed.formUnion(targetIDs)
+        defer {
+            sessionsBeingTrashed.subtract(targetIDs)
+            isTrashingSessions = false
+        }
         let result = await catalog.trash(sessions: targets)
         let removed = result.trashedIDs
         guard !removed.isEmpty else {
@@ -731,14 +837,46 @@ final class AppModel {
             selectedItemForSessionSelectionChanged()
         }
         let count = removed.count
-        let message = count == 1
-            ? "Moved 1 session to the Trash"
-            : "Moved \(count) sessions to the Trash"
+        var message = count == 1
+            ? "Moved 1 session transcript to the Trash"
+            : "Moved \(count) session transcripts to the Trash"
+        if !result.partialFailures.isEmpty {
+            message += "; \(result.partialFailures.count) had companion data that could not move"
+        }
+        if !result.failures.isEmpty {
+            message += "; \(result.failures.count) transcripts could not be moved"
+        }
+        let details = result.partialFailures.values.sorted()
+            + result.failures.values.sorted()
+        if !details.isEmpty { message += ": " + details.joined(separator: "\n") }
         toast = Toast(
-            message: result.failures.isEmpty
-                ? message
-                : message + "; \(result.failures.count) could not be moved",
-            isError: !result.failures.isEmpty)
+            message: message,
+            isError: !result.failures.isEmpty || !result.partialFailures.isEmpty)
+    }
+
+    /// Reversibly organize durable conversation history without ending Work or moving files.
+    func setSessionsArchived(_ targets: [SessionSummary], archived: Bool) async {
+        guard let catalog, !isArchivingSessions, !targets.isEmpty else { return }
+        guard !targets.contains(where: \.isCanonicalOnly) else {
+            show("Native canonical rows cannot be archived through the legacy catalog yet.",
+                 isError: true)
+            return
+        }
+        isArchivingSessions = true
+        defer { isArchivingSessions = false }
+        do {
+            let ids = Set(targets.map(\.id))
+            try await catalog.setArchived(archived, sessionIDs: ids)
+            for index in sessions.indices where ids.contains(sessions[index].id) {
+                sessions[index].isArchived = archived
+            }
+            show(
+                archived
+                    ? "Archived \(ids.count == 1 ? "1 session" : "\(ids.count) sessions")"
+                    : "Restored \(ids.count == 1 ? "1 session" : "\(ids.count) sessions")")
+        } catch {
+            show("Could not update the archive: \(error.localizedDescription)", isError: true)
+        }
     }
 
     // MARK: Provider testing
@@ -768,9 +906,15 @@ final class AppModel {
         }
     }
 
-    /// Start a run that resumes this session with payload recording on — the way to get a
-    /// breakdown for a session that was not recorded the first time.
+    /// Start a run that cold-resumes this session with payload recording on — history and the
+    /// durable identity are recovered, while the prior in-memory Python namespace is not
+    /// claimed to survive this new runtime host.
     func continueWithRecording(_ session: SessionSummary) {
+        guard !session.isCanonicalOnly else {
+            toast = Toast(message: "Native canonical sessions have no legacy payload recording path.",
+                          isError: true)
+            return
+        }
         // On the in-house engine recording is native, so it needs no extension to be present.
         continueSession(
             session,
@@ -793,7 +937,7 @@ final class AppModel {
     /// Exited runs are excluded: a message to something that has stopped would be accepted and
     /// never read, which is worse than being refused.
     func peerRuns(excluding sessionID: String) -> [LiveRun] {
-        runs.filter { !$0.hasExited && $0.sessionID != sessionID }
+        workRuns.filter { !$0.hasExited && $0.sessionID != sessionID }
     }
 
     /// Deliver a message from one run into another.
@@ -819,12 +963,32 @@ final class AppModel {
             return ("", "'\(reference)' matches \(matches.count) runs. Use a session id.")
         }
         if target.isClaudeCode {
-            return ("", "\(target.title) is driven by Claude Code, which owns its turn "
-                + "boundary and will not accept an injected message.")
+            return (
+                "",
+                "\(target.title) is driven by Claude Code, which owns its turn "
+                    + "boundary and will not accept an injected message."
+            )
         }
-        let from = runs.first { $0.sessionID == sessionID }?.title ?? "another agent"
-        await target.receive(text: text, from: from)
+        let displaySender = workRuns.first { $0.sessionID == sessionID }?.title ?? "another agent"
+        guard
+            await target.receive(
+                text: text, displaySender: displaySender, sourceID: "peer:" + sessionID)
+        else {
+            return (target.sessionID ?? target.title, "The target did not accept the message.")
+        }
         return (target.sessionID ?? target.title, nil)
+    }
+
+    /// Main-actor hop for a background Future/Handle reporting to its originating run.
+    /// Return only the Sendable receipt across the boundary; a `LiveRun` never leaves its actor.
+    func deliverSelfMessage(
+        sessionID: String, text: String, from sourceSessionID: String
+    ) async -> Bool {
+        guard let run = workRuns.first(where: { $0.sessionID == sessionID }) else { return false }
+        return await run.receive(
+            text: text,
+            displaySender: "your background task (session " + sourceSessionID + ")",
+            sourceID: "self:" + sourceSessionID)
     }
 
     /// Resolve a picked model the same way a launch does, then hand it to the run.
@@ -840,23 +1004,65 @@ final class AppModel {
         await run.setModel(resolved: resolved)
     }
 
-        func startInHouseRun(
+    func startInHouseRun(
         cwd: String, providerID: String?, modelID: String?, prompt: String,
+        thinkingLevel: String? = nil, noContextFiles: Bool = false,
         recordPayloads: Bool = false, resume: String? = nil, title: String? = nil
     ) {
-        guard let (providerSpec, model) = AgentCLI.resolve(
+        guard acceptsNewWork else {
+            show(
+                "Aviary is ending its current Work and cannot start another run yet.", isError: true
+            )
+            return
+        }
+        if let resume, sessionsBeingTrashed.contains(resume) {
+            show("That conversation is currently moving to the Trash and cannot be resumed.",
+                 isError: true)
+            return
+        }
+        if let resume, focusExistingWork(forSession: resume) { return }
+        guard
+            let (providerSpec, model) = AgentCLI.resolve(
             [providerID, modelID].compactMap { $0 }.joined(separator: "/"),
             in: modelsConfig) ?? AgentCLI.resolve(modelID, in: modelsConfig)
         else {
             toast = Toast(message: "No configured provider serves that model.", isError: true)
             return
         }
+        var config = RunConfiguration(
+            cwd: cwd, provider: providerSpec.id, model: model.id,
+            thinkingLevel: thinkingLevel, resume: resume,
+            noContextFiles: noContextFiles,
+            recordPayloads: recordPayloads)
+        let identity = config.resolvedIdentity(home: home)
+        config.identity = identity
+        let writer: SessionWriter
+        do {
+            if let resume {
+                writer = try SessionWriter(
+                    home: home, resuming: resume, cwd: cwd, model: model, identity: identity)
+            } else {
+                writer = try SessionWriter(
+                    home: home, cwd: cwd, model: model, identity: identity)
+            }
+        } catch {
+            toast = Toast(
+                message: "Could not open the session journal: \(error.localizedDescription)",
+                isError: true)
+            return
+        }
+        let commandController = SessionCommandController(
+            identity: identity,
+            capabilities: Agent.inHouseCommandCapabilities,
+            writer: writer)
         let run = LiveRun(
             inHouse: InHouseDriver(
                 home: home, cwd: cwd, model: model, providerSpec: providerSpec,
                 recordPayloads: recordPayloads, resume: resume,
-                peerDelegate: PeerBridge(model: self)),
-            cwd: cwd, modelLabel: model.qualifiedID)
+                peerDelegate: PeerBridge(model: self), identity: identity,
+                commandController: commandController, reasoningEffort: thinkingLevel,
+                noContextFiles: noContextFiles, writer: writer),
+            cwd: cwd, modelLabel: model.qualifiedID, config: config)
         if let title { run.title = title }
         runs.append(run)
         focusedRunID = run.id
@@ -870,14 +1076,40 @@ final class AppModel {
     /// the credential and picks the route. The model is a Claude Code alias (`sonnet`, `opus`,
     /// `haiku`), which is why it is a plain string rather than a `ModelSpec`.
     func startClaudeCodeRun(
-        cwd: String, model: String, effort: String?, prompt: String, title: String? = nil
+        cwd: String, model: String, effort: String?, prompt: String,
+        noContextFiles: Bool = false, title: String? = nil
     ) {
+        guard acceptsNewWork else {
+            show(
+                "Aviary is ending its current Work and cannot start another run yet.", isError: true
+            )
+            return
+        }
         // Remembered for the next run, and for the places that start one without a sheet —
         // the workshop launcher and `continueSession`.
         claudeCodeModel = model
+        var config = RunConfiguration(
+            cwd: cwd, provider: "claude-code", model: model, thinkingLevel: effort,
+            noContextFiles: noContextFiles)
+        let identity = config.resolvedIdentity(home: home)
+        config.identity = identity
+        let writer: SessionWriter
+        do {
+            writer = try SessionWriter(
+                home: home, cwd: cwd, model: ClaudeCodeRun.modelSpec(for: model), identity: identity)
+        } catch {
+            toast = Toast(
+                message: "Could not open the session journal: \(error.localizedDescription)",
+                isError: true)
+            return
+        }
+        let commandController = SessionCommandController(identity: identity, writer: writer)
         let run = LiveRun(
-            claudeCode: ClaudeCodeDriver(home: home, cwd: cwd, model: model, effort: effort),
-            cwd: cwd, modelLabel: "claude-code/\(model)")
+            claudeCode: ClaudeCodeDriver(
+                home: home, cwd: cwd, model: model, effort: effort, identity: identity,
+                commandController: commandController, noContextFiles: noContextFiles,
+                writer: writer),
+            cwd: cwd, modelLabel: "claude-code/\(model)", config: config)
         if let title { run.title = title }
         runs.append(run)
         focusedRunID = run.id
@@ -891,6 +1123,11 @@ final class AppModel {
     /// resume too. They each used to build a harness `RunConfiguration` directly, which is why
     /// resume was harness-only regardless of what the picker said.
     func continueSession(_ s: SessionSummary, recordPayloads: Bool = false) {
+        guard !s.isCanonicalOnly else {
+            toast = Toast(message: "This native session has no legacy transcript resume path yet.",
+                          isError: true)
+            return
+        }
         let cwd = s.cwd.isEmpty ? defaultCwd : s.cwd
         if engineChoice == .claudeCode {
             // Claude Code holds its own history and will not accept a prepared one, so
@@ -904,12 +1141,42 @@ final class AppModel {
                 cwd: cwd, model: claudeCodeModel, effort: nil, prompt: "", title: s.title)
             return
         }
+        // Catalog liveness is refreshed on a timer. Consult Work identity at admission too,
+        // including the window before the driver publishes its session event, so a rapid
+        // double-Continue cannot create two writers for one resumed journal.
+        if focusExistingWork(forSession: s.id) { return }
+        toast = Toast(
+            message: "Conversation history and Work identity will resume in a new Python "
+                + "runtime. The prior interpreter namespace is not restored.",
+            isError: false)
         startInHouseRun(
             cwd: cwd, providerID: s.provider, modelID: s.model, prompt: "",
             recordPayloads: recordPayloads, resume: s.id, title: s.title)
     }
 
+    @discardableResult
+    private func focusExistingWork(forSession sessionID: String) -> Bool {
+        guard let existing = workRuns.first(where: {
+            !$0.hasExited
+                && ($0.config.identity?.sessionID == sessionID || $0.sessionID == sessionID)
+        }) else { return false }
+        if detachedRuns.contains(where: { $0.id == existing.id }) {
+            reattachRun(existing)
+        } else {
+            focusedRunID = existing.id
+            section = .live
+        }
+        show("That conversation already has live Work; reattached its existing run.")
+        return true
+    }
+
     func closeRun(_ run: LiveRun) {
+        // Closing is a view operation. An active run is detached and retained; only End run
+        // carries termination intent.
+        guard run.hasExited else {
+            detachRun(run)
+            return
+        }
         if run.config.recordPayloads {
             // The log is complete now; make it discoverable from the Sessions tab.
             wireIndex = WireLog.buildIndex()
@@ -917,9 +1184,26 @@ final class AppModel {
                 selectedSessionWire = WireLog.records(forSession: id, index: wireIndex)
             }
         }
-        Task { await run.stop() }
         runs.removeAll { $0.id == run.id }
+        detachedRuns.removeAll { $0.id == run.id }
         if focusedRunID == run.id { focusedRunID = runs.last?.id }
+    }
+
+    /// Remove only this GUI attachment. The Work remains controllable by its in-process host.
+    func detachRun(_ run: LiveRun) {
+        guard runs.contains(where: { $0.id == run.id }) else { return }
+        runs.removeAll { $0.id == run.id }
+        if !detachedRuns.contains(where: { $0.id == run.id }) { detachedRuns.append(run) }
+        if focusedRunID == run.id { focusedRunID = runs.last?.id }
+        show("Detached the view; the run is still \(run.isStreaming ? "working" : "available").")
+    }
+
+    func reattachRun(_ run: LiveRun) {
+        guard detachedRuns.contains(where: { $0.id == run.id }) else { return }
+        detachedRuns.removeAll { $0.id == run.id }
+        if !runs.contains(where: { $0.id == run.id }) { runs.append(run) }
+        focusedRunID = run.id
+        section = .live
     }
 
     /// A sensible default working directory: the most recent session's, else home.
@@ -943,6 +1227,19 @@ final class AppModel {
     }
 }
 
+/// A command acknowledgement is not an error banner. Keeping the semantic level with the
+/// message prevents a successful safe-boundary cancellation from being rendered as a warning
+/// merely because failures and acknowledgements share the same compact slot in the run UI.
+struct RunCommandNotice: Equatable {
+    enum Level: Equatable { case warning, success }
+
+    var level: Level
+    var message: String
+
+    static func warning(_ message: String) -> Self { .init(level: .warning, message: message) }
+    static func success(_ message: String) -> Self { .init(level: .success, message: message) }
+}
+
 // MARK: - A live run
 
 /// One attached agent run: an engine subprocess, its event stream, and the transcript
@@ -960,10 +1257,10 @@ struct PeerBridge: Agent.PeerDelegate, Agent.SelfDelegate {
     /// Routed through the run rather than the agent because the interesting case is work that
     /// outlives its turn: by the time a test suite finishes, the loop that started it may have
     /// stopped, and only the run can start it again.
-    func deliverToSelf(sessionID: String, text: String) async {
-        await MainActor.run {
-            model.runs.first { $0.sessionID == sessionID }
-        }?.receive(text: text, from: "your background task")
+    func deliverToSelf(sessionID: String, text: String, from sourceSessionID: String) async -> Bool
+    {
+        await model.deliverSelfMessage(
+            sessionID: sessionID, text: text, from: sourceSessionID)
     }
 
     func peers(excluding sessionID: String) async -> [Agent.Peer] {
@@ -998,18 +1295,24 @@ final class LiveRun: Identifiable {
     var isStreaming = false
     var isCompacting = false
     var hasExited = false
+    var isEnding = false
+    var commandState: SessionCommandState = .prepared
     var exitCode: Int32?
     var usage = Usage()
     var queuedSteering: [String] = []
     var queuedFollowUps: [String] = []
     var sessionID: String?
     var sessionFile: String?
+    /// True only after the first admitted prompt crossed the driver's durable delivery seam.
+    /// A session id alone proves allocation, not that the requested work reached the Work.
+    var initialPromptDelivered = false
     var modelLabel: String?
     var thinkingLevel: String?
     var contextTokens: Int?
     var contextWindow: Int?
     var startedAt = Date()
     var errorBanner: String?
+    var commandNotice: RunCommandNotice?
     var stderrTail: [String] = []
     var launchCommand = ""
     var title: String = "New run"
@@ -1017,35 +1320,68 @@ final class LiveRun: Identifiable {
     var wireRecords: [WireRecord] = []
     var wireLogURL: URL?
 
-    private let builder = LiveTranscriptBuilder()
-
     /// One type with two backends rather than two types, because every view that renders a
     /// run — the transcript, the token panel, the sidebar row — should not have to know which
     /// engine produced it. That is the same reason the file format is shared.
     private(set) var inHouse: InHouseDriver?
     var isInHouse: Bool { inHouse != nil }
 
+    /// Capabilities are owned by the Work driver, not inferred by a GUI. This keeps every
+    /// attached view truthful when a remote or driven Work has different command semantics.
+    var commandCapabilities: SessionCommandCapabilities {
+        if let inHouse { return inHouse.commandCapabilities }
+        if let claudeCode { return claudeCode.commandCapabilities }
+        return SessionCommandCapabilities()
+    }
+
+    var acceptsInput: Bool {
+        guard errorBanner == nil, !hasExited, !isEnding else { return false }
+        switch commandState {
+        case .idle: return true
+        case .running:
+            return commandCapabilities.supportsSteering
+                || commandCapabilities.supportsQueuedFollowUps
+        case .prepared, .preparing, .committing, .canceling, .failed, .ending, .ended:
+            return false
+        }
+    }
+
     /// Set when Claude Code is driving this run instead of Aviary.
     private(set) var claudeCode: ClaudeCodeDriver?
     var isClaudeCode: Bool { claudeCode != nil }
 
-    init(inHouse driver: InHouseDriver, cwd: String, modelLabel: String) {
+    init(
+        inHouse driver: InHouseDriver, cwd: String, modelLabel: String,
+        config: RunConfiguration? = nil
+    ) {
         self.engine = EngineLocation(
             kind: .fork, path: "aviary", version: "in-house",
             note: "Aviary's own agent loop")
-        self.config = RunConfiguration(cwd: cwd)
+        var runConfig = config ?? RunConfiguration(cwd: cwd, identity: driver.identity)
+        if runConfig.recordPayloads {
+            let url = WireLog.path(forRun: runConfig.identity?.runID ?? id.uuidString)
+            runConfig.wireLogPath = url.path
+            self.wireLogURL = url
+        }
+        self.config = runConfig
         self.inHouse = driver
         self.modelLabel = modelLabel
+        self.thinkingLevel = runConfig.thinkingLevel
         self.title = "New run"
     }
 
-    init(claudeCode driver: ClaudeCodeDriver, cwd: String, modelLabel: String) {
+    init(
+        claudeCode driver: ClaudeCodeDriver, cwd: String, modelLabel: String,
+        config: RunConfiguration? = nil
+    ) {
         self.engine = EngineLocation(
             kind: .fork, path: "claude", version: "driven",
             note: "Claude Code, with Aviary's kernel as its tool")
-        self.config = RunConfiguration(cwd: cwd)
+        let runConfig = config ?? RunConfiguration(cwd: cwd, identity: driver.identity)
+        self.config = runConfig
         self.claudeCode = driver
         self.modelLabel = modelLabel
+        self.thinkingLevel = runConfig.thinkingLevel
         self.title = "New run"
     }
 
@@ -1059,7 +1395,8 @@ final class LiveRun: Identifiable {
     /// That is what tore down an open NSMenu: AppKit answers a rebuilt menu by dismissing the
     /// submenu and dropping the highlight on its parent row. Shielding the menu with
     /// `EquatableView` was not enough, because the invalidation is upstream of it.
-    private func publish<T: Equatable>(_ value: T, to keyPath: ReferenceWritableKeyPath<LiveRun, T>) {
+    private func publish<T: Equatable>(_ value: T, to keyPath: ReferenceWritableKeyPath<LiveRun, T>)
+    {
         if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
     }
 
@@ -1078,7 +1415,11 @@ final class LiveRun: Identifiable {
                 self.publish(claudeCode.usage, to: \.usage)
                 self.publish(claudeCode.sessionID, to: \.sessionID)
                 self.publish(claudeCode.sessionFile?.path, to: \.sessionFile)
+                self.publish(
+                    claudeCode.initialPromptDelivered, to: \.initialPromptDelivered)
                 self.publish(claudeCode.errorBanner, to: \.errorBanner)
+                self.publish(claudeCode.commandNotice, to: \.commandNotice)
+                self.publish(await claudeCode.commandState(), to: \.commandState)
                 if claudeCode.hasExited { break }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
@@ -1099,8 +1440,15 @@ final class LiveRun: Identifiable {
                 self.publish(inHouse.usage, to: \.usage)
                 self.publish(inHouse.sessionID, to: \.sessionID)
                 self.publish(inHouse.sessionFile?.path, to: \.sessionFile)
+                self.publish(
+                    inHouse.initialPromptDelivered, to: \.initialPromptDelivered)
                 self.publish(inHouse.errorBanner, to: \.errorBanner)
+                self.publish(inHouse.commandNotice, to: \.commandNotice)
+                self.publish(await inHouse.commandState(), to: \.commandState)
+                self.publish(inHouse.pendingSteering, to: \.queuedSteering)
+                self.publish(inHouse.pendingFollowUps, to: \.queuedFollowUps)
                 if let label = inHouse.modelLabel { self.publish(label, to: \.modelLabel) }
+                self.refreshWireLog()
                 // Only stop mirroring once the run is genuinely finished. Idle-between-prompts
                 // is not finished — the interpreter and the conversation are still alive.
                 if inHouse.hasExited { break }
@@ -1110,13 +1458,16 @@ final class LiveRun: Identifiable {
     }
 
     private var mirror: Task<Void, Never>?
+    /// End, Quit, and Reload all join this same teardown. `isEnding` is presentation state,
+    /// not proof that cleanup finished.
+    private var stopTask: Task<Void, Never>?
 
     init(engine: EngineLocation, config: RunConfiguration) {
         self.engine = engine
         var config = config
         if config.recordPayloads {
             // The path has to be decided here, where the run's identity exists.
-            let url = WireLog.path(forRun: id)
+            let url = WireLog.path(forRun: config.identity?.runID ?? id.uuidString)
             config.wireLogPath = url.path
             self.wireLogURL = url
         }
@@ -1131,21 +1482,33 @@ final class LiveRun: Identifiable {
 
     var elapsed: TimeInterval { Date().timeIntervalSince(startedAt) }
 
+    var presentationState: String {
+        switch commandState {
+        case .prepared, .preparing, .committing: return "preparing"
+        case .running: return "working"
+        case .idle: return "idle"
+        case .canceling: return "canceling"
+        case .failed: return "failed"
+        case .ending: return "ending"
+        case .ended: return "completed"
+        }
+    }
+
     var contextShare: Double? {
         guard let t = contextTokens else { return nil }
         return Fmt.contextShare(used: t, window: contextWindow)
     }
 
-    private func markExited() {
-        hasExited = true
-        isStreaming = false
-        sync()
-    }
-
     /// Re-read the recorded payloads. Cheap: a handful of records per run.
     func refreshWireLog() {
         guard let url = wireLogURL else { return }
-        wireRecords = WireLog.read(url: url)
+        let next = WireLog.read(url: url)
+        guard
+            next.count != wireRecords.count
+                || next.last?.seq != wireRecords.last?.seq
+                || next.last?.status != wireRecords.last?.status
+        else { return }
+        wireRecords = next
     }
 
     /// The most recent request payload, decomposed.
@@ -1163,47 +1526,41 @@ final class LiveRun: Identifiable {
         return inputs.last
     }
 
-    func send(_ text: String) async {
-        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        if let claudeCode {
-            guard claudeCode.acceptsFollowUps else {
-                builder.appendNote("The run is still starting — try again in a moment.")
-                sync()
-                return
+    func send(_ text: String) async -> SessionCommandReceipt {
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
+            commandNotice = .warning("Could not send: empty input.")
+            return localReceipt(rejection: .emptyInput)
             }
+        if let claudeCode {
             // No steering. Claude Code owns the turn boundary and will not take an injection
             // mid-turn, so a message sent now would either be lost or arrive as a second
             // conversation. Refusing plainly beats a queue that quietly reorders the session.
             guard !claudeCode.isStreaming else {
-                builder.appendNote(
+                commandNotice = .warning(
                     "Claude Code is mid-turn, and it does not accept steering — the turn "
                         + "boundary is its own. Wait for it to finish.")
-                sync()
-                return
+                return localReceipt(
+                    rejection: .unsupportedCommand(command: "steer"))
             }
-            if title == "New run" { title = String(text.prefix(60)) }
-            claudeCode.send(text)
-            return
+            let receipt = await claudeCode.send(text)
+            if receipt.wasHandedOff, title == "New run" { title = String(text.prefix(60)) }
+            return receipt
         }
         if let inHouse {
-            guard inHouse.acceptsFollowUps else {
-                builder.appendNote("The run is still starting — try again in a moment.")
-                sync()
-                return
-            }
             if inHouse.isStreaming {
                 // Steer rather than refuse: the composer should stay usable while the agent
                 // works, and the message lands at the next turn boundary where the
                 // conversation is well-formed.
-                inHouse.steer(text)
+                let receipt = await inHouse.steer(text)
                 queuedSteering = inHouse.pendingSteering
-                return
+                return receipt
             }
-            inHouse.send(text)
-            return
+            let receipt = await inHouse.send(text)
+            if receipt.wasHandedOff, title == "New run" { title = String(text.prefix(60)) }
+            return receipt
         }
-        builder.appendNote("This run has no engine behind it.")
-        sync()
+        commandNotice = .warning("This run has no engine behind it.")
+        return localReceipt(rejection: .unsupportedCommand(command: "send"))
     }
 
     /// Queue a message for after the current turn.
@@ -1211,13 +1568,28 @@ final class LiveRun: Identifiable {
     /// The harness had a server-side queue for this. Aviary's own engine steers instead —
     /// the message lands at the next turn boundary, which is the same guarantee without a
     /// second place for a message to sit unacknowledged.
-    func queueFollowUp(_ text: String) async {
-        await send(text)
+    func queueFollowUp(_ text: String) async -> SessionCommandReceipt {
+        guard let inHouse else {
+            commandNotice = .warning("Claude Code does not support queued follow-ups.")
+            return localReceipt(
+                rejection: .unsupportedCommand(command: "queue_follow_up"))
+        }
+        let receipt = await inHouse.queueFollowUp(text)
+        queuedFollowUps = inHouse.pendingFollowUps
+        return receipt
     }
 
-    func abort() {
-        claudeCode?.stop()
-        inHouse?.stop()
+    /// Request only a scope the attached Work explicitly advertises.
+    func cancel(_ scope: SessionCancellationScope) async -> SessionCommandReceipt {
+        guard commandCapabilities.supports(scope) else {
+            commandNotice = .warning(
+                "This engine does not support \(scope.rawValue) cancellation.")
+            return localReceipt(rejection: .unsupportedCancellation(scope: scope))
+        }
+        if let inHouse { return await inHouse.cancel(scope: scope) }
+        if let claudeCode { return await claudeCode.cancel(scope: scope) }
+        commandNotice = .warning("This run has no engine behind it.")
+        return localReceipt(rejection: .unsupportedCommand(command: "cancel"))
     }
 
     /// Compaction is automatic on Aviary's own engine — the agent summarises the middle of
@@ -1225,10 +1597,9 @@ final class LiveRun: Identifiable {
     /// There is nothing to trigger by hand, and a button that pretended otherwise would be
     /// worse than its absence.
     func compact() async {
-        builder.appendNote(
+        appendLocalNote(
             "This engine compacts on its own when the conversation approaches the model's "
                 + "context window.")
-        sync()
     }
 
     /// Take a message from another run.
@@ -1237,19 +1608,30 @@ final class LiveRun: Identifiable {
     /// between a tool call and its result — the shape a provider rejects. Attributed in the
     /// text itself, because the receiving agent has no other way to know who is talking: it
     /// arrives in the conversation looking exactly like something a person typed.
-    func receive(text: String, from sender: String) async {
-        let attributed = "[message from \(sender)]\n\n" + text
+    func receive(
+        text: String, displaySender: String, sourceID: String? = nil
+    ) async -> Bool {
+        let attributed = "[message from \(displaySender)]\n\n" + text
         if let inHouse {
             if inHouse.isStreaming {
-                inHouse.steer(attributed)
+                let admission = await inHouse.steer(
+                    attributed, sourceID: sourceID ?? displaySender)
                 queuedSteering = inHouse.pendingSteering
+                return admission.wasHandedOff
             } else {
-                inHouse.send(attributed)
-            }
             return
+                    (await inHouse.send(
+                        attributed, sourceID: sourceID ?? displaySender)).wasHandedOff
         }
-        builder.appendNote("A message arrived but this run has no engine to take it.")
-        sync()
+        }
+        commandNotice = .warning("A message arrived but this run has no engine to take it.")
+        return false
+    }
+
+    private func localReceipt(rejection: SessionCommandRejection) -> SessionCommandReceipt {
+        SessionCommandReceipt(
+            admission: .rejected(
+                commandID: "local-\(UUID().uuidString.lowercased())", reason: rejection))
     }
 
     /// Change the model this run answers with.
@@ -1266,22 +1648,19 @@ final class LiveRun: Identifiable {
             if let failure = await inHouse.switchModel(
                 to: resolved.model, providerSpec: resolved.provider)
             {
-                builder.appendNote("Could not switch model: \(failure)")
-                sync()
+                appendLocalNote("Could not switch model: \(failure)")
                 return
             }
             modelLabel = label
             return
         }
         if isClaudeCode {
-            builder.appendNote(
+            appendLocalNote(
                 "Claude Code owns the loop for this run and takes its model at launch, so it "
                     + "cannot be changed mid-session. Start a new run to use \(label).")
-            sync()
             return
         }
-        builder.appendNote("This run has no engine to switch.")
-        sync()
+        appendLocalNote("This run has no engine to switch.")
     }
 
     func setThinking(_ level: String) async {
@@ -1294,19 +1673,48 @@ final class LiveRun: Identifiable {
         title = name
     }
 
+    /// Publish a local diagnostic without calling the POSIX sync() symbol. These notes are
+    /// ephemeral UI feedback; engine-backed durable events continue to arrive through the
+    /// driver's session file.
+    private func appendLocalNote(_ text: String) {
+        var item = TranscriptItem(
+            id: "local-note-\(UUID().uuidString)", kind: .note, timestamp: Date())
+        item.text = text
+        items.append(item)
+    }
+
     func stop() async {
-        mirror?.cancel()
+        if let stopTask {
+            await stopTask.value
+            return
+        }
+        guard !hasExited else { return }
+        isEnding = true
+        let stopTask = Task { @MainActor in await performStop() }
+        self.stopTask = stopTask
+        await stopTask.value
+        self.stopTask = nil
+        isEnding = false
+    }
+
+    private func performStop() async {
         if let claudeCode {
-            claudeCode.stop()
-            hasExited = true
+            await claudeCode.stop()
+            mirror?.cancel()
+            hasExited = claudeCode.hasExited
+            commandState = await claudeCode.commandState()
+            errorBanner = claudeCode.errorBanner
             return
         }
         if let inHouse {
-            inHouse.stop()
-            hasExited = true
+            await inHouse.stop()
+            mirror?.cancel()
+            hasExited = inHouse.hasExited
+            commandState = await inHouse.commandState()
+            errorBanner = inHouse.errorBanner
             return
         }
-        inHouse?.stop()
         hasExited = true
+        commandState = .ended
     }
 }

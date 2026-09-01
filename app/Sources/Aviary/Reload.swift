@@ -14,7 +14,8 @@ import AviaryCore
 /// this machine to hang one off. What makes it feel like a reload rather than a restart is
 /// that the slow part has already happened: the build starts the moment the request finishes,
 /// while you are still doing something else, so the click itself is immediate — and the app
-/// comes back on the screen you were on with the agent reattached.
+/// comes back on the screen you were on. In-process Work is ended first; any workshop continuation
+/// is a cold reopen in a new runtime, not a live-host reattachment.
 ///
 /// One fact makes it possible at all: SwiftPM can relink `Aviary` while `Aviary` is running.
 /// Verified rather than assumed — the linker writes and renames, and macOS permits renaming

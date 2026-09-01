@@ -2,19 +2,23 @@ import Foundation
 
 /// One row in the sessions list.
 public struct SessionSummary: Sendable, Identifiable, Hashable {
-    /// The session's identity: its transcript filename without the extension.
+    /// The displayed row identity. Legacy rows use their transcript filename without the
+    /// extension; canonical-only rows use an authority-qualified journal identity.
     ///
-    /// **Not** the `id` inside the JSONL header, which disagrees with the filename in the
+    /// For legacy rows, this is **not** the `id` inside the JSONL header, which disagrees with the filename in the
     /// large majority of real sessions (68 of 80 in one checkout). Everything else in the
     /// ecosystem keys on the filename — `session-artifacts/<id>/`, the spawn ledger's
     /// `parentSessionId`, and `list --json`'s `sessionId` — so the filename is canonical and
     /// the header field is the outlier. Using the header id silently breaks live-state
     /// matching, sub-agent grouping, kernel-state lookup and recorded-payload attribution
     /// for most sessions, and each failure looks like missing data rather than a bad join.
+    /// Canonical-only rows set `isCanonicalOnly` and have no legacy transcript identity or URL.
     public var id: String
     /// The `id` recorded inside the transcript header, kept for reference only.
     public var headerID: String?
-    public var fileURL: URL
+    /// Legacy transcript location, absent for a native canonical row that has no compatibility
+    /// file. Callers must not manufacture a path for observe-only canonical entries.
+    public var fileURL: URL?
     public var name: String?
     public var cwd: String
     public var gitBranch: String?
@@ -38,6 +42,11 @@ public struct SessionSummary: Sendable, Identifiable, Hashable {
     /// True when a live worker is mid-operation.
     public var isBusy: Bool = false
     public var liveOperation: String?
+    /// Catalog-only visibility state. The transcript and artifacts stay in place.
+    public var isArchived: Bool = false
+    /// True for a native canonical row with no legacy transcript compatibility identity.
+    /// Such a row can be observed, but legacy transcript/artifact operations are unavailable.
+    public var isCanonicalOnly: Bool = false
 
     public var title: String {
         if let n = name, !n.isEmpty { return n }
@@ -63,10 +72,17 @@ public struct SessionSummary: Sendable, Identifiable, Hashable {
 public struct SessionTrashResult: Sendable {
     public var trashedIDs: Set<String>
     public var failures: [String: String]
+    /// The transcript moved, so its catalog row is gone, but a companion resource did not.
+    /// Kept separate from `failures`, whose rows remain in the catalog and can be retried.
+    public var partialFailures: [String: String]
 
-    public init(trashedIDs: Set<String> = [], failures: [String: String] = [:]) {
+    public init(
+        trashedIDs: Set<String> = [], failures: [String: String] = [:],
+        partialFailures: [String: String] = [:]
+    ) {
         self.trashedIDs = trashedIDs
         self.failures = failures
+        self.partialFailures = partialFailures
     }
 }
 
@@ -85,6 +101,7 @@ public actor SessionCatalog {
     static let schemaVersion = 3
 
     private let home: AgentHome
+    private let trashItem: @Sendable (URL) throws -> Void
     private var cache: [String: CacheEntry] = [:]
     private let cacheFileURL: URL
 
@@ -95,7 +112,17 @@ public actor SessionCatalog {
     }
 
     public init(home: AgentHome) {
+        self.init(home: home) { url in
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        }
+    }
+
+    /// Test seam for deterministic partial-failure coverage. Production always supplies the
+    /// macOS Trash operation above; tests can fail only the artifact crossing without touching
+    /// the user's real Trash.
+    init(home: AgentHome, trashItem: @escaping @Sendable (URL) throws -> Void) {
         self.home = home
+        self.trashItem = trashItem
         let support = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
@@ -149,12 +176,35 @@ public actor SessionCatalog {
         for edge in tree.edges {
             childCounts[edge.parentSessionID, default: 0] += 1
         }
+        let archived = archivedSessionIDs()
         for i in out.indices {
             out[i].childCount = childCounts[out[i].id] ?? 0
+            out[i].isArchived = archived.contains(out[i].id)
         }
 
         saveCache()
         return out.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    /// Read catalog entries through the canonical projection boundary.
+    ///
+    /// The current store has no native Session journal to read, so every returned row is an
+    /// explicit legacy adapter projection. Keeping this API separate from `scan()` prevents a
+    /// future native row from being silently flattened into a filename-only `SessionSummary`.
+    public func scanEntries(
+        progress: (@Sendable (Int, Int) -> Void)? = nil
+    ) -> [SessionCatalogProjection] {
+        scan(progress: progress).map {
+            LegacySessionCatalogAdapter.project(summary: $0, authorityID: home.workHostID)
+        }
+    }
+
+    /// Convert the typed boundary into rows the current list can render. Native canonical rows
+    /// are retained as observe-only summaries; only legacy rows have a transcript URL.
+    public static func displaySummaries(
+        from entries: [SessionCatalogProjection]
+    ) -> [SessionSummary] {
+        entries.compactMap(\.displaySummary)
     }
 
     /// Single-pass summary. Reads the file once and extracts only list-view fields —
@@ -280,14 +330,50 @@ public actor SessionCatalog {
 
     /// Move a session (and its artifacts) to the Trash. Never an unlink: transcripts are
     /// the only record of work an agent did.
-    public func trash(session: SessionSummary) throws {
-        try FileManager.default.trashItem(at: session.fileURL, resultingItemURL: nil)
+    public func trash(session: SessionSummary) throws -> String? {
+        guard let fileURL = session.fileURL else {
+            throw NSError(domain: "AviarySessionCatalog", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "This canonical session has no legacy transcript to move."])
+        }
+        try trashItem(fileURL)
+        var partialFailures: [String] = []
         let artifacts = home.artifacts(forSession: session.id)
         if FileManager.default.fileExists(atPath: artifacts.path) {
-            try? FileManager.default.trashItem(at: artifacts, resultingItemURL: nil)
+            do {
+                try trashItem(artifacts)
+            } catch {
+                partialFailures.append(
+                    "Transcript moved, but artifacts remain at \(artifacts.path): "
+                        + error.localizedDescription)
+            }
         }
-        cache.removeValue(forKey: session.fileURL.lastPathComponent)
+        cache.removeValue(forKey: fileURL.lastPathComponent)
+        var archived = archivedSessionIDs()
+        if archived.remove(session.id) != nil {
+            do {
+                try writeArchivedSessionIDs(archived)
+            } catch {
+                partialFailures.append(
+                    "Archive metadata could not be updated: \(error.localizedDescription)")
+            }
+        }
         saveCache()
+        return partialFailures.isEmpty ? nil : partialFailures.joined(separator: "\n")
+    }
+
+    /// Hide or restore a session in the ordinary catalog without touching its durable history.
+    ///
+    /// The sidecar contains identities only. It is intentionally separate from the append-only
+    /// transcript, because organizing a list is not part of what the agent did.
+    public func setArchived(_ archived: Bool, sessionIDs: Set<String>) throws {
+        var ids = archivedSessionIDs()
+        if archived {
+            ids.formUnion(sessionIDs)
+        } else {
+            ids.subtract(sessionIDs)
+        }
+        try writeArchivedSessionIDs(ids)
     }
 
     /// Move every selected transcript independently. One unreadable or already-moved file
@@ -296,8 +382,9 @@ public actor SessionCatalog {
         var result = SessionTrashResult()
         for session in sessions {
             do {
-                try trash(session: session)
+                let partialFailure = try trash(session: session)
                 result.trashedIDs.insert(session.id)
+                if let partialFailure { result.partialFailures[session.id] = partialFailure }
             } catch {
                 result.failures[session.id] = error.localizedDescription
             }
@@ -312,6 +399,19 @@ public actor SessionCatalog {
     public func clearCache() {
         cache.removeAll()
         try? FileManager.default.removeItem(at: cacheFileURL)
+    }
+
+    private func archivedSessionIDs() -> Set<String> {
+        guard let data = try? Data(contentsOf: home.archivedSessionsFile),
+              let values = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return Set(values)
+    }
+
+    private func writeArchivedSessionIDs(_ ids: Set<String>) throws {
+        try FileManager.default.createDirectory(at: home.root, withIntermediateDirectories: true)
+        let data = try JSONEncoder().encode(ids.sorted())
+        try data.write(to: home.archivedSessionsFile, options: .atomic)
     }
 
     // MARK: Cache persistence
@@ -378,7 +478,7 @@ struct StoredSummary: Codable {
         cAgentMessages = s.counts.agentMessages; cEntries = s.counts.entries
     }
 
-    func restore(fileURL: URL) -> SessionSummary {
+    func restore(fileURL: URL?) -> SessionSummary {
         var counts = Transcript.Counts()
         counts.user = cUser; counts.assistant = cAssistant
         counts.toolCalls = cToolCalls; counts.toolErrors = cToolErrors

@@ -2,6 +2,20 @@ import SwiftUI
 import AppKit
 import AviaryCore
 
+private struct TranscriptViewportHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct TranscriptBottomPositionKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 /// Renders a transcript — read from disk or streaming live, identically.
 struct TranscriptView: View {
     var items: [TranscriptItem]
@@ -12,6 +26,10 @@ struct TranscriptView: View {
     var onSelect: ((TranscriptItem) -> Void)?
 
     @State private var scrollTarget: String?
+    @State private var viewportHeight: CGFloat = 0
+    @State private var bottomPosition: CGFloat = 0
+    @State private var isAtBottom = true
+    @State private var unreadCount = 0
 
     private var visible: [TranscriptItem] {
         let q = searchQuery.trimmingCharacters(in: .whitespaces).lowercased()
@@ -26,38 +44,109 @@ struct TranscriptView: View {
 
     var body: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(visible) { item in
-                        TranscriptRow(
-                            item: item,
-                            searchQuery: searchQuery,
-                            hideThinking: hideThinking,
-                            isLast: item.id == visible.last?.id && isStreaming,
-                            onSelect: onSelect)
-                            .id(item.id)
+            ZStack(alignment: .bottomTrailing) {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(visible) { item in
+                            TranscriptRow(
+                                item: item,
+                                searchQuery: searchQuery,
+                                hideThinking: hideThinking,
+                                isLast: item.id == visible.last?.id && isStreaming,
+                                onSelect: onSelect)
+                                .id(item.id)
+                        }
+                        if isStreaming {
+                            StreamingIndicator()
+                                .id("__streaming_tail__")
+                        }
+                        Color.clear.frame(height: 8)
+                            .id("__bottom__")
+                            .background(GeometryReader { geometry in
+                                Color.clear.preference(
+                                    key: TranscriptBottomPositionKey.self,
+                                    value: geometry.frame(in: .named("AviaryTranscriptScroll")).maxY)
+                            })
                     }
-                    if isStreaming {
-                        StreamingIndicator()
-                            .id("__streaming_tail__")
-                    }
-                    Color.clear.frame(height: 8).id("__bottom__")
+                    .padding(.horizontal, Design.gutter)
+                    .padding(.vertical, 14)
                 }
-                .padding(.horizontal, Design.gutter)
-                .padding(.vertical, 14)
+                .coordinateSpace(name: "AviaryTranscriptScroll")
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: TranscriptViewportHeightKey.self,
+                        value: geometry.size.height)
+                })
+
+                if !isAtBottom {
+                    Button {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo("__bottom__", anchor: .bottom)
+                        }
+                        unreadCount = 0
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.down")
+                            if unreadCount > 0 {
+                                Text("\(unreadCount) new")
+                            }
+                            Text("Jump to latest")
+                        }
+                        .font(.system(size: 11, weight: .semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(.regularMaterial, in: Capsule())
+                        .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.2)))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Design.accent)
+                    .accessibilityLabel(unreadCount > 0
+                        ? "Jump to latest, \(unreadCount) new transcript items"
+                        : "Jump to latest")
+                    .help("Jump to the latest transcript output")
+                    .padding(.trailing, Design.gutter)
+                    .padding(.bottom, 12)
+                }
             }
-            .onChange(of: visible.count) { _, _ in
-                guard autoScroll else { return }
-                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("__bottom__", anchor: .bottom) }
+            .onPreferenceChange(TranscriptViewportHeightKey.self) { height in
+                viewportHeight = height
+                updateBottomState()
+            }
+            .onPreferenceChange(TranscriptBottomPositionKey.self) { position in
+                bottomPosition = position
+                updateBottomState()
+            }
+            .onChange(of: items.count) { oldCount, newCount in
+                let added = max(0, newCount - oldCount)
+                guard added > 0 else { return }
+                if autoScroll && isAtBottom {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo("__bottom__", anchor: .bottom)
+                    }
+                    unreadCount = 0
+                } else {
+                    unreadCount += added
+                }
             }
             .onChange(of: visible.last?.plainText.count ?? 0) { _, _ in
-                guard autoScroll, isStreaming else { return }
+                guard autoScroll, isStreaming, isAtBottom else { return }
                 proxy.scrollTo("__bottom__", anchor: .bottom)
             }
+            .onChange(of: isAtBottom) { _, atBottom in
+                if atBottom { unreadCount = 0 }
+            }
             .onAppear {
-                if autoScroll { proxy.scrollTo("__bottom__", anchor: .bottom) }
+                if autoScroll {
+                    proxy.scrollTo("__bottom__", anchor: .bottom)
+                }
             }
         }
+    }
+
+    private func updateBottomState() {
+        guard viewportHeight > 0 else { return }
+        let atBottom = bottomPosition <= viewportHeight + 24
+        if atBottom != isAtBottom { isAtBottom = atBottom }
     }
 }
 
@@ -114,7 +203,10 @@ struct TranscriptRow: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(showRaw ? Design.accent : Color.secondary.opacity(0.4))
-            .help("Show the raw session entry")
+            .accessibilityLabel(showRaw ? "Hide raw session entry" : "Show raw session entry")
+            .accessibilityValue(showRaw ? "Expanded" : "Collapsed")
+            .accessibilityHint("Shows the original session record for this row")
+            .help(showRaw ? "Hide the raw session entry" : "Show the raw session entry")
             .opacity(item.raw == nil ? 0 : 1)
             .disabled(item.raw == nil)
         }
@@ -382,6 +474,7 @@ struct TranscriptRow: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(Design.accent)
+                .accessibilityLabel("Open artifact")
                 .help("Open the artifact")
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([artifact.url])
@@ -390,6 +483,7 @@ struct TranscriptRow: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(Design.accent)
+                .accessibilityLabel("Reveal artifact in Finder")
                 .help("Reveal in Finder")
             }
             rawPane
@@ -498,6 +592,9 @@ struct ThinkingBlock: View {
                 .foregroundStyle(Design.thinking)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel(expanded ? "Hide thinking" : "Show thinking")
+            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+            .accessibilityHint("Reveals or hides the model's reasoning text")
 
             if expanded {
                 Text(text)
@@ -594,6 +691,9 @@ struct StreamingIndicator: View {
                 .foregroundStyle(.secondary)
         }
         .padding(.leading, 12)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Agent is working")
+        .accessibilityValue("Streaming response")
         .task {
             guard !staticRendering else { return }
             while !Task.isCancelled {
@@ -645,6 +745,10 @@ struct InjectedContextBlock: View {
                 .foregroundStyle(Design.accent)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel(
+                expanded ? "Hide injected context" : "Show injected context")
+            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+            .accessibilityHint("Reveals or hides context added before the prompt")
 
             if expanded {
                 Text(block.body)

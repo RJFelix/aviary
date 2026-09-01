@@ -1,14 +1,12 @@
-import SwiftUI
 import AppKit
-import Combine
 import AviaryCore
+import Combine
+import SwiftUI
 
 /// Start runs, watch them stream, steer them mid-flight.
 ///
-/// Two things share this screen deliberately: runs Aviary started (which it drives over the
-/// harness's RPC protocol) and runs started anywhere else — a terminal, a cron schedule,
-/// another agent. The second kind can only be observed, not steered, and the UI says so
-/// rather than offering controls that would quietly do nothing.
+/// The views on this screen are attachments to Work retained by the app process. Detaching a
+/// view is not a stop request, and closing the last window leaves the menu-bar process running.
 struct LiveView: View {
     @Environment(AppModel.self) private var model
     @State private var showLauncher = false
@@ -44,16 +42,29 @@ struct LiveView: View {
                             }
                             Text(run.title).font(.system(size: 11)).lineLimit(1)
                             Button {
+                                if run.hasExited {
                                 model.closeRun(run)
+                                } else {
+                                    model.detachRun(run)
+                                }
                             } label: {
                                 Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
                             }
                             .buttonStyle(.plain).foregroundStyle(.tertiary)
+                            .accessibilityLabel(
+                                run.hasExited
+                                    ? "Close view" : "Detach view"
+                            )
+                            .help(
+                                run.hasExited
+                                    ? "Close this completed view"
+                                    : "Detach this view; the run continues")
                         }
                         .padding(.horizontal, 9)
                         .padding(.vertical, 5)
                         .background(
-                            Capsule().fill(model.focusedRun?.id == run.id
+                            Capsule().fill(
+                                model.focusedRun?.id == run.id
                                 ? Design.accentSoft : Color.secondary.opacity(0.07)))
                     }
                     .buttonStyle(.plain)
@@ -67,6 +78,8 @@ struct LiveView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(Design.accent)
+                .accessibilityLabel("Start a new run")
+                .help("Start a new run")
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
@@ -80,9 +93,12 @@ struct LiveView: View {
             VStack(alignment: .leading, spacing: 14) {
                 Card("Start a run", symbol: "play.circle.fill") {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Aviary launches the engine in RPC mode and drives it directly — "
-                            + "no terminal, and with your login shell's environment so "
-                            + "credentials resolve the way they do in a terminal.")
+                        Text(
+                            "Aviary starts the selected engine directly, with your login "
+                                + "shell's environment so credentials resolve as they do in a "
+                                + "terminal. Closing the window leaves Work running in the menu "
+                                + "bar; quitting Aviary still ends in-process Work."
+                        )
                             .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -93,6 +109,30 @@ struct LiveView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut("n")
+                    }
+                }
+
+                if !model.detachedRuns.isEmpty {
+                    Card("Detached Work", symbol: "rectangle.on.rectangle.slash") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(
+                                "These runs are still held by this Aviary process. Reattaching "
+                                    + "does not resume or restart them."
+                            )
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                            ForEach(model.detachedRuns) { run in
+                                HStack(spacing: 8) {
+                                    if run.isStreaming { PulseDot(color: Design.success) }
+                                    Text(run.title).font(.system(size: 11.5)).lineLimit(1)
+                                    Spacer()
+                                    Text(run.presentationState)
+                                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                                    Button("Reattach") { model.reattachRun(run) }
+                                        .buttonStyle(.bordered).controlSize(.small)
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -119,6 +159,7 @@ struct RunPane: View {
     @State private var showMarkdownPreview = true
     @State private var showLaunchDetails = false
     @State private var selectedItem: TranscriptItem?
+    @State private var confirmEndRun = false
 
     // Fixed trailing inspector column rather than `.inspector` or a conditional split
     // pane — see the note on SessionsView.body for why both of those misbehave.
@@ -128,7 +169,16 @@ struct RunPane: View {
                 runHeader
                 Divider()
                 if let banner = run.errorBanner {
-                    NoticeBanner(level: .danger, title: "The run could not start", message: banner)
+                    NoticeBanner(level: .danger, title: "Run needs attention", message: banner)
+                        .padding(Design.gutter)
+                }
+                if let notice = run.commandNotice {
+                    NoticeBanner(
+                        level: notice.level == .success ? .success : .warning,
+                        title: notice.level == .success
+                            ? "Command acknowledged" : "Command not accepted",
+                        message: notice.message
+                    )
                         .padding(Design.gutter)
                 }
                 TranscriptView(
@@ -150,6 +200,20 @@ struct RunPane: View {
                     .background(Color(nsColor: .windowBackgroundColor))
             }
         }
+        .confirmationDialog(
+            "End this run?",
+            isPresented: $confirmEndRun,
+            titleVisibility: .visible
+        ) {
+            Button("End run", role: .destructive) {
+                Task { await run.stop() }
+            }
+            Button("Keep running", role: .cancel) {}
+        } message: {
+            Text(
+                "This stops the agent and destroys its current Python runtime. "
+                    + "The transcript remains available.")
+        }
     }
 
     private var runHeader: some View {
@@ -166,9 +230,15 @@ struct RunPane: View {
                 Text(run.title)
                     .font(.system(size: 13.5, weight: .semibold))
                     .lineLimit(1)
+                Chip(
+                    text: run.presentationState,
+                    tint: run.presentationState == "failed"
+                        ? Design.danger
+                        : run.presentationState == "working" ? Design.success : .secondary)
                 if run.isCompacting { Chip(text: "compacting", tint: Design.warning) }
                 if run.hasExited {
-                    Chip(text: run.exitCode.map { "exited \($0)" } ?? "exited",
+                    Chip(
+                        text: run.exitCode.map { "exited \($0)" } ?? "exited",
                          tint: (run.exitCode ?? 0) == 0 ? .secondary : Design.danger)
                 }
                 Spacer()
@@ -185,7 +255,8 @@ struct RunPane: View {
                     Chip(text: level, symbol: "brain", tint: Design.thinking)
                 }
                 if !run.usage.isEmpty {
-                    Chip(text: Fmt.tokens(run.usage.totalTokens), symbol: "number", tint: .secondary)
+                    Chip(
+                        text: Fmt.tokens(run.usage.totalTokens), symbol: "number", tint: .secondary)
                 }
                 if run.usage.cost.total > 0 {
                     Chip(text: Fmt.cost(run.usage.cost.total), tint: Design.accent)
@@ -198,8 +269,10 @@ struct RunPane: View {
                             .font(.system(size: 9.5)).foregroundStyle(.tertiary)
                         RatioBar(
                             fraction: share,
-                            tint: share > 0.85 ? Design.danger
-                                : share > 0.65 ? Design.warning : Design.accent)
+                            tint: share > 0.85
+                                ? Design.danger
+                                : share > 0.65 ? Design.warning : Design.accent
+                        )
                             .frame(width: 90)
                         Text("\(Fmt.tokens(tokens)) / \(Fmt.tokens(run.contextWindow ?? 0))")
                             .font(Design.numeric(9.5))
@@ -231,27 +304,69 @@ struct RunPane: View {
         if !run.queuedFollowUps.isEmpty {
             parts.append("\(run.queuedFollowUps.count) follow-up")
         }
-        return "Queued: " + parts.joined(separator: ", ")
-            + " — delivered after the current turn's tool calls finish"
+        return "Pending: " + parts.joined(separator: ", ")
+            + " — steering lands before the next model call; follow-ups start a later turn"
     }
 
     private var controls: some View {
         HStack(spacing: 6) {
-            if run.isStreaming {
                 Button {
-                    run.abort()
+                if run.hasExited { model.closeRun(run) } else { model.detachRun(run) }
                 } label: {
-                    Label("Abort", systemImage: "stop.fill").font(.system(size: 10.5))
+                Label(
+                    run.hasExited ? "Close view" : "Detach view",
+                    systemImage: run.hasExited ? "xmark" : "rectangle.on.rectangle.slash"
+                )
+                .font(.system(size: 10.5))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help(
+                run.hasExited
+                    ? "Close this completed view"
+                    : "Hide this chat view without ending the run")
+
+            if !run.hasExited {
+                if run.commandCapabilities.supports(.agentLoop) && run.isStreaming {
+                    Button {
+                        Task { _ = await run.cancel(.agentLoop) }
+                    } label: {
+                        Label(
+                            run.commandState == .canceling ? "Canceling…" : "Cancel at boundary",
+                            systemImage: "pause.circle"
+                        )
+                        .font(.system(size: 10.5))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityValue(
+                        run.commandState == .canceling ? "In progress" : "Available")
+                    .disabled(run.commandState == .canceling || run.isEnding)
+                    .help(
+                        "Stop the agent loop at its next safe boundary; this cannot interrupt "
+                            + "an in-flight model stream or Python action")
+                }
+                Button {
+                    confirmEndRun = true
+                } label: {
+                    Label(run.isEnding ? "Ending…" : "End run", systemImage: "stop.fill")
+                        .font(.system(size: 10.5))
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .tint(Design.danger)
+                .accessibilityValue(run.isEnding ? "In progress" : "Available")
+                .disabled(run.isEnding)
+                .help("Stop the agent and destroy this run's Python runtime")
             }
 
             RunOptionsMenu(
                 run: run,
                 models: model.pickerModels,
                 hasExited: run.hasExited,
+                isWorking: run.isStreaming,
+                isCanceling: run.commandState == .canceling,
+                cancellationScopes: run.commandCapabilities.cancellationScopes,
                 sessionFile: run.sessionFile)
         }
     }
@@ -261,9 +376,13 @@ struct RunPane: View {
             HStack(alignment: .bottom, spacing: 8) {
                 ZStack(alignment: .topLeading) {
                     if draft.isEmpty {
-                        Text(run.isStreaming
+                        Text(
+                            run.isStreaming
+                                ? (run.commandCapabilities.supportsSteering
                             ? "Steer the run — lands after the current tool calls…"
-                            : "Ask for something…")
+                                    : "This engine is working — steering is unavailable…")
+                                : "Ask for something…"
+                        )
                             .font(.system(size: 12.5))
                             .foregroundStyle(.tertiary)
                             .padding(.horizontal, 5)
@@ -275,23 +394,38 @@ struct RunPane: View {
                         .scrollContentBackground(.hidden)
                         .frame(minHeight: 34, maxHeight: 130)
                         .padding(.horizontal, 1)
+                        // No focus state is mutated by streaming or delivery callbacks. This
+                        // remains the same editor identity while the parent observes the run.
+                        .accessibilityLabel(
+                            run.isStreaming && run.commandCapabilities.supportsSteering
+                            ? "Steering message" : "Message composer")
+                        .accessibilityHint(
+                            run.isStreaming && run.commandCapabilities.supportsSteering
+                            ? "Delivered before the next model call"
+                            : "Type a message for the agent")
                 }
                 .padding(6)
                 .background(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color(nsColor: .textBackgroundColor)))
+                        .fill(Color(nsColor: .textBackgroundColor))
+                )
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .strokeBorder(.separator, lineWidth: 1))
 
                 VStack(spacing: 5) {
-                    Button { showMarkdownPreview.toggle() } label: {
+                    Button {
+                        showMarkdownPreview.toggle()
+                    } label: {
                         Image(systemName: showMarkdownPreview ? "eye.slash" : "eye")
                             .font(.system(size: 10))
                             .frame(width: 26, height: 20)
                     }
                     .buttonStyle(.bordered)
                     .disabled(draft.isEmpty)
+                    .accessibilityLabel(
+                        showMarkdownPreview ? "Hide Markdown preview" : "Show Markdown preview")
+                    .accessibilityValue(showMarkdownPreview ? "Visible" : "Hidden")
                     .help(showMarkdownPreview ? "Hide Markdown preview" : "Show Markdown preview")
 
                     Button {
@@ -302,24 +436,54 @@ struct RunPane: View {
                             .frame(width: 26, height: 26)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(run.hasExited || draft.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(
+                        run.hasExited || !run.acceptsInput
+                            || draft.trimmingCharacters(in: .whitespaces).isEmpty
+                            || (run.isStreaming && !run.commandCapabilities.supportsSteering)
+                    )
                     .keyboardShortcut(.return, modifiers: .command)
-                    .help(run.isStreaming
+                    .accessibilityLabel(run.isStreaming ? "Steer message" : "Send message")
+                    .accessibilityValue(
+                        draft.trimmingCharacters(in: .whitespaces).isEmpty
+                        ? "Unavailable: message is empty" : "Ready")
+                    .accessibilityHint(
+                        run.isStreaming && run.commandCapabilities.supportsSteering
+                        ? "Sends with Command-Return before the next model call"
+                        : "Sends with Command-Return")
+                    .help(
+                        run.isStreaming && run.commandCapabilities.supportsSteering
                         ? "Steer (⌘↵) — delivered before the next model call"
+                            : run.isStreaming
+                                ? "This engine does not support steering while working"
                         : "Send (⌘↵)")
 
                     Button {
                         let text = draft
-                        draft = ""
-                        Task { await run.queueFollowUp(text) }
+                        Task {
+                            let receipt = await run.queueFollowUp(text)
+                            if receipt.wasHandedOff, draft == text { draft = "" }
+                        }
                     } label: {
                         Image(systemName: "text.append")
                             .font(.system(size: 10))
                             .frame(width: 26, height: 20)
                     }
                     .buttonStyle(.bordered)
-                    .disabled(run.hasExited || draft.trimmingCharacters(in: .whitespaces).isEmpty)
-                    .help("Queue as a follow-up — delivered only once the agent stops")
+                    .disabled(
+                        run.hasExited || !run.acceptsInput || !run.isStreaming
+                            || !run.commandCapabilities.supportsQueuedFollowUps
+                            || draft.trimmingCharacters(in: .whitespaces).isEmpty
+                    )
+                    .accessibilityLabel("Queue follow-up")
+                    .accessibilityValue(
+                        run.commandCapabilities.supportsQueuedFollowUps
+                        ? "Available" : "Unavailable")
+                    .accessibilityHint(
+                        "Keeps this message for a distinct turn after current work")
+                    .help(
+                        run.commandCapabilities.supportsQueuedFollowUps
+                            ? "Queue as a distinct follow-up after the current turn"
+                            : "This engine does not support queued follow-ups")
                 }
             }
             .padding(.horizontal, Design.gutter)
@@ -346,8 +510,10 @@ struct RunPane: View {
 
     private func send() {
         let text = draft
-        draft = ""
-        Task { await run.send(text) }
+        Task {
+            let receipt = await run.send(text)
+            if receipt.wasHandedOff, draft == text { draft = "" }
+        }
     }
 }
 
@@ -380,28 +546,68 @@ struct RunOptionsMenu: View {
     var run: LiveRun
     var models: [ModelSpec]
     var hasExited: Bool
+    var isWorking: Bool
+    var isCanceling: Bool
+    var cancellationScopes: Set<SessionCancellationScope>
     var sessionFile: String?
     @State private var choosingModel = false
 
     var body: some View {
         Menu {
-            Button("Compact context now") { Task { await run.compact() } }
-                .disabled(hasExited)
+            Button("Context compacts automatically") {}
+                .disabled(true)
             Divider()
             Button("Change model…") { choosingModel = true }
                 .disabled(hasExited || models.isEmpty)
             // Flat, not a submenu. Seven items inline cost less than a nested `Menu`, which
             // does not work under `.menuStyle(.borderlessButton)` — see `ModelChooserSheet`.
-            Picker("Thinking level", selection: Binding(
+            Picker(
+                "Thinking level",
+                selection: Binding(
                 get: { run.thinkingLevel ?? "off" },
-                set: { level in Task { await run.setThinking(level) } }))
-            {
+                    set: { level in Task { await run.setThinking(level) } })
+            ) {
                 ForEach(["off", "minimal", "low", "medium", "high", "xhigh", "max"], id: \.self) {
                     Text($0).tag($0)
                 }
             }
             .pickerStyle(.inline)
-            .disabled(hasExited)
+            .disabled(true)
+            .help("Thinking level is fixed when this run starts")
+            Divider()
+            Button("Cancel at next safe boundary") {
+                Task { _ = await run.cancel(.agentLoop) }
+            }
+            .accessibilityValue(
+                cancellationScopes.contains(.agentLoop) ? "Available" : "Unavailable")
+            .accessibilityHint(
+                "Stops at the agent loop's next safe boundary; it does not interrupt a model stream or action")
+            .disabled(
+                hasExited || !isWorking || isCanceling
+                    || !cancellationScopes.contains(.agentLoop))
+            Button("Cancel model stream") {
+                Task { _ = await run.cancel(.modelStream) }
+            }
+            .accessibilityValue(
+                cancellationScopes.contains(.modelStream) ? "Available" : "Unavailable")
+            .accessibilityHint("Interrupts the provider's model stream when supported")
+            .disabled(
+                hasExited || !isWorking || isCanceling
+                    || !cancellationScopes.contains(.modelStream))
+            Button("Cancel current action") {
+                Task { _ = await run.cancel(.currentAction) }
+            }
+            .accessibilityValue(
+                cancellationScopes.contains(.currentAction) ? "Available" : "Unavailable")
+            .accessibilityHint("Interrupts the active action when supported")
+            .disabled(
+                hasExited || !isWorking || isCanceling
+                    || !cancellationScopes.contains(.currentAction))
+            if !cancellationScopes.contains(.modelStream)
+                || !cancellationScopes.contains(.currentAction)
+            {
+                Text("Unavailable scopes are disabled; End run is broader teardown.")
+            }
             Divider()
             Button("Copy launch command") {
                 NSPasteboard.general.clearContents()
@@ -414,10 +620,14 @@ struct RunOptionsMenu: View {
                 }
             }
             Divider()
-            Button("Close run", role: .destructive) { model.closeRun(run) }
+            Button(hasExited ? "Close view" : "Detach view") {
+                if hasExited { model.closeRun(run) } else { model.detachRun(run) }
+            }
         } label: {
             Image(systemName: "ellipsis.circle")
         }
+        .accessibilityLabel("Run actions")
+        .accessibilityHint("Actions for this run, including cancellation scopes")
         .menuStyle(.borderlessButton)
         .fixedSize()
         // Attached to the menu, not inside its content: a sheet modifier on a view that only
@@ -475,7 +685,6 @@ struct LauncherFormBody: View {
     @State private var noContextFiles = false
     @State private var recordPayloads = false
 
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
@@ -497,7 +706,8 @@ struct LauncherFormBody: View {
                                                 cwd = path
                                             } label: {
                                                 Chip(
-                                                    text: URL(fileURLWithPath: path).lastPathComponent,
+                                                    text: URL(fileURLWithPath: path)
+                                                        .lastPathComponent,
                                                     symbol: "clock",
                                                     tint: cwd == path ? Design.accent : .secondary,
                                                     filled: cwd == path)
@@ -508,9 +718,11 @@ struct LauncherFormBody: View {
                                     }
                                 }
                             }
-                            Text("The agent's AGENTS.md and CLAUDE.md discovery walks up from "
+                            Text(
+                                "The agent's AGENTS.md and CLAUDE.md discovery walks up from "
                                 + "here, so this choice changes its instructions, not just its "
-                                + "file paths.")
+                                    + "file paths."
+                            )
                                 .font(.system(size: 10))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -519,15 +731,18 @@ struct LauncherFormBody: View {
 
                     Card("Engine", symbol: "cpu") {
                         VStack(alignment: .leading, spacing: 8) {
-                            Picker("", selection: Binding(
+                            Picker(
+                                "",
+                                selection: Binding(
                                 get: { model.engineChoice },
-                                set: { model.engineChoice = $0 }))
-                            {
+                                    set: { model.engineChoice = $0 })
+                            ) {
                                 ForEach(AppModel.Engine.allCases) { Text($0.label).tag($0) }
                             }
                             .pickerStyle(.segmented).labelsHidden()
                             .onChange(of: model.engineChoice) { _, now in
                                 if now != .claudeCode { lastDirectEngine = now }
+                                if now == .claudeCode { recordPayloads = false }
                                 // The engines offer disjoint catalogues, so a selection made
                                 // under one is meaningless under the other. Re-seeded rather
                                 // than left alone, because a picker showing a provider absent
@@ -549,18 +764,24 @@ struct LauncherFormBody: View {
                                 if let auth = model.claudeCodeAuth {
                                     HStack(spacing: 6) {
                                         Circle()
-                                            .fill(auth.isSubscription
-                                                ? Design.success : Design.warning)
+                                            .fill(
+                                                auth.isSubscription
+                                                    ? Design.success : Design.warning
+                                            )
                                             .frame(width: 6, height: 6)
-                                        Text(auth.isSubscription
+                                        Text(
+                                            auth.isSubscription
                                             ? "\(auth.summary) — draws on the plan"
-                                            : "\(auth.summary) — bills metered API credit")
+                                                : "\(auth.summary) — bills metered API credit"
+                                        )
                                             .font(.system(size: 10))
                                             .foregroundStyle(.secondary)
                                     }
                                 } else {
-                                    Text("No `claude` binary found, or it is not signed in. "
-                                        + "Install Claude Code and run `claude /login`.")
+                                    Text(
+                                        "No `claude` binary found, or it is not signed in. "
+                                            + "Install Claude Code and run `claude /login`."
+                                    )
                                         .font(.system(size: 10))
                                         .foregroundStyle(Design.warning)
                                         .fixedSize(horizontal: false, vertical: true)
@@ -573,10 +794,13 @@ struct LauncherFormBody: View {
                     Card("Model", symbol: "cpu") {
                         VStack(alignment: .leading, spacing: 8) {
                             if model.pickerModels.isEmpty {
-                                Text(model.runtimeModelsError
-                                    ?? "Asking the engine which models it can reach…")
+                                Text(
+                                    model.runtimeModelsError
+                                        ?? "Asking the engine which models it can reach…"
+                                )
                                     .font(.system(size: 11))
-                                    .foregroundStyle(model.runtimeModelsError == nil
+                                .foregroundStyle(
+                                    model.runtimeModelsError == nil
                                         ? .secondary : Design.danger)
                             } else {
                                 Picker("Provider", selection: $provider) {
@@ -602,13 +826,17 @@ struct LauncherFormBody: View {
                                         Text(m.displayName).tag(m.id)
                                     }
                                 }
-                                if let selected = modelsForProvider.first(where: { $0.id == modelID }) {
+                                if let selected = modelsForProvider.first(where: {
+                                    $0.id == modelID
+                                }) {
                                     ModelFactsRow(model: selected, requestedThinking: thinking)
                                 }
                             }
                             Picker("Thinking", selection: $thinking) {
-                                ForEach(["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-                                        id: \.self) { Text($0).tag($0) }
+                                ForEach(
+                                    ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+                                    id: \.self
+                                ) { Text($0).tag($0) }
                             }
                         }
                     }
@@ -622,7 +850,8 @@ struct LauncherFormBody: View {
                                 .padding(6)
                                 .background(
                                     RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                        .fill(Color(nsColor: .textBackgroundColor)))
+                                        .fill(Color(nsColor: .textBackgroundColor))
+                                )
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 7, style: .continuous)
                                         .strokeBorder(.separator, lineWidth: 1))
@@ -634,22 +863,38 @@ struct LauncherFormBody: View {
                     Card("Options", symbol: "slider.horizontal.3") {
                         VStack(alignment: .leading, spacing: 8) {
                             Toggle("Save the session to disk", isOn: $persistSession)
+                                .disabled(true)
+                            Text("Aviary currently always keeps a crash-readable session journal.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
                             Toggle("Skip AGENTS.md / CLAUDE.md discovery", isOn: $noContextFiles)
                             Divider().opacity(0.5)
                             Toggle("Record what's sent to the model", isOn: $recordPayloads)
+                                .disabled(model.engineChoice == .claudeCode)
                             Text(Self.recordPayloadsExplanation)
                                 .font(.system(size: 10))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
-                            if model.preferInHouseEngine {
-                                Text("On the in-house engine this is native — the provider "
+                            if model.engineChoice == .claudeCode {
+                                Text(
+                                    "Unavailable for a Claude Code-driven run: Claude Code owns "
+                                        + "the provider request and does not expose its full payload."
+                                )
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                            } else if model.preferInHouseEngine {
+                                Text(
+                                    "On the in-house engine this is native — the provider "
                                     + "announces each payload as it sends it, so there is no "
-                                    + "extension to install.")
+                                        + "extension to install."
+                                )
                                     .font(.system(size: 10))
                                     .foregroundStyle(.tertiary)
                             } else if EngineLocator.wireLogExtension() == nil {
-                                Text("Unavailable: harness-extensions/wire-log.ts is missing "
-                                    + "from this checkout.")
+                                Text(
+                                    "Unavailable: harness-extensions/wire-log.ts is missing "
+                                        + "from this checkout."
+                                )
                                     .font(.system(size: 10))
                                     .foregroundStyle(Design.warning)
                             }
@@ -679,7 +924,7 @@ struct LauncherFormBody: View {
                             // "off" is the picker's no-reasoning value; Claude Code has no such
                             // level, so it is expressed by omitting the flag entirely.
                             effort: thinking == "off" ? nil : thinking,
-                            prompt: prompt)
+                            prompt: prompt, noContextFiles: noContextFiles)
                         onStart()
                         return
                     }
@@ -688,6 +933,8 @@ struct LauncherFormBody: View {
                         providerID: provider.isEmpty ? nil : provider,
                         modelID: modelID.isEmpty ? nil : modelID,
                         prompt: prompt,
+                        thinkingLevel: thinking == "off" ? nil : thinking,
+                        noContextFiles: noContextFiles,
                         recordPayloads: recordPayloads)
                     onStart()
                 } label: {
@@ -715,14 +962,14 @@ struct LauncherFormBody: View {
                     provider = model.settings.defaultProvider ?? providers.first ?? ""
                 }
                 if modelID.isEmpty
-                    || !modelsForProvider.contains(where: { $0.id == modelID }) {
+                    || !modelsForProvider.contains(where: { $0.id == modelID })
+                {
                     modelID = model.settings.defaultModel ?? modelsForProvider.first?.id ?? ""
                 }
             }
             thinking = model.settings.defaultThinkingLevel ?? "high"
         }
     }
-
 
     /// What each engine actually is, in the terms that matter when choosing one.
     ///
@@ -807,7 +1054,9 @@ struct ModelFactsRow: View {
                 if let m = model.maxTokens {
                     Chip(text: "\(Fmt.tokens(m)) out", tint: .secondary)
                 }
-                if model.reasoning { Chip(text: "reasoning", symbol: "brain", tint: Design.thinking) }
+                if model.reasoning {
+                    Chip(text: "reasoning", symbol: "brain", tint: Design.thinking)
+                }
                 if model.supportsImages { Chip(text: "images", symbol: "photo", tint: .secondary) }
                 if let i = model.costInput, let o = model.costOutput {
                     Chip(text: "$\(fmt(i))/$\(fmt(o))", tint: Design.accent)
@@ -819,9 +1068,11 @@ struct ModelFactsRow: View {
             if let requested = requestedThinking,
                model.deadThinkingLevels.contains(requested)
             {
-                Text("This provider maps “\(requested)” to nothing — the request would carry "
+                Text(
+                    "This provider maps “\(requested)” to nothing — the request would carry "
                     + "no reasoning effort. Levels that do map through: "
-                    + mappedLevels.joined(separator: ", ") + ".")
+                        + mappedLevels.joined(separator: ", ") + "."
+                )
                     .font(.system(size: 10))
                     .foregroundStyle(Design.warning)
                     .fixedSize(horizontal: false, vertical: true)
@@ -858,11 +1109,19 @@ struct RunInspector: View {
                         if let id = run.sessionID {
                             DetailRow(label: "Session id", value: id, mono: true)
                         }
+                        if let identity = run.config.identity {
+                            DetailRow(label: "Work host", value: identity.workHostID, mono: true)
+                            DetailRow(label: "Work id", value: identity.workID, mono: true)
+                            DetailRow(label: "Run id", value: identity.runID, mono: true)
+                        }
                         DetailRow(label: "Model", value: run.modelLabel ?? "—", mono: true)
                         DetailRow(label: "Thinking", value: run.thinkingLevel ?? "—")
                         DetailRow(
                             label: "Session saved",
-                            value: run.config.persistSession ? "yes" : "no (--no-session)")
+                            value: run.config.persistSession ? "yes" : "no")
+                        DetailRow(
+                            label: "Project context",
+                            value: run.config.noContextFiles ? "skipped" : "included")
                     }
                 }
 
@@ -882,7 +1141,8 @@ struct RunInspector: View {
                             StatTile(label: "cached", value: Fmt.tokens(run.usage.cacheRead))
                         }
                         if run.usage.cost.total > 0 {
-                            DetailRow(label: "Cost", value: Fmt.cost(run.usage.cost.total), mono: true)
+                            DetailRow(
+                                label: "Cost", value: Fmt.cost(run.usage.cost.total), mono: true)
                         }
                         if let rate = run.usage.cacheHitRate {
                             VStack(alignment: .leading, spacing: 3) {
@@ -890,7 +1150,8 @@ struct RunInspector: View {
                                     Text("cache hit rate").font(.system(size: 10))
                                         .foregroundStyle(.secondary)
                                     Spacer()
-                                    Text(Fmt.percent(rate)).font(Design.numeric(10, weight: .semibold))
+                                    Text(Fmt.percent(rate)).font(
+                                        Design.numeric(10, weight: .semibold))
                                 }
                                 RatioBar(fraction: rate, tint: Design.tool)
                             }
@@ -914,8 +1175,10 @@ struct RunInspector: View {
                 if !run.stderrTail.isEmpty {
                     Card("Engine stderr", symbol: "exclamationmark.bubble") {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Where the useful failures land — a 401 naming an unresolved "
-                                + "variable, a version-conflict refusal.")
+                            Text(
+                                "Where the useful failures land — a 401 naming an unresolved "
+                                    + "variable, a version-conflict refusal."
+                            )
                                 .font(.system(size: 10)).foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
                             CodeBlock(
@@ -962,7 +1225,8 @@ struct RunInspector: View {
     @ViewBuilder
     private var contextCard: some View {
         if run.config.recordPayloads {
-            Card("What was sent", symbol: "arrow.up.doc",
+            Card(
+                "What was sent", symbol: "arrow.up.doc",
                  accessory: AnyView(
                     HStack(spacing: 8) {
                         Button("Breakdown") { showBreakdown = true }
@@ -971,13 +1235,15 @@ struct RunInspector: View {
                         Button("Raw") { showRaw = true }
                             .buttonStyle(.link).font(.system(size: 10))
                             .disabled(run.wireRecords.isEmpty)
-                    }))
-            {
+                    })
+            ) {
                 if let analysis = run.latestAnalysis {
                     VStack(alignment: .leading, spacing: 6) {
                         DetailRow(
                             label: "Payload",
-                            value: "\(Fmt.bytes(analysis.totalCharacters)) · ≈\(Fmt.tokens(analysis.estimatedTokens)) tokens")
+                            value:
+                                "\(Fmt.bytes(analysis.totalCharacters)) · ≈\(Fmt.tokens(analysis.estimatedTokens)) tokens"
+                        )
                         if let actual = run.lastInputTokens {
                             DetailRow(label: "Billed input", value: Fmt.tokens(actual), mono: true)
                         }
@@ -989,7 +1255,11 @@ struct RunInspector: View {
                                     .font(.system(size: 10.5))
                                     .lineLimit(1).truncationMode(.middle)
                                 Spacer(minLength: 4)
-                                Text(String(format: "%.0f%%", 100 * seg.share(of: analysis.totalCharacters)))
+                                Text(
+                                    String(
+                                        format: "%.0f%%",
+                                        100 * seg.share(of: analysis.totalCharacters))
+                                )
                                     .font(Design.numeric(10, weight: .semibold))
                                     .foregroundStyle(.secondary)
                             }
@@ -1038,19 +1308,23 @@ private struct ScheduleCard: View {
     @State private var adding = false
 
     var body: some View {
-        Card("On its own", symbol: "clock.arrow.2.circlepath",
+        Card(
+            "On its own", symbol: "clock.arrow.2.circlepath",
              accessory: AnyView(
                 Button {
                     adding.toggle()
                 } label: {
-                    Image(systemName: adding ? "xmark" : "plus").font(.system(size: 9, weight: .bold))
+                    Image(systemName: adding ? "xmark" : "plus").font(
+                        .system(size: 9, weight: .bold))
                 }
-                .buttonStyle(.plain).foregroundStyle(.secondary)))
-        {
+                .buttonStyle(.plain).foregroundStyle(.secondary))
+        ) {
             VStack(alignment: .leading, spacing: 7) {
                 if driver.jobs.isEmpty && !adding {
-                    Text("Nothing scheduled. This session can poke itself on an interval — "
-                        + "useful for watching a build, or checking back on something slow.")
+                    Text(
+                        "Nothing scheduled. This session can poke itself on an interval — "
+                            + "useful for watching a build, or checking back on something slow."
+                    )
                         .font(.system(size: 10)).foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1138,8 +1412,10 @@ private struct ClaudeCodeRunCard: View {
                 }
                 if let id = driver.claudeSessionID {
                     DetailRow(label: "Claude session", value: id, mono: true)
-                    Text("`claude --resume \(id)` reopens this conversation in Claude Code "
-                        + "itself, with the history Aviary cannot replay.")
+                    Text(
+                        "`claude --resume \(id)` reopens this conversation in Claude Code "
+                            + "itself, with the history Aviary cannot replay."
+                    )
                         .font(.system(size: 10)).foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 }

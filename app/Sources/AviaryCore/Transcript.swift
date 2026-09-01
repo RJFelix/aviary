@@ -143,10 +143,10 @@ public struct ToolCall: Sendable, Hashable, Identifiable {
         self.arguments = arguments
     }
 
-    /// The harness's only built-in tool is `ipython`, so nearly every tool call in a
-    /// transcript is a Python cell. Pull it out for first-class rendering.
+    /// Aviary's current tool is `python`; older transcripts called the same thing `ipython`.
+    /// Treat both as a Python cell so live and historical runs keep first-class rendering.
     public var pythonCode: String? {
-        guard name == "ipython" else { return nil }
+        guard name == "python" || name == "ipython" else { return nil }
         return arguments["code"]?.stringValue
             ?? arguments["cell"]?.stringValue
             ?? arguments["source"]?.stringValue
@@ -293,6 +293,28 @@ public struct AgentStatus: Sendable, Hashable {
     public var isDone: Bool { taskState == "done" || taskState == "completed" }
 }
 
+/// The last durable terminal outcome for a session's active branch. This is deliberately
+/// separate from transcript rows: a failed or cancelled turn may have no assistant row to
+/// reconcile, while a synthetic note would make cold reload look like a model message.
+public struct TranscriptOutcome: Sendable, Hashable, Equatable {
+    public enum State: String, Sendable, Hashable, Codable {
+        case failed
+        case cancelled
+    }
+
+    public let id: String
+    public let state: State
+    public let detail: String?
+    public let timestamp: Date
+
+    public init(id: String, state: State, detail: String? = nil, timestamp: Date) {
+        self.id = id
+        self.state = state
+        self.detail = detail
+        self.timestamp = timestamp
+    }
+}
+
 // MARK: - Transcript
 
 public struct Transcript: Sendable {
@@ -301,6 +323,8 @@ public struct Transcript: Sendable {
     public var sessionName: String?
     public var status: AgentStatus?
     public var sessionState: String?
+    /// The most recent durable failure/cancellation marker on the active branch, if any.
+    public var outcome: TranscriptOutcome?
     public var usage: Usage
     /// Usage contributed by RLM children and folded into parent messages.
     public var childUsage: Usage
@@ -388,6 +412,7 @@ public enum SessionParser {
 
         var t = Transcript(
             header: header, items: [], sessionName: nil, status: nil, sessionState: nil,
+            outcome: nil,
             usage: Usage(), childUsage: Usage(), modelChanges: [], lastModel: nil,
             lastProvider: nil, counts: Transcript.Counts(), labels: [:], unparsedLines: unparsed)
         t.counts.entries = entries.count
@@ -409,6 +434,9 @@ public enum SessionParser {
                 let role = type == "custom_message" ? "custom" : (msg["role"]?.stringValue ?? "")
                 switch role {
                 case "user":
+                    // A later prompt starts a new attempt; the previous terminal outcome no
+                    // longer describes the active branch's work.
+                    t.outcome = nil
                     var item = TranscriptItem(id: e.id, kind: .user, timestamp: ts)
                     item.blocks = ContentBlock.parse(msg["content"])
                     item.raw = v
@@ -489,6 +517,22 @@ public enum SessionParser {
                         ? v["customType"]?.stringValue
                         : msg["customType"]?.stringValue) ?? "extension"
                     let content = (type == "custom_message" ? v["content"] : msg["content"])
+                    // Controller intents are durable audit records, not conversation turns. They
+                    // remain available in the raw JSONL for recovery and diagnostics but must not
+                    // create empty custom rows in the human-facing transcript.
+                    if ctype == "aviary.command-intent.v1" { continue }
+                    if ctype == "aviary.outcome" {
+                        let state = v["outcomeState"]?.stringValue
+                            ?? msg["outcomeState"]?.stringValue
+                        if let state, let outcomeState = TranscriptOutcome.State(rawValue: state) {
+                            let detail = v["detail"]?.stringValue
+                                ?? msg["detail"]?.stringValue
+                                ?? content?.textContent
+                            t.outcome = TranscriptOutcome(
+                                id: e.id, state: outcomeState, detail: detail, timestamp: ts)
+                        }
+                        continue
+                    }
                     let isAgentMessage = ctype == "agent_message"
                     var item = TranscriptItem(
                         id: e.id, kind: isAgentMessage ? .agentMessage : .custom, timestamp: ts)
@@ -547,6 +591,11 @@ public enum SessionParser {
                 item.text = "Model → \(provider)/\(model)"
                 item.raw = v
                 t.items.append(item)
+
+            case "run_start":
+                // A resumed run is a new attempt. Keep the session/work identity in the
+                // durable marker, but do not carry a prior attempt's failure into it.
+                t.outcome = nil
 
             case "thinking_level_change":
                 var item = TranscriptItem(id: e.id, kind: .stateChange, timestamp: ts)

@@ -328,6 +328,8 @@ struct CodeBlock: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(copied ? Design.success : .secondary)
+                .accessibilityLabel(copied ? "Copied" : "Copy code")
+                .accessibilityValue(copied ? "Complete" : "Ready")
                 .help("Copy")
             }
             .padding(.horizontal, 9)
@@ -368,6 +370,12 @@ struct CodeBlock: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(tint)
+                .accessibilityLabel(
+                    expanded
+                    ? "Collapse code"
+                    : "Show more code")
+                .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+                .accessibilityHint("Shows or hides the remaining lines")
             }
         }
         .background(
@@ -617,5 +625,8 @@ struct NoticeBanner: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(tint.opacity(0.3), lineWidth: 1))
+        // Keep the remedy button independently reachable; the title/message already carry
+        // the state in words, so VoiceOver never has to infer it from the banner tint.
+        .accessibilityElement(children: .contain)
     }
 }

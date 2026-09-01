@@ -57,13 +57,18 @@ struct RootView: View {
         case .cockpit:
             return model.engine.map { "\($0.kind.label) · \($0.version ?? "unknown version")" } ?? "No engine"
         case .sessions:
-            return "\(model.filteredSessions.count) of \(model.sessions.count)"
+            let archived = model.sessions.filter(\.isArchived).count
+            let current = model.sessions.count - archived
+            return archived == 0
+                ? "\(current) sessions"
+                : "\(current) current · \(archived) archived"
         case .workshop:
             return "\(model.board.openCount) open · \(model.board.workingCount) in progress · "
                 + "\(model.board.requests.count) total"
         case .live:
-            let live = model.runs.filter { !$0.hasExited }
-            return "\(live.count) live · \(live.filter(\.isStreaming).count) working"
+            let live = model.workRuns.filter { !$0.hasExited }
+            return "\(live.count) live · \(model.runs.count) attached · "
+                + "\(live.filter(\.isStreaming).count) working"
         case .flock:
             return "\(model.tree.allNodes.count) sub-agents · \(model.tree.runningCount) running"
         case .models:
@@ -212,6 +217,27 @@ struct SidebarView: View {
                 }
             }
 
+            if !model.detachedRuns.isEmpty {
+                SwiftUI.Section("Detached Work") {
+                    ForEach(model.detachedRuns) { run in
+                        Button {
+                            model.reattachRun(run)
+                        } label: {
+                            HStack(spacing: 6) {
+                                if run.isStreaming { PulseDot(color: Design.success) }
+                                else { Circle().fill(.tertiary).frame(width: 7, height: 7) }
+                                Text(run.title).font(.system(size: 11.5)).lineLimit(1)
+                                Spacer()
+                                Image(systemName: "arrowshape.turn.up.left")
+                                    .font(.system(size: 9)).foregroundStyle(.tertiary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help("Reattach this run")
+                    }
+                }
+            }
+
             // The "Working agents" section is deliberately not shown — it listed sessions
             // the harness daemon is holding, and on the in-house engine it was actively wrong:
             // a live in-house run still rendered "Nothing running". Kept as
@@ -230,7 +256,7 @@ struct SidebarView: View {
     private func badge(for s: Section) -> (String, Color)? {
         switch s {
         case .live:
-            let n = model.runs.filter(\.isStreaming).count
+            let n = model.workRuns.filter(\.isStreaming).count
             return n > 0 ? ("\(n)", Design.success) : nil
         case .sessions:
             return model.sessions.isEmpty ? nil : ("\(model.sessions.count)", .secondary)
@@ -277,7 +303,7 @@ struct SidebarView: View {
                         .help("This app was \(model.buildStamp.summary). The checkout has "
                             + "\(behind) commit(s) since. Run `just build` and reopen it.")
                 }
-                let working = model.runs.filter(\.isStreaming).count
+                let working = model.workRuns.filter(\.isStreaming).count
                 if working > 0 {
                     Chip(text: "\(working)", symbol: "bolt.fill", tint: Design.success)
                         .help("\(working) run(s) working")

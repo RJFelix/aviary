@@ -12,6 +12,28 @@ rather than merely unbuilt.
 **D1. Aviary owns dispatched work.** Agents get an interface to *request* actions on it, which
 Aviary can usually be expected to honour. Full agent ownership cuts off too much.
 
+## Remote-first ownership clarification, 2026-08-31
+
+The owner named by D1 is a durable **Work Host**, not the GUI process and not the originating
+conversation.
+
+- **D13. GUI detachment carries no termination intent.** Window close, GUI quit/relaunch, network
+  loss, and device sleep only detach that client. Work continues according to its host-side scope
+  and resource policy until an explicit durable terminate request or policy deadline.
+- **D14. Sessions attach to Work; they do not consume it.** Many sessions may observe ongoing or
+  completed Work, and many GUIs may control it concurrently. The Work Host serializes accepted
+  commands with client/session provenance and explicit conflict/stale outcomes; it does not assign
+  one exclusive controller lease. Connection liveness is not ownership. Completed results are
+  immutable, write-once values; continuation makes linked new Work rather than rewriting them.
+- **D15. Local and remote are one logical model.** A Future remains a local view over a Handle, but
+  the Handle resolves at its Work Host. GUI, agent, and session attachment may be on another device.
+  One GUI may attach to Work across many local/remote hosts, and each Work may have many attached
+  GUIs. The first transport can be a Unix-domain socket as long as identity, commands, cursors, and
+  event ordering contain no local path, PID, client clock, or GUI-lifetime assumption.
+- **D16. Identity is not remote authority.** A Handle/Work ID names the object and preserves
+  provenance; a remote Work Host separately authenticates and authorizes the attaching client.
+  This endpoint boundary does not sandbox the trusted Python agent running on that host.
+
 ## The sorts
 
 We had two. Ownership introduces a third.
@@ -20,7 +42,7 @@ We had two. Ownership introduces a third.
 |---|---|---|---|---|
 | **Value** | one interpreter | the session's namespace | free | no — objects cannot cross sub-interpreters |
 | **Message** | a conversation | permanent, re-sent as context | a model call | only as text |
-| **Handle** | Aviary | durable, reaped by policy | a lookup | **yes** — this is the shared sort |
+| **Handle** | Aviary Work Host | durable, reaped by policy | a lookup | **yes** — this is the shared sort |
 
 A `Future` is a *local view* over a `Handle`. That is already how `spawn` works internally: the
 child id is the handle, the Future polls it. Generalising it is mostly renaming.
@@ -67,6 +89,11 @@ call; `.notify()` costs at most one.
 **D2. No global enumeration.** You hold a handle because you created the work or because
 somebody passed you the id. There is no `all_handles()`.
 
+Under D16, “capability” describes authority *inside an already authenticated Work Host trust
+domain*. An unguessable ID is not a remote login credential. The host first authorizes the client;
+possession of a Handle then narrows which Work that client may resolve. No global enumeration still
+holds.
+
 This keeps the API at two new verbs, and it dissolves a family of scope questions — who may see
 whose work, whether a handle leaks the existence of a run — into "you were told, or you were
 not". `children()` stays, because your own children are not a directory of everyone's.
@@ -111,14 +138,14 @@ it. Owning work means owing it a lifetime.
   timeout that already exists (900s), and should be per-kind: a shell build and a sub-agent
   fan-out do not deserve the same ceiling.
 - *Finished* results have a `keep_result_until`. They are small text; the retention that
-  matters is the one on the session's artifacts, so reuse that.
+  matters is the one on the Work's artifacts, so reuse that.
 
 **D4. Reaping is recorded, not silent** (see H5), and **visible** — see below.
 
-**Q2.** Does a handle survive Aviary restarting? H2 says it outlives its *run*; surviving a
-process restart means persisting the store to disk. Cheap for finished results, meaningless
-for running work (the process is gone). Suggests: persist results, mark running work
-`cancelled: aviary exited` on load.
+**Q2, split by D13.** A Handle and its Work **must** survive GUI restart/disconnection because the
+GUI is only a client. Work Host restart is the real recovery question: terminal results persist;
+running Work reconnects to host-owned processes where possible and otherwise receives an explicit
+indeterminate/canceled outcome. A missing client is never evidence that the process is gone.
 
 ## What this gives Flock back
 
@@ -147,8 +174,8 @@ trusting an aggregate it did not compute.
 
 Contained, mostly renaming:
 
-- `HandleStore` in `AviaryCore`, owned by the app rather than by `AgentRunner`, persisted
-  beside session artifacts.
+- `HandleStore` in `AviaryCore`, owned by the Work Host rather than by the GUI or `AgentRunner`,
+  persisted beside Work journals/artifacts.
 - `AgentRunner.startBackgroundChild` registers a handle instead of writing to a private dict.
 - The prelude's watcher polls `handle(id)` rather than `children()`; `children()` becomes a
   filter over handles by origin.
@@ -171,8 +198,8 @@ intent in the withdrawal of a capability.**
 namespaces with their own scope and duration, with handle lifetimes attached to their
 namespace's lifecycle. That is better than D3's per-handle clocks: it is region-based rather
 than object-based, so a fan-out can be given a child scope and discarded wholesale. D3 survives
-as the degenerate case — scope = session — which keeps it forward-compatible. Larger design,
-deliberately deferred.
+as the degenerate case — scope = Work — which keeps it forward-compatible without making a
+conversation attachment the lifetime owner. Larger design, deliberately deferred.
 
 **Q3 — globally managed.** `ask()` is a request Aviary *may* fulfil; when, whether, and in what
 order is the runtime's to decide. There is a global ceiling because of physics, but how it is
@@ -192,19 +219,21 @@ Two consequences:
 **Q4 — a dying run does not kill its work.** It may schedule it for reaping, but survival must
 not be forbidden: runs die for many reasons, resuming them is normal, and work that completes
 during the dead period is work saved rather than lost. The distinction is **stopping versus
-destroying** — a session may stop or die freely, but is only *destroyed* at the driver's option
-or by well-understood scheduled cleanup.
+destroying** — a run or session attachment may stop freely; Work is destroyed only by an explicit
+authorized request or well-understood host-side lifetime policy.
 
-**D9. Three levels of death**, which the earlier sketch collapsed into two:
+**D9, revised by D13–D16. Death and detachment are different events:**
 
-| | in-process work | handles |
+| Event | running Work | handles/results |
 |---|---|---|
-| Run stops | continues | live |
-| Aviary exits | gone (the process was in it) | persist, marked `cancelled: aviary exited` |
-| Session destroyed | cancelled deliberately | reaped, with a timestamp |
+| Run stops | follows Work scope; not implicitly killed | live |
+| GUI exits or network disconnects | unaffected | live and attachable |
+| Work Host exits | recover/reconnect where possible; otherwise explicit indeterminate/canceled outcome | terminal results persist |
+| Originating session archived/destroyed | unaffected unless an explicit Work lifetime policy says otherwise | live and attachable from other authorized sessions |
+| Work explicitly destroyed or expires | canceled deliberately | reaped, with a timestamp |
 
-The middle row is the only case where work dies without anyone deciding it should, which is
-why it needs recording rather than inferring.
+Work Host death is the remaining involuntary seam. It needs a durable outcome and recovery policy;
+it must never be inferred from a missing GUI connection.
 
 ## Q5 resolved — one clock, derived
 

@@ -1,11 +1,23 @@
-# Splitting Aviary into UI, session service, and kernels
+# Splitting Aviary into GUI, Work Host, and kernels
 
 **Status:** shaping. Nothing implemented. 2026-08-24.
 
-The goal, stated as a test: **relaunching the UI must not disturb work in progress.** Everything
-below is judged against that, and against the fact that this project's whole point is changing
-Aviary often — which is what makes a long-lived service awkward, and which most designs for this
-quietly assume away.
+The goals, stated as tests:
+
+1. **Closing or relaunching the GUI without an explicit terminate command must not disturb work in
+   progress.**
+2. **A later session must be able to attach to ongoing or completed Work, including from a GUI on a
+   different device once a secure remote transport is added.**
+3. **GUI↔Work is many-to-many:** one GUI observes/controls local and remote Work across many hosts;
+   one Work is observed/controlled by many GUIs without an exclusive controller lease.
+
+Everything below is judged against those tests, and against the fact that this project's whole
+point is changing Aviary often — which is what makes a long-lived service awkward, and which most
+designs for this quietly assume away.
+
+The architectural noun is **Work Host**, not “background GUI.” Work is owned by the host service;
+sessions and GUIs attach to it. Local and remote use the same logical contract even when the first
+transport is a Unix-domain socket.
 
 ## Where the three-way split is already true, and where it isn't
 
@@ -26,12 +38,17 @@ in-process inside the UI. So this is not extracting something from the harness; 
 Aviary's own loop out of the app. Worth being precise about, because it means there is no
 existing component to lift, and also no existing protocol to reuse.
 
-**The read path is already solved, and this is the good news.** `InHouseDriver` does not render
+**The same-host read path is already solved, and this remains useful.** `InHouseDriver` does not render
 from memory — it tails the session JSONL and re-parses it (`SessionWatcher` + `SessionParser`).
-The transcript is an append-only event log with a single writer. That means the UI needs **no
-IPC at all for reading**: no event stream to design, no replay-on-reconnect, no lost events if
-the UI dies mid-turn. A service needs only a small *command* surface. Most of the cost people
-associate with this kind of split is the event plumbing, and it is already paid.
+The transcript is an append-only event log with a single writer. This means a local UI does not
+need an ephemeral push bus: it can always reconstruct from a durable cursor.
+
+It does **not** mean the product should expose filesystem tailing as the GUI/service contract. A GUI
+on another device cannot open the host's file, and an attachment from another session should not
+copy the log. The Work Host therefore needs a small durable read surface—describe/snapshot,
+events-after-cursor, and fetch-artifact—alongside commands. Same-host file reading may remain an
+optimization behind the same `WorkServiceClient` interface. The canonical journal, rather than a
+live stream, still pays most of the event-plumbing cost.
 
 ## The prior art is in this repo, and so is the scar tissue
 
@@ -52,7 +69,7 @@ the harness is not being edited hourly by an agent. **In this project, the servi
 version-skewed against the UI constantly.** Any design that assumes "the service is long-lived
 and rarely restarts" is assuming away the actual working conditions.
 
-## Recommendation: four stages, and stage 1 buys most of the benefit
+## Recommendation: five stages, and stage 1 buys most of the benefit
 
 ### Stage 0 — stop leaking (mostly done)
 
@@ -83,7 +100,7 @@ with a token because the courier's endpoint is passed in `--mcp-config` and argv
 Cost: a protocol revision with a documented spec, plus a compatibility window where hosts speak
 both. Small, self-contained, independently valuable.
 
-### Stage 2 — `aviaryd`, and the UI becomes a client
+### Stage 2 — `aviaryd` becomes the local Work Host; the GUI becomes a client
 
 A `launchd` **user agent** (`~/Library/LaunchAgents/works.duckbill.aviaryd.plist`, `RunAtLoad`,
 `KeepAlive`, `ThrottleInterval`) rather than a hand-rolled supervisor. launchd already does
@@ -96,20 +113,43 @@ so the boundary should be drawn to keep the reloadable side fat:
 | In the service | Stays in the UI |
 |---|---|
 | The agent loop (`Agent`, `AgentRunner`) | Rendering, every view |
-| Kernel connections, and the MCP bridge for driven runs | The session catalogue and its cache |
+| Kernel connections, and the MCP bridge for driven runs | Session/Work catalogue cache and projections |
 | The `claude -p` child, and its lifecycle | Usage analytics, the model catalogue |
-| `SessionWriter` — the single writer | Skill/memory *presentation*; the Workshop board |
-| Scheduled jobs (which today only tick while a window is open) | The reloader, which now only relaunches the UI |
+| Authoritative Work registry, client/session attachments, command actors/cursors | Multi-host inbox grouping and presentation state |
+| Work/session journals — one host-side writer per journal | Skill/memory *presentation*; the Workshop board |
+| Scheduled jobs (which today only tick while a window is open) | The reloader, which now only relaunches the GUI |
 
-Transport: Unix socket, LF-delimited JSON, **commands only** — `start`, `prompt`, `steer`,
-`stop`, `list`, `attach`. Reads keep going through the transcript. Aim for a protocol small
-enough to fit on one page, because every field in it is a two-sided deployment.
+Transport: Unix socket first, with a transport-neutral protocol for `list`, `describe`, `attach`,
+`detach`, per-client observe/control capability, `snapshot`, `events-after-cursor`, `fetch-artifact`,
+`start`, `prompt`, `steer`, and explicit scoped stop/destroy commands. Many clients may control one
+Work; the host serializes accepted commands with client/session provenance and causal cursors rather
+than assigning one controller lease. Client/service boundaries use an unambiguous
+`WorkRef = {work_host_id, work_id}` rather than letting a local catalogue or bare Work ID silently
+choose a host. Reads remain journal-backed, not an ephemeral event channel.
+Aim for a protocol small enough to fit on one page, because every field in it is a two-sided
+deployment.
 
-### Stage 3 — the UI becomes disposable
+### Stage 3 — the GUI becomes disposable
 
 Which is where you started. Once no work lives in the UI process, the existing reload feature
 stops needing to stop runs before relaunching, `reloadCost` becomes empty, and auto-relaunch
 becomes a safe default rather than the off-by-default compromise it is now.
+
+### Stage 4 — enable a remote GUI without changing ownership semantics
+
+Add an authenticated encrypted transport (or SSH-tunneled transport) and Work Host discovery/manual
+connection over the same logical protocol. Work IDs are identities, not bearer credentials;
+authorization is checked separately. Model/repository credentials and the unrestricted Python
+runtime remain on the Work Host. Client clocks, filesystem paths, PIDs, and network connection
+liveness never define ordering, control ownership, or lifetime.
+
+The conformance test is stronger than “the socket connects”: two controlling clients with
+independent cursors attach to the same Work and issue concurrent commands; the host records one
+deterministic accepted order and explicit stale/conflict outcomes. One client loses its connection;
+Work and the other client's capabilities continue; reconnect duplicates neither commands nor
+effects. Separately, one GUI aggregates local and remote Work across multiple hosts while one host is
+slow/unavailable. A new session can later attach to completed Work after the originating
+conversation is archived.
 
 ## The thing that will actually bite: version skew
 
@@ -121,9 +161,9 @@ Design for it rather than against it:
 1. **Version-stamp the handshake** with the same string the build already prints.
 2. **Skew + no live sessions → the service replaces itself, silently.** No banner, no decision.
    This is the common case and it should be invisible.
-3. **Skew + live sessions → say so plainly** and let them finish on the old build: *"the session
-   service is running an older build; three sessions will finish on it."* Never migrate a live
-   session across a version boundary.
+3. **Skew + live Work → say so plainly** and let it finish on the old build: *"the Work Host is
+   running an older build; three Work items will finish on it."* Never migrate live
+   Work across a version boundary.
 4. **Keep the protocol tiny**, so most changes do not touch it at all. If a change adds a field
    to the command surface, that is a signal it might belong in the UI instead.
 

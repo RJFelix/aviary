@@ -208,15 +208,49 @@ private struct NewRunRailCard: View {
 
 struct SessionRow: View {
     var session: SessionSummary
+    /// Optional canonical projection supplied by the Sessions list. Cockpit rows remain
+    /// compatible with live-only summaries until its consumer migrates.
+    var canonical: CanonicalSessionCatalogSummary? = nil
     var compact: Bool = false
+
+    private var canonicalIsProven: Bool {
+        canonical?.sessionStructuralIntegrityValid == true
+            && canonical?.sessionSemanticProjectionValid == true
+    }
+
+    private var projectedLive: Bool? {
+        guard let canonical else { return session.isLive }
+        guard canonicalIsProven else { return nil }
+        return canonical.work.contains {
+            $0.canProjectExecution && $0.lifecycle == .active
+        }
+    }
+
+    private var projectedBusy: Bool? {
+        guard let canonical else { return session.isBusy }
+        guard canonicalIsProven else { return nil }
+        return canonical.work.contains {
+            $0.canProjectExecution
+                && [.preparing, .running, .canceling].contains($0.execution)
+        }
+    }
+
+    private var rowTitle: String {
+        if let title = canonical?.title, !title.isEmpty { return title }
+        return session.title
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             VStack(spacing: 3) {
-                if session.isBusy {
+                if projectedBusy == true {
                     PulseDot(color: Design.success)
-                } else if session.isLive {
+                } else if projectedLive == true {
                     Circle().fill(Design.accent.opacity(0.8)).frame(width: 7, height: 7)
+                } else if projectedLive == nil {
+                    Circle().stroke(Color.secondary.opacity(0.55), lineWidth: 1)
+                        .frame(width: 7, height: 7)
+                        .overlay(Text("?").font(.system(size: 6, weight: .bold)))
                 } else {
                     Circle().fill(Color.secondary.opacity(0.22)).frame(width: 7, height: 7)
                 }
@@ -224,7 +258,7 @@ struct SessionRow: View {
             .padding(.top, 4)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(session.title)
+                Text(rowTitle)
                     .font(.system(size: 12, weight: .medium))
                     .lineLimit(compact ? 1 : 2)
                     .multilineTextAlignment(.leading)
@@ -239,9 +273,15 @@ struct SessionRow: View {
                             .foregroundStyle(.tertiary)
                             .labelStyle(.titleAndIcon)
                     }
-                    Text(Fmt.ago(session.updatedAt))
-                        .font(.system(size: 9.5))
-                        .foregroundStyle(.tertiary)
+                    if session.isCanonicalOnly {
+                        Text("metadata partial")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.tertiary)
+                    } else {
+                        Text(Fmt.ago(session.updatedAt))
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
 
                 if !compact {
@@ -249,17 +289,17 @@ struct SessionRow: View {
                         if let m = session.model {
                             Chip(text: m, symbol: "cpu", tint: Design.assistant)
                         }
-                        if session.counts.toolCalls > 0 {
+                        if !session.isCanonicalOnly, session.counts.toolCalls > 0 {
                             Chip(text: "\(session.counts.toolCalls) tools", tint: Design.tool)
                         }
-                        if session.counts.toolErrors > 0 {
+                        if !session.isCanonicalOnly, session.counts.toolErrors > 0 {
                             Chip(text: "\(session.counts.toolErrors) errors", tint: Design.danger)
                         }
-                        if session.childCount > 0 {
+                        if !session.isCanonicalOnly, session.childCount > 0 {
                             Chip(text: "\(session.childCount) sub-agents", symbol: "bird",
                                  tint: Design.agentMessage)
                         }
-                        if session.counts.compactions > 0 {
+                        if !session.isCanonicalOnly, session.counts.compactions > 0 {
                             Chip(text: "\(session.counts.compactions)×compact",
                                  tint: Design.warning)
                         }
@@ -270,16 +310,22 @@ struct SessionRow: View {
             Spacer(minLength: 6)
 
             VStack(alignment: .trailing, spacing: 1) {
-                Text(Fmt.tokens(session.usage.totalTokens))
-                    .font(Design.numeric(11, weight: .semibold))
-                if session.usage.cost.total > 0 {
-                    Text(Fmt.cost(session.usage.cost.total))
-                        .font(.system(size: 9.5))
+                if session.isCanonicalOnly {
+                    Text("—")
+                        .font(Design.numeric(11, weight: .semibold))
                         .foregroundStyle(.tertiary)
-                } else if session.counts.assistant > 0 {
-                    Text("\(session.counts.assistant) turns")
-                        .font(.system(size: 9.5))
-                        .foregroundStyle(.tertiary)
+                } else {
+                    Text(Fmt.tokens(session.usage.totalTokens))
+                        .font(Design.numeric(11, weight: .semibold))
+                    if session.usage.cost.total > 0 {
+                        Text(Fmt.cost(session.usage.cost.total))
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.tertiary)
+                    } else if session.counts.assistant > 0 {
+                        Text("\(session.counts.assistant) turns")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
         }

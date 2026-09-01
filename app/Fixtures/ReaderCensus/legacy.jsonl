@@ -1,0 +1,2 @@
+{"type":"session","version":3,"id":"legacy-census","timestamp":"2026-08-31T00:00:00.000Z","cwd":"/tmp/reader-census"}
+{"type":"message","id":"legacy-m1","parentId":null,"timestamp":"2026-08-31T00:00:01.000Z","message":{"role":"user","content":"legacy input"}}

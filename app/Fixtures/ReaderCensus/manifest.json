@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "projectionRulesVersion": 1,
+  "fixtureID": "reader-census-v2-adversarial",
+  "sessionJournal": "session.jsonl",
+  "workJournal": "work.jsonl",
+  "legacyJournal": "legacy.jsonl",
+  "retainedBodies": ["bodies/tool-result.txt", "bodies/large-artifact.json"],
+  "malformedVariants": ["variants/work-malformed.jsonl", "variants/work-truncated.jsonl"],
+  "intentionallyUnwiredConsumers": ["legacy SessionCatalog scanner (native timeline consumer pending)", "Flock", "notifications", "search", "service recovery"]
+}

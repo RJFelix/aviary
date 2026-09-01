@@ -158,11 +158,27 @@ struct CommandPaletteView: View {
 
         if !q.isEmpty {
             for s in model.sessions where matches(s, q) {
+                let canonical = model.canonicalCatalogProjections[s.id]
+                let canonicalProven = canonical?.sessionStructuralIntegrityValid == true
+                    && canonical?.sessionSemanticProjectionValid == true
+                let projectedLive: Bool? = {
+                    guard let canonical else { return s.isLive }
+                    guard canonicalProven else { return nil }
+                    return canonical.work.contains {
+                        $0.canProjectExecution && $0.lifecycle == .active
+                    }
+                }()
                 out.append(Entry(
-                    kind: .session, title: s.title,
-                    subtitle: "\(s.projectName) · \(Fmt.ago(s.updatedAt)) · "
-                        + "\(Fmt.tokens(s.usage.totalTokens)) tokens",
-                    symbol: s.isLive ? "dot.radiowaves.left.and.right" : "bubble.left.and.text.bubble.right",
+                    kind: .session, title: model.catalogTitle(for: s),
+                    subtitle: s.isCanonicalOnly
+                        ? "canonical projection · metadata partial"
+                        : "\(s.projectName) · \(Fmt.ago(s.updatedAt)) · "
+                            + "\(Fmt.tokens(s.usage.totalTokens)) tokens",
+                    symbol: projectedLive == true
+                        ? "dot.radiowaves.left.and.right"
+                        : projectedLive == nil
+                            ? "questionmark.circle"
+                            : "bubble.left.and.text.bubble.right",
                     tint: Design.user,
                     action: {
                         model.section = .sessions
@@ -217,7 +233,7 @@ struct CommandPaletteView: View {
     }
 
     private func matches(_ s: SessionSummary, _ q: String) -> Bool {
-        s.title.lowercased().contains(q)
+        model.catalogTitle(for: s).lowercased().contains(q)
             || s.firstPrompt.lowercased().contains(q)
             || s.projectName.lowercased().contains(q)
             || (s.model?.lowercased().contains(q) ?? false)
@@ -234,15 +250,15 @@ struct CommandPaletteView: View {
                       NotificationCenter.default.post(name: .aviaryNewRun, object: nil)
                   }),
             Entry(kind: .action, title: "Refresh everything",
-                  subtitle: "Rescan transcripts, re-poll the daemon, reload the model catalog",
+                  subtitle: "Rescan transcripts, runtime health, and the model catalog",
                   symbol: "arrow.clockwise", tint: Design.accent,
                   action: { Task { await model.refreshAll() } }),
             Entry(kind: .action, title: "Rescan sessions",
                   subtitle: "Re-read every transcript file",
                   symbol: "magnifyingglass", tint: Design.accent,
                   action: { Task { await model.refreshCatalog() } }),
-            Entry(kind: .action, title: "Check the background service",
-                  subtitle: "Handshake, ownership assertion, and process table",
+            Entry(kind: .action, title: "Check runtime health",
+                  subtitle: "Python hosts, Claude Code login, and process diagnostics",
                   symbol: "stethoscope", tint: Design.warning,
                   action: {
                       model.section = .health

@@ -104,6 +104,10 @@ public actor RuntimeHost {
     private var outputHandler: OutputHandler?
     private var callbackHandler: CallbackHandler?
     private var stderrTail: [String] = []
+    /// One consumer for stdout. A Task per line can enter this actor out of wire order even
+    /// though actor mutation itself is serialized; deltas, replies, and callbacks must retain
+    /// the order in which the host wrote them.
+    private var outputPump: Task<Void, Never>?
 
     public private(set) var capabilities: Capabilities?
     public private(set) var isRunning = false
@@ -155,11 +159,23 @@ public actor RuntimeHost {
         p.standardError = errPipe
 
         let framer = LineFramer()
-        outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        let (outputLines, outputContinuation) = AsyncStream<Data>.makeStream(
+            bufferingPolicy: .unbounded)
+        outputPump = Task { [weak self] in
+            for await line in outputLines {
+                guard let self else { return }
+                await self.ingest(line)
+            }
+        }
+        outPipe.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
-            guard !chunk.isEmpty else { handle.readabilityHandler = nil; return }
+            guard !chunk.isEmpty else {
+                handle.readabilityHandler = nil
+                outputContinuation.finish()
+                return
+            }
             for line in framer.feed(chunk) {
-                Task { await self?.ingest(line) }
+                outputContinuation.yield(line)
             }
         }
         errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -176,6 +192,9 @@ public actor RuntimeHost {
         do {
             try p.run()
         } catch {
+            outputContinuation.finish()
+            outputPump?.cancel()
+            outputPump = nil
             throw HostError.launchFailed(error.localizedDescription)
         }
         process = p
@@ -220,6 +239,8 @@ public actor RuntimeHost {
         try? await Task.sleep(nanoseconds: 300_000_000)
         if p.isRunning { kill(p.processIdentifier, SIGKILL) }
         isRunning = false
+        outputPump?.cancel()
+        outputPump = nil
     }
 
     // MARK: Reading
@@ -275,6 +296,8 @@ public actor RuntimeHost {
 
     private func handleExit() {
         isRunning = false
+        outputPump?.cancel()
+        outputPump = nil
         let error = HostError.notRunning
         for (_, waiter) in pending { waiter.resume(throwing: error) }
         pending.removeAll()
