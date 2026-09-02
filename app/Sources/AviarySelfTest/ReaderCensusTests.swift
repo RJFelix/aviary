@@ -64,7 +64,8 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertNil(flock.nodes[0].name, "fixture omits a display name; Flock must not invent one")
     XCTAssertEqual(flock.nodes[0].source.eventID, "w19")
     XCTAssertEqual(report.registeredConsumers, [
-        "canonical SessionCatalog projection", "canonical Flock adapter",
+        "production local Timeline catalog", "canonical SessionCatalog projection",
+        "canonical Flock adapter",
     ])
     XCTAssertTrue(report.assemblerReady)
     XCTAssertEqual(report.visibleMessageIDs, ["s6", "s7", "s10", "s11"])
@@ -118,7 +119,8 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(report.unknownReferences.count, 1)
     XCTAssertEqual(report.unknownReferences[0].eventID, "missing-activity")
     XCTAssertEqual(report.intentionallyUnwiredConsumers, [
-        "legacy SessionCatalog scanner (native timeline consumer pending)", "Flock UI (canonical projection adoption pending)", "notifications", "search", "service recovery",
+        "Flock UI (canonical projection adoption pending)", "notifications", "search",
+        "service recovery",
     ])
 
     let workEvents = ReaderCensus.read(

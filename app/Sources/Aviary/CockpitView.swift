@@ -216,6 +216,8 @@ struct SessionRow: View {
     private var canonicalIsProven: Bool {
         canonical?.sessionStructuralIntegrityValid == true
             && canonical?.sessionSemanticProjectionValid == true
+            && canonical?.unknownDomains.contains(.session) == false
+            && canonical?.unknownDomains.contains(.work) == false
     }
 
     private var projectedLive: Bool? {
@@ -238,6 +240,15 @@ struct SessionRow: View {
     private var rowTitle: String {
         if let title = canonical?.title, !title.isEmpty { return title }
         return session.title
+    }
+
+    private var rowModel: String? {
+        guard let canonical else { return session.model }
+        guard canonicalIsProven else {
+            return canonical.sessionSemanticProjectionValid ? nil : session.model
+        }
+        return canonical.sessionModelID
+            ?? (canonical.modelIDs.count == 1 ? canonical.modelIDs.first : nil)
     }
 
     var body: some View {
@@ -286,7 +297,7 @@ struct SessionRow: View {
 
                 if !compact {
                     HStack(spacing: 5) {
-                        if let m = session.model {
+                        if let m = rowModel {
                             Chip(text: m, symbol: "cpu", tint: Design.assistant)
                         }
                         if !session.isCanonicalOnly, session.counts.toolCalls > 0 {

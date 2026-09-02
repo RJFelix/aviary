@@ -114,7 +114,6 @@ func test_duplicateProjectionIDsAreReportedWithoutTrapping() throws {
     let second = LegacySessionCatalogAdapter.project(summary: secondSummary, authorityID: "host-b")
     let index = SessionCatalogProjectionIndex(entries: [first, second])
     XCTAssertEqual(index.duplicateIDs, ["duplicate"])
-    XCTAssertEqual(index.canonicalByID.count, 1)
-    XCTAssertEqual(index.displaySummaries.map(\.id), ["duplicate"])
-    XCTAssertEqual(index.displaySummaries.first?.title, "Duplicate")
+    XCTAssertTrue(index.canonicalByID.isEmpty)
+    XCTAssertTrue(index.displaySummaries.isEmpty)
 }

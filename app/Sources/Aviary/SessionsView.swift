@@ -199,8 +199,8 @@ struct SessionsView: View {
                 }
                 .disabled(containsLive || model.isTrashingSessions)
                 if containsLive {
-                    Text("Native canonical rows are observe-only; deselect them and any live "
-                        + "sessions before moving legacy transcripts to the Trash.")
+                    Text("Native canonical rows are observe-only; deselect them and any session "
+                        + "with active or uncertain Work before moving transcripts to the Trash.")
                 }
             } label: {
                 Label("Actions", systemImage: "ellipsis.circle")
@@ -233,7 +233,9 @@ struct SessionsView: View {
                     return session.isLive
                 }
                 guard canonical.sessionStructuralIntegrityValid,
-                      canonical.sessionSemanticProjectionValid
+                      canonical.sessionSemanticProjectionValid,
+                      !canonical.unknownDomains.contains(.session),
+                      !canonical.unknownDomains.contains(.work)
                 else { return false }
                 return canonical.work.contains {
                     $0.canProjectExecution && $0.lifecycle == .active
@@ -512,6 +514,11 @@ struct SessionInspector: View {
                     } else {
                         sessionCard(s)
                         usageCard(s)
+                        if let canonical = model.canonicalCatalogProjections[s.id],
+                           canonical.sessionStructuralIntegrityValid,
+                           canonical.sessionSemanticProjectionValid {
+                            canonicalSessionCard(canonical)
+                        }
                     }
                 }
                 if let t = model.transcript {
@@ -751,13 +758,23 @@ struct SessionInspector: View {
                 DetailRow(label: "Attention", value: c.effectiveAttention?.rawValue ?? "unknown")
                 DetailRow(label: "Model", value: c.modelIDs.isEmpty
                           ? "unknown" : c.modelIDs.joined(separator: ", "))
+                if !c.unknownDomains.isEmpty {
+                    DetailRow(
+                        label: "Unknown domains",
+                        value: c.unknownDomains.map(\.rawValue).joined(separator: ", "),
+                        tint: Design.warning)
+                }
                 Divider().opacity(0.5)
                 Text("Work projection")
                     .font(.system(size: 11, weight: .semibold))
                 if c.work.isEmpty {
+                    let attachmentsKnown = !c.unknownDomains.contains(.session)
+                        && !c.unknownDomains.contains(.work)
                     DetailRow(label: "Status", value: c.sessionSemanticProjectionValid
-                              ? "no attached Work" : "unknown (legacy semantics)")
+                              && attachmentsKnown
+                              ? "no attached Work" : "unknown (projection incomplete)")
                     DetailRow(label: "Liveness", value: c.sessionSemanticProjectionValid
+                              && attachmentsKnown
                               ? "not running" : "unknown")
                 } else {
                     let exact = c.work.filter(\.canProjectExecution)

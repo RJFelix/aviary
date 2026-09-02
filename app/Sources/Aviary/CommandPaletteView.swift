@@ -161,6 +161,8 @@ struct CommandPaletteView: View {
                 let canonical = model.canonicalCatalogProjections[s.id]
                 let canonicalProven = canonical?.sessionStructuralIntegrityValid == true
                     && canonical?.sessionSemanticProjectionValid == true
+                    && canonical?.unknownDomains.contains(.session) == false
+                    && canonical?.unknownDomains.contains(.work) == false
                 let projectedLive: Bool? = {
                     guard let canonical else { return s.isLive }
                     guard canonicalProven else { return nil }

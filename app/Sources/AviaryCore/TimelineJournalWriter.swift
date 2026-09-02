@@ -268,6 +268,22 @@ public actor TimelineJournalWriter {
         self.failurePlan = failurePlan
     }
 
+    /// Run a synchronous owner-side operation under the same cross-process advisory lock used by
+    /// Timeline writers. This is for short catalog mutations such as moving a legacy companion to
+    /// Trash: the caller can revalidate native truth and complete the move without a cooperating
+    /// writer entering between check and action. It is not a remote lease protocol.
+    public static func withAdvisoryOwnerLock<T>(
+        home: AgentHome,
+        journal: JournalRef,
+        dataURL: URL,
+        _ operation: () throws -> T
+    ) throws -> T {
+        let lock = try openLock(
+            at: home.timelineV2JournalLockURL(for: journal), reporting: dataURL)
+        defer { try? lock.close() }
+        return try operation()
+    }
+
     public static func createFresh(
         at fileURL: URL,
         journal: JournalRef,

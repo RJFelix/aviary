@@ -6343,6 +6343,9 @@ let casesPhase1Timeline: [Case] = [
     ("phase1 catalog: attached Work identity must agree across projections", {
         try test_canonicalSessionCatalogRequiresAllAttachedWorkIdentitiesToAgree()
     }),
+    ("phase1 catalog: unknown Session domains suppress affected facts", {
+        try test_canonicalSessionCatalogSuppressesUnknownSessionAndAttachmentDomains()
+    }),
     ("phase1 catalog: read integrity requires an exact canonical Work read", {
         try test_canonicalSessionCatalogOnlyReportsExactCanonicalWorkReads()
     }),
@@ -6354,6 +6357,54 @@ let casesPhase1Timeline: [Case] = [
     }),
     ("phase1 catalog: authority qualifies identity and rejects owner mismatch", {
         try test_canonicalSessionCatalogQualifiesSessionIDsAndRejectsOwnerMismatch()
+    }),
+    ("phase1 catalog: companion keeps one legacy-backed display row", {
+        try test_companionProjectionIsOneLegacyBackedDisplayRow()
+    }),
+    ("phase1 catalog: companion title falls back to legacy", {
+        try test_companionTitleFallsBackToLegacyWhenCanonicalIsEmpty()
+    }),
+    ("phase1 catalog: companion keeps canonical and legacy facts separate", {
+        try test_companionKeepsCanonicalFactsSeparateFromHealthierLegacyFacts()
+    }),
+    ("phase1 catalog: unknown companion Session facts stay unknown", {
+        try test_companionUnknownSessionDomainDoesNotRefillFactsFromLegacy()
+    }),
+    ("phase1 catalog: companion index maps display identity to canonical truth", {
+        try test_companionIndexHasOneRowAndMapsLegacyIDToCanonicalSummary()
+    }),
+    ("phase1 catalog: companion refuses mismatched Session identities", {
+        try test_companionFactoryRefusesMismatchedSessionIDs()
+    }),
+    ("phase1 catalog: pure canonical and legacy projections remain compatible", {
+        try test_pureCanonicalAndLegacyProjectionBehaviorRemainsUnchanged()
+    }),
+    ("phase1 catalog: companion duplicates remain explicit and non-trapping", {
+        try test_companionAndDuplicateRowsRemainExplicitAndNonTrapping()
+    }),
+    ("phase1 catalog: native and legacy stores join into one companion", {
+        try await test_sessionCatalogScanCatalogJoinsNativeAndLegacyIntoOneCompanion()
+    }),
+    ("phase1 catalog: native-only Session remains observe-only", {
+        try await test_sessionCatalogScanCatalogRetainsNativeOnlyRowsAsCanonicalOnly()
+    }),
+    ("phase1 catalog: legacy-only Session behavior remains unchanged", {
+        try await test_sessionCatalogScanCatalogLeavesLegacyOnlyRowsUnchanged()
+    }),
+    ("phase1 catalog: independent Work survives without a Session", {
+        try await test_sessionCatalogScanCatalogKeepsIndependentWorkWithoutSession()
+    }),
+    ("phase1 catalog: unknown native Session remains visible with facts suppressed", {
+        try await test_sessionCatalogScanCatalogKeepsUnknownSessionVisibleButSuppressesItsFacts()
+    }),
+    ("phase1 catalog: conflicting native authority cannot form a companion", {
+        try await test_sessionCatalogScanCatalogDoesNotPairConflictingNativeAuthority()
+    }),
+    ("phase1 catalog: corrupt native tail cannot replace healthy legacy", {
+        try await test_sessionCatalogScanCatalogCorruptNativeTailCannotReplaceHealthyLegacy()
+    }),
+    ("phase1 catalog: Trash shares the native Session owner lock", {
+        try await test_sessionCatalogTrashSharesTheNativeSessionOwnerLock()
     }),
     ("phase1 census: canonical SessionCatalog projection is registered", {
         try test_readerCensusRegistersCanonicalSessionCatalogProjection()
@@ -6504,6 +6555,54 @@ let casesNativeColdResume: [Case] = [
     }),
 ]
 
+let casesLocalTimelineCatalog: [Case] = [
+    ("phase1 local catalog: discovers native Session and independent Work", {
+        try test_localTimelineCatalogDiscoversNativeSessionAndIndependentWork()
+    }),
+    ("phase1 local catalog: preserves active Work across absent or stale Session cursor", {
+        try test_localTimelineCatalogKeepsActiveWorkWhenSessionCursorIsAbsentOrStale()
+    }),
+    ("phase1 local catalog: rejects owner authority and locator mismatches", {
+        try test_localTimelineCatalogRejectsOwnerAuthorityAndLocatorMismatches()
+    }),
+    ("phase1 local catalog: retains truncated and corrupt files", {
+        try test_localTimelineCatalogKeepsTruncatedAndCorruptFilesVisible()
+    }),
+    ("phase1 local catalog: tailed Session remains visible but non-projectable", {
+        try test_localTimelineCatalogKeepsTailedSessionVisibleButNonProjectable()
+    }),
+    ("phase1 local catalog: unterminated first event remains visible as tail", {
+        try test_localTimelineCatalogClassifiesUnterminatedFirstEventAsTail()
+    }),
+    ("phase1 local catalog: malformed native Session blocks legacy actions", {
+        try test_localTimelineCatalogBlocksMalformedNativeSessionAtLegacyActionBoundary()
+    }),
+    ("phase1 local catalog: unknown domains suppress affected Work facts", {
+        try test_localTimelineCatalogSuppressesFactsInUnknownDeclaredDomains()
+    }),
+    ("phase1 local catalog: unreadable catalog directories are diagnosed", {
+        try test_localTimelineCatalogReportsUnreadableCatalogDirectories()
+    }),
+    ("phase1 local catalog: rejects symlink escapes", {
+        try test_localTimelineCatalogRejectsSymlinkEscapes()
+    }),
+    ("phase1 local catalog: symlinked home roots cannot establish authority", {
+        try test_localTimelineCatalogRejectsSymlinkedHomeRootAuthority()
+    }),
+    ("phase1 local catalog: reports duplicate event identity without trapping", {
+        try test_localTimelineCatalogReportsDuplicateEventIdentityWithoutTrapping()
+    }),
+    ("phase1 local catalog: round trips unsafe encoded Work IDs", {
+        try test_localTimelineCatalogRoundTripsUnsafeEncodedWorkIDs()
+    }),
+    ("phase1 local catalog: Work row IDs are injective across slash boundaries", {
+        try test_localTimelineCatalogWorkRowIDsAreInjectiveAcrossSlashBoundaries()
+    }),
+    ("phase1 local catalog: ordering bounds and metadata are deterministic", {
+        try test_localTimelineCatalogOrderingBoundsAndMetadataAreDeterministic()
+    }),
+]
+
 let casesTimelineWriter: [Case] = [
     ("phase1 writer: fresh appendBatch bytes, reducer, and reopen", {
         try await test_timelineJournalWriterFreshBatchReopenAndReducer()
@@ -6594,7 +6693,7 @@ await Harness.run(
         + casesBackgroundSpawn + casesWebSearch + casesDispatched
         + casesCrossingLaws + casesPhase0SessionControl + casesPhase1Timeline
         + casesContextManifest + casesPromptProvenance + casesNativeColdResume
-        + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
+        + casesLocalTimelineCatalog + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal
         + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel
         + casesNativeIndeterminateEffects + casesChildLifecycle

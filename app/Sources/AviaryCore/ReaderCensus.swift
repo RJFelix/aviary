@@ -587,12 +587,12 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
 /// locations are not part of the protocol and must not leak into a report.
 public enum ReaderCensus {
     private static let defaultIntentionallyUnwiredConsumers = [
-        "legacy SessionCatalog scanner (native timeline consumer pending)",
         "Flock UI (canonical projection adoption pending)", "notifications", "search",
         "service recovery",
     ]
     private static let defaultRegisteredConsumers = [
-        "canonical SessionCatalog projection", "canonical Flock adapter",
+        "production local Timeline catalog", "canonical SessionCatalog projection",
+        "canonical Flock adapter",
     ]
     public static func read(
         _ data: Data,
@@ -667,7 +667,8 @@ public enum ReaderCensus {
         sessionJournal: JournalRef,
         workJournal: JournalRef,
         registeredConsumers: [String] = [
-            "canonical SessionCatalog projection", "canonical Flock adapter",
+            "production local Timeline catalog", "canonical SessionCatalog projection",
+            "canonical Flock adapter",
         ],
         intentionallyUnwiredConsumers: [String] = []
     ) -> ReaderCensusReport {

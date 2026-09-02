@@ -39,6 +39,8 @@ public struct CanonicalWorkCatalogSummary: Codable, Hashable, Sendable, Identifi
     public let cursorAlignment: CursorAlignment
     public let workReadAlignment: WorkReadAlignment
     public let isAttached: Bool
+    /// False when an unknown Session-journal event may have changed attachment semantics.
+    public let attachmentProjectionKnown: Bool
     public let isAvailable: Bool
     public let lifecycle: WorkLifecycle
     public let execution: WorkExecution
@@ -71,13 +73,16 @@ public struct CanonicalWorkCatalogSummary: Codable, Hashable, Sendable, Identifi
     public var canProjectExecution: Bool {
         isAttached && cursorAlignment == .exact
             && structuralIntegrityValid && semanticProjectionValid
+            && !unknownDomains.contains(.work)
+            && attachmentProjectionKnown && journalIntegrityValid == true
     }
 
     fileprivate init(
         attachment: SessionAttachmentSnapshot,
         work: WorkSnapshot?,
         cursor: JournalCursor?,
-        workRead: TimelineJournalReadResult?
+        workRead: TimelineJournalReadResult?,
+        attachmentProjectionKnown: Bool
     ) {
         self.attachment = attachment.attachment
         self.work = attachment.work
@@ -104,23 +109,35 @@ public struct CanonicalWorkCatalogSummary: Codable, Hashable, Sendable, Identifi
             workRead: workRead,
             workReadIsCanonical: Self.workReadIsCanonical(workRead, for: trustedWork))
         self.isAttached = attachment.isAttached
+        self.attachmentProjectionKnown = attachmentProjectionKnown
         self.isAvailable = trustedWork != nil
         let aligned = self.cursorAlignment == .exact
         self.structuralIntegrityValid = trustedWork?.structuralIntegrityValid ?? false
         self.semanticProjectionValid = trustedWork?.semanticProjectionValid ?? false
+        let workFactsKnown = trustedWork?.unknownDomains.contains(.work) == false
+        let suppliedReadIsUsable = workRead != nil && (
+            self.workReadAlignment == .exact
+                && workRead?.quarantinedSuffix == nil
+                && workRead?.truncatedTail == nil)
         let projectable = attachment.isAttached && aligned
             && self.structuralIntegrityValid && self.semanticProjectionValid
+            && workFactsKnown && suppliedReadIsUsable && attachmentProjectionKnown
         self.lifecycle = projectable ? (trustedWork?.lifecycle ?? .unknown) : .unknown
         self.execution = projectable ? (trustedWork?.execution ?? .unknown) : .unknown
         self.modelID = projectable ? trustedWork?.modelID : nil
         self.activeRun = projectable ? trustedWork?.activeRun : nil
         self.activeTurn = projectable ? trustedWork?.activeTurn : nil
-        self.outstandingActionIDs = projectable ? (trustedWork?.activeActionIDs.sorted() ?? []) : []
-        self.indeterminateActionIDs = projectable ? trustedWork?.actions.values
+        let actionFactsKnown = projectable
+            && trustedWork?.unknownDomains.contains(.externalEffects) == false
+        let runtimeFactsKnown = projectable
+            && trustedWork?.unknownDomains.contains(.runtime) == false
+        self.outstandingActionIDs = actionFactsKnown
+            ? (trustedWork?.activeActionIDs.sorted() ?? []) : []
+        self.indeterminateActionIDs = actionFactsKnown ? trustedWork?.actions.values
             .filter { $0.state == .indeterminateEffect }
             .map { $0.action.actionID }
             .sorted() ?? [] : []
-        self.outstandingHandleIDs = projectable ? trustedWork?.handles.values
+        self.outstandingHandleIDs = runtimeFactsKnown ? trustedWork?.handles.values
             .filter { !["succeeded", "failed", "canceled", "completed"].contains($0.state) }
             .map { $0.handle.handleID }
             .sorted() ?? [] : []
@@ -140,6 +157,9 @@ public struct CanonicalWorkCatalogSummary: Codable, Hashable, Sendable, Identifi
         var reasons = trustedWork?.corruptionReasons ?? []
         if work != nil && trustedWork == nil {
             reasons.append("Work snapshot identity does not match attachment, journal owner, or Work Host")
+        }
+        if !attachmentProjectionKnown {
+            reasons.append("Session attachment projection is affected by an unknown event domain")
         }
         if let workRead, !Self.workReadIsCanonical(workRead, for: trustedWork) {
             reasons.append("Work journal read contains a foreign or mismatched journal record")
@@ -331,6 +351,8 @@ public struct CanonicalSessionCatalogSummary: Codable, Hashable, Sendable, Ident
     public let visibleMessages: [SessionMessageSnapshot]
     public let contextInclusionIDs: [String]
     public let omittedContextIDs: [String]
+    /// The model selected by the Session journal itself, separate from models observed on Work.
+    public let sessionModelID: String?
     public let modelIDs: [String]
     public let childStates: [String: String]
     /// The cursor of the reducer snapshot. This is never inferred from a read result.
@@ -359,7 +381,8 @@ public struct CanonicalSessionCatalogSummary: Codable, Hashable, Sendable, Ident
         works: [WorkSnapshot],
         cursors: [String: JournalCursor],
         sessionRead: TimelineJournalReadResult?,
-        workReads: [JournalRef: TimelineJournalReadResult]
+        workReads: [JournalRef: TimelineJournalReadResult],
+        allowLegacyCompatibilityFacts: Bool = false
     ) {
         // SessionReducer establishes this identity from its journal. A missing identity is not a
         // valid canonical catalog row and is surfaced by the failable public adapter below.
@@ -371,15 +394,25 @@ public struct CanonicalSessionCatalogSummary: Codable, Hashable, Sendable, Ident
         guard case .session(let owner) = canonicalJournal.owner, owner == canonicalSession else {
             return nil
         }
+        // The legacy bridge has a deliberately tiny, explicitly mapped fact set. Preserve those
+        // title/model/lifecycle values for compatibility, but never let that exception project
+        // native attachments, context, attention, or execution truth.
+        let sessionFactsKnown = allowLegacyCompatibilityFacts
+            || !session.unknownDomains.contains(.session)
+        let attachmentFactsKnown = !allowLegacyCompatibilityFacts && sessionFactsKnown
+            && !session.unknownDomains.contains(.work)
+        let contextFactsKnown = !allowLegacyCompatibilityFacts && sessionFactsKnown
+            && !session.unknownDomains.contains(.context)
         self.id = canonicalJournal.stableKey
         let firstUser = session.messages.first(where: { $0.role == "user" })?.text ?? ""
         let flattenedTitle = firstUser.split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        self.title = String(flattenedTitle.prefix(120))
-        self.lifecycle = session.lifecycle
-        self.authoredAttention = session.attention
+        self.title = sessionFactsKnown ? String(flattenedTitle.prefix(120)) : ""
+        self.lifecycle = sessionFactsKnown ? session.lifecycle : .unknown
+        self.authoredAttention = sessionFactsKnown ? session.attention : .none
+        self.sessionModelID = sessionFactsKnown ? session.modelID : nil
         let orderedWorks = works.sorted { lhs, rhs in
             let lhsKey = lhs.journal?.stableKey ?? ""
             let rhsKey = rhs.journal?.stableKey ?? ""
@@ -391,7 +424,7 @@ public struct CanonicalSessionCatalogSummary: Codable, Hashable, Sendable, Ident
         // It remains visible below as an unavailable Work row, but cannot contribute effective
         // attention, model, child, or assembly-ready facts.
         let attachedWorkIDs = Set(session.attachments.values.compactMap {
-            $0.isAttached ? $0.work : nil
+            attachmentFactsKnown && $0.isAttached ? $0.work : nil
         })
         let trustedWorks = orderedWorks.filter { snapshot in
             guard let attachedWork = snapshot.work,
@@ -400,38 +433,17 @@ public struct CanonicalSessionCatalogSummary: Codable, Hashable, Sendable, Ident
             else { return false }
             return trusted.structuralIntegrityValid && trusted.semanticProjectionValid
         }
-        let projectableAttachmentIDs = Set(session.attachments.values.compactMap { attachment -> String? in
-            guard attachment.isAttached,
-                  let snapshot = trustedWorks.first(where: { $0.work == attachment.work }),
-                  let journal = snapshot.journal,
-                  let eventID = snapshot.lastEventID, snapshot.lastSequence > 0
-            else { return nil }
-            let observed = JournalCursor(
-                journal: journal, eventID: eventID, sequence: snapshot.lastSequence)
-            let requested = cursors[attachment.attachment.attachmentID] ?? attachment.cursor
-            guard requested == observed else { return nil }
-            return attachment.attachment.attachmentID
-        })
-        let assembly = session.structuralIntegrityValid && session.semanticProjectionValid
+        let assembly = sessionFactsKnown && attachmentFactsKnown
+            && session.structuralIntegrityValid && session.semanticProjectionValid
             ? SessionAssembler.assemble(session: session, works: trustedWorks, at: cursors)
             : nil
-        self.attention = session.attention
-        // A legacy adapter marks all semantic domains unknown. An empty attachment set is not
-        // evidence that no Work or attention exists, so do not project the assembler's default
-        // `.none` as an effective answer in that case.
-        let assemblyAttachedIDs = Set(session.attachments.values.filter(\.isAttached).map {
-            $0.attachment.attachmentID
-        })
-        let assemblyEligible = session.attachments.isEmpty
-            ? true : assemblyAttachedIDs == projectableAttachmentIDs
-        self.effectiveAttention = session.unknownDomains.isEmpty && assemblyEligible
-            ? assembly?.effectiveAttention : nil
-        self.activeTip = session.semanticTip
-        self.visibleMessages = session.messages
-        self.contextInclusionIDs = session.contextComponents
-            .filter { !$0.omitted && $0.mode != .omitted }.map(\.inclusionID)
-        self.omittedContextIDs = session.contextComponents
-            .filter { $0.omitted || $0.mode == .omitted }.map(\.inclusionID)
+        self.attention = sessionFactsKnown ? session.attention : .none
+        self.activeTip = sessionFactsKnown ? session.semanticTip : nil
+        self.visibleMessages = sessionFactsKnown ? session.messages : []
+        self.contextInclusionIDs = contextFactsKnown ? session.contextComponents
+            .filter { !$0.omitted && $0.mode != .omitted }.map(\.inclusionID) : []
+        self.omittedContextIDs = contextFactsKnown ? session.contextComponents
+            .filter { $0.omitted || $0.mode == .omitted }.map(\.inclusionID) : []
         let snapshotCursor: JournalCursor?
         if let eventID = session.lastEventID, session.lastSequence > 0 {
             snapshotCursor = JournalCursor(
@@ -524,16 +536,22 @@ public struct CanonicalSessionCatalogSummary: Codable, Hashable, Sendable, Ident
                 read = nil
             }
             return CanonicalWorkCatalogSummary(
-                attachment: attachment, work: suppliedSnapshot, cursor: cursor, workRead: read)
+                attachment: attachment, work: suppliedSnapshot, cursor: cursor, workRead: read,
+                attachmentProjectionKnown: attachmentFactsKnown)
         }
         self.work = workRows
         let attachedIDs = Set(session.attachments.values.filter(\.isAttached).map { $0.attachment.attachmentID })
         let projectableIDs = Set(workRows.filter(\.canProjectExecution).map { $0.attachment.attachmentID })
         self.assemblyReady = assembly != nil && attachedIDs.isSubset(of: projectableIDs)
+        // A legacy adapter marks all semantic domains unknown. An empty attachment set is not
+        // evidence that no Work or attention exists, so do not project the assembler's default
+        // `.none` as an effective answer in that case.
+        self.effectiveAttention = session.unknownDomains.isEmpty && self.assemblyReady
+            ? assembly?.effectiveAttention : nil
         let alignedWorks = workRows.filter(\.canProjectExecution)
-        self.modelIDs = Array(Set([session.modelID].compactMap { $0 }
+        self.modelIDs = Array(Set([self.sessionModelID].compactMap { $0 }
             + alignedWorks.compactMap(\.modelID))).sorted()
-        var alignedChildren = session.childStates
+        var alignedChildren = sessionFactsKnown ? session.childStates : [:]
         for row in alignedWorks {
             if let snapshot = trustedWorks.first(where: { $0.work == row.work }) {
                 alignedChildren.merge(snapshot.childStates) { _, workState in workState }
@@ -599,6 +617,18 @@ public enum SessionCatalogCanonicalAdapter {
 }
 
 public extension CanonicalSessionCatalogSummary {
+    /// Destructive or duplicate-start actions must fail closed when native attachment truth is
+    /// incomplete. Callers should use this only for structurally/semantically valid native rows;
+    /// legacy compatibility rows deliberately mark every domain unknown.
+    var hasOngoingOrUncertainAttachedWork: Bool {
+        if unknownDomains.contains(.session) || unknownDomains.contains(.work) {
+            return true
+        }
+        return work.contains {
+            $0.isAttached && (!$0.canProjectExecution || $0.lifecycle == .active)
+        }
+    }
+
     /// Build the bounded compatibility projection used while the catalog still reads legacy
     /// transcripts. This is an explicit mapping of the scanner's title/model/lifecycle facts,
     /// not semantic parity with a native Session journal: context, Work, runtime, and external
@@ -633,7 +663,8 @@ public extension CanonicalSessionCatalogSummary {
             "legacy SessionSummary mapped; native Session/Work semantics unavailable"
         ]
         return CanonicalSessionCatalogSummary(
-            session: snapshot, works: [], cursors: [:], sessionRead: nil, workReads: [:])!
+            session: snapshot, works: [], cursors: [:], sessionRead: nil, workReads: [:],
+            allowLegacyCompatibilityFacts: true)!
     }
 }
 

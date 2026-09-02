@@ -86,6 +86,31 @@ public struct SessionTrashResult: Sendable {
     }
 }
 
+/// One production catalog refresh across the legacy transcript compatibility store and the
+/// native Timeline journals. Session rows are joined only by an unambiguous local Session id;
+/// Work remains an independent inventory because a Work Host can outlive or serve many GUIs.
+public struct SessionCatalogScanResult: Sendable {
+    public let entries: [SessionCatalogProjection]
+    public let workInventory: [LocalTimelineCatalog.WorkRow]
+    public let diagnostics: [LocalTimelineCatalog.Diagnostic]
+    /// Local legacy Session ids whose native journal cannot prove attachment/liveness truth.
+    /// Transcript actions must fail closed for these ids even when no canonical companion could
+    /// be constructed from the corrupt or ambiguous native record.
+    public let nativeActionBlockedSessionIDs: Set<String>
+
+    public init(
+        entries: [SessionCatalogProjection],
+        workInventory: [LocalTimelineCatalog.WorkRow],
+        diagnostics: [LocalTimelineCatalog.Diagnostic],
+        nativeActionBlockedSessionIDs: Set<String> = []
+    ) {
+        self.entries = entries
+        self.workInventory = workInventory
+        self.diagnostics = diagnostics
+        self.nativeActionBlockedSessionIDs = nativeActionBlockedSessionIDs
+    }
+}
+
 /// Scans and caches the session catalog.
 ///
 /// Reimplemented natively rather than shelling out to the harness's catalog process: the
@@ -188,15 +213,65 @@ public actor SessionCatalog {
 
     /// Read catalog entries through the canonical projection boundary.
     ///
-    /// The current store has no native Session journal to read, so every returned row is an
-    /// explicit legacy adapter projection. Keeping this API separate from `scan()` prevents a
-    /// future native row from being silently flattened into a filename-only `SessionSummary`.
+    /// Native Timeline rows supply lifecycle/model/attention/Work truth. A same-id legacy
+    /// transcript remains the compatibility identity for transcript and artifact actions, but
+    /// never supplies missing native facts. Native-only sessions are observe-only, and Work is
+    /// returned independently rather than hidden behind whichever Session happens to be open.
+    public func scanCatalog(
+        progress: (@Sendable (Int, Int) -> Void)? = nil
+    ) -> SessionCatalogScanResult {
+        let legacy = scan(progress: progress)
+        let native = LocalTimelineCatalog.scan(home: home)
+        let nativeByLocalSessionID = Dictionary(grouping: native.sessionSummaries) {
+            $0.session.sessionID
+        }
+        var actionBlockedSessionIDs = Set(native.sessions.compactMap { row -> String? in
+            guard row.summary == nil, let journal = row.journal,
+                  case .session(let session) = journal.owner
+            else { return nil }
+            return session.sessionID
+        })
+        for (sessionID, candidates) in nativeByLocalSessionID where candidates.count > 1 {
+            actionBlockedSessionIDs.insert(sessionID)
+        }
+        var matchedCanonicalIDs = Set<String>()
+        var diagnostics = native.diagnostics
+        var entries: [SessionCatalogProjection] = []
+        entries.reserveCapacity(legacy.count + native.sessionSummaries.count)
+
+        for summary in legacy {
+            let candidates = nativeByLocalSessionID[summary.id] ?? []
+            if candidates.count == 1, let canonical = candidates.first,
+               let companion = SessionCatalogProjection.companion(
+                   canonical: canonical, legacySummary: summary)
+            {
+                entries.append(companion)
+                matchedCanonicalIDs.insert(canonical.id)
+            } else {
+                entries.append(LegacySessionCatalogAdapter.project(
+                    summary: summary, authorityID: home.workHostID))
+                if candidates.count > 1 {
+                    diagnostics.append(LocalTimelineCatalog.Diagnostic(
+                        kind: "ambiguous_session_companion",
+                        message: "Session \(summary.id) has \(candidates.count) native authorities; legacy companion was not paired"))
+                }
+            }
+        }
+
+        entries.append(contentsOf: native.sessionSummaries
+            .filter { !matchedCanonicalIDs.contains($0.id) }
+            .sorted { $0.id < $1.id }
+            .map(SessionCatalogProjection.canonical))
+        return SessionCatalogScanResult(
+            entries: entries, workInventory: native.works, diagnostics: diagnostics,
+            nativeActionBlockedSessionIDs: actionBlockedSessionIDs)
+    }
+
+    /// Compatibility spelling retained for existing callers that need only Session entries.
     public func scanEntries(
         progress: (@Sendable (Int, Int) -> Void)? = nil
     ) -> [SessionCatalogProjection] {
-        scan(progress: progress).map {
-            LegacySessionCatalogAdapter.project(summary: $0, authorityID: home.workHostID)
-        }
+        scanCatalog(progress: progress).entries
     }
 
     /// Convert the typed boundary into rows the current list can render. Native canonical rows
@@ -329,13 +404,34 @@ public actor SessionCatalog {
     // MARK: Delete
 
     /// Move a session (and its artifacts) to the Trash. Never an unlink: transcripts are
-    /// the only record of work an agent did.
+    /// the only record of work an agent did. The native Session owner lock spans the fresh
+    /// liveness read and transcript move, so a cooperating Work Host cannot enter between them.
     public func trash(session: SessionSummary) throws -> String? {
         guard let fileURL = session.fileURL else {
             throw NSError(domain: "AviarySessionCatalog", code: 1,
                           userInfo: [NSLocalizedDescriptionKey:
                             "This canonical session has no legacy transcript to move."])
         }
+        let nativeSession = SessionRef(session.id)
+        let nativeJournal = JournalRef.session(
+            nativeSession, authority: TimelineAuthorityRef(home.workHostID))
+        return try TimelineJournalWriter.withAdvisoryOwnerLock(
+            home: home, journal: nativeJournal,
+            dataURL: home.timelineV2SessionJournalURL(nativeSession)
+        ) {
+            guard !LocalTimelineCatalog.blocksLegacyAction(
+                home: home, sessionID: session.id)
+            else {
+                throw NSError(
+                    domain: "AviarySessionCatalog", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "Native Work is active or its state cannot be proven; the transcript was not moved."])
+            }
+            return try trashUnlocked(session: session, fileURL: fileURL)
+        }
+    }
+
+    private func trashUnlocked(session: SessionSummary, fileURL: URL) throws -> String? {
         try trashItem(fileURL)
         var partialFailures: [String] = []
         let artifacts = home.artifacts(forSession: session.id)

@@ -93,9 +93,18 @@ final class AppModel {
     /// stem, while native rows use their authority-qualified id; artifact, kernel, and live-run
     /// joins still use the separate local compatibility identity until native journals land.
     var canonicalCatalogProjections: [String: CanonicalSessionCatalogSummary] = [:]
-    /// Projection ids reported more than once in one catalog refresh. Keep the first stable row
-    /// for display and surface the conflict instead of trapping or silently replacing it.
+    /// Projection ids reported more than once in one catalog refresh. Conflicting rows are
+    /// withheld from display and lookup rather than selecting an arbitrary authority.
     var canonicalCatalogProjectionConflicts: [String] = []
+    /// Work is inventoried independently of Session rows so a live or completed Work Host can
+    /// remain observable before any GUI attaches, and so future GUIs do not need to manufacture
+    /// Work state from their own in-memory runs.
+    var canonicalWorkInventory: [LocalTimelineCatalog.WorkRow] = []
+    var nativeTimelineCatalogDiagnostics: [LocalTimelineCatalog.Diagnostic] = []
+    /// Native Session journals that exist but cannot prove attachment/liveness truth. This is
+    /// separate from canonical projections because invalid native rows are intentionally absent
+    /// from that fact map while still needing to block destructive or duplicate-start actions.
+    var nativeActionBlockedSessionIDs: Set<String> = []
     var isScanning = false
     var scanProgress: (done: Int, total: Int) = (0, 0)
     var catalogError: String?
@@ -434,15 +443,28 @@ final class AppModel {
     func refreshCatalog() async {
         guard let catalog else { return }
         isScanning = true
-        let entries = await catalog.scanEntries { [weak self] done, total in
+        let result = await catalog.scanCatalog { [weak self] done, total in
             Task { @MainActor in self?.scanProgress = (done, total) }
         }
-        let projectionIndex = SessionCatalogProjectionIndex(entries: entries)
+        let projectionIndex = SessionCatalogProjectionIndex(entries: result.entries)
         canonicalCatalogProjections = projectionIndex.canonicalByID
         canonicalCatalogProjectionConflicts = projectionIndex.duplicateIDs
-        catalogError = projectionIndex.duplicateIDs.isEmpty
-            ? nil
-            : "Duplicate canonical catalog ids: " + projectionIndex.duplicateIDs.joined(separator: ", ")
+        canonicalWorkInventory = result.workInventory
+        nativeTimelineCatalogDiagnostics = result.diagnostics
+        nativeActionBlockedSessionIDs = result.nativeActionBlockedSessionIDs
+        var catalogIssues: [String] = []
+        if !projectionIndex.duplicateIDs.isEmpty {
+            catalogIssues.append(
+                "Duplicate canonical catalog ids: "
+                    + projectionIndex.duplicateIDs.joined(separator: ", "))
+        }
+        if !result.diagnostics.isEmpty {
+            let kinds = Array(Set(result.diagnostics.map(\.kind))).sorted()
+            catalogIssues.append(
+                "Native Timeline catalog: \(result.diagnostics.count) issue(s)"
+                    + (kinds.isEmpty ? "" : " (\(kinds.joined(separator: ", ")))"))
+        }
+        catalogError = catalogIssues.isEmpty ? nil : catalogIssues.joined(separator: "; ")
         // The index owns first-seen identity deduplication. Feeding all adapted entries directly
         // to the list would give SwiftUI duplicate tags and make selection nondeterministic.
         let found = projectionIndex.displaySummaries
@@ -789,13 +811,28 @@ final class AppModel {
         sessions.filter { selectedSessionIDs.contains($0.id) }
     }
 
-    /// Authoritative in-process liveness at an action boundary. Catalog annotations refresh
-    /// on a timer and can lag a newly allocated Work identity by several seconds.
+    /// Fail-closed liveness at an action boundary. In-process identity closes the refresh race;
+    /// canonical attachments cover Work owned by another GUI/process and treat an unprojectable
+    /// attached Work as uncertain rather than terminal.
     func hasLiveWork(forSession sessionID: String) -> Bool {
-        workRuns.contains {
+        let inProcess = workRuns.contains {
             !$0.hasExited
                 && ($0.config.identity?.sessionID == sessionID || $0.sessionID == sessionID)
         }
+        if inProcess { return true }
+        if nativeActionBlockedSessionIDs.contains(sessionID) { return true }
+        guard let canonical = canonicalCatalogProjections[sessionID],
+              canonical.sessionStructuralIntegrityValid,
+              canonical.sessionSemanticProjectionValid
+        else { return false }
+        return canonical.hasOngoingOrUncertainAttachedWork
+    }
+
+    /// Revalidate the native locator at the user action boundary. Rendering uses the cached
+    /// projection above; Continue/Trash must account for appends by another process since then.
+    private func nativeActionIsBlocked(forSession sessionID: String) -> Bool {
+        hasLiveWork(forSession: sessionID)
+            || LocalTimelineCatalog.blocksLegacyAction(home: home, sessionID: sessionID)
     }
 
     /// Batch deletion deliberately shares the single-item Trash path. It moves each transcript
@@ -806,7 +843,7 @@ final class AppModel {
         let targets = selectedSessions
         guard !targets.isEmpty else { return }
         guard !targets.contains(where: {
-            $0.isCanonicalOnly || $0.isLive || hasLiveWork(forSession: $0.id)
+            $0.isCanonicalOnly || $0.isLive || nativeActionIsBlocked(forSession: $0.id)
         }) else {
             show(
                 "Native canonical rows are observe-only here; stop or deselect live sessions "
@@ -1021,6 +1058,13 @@ final class AppModel {
             return
         }
         if let resume, focusExistingWork(forSession: resume) { return }
+        if let resume, nativeActionIsBlocked(forSession: resume) {
+            show(
+                "That session has active or uncertain Work on a Work Host. Attach to it or wait "
+                    + "for a proven terminal state before starting another writer.",
+                isError: true)
+            return
+        }
         guard
             let (providerSpec, model) = AgentCLI.resolve(
             [providerID, modelID].compactMap { $0 }.joined(separator: "/"),
@@ -1128,6 +1172,14 @@ final class AppModel {
                           isError: true)
             return
         }
+        if focusExistingWork(forSession: s.id) { return }
+        if nativeActionIsBlocked(forSession: s.id) {
+            toast = Toast(
+                message: "This session has active or uncertain Work on a Work Host. Attach to "
+                    + "that Work or wait for a proven terminal state before continuing.",
+                isError: true)
+            return
+        }
         let cwd = s.cwd.isEmpty ? defaultCwd : s.cwd
         if engineChoice == .claudeCode {
             // Claude Code holds its own history and will not accept a prepared one, so
@@ -1141,10 +1193,9 @@ final class AppModel {
                 cwd: cwd, model: claudeCodeModel, effort: nil, prompt: "", title: s.title)
             return
         }
-        // Catalog liveness is refreshed on a timer. Consult Work identity at admission too,
-        // including the window before the driver publishes its session event, so a rapid
-        // double-Continue cannot create two writers for one resumed journal.
-        if focusExistingWork(forSession: s.id) { return }
+        // Re-read native Work identity at admission, including the window before this driver
+        // publishes its session event. The native bundle's writer lock remains the final guard
+        // against a cross-process race after this bounded observation.
         toast = Toast(
             message: "Conversation history and Work identity will resume in a new Python "
                 + "runtime. The prior interpreter namespace is not restored.",

@@ -116,7 +116,8 @@ func test_canonicalSessionCatalogPreservesAttachedWorkIdentityAndTruth() throws 
         session: session, works: [work, unrelated], cursors: [
             attachment.attachmentID: JournalCursor(
                 journal: canonicalWorkJournal, eventID: "w3", sequence: 3)
-        ]))
+        ], workReads: [canonicalWorkJournal: catalogWorkRead(
+            journal: canonicalWorkJournal, points: [("w1", 1), ("w2", 2), ("w3", 3)])]))
     XCTAssertEqual(summary.id, canonicalSessionJournal.stableKey)
     XCTAssertEqual(summary.journal, canonicalSessionJournal)
     XCTAssertTrue(summary.assemblyReady)
@@ -127,8 +128,8 @@ func test_canonicalSessionCatalogPreservesAttachedWorkIdentityAndTruth() throws 
     XCTAssertEqual(summary.work[0].workHost, WorkHostRef("catalog-host"))
     XCTAssertEqual(summary.work[0].journal, canonicalWorkJournal)
     XCTAssertEqual(summary.work[0].outstandingActionIDs, ["action-1"])
-    XCTAssertEqual(summary.work[0].journalIntegrityValid, nil)
-    XCTAssertEqual(summary.work[0].tailBytes, nil)
+    XCTAssertEqual(summary.work[0].journalIntegrityValid, true)
+    XCTAssertEqual(summary.work[0].tailBytes, 0)
     XCTAssertEqual(summary.sessionIntegrityValid, nil)
     XCTAssertEqual(summary.sessionTailBytes, nil)
     XCTAssertEqual(summary.modelIDs, ["session-model", "work-model"])
@@ -373,6 +374,66 @@ func test_canonicalSessionCatalogRequiresAllAttachedWorkIdentitiesToAgree() thro
     }
 }
 
+func test_canonicalSessionCatalogSuppressesUnknownSessionAndAttachmentDomains() throws {
+    let attachment = SessionAttachmentRef("unknown-domain-attachment")
+    let cursor = JournalCursor(
+        journal: canonicalWorkJournal, eventID: "w1", sequence: 1)
+    var session = SessionSnapshot()
+    session.session = canonicalSession
+    session.journal = canonicalSessionJournal
+    session.lifecycle = .completed
+    session.attention = .review
+    session.modelID = "session-before-unknown"
+    session.messages = [SessionMessageSnapshot(
+        eventID: "message-before-unknown", role: "user", text: "stale title")]
+    session.attachments[attachment.attachmentID] = SessionAttachmentSnapshot(
+        attachment: attachment, work: canonicalWork, cursor: cursor)
+    var work = WorkSnapshot()
+    work.journal = canonicalWorkJournal
+    work.work = canonicalWork
+    work.workHost = WorkHostRef(canonicalWork.workHostID)
+    work.lifecycle = .active
+    work.execution = .running
+    work.modelID = "work-before-unknown"
+    work.lastEventID = "w1"
+    work.lastSequence = 1
+    work.eventSequences = ["w1": 1]
+    let read = catalogWorkRead(journal: canonicalWorkJournal, points: [("w1", 1)])
+
+    var unknownSession = session
+    unknownSession.unknownDomains = [.session]
+    let sessionUnknown = try XCTUnwrap(SessionCatalog.summarizeCanonical(
+        session: unknownSession, works: [work],
+        cursors: [attachment.attachmentID: cursor],
+        workReads: [canonicalWorkJournal: read]))
+    XCTAssertEqual(sessionUnknown.title, "")
+    XCTAssertEqual(sessionUnknown.lifecycle, .unknown)
+    XCTAssertEqual(sessionUnknown.attention, .none)
+    XCTAssertNil(sessionUnknown.effectiveAttention)
+    XCTAssertTrue(sessionUnknown.visibleMessages.isEmpty)
+    XCTAssertNil(sessionUnknown.sessionModelID)
+    XCTAssertTrue(sessionUnknown.modelIDs.isEmpty)
+    XCTAssertFalse(sessionUnknown.work[0].attachmentProjectionKnown)
+    XCTAssertFalse(sessionUnknown.work[0].canProjectExecution)
+    XCTAssertFalse(sessionUnknown.assemblyReady)
+    XCTAssertTrue(sessionUnknown.hasOngoingOrUncertainAttachedWork)
+
+    var unknownAttachment = session
+    unknownAttachment.unknownDomains = [.work]
+    let attachmentUnknown = try XCTUnwrap(SessionCatalog.summarizeCanonical(
+        session: unknownAttachment, works: [work],
+        cursors: [attachment.attachmentID: cursor],
+        workReads: [canonicalWorkJournal: read]))
+    XCTAssertEqual(attachmentUnknown.title, "stale title")
+    XCTAssertEqual(attachmentUnknown.lifecycle, .completed)
+    XCTAssertEqual(attachmentUnknown.sessionModelID, "session-before-unknown")
+    XCTAssertFalse(attachmentUnknown.work[0].attachmentProjectionKnown)
+    XCTAssertFalse(attachmentUnknown.work[0].canProjectExecution)
+    XCTAssertEqual(attachmentUnknown.work[0].lifecycle, .unknown)
+    XCTAssertFalse(attachmentUnknown.assemblyReady)
+    XCTAssertTrue(attachmentUnknown.hasOngoingOrUncertainAttachedWork)
+}
+
 func test_canonicalSessionCatalogOnlyReportsExactCanonicalWorkReads() throws {
     var session = SessionSnapshot()
     session.session = canonicalSession
@@ -406,6 +467,9 @@ func test_canonicalSessionCatalogOnlyReportsExactCanonicalWorkReads() throws {
     XCTAssertNil(noRead.work[0].workReadCursor)
     XCTAssertNil(noRead.work[0].journalIntegrityValid)
     XCTAssertNil(noRead.work[0].tailBytes)
+    XCTAssertFalse(noRead.work[0].canProjectExecution)
+    XCTAssertEqual(noRead.work[0].lifecycle, .unknown)
+    XCTAssertFalse(noRead.assemblyReady)
 
     let staleRead = try XCTUnwrap(SessionCatalog.summarizeCanonical(
         session: session, works: [work], cursors: [attachment.attachmentID: cursor],
@@ -416,6 +480,9 @@ func test_canonicalSessionCatalogOnlyReportsExactCanonicalWorkReads() throws {
     XCTAssertEqual(staleRead.work[0].workReadCursor?.sequence, 2)
     XCTAssertEqual(staleRead.work[0].journalIntegrityValid, false)
     XCTAssertEqual(staleRead.work[0].tailBytes, 0)
+    XCTAssertFalse(staleRead.work[0].canProjectExecution)
+    XCTAssertEqual(staleRead.work[0].lifecycle, .unknown)
+    XCTAssertFalse(staleRead.assemblyReady)
 
     let aheadRead = try XCTUnwrap(SessionCatalog.summarizeCanonical(
         session: session, works: [work], cursors: [attachment.attachmentID: cursor],
@@ -424,6 +491,9 @@ func test_canonicalSessionCatalogOnlyReportsExactCanonicalWorkReads() throws {
     XCTAssertEqual(aheadRead.work[0].workReadAlignment, .ahead)
     XCTAssertEqual(aheadRead.work[0].workReadCursor?.sequence, 4)
     XCTAssertEqual(aheadRead.work[0].journalIntegrityValid, false)
+    XCTAssertFalse(aheadRead.work[0].canProjectExecution)
+    XCTAssertEqual(aheadRead.work[0].lifecycle, .unknown)
+    XCTAssertFalse(aheadRead.assemblyReady)
 
     var missingEvidenceWork = work
     missingEvidenceWork.eventSequences = ["w1": 1, "w3": 3]
@@ -452,6 +522,9 @@ func test_canonicalSessionCatalogOnlyReportsExactCanonicalWorkReads() throws {
     XCTAssertEqual(foreignRead.work[0].workReadAlignment, .foreign)
     XCTAssertEqual(foreignRead.work[0].journalIntegrityValid, false)
     XCTAssertEqual(foreignRead.work[0].tailBytes, 0)
+    XCTAssertFalse(foreignRead.work[0].canProjectExecution)
+    XCTAssertEqual(foreignRead.work[0].lifecycle, .unknown)
+    XCTAssertFalse(foreignRead.assemblyReady)
 
     let duplicateRead = try XCTUnwrap(SessionCatalog.summarizeCanonical(
         session: session, works: [work], cursors: [attachment.attachmentID: cursor],
@@ -483,6 +556,9 @@ func test_canonicalSessionCatalogOnlyReportsExactCanonicalWorkReads() throws {
     XCTAssertEqual(tailedRead.work[0].workReadAlignment, .exact)
     XCTAssertEqual(tailedRead.work[0].journalIntegrityValid, false)
     XCTAssertEqual(tailedRead.work[0].tailBytes, 7)
+    XCTAssertFalse(tailedRead.work[0].canProjectExecution)
+    XCTAssertEqual(tailedRead.work[0].lifecycle, .unknown)
+    XCTAssertFalse(tailedRead.assemblyReady)
 }
 
 func test_canonicalSessionCatalogRetainsReducerDuplicateTruthWithoutTrapping() throws {
@@ -645,6 +721,10 @@ func test_readerCensusRegistersCanonicalSessionCatalogProjection() throws {
         workData: workData, workJournal: JournalRef.work(
             WorkRef(workHostID: "census-host", workID: "census-work"), journalID: "work-journal"))
     let projection = try XCTUnwrap(report.canonicalSessionCatalog)
+    XCTAssertTrue(report.registeredConsumers.contains("production local Timeline catalog"))
+    XCTAssertFalse(report.intentionallyUnwiredConsumers.contains {
+        $0.contains("legacy SessionCatalog scanner")
+    })
     let censusJournal = JournalRef.session(
         SessionRef("census-session"), journalID: "session-journal",
         authority: TimelineAuthorityRef("session-authority"))

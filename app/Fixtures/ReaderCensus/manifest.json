@@ -7,6 +7,6 @@
   "legacyJournal": "legacy.jsonl",
   "retainedBodies": ["bodies/tool-result.txt", "bodies/large-artifact.json"],
   "malformedVariants": ["variants/work-malformed.jsonl", "variants/work-truncated.jsonl"],
-  "registeredConsumers": ["canonical SessionCatalog projection", "canonical Flock adapter"],
-  "intentionallyUnwiredConsumers": ["legacy SessionCatalog scanner (native timeline consumer pending)", "Flock UI (canonical projection adoption pending)", "notifications", "search", "service recovery"]
+  "registeredConsumers": ["production local Timeline catalog", "canonical SessionCatalog projection", "canonical Flock adapter"],
+  "intentionallyUnwiredConsumers": ["Flock UI (canonical projection adoption pending)", "notifications", "search", "service recovery"]
 }
