@@ -241,12 +241,26 @@ public struct JournalRef: Codable, Hashable, Sendable {
         JournalRef(uncheckedJournalID: journalID, authority: authority, owner: .session(session))
     }
 
-    /// Stable, non-secret namespace for legacy synthetic IDs and cross-journal references.
+    /// Stable, non-secret, injective namespace for synthetic IDs and cross-journal references.
+    ///
+    /// Timeline identifiers are unrestricted strings, so delimiter-only concatenation is not a
+    /// valid identity encoding. Length-prefix every component before composing the key.
     public var stableKey: String {
         switch owner {
-        case .work(let work): return "authority:\(authority.authorityID)/kind:work/work-host:\(work.workHostID)/work:\(work.workID)/journal:\(journalID)"
-        case .session(let session): return "authority:\(authority.authorityID)/kind:session/session:\(session.sessionID)/journal:\(journalID)"
+        case .work(let work):
+            return "journal:v1/authority:\(Self.identityComponent(authority.authorityID))"
+                + "/kind:work/work-host:\(Self.identityComponent(work.workHostID))"
+                + "/work:\(Self.identityComponent(work.workID))"
+                + "/journal:\(Self.identityComponent(journalID))"
+        case .session(let session):
+            return "journal:v1/authority:\(Self.identityComponent(authority.authorityID))"
+                + "/kind:session/session:\(Self.identityComponent(session.sessionID))"
+                + "/journal:\(Self.identityComponent(journalID))"
         }
+    }
+
+    private static func identityComponent(_ value: String) -> String {
+        "\(value.utf8.count):\(value)"
     }
 
     public var kind: TimelineJournalKind {

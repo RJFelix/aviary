@@ -97,17 +97,22 @@ public struct SessionCatalogScanResult: Sendable {
     /// Transcript actions must fail closed for these ids even when no canonical companion could
     /// be constructed from the corrupt or ambiguous native record.
     public let nativeActionBlockedSessionIDs: Set<String>
+    /// Legacy transcript ids paired with a valid native Session. This provenance is deliberately
+    /// separate from canonicalByID, whose map also contains legacy adapters.
+    public let nativeCompanionLegacyIDs: Set<String>
 
     public init(
         entries: [SessionCatalogProjection],
         workInventory: [LocalTimelineCatalog.WorkRow],
         diagnostics: [LocalTimelineCatalog.Diagnostic],
-        nativeActionBlockedSessionIDs: Set<String> = []
+        nativeActionBlockedSessionIDs: Set<String> = [],
+        nativeCompanionLegacyIDs: Set<String> = []
     ) {
         self.entries = entries
         self.workInventory = workInventory
         self.diagnostics = diagnostics
         self.nativeActionBlockedSessionIDs = nativeActionBlockedSessionIDs
+        self.nativeCompanionLegacyIDs = nativeCompanionLegacyIDs
     }
 }
 
@@ -235,6 +240,7 @@ public actor SessionCatalog {
             actionBlockedSessionIDs.insert(sessionID)
         }
         var matchedCanonicalIDs = Set<String>()
+        var companionLegacyIDs = Set<String>()
         var diagnostics = native.diagnostics
         var entries: [SessionCatalogProjection] = []
         entries.reserveCapacity(legacy.count + native.sessionSummaries.count)
@@ -247,6 +253,7 @@ public actor SessionCatalog {
             {
                 entries.append(companion)
                 matchedCanonicalIDs.insert(canonical.id)
+                companionLegacyIDs.insert(summary.id)
             } else {
                 entries.append(LegacySessionCatalogAdapter.project(
                     summary: summary, authorityID: home.workHostID))
@@ -264,7 +271,8 @@ public actor SessionCatalog {
             .map(SessionCatalogProjection.canonical))
         return SessionCatalogScanResult(
             entries: entries, workInventory: native.works, diagnostics: diagnostics,
-            nativeActionBlockedSessionIDs: actionBlockedSessionIDs)
+            nativeActionBlockedSessionIDs: actionBlockedSessionIDs,
+            nativeCompanionLegacyIDs: companionLegacyIDs)
     }
 
     /// Compatibility spelling retained for existing callers that need only Session entries.

@@ -141,6 +141,7 @@ func test_sessionCatalogScanCatalogJoinsNativeAndLegacyIntoOneCompanion() async 
         entry.legacySummary?.fileURL?.resolvingSymlinksInPath(),
         home.sessionFile(id: session.sessionID).resolvingSymlinksInPath())
     XCTAssertFalse(entry.displaySummary?.isCanonicalOnly == true)
+    XCTAssertEqual(result.nativeCompanionLegacyIDs, [session.sessionID])
     XCTAssertEqual(result.diagnostics, [])
 }
 
@@ -181,6 +182,8 @@ func test_sessionCatalogScanCatalogLeavesLegacyOnlyRowsUnchanged() async throws 
     XCTAssertFalse(entry.displaySummary?.isCanonicalOnly == true)
     XCTAssertEqual(entry.canonical?.modelIDs, ["legacy-only-model"])
     XCTAssertFalse(entry.canonical?.sessionSemanticProjectionValid == true)
+    XCTAssertTrue(result.nativeCompanionLegacyIDs.isEmpty,
+                  "legacy-only roots must remain eligible for the compatibility Flock view")
 }
 
 func test_sessionCatalogScanCatalogKeepsIndependentWorkWithoutSession() async throws {

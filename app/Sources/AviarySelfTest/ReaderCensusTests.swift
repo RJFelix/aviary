@@ -63,9 +63,16 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(flock.nodes[0].state, "completed")
     XCTAssertNil(flock.nodes[0].name, "fixture omits a display name; Flock must not invent one")
     XCTAssertEqual(flock.nodes[0].source.eventID, "w19")
+    let flockCatalog = try XCTUnwrap(report.canonicalFlockCatalog.first)
+    XCTAssertFalse(flockCatalog.childLifecycleAvailable,
+                   "Reader Census must exercise the production Flock projection boundary")
+    XCTAssertTrue(flockCatalog.children.isEmpty)
+    XCTAssertTrue(flockCatalog.unknownDomains.contains(.work)
+                  || flockCatalog.unknownDomains.contains(.externalEffects)
+                  || flockCatalog.unknownDomains.contains(.runtime))
     XCTAssertEqual(report.registeredConsumers, [
         "production local Timeline catalog", "canonical SessionCatalog projection",
-        "canonical Flock adapter",
+        "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
     ])
     XCTAssertTrue(report.assemblerReady)
     XCTAssertEqual(report.visibleMessageIDs, ["s6", "s7", "s10", "s11"])
@@ -94,6 +101,12 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
         "sha256:f7423ed89ecf634efc2cbe26e719d08e53fd49888c41af2547b378740a5d7fe8")
     XCTAssertEqual(report.authoredAttention, .review)
     XCTAssertEqual(report.attention, .error)
+    let attentionRow = try XCTUnwrap(report.canonicalAttentionInbox.rows.first)
+    XCTAssertEqual(attentionRow.authoredAttention, .review)
+    XCTAssertNil(attentionRow.effectiveAttention,
+                 "unknown runtime state must keep the notification boundary non-actionable")
+    XCTAssertEqual(attentionRow.attentionRequirement, .unknown)
+    XCTAssertTrue(attentionRow.sessionUnknownDomains.contains(.runtime))
     XCTAssertEqual(report.outstandingActionIDs, ["action-incomplete"])
     XCTAssertEqual(report.indeterminateActionIDs, ["action-indeterminate"])
     XCTAssertEqual(report.outstandingHandleIDs, ["handle-background"])
@@ -119,8 +132,7 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(report.unknownReferences.count, 1)
     XCTAssertEqual(report.unknownReferences[0].eventID, "missing-activity")
     XCTAssertEqual(report.intentionallyUnwiredConsumers, [
-        "Flock UI (canonical projection adoption pending)", "notifications", "search",
-        "service recovery",
+        "notifications", "search", "service recovery",
     ])
 
     let workEvents = ReaderCensus.read(

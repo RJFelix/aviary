@@ -127,6 +127,11 @@ public struct CanonicalFlockProjection: Codable, Hashable, Sendable {
 /// text. Aviary reads the per-session files as primary — they are the ones that get
 /// updated — and folds in ledger edges the artifacts missed.
 public enum AgentTreeReader {
+    private struct LegacyNodeKey: Hashable {
+        let parentSessionID: String
+        let childID: String
+    }
+
     /// Project child lifecycle records for Flock only when the supplied Work read is an exact,
     /// canonical append-chain ending at the supplied reducer snapshot. Stale, divergent,
     /// foreign, tailed, or corrupt reads are visible as unavailable and yield no child rows;
@@ -196,8 +201,9 @@ public enum AgentTreeReader {
     }
 
     public static func read(home: AgentHome) -> AgentTree {
-        var nodes: [String: AgentNode] = [:]         // childId -> node
-        var childSessionToParent: [String: String] = [:]  // child session id -> parent session id
+        // childId is only unique inside one parent Session. Keep the parent in the reader key;
+        // AgentNode.id remains the legacy childId compatibility field for callers.
+        var nodes: [LegacyNodeKey: AgentNode] = [:]
         var tree = AgentTree()
 
         // 1. Per-session sub-agent records (recursive: grandchildren nest their own
@@ -240,10 +246,10 @@ public enum AgentTreeReader {
                         createdAt: epochOrISO(v["createdAt"]),
                         updatedAt: epochOrISO(v["updatedAt"]))
 
-                    // Later records supersede earlier ones for the same child.
-                    if let existing = nodes[childID], existing.updatedAt > node.updatedAt { continue }
-                    nodes[childID] = node
-                    childSessionToParent[childSessionID] = parentSessionID
+                    // Later records supersede earlier ones for the same parent-qualified child.
+                    let key = LegacyNodeKey(parentSessionID: parentSessionID, childID: childID)
+                    if let existing = nodes[key], existing.updatedAt > node.updatedAt { continue }
+                    nodes[key] = node
                 }
             }
         }
@@ -259,7 +265,6 @@ public enum AgentTreeReader {
                     guard let v = JSONValue.parse(Data(chunk)),
                           v["op"]?.stringValue == "spawn",
                           let childID = v["childId"]?.stringValue,
-                          nodes[childID] == nil,
                           let childPath = v["child"]?.stringValue,
                           let parentPath = v["parent"]?.stringValue
                     else { continue }
@@ -267,7 +272,9 @@ public enum AgentTreeReader {
                     let parentID = URL(fileURLWithPath: parentPath)
                         .deletingPathExtension().lastPathComponent
                     let childSessionID = childURL.deletingPathExtension().lastPathComponent
-                    nodes[childID] = AgentNode(
+                    let key = LegacyNodeKey(parentSessionID: parentID, childID: childID)
+                    guard nodes[key] == nil else { continue }
+                    nodes[key] = AgentNode(
                         id: childID,
                         name: v["name"]?.stringValue ?? childID,
                         sessionID: childSessionID,
@@ -280,39 +287,54 @@ public enum AgentTreeReader {
                         provider: nil, model: nil, prompt: "", spawnCode: "",
                         createdAt: ISO8601.date(v["at"]?.stringValue) ?? .distantPast,
                         updatedAt: ISO8601.date(v["at"]?.stringValue) ?? .distantPast)
-                    childSessionToParent[childSessionID] = parentID
                 }
             }
         }
 
         // 3. Build the tree. A node's parent is either another sub-agent (when its
         // parentSessionID is itself a child session) or a top-level session.
-        var childrenOf: [String: [AgentNode]] = [:]  // parent childId -> children
-        var topLevel: [String: [AgentNode]] = [:]    // root session id -> children
-        let nodeBySessionID = Dictionary(nodes.values.map { ($0.sessionID, $0) },
-                                        uniquingKeysWith: { a, _ in a })
+        var childrenOf: [LegacyNodeKey: [LegacyNodeKey]] = [:]
+        var topLevel: [String: [LegacyNodeKey]] = [:]
+        let nodeKeysBySessionID = Dictionary(grouping: nodes.keys) { key in
+            nodes[key]!.sessionID
+        }
 
-        for node in nodes.values {
-            if let parentNode = nodeBySessionID[node.parentSessionID] {
-                childrenOf[parentNode.id, default: []].append(node)
+        for (key, node) in nodes {
+            // A child session id can collide across authorities/parents. Only a unique match
+            // is safe to nest; ambiguity stays visible as a top-level/unknown root.
+            if let parentKeys = nodeKeysBySessionID[node.parentSessionID], parentKeys.count == 1,
+               let parentKey = parentKeys.first {
+                childrenOf[parentKey, default: []].append(key)
             } else {
-                topLevel[node.parentSessionID, default: []].append(node)
+                topLevel[node.parentSessionID, default: []].append(key)
             }
             tree.edges.append((parentSessionID: node.parentSessionID, childID: node.id))
         }
 
-        func attach(_ node: AgentNode, guardDepth: Int = 0) -> AgentNode {
+        func attach(_ key: LegacyNodeKey, guardDepth: Int = 0) -> AgentNode {
+            guard let node = nodes[key] else {
+                fatalError("AgentTree reader lost qualified node")
+            }
             var n = node
             guard guardDepth < 12 else { return n }  // cycle guard
-            n.children = (childrenOf[node.id] ?? [])
-                .sorted { $0.createdAt < $1.createdAt }
+            n.children = (childrenOf[key] ?? [])
+                .sorted { lhs, rhs in
+                    let left = nodes[lhs]!, right = nodes[rhs]!
+                    if left.createdAt != right.createdAt { return left.createdAt < right.createdAt }
+                    return lhs.childID < rhs.childID
+                }
                 .map { attach($0, guardDepth: guardDepth + 1) }
             return n
         }
 
-        for (sessionID, kids) in topLevel {
+        for sessionID in topLevel.keys.sorted() {
+            let kids = topLevel[sessionID] ?? []
             tree.byParentSession[sessionID] = kids
-                .sorted { $0.createdAt < $1.createdAt }
+                .sorted { lhs, rhs in
+                    let left = nodes[lhs]!, right = nodes[rhs]!
+                    if left.createdAt != right.createdAt { return left.createdAt < right.createdAt }
+                    return lhs.childID < rhs.childID
+                }
                 .map { attach($0) }
         }
         tree.allNodes = tree.byParentSession.values.flatMap { $0.flatMap(\.flattened) }

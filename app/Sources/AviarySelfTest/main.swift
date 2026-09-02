@@ -6313,6 +6313,36 @@ let casesPhase1Timeline: [Case] = [
     ("phase1 catalog: canonical rows preserve attached Work truth", {
         try test_canonicalSessionCatalogPreservesAttachedWorkIdentityAndTruth()
     }),
+    ("phase1 attention: canonical rows preserve qualified Session identity", {
+        try test_canonicalAttentionInboxUsesQualifiedSessionIdentity()
+    }),
+    ("phase1 attention: no attention is distinct from unknown", {
+        try test_canonicalAttentionInboxReportsNoAttentionSeparatelyFromUnknown()
+    }),
+    ("phase1 attention: missing and unaligned Work fail closed", {
+        try test_canonicalAttentionInboxFailsClosedForMissingAndUnalignedWork()
+    }),
+    ("phase1 attention: unknown domains and tails fail closed", {
+        try test_canonicalAttentionInboxFailsClosedForUnknownDomainsAndTails()
+    }),
+    ("phase1 attention: foreign, ahead, and divergent Work fail closed", {
+        try test_canonicalAttentionInboxRejectsForeignAheadAndDivergentWork()
+    }),
+    ("phase1 attention: attachment identity qualifies duplicate Work rows", {
+        try test_canonicalAttentionInboxQualifiesRowsByAttachmentIdentity()
+    }),
+    ("phase1 attention: aggregate bounds preserve Session authority identity", {
+        try test_canonicalAttentionInboxBoundsAcrossSessionsAndKeepsAuthoritiesDistinct()
+    }),
+    ("phase1 attention: bounded rows remain deterministic and qualified", {
+        try test_canonicalAttentionInboxIsBoundedDeterministicAndAuthorityQualified()
+    }),
+    ("phase1 attention: evidence and reasons remain bounded", {
+        try test_canonicalAttentionInboxBoundsEvidenceAndReasons()
+    }),
+    ("phase1 attention: duplicate journal summaries become conflicts", {
+        try test_canonicalAttentionInboxCoalescesDuplicateJournalSummariesAsConflict()
+    }),
     ("phase1 catalog: detached active Work remains unprojected", {
         try test_canonicalSessionCatalogDoesNotProjectDetachedActiveWork()
     }),
@@ -6414,6 +6444,27 @@ let casesPhase1Timeline: [Case] = [
     }),
     ("phase1 census: canonical Flock rejects unaligned or foreign Work", {
         try test_readerCensusFlockRejectsUnalignedOrForeignWork()
+    }),
+    ("phase1 census: production Flock uses qualified canonical Work rows", {
+        try test_canonicalFlockCatalogQualifiesChildIDsAndSessionLinks()
+    }),
+    ("phase1 census: Flock suppresses children for unknown Work domains", {
+        try test_canonicalFlockCatalogSuppressesChildrenForUnknownAffectedDomains()
+    }),
+    ("phase1 census: Flock treats Work and external effects as child domains", {
+        test_canonicalFlockUnknownWorkAndExternalEffectsSuppressChildCompleteness()
+    }),
+    ("phase1 census: Flock keeps legacy roots only by explicit companion provenance", {
+        test_canonicalFlockLegacyCompatibilityRequiresExplicitNativeCompanionProvenance()
+    }),
+    ("phase1 census: Flock duplicate Work rows stay deterministic", {
+        try test_canonicalFlockDuplicateWorkPresentationIDsAreStableAcrossInputOrder()
+    }),
+    ("phase1 census: Flock attention is deduplicated per Session", {
+        try test_canonicalFlockAttentionCountDeduplicatesAuthorityQualifiedSessions()
+    }),
+    ("phase1 census: legacy Flock preserves duplicate child IDs by parent", {
+        try test_legacyAgentTreePreservesDuplicateChildIDsPerParentSession()
     }),
     ("phase1 census: malformed child ownership cannot be silently omitted", {
         try test_readerCensusRejectsMalformedChildOwnershipInsteadOfOmittingIt()
@@ -6570,6 +6621,9 @@ let casesLocalTimelineCatalog: [Case] = [
     }),
     ("phase1 local catalog: tailed Session remains visible but non-projectable", {
         try test_localTimelineCatalogKeepsTailedSessionVisibleButNonProjectable()
+    }),
+    ("phase1 local catalog: semantically invalid Session withholds summary", {
+        try test_localTimelineCatalogKeepsSemanticallyInvalidSessionVisibleButWithholdsSummary()
     }),
     ("phase1 local catalog: unterminated first event remains visible as tail", {
         try test_localTimelineCatalogClassifiesUnterminatedFirstEventAsTail()

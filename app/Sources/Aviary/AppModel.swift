@@ -8,12 +8,9 @@ enum Section: String, CaseIterable, Identifiable, Hashable {
 
     /// What the sidebar offers.
     ///
-    /// Flock is kept and not shown. It drew the harness's world — a forest of sub-agent
-    /// sessions held by a supervisor — and that world is gone; the shape of the idea is worth
-    /// keeping, but it needs to describe what the in-house engine actually does before it
-    /// earns a place back. Hiding rather than deleting, because the argument for it was never
-    /// wrong, only its subject.
-    static var visible: [Section] { allCases.filter { $0 != .flock } }
+    /// Flock is a Work/Session projection. Legacy child rows remain available only as an
+    /// explicit compatibility section when no canonical Session projection exists.
+    static var visible: [Section] { allCases }
 
     var id: String { rawValue }
 
@@ -100,11 +97,17 @@ final class AppModel {
     /// remain observable before any GUI attaches, and so future GUIs do not need to manufacture
     /// Work state from their own in-memory runs.
     var canonicalWorkInventory: [LocalTimelineCatalog.WorkRow] = []
+    /// Bounded reader projections are assembled once at the catalog boundary. Views consume
+    /// these values rather than repeatedly joining every Work to every Session during rendering.
+    var canonicalFlockInventory: [CanonicalFlockCatalogProjection] = []
+    var canonicalAttentionInbox = CanonicalAttentionInboxProjection(summaries: [])
     var nativeTimelineCatalogDiagnostics: [LocalTimelineCatalog.Diagnostic] = []
     /// Native Session journals that exist but cannot prove attachment/liveness truth. This is
     /// separate from canonical projections because invalid native rows are intentionally absent
     /// from that fact map while still needing to block destructive or duplicate-start actions.
     var nativeActionBlockedSessionIDs: Set<String> = []
+    /// Explicit catalog provenance for which legacy rows have a native companion.
+    var nativeCompanionLegacyIDs: Set<String> = []
     var isScanning = false
     var scanProgress: (done: Int, total: Int) = (0, 0)
     var catalogError: String?
@@ -450,8 +453,19 @@ final class AppModel {
         canonicalCatalogProjections = projectionIndex.canonicalByID
         canonicalCatalogProjectionConflicts = projectionIndex.duplicateIDs
         canonicalWorkInventory = result.workInventory
+        let nativeSummaries = result.entries.compactMap { entry -> CanonicalSessionCatalogSummary? in
+            switch entry {
+            case .canonical(let summary): return summary
+            case .companion(let companion): return companion.canonical
+            case .legacy: return nil
+            }
+        }
+        canonicalFlockInventory = CanonicalFlockCatalogProjection.project(
+            sessions: nativeSummaries, works: result.workInventory)
+        canonicalAttentionInbox = CanonicalAttentionInboxProjection(summaries: nativeSummaries)
         nativeTimelineCatalogDiagnostics = result.diagnostics
         nativeActionBlockedSessionIDs = result.nativeActionBlockedSessionIDs
+        nativeCompanionLegacyIDs = result.nativeCompanionLegacyIDs
         var catalogIssues: [String] = []
         if !projectionIndex.duplicateIDs.isEmpty {
             catalogIssues.append(

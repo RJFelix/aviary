@@ -87,6 +87,9 @@ public enum LocalTimelineCatalog {
     /// and affected domains remain as explicit evidence even when projection is unavailable.
     public struct WorkRow: Codable, Hashable, Sendable, Identifiable {
         public let id: String
+        /// Stable discovered locator, retained only to disambiguate duplicate qualified Work
+        /// identities in presentation. It is not an authority or a source of Work facts.
+        public let locatorID: String?
         public let work: WorkRef?
         public let journal: JournalRef?
         public let workHost: WorkHostRef?
@@ -103,6 +106,10 @@ public enum LocalTimelineCatalog {
         public let actions: [ActionFact]
         public let handles: [HandleFact]
         public let commands: [CommandFact]
+        /// Child lifecycle facts from the exact Work journal, when one was supplied. This is
+        /// deliberately separate from the legacy AgentTree; an unavailable or unaligned read
+        /// yields an unavailable projection and never lends child state to the UI.
+        public let canonicalFlock: CanonicalFlockProjection?
         public let unknownEventRefs: [EventRef]
         public let unknownDomains: [TimelineDomain]
         public let tailBytes: Int
@@ -111,8 +118,9 @@ public enum LocalTimelineCatalog {
         fileprivate init(locatorID: String, work declaredWork: WorkRef?, journal: JournalRef?,
                          snapshot: WorkSnapshot?,
                          read: TimelineJournalReadResult?, available: Bool, reasons: [String],
-                         limit: Int) {
-            id = locatorID
+                         limit: Int, presentationID: String? = nil) {
+            id = presentationID ?? declaredWork.map { LocalTimelineCatalog.qualifiedWork($0) } ?? locatorID
+            self.locatorID = locatorID
             work = declaredWork
             self.journal = journal
             workHost = declaredWork.map { WorkHostRef($0.workHostID) }
@@ -132,6 +140,11 @@ public enum LocalTimelineCatalog {
             unknownDomains = snapshot.map {
                 Array($0.unknownDomains).sorted { $0.rawValue < $1.rawValue }
             } ?? []
+            if let snapshot, let read, !read.records.isEmpty {
+                canonicalFlock = AgentTreeReader.canonicalProjection(work: snapshot, read: read)
+            } else {
+                canonicalFlock = nil
+            }
             if exact, let snapshot {
                 let workFactsKnown = !snapshot.unknownDomains.contains(.work)
                 let actionFactsKnown = workFactsKnown
@@ -250,7 +263,8 @@ public enum LocalTimelineCatalog {
                 row: WorkRow(
                     locatorID: record.locatorID, work: work, journal: record.row.journal,
                     snapshot: record.snapshot, read: record.read, available: false,
-                    reasons: reasons, limit: limits.maxCorruptionReasonsPerRow),
+                    reasons: reasons, limit: limits.maxCorruptionReasonsPerRow,
+                    presentationID: "\(qualifiedWork(work))#\(record.locatorID)"),
                 snapshot: record.snapshot, read: record.read)
         }
         workRecords.sort {
@@ -489,7 +503,7 @@ public enum LocalTimelineCatalog {
         }
         reasons = unique(reasons)
         let available = reasons.isEmpty
-        let row = WorkRow(locatorID: qualifiedWork(work), work: work, journal: declared,
+        let row = WorkRow(locatorID: candidate.locatorID, work: work, journal: declared,
                           snapshot: snapshot,
                           read: read, available: available, reasons: reasons,
                           limit: limits.maxCorruptionReasonsPerRow)
@@ -596,7 +610,23 @@ public enum LocalTimelineCatalog {
         diagnostics: inout DiagnosticSink
     ) -> [URL] {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: url.path) else { return [] }
+        do {
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey])
+            guard values.isDirectory == true else {
+                diagnostics.append(kind: "unavailable_directory", message: "\(label) is not a directory")
+                return []
+            }
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain,
+               [CocoaError.fileNoSuchFile.rawValue,
+                CocoaError.fileReadNoSuchFile.rawValue].contains(nsError.code)
+            {
+                return []
+            }
+            diagnostics.append(kind: "unavailable_directory", message: "\(label) could not be read")
+            return []
+        }
         var readFailed = false
         guard let enumerator = fm.enumerator(
             at: url, includingPropertiesForKeys: [.isDirectoryKey],

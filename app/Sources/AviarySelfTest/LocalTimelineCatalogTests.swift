@@ -228,6 +228,33 @@ func test_localTimelineCatalogKeepsTailedSessionVisibleButNonProjectable() throw
     XCTAssertTrue(catalog.sessionSummaries.isEmpty)
 }
 
+func test_localTimelineCatalogKeepsSemanticallyInvalidSessionVisibleButWithholdsSummary() throws {
+    let home = try localCatalogHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let session = SessionRef("semantic-invalid-session")
+    let journal = JournalRef.session(session, authority: TimelineAuthorityRef("session-service"))
+    var data = try localCatalogEvent(
+        id: "s1", journal: journal, sequence: 1, type: TimelineEventType.sessionCreated,
+        session: session)
+    // The event is structurally valid but cannot be semantically projected by SessionReducer.
+    let malformedPayload: JSONValue = .object([
+        "components": .array([.object(["bad": .bool(true)])]),
+    ])
+    data.append(try localCatalogEvent(
+        id: "s2", journal: journal, sequence: 2, previous: "s1",
+        type: TimelineEventType.contextAssembled, session: session,
+        declaredDomains: [.context],
+        payload: malformedPayload))
+    try localCatalogWrite(data, to: home.timelineV2SessionJournalURL(session))
+
+    let catalog = LocalTimelineCatalog.scan(home: home)
+    let row = try XCTUnwrap(catalog.sessions.first)
+    XCTAssertFalse(row.isAvailable)
+    XCTAssertNil(row.summary)
+    XCTAssertTrue(row.corruptionReasons.contains { $0.contains("semantic") })
+    XCTAssertTrue(catalog.sessionSummaries.isEmpty)
+}
+
 func test_localTimelineCatalogClassifiesUnterminatedFirstEventAsTail() throws {
     let home = try localCatalogHome()
     defer { try? FileManager.default.removeItem(at: home.root) }

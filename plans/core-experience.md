@@ -25,9 +25,9 @@ events, and quarantines malformed or truncated suffixes without overstating the 
 versioned Reader Census fixture exercises branching, compaction, model change, queued input, child
 completion, late steering, indeterminate actions, unknown events, legacy input, retained bodies, and
 malformed/truncated tails across linked Session and Work journals. The production local Timeline
-catalog now joins the Census; the production Flock UI, notifications, search, and service recovery
-remain explicitly unwired. A source-qualified canonical Flock adapter joins the Census separately
-from that still-legacy UI consumer.
+catalog now joins the Census. The production Flock UI consumes the same source-qualified,
+unknown-aware Work projection exercised by the fixture; notifications, search, and service recovery
+remain explicitly unwired.
 
 A canonical catalog adapter now projects authority-qualified Session identities and attached Work
 at independently verified requested/observed cursors. Only attached, exactly aligned Work with
@@ -40,14 +40,24 @@ as one companion row: canonical lifecycle/model/attention/Work truth drives the 
 file remains the compatibility target for transcript and artifact actions. Native-only sessions are
 observe-only; legacy-only rows retain their prior behavior; corrupt, tailed, unknown, foreign,
 duplicate, ambiguous, or symlink-misaligned records remain visible or diagnosed without lending
-facts. Unknown Session semantics also scrub legacy-derived title, message, usage, model, provider,
+facts. Duplicate Work identities are excluded from Session assembly, invalid or tailed Sessions
+publish no canonical summary, recoverable Work-prefix cursors remain explicit but non-projectable,
+and unexpected directory failures are diagnosed rather than appearing as an empty catalog.
+Unknown Session semantics also scrub legacy-derived title, message, usage, model, provider,
 and lifecycle fields from a companion display rather than letting compatibility data refill an
 unknown canonical projection. Continue re-reads native state at its action boundary and the native
 bundle's owner lock remains the final admission guard; Trash holds that same persistent Session
 owner lock across its fresh canonical read and transcript move. The Reader Census registers this
-production consumer. The Flock UI, notifications, search, and service recovery remain unwired to
-the canonical projection. Work rows separately report whether a supplied journal read is absent,
-exact, stale, ahead, foreign, divergent, or invalid;
+production consumer. Flock now inventories Work independently of Session, qualifies child identity
+by Work, retains legacy trees only through explicit compatibility provenance, and withholds child
+lifecycle when an unknown Work/runtime/external-effects domain may affect it. A separate bounded,
+client-neutral attention projection retains authored/effective attention, independent Session/Work
+cursors, attachment identity, integrity, tails, and unknowns; its `attentionRequirement` is
+explicitly `unknown`, `none`, or `required`, without implying that the observing GUI has control
+capability. Duplicate summaries become one unknown conflict row, and attachment, unknown-event,
+and corruption evidence is independently bounded with omission counts. OS notifications, search,
+and service recovery remain unwired to the canonical projection. Work rows separately report
+whether a supplied journal read is absent, exact, stale, ahead, foreign, divergent, or invalid;
 `journalIntegrityValid` is nil only when no read was supplied and is false for every supplied
 non-exact or tailed read. A supplied exact, canonical, tail-free read is required before assembly or
 Work execution facts can project, while a tailed local journal retains a distinct non-projectable
@@ -128,18 +138,19 @@ creating an empty visible chat row.
 
 The Apple Swift 6.3.3 compiler accepts the SDK emitted by Apple Swift 6.3.2; the compatibility probe
 configures its own writable module cache and succeeds both directly and through every gate. At this
-checkpoint, the full suite passes 459 cases / 4,136 assertions in 46.68 seconds and `just compile`
-is clean. Phase 1 passes 168 cases / 2,207 assertions in 15.99 seconds. The versioned 100,000-event
-benchmark reads and reduces a 46,766,700-byte input in 5.741 seconds on the checkpoint machine
-(generation 0.900 seconds). The visual gate renders all 8 canonical screens. Final Sol review found
+checkpoint, the full suite passes 477 cases / 4,317 assertions in 46.95 seconds and `just compile`
+is clean. Phase 1 passes 186 cases / 2,388 assertions in 16.33 seconds. The versioned 100,000-event
+benchmark reads and reduces a 46,766,700-byte input in 5.858 seconds on the checkpoint machine
+(generation 0.907 seconds). The visual gate renders all 9 canonical screens. Final Sol review found
 no remaining must-fix issue after exact cursor/attachment/read authority, local action-time
 revalidation and owner locking, unknown-domain display scrubbing, duplicate non-projection,
 slash-injective Work identity, provider-action causality, exhaustive retained-body decoding,
 structured assistant replay, pre-Start capture/cleanup, source-assembly binding, truncated-source
-replay, and metadata-only inspection findings were remediated.
+replay, metadata-only inspection, parent-qualified legacy selection, multi-Session attention,
+bounded evidence, and conflict projection findings were remediated.
 
 Phase 0 still owes real VoiceOver/keyboard UI automation and broader driver focus/race proof. Phase 1
-still owes the remaining canonical consumer migrations (Flock UI, notifications, search, service
+still owes the remaining canonical consumer migrations (notification delivery, search, service
 recovery, and other named legacy readers); individual skill/memory identity and included-versus-listed
 provenance inside the now-durable block-level prompt sources; independent native Work bundles for
 children; actual disk-full and permission fault reachability; and a measured

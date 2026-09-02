@@ -554,6 +554,14 @@ func test_timelineJournalRefPublicConstructionCannotTrap() throws {
     let valid = JournalRef.work(work, journalID: "valid")
     XCTAssertEqual(valid.authority.authorityID, work.workHostID)
 
+    let delimiterBearingAuthority = JournalRef.session(
+        SessionRef("c"), authority: TimelineAuthorityRef("a/kind:session/session:b"))
+    let delimiterBearingSession = JournalRef.session(
+        SessionRef("b/kind:session/session:c"), authority: TimelineAuthorityRef("a"))
+    XCTAssertNotEqual(
+        delimiterBearingAuthority.stableKey, delimiterBearingSession.stableKey,
+        "structured journal identities must remain distinct when IDs contain key delimiters")
+
     let mismatchedWire = Data(
         #"{"authority":{"authorityID":"wrong-host"},"kind":"work","journal_id":"bad","owner":{"kind":"work","work_host_id":"ref-host","work_id":"ref-work"}}"#.utf8)
     do {

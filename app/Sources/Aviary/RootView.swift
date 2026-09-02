@@ -70,7 +70,17 @@ struct RootView: View {
             return "\(live.count) live · \(model.runs.count) attached · "
                 + "\(live.filter(\.isStreaming).count) working"
         case .flock:
-            return "\(model.tree.allNodes.count) sub-agents · \(model.tree.runningCount) running"
+            let works = model.canonicalFlockInventory
+            let children = works.flatMap(\.children).count
+            let attention = CanonicalFlockCatalogProjection.attentionSessionCount(works)
+            let legacyIDs = Set(CanonicalFlockCatalogProjection.legacyCompatibilityRootIDs(
+                Array(model.tree.byParentSession.keys),
+                nativeCompanionLegacyIDs: model.nativeCompanionLegacyIDs))
+            let legacyChildren = model.tree.byParentSession
+                .filter { legacyIDs.contains($0.key) }
+                .flatMap(\.value).flatMap(\.flattened).count
+            return "\(works.count) Work · \(children) children · \(attention) attention"
+                + (legacyChildren == 0 ? "" : " · \(legacyChildren) legacy children")
         case .models:
             return "\(model.runtimeModels.count) reachable · \(model.modelsConfig.providers.count) configured providers"
         case .usage:
@@ -264,7 +274,13 @@ struct SidebarView: View {
             let n = model.board.openCount
             return n > 0 ? ("\(n)", Design.accent) : nil
         case .flock:
-            let n = model.tree.runningCount
+            let legacyIDs = Set(CanonicalFlockCatalogProjection.legacyCompatibilityRootIDs(
+                Array(model.tree.byParentSession.keys),
+                nativeCompanionLegacyIDs: model.nativeCompanionLegacyIDs))
+            let legacyRunning = model.tree.byParentSession
+                .filter { legacyIDs.contains($0.key) }
+                .flatMap(\.value).flatMap(\.flattened).filter(\.isRunning).count
+            let n = model.canonicalFlockInventory.filter(\.isRunning).count + legacyRunning
             return n > 0 ? ("\(n)", Design.agentMessage) : nil
         case .health:
             // Only shouts when the runtime has been probed and failed. An unprobed runtime is

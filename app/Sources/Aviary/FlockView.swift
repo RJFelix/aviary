@@ -2,15 +2,19 @@ import SwiftUI
 import AppKit
 import AviaryCore
 
-/// The sub-agent view: who spawned whom, with what instructions, and how it went.
+/// The Work and child view: what delegated Work exists, which Sessions observe it, and what
+/// child lifecycle the exact Work journal proves.
 ///
 /// The harness can recurse — an agent calls `rlm(...)` and gets a child with its own
 /// kernel, its own transcript, and its own children. In a terminal that structure is
 /// invisible: you see one stream of text and a lot of `agent_message` traffic. This screen
 /// is the reason a GUI is worth building for this harness at all.
 struct FlockView: View {
+    private static let maxDisplayedCanonicalWorks = 128
+    static let maxDisplayedChildrenPerWork = 64
     @Environment(AppModel.self) private var model
     @State private var selectedNodeID: String?
+    @State private var selectedCanonicalWorkID: String?
     @State private var expanded: Set<String> = []
     @State private var showOnlyRunning = false
 
@@ -19,13 +23,12 @@ struct FlockView: View {
             VStack(spacing: 0) {
                 summaryBar
                 Divider()
-                if roots.isEmpty {
+                if canonicalWorks.isEmpty && legacyRoots.isEmpty {
                     EmptyStateView(
                         symbol: "bird",
-                        title: "No sub-agents yet",
-                        message: "When an agent calls rlm(...) to spawn children, the whole "
-                            + "tree shows up here — each child's prompt, model, status, and "
-                            + "transcript.")
+                        title: "No delegated Work yet",
+                        message: "Native Work and legacy child records will appear here when "
+                            + "they are available.")
                 } else {
                     treeList
                 }
@@ -39,12 +42,39 @@ struct FlockView: View {
 
     // MARK: Data
 
-    private var roots: [(session: SessionSummary?, sessionID: String, nodes: [AgentNode])] {
-        model.tree.byParentSession
+    private var canonicalAllWorks: [CanonicalFlockCatalogProjection] {
+        model.canonicalFlockInventory
+    }
+
+    private var canonicalWorks: [CanonicalFlockCatalogProjection] {
+        canonicalAllWorks.filter { !showOnlyRunning || isRunning($0) }
+    }
+
+    private var canonicalWorksForDisplay: [CanonicalFlockCatalogProjection] {
+        Array(canonicalWorks.prefix(Self.maxDisplayedCanonicalWorks))
+    }
+
+    /// Only a proven companion may suppress a legacy AgentTree root. A canonical Session's
+    /// local sessionID is not enough: another authority may legitimately use the same value.
+    private var legacyCompanionSessionIDs: Set<String> {
+        model.nativeCompanionLegacyIDs
+    }
+
+    /// Legacy topology is a compatibility view only. A Session that has a canonical Work row
+    /// is never filled back in from AgentTree when that Work has no child records.
+    private var legacyRootsAll: [(session: SessionSummary?, sessionID: String, nodes: [AgentNode])] {
+        let eligibleIDs = Set(CanonicalFlockCatalogProjection.legacyCompatibilityRootIDs(
+            Array(model.tree.byParentSession.keys),
+            nativeCompanionLegacyIDs: legacyCompanionSessionIDs))
+        return model.tree.byParentSession
             .map { key, value in
                 (session: model.sessions.first { $0.id == key }, sessionID: key, nodes: value)
             }
-            .filter { entry in
+            .filter { eligibleIDs.contains($0.sessionID) }
+    }
+
+    private var legacyRoots: [(session: SessionSummary?, sessionID: String, nodes: [AgentNode])] {
+        legacyRootsAll.filter { entry in
                 guard showOnlyRunning else { return true }
                 return entry.nodes.contains { $0.flattened.contains(where: \.isRunning) }
             }
@@ -55,27 +85,58 @@ struct FlockView: View {
             }
     }
 
+    private var legacySelection: Binding<String?> {
+        Binding(
+            get: { selectedNodeID },
+            set: {
+                selectedNodeID = $0
+                if $0 != nil { selectedCanonicalWorkID = nil }
+            })
+    }
+
     private var selectedNode: AgentNode? {
         guard let id = selectedNodeID else { return nil }
-        return model.tree.allNodes.first { $0.id == id }
+        for roots in model.tree.byParentSession.values {
+            if let node = roots.flatMap(\.flattened).first(where: {
+                LegacyFlockIdentity.rowID(
+                    parentSessionID: $0.parentSessionID, childID: $0.id) == id
+            }) { return node }
+        }
+        return nil
+    }
+
+    private var selectedCanonicalWork: CanonicalFlockCatalogProjection? {
+        guard let id = selectedCanonicalWorkID else { return nil }
+        return canonicalWorks.first { $0.id == id }
+    }
+
+    private func isRunning(_ work: CanonicalFlockCatalogProjection) -> Bool {
+        work.isRunning
     }
 
     private var summaryBar: some View {
-        HStack(spacing: 14) {
+        let canonicalRunning = canonicalAllWorks.filter(isRunning).count
+        let legacyChildren = legacyRootsAll.flatMap(\.nodes).flatMap(\.flattened)
+        let legacyRunning = legacyChildren.filter(\.isRunning).count
+        let attentionCount = CanonicalFlockCatalogProjection.attentionSessionCount(canonicalAllWorks)
+        return HStack(spacing: 14) {
             StatTile(
-                label: "sub-agents", value: "\(model.tree.allNodes.count)",
-                symbol: "bird.fill", tint: Design.agentMessage)
+                label: "Work", value: "\(canonicalAllWorks.count)",
+                symbol: "circle.hexagongrid.fill", tint: Design.agentMessage)
             StatTile(
-                label: "running", value: "\(model.tree.runningCount)",
+                label: "running",
+                value: "\(canonicalRunning + legacyRunning)",
                 symbol: "bolt.fill",
-                tint: model.tree.runningCount > 0 ? Design.success : .secondary)
+                tint: canonicalRunning + legacyRunning > 0 ? Design.success : .secondary)
             StatTile(
-                label: "fan-outs", value: "\(model.tree.byParentSession.count)",
-                caption: "parent sessions", symbol: "arrow.triangle.branch")
+                label: "children", value: "\(canonicalAllWorks.flatMap(\.children).count)",
+                caption: legacyChildren.isEmpty ? "canonical lifecycle"
+                    : "\(legacyChildren.count) legacy",
+                symbol: "arrow.triangle.branch")
             StatTile(
-                label: "max depth",
-                value: "\(model.tree.allNodes.map(\.depth).max() ?? 0)",
-                symbol: "arrow.down.to.line")
+                label: "attention",
+                value: "\(attentionCount)",
+                symbol: "exclamationmark.bubble")
             Spacer()
             Toggle("Running only", isOn: $showOnlyRunning)
                 .toggleStyle(.switch)
@@ -90,9 +151,25 @@ struct FlockView: View {
     private var treeList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
-                ForEach(roots, id: \.sessionID) { entry in
+                if canonicalWorks.count > canonicalWorksForDisplay.count {
+                    Text("Showing first \(canonicalWorksForDisplay.count) of \(canonicalWorks.count) Work rows")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                ForEach(canonicalWorksForDisplay) { work in
+                    CanonicalFlockWorkRow(
+                        work: work, selectedID: $selectedCanonicalWorkID,
+                        onSelect: { selectedNodeID = nil })
+                }
+
+                if !legacyRoots.isEmpty {
+                    Text("Legacy compatibility")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.top, canonicalWorks.isEmpty ? 0 : 5)
+                    ForEach(legacyRoots, id: \.sessionID) { entry in
                     VStack(alignment: .leading, spacing: 5) {
                         Button {
+                            selectedCanonicalWorkID = nil
                             model.openTranscript(sessionID: entry.sessionID)
                         } label: {
                             HStack(spacing: 6) {
@@ -113,14 +190,14 @@ struct FlockView: View {
                         }
                         .buttonStyle(.plain)
 
-                        FanoutTimeline(nodes: entry.nodes.flatMap(\.flattened),
-                                       selectedID: $selectedNodeID)
+                        FanoutTimeline(
+                            nodes: entry.nodes.flatMap(\.flattened), selectedID: legacySelection)
 
-                        ForEach(entry.nodes) { node in
+                        ForEach(Array(entry.nodes.enumerated()), id: \.offset) { _, node in
                             AgentNodeRow(
                                 node: node,
                                 depth: 0,
-                                selectedID: $selectedNodeID,
+                                selectedID: legacySelection,
                                 expanded: $expanded)
                         }
                     }
@@ -131,6 +208,7 @@ struct FlockView: View {
                     .overlay(
                         RoundedRectangle(cornerRadius: 9, style: .continuous)
                             .strokeBorder(.separator.opacity(0.6), lineWidth: 1))
+                    }
                 }
             }
             .padding(Design.gutter)
@@ -141,14 +219,183 @@ struct FlockView: View {
 
     @ViewBuilder
     private var detailPane: some View {
-        if let node = selectedNode {
+        if let work = selectedCanonicalWork {
+            CanonicalFlockDetail(work: work)
+        } else if let node = selectedNode {
             AgentNodeDetail(node: node)
         } else {
             EmptyStateView(
                 symbol: "sidebar.right",
-                title: "Pick a sub-agent",
-                message: "Its instructions, the code that spawned it, its model, and its "
-                    + "own transcript are all recorded.")
+                title: "Pick Work or a legacy child",
+                message: "Canonical Work is authoritative for lifecycle and attention. Legacy "
+                    + "child details remain available only where no native projection exists.")
+        }
+    }
+}
+
+private struct CanonicalFlockWorkRow: View {
+    let work: CanonicalFlockCatalogProjection
+    @Binding var selectedID: String?
+    let onSelect: () -> Void
+
+    private var selected: Bool { selectedID == work.id }
+    private var running: Bool {
+        work.isRunning
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Button {
+                onSelect()
+                selectedID = work.id
+            } label: {
+                HStack(spacing: 7) {
+                    if running {
+                        PulseDot(color: Design.success)
+                    } else if !work.isAvailable || !work.childLifecycleAvailable {
+                        Image(systemName: "questionmark.circle")
+                            .foregroundStyle(Design.warning)
+                    } else {
+                        Circle().fill(.tertiary).frame(width: 7, height: 7)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(work.sessions.first?.title ?? "Unattached Work")
+                            .font(.system(size: 12, weight: .semibold))
+                            .lineLimit(1)
+                        Text(work.id).font(Design.mono(9)).foregroundStyle(.tertiary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                    Spacer()
+                    if let attention = work.attentionStatus.attention,
+                       work.attentionStatus.requirement == .required {
+                        Chip(text: attention.rawValue, symbol: "exclamationmark.bubble",
+                             tint: Design.warning, filled: true)
+                    } else if work.attentionStatus.requirement == .unknown {
+                        Chip(text: "attention unknown", symbol: "questionmark.bubble",
+                             tint: Design.warning)
+                    }
+                    Chip(text: work.childLifecycleAvailable ? "\(work.children.count)" : "?",
+                         symbol: "bird",
+                         tint: Design.agentMessage)
+                }
+            }
+            .buttonStyle(.plain)
+
+            HStack(spacing: 6) {
+                if let host = work.workHost {
+                    Chip(text: host.workHostID, symbol: "server.rack")
+                }
+                if let lifecycle = work.lifecycle { Chip(text: lifecycle.rawValue) }
+                if let execution = work.execution { Chip(text: execution.rawValue) }
+                if let model = work.modelID {
+                    Text(model).font(Design.mono(9)).foregroundStyle(.tertiary)
+                }
+                Spacer()
+            }
+
+            if work.childLifecycleAvailable {
+                if work.children.isEmpty {
+                    Text("No child lifecycle records at this Work tip.")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                } else {
+                    ForEach(Array(work.children.prefix(FlockView.maxDisplayedChildrenPerWork))) { child in
+                        HStack(spacing: 6) {
+                            Circle().fill(child.state == "running"
+                                          ? AnyShapeStyle(Design.success)
+                                          : AnyShapeStyle(.tertiary))
+                                .frame(width: 6, height: 6)
+                            Text(child.name ?? child.childID).font(.system(size: 11))
+                            Spacer()
+                            Text(child.state).font(Design.mono(9)).foregroundStyle(.secondary)
+                        }
+                        .padding(.leading, 12)
+                    }
+                    if work.children.count > FlockView.maxDisplayedChildrenPerWork {
+                        Text("+\(work.children.count - FlockView.maxDisplayedChildrenPerWork) children omitted")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .padding(.leading, 12)
+                    }
+                }
+            } else {
+                Text(work.unavailableReason ?? "Child lifecycle is unavailable")
+                    .font(.system(size: 10)).foregroundStyle(Design.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(selected ? AnyShapeStyle(Design.accentSoft)
+                      : AnyShapeStyle(.background.secondary)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(selected ? AnyShapeStyle(Design.accent.opacity(0.7))
+                              : AnyShapeStyle(.separator.opacity(0.6)), lineWidth: 1))
+    }
+}
+
+private struct CanonicalFlockDetail: View {
+    let work: CanonicalFlockCatalogProjection
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    Image(systemName: "circle.hexagongrid.fill")
+                        .foregroundStyle(Design.agentMessage)
+                    Text(work.sessions.first?.title ?? "Unattached Work")
+                        .font(.system(size: 16, weight: .semibold))
+                    if let attention = work.attentionStatus.attention,
+                       work.attentionStatus.requirement == .required {
+                        Chip(text: attention.rawValue, symbol: "exclamationmark.bubble",
+                             tint: Design.warning, filled: true)
+                    } else if work.attentionStatus.requirement == .unknown {
+                        Chip(text: "attention unknown", symbol: "questionmark.bubble",
+                             tint: Design.warning)
+                    }
+                }
+                Card("Canonical Work", symbol: "checkmark.seal") {
+                    VStack(alignment: .leading, spacing: 5) {
+                        DetailRow(label: "Work", value: work.id, mono: true)
+                        DetailRow(label: "Host",
+                                  value: work.workHost?.workHostID ?? "unknown", mono: true)
+                        DetailRow(label: "Lifecycle",
+                                  value: work.lifecycle?.rawValue ?? "unknown")
+                        DetailRow(label: "Execution",
+                                  value: work.execution?.rawValue ?? "unknown")
+                        DetailRow(label: "Model", value: work.modelID ?? "unknown", mono: true)
+                        DetailRow(label: "Children",
+                                  value: work.childLifecycleAvailable
+                                    ? "\(work.children.count)" : "unknown")
+                    }
+                }
+                if !work.sessions.isEmpty {
+                    Card("Attached Sessions", symbol: "bubble.left.and.text.bubble.right") {
+                        VStack(alignment: .leading, spacing: 5) {
+                            ForEach(work.sessions) { link in
+                                HStack {
+                                    Text(link.title).font(.system(size: 11))
+                                    Spacer()
+                                    Text(link.attention?.rawValue ?? "attention unknown")
+                                        .font(Design.mono(9)).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+                if !work.childLifecycleAvailable {
+                    Card("Projection status", symbol: "exclamationmark.triangle") {
+                        Text(work.unavailableReason ?? "Child lifecycle is unavailable")
+                            .font(.system(size: 11)).foregroundStyle(Design.warning)
+                        if !work.unknownDomains.isEmpty {
+                            Text("Unknown domains: "
+                                 + work.unknownDomains.map(\.rawValue).joined(separator: ", "))
+                                .font(Design.mono(9)).foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+            .padding(Design.gutter)
         }
     }
 }
@@ -161,15 +408,18 @@ struct AgentNodeRow: View {
     @Binding var selectedID: String?
     @Binding var expanded: Set<String>
 
-    private var isExpanded: Bool { expanded.contains(node.id) }
-    private var isSelected: Bool { selectedID == node.id }
+    private var rowID: String {
+        LegacyFlockIdentity.rowID(parentSessionID: node.parentSessionID, childID: node.id)
+    }
+    private var isExpanded: Bool { expanded.contains(rowID) }
+    private var isSelected: Bool { selectedID == rowID }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 5) {
                 if !node.children.isEmpty {
                     Button {
-                        if isExpanded { expanded.remove(node.id) } else { expanded.insert(node.id) }
+                        if isExpanded { expanded.remove(rowID) } else { expanded.insert(rowID) }
                     } label: {
                         Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                             .font(.system(size: 8, weight: .bold))
@@ -184,7 +434,7 @@ struct AgentNodeRow: View {
                 statusDot
 
                 Button {
-                    selectedID = node.id
+                    selectedID = rowID
                 } label: {
                     HStack(spacing: 6) {
                         Text(node.name)
@@ -212,7 +462,7 @@ struct AgentNodeRow: View {
             .padding(.leading, CGFloat(depth) * 15)
 
             if isExpanded {
-                ForEach(node.children) { child in
+                ForEach(Array(node.children.enumerated()), id: \.offset) { _, child in
                     AgentNodeRow(
                         node: child, depth: depth + 1,
                         selectedID: $selectedID, expanded: $expanded)
@@ -259,7 +509,7 @@ struct FanoutTimeline: View {
             VStack(alignment: .leading, spacing: 2) {
                 GeometryReader { geo in
                     VStack(alignment: .leading, spacing: 2) {
-                        ForEach(nodes.prefix(24)) { node in
+                        ForEach(Array(nodes.prefix(24).enumerated()), id: \.offset) { _, node in
                             let offset = max(0, node.createdAt.timeIntervalSince(bounds.start)) / span
                             let width = max(0.006, node.duration / span)
                             ZStack(alignment: .leading) {
@@ -270,7 +520,10 @@ struct FanoutTimeline: View {
                                     .offset(x: geo.size.width * offset)
                             }
                             .frame(height: 5)
-                            .onTapGesture { selectedID = node.id }
+                            .onTapGesture {
+                                selectedID = LegacyFlockIdentity.rowID(
+                                    parentSessionID: node.parentSessionID, childID: node.id)
+                            }
                             .help("\(node.name) · \(Fmt.duration(node.duration)) · \(node.status)")
                         }
                     }
@@ -292,7 +545,8 @@ struct FanoutTimeline: View {
     }
 
     private func barColor(_ node: AgentNode) -> Color {
-        if selectedID == node.id { return Design.accent }
+        if selectedID == LegacyFlockIdentity.rowID(
+            parentSessionID: node.parentSessionID, childID: node.id) { return Design.accent }
         if node.isRunning { return Design.success.opacity(0.8) }
         if node.isFailed { return Design.danger.opacity(0.8) }
         return Design.agentMessage.opacity(0.55)

@@ -483,6 +483,12 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
     /// stale, foreign, divergent, tailed, or corrupt page remains an unavailable projection and
     /// cannot contribute lifecycle rows.
     public let canonicalFlock: CanonicalFlockProjection?
+    /// Flock's production-facing catalog projection, retained so Census fixtures exercise the
+    /// same unknown-domain and authority rules as the UI.
+    public let canonicalFlockCatalog: [CanonicalFlockCatalogProjection]
+    /// Bounded client-neutral attention rows. This is not an OS-notification projection and
+    /// does not claim that the observing client has control capability.
+    public let canonicalAttentionInbox: CanonicalAttentionInboxProjection
     public let registeredConsumers: [String]
     public let intentionallyUnwiredConsumers: [String]
 
@@ -535,6 +541,8 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         unknownReferences: [EventRef],
         assemblerReady: Bool, canonicalSessionCatalog: CanonicalSessionCatalogSummary? = nil,
         canonicalFlock: CanonicalFlockProjection? = nil,
+        canonicalFlockCatalog: [CanonicalFlockCatalogProjection] = [],
+        canonicalAttentionInbox: CanonicalAttentionInboxProjection = .init(summaries: []),
         registeredConsumers: [String] = [],
         intentionallyUnwiredConsumers: [String]
     ) {
@@ -578,6 +586,8 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         self.assemblerReady = assemblerReady
         self.canonicalSessionCatalog = canonicalSessionCatalog
         self.canonicalFlock = canonicalFlock
+        self.canonicalFlockCatalog = canonicalFlockCatalog
+        self.canonicalAttentionInbox = canonicalAttentionInbox
         self.registeredConsumers = registeredConsumers
         self.intentionallyUnwiredConsumers = intentionallyUnwiredConsumers
     }
@@ -587,12 +597,11 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
 /// locations are not part of the protocol and must not leak into a report.
 public enum ReaderCensus {
     private static let defaultIntentionallyUnwiredConsumers = [
-        "Flock UI (canonical projection adoption pending)", "notifications", "search",
-        "service recovery",
+        "notifications", "search", "service recovery",
     ]
     private static let defaultRegisteredConsumers = [
         "production local Timeline catalog", "canonical SessionCatalog projection",
-        "canonical Flock adapter",
+        "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
     ]
     public static func read(
         _ data: Data,
@@ -668,7 +677,7 @@ public enum ReaderCensus {
         workJournal: JournalRef,
         registeredConsumers: [String] = [
             "production local Timeline catalog", "canonical SessionCatalog projection",
-            "canonical Flock adapter",
+            "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
         ],
         intentionallyUnwiredConsumers: [String] = []
     ) -> ReaderCensusReport {
@@ -740,6 +749,13 @@ public enum ReaderCensus {
         let canonicalFlock = workRead.records.isEmpty
             ? nil
             : AgentTreeReader.canonicalProjection(work: work, read: workRead)
+        let canonicalFlockCatalog = canonicalFlock.map {
+            CanonicalFlockCatalogProjection.project(
+                sessions: canonicalSessionCatalog.map { [$0] } ?? [], flock: $0,
+                unknownDomains: work.unknownDomains.sorted { $0.rawValue < $1.rawValue })
+        }.map { [$0] } ?? []
+        let canonicalAttentionInbox = CanonicalAttentionInboxProjection(
+            summaries: canonicalSessionCatalog.map { [$0] } ?? [])
 
         let allEvents = sessionEvents + workEvents
         let allEventRefs = Set(allEvents.map { EventRef(journal: $0.journal, eventID: $0.eventID) })
@@ -846,6 +862,8 @@ public enum ReaderCensus {
             assemblerReady: assemblerReady,
             canonicalSessionCatalog: canonicalSessionCatalog,
             canonicalFlock: canonicalFlock,
+            canonicalFlockCatalog: canonicalFlockCatalog,
+            canonicalAttentionInbox: canonicalAttentionInbox,
             registeredConsumers: registeredConsumers,
             intentionallyUnwiredConsumers: intentionallyUnwiredConsumers)
     }
