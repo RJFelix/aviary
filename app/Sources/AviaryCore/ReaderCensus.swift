@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// The fixture manifest is intentionally data-only. It is useful to external readers and
@@ -129,6 +130,302 @@ public struct ReaderCensusRecovery: Codable, Hashable, Sendable {
     }
 }
 
+/// Whether a context projection has a provider-bound manifest, only a legacy component
+/// projection, or no context evidence at all. `unknown` is intentionally different from an
+/// empty context: an older reader cannot prove that no context was sent.
+public enum ReaderCensusContextProjectionState: String, Codable, Hashable, Sendable {
+    case observed
+    case legacy
+    case unknown
+}
+
+/// The addressability of a retained body. An address is a content-addressed reference, not a
+/// claim that the body is present on this device; this projection never contains a filesystem
+/// path or any body bytes.
+public enum ReaderCensusBodyAddressStatus: String, Codable, Hashable, Sendable {
+    case addressed
+    case notAddressed = "not_addressed"
+}
+
+/// The bounded metadata view of one context component. It deliberately does not carry the
+/// component's body reference: the UI only needs to know whether an address was recorded.
+public struct ReaderCensusContextComponentProjection: Codable, Hashable, Sendable {
+    public let componentID: String
+    public let inclusionID: String
+    public let sourceID: String
+    public let mode: ContextComponentMode
+    public let deliveryMode: ContextDeliveryMode
+    public let measuredBytes: Int?
+    public let includedBytes: Int?
+    public let deliveredBytes: Int?
+    public let fullByteCount: Int?
+    public let digest: String?
+    public let bodyAddressStatus: ReaderCensusBodyAddressStatus
+    public let omitted: Bool
+
+    public var deliveryStatus: ContextDeliveryMode { deliveryMode }
+    public var bodyAddressAvailable: Bool { bodyAddressStatus == .addressed }
+    public var measuredSize: Int? { measuredBytes }
+    public var deliveredSize: Int? { deliveredBytes }
+
+    public init(_ component: ContextComponent) {
+        componentID = component.componentID
+        inclusionID = component.inclusionID
+        sourceID = component.sourceID
+        mode = component.mode
+        deliveryMode = component.deliveryMode
+        measuredBytes = component.measuredBytes
+        includedBytes = component.includedBytes
+        deliveredBytes = component.deliveredBytes
+        fullByteCount = component.fullByteCount
+        digest = component.digest
+        bodyAddressStatus = component.bodyReference == nil ? .notAddressed : .addressed
+        omitted = component.omitted
+    }
+
+    public init(_ component: ReaderCensusContextComponent) {
+        self.init(ContextComponent(
+            componentID: component.componentID, inclusionID: component.inclusionID,
+            sourceID: component.sourceID, mode: component.mode,
+            deliveryMode: component.deliveryMode, measuredBytes: component.measuredBytes,
+            includedBytes: component.includedBytes, deliveredBytes: component.deliveredBytes,
+            fullByteCount: component.fullByteCount, bodyReference: component.bodyReference,
+            digest: component.digest, omitted: component.omitted))
+    }
+}
+
+/// The bounded metadata view of one producer-side system-prompt source. Source identities are
+/// intentionally excluded because they may be paths. Display labels are derived from the typed
+/// kind instead of accepting producer-controlled text, which can itself contain paths or
+/// credentials. Digests, sizes, typed provenance, and addressability are sufficient for a future
+/// UI to explain what was measured without displaying source material.
+public struct ReaderCensusPromptSourceProjection: Codable, Hashable, Sendable {
+    public let sourceID: String
+    public let inclusionID: String
+    public let kind: PromptSourceKind
+    public let status: PromptSourceStatus
+    /// Non-sensitive display text derived from the source kind at this boundary.
+    public let label: String
+    public let fullByteCount: Int?
+    public let deliveredByteCount: Int
+    public let renderedByteCount: Int
+    public let fullDigest: String?
+    public let deliveredDigest: String
+    public let renderedDigest: String
+    public let fullBodyAddressStatus: ReaderCensusBodyAddressStatus
+    public let deliveredBodyAddressStatus: ReaderCensusBodyAddressStatus
+    public let renderedBodyAddressStatus: ReaderCensusBodyAddressStatus
+    public let provenance: EventRef?
+
+    public var fullSize: Int? { fullByteCount }
+    public var deliveredSize: Int { deliveredByteCount }
+    public var renderedSize: Int { renderedByteCount }
+    public var fullBodyAddressAvailable: Bool {
+        fullBodyAddressStatus == .addressed
+    }
+    public var deliveredBodyAddressAvailable: Bool {
+        deliveredBodyAddressStatus == .addressed
+    }
+    public var renderedBodyAddressAvailable: Bool {
+        renderedBodyAddressStatus == .addressed
+    }
+    public var bodyAddressAvailable: Bool {
+        fullBodyAddressAvailable || deliveredBodyAddressAvailable || renderedBodyAddressAvailable
+    }
+    public var bodyAddressStatus: ReaderCensusBodyAddressStatus {
+        bodyAddressAvailable ? .addressed : .notAddressed
+    }
+
+    public init(_ source: ContextManifestSource) {
+        sourceID = Self.opaqueID(source.sourceID, namespace: "source")
+        inclusionID = Self.opaqueID(source.inclusionID, namespace: "inclusion")
+        kind = source.kind
+        status = source.status
+        label = Self.safeLabel(for: source.kind)
+        fullByteCount = source.fullByteCount
+        deliveredByteCount = source.deliveredByteCount
+        renderedByteCount = source.renderedByteCount
+        fullDigest = source.fullDigest
+        deliveredDigest = source.deliveredDigest
+        renderedDigest = source.renderedDigest
+        fullBodyAddressStatus = source.fullBodyReference == nil ? .notAddressed : .addressed
+        deliveredBodyAddressStatus = source.deliveredBodyReference == nil
+            ? .notAddressed : .addressed
+        renderedBodyAddressStatus = source.renderedBodyReference == nil
+            ? .notAddressed : .addressed
+        provenance = source.provenance
+    }
+
+    private static func safeLabel(for kind: PromptSourceKind) -> String {
+        switch kind {
+        case .baseInstruction: "Base instructions"
+        case .workingDirectory: "Working directory"
+        case .contextFile: "Context file"
+        case .skill: "Skills"
+        case .memory: "Memory"
+        case .generated: "Generated context"
+        }
+    }
+
+    private static func opaqueID(_ value: String, namespace: String) -> String {
+        let digest = SHA256.hash(data: Data(value.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        return "\(namespace)-sha256:\(digest)"
+    }
+}
+
+/// A bounded, source-qualified account of what is unknown in the context plane. Counts retain
+/// the distinction between "there were no unknowns" and "the bounded list omitted some".
+public struct ReaderCensusContextUnknowns: Codable, Hashable, Sendable {
+    public let eventRefs: [EventRef]
+    public let eventRefOmittedCount: Int
+    public let domains: [TimelineDomain]
+    public let referenceIDs: [String]
+    public let referenceIDOmittedCount: Int
+
+    public init(
+        eventRefs: [EventRef], eventRefOmittedCount: Int,
+        domains: [TimelineDomain], referenceIDs: [String], referenceIDOmittedCount: Int
+    ) {
+        self.eventRefs = eventRefs
+        self.eventRefOmittedCount = eventRefOmittedCount
+        self.domains = domains
+        self.referenceIDs = referenceIDs
+        self.referenceIDOmittedCount = referenceIDOmittedCount
+    }
+}
+
+/// Metadata-only projection of the latest recorded provider-bound model context.
+///
+/// This is a reader projection, not a runtime working-state claim. A manifest-backed state is
+/// the only state that can identify a provider-bound crossing; legacy state preserves its known
+/// components but leaves manifest and source identity unknown. Arrays preserve canonical
+/// producer order where order is semantic and are bounded with explicit omitted counts, so a
+/// future UI cannot mistake a prefix for complete context.
+public struct ReaderCensusContextProjection: Codable, Hashable, Sendable {
+    public static let maxComponents = 64
+    public static let maxPromptSources = 32
+    public static let maxOmissions = 64
+    public static let maxUnknowns = 32
+
+    public let state: ReaderCensusContextProjectionState
+    public let manifestID: String?
+    public let requestID: String?
+    public let modelID: String?
+    public let assemblyID: String?
+    public let components: [ReaderCensusContextComponentProjection]
+    public let componentCount: Int
+    public let omittedComponentCount: Int
+    public let omissions: [ContextManifestOmission]
+    public let omissionCount: Int
+    public let omittedOmissionCount: Int
+    /// Nil means no source list was observed. It does not mean that zero sources were sent.
+    public let promptSources: [ReaderCensusPromptSourceProjection]?
+    public let promptSourceCount: Int?
+    public let omittedPromptSourceCount: Int
+    public let contextBoundaryEventID: String?
+    public let compactionBoundaryEventID: String?
+    /// Raw compaction text is conversation content, not metadata. It may contain paths,
+    /// credentials, or identifiers and therefore stays behind explicit journal inspection.
+    public let compactionSummaryByteCount: Int?
+    public let compactionSummaryDigest: String?
+    public let compactionSummaryInspectionRequired: Bool
+    public let unknowns: ReaderCensusContextUnknowns
+
+    public var sourceProjectionKnown: Bool { promptSources != nil }
+    public var hasOmittedRecords: Bool {
+        omittedComponentCount > 0 || omittedOmissionCount > 0 || omittedPromptSourceCount > 0
+            || unknowns.eventRefOmittedCount > 0 || unknowns.referenceIDOmittedCount > 0
+    }
+
+    init(
+        manifest: ContextManifest?, legacyComponents: [ReaderCensusContextComponent],
+        contextBoundaryEventID: String?, compactionBoundaryEventID: String?,
+        compactionSummary: String?, unknownEventRefs: [EventRef], unknownDomains: [TimelineDomain],
+        unknownReferenceIDs: [String]
+    ) {
+        // Reducer order is the producer's canonical request order. It is meaningful for
+        // components (and remains deterministic for a given journal prefix), so do not sort it
+        // lexicographically: `include-10` must not move ahead of `include-2`.
+        let manifestComponents = manifest?.components
+        let componentCount = manifestComponents?.count ?? legacyComponents.count
+        self.componentCount = componentCount
+        if let manifestComponents {
+            components = Array(manifestComponents.prefix(Self.maxComponents)).map {
+                ReaderCensusContextComponentProjection($0)
+            }
+        } else {
+            components = legacyComponents.prefix(Self.maxComponents).map {
+                ReaderCensusContextComponentProjection($0)
+            }
+        }
+        omittedComponentCount = max(0, componentCount - components.count)
+
+        let allOmissions = manifest?.omissions ?? []
+        omissionCount = allOmissions.count
+        omissions = Array(allOmissions.prefix(Self.maxOmissions))
+        omittedOmissionCount = max(0, allOmissions.count - omissions.count)
+
+        // A standalone source observation can be immediately followed by a failed or
+        // quarantined crossing. It is evidence about a producer observation, not evidence that
+        // those sources reached a model request. The recorded-crossing projection therefore
+        // takes source identity only from the provider-bound manifest.
+        let sourceRecords = manifest?.systemPromptSources
+        if let sourceRecords {
+            promptSources = Array(sourceRecords.prefix(Self.maxPromptSources)).map {
+                ReaderCensusPromptSourceProjection($0)
+            }
+            promptSourceCount = sourceRecords.count
+            omittedPromptSourceCount = max(0, sourceRecords.count - (promptSources?.count ?? 0))
+        } else {
+            promptSources = nil
+            promptSourceCount = nil
+            omittedPromptSourceCount = 0
+        }
+
+        if manifest != nil {
+            state = .observed
+        } else if !legacyComponents.isEmpty {
+            state = .legacy
+        } else {
+            state = .unknown
+        }
+        manifestID = manifest?.manifestID
+        requestID = manifest?.requestID
+        modelID = manifest?.modelID
+        assemblyID = manifest?.systemPromptAssemblyID
+        self.contextBoundaryEventID = contextBoundaryEventID
+        self.compactionBoundaryEventID = compactionBoundaryEventID
+
+        if let compactionSummary {
+            let bytes = Data(compactionSummary.utf8)
+            compactionSummaryByteCount = bytes.count
+            compactionSummaryDigest = "sha256:" + SHA256.hash(data: bytes)
+                .map { String(format: "%02x", $0) }.joined()
+            compactionSummaryInspectionRequired = true
+        } else {
+            compactionSummaryByteCount = nil
+            compactionSummaryDigest = nil
+            compactionSummaryInspectionRequired = false
+        }
+
+        let sortedEvents = unknownEventRefs.sorted {
+            if $0.journal.stableKey != $1.journal.stableKey {
+                return $0.journal.stableKey < $1.journal.stableKey
+            }
+            return $0.eventID < $1.eventID
+        }
+        let boundedEvents = Array(sortedEvents.prefix(Self.maxUnknowns))
+        let sortedReferences = Array(Set(unknownReferenceIDs)).sorted()
+        let boundedReferences = Array(sortedReferences.prefix(Self.maxUnknowns))
+        unknowns = ReaderCensusContextUnknowns(
+            eventRefs: boundedEvents, eventRefOmittedCount: max(0, sortedEvents.count - boundedEvents.count),
+            domains: Array(Set(unknownDomains).sorted { $0.rawValue < $1.rawValue }),
+            referenceIDs: boundedReferences,
+            referenceIDOmittedCount: max(0, sortedReferences.count - boundedReferences.count))
+    }
+}
+
 /// A deliberately boring, serializable account of what a core reader can prove.
 ///
 /// This is a diagnostic projection, not a second source of truth. In particular, an
@@ -158,6 +455,8 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
     /// Latest complete production crossing metadata. Nil is allowed for older fixtures that
     /// predate the provider-bound manifest fields while still carrying components.
     public let contextManifest: ContextManifest?
+    public let contextBoundaryEventID: String?
+    public let compactionBoundaryEventID: String?
     public let compactionSummary: String?
     public let recovery: [ReaderCensusRecovery]
     public let authoredAttention: SessionAttention
@@ -187,6 +486,25 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
     public let registeredConsumers: [String]
     public let intentionallyUnwiredConsumers: [String]
 
+    /// Bounded metadata-only view of the latest provider-bound context the journal accepted.
+    /// This does not claim that an unchanged context will be sent on the next request: later
+    /// messages, compaction, attachments, or runtime decisions may alter that future crossing.
+    public var recordedModelContext: ReaderCensusContextProjection {
+        ReaderCensusContextProjection(
+            manifest: contextManifest, legacyComponents: contextComponents,
+            contextBoundaryEventID: contextBoundaryEventID,
+            compactionBoundaryEventID: compactionBoundaryEventID,
+            compactionSummary: compactionSummary, unknownEventRefs: unknownEventRefs,
+            unknownDomains: unknownDomains, unknownReferenceIDs: unknownReferenceIDs)
+    }
+
+    /// Compatibility alias retained for callers built before the projection's temporal basis
+    /// was named precisely. Prefer `recordedModelContext` in new code.
+    public var nextModelContext: ReaderCensusContextProjection { recordedModelContext }
+
+    /// Naming useful to callers that treat this as a general report projection.
+    public var contextProjection: ReaderCensusContextProjection { recordedModelContext }
+
     /// Compatibility projection for older consumers. Equal event IDs from different journals
     /// intentionally collapse here; use `unknownEventRefs` when provenance matters.
     public var unknownEventIDs: [String] {
@@ -203,7 +521,9 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         sessionTailBytes: Int, workTailBytes: Int,
         visibleMessageIDs: [String], contextInclusionIDs: [String], omittedContextIDs: [String],
         contextComponents: [ReaderCensusContextComponent],
-        contextManifest: ContextManifest? = nil, compactionSummary: String?,
+        contextManifest: ContextManifest? = nil,
+        contextBoundaryEventID: String? = nil, compactionBoundaryEventID: String? = nil,
+        compactionSummary: String?,
         recovery: [ReaderCensusRecovery], authoredAttention: SessionAttention,
         attention: SessionAttention,
         outstandingActionIDs: [String], indeterminateActionIDs: [String],
@@ -236,6 +556,8 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         self.omittedContextIDs = omittedContextIDs
         self.contextComponents = contextComponents
         self.contextManifest = contextManifest
+        self.contextBoundaryEventID = contextBoundaryEventID
+        self.compactionBoundaryEventID = compactionBoundaryEventID
         self.compactionSummary = compactionSummary
         self.recovery = recovery
         self.authoredAttention = authoredAttention
@@ -492,6 +814,8 @@ public enum ReaderCensus {
             omittedContextIDs: omittedContext,
             contextComponents: contextComponents,
             contextManifest: session.contextManifest,
+            contextBoundaryEventID: session.contextBoundaryEventID,
+            compactionBoundaryEventID: session.compactionBoundaryEventID,
             compactionSummary: session.compactionSummary,
             recovery: session.recovery.map {
                 ReaderCensusRecovery(journal: sessionJournal, coverage: $0)

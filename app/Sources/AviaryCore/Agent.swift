@@ -39,6 +39,10 @@ public actor Agent {
         public var model: ModelSpec
         public var cwd: String
         public var systemPrompt: String
+        /// The producer-side decomposition of the pinned system instruction. It is auxiliary to
+        /// ``systemPrompt`` and remains nil for legacy/native-resume configurations whose
+        /// durable prefix only retained an opaque aggregate message.
+        public var systemPromptAssembly: SystemPromptAssembly?
         /// A ceiling on model round trips per prompt. Not a budget — a stop, so a tool-calling
         /// loop that never converges cannot spend indefinitely while nobody is watching.
         public var maxIterations: Int
@@ -75,6 +79,7 @@ public actor Agent {
 
         public init(
             model: ModelSpec, cwd: String, systemPrompt: String,
+            systemPromptAssembly: SystemPromptAssembly? = nil,
             maxIterations: Int = 40, maxTokens: Int? = nil, reasoningEffort: String? = nil,
             compactAtContextShare: Double = 0.7, maxDepth: Int = 3, depth: Int = 0,
             goal: Goal? = nil, resumedHistory: [ChatMessage] = [],
@@ -83,6 +88,7 @@ public actor Agent {
             self.model = model
             self.cwd = cwd
             self.systemPrompt = systemPrompt
+            self.systemPromptAssembly = systemPromptAssembly
             self.maxIterations = maxIterations
             self.maxTokens = maxTokens
             self.reasoningEffort = reasoningEffort
@@ -1105,7 +1111,8 @@ public actor Agent {
         for request: ChatRequest,
         purpose: String,
         kind: ActionKind,
-        intent: String
+        intent: String,
+        assembly: SystemPromptAssembly? = nil
     ) async -> EffectPermit? {
         guard let nativeJournal else { return nil }
         guard let contextBodyStore else {
@@ -1113,6 +1120,50 @@ public actor Agent {
                 "the \(purpose) context crossing",
                 NativeJournalFailure(detail: "The retained context body store is unavailable."))
             return nil
+        }
+        let applicableAssembly = assembly ?? config.systemPromptAssembly
+        if let applicableAssembly {
+            guard applicableAssembly.sources.count <= 32 else {
+                latchNativeJournalFailure(
+                    "validating the \(purpose) prompt sources",
+                    NativeJournalFailure(
+                        detail: "The prompt source decomposition exceeds 32 sources."))
+                return nil
+            }
+            let systemMessages = request.messages.filter { $0.role == .system }
+            guard systemMessages.count == 1,
+                  let systemMessage = systemMessages.first,
+                  systemMessage.content.count == 1,
+                  case .text(let systemText) = systemMessage.content[0] else {
+                latchNativeJournalFailure(
+                    "validating the \(purpose) system prompt",
+                    NativeJournalFailure(
+                        detail: "The assembled system prompt must be one text ChatMessage."))
+                return nil
+            }
+            let expectedBytes = Data(systemText.utf8)
+            let assemblyBytes = Data(applicableAssembly.flattenedText.utf8)
+            var renderedBytes = Data()
+            var expectedOffset = 0
+            var sourceAccountingValid = true
+            for source in applicableAssembly.sources {
+                guard source.renderedByteOffset == expectedOffset else {
+                    sourceAccountingValid = false
+                    break
+                }
+                let bytes = Data(source.renderedBody.utf8)
+                renderedBytes.append(bytes)
+                expectedOffset += bytes.count
+            }
+            guard sourceAccountingValid, renderedBytes == expectedBytes,
+                  assemblyBytes == expectedBytes,
+                  expectedOffset == expectedBytes.count else {
+                latchNativeJournalFailure(
+                    "validating the \(purpose) system prompt",
+                    NativeJournalFailure(
+                        detail: "The prompt source rendering does not equal the system message."))
+                return nil
+            }
         }
         let ordinal = modelRequestOrdinal
         let priorDeliveredBytes = await nativeJournal.activeRunContextDeliveredBytes
@@ -1127,6 +1178,7 @@ public actor Agent {
             return nil
         }
         var bodyReferences: [String: TimelineBodyReference] = [:]
+        var promptSources: [ContextManifestSource]?
         do {
             // The first component per message is in message order; the final optional
             // component is the tool schema. Retain the full source bytes before the manifest
@@ -1147,15 +1199,67 @@ public actor Agent {
                     mediaType: "application/vnd.aviary.tool-schema-manifest+json")
                 bodyReferences[component.sourceID] = reference
             }
+
+            if let applicableAssembly {
+                var records: [ContextManifestSource] = []
+                records.reserveCapacity(applicableAssembly.sources.count)
+                for (index, source) in applicableAssembly.sources.enumerated() {
+                    let inclusionID = "\(requestID):source:\(index)"
+                    switch source.status {
+                    case .missing, .unreadable, .disabled:
+                        // These statuses intentionally carry no body or reference. The source
+                        // remains visible as an observation, but there is nothing reconstructable
+                        // to retain for a source that never entered the rendered prompt.
+                        guard source.fullBody == nil,
+                              source.deliveredBody.isEmpty,
+                              source.renderedBody.isEmpty else {
+                            throw NativeJournalFailure(
+                                detail: "Source \(source.sourceID) claims \(source.status.rawValue) "
+                                    + "but carries body bytes.")
+                        }
+                        records.append(ContextManifestSource(
+                            source: source, inclusionID: inclusionID, provenance: nil))
+                    case .present, .truncated:
+                        guard let fullBody = source.fullBody else {
+                            throw NativeJournalFailure(
+                                detail: "Source \(source.sourceID) has no full body.")
+                        }
+                        let fullReference = try contextBodyStore.retain(
+                            Data(fullBody.utf8), authority: nativeJournal.sessionJournal,
+                            mediaType: "application/vnd.aviary.prompt-source+utf8")
+                        let deliveredReference = try contextBodyStore.retain(
+                            Data(source.deliveredBody.utf8), authority: nativeJournal.sessionJournal,
+                            mediaType: "application/vnd.aviary.prompt-source+utf8")
+                        let renderedReference = try contextBodyStore.retain(
+                            Data(source.renderedBody.utf8), authority: nativeJournal.sessionJournal,
+                            mediaType: "application/vnd.aviary.prompt-source+utf8")
+                        records.append(ContextManifestSource(
+                            source: source, inclusionID: inclusionID,
+                            fullBodyReference: fullReference,
+                            deliveredBodyReference: deliveredReference,
+                            renderedBodyReference: renderedReference,
+                            provenance: nil))
+                    }
+                }
+                promptSources = records
+            }
         } catch {
             latchNativeJournalFailure("retaining the \(purpose) context body", error)
             return nil
         }
         do {
-            let manifest = try ContextManifest.build(
+            let bodyManifest = try ContextManifest.build(
                 request: request, manifestID: requestID, requestID: requestID,
                 bodyReferences: bodyReferences,
                 priorDeliveredBytes: priorDeliveredBytes)
+            let manifest = ContextManifest(
+                schemaVersion: bodyManifest.schemaVersion, manifestID: bodyManifest.manifestID,
+                requestID: bodyManifest.requestID, modelID: bodyManifest.modelID,
+                measuredBy: bodyManifest.measuredBy, components: bodyManifest.components,
+                omissions: bodyManifest.omissions,
+                cumulativeDeliveredBytes: bodyManifest.cumulativeDeliveredBytes,
+                systemPromptAssemblyID: applicableAssembly?.digest,
+                systemPromptSources: promptSources)
             let permit = try await nativeJournal.prepareModelCrossing(
                 manifest: manifest, kind: kind, intent: intent,
                 target: config.model.qualifiedID)
@@ -1456,6 +1560,55 @@ public actor Agent {
         return head + "\n\n[truncated by Aviary: \(text.count) characters in total]"
     }
 
+    /// Add a generated slice while preserving the base assembly's exact source ordering and
+    /// byte offsets. Generated slices are deliberately represented as full source bodies too:
+    /// the bytes are per-request state, but their stable identity lets a crossing explain why a
+    /// turn's system message changed.
+    private func appendGeneratedSource(
+        to assembly: SystemPromptAssembly,
+        sourceID: String,
+        label: String,
+        body: String,
+        renderedPrefix: String = "\n\n"
+    ) throws -> SystemPromptAssembly {
+        let renderedBody = renderedPrefix + body
+        let source = try PromptSource(
+            sourceID: sourceID, kind: .generated, label: label,
+            identity: sourceID, status: .present, fullBody: body,
+            deliveredBody: body, renderedBody: renderedBody,
+            deliveredByteOffsetInRendered: Data(renderedPrefix.utf8).count,
+            renderedByteOffset: assembly.flattenedByteCount)
+        return try SystemPromptAssembly(
+            text: assembly.flattenedText + renderedBody,
+            sources: assembly.sources + [source])
+    }
+
+    /// Remove one generated slice before refreshing it. A native resume can restore the exact
+    /// assembly from the previous request, including its goal briefing; re-appending the stable
+    /// goal source ID would otherwise be rejected as a duplicate. Rebuilding the offsets here
+    /// keeps the replacement producer-side and leaves every other source byte untouched.
+    private func removingSource(
+        from assembly: SystemPromptAssembly, sourceID: String
+    ) throws -> SystemPromptAssembly {
+        guard assembly.sources.contains(where: { $0.sourceID == sourceID }) else {
+            return assembly
+        }
+        var offset = 0
+        let sources = try assembly.sources.compactMap { source -> PromptSource? in
+            guard source.sourceID != sourceID else { return nil }
+            let retained = try PromptSource(
+                sourceID: source.sourceID, kind: source.kind, label: source.label,
+                identity: source.identity, status: source.status, fullBody: source.fullBody,
+                deliveredBody: source.deliveredBody, renderedBody: source.renderedBody,
+                deliveredByteOffsetInRendered: source.deliveredByteOffsetInRendered,
+                renderedByteOffset: offset)
+            offset += retained.renderedByteCount
+            return retained
+        }
+        return try SystemPromptAssembly(
+            text: sources.map(\.renderedBody).joined(), sources: sources)
+    }
+
     /// Hold the run open while work it asked to be told about is still going.
     ///
     /// Returns true when something arrived, so the loop can take it. Bounded, because a
@@ -1544,14 +1697,33 @@ public actor Agent {
             return line
         }.joined(separator: "\n\n")
 
+        let compactionInstructions =
+            "You compress an agent's working transcript so it can keep going. "
+            + "Write a dense factual summary: what was attempted, what was learned, "
+            + "what is established fact about this codebase, what failed and why, and "
+            + "what remains. Keep file paths, commands, identifiers and numbers "
+            + "exactly. Omit pleasantries and narration. No preamble."
+        let compactionAssembly: SystemPromptAssembly
+        do {
+            let source = try PromptSource(
+                sourceID: "generated:compaction-instructions:v1",
+                kind: .generated, label: "Compaction instructions",
+                identity: "generated:compaction-instructions:v1", status: .present,
+                fullBody: compactionInstructions, deliveredBody: compactionInstructions,
+                renderedBody: compactionInstructions)
+            compactionAssembly = try SystemPromptAssembly(
+                text: compactionInstructions, sources: [source])
+        } catch {
+            if nativeJournal != nil {
+                latchNativeJournalFailure("assembling the compaction prompt", error)
+            }
+            return
+        }
+
         let ask = ChatRequest(
             model: config.model.id,
             messages: [
-                .system("You compress an agent's working transcript so it can keep going. "
-                    + "Write a dense factual summary: what was attempted, what was learned, "
-                    + "what is established fact about this codebase, what failed and why, and "
-                    + "what remains. Keep file paths, commands, identifiers and numbers "
-                    + "exactly. Omit pleasantries and narration. No preamble."),
+                .system(compactionInstructions),
                 .user("Summarise this span of work:\n\n"
                     + String(transcriptText.prefix(60_000))),
             ])
@@ -1559,7 +1731,8 @@ public actor Agent {
         var summary = ""
         let permit = await prepareModelCrossing(
             for: ask, purpose: "compaction", kind: .compactionProvider,
-            intent: "Compact the conversation with the provider")
+            intent: "Compact the conversation with the provider",
+            assembly: compactionAssembly)
         do { try requireNativePermit(permit, for: "compaction provider") }
         catch { return }
         do {
@@ -1630,11 +1803,44 @@ public actor Agent {
 
     private func runTurn() async throws -> Turn {
         var messagesForTurn = messages
+        var requestAssembly = config.systemPromptAssembly
+        if let assembly = requestAssembly {
+            guard let first = messagesForTurn.first,
+                  first.role == .system,
+                  first.content.count == 1,
+                  case .text(let systemText) = first.content[0],
+                  Data(systemText.utf8) == Data(assembly.flattenedText.utf8) else {
+                let error = NativeJournalFailure(
+                    detail: "The configured prompt assembly does not equal the system message.")
+                if nativeJournal != nil {
+                    latchNativeJournalFailure("validating the model system prompt", error)
+                }
+                throw error
+            }
+        }
         if let goal = config.goal, let first = messagesForTurn.first, first.role == .system {
             // Refreshed every turn rather than stated once: the remaining budget is the part
             // that changes, and a stale number is worse than none.
-            messagesForTurn[0] = .system(
-                first.plainText + "\n\n" + goal.briefing(spent: totalUsage.totalTokens))
+            let briefing = goal.briefing(spent: totalUsage.totalTokens)
+            if let assembly = requestAssembly {
+                do {
+                    let baseAssembly = try removingSource(
+                        from: assembly, sourceID: "generated:goal-briefing:v1")
+                    let refreshedAssembly = try appendGeneratedSource(
+                        to: baseAssembly, sourceID: "generated:goal-briefing:v1",
+                        label: "Goal briefing", body: briefing)
+                    requestAssembly = refreshedAssembly
+                    messagesForTurn[0] = .system(refreshedAssembly.flattenedText)
+                } catch {
+                    if nativeJournal != nil {
+                        latchNativeJournalFailure("assembling the goal briefing", error)
+                    }
+                    throw error
+                }
+            } else {
+                messagesForTurn[0] = .system(
+                    first.plainText + "\n\n" + briefing)
+            }
         }
         let tools = activeTools
         if let expected = config.expectedResumeTools {
@@ -1655,7 +1861,7 @@ public actor Agent {
 
         let permit = await prepareModelCrossing(
             for: request, purpose: "model", kind: .provider,
-            intent: "Request the next agent response")
+            intent: "Request the next agent response", assembly: requestAssembly)
         try requireNativePermit(permit, for: "provider")
         var turn = Turn()
         var streamFailure: Error?

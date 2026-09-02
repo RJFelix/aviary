@@ -6,6 +6,123 @@ import Darwin
 import Glibc
 #endif
 
+/// The metadata-only durable projection of one producer-side system-prompt source.
+///
+/// This is deliberately separate from ``PromptSource``: the latter owns in-memory source
+/// bodies, while this value is safe to put in a journal or manifest.  A source identity is
+/// stable across content changes; the digests identify the bytes observed for this inclusion.
+public struct ContextManifestSource: Codable, Hashable, Sendable {
+    public let sourceID: String
+    public let inclusionID: String
+    public let kind: PromptSourceKind
+    public let status: PromptSourceStatus
+    public let label: String
+    public let fullByteCount: Int?
+    public let fullDigest: String?
+    public let deliveredByteCount: Int
+    public let deliveredDigest: String
+    public let deliveredByteOffsetInRendered: Int
+    public let renderedByteCount: Int
+    public let renderedDigest: String
+    public let fullBodyReference: TimelineBodyReference?
+    public let deliveredBodyReference: TimelineBodyReference?
+    public let renderedBodyReference: TimelineBodyReference?
+    public let provenance: EventRef?
+
+    public var fullBodyRef: TimelineBodyReference? { fullBodyReference }
+    public var deliveredBodyRef: TimelineBodyReference? { deliveredBodyReference }
+    public var renderedBodyRef: TimelineBodyReference? { renderedBodyReference }
+
+    public init(
+        sourceID: String,
+        inclusionID: String,
+        kind: PromptSourceKind,
+        status: PromptSourceStatus,
+        label: String,
+        fullByteCount: Int? = nil,
+        fullDigest: String? = nil,
+        deliveredByteCount: Int,
+        deliveredDigest: String,
+        deliveredByteOffsetInRendered: Int = 0,
+        renderedByteCount: Int,
+        renderedDigest: String,
+        fullBodyReference: TimelineBodyReference? = nil,
+        deliveredBodyReference: TimelineBodyReference? = nil,
+        renderedBodyReference: TimelineBodyReference? = nil,
+        provenance: EventRef? = nil
+    ) {
+        self.sourceID = sourceID
+        self.inclusionID = inclusionID
+        self.kind = kind
+        self.status = status
+        self.label = label
+        self.fullByteCount = fullByteCount
+        self.fullDigest = fullDigest
+        self.deliveredByteCount = deliveredByteCount
+        self.deliveredDigest = deliveredDigest
+        self.deliveredByteOffsetInRendered = deliveredByteOffsetInRendered
+        self.renderedByteCount = renderedByteCount
+        self.renderedDigest = renderedDigest
+        self.fullBodyReference = fullBodyReference
+        self.deliveredBodyReference = deliveredBodyReference
+        self.renderedBodyReference = renderedBodyReference
+        self.provenance = provenance
+    }
+
+    /// Adapt an in-memory source without serializing any body. Delivered source content and its
+    /// exact rendered prompt slice remain separate when the producer added framing.
+    public init(
+        source: PromptSource,
+        inclusionID: String,
+        fullBodyReference: TimelineBodyReference? = nil,
+        deliveredBodyReference: TimelineBodyReference? = nil,
+        renderedBodyReference: TimelineBodyReference? = nil,
+        provenance: EventRef? = nil
+    ) {
+        self.init(
+            sourceID: source.sourceID, inclusionID: inclusionID, kind: source.kind,
+            status: source.status, label: source.label, fullByteCount: source.fullByteCount,
+            fullDigest: source.fullDigest, deliveredByteCount: source.deliveredByteCount,
+            deliveredDigest: source.deliveredDigest,
+            deliveredByteOffsetInRendered: source.deliveredByteOffsetInRendered,
+            renderedByteCount: source.renderedByteCount,
+            renderedDigest: source.renderedDigest, fullBodyReference: fullBodyReference,
+            deliveredBodyReference: deliveredBodyReference,
+            renderedBodyReference: renderedBodyReference, provenance: provenance)
+    }
+
+    public func withProvenance(_ provenance: EventRef?) -> ContextManifestSource {
+        ContextManifestSource(
+            sourceID: sourceID, inclusionID: inclusionID, kind: kind, status: status,
+            label: label, fullByteCount: fullByteCount, fullDigest: fullDigest,
+            deliveredByteCount: deliveredByteCount, deliveredDigest: deliveredDigest,
+            deliveredByteOffsetInRendered: deliveredByteOffsetInRendered,
+            renderedByteCount: renderedByteCount, renderedDigest: renderedDigest,
+            fullBodyReference: fullBodyReference, deliveredBodyReference: deliveredBodyReference,
+            renderedBodyReference: renderedBodyReference, provenance: provenance)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sourceID = "source_id"
+        case inclusionID = "inclusion_id"
+        case kind, status, label
+        case fullByteCount = "full_byte_count"
+        case fullDigest = "full_digest"
+        case deliveredByteCount = "delivered_byte_count"
+        case deliveredDigest = "delivered_digest"
+        case deliveredByteOffsetInRendered = "delivered_byte_offset_in_rendered"
+        case renderedByteCount = "rendered_byte_count"
+        case renderedDigest = "rendered_digest"
+        case fullBodyReference = "full_body_ref"
+        case deliveredBodyReference = "delivered_body_ref"
+        case renderedBodyReference = "rendered_body_ref"
+        case provenance
+    }
+}
+
+/// Compatibility spelling for callers that describe these as prompt records.
+public typealias ContextPromptSource = ContextManifestSource
+
 /// A bounded account of one request's model-visible context.
 ///
 /// The manifest is deliberately metadata-only. It never stores message text, tool arguments,
@@ -28,6 +145,14 @@ public struct ContextManifest: Codable, Hashable, Sendable {
     public let measuredBytes: Int
     public let deliveredBytes: Int
     public let cumulativeDeliveredBytes: Int
+    /// Optional producer-side decomposition of the pinned system prompt. It is auxiliary to
+    /// ``components`` and therefore contributes nothing to any measured or cumulative total.
+    public let systemPromptAssemblyID: String?
+    public let systemPromptSources: [ContextManifestSource]?
+
+    /// Compatibility aliases used by consumers that call this a prompt assembly.
+    public var promptAssemblyID: String? { systemPromptAssemblyID }
+    public var promptSources: [ContextManifestSource]? { systemPromptSources }
 
     public init(
         schemaVersion: Int = ContextManifest.currentSchemaVersion,
@@ -37,7 +162,9 @@ public struct ContextManifest: Codable, Hashable, Sendable {
         measuredBy: String = ContextManifest.measurementBasis,
         components: [ContextComponent],
         omissions: [ContextManifestOmission] = [],
-        cumulativeDeliveredBytes: Int? = nil
+        cumulativeDeliveredBytes: Int? = nil,
+        systemPromptAssemblyID: String? = nil,
+        systemPromptSources: [ContextManifestSource]? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.manifestID = manifestID
@@ -50,6 +177,8 @@ public struct ContextManifest: Codable, Hashable, Sendable {
         deliveredBytes = Self.checkedSum(components.compactMap(\.deliveredBytes)) ?? -1
         self.cumulativeDeliveredBytes = cumulativeDeliveredBytes
             ?? deliveredBytes
+        self.systemPromptAssemblyID = systemPromptAssemblyID
+        self.systemPromptSources = systemPromptSources
     }
 
     /// Build a manifest for the request shape Aviary owns. `sourceRefs` and `bodyReferences`
@@ -244,6 +373,7 @@ public struct ContextManifest: Codable, Hashable, Sendable {
         guard Self.isPresent(manifestID), Self.isPresent(requestID), Self.isPresent(modelID) else {
             throw ContextManifestValidationError.invalidIdentity
         }
+        try validatePromptSources(authority: authority, requireRetainedBodies: requireRetainedBodies)
         guard !components.isEmpty else {
             throw ContextManifestValidationError.emptyComponents
         }
@@ -327,9 +457,156 @@ public struct ContextManifest: Codable, Hashable, Sendable {
         }
     }
 
+    /// Validate the optional source projection independently of message components. Source
+    /// metadata is bounded and journal-authoritative, but it is never folded into context
+    /// measurement totals (which remain the canonical ChatRequest component accounting).
+    public func validatePromptSources(
+        authority: JournalRef, requireRetainedBodies: Bool = false
+    ) throws {
+        guard let sources = systemPromptSources else {
+            guard systemPromptAssemblyID == nil else {
+                throw ContextManifestValidationError.invalidPromptSourceAssembly
+            }
+            return
+        }
+        guard !sources.isEmpty else {
+            throw ContextManifestValidationError.invalidPromptSourceAssembly
+        }
+        guard sources.count <= 32 else {
+            throw ContextManifestValidationError.tooManyPromptSources
+        }
+        guard Self.isBoundedIdentity(systemPromptAssemblyID ?? ""),
+              ContextBodyStore.isValidDigest(systemPromptAssemblyID ?? "") else {
+            throw ContextManifestValidationError.invalidPromptSourceAssembly
+        }
+        guard Set(sources.map(\.sourceID)).count == sources.count,
+              Set(sources.map(\.inclusionID)).count == sources.count else {
+            throw ContextManifestValidationError.duplicatePromptSourceIdentity
+        }
+
+        var totalRenderedBytes = 0
+        for source in sources {
+            guard Self.isBoundedIdentity(source.sourceID),
+                  Self.isBoundedIdentity(source.inclusionID),
+                  Self.isPresent(source.label), Data(source.label.utf8).count <= 256,
+                  source.deliveredByteCount >= 0,
+                  source.deliveredByteOffsetInRendered >= 0,
+                  source.renderedByteCount >= 0,
+                  ContextBodyStore.isValidDigest(source.deliveredDigest),
+                  ContextBodyStore.isValidDigest(source.renderedDigest) else {
+                throw ContextManifestValidationError.invalidPromptSource(source.sourceID)
+            }
+            if let fullByteCount = source.fullByteCount {
+                guard fullByteCount >= 0,
+                      let fullDigest = source.fullDigest,
+                      ContextBodyStore.isValidDigest(fullDigest),
+                      source.deliveredByteCount <= fullByteCount else {
+                    throw ContextManifestValidationError.invalidPromptSource(source.sourceID)
+                }
+                switch source.status {
+                case .present:
+                    guard source.deliveredByteCount == fullByteCount,
+                          source.deliveredDigest == fullDigest else {
+                        throw ContextManifestValidationError.invalidPromptSource(source.sourceID)
+                    }
+                case .truncated:
+                    guard source.deliveredByteCount < fullByteCount else {
+                        throw ContextManifestValidationError.invalidPromptSource(source.sourceID)
+                    }
+                case .missing, .unreadable, .disabled:
+                    throw ContextManifestValidationError.invalidPromptSource(source.sourceID)
+                }
+            } else {
+                guard source.fullDigest == nil,
+                      source.status == .missing || source.status == .unreadable
+                        || source.status == .disabled,
+                      source.deliveredByteCount == 0, source.renderedByteCount == 0,
+                      source.deliveredByteOffsetInRendered == 0,
+                      source.deliveredDigest == Self.emptyBodyDigest,
+                      source.renderedDigest == Self.emptyBodyDigest,
+                      source.fullBodyReference == nil, source.deliveredBodyReference == nil,
+                      source.renderedBodyReference == nil else {
+                    throw ContextManifestValidationError.invalidPromptSource(source.sourceID)
+                }
+
+                if source.status == .missing || source.status == .unreadable
+                    || source.status == .disabled {
+                    guard source.fullBodyReference == nil, source.deliveredBodyReference == nil,
+                          source.renderedBodyReference == nil else {
+                        throw ContextManifestValidationError.invalidPromptSourceBodyReference(source.sourceID)
+                    }
+                }
+            }
+
+            // Rendered bytes are the exact source slice in the flattened system message. They
+            // may include framing, but can never be negative or claim less than the source bytes.
+            let deliveredEnd = source.deliveredByteOffsetInRendered.addingReportingOverflow(
+                source.deliveredByteCount)
+            guard !deliveredEnd.overflow,
+                  deliveredEnd.partialValue <= source.renderedByteCount else {
+                throw ContextManifestValidationError.invalidPromptSource(source.sourceID)
+            }
+            let renderedTotal = totalRenderedBytes.addingReportingOverflow(
+                source.renderedByteCount)
+            guard !renderedTotal.overflow else {
+                throw ContextManifestValidationError.invalidPromptSourceAssembly
+            }
+            totalRenderedBytes = renderedTotal.partialValue
+            try validatePromptBodyReference(
+                source.fullBodyReference, digest: source.fullDigest, byteCount: source.fullByteCount,
+                authority: authority, sourceID: source.sourceID)
+            try validatePromptBodyReference(
+                source.deliveredBodyReference, digest: source.deliveredDigest,
+                byteCount: source.deliveredByteCount, authority: authority, sourceID: source.sourceID)
+            try validatePromptBodyReference(
+                source.renderedBodyReference, digest: source.renderedDigest,
+                byteCount: source.renderedByteCount, authority: authority, sourceID: source.sourceID)
+            if let provenance = source.provenance, provenance.journal != authority {
+                throw ContextManifestValidationError.invalidPromptSourceProvenance(source.sourceID)
+            }
+            if requireRetainedBodies {
+                guard source.status == .missing || source.status == .unreadable
+                    || source.status == .disabled
+                    || (source.fullBodyReference != nil && source.deliveredBodyReference != nil
+                        && source.renderedBodyReference != nil) else {
+                    throw ContextManifestValidationError.invalidPromptSourceBodyReference(source.sourceID)
+                }
+            }
+            if source.status == .present,
+               let fullReference = source.fullBodyReference,
+               let deliveredReference = source.deliveredBodyReference,
+               fullReference != deliveredReference {
+                throw ContextManifestValidationError.invalidPromptSourceBodyReference(source.sourceID)
+            }
+        }
+    }
+
+    private func validatePromptBodyReference(
+        _ reference: TimelineBodyReference?, digest: String?, byteCount: Int?,
+        authority: JournalRef, sourceID: String
+    ) throws {
+        guard let reference else { return }
+        guard let digest, let byteCount, byteCount >= 0,
+              reference.authority == authority,
+              reference.mediaType == "application/vnd.aviary.prompt-source+utf8",
+              reference.referenceID == digest,
+              reference.digest == digest,
+              reference.byteCount == byteCount,
+              ContextBodyStore.isValidDigest(digest) else {
+            throw ContextManifestValidationError.invalidPromptSourceBodyReference(sourceID)
+        }
+    }
+
     private static func isPresent(_ value: String) -> Bool {
         !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
+
+    private static func isBoundedIdentity(_ value: String) -> Bool {
+        isPresent(value) && Data(value.utf8).count <= 512
+    }
+
+    private static let emptyBodyDigest =
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
     private static func checkedSum<S: Sequence>(_ values: S) -> Int? where S.Element == Int {
         var total = 0
@@ -354,6 +631,12 @@ public enum ContextManifestValidationError: LocalizedError, Equatable, Sendable 
     case inconsistentTotals
     case invalidOmission
     case invalidCumulativeMeasurement(expected: Int, actual: Int)
+    case invalidPromptSourceAssembly
+    case tooManyPromptSources
+    case duplicatePromptSourceIdentity
+    case invalidPromptSource(String)
+    case invalidPromptSourceBodyReference(String)
+    case invalidPromptSourceProvenance(String)
 
     public var errorDescription: String? {
         switch self {
@@ -374,6 +657,18 @@ public enum ContextManifestValidationError: LocalizedError, Equatable, Sendable 
         case .invalidOmission: return "The context manifest omission set is invalid."
         case .invalidCumulativeMeasurement(let expected, let actual):
             return "The cumulative context measurement is \(actual), expected \(expected)."
+        case .invalidPromptSourceAssembly:
+            return "The prompt source assembly identity and records must be present together."
+        case .tooManyPromptSources:
+            return "The prompt source decomposition exceeds its 32-source bound."
+        case .duplicatePromptSourceIdentity:
+            return "The prompt source decomposition repeats a source or inclusion identity."
+        case .invalidPromptSource(let sourceID):
+            return "The prompt source metadata is invalid: \(sourceID)."
+        case .invalidPromptSourceBodyReference(let sourceID):
+            return "The retained prompt source body reference is invalid: \(sourceID)."
+        case .invalidPromptSourceProvenance(let sourceID):
+            return "The prompt source provenance journal is invalid: \(sourceID)."
         }
     }
 }

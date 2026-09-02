@@ -472,6 +472,7 @@ public enum TimelineEventType {
     public static let handleStarted = "handle.started"
     public static let handleOutcome = "handle.outcome"
     public static let recoveryCoverage = "recovery.coverage"
+    public static let contextSourcesObserved = "context.sources_observed"
     public static let contextAssembled = "context.assembled"
     public static let sessionAttention = "session.attention"
     public static let sessionCompleted = "session.completed"
@@ -879,6 +880,7 @@ public struct TimelineEvent: Codable, Hashable, Sendable {
         TimelineEventType.actionIntent,
         TimelineEventType.actionOutcome, TimelineEventType.handleStarted,
         TimelineEventType.handleOutcome, TimelineEventType.recoveryCoverage,
+        TimelineEventType.contextSourcesObserved,
         TimelineEventType.contextAssembled, TimelineEventType.sessionAttention,
         TimelineEventType.sessionCompleted, TimelineEventType.sessionArchived,
         TimelineEventType.sessionTipSelected,
@@ -1335,10 +1337,20 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
     /// Authoritative context-carriage totals, scoped by Run. Optional preserves decoding of
     /// snapshots created before cumulative manifests existed.
     public var contextCumulativeDeliveredBytesByRun: [String: Int]?
+    /// The latest metadata-only producer observation. These fields are auxiliary to the exact
+    /// canonical system message and remain nil for legacy prefixes without source metadata.
+    public var contextPromptAssemblyID: String?
+    public var contextPromptSources: [ContextManifestSource]?
+    public var contextSourcesObservationEventID: String?
+    public var contextSourcesObservationSession: SessionRef?
+    public var contextSourcesObservationWork: WorkRef?
+    public var contextSourcesObservationWorkHost: WorkHostRef?
+    public var contextSourcesObservationRun: RunRef?
     public var contextBoundaryEventID: String?
     /// The latest compaction summary is a durable context projection, not merely an unknown
     /// event retained for a future reader.
     public var compactionSummary: String?
+    public var compactionBoundaryEventID: String?
     /// Child lifecycle is retained on whichever journal records the observation.
     public var childStates: [String: String] = [:]
     public var recovery: [RecoveryCoverage] = []

@@ -448,13 +448,23 @@ enum AgentCLI {
                 + (recalled.listed.isEmpty ? "" : ", \(recalled.listed.count) listed"))
         }
 
+        let assembly: SystemPromptAssembly
+        do {
+            assembly = try SystemPromptAssembly.build(
+                cwd: cwd, skills: gate.render(selection), memory: memoryGate.render(recalled))
+        } catch {
+            await endAndCleanup(
+                host: host, outcome: .failed,
+                detail: "Could not assemble the system prompt: \(error.localizedDescription)")
+            fail("Could not assemble the system prompt: \(error.localizedDescription)")
+        }
+
         let runner = AgentRunner(
             provider: provider, host: host,
             settings: .init(
                 home: home, cwd: cwd, model: model,
-                systemPrompt: SystemPrompt.build(
-                    cwd: cwd, model: model, skills: gate.render(selection),
-                    memory: memoryGate.render(recalled)),
+                systemPrompt: assembly.flattenedText,
+                systemPromptAssembly: assembly,
                 memory: memory, recordPayloads: record,
                 goal: (tokenBudget != nil || minutes != nil)
                     ? Goal(text: prompt, tokenBudget: tokenBudget,
@@ -639,55 +649,4 @@ final class Atomic: @unchecked Sendable {
     init(_ initial: Bool) { value = initial }
     func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
     func set(_ new: Bool) { lock.lock(); value = new; lock.unlock() }
-}
-
-/// What the agent is told about itself.
-///
-/// Short on purpose. The measured cost of the harness's prompt was 68 skill descriptions at
-/// 62.7% of input on a trivial run — paid on every request whether or not any skill was used.
-/// Starting from nothing and adding only what earns its tokens is the whole point of owning
-/// this.
-enum SystemPrompt {
-    static func build(
-        cwd: String, model: ModelSpec, skills: String = "", memory: String = "",
-        includeContextFiles: Bool = true
-    ) -> String {
-        var lines = [
-            "You are a coding agent working in \(cwd) on a macOS machine.",
-            "",
-            "You act by running Python in a persistent interpreter — that is your only tool, "
-                + "and it is enough. State survives between calls, so build on what you have "
-                + "already loaded instead of repeating work.",
-            "",
-            "`sh(command)` runs a shell command and returns {'stdout','stderr','status'}. Its "
-                + "working directory and environment persist across calls, so `sh('cd sub')` "
-                + "then `sh('pwd')` does what you would expect. `cwd()` reports where you are.",
-            "",
-            "Prefer the tools the repository already has — git, grep, and whatever its own "
-                + "task runner exposes — over reimplementing them in Python.",
-            "",
-            "Say what you found, not what you are about to do. When you are finished, stop "
-                + "calling tools and answer.",
-        ]
-        if !memory.isEmpty {
-            lines.append("")
-            lines.append(memory)
-        }
-        if !skills.isEmpty {
-            lines.append("")
-            lines.append(skills)
-        }
-        // Project instructions, if the working directory has any. Read at start rather than
-        // discovered per turn, so the cost is visible and paid once.
-        for name in includeContextFiles ? ["AGENTS.md", "CLAUDE.md"] : [] {
-            let url = URL(fileURLWithPath: cwd).appending(path: name)
-            if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
-                lines.append("")
-                lines.append("## \(name) (from \(cwd))")
-                lines.append("")
-                lines.append(text.count > 12_000 ? String(text.prefix(12_000)) + "\n…(truncated)" : text)
-            }
-        }
-        return lines.joined(separator: "\n")
-    }
 }

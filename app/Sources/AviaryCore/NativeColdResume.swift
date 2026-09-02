@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// The result of reconstructing a native conversation from the durable journals.
@@ -14,6 +15,10 @@ public struct NativeColdResumeResult: Sendable {
     public let tools: [ChatTool]
     public let modelID: String
     public let contextManifest: ContextManifest
+    /// The retained producer-side decomposition of the pinned system prompt, when this native
+    /// crossing carried source metadata. Legacy manifests deliberately leave this nil: replay
+    /// never guesses by rebuilding the current working directory.
+    public let systemPromptAssembly: SystemPromptAssembly?
     public let contextBoundary: EventRef
     public let sessionCursor: JournalCursor
     public let workCursor: JournalCursor
@@ -25,6 +30,7 @@ public struct NativeColdResumeResult: Sendable {
     public init(
         pinnedMessages: [ChatMessage], messages: [ChatMessage], tools: [ChatTool],
         modelID: String, contextManifest: ContextManifest,
+        systemPromptAssembly: SystemPromptAssembly? = nil,
         contextBoundary: EventRef, sessionCursor: JournalCursor, workCursor: JournalCursor,
         coverage: RecoveryCoverage, caveats: [String] = []
     ) {
@@ -33,6 +39,7 @@ public struct NativeColdResumeResult: Sendable {
         self.tools = tools
         self.modelID = modelID
         self.contextManifest = contextManifest
+        self.systemPromptAssembly = systemPromptAssembly
         self.contextBoundary = contextBoundary
         self.sessionCursor = sessionCursor
         self.workCursor = workCursor
@@ -98,10 +105,14 @@ public enum NativeColdResume {
         guard let manifest = sessionSnapshot.contextManifest else {
             throw NativeColdResumeError.noCompleteContextManifest
         }
-        guard let boundaryEvent = sessionEvents.last(where: {
+        guard let boundaryIndex = sessionEvents.lastIndex(where: {
             $0.type == TimelineEventType.contextAssembled
                 && $0.payload["manifest_id"]?.stringValue == manifest.manifestID
-        }), let boundaryRun = boundaryEvent.run,
+        }) else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+        let boundaryEvent = sessionEvents[boundaryIndex]
+        guard let boundaryRun = boundaryEvent.run,
         let boundarySession = boundaryEvent.session,
         let boundaryWork = boundaryEvent.work,
         let boundaryWorkHost = boundaryEvent.workHost,
@@ -111,9 +122,23 @@ public enum NativeColdResume {
         boundaryWork.workHostID == boundaryWorkHost.workHostID else {
             throw NativeColdResumeError.contextBoundaryMalformed
         }
+        // A malformed or newer crossing must not be hidden by a reducer that retained the last
+        // valid manifest. The selected boundary is always the latest canonical context event in
+        // this exact Session journal.
+        guard sessionEvents.lastIndex(where: { $0.type == TimelineEventType.contextAssembled })
+            == boundaryIndex else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
         let boundary = EventRef(journal: sessionJournal, eventID: boundaryEvent.eventID)
 
+        let sourceObservation = try validatePromptSourceBoundary(
+            manifest: manifest, boundaryEvent: boundaryEvent, boundaryIndex: boundaryIndex,
+            sessionEvents: sessionEvents, journal: sessionJournal)
+
         let reconstructed = try decodeManifest(manifest, bodyStore: bodyStore)
+        let systemPromptAssembly = try reconstructPromptAssembly(
+            manifest: manifest, pinnedMessages: reconstructed.pinned,
+            bodyStore: bodyStore, journal: sessionJournal, sourceObservation: sourceObservation)
         let activeMessageIDs = Set(sessionSnapshot.messages.map(\.eventID))
         let activeSuffixEvents = sessionEvents.filter {
             $0.sequence > boundaryEvent.sequence && activeMessageIDs.contains($0.eventID)
@@ -235,6 +260,7 @@ public enum NativeColdResume {
             tools: reconstructed.tools,
             modelID: manifest.modelID,
             contextManifest: manifest,
+            systemPromptAssembly: systemPromptAssembly,
             contextBoundary: boundary,
             sessionCursor: expectedSessionCursor,
             workCursor: expectedWorkCursor,
@@ -309,6 +335,270 @@ public enum NativeColdResume {
         guard semantic else {
             throw NativeColdResumeError.semanticallyInvalid(journal, reasons.joined(separator: "; "))
         }
+    }
+
+    /// Validate the source-observation edge before any reconstructed prompt can be handed to a
+    /// runtime.  The reducer keeps the last valid context projection visible when it quarantines a
+    /// later event; inspecting the raw canonical sequence here prevents that fallback from
+    /// making a forged or incomplete source-aware crossing look resumable.
+    private static func validatePromptSourceBoundary(
+        manifest: ContextManifest,
+        boundaryEvent: TimelineEvent,
+        boundaryIndex: Int,
+        sessionEvents: [TimelineEvent],
+        journal: JournalRef
+    ) throws -> EventRef? {
+        let contextPayload = boundaryEvent.payload.objectValue ?? [:]
+        let hasContextSourceMetadata = contextPayload["system_prompt_sources"] != nil
+            || contextPayload["system_prompt_assembly_id"] != nil
+
+        guard let manifestSources = manifest.systemPromptSources else {
+            // A legacy manifest has no source metadata at all. In particular, a caller must not
+            // ask cold resume to infer an assembly from the current cwd, skills, or memory.
+            guard manifest.systemPromptAssemblyID == nil, !hasContextSourceMetadata else {
+                throw NativeColdResumeError.contextBoundaryMalformed
+            }
+            return nil
+        }
+
+        guard let assemblyID = manifest.systemPromptAssemblyID,
+              let contextAssemblyID = contextPayload["system_prompt_assembly_id"]?.stringValue,
+              contextAssemblyID == assemblyID,
+              let contextValues = contextPayload["system_prompt_sources"]?.arrayValue,
+              let contextSources = decodePromptSources(contextValues),
+              contextSources == manifestSources else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+
+        do {
+            try manifest.validatePromptSources(
+                authority: journal, requireRetainedBodies: true)
+        } catch {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+
+        guard boundaryIndex > 0 else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+        let observation = sessionEvents[boundaryIndex - 1]
+        guard observation.type == TimelineEventType.contextSourcesObserved,
+              observation.provenance == .native,
+              observation.causedByEventID == nil,
+              let boundarySession = boundaryEvent.session,
+              let boundaryWork = boundaryEvent.work,
+              let boundaryWorkHost = boundaryEvent.workHost,
+              let boundaryRun = boundaryEvent.run,
+              let observationSession = observation.session,
+              let observationWork = observation.work,
+              let observationWorkHost = observation.workHost,
+              let observationRun = observation.run,
+              observation.journal == journal,
+              observationSession == boundarySession,
+              observationWork == boundaryWork,
+              observationWorkHost == boundaryWorkHost,
+              observationRun == boundaryRun,
+              observationWork.workHostID == observationWorkHost.workHostID,
+              boundaryWork.workHostID == boundaryWorkHost.workHostID,
+              observation.sequence + 1 == boundaryEvent.sequence,
+              boundaryEvent.previousEventID == observation.eventID else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+
+        let observationRef = EventRef(journal: journal, eventID: observation.eventID)
+        guard boundaryEvent.causedByEventID == observationRef else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+
+        guard let observationAssemblyID = observation.payload["assembly_id"]?.stringValue,
+              observationAssemblyID == assemblyID,
+              let sourceValues = observation.payload["sources"]?.arrayValue,
+              observation.payload["source_count"]?.intValue == sourceValues.count,
+              let observationSources = decodePromptSources(sourceValues),
+              observationSources.allSatisfy({ $0.provenance == nil }),
+              observationSources.map({ $0.withProvenance(nil) })
+                == manifestSources.map({ $0.withProvenance(nil) }),
+              manifestSources.allSatisfy({ $0.provenance == observationRef }) else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+
+        // Validate the observation independently as well. This catches a malformed body
+        // reference or digest even if the corresponding context event happened to carry a
+        // matching-looking copy of the metadata.
+        let observationProbe = ContextManifest(
+            manifestID: "source-observation", requestID: "source-observation",
+            modelID: "source-observation", components: [ContextComponent(
+                componentID: "source-observation", inclusionID: "source-observation",
+                sourceID: "source-observation", mode: .instruction, measuredBytes: 0,
+                includedBytes: 0, deliveredBytes: 0, fullByteCount: 0,
+                digest: "sha256:" + String(repeating: "0", count: 64))],
+            systemPromptAssemblyID: observationAssemblyID,
+            systemPromptSources: observationSources)
+        do {
+            try observationProbe.validatePromptSources(authority: journal)
+        } catch {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+        return observationRef
+    }
+
+    private static func decodePromptSources(
+        _ values: [JSONValue]
+    ) -> [ContextManifestSource]? {
+        let sources: [ContextManifestSource] = values.compactMap {
+            decodeNativeTimelineValue($0)
+        }
+        return sources.count == values.count ? sources : nil
+    }
+
+    /// Rebuild a source-aware prompt solely from the retained bodies addressed by the manifest.
+    /// No source identity is recovered from the filesystem: encoded source metadata intentionally
+    /// omits host-local paths, so reconstructed ``PromptSource`` values use a nil identity.
+    private static func reconstructPromptAssembly(
+        manifest: ContextManifest,
+        pinnedMessages: [ChatMessage],
+        bodyStore: ContextBodyStore,
+        journal: JournalRef,
+        sourceObservation: EventRef?
+    ) throws -> SystemPromptAssembly? {
+        guard sourceObservation != nil else { return nil }
+        guard let sources = manifest.systemPromptSources,
+              let assemblyID = manifest.systemPromptAssemblyID else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+
+        var offset = 0
+        var reconstructed: [PromptSource] = []
+        reconstructed.reserveCapacity(sources.count)
+        for source in sources {
+            let full = try readPromptBody(
+                source.fullBodyReference, expectedByteCount: source.fullByteCount,
+                expectedDigest: source.fullDigest, sourceID: source.sourceID,
+                expectedMediaTypes: ["application/vnd.aviary.prompt-source+utf8"],
+                bodyStore: bodyStore, journal: journal)
+            let delivered = try readPromptBody(
+                source.deliveredBodyReference, expectedByteCount: source.deliveredByteCount,
+                expectedDigest: source.deliveredDigest, sourceID: source.sourceID,
+                expectedMediaTypes: ["application/vnd.aviary.prompt-source+utf8"],
+                bodyStore: bodyStore, journal: journal) ?? ""
+            let rendered = try readPromptBody(
+                source.renderedBodyReference, expectedByteCount: source.renderedByteCount,
+                expectedDigest: source.renderedDigest, sourceID: source.sourceID,
+                expectedMediaTypes: ["application/vnd.aviary.prompt-source+utf8"],
+                bodyStore: bodyStore, journal: journal) ?? ""
+
+            switch source.status {
+            case .present:
+                guard let full, Data(full.utf8) == Data(delivered.utf8) else {
+                    throw NativeColdResumeError.contextBoundaryMalformed
+                }
+            case .truncated:
+                guard let full else {
+                    throw NativeColdResumeError.contextBoundaryMalformed
+                }
+                let fullBytes = Data(full.utf8)
+                let deliveredBytes = Data(delivered.utf8)
+                guard deliveredBytes.count < fullBytes.count,
+                      fullBytes.starts(with: deliveredBytes) else {
+                    throw NativeColdResumeError.contextBoundaryMalformed
+                }
+            case .missing, .unreadable, .disabled:
+                guard full == nil, delivered.isEmpty, rendered.isEmpty else {
+                    throw NativeColdResumeError.contextBoundaryMalformed
+                }
+            }
+
+            let promptSource: PromptSource
+            do {
+                promptSource = try PromptSource(
+                    sourceID: source.sourceID, kind: source.kind, label: source.label,
+                    status: source.status, fullBody: full, deliveredBody: delivered,
+                    renderedBody: rendered,
+                    deliveredByteOffsetInRendered: source.deliveredByteOffsetInRendered,
+                    renderedByteOffset: offset)
+            } catch {
+                throw NativeColdResumeError.contextBoundaryMalformed
+            }
+            guard promptSource.fullByteCount == source.fullByteCount,
+                  promptSource.fullDigest == source.fullDigest,
+                  promptSource.deliveredByteCount == source.deliveredByteCount,
+                  promptSource.deliveredDigest == source.deliveredDigest,
+                  promptSource.renderedByteCount == source.renderedByteCount,
+                  promptSource.renderedDigest == source.renderedDigest else {
+                throw NativeColdResumeError.contextBoundaryMalformed
+            }
+            reconstructed.append(promptSource)
+            offset += promptSource.renderedByteCount
+        }
+
+        let flattenedText = reconstructed.map(\.renderedBody).joined()
+        let assembly: SystemPromptAssembly
+        do {
+            assembly = try SystemPromptAssembly(text: flattenedText, sources: reconstructed)
+        } catch {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+        guard assembly.digest == assemblyID else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+
+        // A source decomposition is only useful if it accounts for the exact pinned system
+        // message that the manifest retained. Do not compare against a newly built prompt or a
+        // presentation transcript: both can change independently after the run.
+        guard pinnedMessages.count == 1,
+              let pinned = pinnedMessages.first,
+              pinned.role == .system,
+              pinned.content.count == 1,
+              case .text(let pinnedText) = pinned.content[0] else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+        let pinnedBytes = Data(pinnedText.utf8)
+        guard assembly.text == pinnedText,
+              assembly.byteCount == pinnedBytes.count,
+              assembly.digest == digest(pinnedBytes) else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+        return assembly
+    }
+
+    /// Resolve one body through the canonical content-addressed store and independently verify
+    /// the metadata carried by both the source record and its body reference. A nil reference is
+    /// valid only for a non-body-bearing source status (checked by manifest validation).
+    private static func readPromptBody(
+        _ reference: TimelineBodyReference?,
+        expectedByteCount: Int?,
+        expectedDigest: String?,
+        sourceID: String,
+        expectedMediaTypes: [String],
+        bodyStore: ContextBodyStore,
+        journal: JournalRef
+    ) throws -> String? {
+        guard let reference else { return nil }
+        guard reference.authority == journal,
+              let mediaType = reference.mediaType,
+              expectedMediaTypes.contains(mediaType),
+              let expectedByteCount,
+              let expectedDigest else {
+            throw NativeColdResumeError.contextBoundaryMalformed
+        }
+        let data: Data
+        do {
+            data = try bodyStore.read(reference)
+        } catch {
+            throw NativeColdResumeError.retainedBodyUnavailable(sourceID)
+        }
+        guard data.count == expectedByteCount,
+              digest(data) == expectedDigest else {
+            throw NativeColdResumeError.retainedBodyUnavailable(sourceID)
+        }
+        guard let body = String(data: data, encoding: .utf8),
+              Data(body.utf8) == data else {
+            throw NativeColdResumeError.malformedMessageBody(sourceID)
+        }
+        return body
+    }
+
+    private static func digest(_ data: Data) -> String {
+        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func decodeManifest(

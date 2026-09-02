@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// The delivery crossing recorded by ``RunJournalBundle.commitInput``.
@@ -1274,6 +1275,50 @@ public actor RunJournalBundle {
         }
     }
 
+    private func appendContextSourcesObservedLocked(
+        _ manifest: ContextManifest
+    ) async throws -> TimelineJournalCommit {
+        try await appendContextSourcesObservedLocked(
+            assemblyID: manifest.systemPromptAssemblyID ?? "",
+            sources: manifest.systemPromptSources ?? [])
+    }
+
+    private func appendContextSourcesObservedLocked(
+        assemblyID: String,
+        sources: [ContextManifestSource]
+    ) async throws -> TimelineJournalCommit {
+        guard let activeRun else {
+            throw RunJournalBundleError.invalidOperation(
+                "cannot observe prompt sources without an active Run")
+        }
+        // Provenance is the EventRef of this observation, which does not exist until append
+        // returns. Never carry a caller's prior observation reference into this event.
+        let observedSources = sources.map { $0.withProvenance(nil) }
+        let probe = ContextManifest(
+            manifestID: "source-observation", requestID: "source-observation",
+            modelID: "source-observation", components: [ContextComponent(
+                componentID: "source-observation", inclusionID: "source-observation",
+                sourceID: "source-observation", mode: .instruction, measuredBytes: 0,
+                includedBytes: 0, deliveredBytes: 0, fullByteCount: 0,
+                digest: "sha256:" + String(repeating: "0", count: 64))],
+            systemPromptAssemblyID: assemblyID, systemPromptSources: observedSources)
+        do {
+            try probe.validatePromptSources(authority: sessionJournal)
+        } catch {
+            throw RunJournalBundleError.invalidOperation(
+                "prompt source observation is invalid: \(error.localizedDescription)")
+        }
+        return try await appendSession(TimelineEventDraft(
+            hostSequence: nextHostOrder(), session: session,
+            work: work, workHost: workHost, run: activeRun,
+            type: TimelineEventType.contextSourcesObserved,
+            declaredDomains: [.session, .context], payload: .object([
+                "assembly_id": .string(assemblyID),
+                "source_count": .number(Double(sources.count)),
+                "sources": .array(observedSources.map(encodeTimelineValue)),
+            ])))
+    }
+
     private func appendContextManifestLocked(
         _ manifest: ContextManifest
     ) async throws -> TimelineJournalCommit {
@@ -1293,28 +1338,134 @@ public actor RunJournalBundle {
             for component in manifest.components {
                 _ = try contextBodyStore.read(component.bodyReference!)
             }
+            for source in manifest.systemPromptSources ?? [] {
+                if let reference = source.fullBodyReference { _ = try contextBodyStore.read(reference) }
+                if let reference = source.deliveredBodyReference { _ = try contextBodyStore.read(reference) }
+                if let reference = source.renderedBodyReference { _ = try contextBodyStore.read(reference) }
+            }
+            try validatePromptAssemblyBodies(manifest)
         } catch {
             throw RunJournalBundleError.invalidOperation(
                 "context manifest or retained body is invalid: \(error.localizedDescription)")
         }
+        let sourceObservation = manifest.systemPromptSources == nil
+            ? nil
+            : try await appendContextSourcesObservedLocked(manifest)
+        let durableManifest: ContextManifest
+        if let sources = manifest.systemPromptSources, let sourceObservation {
+            let observedSources = sources.map { $0.withProvenance(sourceObservation.eventRef) }
+            durableManifest = ContextManifest(
+                schemaVersion: manifest.schemaVersion, manifestID: manifest.manifestID,
+                requestID: manifest.requestID, modelID: manifest.modelID,
+                measuredBy: manifest.measuredBy, components: manifest.components,
+                omissions: manifest.omissions,
+                cumulativeDeliveredBytes: manifest.cumulativeDeliveredBytes,
+                systemPromptAssemblyID: manifest.systemPromptAssemblyID,
+                systemPromptSources: observedSources)
+        } else {
+            durableManifest = manifest
+        }
+        var payload: [String: JSONValue] = [
+            "manifest_id": .string(durableManifest.manifestID),
+            "request_id": .string(durableManifest.requestID),
+            "model_id": .string(durableManifest.modelID),
+            "schema_version": .number(Double(durableManifest.schemaVersion)),
+            "measured_by": .string(durableManifest.measuredBy),
+            "measured_bytes": .number(Double(durableManifest.measuredBytes)),
+            "delivered_bytes": .number(Double(durableManifest.deliveredBytes)),
+            "cumulative_delivered_bytes": .number(Double(durableManifest.cumulativeDeliveredBytes)),
+            "components": .array(durableManifest.components.map(encodeTimelineValue)),
+            "omissions": .array(durableManifest.omissions.map(encodeTimelineValue)),
+        ]
+        if let assemblyID = durableManifest.systemPromptAssemblyID {
+            payload["system_prompt_assembly_id"] = .string(assemblyID)
+        }
+        if let sources = durableManifest.systemPromptSources {
+            payload["system_prompt_sources"] = .array(sources.map(encodeTimelineValue))
+        }
         let commit = try await appendSession(TimelineEventDraft(
-            hostSequence: nextHostOrder(), session: session,
+            hostSequence: nextHostOrder(), causedByEventID: sourceObservation?.eventRef,
+            session: session,
             work: work, workHost: workHost, run: activeRun,
             type: TimelineEventType.contextAssembled,
-            declaredDomains: [.session, .context], payload: .object([
-                "manifest_id": .string(manifest.manifestID),
-                "request_id": .string(manifest.requestID),
-                "model_id": .string(manifest.modelID),
-                "schema_version": .number(Double(manifest.schemaVersion)),
-                "measured_by": .string(manifest.measuredBy),
-                "measured_bytes": .number(Double(manifest.measuredBytes)),
-                "delivered_bytes": .number(Double(manifest.deliveredBytes)),
-                "cumulative_delivered_bytes": .number(Double(manifest.cumulativeDeliveredBytes)),
-                "components": .array(manifest.components.map(encodeTimelineValue)),
-                "omissions": .array(manifest.omissions.map(encodeTimelineValue)),
-            ])))
+            declaredDomains: [.session, .context], payload: .object(payload)))
         contextDeliveredBytesByRun[activeRun.runID] = manifest.cumulativeDeliveredBytes
         return commit
+    }
+
+    /// Re-bind a source-aware manifest to the exact retained system ChatMessage. The metadata
+    /// validator proves identities, sizes, and references; this body-store boundary proves the
+    /// byte relationships that a pure reducer cannot inspect.
+    private func validatePromptAssemblyBodies(_ manifest: ContextManifest) throws {
+        guard let sources = manifest.systemPromptSources,
+              let assemblyID = manifest.systemPromptAssemblyID else { return }
+        let pinned = manifest.components.filter { $0.mode == .pinned }
+        guard sources.count > 0, pinned.count == 1,
+              let systemReference = pinned[0].bodyReference,
+              systemReference.mediaType == "application/vnd.aviary.chat-message+json" else {
+            throw RunJournalBundleError.invalidOperation(
+                "source-aware context requires one retained system ChatMessage")
+        }
+        let systemData = try contextBodyStore.read(systemReference)
+        guard let systemObject = JSONValue.parse(systemData)?.objectValue,
+              systemObject["role"]?.stringValue == ChatRole.system.rawValue,
+              let content = systemObject["content"]?.arrayValue,
+              content.count == 1,
+              content[0]["type"]?.stringValue == "text",
+              let systemText = content[0]["text"]?.stringValue else {
+            throw RunJournalBundleError.invalidOperation(
+                "source-aware context system body is not one text ChatMessage")
+        }
+
+        var assembled = Data()
+        for source in sources {
+            let full = try source.fullBodyReference.map(contextBodyStore.read)
+            let delivered = try source.deliveredBodyReference.map(contextBodyStore.read)
+            let rendered = try source.renderedBodyReference.map(contextBodyStore.read)
+            switch source.status {
+            case .present:
+                guard let full, let delivered, let rendered, full == delivered else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "present prompt source bytes do not match: \(source.sourceID)")
+                }
+                try validateDeliveredPromptSlice(source, delivered: delivered, rendered: rendered)
+                assembled.append(rendered)
+            case .truncated:
+                guard let full, let delivered, let rendered,
+                      delivered.count < full.count, full.starts(with: delivered) else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "truncated prompt source is not a retained prefix: \(source.sourceID)")
+                }
+                try validateDeliveredPromptSlice(source, delivered: delivered, rendered: rendered)
+                assembled.append(rendered)
+            case .missing, .unreadable, .disabled:
+                guard full == nil, delivered == nil, rendered == nil else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "non-delivered prompt source retained unexpected bytes: \(source.sourceID)")
+                }
+            }
+        }
+        guard Self.promptDigest(assembled) == assemblyID,
+              assembled == Data(systemText.utf8) else {
+            throw RunJournalBundleError.invalidOperation(
+                "prompt source assembly does not equal the retained system message")
+        }
+    }
+
+    private func validateDeliveredPromptSlice(
+        _ source: ContextManifestSource, delivered: Data, rendered: Data
+    ) throws {
+        let end = source.deliveredByteOffsetInRendered.addingReportingOverflow(delivered.count)
+        guard !end.overflow, end.partialValue <= rendered.count,
+              rendered.subdata(
+                in: source.deliveredByteOffsetInRendered..<end.partialValue) == delivered else {
+            throw RunJournalBundleError.invalidOperation(
+                "prompt source framing does not contain its declared delivered bytes: \(source.sourceID)")
+        }
+    }
+
+    private static func promptDigest(_ data: Data) -> String {
+        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     /// End the current run only after all actions and turns are terminal. Cursor advancement is a

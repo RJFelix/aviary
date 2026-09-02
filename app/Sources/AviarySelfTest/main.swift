@@ -6417,6 +6417,66 @@ let casesContextManifest: [Case] = [
     }),
 ]
 
+let casesPromptProvenance: [Case] = [
+    ("phase1 prompt provenance: producer assembly preserves exact prompt bytes", {
+        try test_systemPromptAssemblyMatchesLegacyForEveryRenderedSection()
+    }),
+    ("phase1 prompt provenance: source status and Unicode truncation are explicit", {
+        try test_systemPromptAssemblyReportsContextStatesAndCharacterTruncation()
+    }),
+    ("phase1 prompt provenance: source identity is stable and distinct from content", {
+        try test_systemPromptAssemblyUsesDistinctStableIdentityAndContentDigests()
+    }),
+    ("phase1 prompt provenance: duplicate sources and raw-body encoding are refused", {
+        try test_systemPromptAssemblyRejectsDuplicateIDsAndDoesNotEncodeBodies()
+    }),
+    ("phase1 prompt provenance: source observation is causal bounded and secret safe", {
+        try await test_promptSourceManifestCrossingIsCausalBoundedAndSecretSafe()
+    }),
+    ("phase1 prompt provenance: forged source observation is quarantined", {
+        try await test_promptSourceManifestReducerRejectsForgedOrMismatchedObservation()
+    }),
+    ("phase1 prompt provenance: swapped and empty source assemblies are refused", {
+        try await test_promptSourceManifestRejectsSwappedAssemblyAndEmptySourcesBeforeAppend()
+    }),
+    ("phase1 prompt provenance: contradictory source metadata and media are refused", {
+        try await test_promptSourceManifestRejectsContradictorySourceMetadataAndMedia()
+    }),
+    ("phase1 prompt provenance: truncated source must be a retained prefix", {
+        try await test_promptSourceManifestRejectsTruncatedBodyThatIsNotAFullPrefix()
+    }),
+    ("phase1 prompt provenance: runtime bytes and generated goal source stay exact", {
+        try await test_promptProvenanceRuntimePreservesProviderBytesAndGeneratedGoalSource()
+    }),
+    ("phase1 prompt provenance: runtime mismatch prevents provider effect", {
+        try await test_promptProvenanceRuntimeMismatchPreventsProviderEffect()
+    }),
+    ("phase1 prompt provenance: Reader Census context is metadata only and bounded", {
+        try test_readerCensusNextModelContextIsMetadataOnlyAndBounded()
+    }),
+    ("phase1 prompt provenance: Reader Census preserves order and legacy unknowns", {
+        try test_readerCensusNextModelContextPreservesCanonicalOrderAndLegacyUnknowns()
+    }),
+    ("phase1 prompt provenance: Reader Census uses accepted compaction boundary", {
+        try test_readerCensusCompactionBoundaryComesFromLastAcceptedEvent()
+    }),
+    ("phase1 prompt provenance: cold resume uses retained source bodies", {
+        try await test_promptProvenanceColdResumeUsesRetainedBodiesAfterSourceFilesChange()
+    }),
+    ("phase1 prompt provenance: cold resume refuses unavailable source bodies", {
+        try await test_promptProvenanceColdResumeRefusesMissingOrCorruptSourceBody()
+    }),
+    ("phase1 prompt provenance: cold resume rechecks truncated source prefix", {
+        try await test_promptProvenanceColdResumeRechecksTruncatedFullBodyPrefix()
+    }),
+    ("phase1 prompt provenance: cold resume requires exact source observation", {
+        try await test_promptProvenanceColdResumeRefusesForgedMissingAndMismatchedObservation()
+    }),
+    ("phase1 prompt provenance: legacy cold resume remains opaque", {
+        try await test_promptProvenanceColdResumeLeavesLegacyAssemblyNil()
+    }),
+]
+
 let casesNativeColdResume: [Case] = [
     ("phase1 native resume: producer context reports six-plane coverage", {
         try await test_nativeColdResumeReconstructsProducerContextAndReportsCoverage()
@@ -6533,7 +6593,8 @@ await Harness.run(
         + casesPeers + casesMCPSurface
         + casesBackgroundSpawn + casesWebSearch + casesDispatched
         + casesCrossingLaws + casesPhase0SessionControl + casesPhase1Timeline
-        + casesContextManifest + casesNativeColdResume + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
+        + casesContextManifest + casesPromptProvenance + casesNativeColdResume
+        + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal
         + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel
         + casesNativeIndeterminateEffects + casesChildLifecycle

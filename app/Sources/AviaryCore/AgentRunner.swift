@@ -14,6 +14,10 @@ public actor AgentRunner {
         public var cwd: String
         public var model: ModelSpec
         public var systemPrompt: String
+        /// The producer-side decomposition of ``systemPrompt``. This remains optional so
+        /// legacy callers and native resumes whose durable prefix predates source observations
+        /// keep the opaque aggregate path.
+        public var systemPromptAssembly: SystemPromptAssembly?
         /// The user-selected reasoning level for provider routes that support it.
         public var reasoningEffort: String?
         public var maxDepth: Int
@@ -59,6 +63,7 @@ public actor AgentRunner {
 
         public init(
             home: AgentHome, cwd: String, model: ModelSpec, systemPrompt: String,
+            systemPromptAssembly: SystemPromptAssembly? = nil,
             maxDepth: Int = 3, maxIterations: Int = 40, childMaxIterations: Int = 20,
             memory: MemoryStore? = nil, recordPayloads: Bool = false, goal: Goal? = nil,
             hookPaths: [String] = [], resume: String? = nil,
@@ -76,6 +81,7 @@ public actor AgentRunner {
             self.cwd = cwd
             self.model = model
             self.systemPrompt = systemPrompt
+            self.systemPromptAssembly = systemPromptAssembly
             self.reasoningEffort = reasoningEffort
             self.maxDepth = maxDepth
             self.maxIterations = maxIterations
@@ -297,7 +303,13 @@ public actor AgentRunner {
             // pinned instruction set is a hard recovery error, never an invitation to consult the
             // legacy presentation transcript.
             var replay = SessionReplay()
-            var systemPrompt = settings.systemPrompt
+            var systemPrompt = settings.systemPromptAssembly?.flattenedText ?? settings.systemPrompt
+            var systemPromptAssembly = settings.systemPromptAssembly
+            if let assembly = systemPromptAssembly,
+               Data(settings.systemPrompt.utf8) != Data(assembly.flattenedText.utf8) {
+                throw RunJournalBundleError.invalidConfiguration(
+                    "systemPrompt and systemPromptAssembly contain different bytes")
+            }
             var expectedResumeTools: [ChatTool]?
             var nativeResumeNote: String?
             if settings.resume != nil {
@@ -317,6 +329,10 @@ public actor AgentRunner {
                     replay.messages = seed.messages
                     replay.lastModel = seed.modelID
                     systemPrompt = retainedSystemPrompt
+                    // NativeColdResume owns source-body reconstruction and validation at the
+                    // recovery boundary. A nil value is intentional for legacy native prefixes
+                    // whose effective system prompt is only an opaque retained message.
+                    systemPromptAssembly = seed.systemPromptAssembly
                     expectedResumeTools = seed.tools
                     nativeResumeNote =
                         "Native cold resume reconstructed the durable timeline and "
@@ -366,6 +382,7 @@ public actor AgentRunner {
             provider: provider, host: host, writer: writer, hostSession: hostSession,
             config: .init(
                 model: settings.model, cwd: settings.cwd, systemPrompt: systemPrompt,
+                systemPromptAssembly: systemPromptAssembly,
                 maxIterations: settings.maxIterations, maxTokens: settings.model.maxTokens,
                     reasoningEffort: settings.reasoningEffort,
                 maxDepth: settings.maxDepth, depth: 0, goal: settings.goal,

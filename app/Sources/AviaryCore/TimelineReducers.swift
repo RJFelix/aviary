@@ -658,6 +658,43 @@ public struct SessionReducer: Sendable {
                 return
             }
             snapshot.childStates[childID] = state
+        case TimelineEventType.contextSourcesObserved:
+            guard let assemblyID = event.payload["assembly_id"]?.stringValue,
+                  let sources = decodeContextSources(event.payload),
+                  let observationSession = event.session,
+                  let observationWork = event.work,
+                  let observationWorkHost = event.workHost,
+                  let observationRun = event.run,
+                  observationSession == snapshot.session,
+                  observationWork.workHostID == observationWorkHost.workHostID,
+                  !observationWork.workID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !observationWork.workHostID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !observationRun.runID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !assemblyID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                quarantine(event, reason: "context source observation is malformed")
+                return
+            }
+            let probe = ContextManifest(
+                manifestID: "source-observation", requestID: "source-observation",
+                modelID: "source-observation", components: [ContextComponent(
+                    componentID: "source-observation", inclusionID: "source-observation",
+                    sourceID: "source-observation", mode: .instruction, measuredBytes: 0,
+                    includedBytes: 0, deliveredBytes: 0, fullByteCount: 0,
+                    digest: "sha256:" + String(repeating: "0", count: 64))],
+                systemPromptAssemblyID: assemblyID, systemPromptSources: sources)
+            do {
+                try probe.validatePromptSources(authority: event.journal)
+            } catch {
+                quarantine(event, reason: "context source observation failed validation")
+                return
+            }
+            snapshot.contextPromptAssemblyID = assemblyID
+            snapshot.contextPromptSources = sources
+            snapshot.contextSourcesObservationEventID = event.eventID
+            snapshot.contextSourcesObservationSession = observationSession
+            snapshot.contextSourcesObservationWork = observationWork
+            snapshot.contextSourcesObservationWorkHost = observationWorkHost
+            snapshot.contextSourcesObservationRun = observationRun
         case TimelineEventType.contextAssembled:
             guard let components = decodeContextComponents(event.payload) else {
                 quarantine(event, reason: "context component manifest is malformed")
@@ -682,6 +719,30 @@ public struct SessionReducer: Sendable {
                         reason: "context crossing is missing or mismatches Work, Work Host, or Run identity")
                     return
                 }
+                if let sources = contextManifest.systemPromptSources {
+                    guard let assemblyID = contextManifest.systemPromptAssemblyID,
+                          let observedAssemblyID = snapshot.contextPromptAssemblyID,
+                          let observedSources = snapshot.contextPromptSources,
+                          let observationEventID = snapshot.contextSourcesObservationEventID,
+                          let causedBy = event.causedByEventID,
+                          assemblyID == observedAssemblyID,
+                          causedBy.journal == event.journal,
+                          causedBy.eventID == observationEventID,
+                          event.previousEventID == observationEventID,
+                          snapshot.contextSourcesObservationSession == event.session,
+                          snapshot.contextSourcesObservationWork == event.work,
+                          snapshot.contextSourcesObservationWorkHost == event.workHost,
+                          snapshot.contextSourcesObservationRun == event.run,
+                          sources.allSatisfy({ $0.provenance == causedBy }),
+                          sources.map({ $0.withProvenance(nil) }) == observedSources.map({
+                              $0.withProvenance(nil)
+                          }) else {
+                        quarantine(
+                            event,
+                            reason: "context crossing does not match its immediately preceding source observation")
+                        return
+                    }
+                }
                 do {
                     try contextManifest.validate(
                         authority: event.journal,
@@ -700,6 +761,16 @@ public struct SessionReducer: Sendable {
             }
             snapshot.contextComponents = components
             snapshot.contextManifest = contextManifest
+            snapshot.contextPromptAssemblyID = contextManifest?.systemPromptAssemblyID
+            snapshot.contextPromptSources = contextManifest?.systemPromptSources
+            snapshot.contextSourcesObservationEventID = contextManifest?.systemPromptSources == nil
+                ? nil : event.causedByEventID?.eventID
+            if contextManifest?.systemPromptSources == nil {
+                snapshot.contextSourcesObservationSession = nil
+                snapshot.contextSourcesObservationWork = nil
+                snapshot.contextSourcesObservationWorkHost = nil
+                snapshot.contextSourcesObservationRun = nil
+            }
             snapshot.contextBoundaryEventID = event.eventID
         case TimelineEventType.compaction:
             guard let summary = event.payload["summary"]?.stringValue,
@@ -708,6 +779,7 @@ public struct SessionReducer: Sendable {
                 return
             }
             snapshot.compactionSummary = summary
+            snapshot.compactionBoundaryEventID = event.eventID
         case TimelineEventType.modelChanged:
             guard let model = event.payload["model_id"]?.stringValue
                     ?? event.payload["model"]?.stringValue,
@@ -924,11 +996,32 @@ private func decodeContextManifest(
         decodeTimelineValue($0)
     }
     guard omissions.count == omissionValues.count else { return nil }
+    let sourceValues = payload["system_prompt_sources"]?.arrayValue
+    let promptSources: [ContextManifestSource]?
+    if let sourceValues {
+        let decoded: [ContextManifestSource] = sourceValues.compactMap {
+            decodeTimelineValue($0)
+        }
+        guard decoded.count == sourceValues.count else { return nil }
+        promptSources = decoded
+    } else {
+        promptSources = nil
+    }
     let manifest = ContextManifest(
         schemaVersion: schemaVersion, manifestID: manifestID, requestID: requestID,
         modelID: modelID, measuredBy: measuredBy, components: components,
-        omissions: omissions, cumulativeDeliveredBytes: cumulativeDeliveredBytes)
+        omissions: omissions, cumulativeDeliveredBytes: cumulativeDeliveredBytes,
+        systemPromptAssemblyID: payload["system_prompt_assembly_id"]?.stringValue,
+        systemPromptSources: promptSources)
     guard manifest.measuredBytes == measuredBytes,
           manifest.deliveredBytes == deliveredBytes else { return nil }
     return manifest
+}
+
+private func decodeContextSources(_ payload: JSONValue) -> [ContextManifestSource]? {
+    guard let values = payload["sources"]?.arrayValue,
+          let expectedCount = payload["source_count"]?.intValue,
+          expectedCount == values.count else { return nil }
+    let decoded: [ContextManifestSource] = values.compactMap { decodeTimelineValue($0) }
+    return decoded.count == values.count ? decoded : nil
 }

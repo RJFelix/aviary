@@ -311,14 +311,24 @@ final class InHouseDriver {
             return
         }
 
+        let assembly: SystemPromptAssembly
+        do {
+            assembly = try SystemPromptAssembly.build(
+                cwd: cwd, skills: gate.render(selection), memory: memoryGate.render(recalled),
+                includeContextFiles: !noContextFiles)
+        } catch {
+            errorBanner = "Could not assemble the system prompt: \(error.localizedDescription)"
+            await stopRuntimeHost(host)
+            _ = await commandController.markFailed(commandID: admittedStart.commandID)
+            await finishFailedLaunch()
+            return
+        }
         let runner = AgentRunner(
             provider: provider, host: host,
             settings: .init(
                 home: home, cwd: cwd, model: model,
-                systemPrompt: SystemPrompt.build(
-                    cwd: cwd, model: model, skills: gate.render(selection),
-                    memory: memoryGate.render(recalled),
-                    includeContextFiles: !noContextFiles),
+                systemPrompt: assembly.flattenedText,
+                systemPromptAssembly: assembly,
                 memory: memory, recordPayloads: recordPayloads,
                 hookPaths: HookDiscovery.paths(repoRoot: repoRoot), resume: resume,
                 peerDelegate: peerDelegate,
