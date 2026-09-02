@@ -754,6 +754,14 @@ public enum PromptText {
         public var hasInjection: Bool { !injected.isEmpty }
     }
 
+    /// A prefix of the person-authored portion of a prompt. Unlike `split`, this projection does
+    /// not copy injected block bodies, so catalog/search refreshes stay bounded even when a hook
+    /// prepended a very large payload.
+    public struct BoundedUserText: Sendable, Hashable {
+        public let text: String
+        public let omittedCharacterCount: Int
+    }
+
     /// Peel leading (and trailing) wrapper blocks off a prompt.
     public static func split(_ text: String) -> Split {
         var result = Split()
@@ -799,5 +807,59 @@ public enum PromptText {
     /// Just the part a person wrote.
     public static func userFacing(_ text: String) -> String {
         split(text).userText
+    }
+
+    public static func boundedUserFacing(
+        _ text: String, maximumCharacters: Int,
+        fallbackToFirstInjectedBody: Bool = true
+    ) -> BoundedUserText {
+        let maximum = max(0, maximumCharacters)
+        var rest = Substring(text)
+        var firstBody: Substring?
+        var peeled = 0
+
+        while peeled < 8 {
+            let leadingTrimmed = trim(rest)
+            guard leadingTrimmed.first == "<" else { break }
+            let afterAngle = leadingTrimmed.dropFirst()
+            guard let firstChar = afterAngle.first, firstChar.isLetter else { break }
+            let name = afterAngle.prefix {
+                $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" || $0 == "."
+            }
+            guard !name.isEmpty else { break }
+            let afterName = afterAngle.dropFirst(name.count)
+            guard afterName.first == ">" else { break }
+            let closing = "</\(name)>"
+            guard let closeRange = leadingTrimmed.range(of: closing) else { break }
+            let openEnd = afterName.index(after: afterName.startIndex)
+            if firstBody == nil {
+                firstBody = trim(leadingTrimmed[openEnd..<closeRange.lowerBound])
+            }
+            rest = leadingTrimmed[closeRange.upperBound...]
+            peeled += 1
+        }
+
+        let user = trim(rest)
+        let selected = user.isEmpty && fallbackToFirstInjectedBody
+            ? (firstBody ?? user)
+            : user
+        let total = selected.count
+        return BoundedUserText(
+            text: String(selected.prefix(maximum)),
+            omittedCharacterCount: max(0, total - maximum))
+    }
+
+    private static func trim(_ value: Substring) -> Substring {
+        var lower = value.startIndex
+        while lower < value.endIndex, value[lower].isWhitespace {
+            lower = value.index(after: lower)
+        }
+        var upper = value.endIndex
+        while lower < upper {
+            let previous = value.index(before: upper)
+            guard value[previous].isWhitespace else { break }
+            upper = previous
+        }
+        return value[lower..<upper]
     }
 }

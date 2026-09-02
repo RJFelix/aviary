@@ -161,21 +161,27 @@ public struct SessionCatalogProjectionIndex: Sendable {
     /// Rows in their first-seen order, with duplicate display identities removed. This is the
     /// sequence the GUI consumes; the map above remains a lookup projection and diagnostics.
     public let displaySummaries: [SessionSummary]
+    /// The same conflict-free rows as their migration-boundary projections. Consumers that need
+    /// bounded native fields (rather than the compatibility summaries) use this exact sequence.
+    public let displayEntries: [SessionCatalogProjection]
 
     public init(entries: [SessionCatalogProjection]) {
         let counts = Dictionary(grouping: entries, by: \.id).mapValues(\.count)
         let duplicateSet = Set(counts.compactMap { $0.value > 1 ? $0.key : nil })
         var rows: [String: CanonicalSessionCatalogSummary] = [:]
         var displayRows: [SessionSummary] = []
+        var displayEntries: [SessionCatalogProjection] = []
         for entry in entries {
             guard !duplicateSet.contains(entry.id) else { continue }
             guard let canonical = entry.canonical else { continue }
             rows[entry.id] = canonical
+            displayEntries.append(entry)
             if let summary = entry.displaySummary { displayRows.append(summary) }
         }
         canonicalByID = rows
         duplicateIDs = duplicateSet.sorted()
         displaySummaries = displayRows
+        self.displayEntries = displayEntries
     }
 }
 

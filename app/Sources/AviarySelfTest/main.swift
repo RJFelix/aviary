@@ -6489,6 +6489,36 @@ let casesPhase1Timeline: [Case] = [
     }),
 ]
 
+let casesCanonicalSessionSearch: [Case] = [
+    ("phase1 search: authority-qualified same IDs remain distinct", {
+        try test_canonicalSessionSearchSeparatesAuthorityQualifiedSameIDs()
+    }),
+    ("phase1 search: unknown companion facts never refill from legacy", {
+        try test_canonicalSessionSearchUnknownNeverRefillsCompanionLegacyFacts()
+    }),
+    ("phase1 search: non-exact native facts are withheld", {
+        try test_canonicalSessionSearchWithholdsNonExactOrInvalidNativeFacts()
+    }),
+    ("phase1 search: large fields are bounded before indexing", {
+        try test_canonicalSessionSearchBoundsLargeFieldsBeforeIndexing()
+    }),
+    ("phase1 search: legacy agent prompts are bounded and sanitized", {
+        test_legacyAgentSearchIsBoundedAndExcludesInjectedPromptContext()
+    }),
+    ("phase1 search: visible conversation is whitelisted and bounded", {
+        try test_canonicalSessionSearchWhitelistsVisibleConversationAndBoundsIt()
+    }),
+    ("phase1 search: legacy compatibility is explicit and sanitized", {
+        try test_canonicalSessionSearchLegacyCompatibilityIsExplicitAndSanitized()
+    }),
+    ("phase1 search: duplicate rows and global bounds are deterministic", {
+        try test_canonicalSessionSearchDuplicateRowsAreWithheldAndGlobalBoundsAreDeterministic()
+    }),
+    ("phase1 search: conversation lifecycle stays separate from Work liveness", {
+        try test_canonicalSessionSearchKeepsConversationLifecycleSeparateFromWorkLiveness()
+    }),
+]
+
 let casesContextManifest: [Case] = [
     ("phase1 context: manifest is stable measured and secret safe", {
         try test_contextManifestIsStableMeasuredAndSecretSafe()
@@ -6747,6 +6777,7 @@ await Harness.run(
         + casesBackgroundSpawn + casesWebSearch + casesDispatched
         + casesCrossingLaws + casesPhase0SessionControl + casesPhase1Timeline
         + casesContextManifest + casesPromptProvenance + casesNativeColdResume
+        + casesCanonicalSessionSearch
         + casesLocalTimelineCatalog + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal
         + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel

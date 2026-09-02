@@ -73,7 +73,14 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(report.registeredConsumers, [
         "production local Timeline catalog", "canonical SessionCatalog projection",
         "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
+        "canonical Session search",
     ])
+    let search = report.canonicalSessionSearch
+    let searchDocument = try XCTUnwrap(search.documents.first)
+    XCTAssertTrue(searchDocument.matches("selected branch is preserved"))
+    XCTAssertFalse(searchDocument.matches("abandoned branch"))
+    XCTAssertFalse(searchDocument.matches("earlier inspection was compacted"))
+    XCTAssertEqual(searchDocument.sourceEventRefs.map(\.eventID), ["s6", "s7", "s10", "s11"])
     XCTAssertTrue(report.assemblerReady)
     XCTAssertEqual(report.visibleMessageIDs, ["s6", "s7", "s10", "s11"])
     XCTAssertEqual(report.activeTip?.eventID, "s11")
@@ -132,7 +139,7 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(report.unknownReferences.count, 1)
     XCTAssertEqual(report.unknownReferences[0].eventID, "missing-activity")
     XCTAssertEqual(report.intentionallyUnwiredConsumers, [
-        "notifications", "search", "service recovery",
+        "notifications", "service recovery",
     ])
 
     let workEvents = ReaderCensus.read(

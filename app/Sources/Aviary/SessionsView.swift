@@ -895,10 +895,10 @@ struct SessionInspector: View {
     private var subagentsCard: some View {
         if let id = model.selectedSessionID {
             let kids = model.tree.roots(forSession: id)
+                .filter { !model.nativeCompanionLegacyIDs.contains($0.parentSessionID) }
             if !kids.isEmpty {
-                // No link out: Flock is hidden until it describes the in-house world rather
-                // than the harness's forest of supervisor-held sessions. The rows below are
-                // read from the spawn ledger and stand on their own.
+                // Legacy-only compatibility rows remain useful beside their transcript. Native
+                // companions are withheld here because canonical Work owns their child truth.
                 Card("Sub-agents", symbol: "bird.fill") {
                     VStack(alignment: .leading, spacing: 5) {
                         ForEach(kids) { node in

@@ -101,6 +101,9 @@ final class AppModel {
     /// these values rather than repeatedly joining every Work to every Session during rendering.
     var canonicalFlockInventory: [CanonicalFlockCatalogProjection] = []
     var canonicalAttentionInbox = CanonicalAttentionInboxProjection(summaries: [])
+    /// Cached bounded lexical documents. Views never rebuild native/legacy search fields on each
+    /// keystroke, and the index consumes only conflict-free display projections.
+    var canonicalSessionSearchIndex = CanonicalSessionSearchIndex(entries: [])
     var nativeTimelineCatalogDiagnostics: [LocalTimelineCatalog.Diagnostic] = []
     /// Native Session journals that exist but cannot prove attachment/liveness truth. This is
     /// separate from canonical projections because invalid native rows are intentionally absent
@@ -452,6 +455,7 @@ final class AppModel {
         let projectionIndex = SessionCatalogProjectionIndex(entries: result.entries)
         canonicalCatalogProjections = projectionIndex.canonicalByID
         canonicalCatalogProjectionConflicts = projectionIndex.duplicateIDs
+        canonicalSessionSearchIndex = CanonicalSessionSearchIndex(entries: projectionIndex.displayEntries)
         canonicalWorkInventory = result.workInventory
         let nativeSummaries = result.entries.compactMap { entry -> CanonicalSessionCatalogSummary? in
             switch entry {
@@ -471,6 +475,11 @@ final class AppModel {
             catalogIssues.append(
                 "Duplicate canonical catalog ids: "
                     + projectionIndex.duplicateIDs.joined(separator: ", "))
+        }
+        if !canonicalSessionSearchIndex.duplicateCanonicalIdentities.isEmpty {
+            catalogIssues.append(
+                "Canonical Session search withheld "
+                    + "\(canonicalSessionSearchIndex.duplicateCanonicalIdentities.count) conflicting journal identity claim(s)")
         }
         if !result.diagnostics.isEmpty {
             let kinds = Array(Set(result.diagnostics.map(\.kind))).sorted()
@@ -795,26 +804,35 @@ final class AppModel {
     var filteredSessions: [SessionSummary] {
         let q = sessionSearch.trimmingCharacters(in: .whitespaces).lowercased()
         guard !q.isEmpty else { return sessions }
-        return sessions.filter { s in
-            catalogTitle(for: s).lowercased().contains(q)
-                || s.firstPrompt.lowercased().contains(q)
-                || s.lastAssistantText.lowercased().contains(q)
-                || s.projectName.lowercased().contains(q)
-                || (s.model?.lowercased().contains(q) ?? false)
-                || (s.provider?.lowercased().contains(q) ?? false)
-                || s.id.lowercased().contains(q)
-        }
+        return sessions.filter { canonicalSessionSearchIndex.document(actionTargetID: $0.id)?.matches(q) == true }
     }
 
     /// The list's title/search projection comes from the canonical boundary when available. The
     /// legacy summary remains the compatibility fallback, and local identity is never replaced
     /// by the canonical authority-qualified journal id.
     func catalogTitle(for session: SessionSummary) -> String {
+        if let document = canonicalSessionSearchIndex.document(actionTargetID: session.id) {
+            return document.displayTitle
+        }
         if let projected = canonicalCatalogProjections[session.id]?.title,
            !projected.isEmpty {
             return projected
         }
         return session.title
+    }
+
+    func sessionSearchDocument(for session: SessionSummary) -> CanonicalSessionSearchDocument? {
+        canonicalSessionSearchIndex.document(actionTargetID: session.id)
+    }
+
+    /// Running Work is not the same thing as an active conversation. Preserve in-process
+    /// liveness for legacy rows and require exact attached Work before native state drives the
+    /// palette's live indicator.
+    func sessionLiveness(for session: SessionSummary) -> Bool? {
+        guard let document = sessionSearchDocument(for: session) else { return nil }
+        return CanonicalSessionLivenessProjection.project(
+            inProcess: session.isLive, source: document.source,
+            summary: canonicalCatalogProjections[session.id])
     }
 
     var selectedSession: SessionSummary? {

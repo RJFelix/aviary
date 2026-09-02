@@ -157,25 +157,14 @@ struct CommandPaletteView: View {
         }
 
         if !q.isEmpty {
-            for s in model.sessions where matches(s, q) {
-                let canonical = model.canonicalCatalogProjections[s.id]
-                let canonicalProven = canonical?.sessionStructuralIntegrityValid == true
-                    && canonical?.sessionSemanticProjectionValid == true
-                    && canonical?.unknownDomains.contains(.session) == false
-                    && canonical?.unknownDomains.contains(.work) == false
-                let projectedLive: Bool? = {
-                    guard let canonical else { return s.isLive }
-                    guard canonicalProven else { return nil }
-                    return canonical.work.contains {
-                        $0.canProjectExecution && $0.lifecycle == .active
-                    }
-                }()
+            for s in model.sessions {
+                guard let document = model.sessionSearchDocument(for: s), document.matches(q) else {
+                    continue
+                }
+                let projectedLive = model.sessionLiveness(for: s)
                 out.append(Entry(
-                    kind: .session, title: model.catalogTitle(for: s),
-                    subtitle: s.isCanonicalOnly
-                        ? "canonical projection · metadata partial"
-                        : "\(s.projectName) · \(Fmt.ago(s.updatedAt)) · "
-                            + "\(Fmt.tokens(s.usage.totalTokens)) tokens",
+                    kind: .session, title: document.displayTitle,
+                    subtitle: document.displaySubtitle,
                     symbol: projectedLive == true
                         ? "dot.radiowaves.left.and.right"
                         : projectedLive == nil
@@ -186,14 +175,21 @@ struct CommandPaletteView: View {
                         model.section = .sessions
                         model.select(session: s)
                     }))
-                if out.count > 120 { break }
+                if out.count >= 120 { break }
             }
 
-            for node in model.tree.allNodes
-            where node.name.lowercased().contains(q) || node.prompt.lowercased().contains(q) {
+            // AgentTree roots are the only legacy compatibility entry points. Flatten only
+            // roots that have no native companion; otherwise stale legacy descendants can refill
+            // a native row through a child search hit.
+            let eligibleLegacyNodes = model.tree.byParentSession.keys.sorted()
+                .filter { !model.nativeCompanionLegacyIDs.contains($0) }
+                .flatMap { model.tree.roots(forSession: $0).flatMap(\.flattened) }
+            for node in eligibleLegacyNodes {
+                let document = LegacyAgentSearchDocument(node: node)
+                guard document.matches(q) else { continue }
                 out.append(Entry(
-                    kind: .agent, title: node.name,
-                    subtitle: "\(node.status) · \(node.modelLabel) · depth \(node.depth)",
+                    kind: .agent, title: document.displayName,
+                    subtitle: document.displaySubtitle + " · depth \(node.depth)",
                     symbol: "bird", tint: Design.agentMessage,
                     action: {
                         // Sessions, not Flock: a sub-agent's transcript opens beside its
@@ -201,7 +197,7 @@ struct CommandPaletteView: View {
                         model.section = .sessions
                         Task { await model.loadChildTranscript(node: node) }
                     }))
-                if out.count > 160 { break }
+                if out.count >= 160 { break }
             }
 
             for m in model.pickerModels where m.qualifiedID.lowercased().contains(q) {
@@ -217,7 +213,7 @@ struct CommandPaletteView: View {
                         model.section = .live
                         NotificationCenter.default.post(name: .aviaryNewRun, object: nil)
                     }))
-                if out.count > 200 { break }
+                if out.count >= 200 { break }
             }
 
             for skill in model.library.skills
@@ -227,19 +223,11 @@ struct CommandPaletteView: View {
                     subtitle: skill.description.isEmpty ? skill.sourceLabel : skill.description,
                     symbol: "wand.and.stars", tint: Design.tool,
                     action: { model.section = .library }))
-                if out.count > 240 { break }
+                if out.count >= 240 { break }
             }
         }
 
         return out
-    }
-
-    private func matches(_ s: SessionSummary, _ q: String) -> Bool {
-        model.catalogTitle(for: s).lowercased().contains(q)
-            || s.firstPrompt.lowercased().contains(q)
-            || s.projectName.lowercased().contains(q)
-            || (s.model?.lowercased().contains(q) ?? false)
-            || s.id.lowercased().contains(q)
     }
 
     private var actions: [Entry] {

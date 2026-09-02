@@ -26,8 +26,9 @@ versioned Reader Census fixture exercises branching, compaction, model change, q
 completion, late steering, indeterminate actions, unknown events, legacy input, retained bodies, and
 malformed/truncated tails across linked Session and Work journals. The production local Timeline
 catalog now joins the Census. The production Flock UI consumes the same source-qualified,
-unknown-aware Work projection exercised by the fixture; notifications, search, and service recovery
-remain explicitly unwired.
+unknown-aware Work projection exercised by the fixture, and the Sessions list plus command palette
+consume a canonical Session search projection exercised by that same fixture. Notifications and
+service recovery remain explicitly unwired.
 
 A canonical catalog adapter now projects authority-qualified Session identities and attached Work
 at independently verified requested/observed cursors. Only attached, exactly aligned Work with
@@ -55,8 +56,14 @@ client-neutral attention projection retains authored/effective attention, indepe
 cursors, attachment identity, integrity, tails, and unknowns; its `attentionRequirement` is
 explicitly `unknown`, `none`, or `required`, without implying that the observing GUI has control
 capability. Duplicate summaries become one unknown conflict row, and attachment, unknown-event,
-and corruption evidence is independently bounded with omission counts. OS notifications, search,
-and service recovery remain unwired to the canonical projection. Work rows separately report
+and corruption evidence is independently bounded with omission counts. Canonical Session search is
+an ephemeral, conflict-free projection over exact active-branch user/assistant conversation and
+bounded title/model metadata; unknown or invalid native facts fail closed, legacy compatibility is
+sanitized, identity matches are exact-or-prefix by field, and result bounds do not hide later corpus
+rows. Search selection retains the GUI action identity and canonical EventRefs, native companion
+rows cannot be refilled by legacy AgentTree prompts, and conversation lifecycle is kept separate
+from attached Work liveness. OS notifications and service recovery remain unwired to the canonical
+projection. Work rows separately report
 whether a supplied journal read is absent, exact, stale, ahead, foreign, divergent, or invalid;
 `journalIntegrityValid` is nil only when no read was supplied and is false for every supplied
 non-exact or tailed read. A supplied exact, canonical, tail-free read is required before assembly or
@@ -138,20 +145,21 @@ creating an empty visible chat row.
 
 The Apple Swift 6.3.3 compiler accepts the SDK emitted by Apple Swift 6.3.2; the compatibility probe
 configures its own writable module cache and succeeds both directly and through every gate. At this
-checkpoint, the full suite passes 477 cases / 4,317 assertions in 46.95 seconds and `just compile`
-is clean. Phase 1 passes 186 cases / 2,388 assertions in 16.33 seconds. The versioned 100,000-event
-benchmark reads and reduces a 46,766,700-byte input in 5.858 seconds on the checkpoint machine
-(generation 0.907 seconds). The visual gate renders all 9 canonical screens. Final Sol review found
+checkpoint, the full suite passes 486 cases / 4,434 assertions in 50.11 seconds and `just compile`
+is clean. Phase 1 passes 195 cases / 2,505 assertions in 17.26 seconds. The versioned 100,000-event
+benchmark reads and reduces a 46,766,700-byte input in 6.199 seconds on the checkpoint machine
+(generation 1.010 seconds). The visual gate renders all 9 canonical screens. Final Sol review found
 no remaining must-fix issue after exact cursor/attachment/read authority, local action-time
 revalidation and owner locking, unknown-domain display scrubbing, duplicate non-projection,
 slash-injective Work identity, provider-action causality, exhaustive retained-body decoding,
 structured assistant replay, pre-Start capture/cleanup, source-assembly binding, truncated-source
 replay, metadata-only inspection, parent-qualified legacy selection, multi-Session attention,
-bounded evidence, and conflict projection findings were remediated.
+bounded evidence, conflict projection, Work-liveness separation, bounded search allocation, and
+wrapper-only injection findings were remediated.
 
 Phase 0 still owes real VoiceOver/keyboard UI automation and broader driver focus/race proof. Phase 1
-still owes the remaining canonical consumer migrations (notification delivery, search, service
-recovery, and other named legacy readers); individual skill/memory identity and included-versus-listed
+still owes the remaining canonical consumer migrations (notification delivery, service recovery,
+and other named legacy readers); individual skill/memory identity and included-versus-listed
 provenance inside the now-durable block-level prompt sources; independent native Work bundles for
 children; actual disk-full and permission fault reachability; and a measured
 peak-RSS budget. The semantic component measure is deliberately not claimed to be provider-specific

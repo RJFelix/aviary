@@ -492,6 +492,14 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
     public let registeredConsumers: [String]
     public let intentionallyUnwiredConsumers: [String]
 
+    /// Rebuild the production lexical search projection from the retained canonical catalog row.
+    /// The ephemeral document itself is intentionally excluded from the Codable report surface.
+    public var canonicalSessionSearch: CanonicalSessionSearchIndex {
+        CanonicalSessionSearchIndex(entries: canonicalSessionCatalog.map {
+            [SessionCatalogProjection.canonical($0)]
+        } ?? [])
+    }
+
     /// Bounded metadata-only view of the latest provider-bound context the journal accepted.
     /// This does not claim that an unchanged context will be sent on the next request: later
     /// messages, compaction, attachments, or runtime decisions may alter that future crossing.
@@ -597,11 +605,12 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
 /// locations are not part of the protocol and must not leak into a report.
 public enum ReaderCensus {
     private static let defaultIntentionallyUnwiredConsumers = [
-        "notifications", "search", "service recovery",
+        "notifications", "service recovery",
     ]
     private static let defaultRegisteredConsumers = [
         "production local Timeline catalog", "canonical SessionCatalog projection",
         "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
+        "canonical Session search",
     ]
     public static func read(
         _ data: Data,
@@ -678,6 +687,7 @@ public enum ReaderCensus {
         registeredConsumers: [String] = [
             "production local Timeline catalog", "canonical SessionCatalog projection",
             "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
+            "canonical Session search",
         ],
         intentionallyUnwiredConsumers: [String] = []
     ) -> ReaderCensusReport {
