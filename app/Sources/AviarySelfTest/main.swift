@@ -6283,6 +6283,9 @@ let casesPhase1Timeline: [Case] = [
     ("phase1: live and cold timeline prefixes reduce identically", {
         try test_timelineReducersLiveAndColdPrefixEquivalence()
     }),
+    ("phase1: malformed Session attention stays unknown", {
+        try test_sessionAttentionMalformedPayloadIsUnknownNotNone()
+    }),
     ("phase1: one Session supports many Work attachments with isolated detach", {
         try test_timelineSessionSupportsManyAttachmentsAndDetachIsolation()
     }),
@@ -6342,6 +6345,33 @@ let casesPhase1Timeline: [Case] = [
     }),
     ("phase1 attention: duplicate journal summaries become conflicts", {
         try test_canonicalAttentionInboxCoalescesDuplicateJournalSummariesAsConflict()
+    }),
+    ("phase1 notifications: classify canonical transitions and preserve action identity", {
+        try test_canonicalNotificationsClassifyAndRetainActionIdentity()
+    }),
+    ("phase1 notifications: delivery baselines and withholds incomplete scans", {
+        try test_canonicalNotificationDeliveryBaselinesDeduplicatesAndWithholdsIncompleteScans()
+    }),
+    ("phase1 notifications: unknowns conflicts and source transitions stay exact", {
+        try test_canonicalNotificationsRetainUnknownsConflictsAndTransitionProvenance()
+    }),
+    ("phase1 notifications: delivery commits only after acknowledgement and persists", {
+        try test_canonicalNotificationDeliveryCommitsOnlyAfterAcknowledgementAndPersists()
+    }),
+    ("phase1 notifications: new Sessions notify after the initial baseline", {
+        try test_canonicalNotificationDeliveryEmitsForSessionCreatedAfterInitialBaseline()
+    }),
+    ("phase1 notifications: identities are injective and request ids bounded", {
+        try test_canonicalNotificationIdentityIsInjectiveAndRequestIDsBounded()
+    }),
+    ("phase1 notifications: routes are bounded and identity validated", {
+        try test_canonicalNotificationRouteRejectsOversizedOrForeignPayloads()
+    }),
+    ("phase1 notifications: checkpoint state stays bounded", {
+        try test_canonicalNotificationCheckpointIsBoundedAndCurrentKeysSurvivePruning()
+    }),
+    ("phase1 notifications: live turn completion becomes exact ready-for-review", {
+        try await test_runJournalBundleFinishedTurnPublishesExactReadyForReviewWhileRunRemainsActive()
     }),
     ("phase1 catalog: detached active Work remains unprojected", {
         try test_canonicalSessionCatalogDoesNotProjectDetachedActiveWork()
@@ -6441,6 +6471,9 @@ let casesPhase1Timeline: [Case] = [
     }),
     ("phase1 census: linked fixture reports canonical state planes", {
         try test_readerCensusFixtureProjectsCorePlanes()
+    }),
+    ("phase1 census: positive ready projection crosses delivery gate", {
+        try test_readerCensusProjectsPositiveReadyNotificationAndDeliveryTransition()
     }),
     ("phase1 census: canonical Flock rejects unaligned or foreign Work", {
         try test_readerCensusFlockRejectsUnalignedOrForeignWork()
@@ -6643,8 +6676,8 @@ let casesLocalTimelineCatalog: [Case] = [
     ("phase1 local catalog: preserves active Work across absent or stale Session cursor", {
         try test_localTimelineCatalogKeepsActiveWorkWhenSessionCursorIsAbsentOrStale()
     }),
-    ("phase1 local catalog: rejects owner authority and locator mismatches", {
-        try test_localTimelineCatalogRejectsOwnerAuthorityAndLocatorMismatches()
+    ("phase1 local catalog: rejects owner authority and locator mismatches locally", {
+        try test_localTimelineCatalogRejectsOwnerAuthorityAndLocatorMismatchesLocally()
     }),
     ("phase1 local catalog: retains truncated and corrupt files", {
         try test_localTimelineCatalogKeepsTruncatedAndCorruptFilesVisible()
@@ -6673,8 +6706,8 @@ let casesLocalTimelineCatalog: [Case] = [
     ("phase1 local catalog: symlinked home roots cannot establish authority", {
         try test_localTimelineCatalogRejectsSymlinkedHomeRootAuthority()
     }),
-    ("phase1 local catalog: reports duplicate event identity without trapping", {
-        try test_localTimelineCatalogReportsDuplicateEventIdentityWithoutTrapping()
+    ("phase1 local catalog: reports duplicate event identity without blocking other rows", {
+        try test_localTimelineCatalogReportsDuplicateEventIdentityWithoutBlockingOtherRows()
     }),
     ("phase1 local catalog: round trips unsafe encoded Work IDs", {
         try test_localTimelineCatalogRoundTripsUnsafeEncodedWorkIDs()
@@ -6748,6 +6781,9 @@ let casesRunJournalBundle: [Case] = [
     ("phase1 bundle: terminal run outcomes remain typed", {
         try await test_runJournalBundleTerminalRunOutcomesRemainTyped()
     }),
+    ("phase1 bundle: turn outcomes reach catalog notifications and deduplicate", {
+        try await test_runJournalBundleTurnOutcomesReachCatalogNotificationsAndDeduplicate()
+    }),
     ("phase1 bundle: partial prefixes latch and refuse permits", {
         try await test_runJournalBundlePartialPrefixesLatchAndRefusePermits()
     }),
@@ -6762,6 +6798,9 @@ let casesRunJournalBundle: [Case] = [
     }),
     ("phase1 bundle: checked close reports a partial close", {
         try await test_runJournalBundleCheckedCloseReportsPartialClose()
+    }),
+    ("phase1 bundle: native producers record attention transitions", {
+        try await test_runJournalBundleProducesCanonicalAttentionTransitions()
     }),
     ("phase1 bundle: canceled teardown still finishes and closes", {
         try await test_runJournalBundleCanceledTaskStillFinishesAndCloses()

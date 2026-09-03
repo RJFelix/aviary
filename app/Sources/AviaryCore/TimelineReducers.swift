@@ -789,15 +789,23 @@ public struct SessionReducer: Sendable {
             }
             snapshot.modelID = model
         case TimelineEventType.sessionAttention:
-            if let attention = event.payload["attention"]?.stringValue {
-                snapshot.attention = SessionAttention(rawValue: attention) ?? .none
+            guard let raw = event.payload["attention"]?.stringValue,
+                  let attention = SessionAttention(rawValue: raw) else {
+                // A malformed attention event cannot mean `.none`: quarantine it and retain
+                // the prior known state so notification delivery never invents a clearing edge.
+                recordUnknown(event)
+                quarantine(event, reason: "session attention payload is missing or invalid")
+                return
             }
+            snapshot.attention = attention
+            snapshot.attentionEvent = EventRef(journal: event.journal, eventID: event.eventID)
         case TimelineEventType.sessionCompleted:
             snapshot.lifecycle = .completed
             snapshot.execution = .idle
         case TimelineEventType.sessionArchived:
             snapshot.lifecycle = .archived
             snapshot.attention = .none
+            snapshot.attentionEvent = EventRef(journal: event.journal, eventID: event.eventID)
         case TimelineEventType.sessionTipSelected:
             guard let tip = event.conversationParent, validateConversationTip(tip) else {
                 quarantine(event, reason: "semantic tip is not a known acyclic Session node")

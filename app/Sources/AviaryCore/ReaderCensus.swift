@@ -476,8 +476,7 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
     public let unknownReferenceIDs: [String]
     public let unknownReferences: [EventRef]
     public let assemblerReady: Bool
-    /// Canonical SessionCatalog-shaped projection. The legacy disk scanner remains separately
-    /// listed in `intentionallyUnwiredConsumers` until its callers move to this value.
+    /// Canonical SessionCatalog-shaped projection.
     public let canonicalSessionCatalog: CanonicalSessionCatalogSummary?
     /// Canonical Flock child projection. It is nil when no Work page was supplied; a supplied
     /// stale, foreign, divergent, tailed, or corrupt page remains an unavailable projection and
@@ -486,9 +485,13 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
     /// Flock's production-facing catalog projection, retained so Census fixtures exercise the
     /// same unknown-domain and authority rules as the UI.
     public let canonicalFlockCatalog: [CanonicalFlockCatalogProjection]
-    /// Bounded client-neutral attention rows. This is not an OS-notification projection and
-    /// does not claim that the observing client has control capability.
+    /// Bounded client-neutral attention rows. This does not claim that the observing client has
+    /// control capability.
     public let canonicalAttentionInbox: CanonicalAttentionInboxProjection
+    /// The native delivery consumer's bounded projection. Retaining it in the Codable report
+    /// makes notification behavior part of the fixture receipt rather than a test-only computed
+    /// convenience that disappears when the census is serialized.
+    public let canonicalNotifications: CanonicalNotificationProjection
     public let registeredConsumers: [String]
     public let intentionallyUnwiredConsumers: [String]
 
@@ -512,18 +515,8 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
             unknownDomains: unknownDomains, unknownReferenceIDs: unknownReferenceIDs)
     }
 
-    /// Compatibility alias retained for callers built before the projection's temporal basis
-    /// was named precisely. Prefer `recordedModelContext` in new code.
-    public var nextModelContext: ReaderCensusContextProjection { recordedModelContext }
-
     /// Naming useful to callers that treat this as a general report projection.
     public var contextProjection: ReaderCensusContextProjection { recordedModelContext }
-
-    /// Compatibility projection for older consumers. Equal event IDs from different journals
-    /// intentionally collapse here; use `unknownEventRefs` when provenance matters.
-    public var unknownEventIDs: [String] {
-        Array(Set(unknownEventRefs.map(\.eventID))).sorted()
-    }
 
     public init(
         projectionRulesVersion: Int = ReaderCensusReport.currentProjectionRulesVersion,
@@ -551,6 +544,7 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         canonicalFlock: CanonicalFlockProjection? = nil,
         canonicalFlockCatalog: [CanonicalFlockCatalogProjection] = [],
         canonicalAttentionInbox: CanonicalAttentionInboxProjection = .init(summaries: []),
+        canonicalNotifications: CanonicalNotificationProjection = .init(summaries: []),
         registeredConsumers: [String] = [],
         intentionallyUnwiredConsumers: [String]
     ) {
@@ -596,6 +590,7 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         self.canonicalFlock = canonicalFlock
         self.canonicalFlockCatalog = canonicalFlockCatalog
         self.canonicalAttentionInbox = canonicalAttentionInbox
+        self.canonicalNotifications = canonicalNotifications
         self.registeredConsumers = registeredConsumers
         self.intentionallyUnwiredConsumers = intentionallyUnwiredConsumers
     }
@@ -605,12 +600,12 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
 /// locations are not part of the protocol and must not leak into a report.
 public enum ReaderCensus {
     private static let defaultIntentionallyUnwiredConsumers = [
-        "notifications", "service recovery",
+        "service recovery",
     ]
     private static let defaultRegisteredConsumers = [
         "production local Timeline catalog", "canonical SessionCatalog projection",
         "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
-        "canonical Session search",
+        "canonical Session search", "canonical notification projection",
     ]
     public static func read(
         _ data: Data,
@@ -687,7 +682,7 @@ public enum ReaderCensus {
         registeredConsumers: [String] = [
             "production local Timeline catalog", "canonical SessionCatalog projection",
             "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
-            "canonical Session search",
+            "canonical Session search", "canonical notification projection",
         ],
         intentionallyUnwiredConsumers: [String] = []
     ) -> ReaderCensusReport {
@@ -765,6 +760,8 @@ public enum ReaderCensus {
                 unknownDomains: work.unknownDomains.sorted { $0.rawValue < $1.rawValue })
         }.map { [$0] } ?? []
         let canonicalAttentionInbox = CanonicalAttentionInboxProjection(
+            summaries: canonicalSessionCatalog.map { [$0] } ?? [])
+        let canonicalNotifications = CanonicalNotificationProjection(
             summaries: canonicalSessionCatalog.map { [$0] } ?? [])
 
         let allEvents = sessionEvents + workEvents
@@ -874,6 +871,7 @@ public enum ReaderCensus {
             canonicalFlock: canonicalFlock,
             canonicalFlockCatalog: canonicalFlockCatalog,
             canonicalAttentionInbox: canonicalAttentionInbox,
+            canonicalNotifications: canonicalNotifications,
             registeredConsumers: registeredConsumers,
             intentionallyUnwiredConsumers: intentionallyUnwiredConsumers)
     }

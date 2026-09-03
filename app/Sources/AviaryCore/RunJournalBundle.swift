@@ -19,6 +19,21 @@ public enum RunTerminalOutcome: String, Codable, Hashable, Sendable {
     case indeterminate
 }
 
+/// The outcome of one native turn, projected onto Session attention at the turn boundary.
+public enum RunTurnOutcome: String, Codable, Hashable, Sendable {
+    case completed
+    case failed
+    case canceled
+
+    public var sessionAttention: SessionAttention {
+        switch self {
+        case .completed: return .review
+        case .failed: return .error
+        case .canceled: return .none
+        }
+    }
+}
+
 /// The bounded vocabulary used by the first native effect boundary. Keeping this typed makes
 /// action accounting useful without making the bundle know how any one provider executes.
 public enum ActionKind: String, Codable, CaseIterable, Hashable, Sendable {
@@ -175,6 +190,9 @@ public actor RunJournalBundle {
     private var activeTurn: TurnRef?
     private var activeRun: RunRef?
     private var lastMessage: EventRef?
+    /// Authored Session attention avoids duplicate evidence edges when a turn and its enclosing
+    /// Run settle to the same visible state.
+    private var authoredAttention: SessionAttention
     /// The journal, not the request builder, owns cumulative carriage accounting. Values are
     /// scoped by Run so a cold reducer and a reopened writer make the same claim.
     private var contextDeliveredBytesByRun: [String: Int]
@@ -198,6 +216,7 @@ public actor RunJournalBundle {
         commandAcceptedRefs: [String: EventRef] = [:], permits: [String: EffectPermit] = [:],
         activeTurn: TurnRef? = nil, activeRun: RunRef? = nil,
         lastMessage: EventRef? = nil,
+        authoredAttention: SessionAttention = .none,
         contextDeliveredBytesByRun: [String: Int] = [:]
     ) {
         self.session = session
@@ -224,6 +243,7 @@ public actor RunJournalBundle {
         self.activeTurn = activeTurn
         self.activeRun = activeRun
         self.lastMessage = lastMessage
+        self.authoredAttention = authoredAttention
         self.contextDeliveredBytesByRun = contextDeliveredBytesByRun
     }
 
@@ -371,7 +391,7 @@ public actor RunJournalBundle {
             contextBodyStore: ContextBodyStore(home: home),
             sessionWriter: sessionWriter, workWriter: workWriter,
             sessionCursor: nil, workCursor: nil, sessionEventCount: 0, workEventCount: 0,
-            hostOrder: 0, activeRun: run)
+            hostOrder: 0, activeRun: run, authoredAttention: .none)
         do {
             try await bundle.appendFreshGenesis(modelID: modelID)
             return bundle
@@ -505,6 +525,7 @@ public actor RunJournalBundle {
                 lastMessage: sessionState.semanticTip ?? sessionState.messageHistory.last.map {
                     EventRef(journal: configuration.sessionJournal, eventID: $0.eventID)
                 },
+                authoredAttention: sessionState.attention,
                 contextDeliveredBytesByRun:
                     sessionState.contextCumulativeDeliveredBytesByRun ?? [:])
             do {
@@ -616,7 +637,37 @@ public actor RunJournalBundle {
             type: TimelineEventType.sessionTipSelected, declaredDomains: [.session],
             payload: .object(["target": .string(input.eventRef.eventID)])))
         commits.append(tip)
+        // A newly accepted input is now being worked. Clearing any prior review/error state is
+        // a canonical Session fact, not a UI inference from an in-process LiveRun.
+        if let attention = try await appendAttentionLocked(.none, causedBy: tip.eventRef) {
+            commits.append(attention)
+        }
         return commits
+    }
+
+    /// Record the Session attention that a producer has actually established. This is kept on
+    /// the Session journal so every client can observe the same transition; callers must only
+    /// use values supported by their real boundary (for example, the native runner does not
+    /// claim confirmation without an explicit confirmation protocol).
+    @discardableResult
+    public func setAttention(_ attention: SessionAttention) async throws -> TimelineJournalCommit? {
+        try await withSemanticGate {
+            try await self.appendAttentionLocked(attention, causedBy: self.lastMessage)
+        }
+    }
+
+    private func appendAttentionLocked(
+        _ attention: SessionAttention, causedBy: EventRef?
+    ) async throws -> TimelineJournalCommit? {
+        try ensureUsable()
+        guard authoredAttention != attention else { return nil }
+        let commit = try await appendSession(TimelineEventDraft(
+            hostSequence: nextHostOrder(), causedByEventID: causedBy,
+            session: session, run: activeRun,
+            type: TimelineEventType.sessionAttention, declaredDomains: [.session],
+            payload: .object(["attention": .string(attention.rawValue)])))
+        authoredAttention = attention
+        return commit
     }
 
     /// Record a non-conversational command such as cancellation or End. Unlike `commitInput`,
@@ -917,13 +968,17 @@ public actor RunJournalBundle {
         return commit
     }
 
-    public func finishTurn(_ turn: TurnRef) async throws -> TimelineJournalCommit {
+    public func finishTurn(
+        _ turn: TurnRef, outcome: RunTurnOutcome = .completed
+    ) async throws -> [TimelineJournalCommit] {
         try await withSemanticGate(respectCancellation: false) {
-            try await self.finishTurnLocked(turn)
+            try await self.finishTurnLocked(turn, outcome: outcome)
         }
     }
 
-    private func finishTurnLocked(_ turn: TurnRef) async throws -> TimelineJournalCommit {
+    private func finishTurnLocked(
+        _ turn: TurnRef, outcome: RunTurnOutcome
+    ) async throws -> [TimelineJournalCommit] {
         try ensureUsable()
         guard !turn.turnID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw RunJournalBundleError.invalidOperation("turn identity is empty")
@@ -935,8 +990,24 @@ public actor RunJournalBundle {
             hostSequence: nextHostOrder(), work: work, workHost: workHost,
             run: activeRun, turn: turn, type: TimelineEventType.turnFinished,
             declaredDomains: [.work]))
+        guard let cursor = workCursor else {
+            throw RunJournalBundleError.invalidOperation(
+                "turn.finished did not produce a Work cursor")
+        }
+        // A turn outcome establishes the Session attention boundary. Persist attention and then
+        // advance the attachment to this exact Work prefix. Failure at either Session append
+        // keeps effective attention unknown; no reader may project ready-for-review from the
+        // in-memory turn state alone.
+        var commits = [commit]
+        if let attention = try await appendAttentionLocked(
+            outcome.sessionAttention, causedBy: commit.eventRef) {
+            commits.append(attention)
+        }
+        let advanced = try await appendAttachmentCursorLocked(
+            cursor, causedBy: commit.eventRef)
         activeTurn = nil
-        return commit
+        commits.append(advanced)
+        return commits
     }
 
     public func changeModel(_ modelID: String) async throws -> TimelineJournalCommit {
@@ -1505,15 +1576,41 @@ public actor RunJournalBundle {
         guard let cursor = workCursor else {
             throw RunJournalBundleError.invalidOperation("run.finished did not produce a Work cursor")
         }
-        let advanced = try await appendSession(TimelineEventDraft(
-            hostSequence: nextHostOrder(), causedByEventID: finished.eventRef,
+        var commits: [TimelineJournalCommit] = [finished]
+        let finalAttention: SessionAttention?
+        switch outcome {
+        case .failed, .indeterminate: finalAttention = .error
+        case .held: finalAttention = .review
+        case .canceled: finalAttention = SessionAttention.none
+        case .completed: finalAttention = .review
+        }
+        // The attention transition must precede the attachment cursor advance. If the paired
+        // Session append fails after Work has terminalized, the stale attachment keeps the
+        // completed Work non-projectable instead of exposing a false ready-for-review fact.
+        if let finalAttention {
+            if let attentionCommit = try await appendAttentionLocked(
+                finalAttention, causedBy: finished.eventRef) {
+                commits.append(attentionCommit)
+            }
+        }
+        let advanced = try await appendAttachmentCursorLocked(
+            cursor, causedBy: finished.eventRef)
+        activeRun = nil
+        commits.append(advanced)
+        return commits
+    }
+
+    private func appendAttachmentCursorLocked(
+        _ cursor: JournalCursor, causedBy cause: EventRef
+    ) async throws -> TimelineJournalCommit {
+        try ensureUsable()
+        return try await appendSession(TimelineEventDraft(
+            hostSequence: nextHostOrder(), causedByEventID: cause,
             session: session, sessionAttachment: sessionAttachment,
             type: TimelineEventType.sessionAttachmentCursorAdvanced,
             declaredDomains: [.session, .work], payload: .object([
                 "cursor": encodeTimelineValue(cursor)
             ])))
-        activeRun = nil
-        return [finished, advanced]
     }
 
     /// Close both files and report which durable prefix survived a partial close.

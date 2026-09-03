@@ -22,7 +22,7 @@ func test_sessionCatalogScanUsesExplicitLegacyProjectionBoundary() async throws 
     try Data(jsonl.utf8).write(to: file)
 
     let catalog = SessionCatalog(home: home)
-    let entries = await catalog.scanEntries()
+    let entries = await catalog.scanCatalog().entries
     let entry = try XCTUnwrap(entries.first)
     let legacy = try XCTUnwrap(entry.legacySummary)
     let canonical = try XCTUnwrap(entry.canonical)

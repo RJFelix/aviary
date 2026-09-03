@@ -1,6 +1,7 @@
 import AppKit
 import AviaryCore
 import SwiftUI
+@preconcurrency import UserNotifications
 
 @main
 struct AviaryApp: App {
@@ -39,6 +40,12 @@ struct AviaryApp: App {
                 .frame(minWidth: 1100, minHeight: 680)
                 .task {
                     delegate.prepareForTermination = { await model.stopAllWork() }
+                    delegate.handleNotification = { route in
+                        model.openCanonicalNotification(route)
+                    }
+                    if CanonicalNotificationPlatform.isAvailable {
+                        UNUserNotificationCenter.current().delegate = delegate
+                    }
                     if let preview = Self.previewSection {
                         model.bootstrapPreview(section: preview)
                     } else {
@@ -66,9 +73,69 @@ struct AviaryApp: App {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    private static let maximumQueuedNotificationRoutes = 32
     var prepareForTermination: (() async -> Void)?
+    var handleNotification: ((CanonicalNotificationRoute) -> Void)? {
+        didSet {
+            guard let handleNotification else { return }
+            let queued = queuedNotificationRoutes
+            queuedNotificationRoutes.removeAll()
+            queuedNotificationRouteKeys.removeAll()
+            queued.forEach(handleNotification)
+        }
+    }
+    private var queuedNotificationRoutes: [CanonicalNotificationRoute] = []
+    private var queuedNotificationRouteKeys: Set<String> = []
     private var terminationTask: Task<Void, Never>?
+
+    override init() {
+        super.init()
+        // Install before the SwiftUI scene/task exists. macOS can deliver a cold-click during
+        // launch; routeNotification queues it until AppModel has built its catalog.
+        if CanonicalNotificationPlatform.isAvailable {
+            UNUserNotificationCenter.current().delegate = self
+        }
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let userInfo = response.notification.request.content.userInfo
+        Task { @MainActor [weak self] in
+            self?.routeNotification(userInfo)
+        }
+        completionHandler()
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        // A foreground Aviary window is already the attention surface. Avoid duplicating the
+        // banner while retaining background delivery for the user-enabled notification path.
+        completionHandler([])
+    }
+
+    private func routeNotification(_ userInfo: [AnyHashable: Any]) {
+        guard let route = CanonicalNotificationRoute.decode(userInfo: userInfo) else { return }
+        guard let handleNotification else {
+            let key = route.deduplicationKey
+            guard queuedNotificationRouteKeys.insert(key).inserted else { return }
+            queuedNotificationRoutes.append(route)
+            if queuedNotificationRoutes.count > Self.maximumQueuedNotificationRoutes,
+               let dropped = queuedNotificationRoutes.first
+            {
+                queuedNotificationRoutes.removeFirst()
+                queuedNotificationRouteKeys.remove(dropped.deduplicationKey)
+            }
+            return
+        }
+        handleNotification(route)
+    }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
 

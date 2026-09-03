@@ -73,7 +73,7 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(report.registeredConsumers, [
         "production local Timeline catalog", "canonical SessionCatalog projection",
         "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
-        "canonical Session search",
+        "canonical Session search", "canonical notification projection",
     ])
     let search = report.canonicalSessionSearch
     let searchDocument = try XCTUnwrap(search.documents.first)
@@ -108,6 +108,16 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
         "sha256:f7423ed89ecf634efc2cbe26e719d08e53fd49888c41af2547b378740a5d7fe8")
     XCTAssertEqual(report.authoredAttention, .review)
     XCTAssertEqual(report.attention, .error)
+    XCTAssertTrue(report.canonicalNotifications.candidates.isEmpty,
+                  "Reader Census must withhold notifications when the exact Work state is unknown")
+    let serializedReport = try JSONEncoder().encode(report)
+    let restoredReport = try JSONDecoder().decode(
+        ReaderCensusReport.self, from: serializedReport)
+    XCTAssertEqual(restoredReport.canonicalNotifications, report.canonicalNotifications,
+                   "the notification consumer receipt must survive Reader Census serialization")
+    var notificationDelivery = CanonicalNotificationDelivery()
+    XCTAssertTrue(notificationDelivery.plan(report.canonicalNotifications).candidates.isEmpty,
+                  "Reader Census must exercise the production delivery gate, not only register its name")
     let attentionRow = try XCTUnwrap(report.canonicalAttentionInbox.rows.first)
     XCTAssertEqual(attentionRow.authoredAttention, .review)
     XCTAssertNil(attentionRow.effectiveAttention,
@@ -129,7 +139,7 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
         report.attachments.filter { $0.journal == censusSessionJournal }.count, 4)
     XCTAssertEqual(
         report.attachments.filter { $0.journal == censusWorkJournal }.count, 2)
-    XCTAssertTrue(report.unknownEventIDs.contains("w21"))
+    XCTAssertTrue(report.unknownEventRefs.contains { $0.eventID == "w21" })
     XCTAssertEqual(report.unknownEventRefs.count, 2)
     XCTAssertEqual(
         Set(report.unknownEventRefs.map { $0.journal }),
@@ -139,7 +149,7 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(report.unknownReferences.count, 1)
     XCTAssertEqual(report.unknownReferences[0].eventID, "missing-activity")
     XCTAssertEqual(report.intentionallyUnwiredConsumers, [
-        "notifications", "service recovery",
+        "service recovery",
     ])
 
     let workEvents = ReaderCensus.read(
@@ -182,10 +192,52 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
         sessionData: duplicateSessionData, sessionJournal: censusSessionJournal,
         workData: try ReaderCensusFixtureFiles.data("work.jsonl"), workJournal: censusWorkJournal)
     XCTAssertEqual(duplicateReport.unknownEventRefs.map(\.eventID), ["w21", "w21"])
-    XCTAssertEqual(duplicateReport.unknownEventIDs, ["w21"])
+    XCTAssertEqual(Set(duplicateReport.unknownEventRefs.map(\.eventID)), ["w21"])
     XCTAssertEqual(
         Set(duplicateReport.unknownEventRefs.map { $0.journal }),
         Set([censusSessionJournal, censusWorkJournal]))
+}
+
+func test_readerCensusProjectsPositiveReadyNotificationAndDeliveryTransition() throws {
+    let session = SessionRef("census-notification-ready")
+    let sessionJournal = JournalRef.session(
+        session, journalID: "notification-session-journal",
+        authority: TimelineAuthorityRef("notification-session-service"))
+    let workJournal = JournalRef.work(
+        WorkRef(workHostID: "notification-work-host", workID: "unused-work"))
+    let actor = TimelineActor(actorID: "reader-census-notification", kind: "self-test")
+    let created = TimelineEvent(
+        eventID: "ready-s1", journal: sessionJournal, sequence: 1,
+        session: session, actor: actor,
+        hostRecordedAt: Date(timeIntervalSince1970: 1),
+        type: TimelineEventType.sessionCreated)
+    let attention = TimelineEvent(
+        eventID: "ready-s2", journal: sessionJournal, sequence: 2,
+        previousEventID: "ready-s1", session: session, actor: actor,
+        hostRecordedAt: Date(timeIntervalSince1970: 2),
+        type: TimelineEventType.sessionAttention,
+        payload: .object(["attention": .string(SessionAttention.review.rawValue)]))
+    var sessionData = Data()
+    for event in [created, attention] {
+        sessionData.append(try JSONEncoder().encode(event))
+        sessionData.append(0x0A)
+    }
+
+    let report = ReaderCensus.report(
+        sessionData: sessionData, sessionJournal: sessionJournal,
+        workData: Data(), workJournal: workJournal)
+    let candidate = try XCTUnwrap(report.canonicalNotifications.candidates.first)
+    XCTAssertEqual(candidate.kind, .readyForReview)
+    XCTAssertEqual(candidate.actionIdentity.session, session)
+    XCTAssertEqual(candidate.sourceCursor.eventID, "ready-s2")
+    XCTAssertEqual(candidate.sourceEvent?.eventID, "ready-s2")
+
+    var delivery = CanonicalNotificationDelivery()
+    XCTAssertTrue(delivery.plan(
+        CanonicalNotificationProjection(summaries: [])).candidates.isEmpty)
+    let transition = delivery.plan(report.canonicalNotifications)
+    XCTAssertEqual(transition.candidates, [candidate],
+                   "Reader Census must exercise a positive production delivery transition")
 }
 
 func test_readerCensusFlockRejectsUnalignedOrForeignWork() throws {

@@ -221,13 +221,25 @@ public enum LocalTimelineCatalog {
         public let sessionSummaries: [CanonicalSessionCatalogSummary]
         public let works: [WorkRow]
         public let diagnostics: [Diagnostic]
+        public let diagnosticsTruncated: Bool
 
-        fileprivate init(sessions: [SessionRow], works: [WorkRow], diagnostics: [Diagnostic]) {
+        fileprivate init(sessions: [SessionRow], works: [WorkRow], diagnostics: [Diagnostic],
+                         diagnosticsTruncated: Bool) {
             self.sessions = sessions
             sessionSummaries = sessions.compactMap(\SessionRow.summary)
                 .sorted { $0.id < $1.id }
             self.works = works
             self.diagnostics = diagnostics
+            self.diagnosticsTruncated = diagnosticsTruncated
+        }
+
+        /// Notification delivery may baseline when discovery is complete. Row-local failures are
+        /// omitted from canonical facts and retain their prior checkpoint; they must not block
+        /// unrelated exact Sessions. Only discovery uncertainty makes the source incomplete.
+        public var canonicalNotificationSourceComplete: Bool {
+            guard !diagnosticsTruncated else { return false }
+            let globalKinds: Set<String> = ["unsafe_root", "catalog_bound", "unavailable_directory"]
+            return !diagnostics.contains { globalKinds.contains($0.kind) }
         }
     }
 
@@ -321,7 +333,7 @@ public enum LocalTimelineCatalog {
         let sessionRows = sessionRecords.map(\.row)
 
         return Snapshot(sessions: sessionRows, works: workRecords.map(\WorkRecord.row),
-                        diagnostics: diagnostics.values)
+                        diagnostics: diagnostics.values, diagnosticsTruncated: diagnostics.didOmit)
     }
 
     /// Alias for callers that use read terminology for a read-only catalog operation.
@@ -388,11 +400,15 @@ public enum LocalTimelineCatalog {
     private struct DiagnosticSink {
         let limit: Int
         var values: [Diagnostic] = []
+        var didOmit = false
 
         init(limit: Int) { self.limit = limit }
 
         mutating func append(kind: String, message: String) {
-            guard values.count < limit else { return }
+            guard values.count < limit else {
+                didOmit = true
+                return
+            }
             let diagnostic = Diagnostic(kind: kind, message: message)
             guard !values.contains(where: { $0.id == diagnostic.id }) else { return }
             values.append(diagnostic)

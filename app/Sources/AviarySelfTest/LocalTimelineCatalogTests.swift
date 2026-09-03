@@ -72,6 +72,7 @@ func test_localTimelineCatalogDiscoversNativeSessionAndIndependentWork() throws 
     try localCatalogWrite(sessionData, to: home.timelineV2SessionJournalURL(session))
 
     let catalog = LocalTimelineCatalog.scan(home: home)
+    XCTAssertTrue(catalog.canonicalNotificationSourceComplete)
     let workRow = try XCTUnwrap(catalog.works.first { $0.work == work })
     XCTAssertTrue(workRow.isAvailable)
     XCTAssertEqual(workRow.cursor?.sequence, 2)
@@ -132,7 +133,7 @@ func test_localTimelineCatalogKeepsActiveWorkWhenSessionCursorIsAbsentOrStale() 
     XCTAssertEqual(summary.work.first?.workReadAlignment, .exact)
 }
 
-func test_localTimelineCatalogRejectsOwnerAuthorityAndLocatorMismatches() throws {
+func test_localTimelineCatalogRejectsOwnerAuthorityAndLocatorMismatchesLocally() throws {
     let home = try localCatalogHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
     let actual = WorkRef(workHostID: "actual-host", workID: "actual-work")
@@ -170,6 +171,8 @@ func test_localTimelineCatalogRejectsOwnerAuthorityAndLocatorMismatches() throws
     XCTAssertEqual(catalog.works.count, 3)
     XCTAssertTrue(catalog.works.allSatisfy { !$0.isAvailable && $0.cursor == nil })
     XCTAssertTrue(catalog.diagnostics.contains { $0.kind == "unavailable_work" })
+    XCTAssertTrue(catalog.canonicalNotificationSourceComplete,
+                  "row-local unavailable facts must not block unrelated notification rows")
 }
 
 func test_localTimelineCatalogKeepsTruncatedAndCorruptFilesVisible() throws {
@@ -410,7 +413,7 @@ func test_localTimelineCatalogRejectsSymlinkedHomeRootAuthority() throws {
     XCTAssertFalse(catalog.diagnostics.contains { $0.message.contains(linkRoot.path) })
 }
 
-func test_localTimelineCatalogReportsDuplicateEventIdentityWithoutTrapping() throws {
+func test_localTimelineCatalogReportsDuplicateEventIdentityWithoutBlockingOtherRows() throws {
     let home = try localCatalogHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
     let work = WorkRef(workHostID: "duplicate-host", workID: "duplicate-work")
@@ -427,6 +430,8 @@ func test_localTimelineCatalogReportsDuplicateEventIdentityWithoutTrapping() thr
     let row = try XCTUnwrap(LocalTimelineCatalog.scan(home: home).works.first)
     XCTAssertFalse(row.isAvailable)
     XCTAssertTrue(row.corruptionReasons.contains { $0.contains("quarantined") || $0.contains("duplicate") })
+    XCTAssertTrue(LocalTimelineCatalog.scan(home: home).canonicalNotificationSourceComplete,
+                  "a duplicate row is omitted without making global discovery uncertain")
 }
 
 func test_localTimelineCatalogRoundTripsUnsafeEncodedWorkIDs() throws {
@@ -492,4 +497,6 @@ func test_localTimelineCatalogOrderingBoundsAndMetadataAreDeterministic() throws
     XCTAssertEqual(Set(first.diagnostics.map(\.id)).count, first.diagnostics.count)
     XCTAssertFalse(first.works.contains { $0.corruptionReasons.contains(home.root.path) })
     XCTAssertFalse(first.diagnostics.contains { $0.message.contains(home.root.path) })
+    XCTAssertFalse(first.canonicalNotificationSourceComplete,
+                   "bounded discovery cannot advance notification delivery state")
 }

@@ -23,8 +23,11 @@ what it does; this file is how to work on it without relearning the traps.
   is surfaced in the UI precisely so a format drift shows up instead of silently truncating.
 - **Never put a credential on screen.** `auth.json` is read for provider names and auth
   kinds only. A resolved key appears as a masked prefix and a length, never a value.
-- **Never unlink a transcript.** Deletion goes to the Trash. It is the only record of work
-  an agent did.
+- **Data ownership decides preservation, not age.** Aviary-owned transcripts, artifacts, caches,
+  fixtures, and schemas are disposable development state: migrate, rewrite, regenerate, or remove
+  them instead of adding permanent compatibility interfaces. Claude Code- and Codex-owned stores
+  are valuable and read-only. If Aviary needs their content, copy it into Aviary-owned space with
+  source provenance, then transform only the copy. Treat ambiguous ownership as external/read-only.
 - **Back up before writing config.** `models.json` gets a timestamped copy on every write,
   and edits round-trip through the original bytes so unknown fields survive.
 - **Split records on `\n` only.** Not on Unicode line separators. `U+2028`/`U+2029` are legal

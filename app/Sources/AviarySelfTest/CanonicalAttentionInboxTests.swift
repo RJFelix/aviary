@@ -283,19 +283,24 @@ func test_canonicalAttentionInboxQualifiesRowsByAttachmentIdentity() throws {
     XCTAssertEqual(bounded.rows[0].omittedAttachmentCount, 1)
 }
 
-private func attentionSessionOnlySummary(authorityID: String) throws -> CanonicalSessionCatalogSummary {
+private func attentionSessionOnlySummary(
+    authorityID: String, attention: SessionAttention = .input,
+    attentionEventID: String? = nil
+) throws -> CanonicalSessionCatalogSummary {
     let journal = JournalRef.session(
         attentionSession, journalID: "session-journal", authority: TimelineAuthorityRef(authorityID))
     var session = SessionSnapshot()
     session.session = attentionSession
     session.journal = journal
     session.lifecycle = .active
-    session.attention = .input
-    session.lastEventID = "s1"
+    session.attention = attention
+    let sourceID = attentionEventID ?? "s1"
+    session.lastEventID = sourceID
     session.lastSequence = 1
-    session.seenEventIDs = ["s1"]
+    session.seenEventIDs = [sourceID]
+    session.attentionEvent = EventRef(journal: journal, eventID: sourceID)
     let readEvent = TimelineEvent(
-        eventID: "s1", journal: journal, sequence: 1, session: attentionSession,
+        eventID: sourceID, journal: journal, sequence: 1, session: attentionSession,
         actor: TimelineActor(actorID: "attention-test", kind: "test"),
         hostRecordedAt: Date(timeIntervalSince1970: 1), type: TimelineEventType.sessionCreated)
     let read = TimelineJournalReadResult(records: [TimelineJournalRecord(
@@ -375,6 +380,267 @@ func test_canonicalAttentionInboxIsBoundedDeterministicAndAuthorityQualified() t
     XCTAssertNotEqual(all.rows[0].attachments[0].qualifiedWorkID,
                       all.rows[0].attachments[1].qualifiedWorkID)
     XCTAssertTrue(all.rows[0].id.contains("session-authority"))
+}
+
+func test_canonicalNotificationsClassifyAndRetainActionIdentity() throws {
+    let needsYou = try attentionSessionOnlySummary(authorityID: "notification-needs")
+    let needsProjection = CanonicalNotificationProjection(summaries: [needsYou])
+    let needs = try XCTUnwrap(needsProjection.candidates.first)
+    XCTAssertEqual(needs.kind, .needsYou)
+    XCTAssertEqual(needs.actionIdentity.session, attentionSession)
+    XCTAssertEqual(needs.sourceCursor.eventID, "s1")
+    let userInfo = try XCTUnwrap(needs.routeUserInfo)
+    XCTAssertEqual(userInfo.count, 1, "the OS payload has one canonical route value")
+    let decodedRoute = try XCTUnwrap(CanonicalNotificationRoute.decode(userInfo: userInfo))
+    XCTAssertEqual(decodedRoute, needs.route)
+
+    var reviewSession = SessionSnapshot()
+    let reviewJournal = JournalRef.session(
+        attentionSession, journalID: "review-journal", authority: TimelineAuthorityRef("review"))
+    reviewSession.session = attentionSession
+    reviewSession.journal = reviewJournal
+    reviewSession.lifecycle = .completed
+    reviewSession.attention = .review
+    reviewSession.lastEventID = "review-tip"
+    reviewSession.lastSequence = 1
+    reviewSession.seenEventIDs = ["review-tip"]
+    let reviewEvent = TimelineEvent(
+        eventID: "review-tip", journal: reviewJournal, sequence: 1,
+        session: attentionSession, actor: TimelineActor(actorID: "test"),
+        hostRecordedAt: Date(timeIntervalSince1970: 1), type: TimelineEventType.sessionCreated)
+    let review = try XCTUnwrap(SessionCatalog.summarizeCanonical(
+        session: reviewSession, works: [], sessionRead: TimelineJournalReadResult(records: [
+            TimelineJournalRecord(event: reviewEvent, rawLineBytes: Data("{}\n".utf8), byteStart: 0, byteEnd: 3)
+        ])))
+    let reviewCandidate = try XCTUnwrap(
+        CanonicalNotificationProjection(summaries: [review]).candidates.first)
+    XCTAssertEqual(reviewCandidate.kind, .readyForReview)
+}
+
+func test_canonicalNotificationDeliveryBaselinesDeduplicatesAndWithholdsIncompleteScans() throws {
+    let summary = try attentionSessionOnlySummary(
+        authorityID: "notification-delivery", attention: .review)
+    let projection = CanonicalNotificationProjection(summaries: [summary])
+    var delivery = CanonicalNotificationDelivery()
+    XCTAssertTrue(delivery.plan(projection).candidates.isEmpty)
+    XCTAssertTrue(delivery.plan(projection).candidates.isEmpty)
+
+    let none = try attentionSessionOnlySummary(
+        authorityID: "notification-delivery", attention: .none)
+    XCTAssertTrue(delivery.plan(CanonicalNotificationProjection(summaries: [none])).candidates.isEmpty)
+    let returned = delivery.plan(projection).candidates
+    XCTAssertEqual(returned.count, 1)
+    XCTAssertEqual(returned[0].kind, .readyForReview)
+
+    let truncated = CanonicalNotificationProjection(summaries: [summary], maxCandidates: 0)
+    XCTAssertFalse(truncated.isComplete)
+    XCTAssertTrue(delivery.plan(truncated).candidates.isEmpty)
+}
+
+func test_canonicalNotificationsRetainUnknownsConflictsAndTransitionProvenance() throws {
+    let baseline = try attentionSessionOnlySummary(
+        authorityID: "notification-fingerprint", attention: .review, attentionEventID: "review-1")
+    var delivery = CanonicalNotificationDelivery()
+    XCTAssertTrue(delivery.plan(CanonicalNotificationProjection(summaries: [baseline])).candidates.isEmpty)
+    let repeated = try attentionSessionOnlySummary(
+        authorityID: "notification-fingerprint", attention: .review, attentionEventID: "review-2")
+    let repeatedPlan = delivery.plan(CanonicalNotificationProjection(summaries: [repeated]))
+    XCTAssertEqual(repeatedPlan.candidates.count, 1,
+                   "a second review event is a new source transition")
+    XCTAssertNotEqual(repeatedPlan.candidates[0].id, CanonicalNotificationProjection(
+        summaries: [baseline]).candidates[0].id)
+    delivery.commit(repeatedPlan.candidates[0])
+
+    let exact = try attentionSessionOnlySummary(authorityID: "unrelated-exact", attention: .review)
+    let conflictProjection = CanonicalNotificationProjection(summaries: [baseline, baseline, exact])
+    XCTAssertEqual(conflictProjection.conflictingSessionCount, 1)
+    XCTAssertEqual(conflictProjection.candidates.count, 1,
+                   "one conflicted Session must not suppress an unrelated exact Session")
+
+    let healthyNone = try attentionSessionOnlySummary(
+        authorityID: "interleaved-healthy", attention: .none, attentionEventID: "healthy-none")
+    let healthyReview = try attentionSessionOnlySummary(
+        authorityID: "interleaved-healthy", attention: .review, attentionEventID: "healthy-review")
+    let conflict = try attentionSessionOnlySummary(
+        authorityID: "interleaved-conflict", attention: .review, attentionEventID: "conflict-review")
+    var interleavedDelivery = CanonicalNotificationDelivery()
+    _ = interleavedDelivery.plan(CanonicalNotificationProjection(
+        summaries: [healthyNone, conflict, conflict]))
+    let interleavedPlan = interleavedDelivery.plan(CanonicalNotificationProjection(
+        summaries: [healthyReview, conflict, conflict]))
+    XCTAssertEqual(interleavedPlan.candidates.count, 1,
+                   "an exact Session may transition while another row is conflicted")
+    interleavedDelivery.commit(try XCTUnwrap(interleavedPlan.candidates.first))
+    XCTAssertTrue(interleavedDelivery.plan(CanonicalNotificationProjection(
+        summaries: [healthyReview, conflict, conflict])).candidates.isEmpty,
+        "the interleaved healthy transition must not repeat on the next poll")
+
+    let complete = try attentionSummary(attention: .review, workSnapshot: false)
+    let unknownProjection = CanonicalNotificationProjection(summaries: [complete])
+    XCTAssertTrue(unknownProjection.candidates.isEmpty)
+    XCTAssertTrue(unknownProjection.observedStates.isEmpty,
+                  "unknown Work must not be collapsed into a baseline `.none`")
+
+    var incompleteDelivery = CanonicalNotificationDelivery()
+    let incomplete = CanonicalNotificationProjection(
+        summaries: [baseline], sourceComplete: false)
+    XCTAssertFalse(incomplete.isComplete)
+    XCTAssertTrue(incompleteDelivery.plan(incomplete).candidates.isEmpty)
+    XCTAssertTrue(incompleteDelivery.plan(CanonicalNotificationProjection(
+        summaries: [baseline])).candidates.isEmpty,
+        "a source-completeness failure must not consume or replace the baseline")
+}
+
+func test_canonicalNotificationDeliveryCommitsOnlyAfterAcknowledgementAndPersists() throws {
+    let none = try attentionSessionOnlySummary(authorityID: "notification-ack", attention: .none)
+    let review = try attentionSessionOnlySummary(
+        authorityID: "notification-ack", attention: .review, attentionEventID: "ack-review")
+    var delivery = CanonicalNotificationDelivery()
+    _ = delivery.plan(CanonicalNotificationProjection(summaries: [none]))
+    let plan = delivery.plan(CanonicalNotificationProjection(summaries: [review]))
+    let candidate = try XCTUnwrap(plan.candidates.first)
+    XCTAssertEqual(delivery.plan(CanonicalNotificationProjection(summaries: [review])).candidates.count, 0,
+                   "an in-flight candidate is reserved until its platform request resolves")
+    delivery.rollback(candidate)
+    let retryPlan = delivery.plan(CanonicalNotificationProjection(summaries: [review]))
+    XCTAssertEqual(retryPlan.candidates.count, 1)
+    let retry = try XCTUnwrap(retryPlan.candidates.first)
+    delivery.commit(retry)
+    let checkpoint = try XCTUnwrap(delivery.checkpointData)
+    var restored = CanonicalNotificationDelivery(checkpoint: checkpoint)
+    XCTAssertTrue(restored.plan(CanonicalNotificationProjection(summaries: [review])).candidates.isEmpty,
+                  "an acknowledged transition remains deduplicated across relaunch")
+}
+
+func test_canonicalNotificationDeliveryEmitsForSessionCreatedAfterInitialBaseline() throws {
+    var delivery = CanonicalNotificationDelivery()
+    XCTAssertTrue(delivery.plan(
+        CanonicalNotificationProjection(summaries: [])).candidates.isEmpty)
+
+    let firstReview = try attentionSessionOnlySummary(
+        authorityID: "notification-new-session", attention: .review,
+        attentionEventID: "new-session-review")
+    let plan = delivery.plan(CanonicalNotificationProjection(summaries: [firstReview]))
+    XCTAssertEqual(plan.candidates.count, 1)
+    XCTAssertEqual(plan.candidates.first?.kind, .readyForReview)
+    delivery.commit(try XCTUnwrap(plan.candidates.first))
+    XCTAssertTrue(delivery.plan(
+        CanonicalNotificationProjection(summaries: [firstReview])).candidates.isEmpty)
+}
+
+func test_canonicalNotificationIdentityIsInjectiveAndRequestIDsBounded() throws {
+    let cursor = JournalCursor(journal: attentionSessionJournal, eventID: "cursor", sequence: 1)
+    let first = CanonicalNotificationCandidate(
+        kind: .failedRecovery, title: "generic", body: "generic",
+        actionIdentity: CanonicalNotificationActionIdentity(
+            session: SessionRef("a|b"), sessionJournal: attentionSessionJournal,
+            work: attentionWork, workJournal: attentionWorkJournal,
+            sessionAttachment: SessionAttachmentRef("attachment/a"), action: ActionRef("x|y")),
+        sourceCursor: cursor)
+    let second = CanonicalNotificationCandidate(
+        kind: .failedRecovery, title: "generic", body: "generic",
+        actionIdentity: CanonicalNotificationActionIdentity(
+            session: SessionRef("a"), sessionJournal: attentionSessionJournal,
+            work: attentionWork, workJournal: attentionWorkJournal,
+            sessionAttachment: SessionAttachmentRef("attachment/a"), action: ActionRef("x|y")),
+        sourceCursor: cursor)
+    XCTAssertNotEqual(first.actionIdentity.stableKey, second.actionIdentity.stableKey)
+    XCTAssertNotEqual(first.id, second.id)
+    XCTAssertTrue(first.id.utf8.count <= 128,
+                  "OS request IDs must not contain unbounded user-controlled identity bytes")
+}
+
+func test_canonicalNotificationRouteRejectsOversizedOrForeignPayloads() throws {
+    let hugeSession = SessionRef(String(repeating: "s", count: 20_000))
+    let journal = try JournalRef(
+        journalID: "huge-session-journal", authority: TimelineAuthorityRef("route"),
+        owner: .session(hugeSession))
+    let route = CanonicalNotificationRoute(
+        kind: .needsYou, session: hugeSession, sessionJournal: journal,
+        sourceSessionCursor: JournalCursor(journal: journal, eventID: "event", sequence: 1))
+    XCTAssertNil(route.encodedValue)
+    XCTAssertNil(CanonicalNotificationRoute.decode(userInfo: [
+        CanonicalNotificationRoute.userInfoKey: String(repeating: "A", count: 20_000)
+    ]))
+
+    let other = try attentionSessionOnlySummary(authorityID: "route-foreign")
+    let candidate = try XCTUnwrap(CanonicalNotificationProjection(summaries: [other]).candidates.first)
+    let foreignRoute = CanonicalNotificationRoute(
+        kind: candidate.kind, session: candidate.actionIdentity.session,
+        sessionJournal: candidate.actionIdentity.sessionJournal,
+        sourceSessionCursor: JournalCursor(
+            journal: attentionSessionJournal, eventID: "foreign", sequence: 1))
+    XCTAssertFalse(foreignRoute.isValid)
+
+    let invalidCursor = CanonicalNotificationRoute(
+        kind: .needsYou, session: attentionSession, sessionJournal: attentionSessionJournal,
+        sourceSessionCursor: JournalCursor(
+            journal: attentionSessionJournal, eventID: "", sequence: 0))
+    XCTAssertFalse(invalidCursor.isValid, "routes need positive, named Session evidence")
+    let incoherentKind = CanonicalNotificationRoute(
+        kind: .failedRecovery, session: attentionSession, sessionJournal: attentionSessionJournal,
+        sourceSessionCursor: JournalCursor(
+            journal: attentionSessionJournal, eventID: "event", sequence: 1))
+    XCTAssertFalse(incoherentKind.isValid,
+                   "failed recovery routes must retain Work, action, and outcome identity")
+    let wrongRecoveryOutcome = CanonicalNotificationRoute(
+        kind: .failedRecovery, session: attentionSession,
+        sessionJournal: attentionSessionJournal, work: attentionWork,
+        workJournal: attentionWorkJournal,
+        sessionAttachment: SessionAttachmentRef("attachment"), action: ActionRef("action"),
+        outcome: .failed, sourceSessionCursor: JournalCursor(
+            journal: attentionSessionJournal, eventID: "event", sequence: 1))
+    XCTAssertFalse(wrongRecoveryOutcome.isValid,
+                   "failed-recovery routes must name an indeterminate external effect")
+    let incompleteRecoveryEvidence = CanonicalNotificationRoute(
+        kind: .failedRecovery, session: attentionSession,
+        sessionJournal: attentionSessionJournal, work: attentionWork,
+        workJournal: attentionWorkJournal,
+        sessionAttachment: SessionAttachmentRef("attachment"), action: ActionRef("action"),
+        outcome: .indeterminateEffect, sourceSessionCursor: JournalCursor(
+            journal: attentionSessionJournal, eventID: "event", sequence: 1))
+    XCTAssertFalse(incompleteRecoveryEvidence.isValid,
+                   "failed-recovery routes require the exact Work evidence cursor")
+    let workBackedReview = CanonicalNotificationRoute(
+        kind: .readyForReview, session: attentionSession,
+        sessionJournal: attentionSessionJournal, work: attentionWork,
+        workJournal: attentionWorkJournal, sourceSessionCursor: JournalCursor(
+            journal: attentionSessionJournal, eventID: "event", sequence: 1),
+        workCursor: JournalCursor(
+            journal: attentionWorkJournal, eventID: "work-event", sequence: 1))
+    XCTAssertFalse(workBackedReview.isValid,
+                   "non-recovery routes cannot carry unused Work evidence")
+    let incoherentFields = CanonicalNotificationRoute(
+        kind: .readyForReview, session: attentionSession, sessionJournal: attentionSessionJournal,
+        action: ActionRef("unexpected-action"), sourceSessionCursor: JournalCursor(
+            journal: attentionSessionJournal, eventID: "event", sequence: 1))
+    XCTAssertFalse(incoherentFields.isValid,
+                   "review routes cannot carry failed-action fields")
+}
+
+func test_canonicalNotificationCheckpointIsBoundedAndCurrentKeysSurvivePruning() throws {
+    var delivery = CanonicalNotificationDelivery()
+    let summaries = try (0..<1025).map {
+        try attentionSessionOnlySummary(
+            authorityID: "checkpoint-\($0)", attention: .none, attentionEventID: "none-\($0)")
+    }
+    for chunkStart in stride(from: 0, to: summaries.count, by: 512) {
+        let chunk = Array(summaries[chunkStart..<min(chunkStart + 512, summaries.count)])
+        _ = delivery.plan(CanonicalNotificationProjection(summaries: chunk))
+    }
+    let data = try XCTUnwrap(delivery.checkpointData)
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let states = try XCTUnwrap(object["stateBySession"] as? [String: Any])
+    XCTAssertTrue(
+        states.count <= CanonicalNotificationDelivery.maximumCheckpointSessions,
+        "checkpoint state must stay bounded")
+
+    let newest = try attentionSessionOnlySummary(
+        authorityID: "checkpoint-newest", attention: .review, attentionEventID: "newest")
+    let projection = CanonicalNotificationProjection(summaries: [newest])
+    _ = delivery.plan(projection)
+    let retry = delivery.plan(projection)
+    XCTAssertTrue(retry.candidates.isEmpty, "the current projection remains deduplicated after pruning")
 }
 
 func test_canonicalAttentionInboxBoundsEvidenceAndReasons() throws {

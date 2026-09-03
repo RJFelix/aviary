@@ -249,9 +249,49 @@ struct PreferencesView: View {
                         .buttonStyle(.bordered).controlSize(.small)
                     }
                 }
+
+                Card("Notifications", symbol: "bell") {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text("Aviary can alert you when canonical work needs attention. "
+                            + "Nothing is requested automatically at launch.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack {
+                            Text(model.canonicalNotificationStatusText)
+                                .font(.system(size: 11))
+                                .foregroundStyle(model.canonicalNotificationDeliveryEnabled
+                                    ? .secondary : Design.warning)
+                            Spacer()
+                            if model.canonicalNotificationNeedsSystemSettings {
+                                Button("Open System Settings") {
+                                    NSWorkspace.shared.open(
+                                        URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings")!)
+                                }
+                                .controlSize(.small)
+                            } else if !model.canonicalNotificationDeliveryEnabled {
+                                Button("Enable Notifications") {
+                                    Task { await model.requestCanonicalNotificationAuthorization() }
+                                }
+                                .controlSize(.small)
+                            }
+                        }
+                        if let error = model.canonicalNotificationAuthorizationError {
+                            Text(error)
+                                .font(.system(size: 10)).foregroundStyle(Design.danger)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if let error = model.canonicalNotificationError {
+                            Text(error)
+                                .font(.system(size: 10)).foregroundStyle(Design.warning)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .controlSize(.small)
+                }
             }
             .padding(14)
         }
+        .task { await model.refreshCanonicalNotificationAuthorization() }
     }
 
     // MARK: Workshop

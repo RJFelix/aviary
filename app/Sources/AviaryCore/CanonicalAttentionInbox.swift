@@ -156,7 +156,7 @@ public struct CanonicalAttentionInboxRow: Codable, Hashable, Sendable, Identifia
     /// no Session/Work facts are selected from any of the conflicting summaries.
     public let duplicateSummaryCount: Int
 
-    fileprivate init(
+    init(
         summary: CanonicalSessionCatalogSummary,
         maxAttachments: Int
     ) {

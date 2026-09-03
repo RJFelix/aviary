@@ -1338,6 +1338,10 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
     /// SessionAssembler from the attached WorkSnapshot, never reduced here.
     public var execution: WorkExecution = .idle
     public var attention: SessionAttention = .none
+    /// The latest canonical event that established `attention`, when the reducer observed one.
+    /// Keeping this separate from the conversation tip prevents notification provenance from
+    /// pointing at an unrelated message.
+    public var attentionEvent: EventRef?
     /// Kept for compatibility with early consumers; these are not populated by SessionReducer.
     public var activeRun: RunRef?
     public var modelID: String?

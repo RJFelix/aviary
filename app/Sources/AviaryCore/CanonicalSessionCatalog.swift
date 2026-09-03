@@ -342,6 +342,7 @@ public struct CanonicalSessionCatalogSummary: Codable, Hashable, Sendable, Ident
     public let title: String
     public let lifecycle: SessionLifecycle
     public let authoredAttention: SessionAttention
+    public let attentionSourceEvent: EventRef?
     /// Compatibility field retaining the authored Session attention. Consumers needing an
     /// effective answer must use `effectiveAttention`, which is nil until every active Work
     /// attachment is available and exactly aligned at its requested cursor.
@@ -412,6 +413,7 @@ public struct CanonicalSessionCatalogSummary: Codable, Hashable, Sendable, Ident
         self.title = sessionFactsKnown ? String(flattenedTitle.prefix(120)) : ""
         self.lifecycle = sessionFactsKnown ? session.lifecycle : .unknown
         self.authoredAttention = sessionFactsKnown ? session.attention : .none
+        self.attentionSourceEvent = sessionFactsKnown ? session.attentionEvent : nil
         self.sessionModelID = sessionFactsKnown ? session.modelID : nil
         let orderedWorks = works.sorted { lhs, rhs in
             let lhsKey = lhs.journal?.stableKey ?? ""

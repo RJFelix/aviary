@@ -4,7 +4,7 @@ Status: implementation in progress; Phase 0 and Phase 1 live-producer/local-cata
 Date: 2026-08-31
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
-Implementation checkpoint (2026-09-01): stable session/Work/run identity, serialized command
+Implementation checkpoint (2026-09-02): stable session/Work/run identity, serialized command
 admission, immutable admission plus delivery receipts, writer-confirmed input delivery, live
 transcript overlays, true steer/follow-up routing, scroll anchoring, truthful run states, explicit End
 run, and cancellation/quiescence barriers are implemented in the current tree. Capability-scoped
@@ -27,8 +27,9 @@ completion, late steering, indeterminate actions, unknown events, legacy input, 
 malformed/truncated tails across linked Session and Work journals. The production local Timeline
 catalog now joins the Census. The production Flock UI consumes the same source-qualified,
 unknown-aware Work projection exercised by the fixture, and the Sessions list plus command palette
-consume a canonical Session search projection exercised by that same fixture. Notifications and
-service recovery remain explicitly unwired.
+consume a canonical Session search projection exercised by that same fixture. Native macOS
+notifications now consume the same canonical Session/Work projection; service recovery remains
+explicitly unwired.
 
 A canonical catalog adapter now projects authority-qualified Session identities and attached Work
 at independently verified requested/observed cursors. Only attached, exactly aligned Work with
@@ -62,8 +63,20 @@ bounded title/model metadata; unknown or invalid native facts fail closed, legac
 sanitized, identity matches are exact-or-prefix by field, and result bounds do not hide later corpus
 rows. Search selection retains the GUI action identity and canonical EventRefs, native companion
 rows cannot be refilled by legacy AgentTree prompts, and conversation lifecycle is kept separate
-from attached Work liveness. OS notifications and service recovery remain unwired to the canonical
-projection. Work rows separately report
+from attached Work liveness. The first notification adapter is now wired for needs-you,
+failed-recovery, and ready-for-review transitions. It observes permission without prompting at
+launch, baselines rather than replays attention accumulated while delivery is disabled, uses bounded
+typed cold-click routes,
+and preserves the route's Session/Work/action/cursor identity in the workspace. Session selection is
+re-resolved canonically; reconciling every Work/action/cursor field against the current catalog before
+labeling the focus as exact evidence is part of the Work-recovery follow-up. Unknown, corrupt,
+unaligned, or conflicting rows cannot lend notification facts, while unrelated exact Sessions remain
+independently actionable. Delivery checkpoints are bounded and persisted; cold-click queues are
+bounded but currently in memory. An OS-acceptance crash window still provides at-least-once rather
+than exactly-once delivery until a durable outbox is reconciled with pending/delivered platform
+request identifiers. Child coalescing and incremental journal watching remain Phase 2/Phase 1
+follow-up work. Service recovery remains
+unwired. Work rows separately report
 whether a supplied journal read is absent, exact, stale, ahead, foreign, divergent, or invalid;
 `journalIntegrityValid` is nil only when no read was supplied and is false for every supplied
 non-exact or tailed read. A supplied exact, canonical, tail-free read is required before assembly or
@@ -145,21 +158,25 @@ creating an empty visible chat row.
 
 The Apple Swift 6.3.3 compiler accepts the SDK emitted by Apple Swift 6.3.2; the compatibility probe
 configures its own writable module cache and succeeds both directly and through every gate. At this
-checkpoint, the full suite passes 486 cases / 4,434 assertions in 50.11 seconds and `just compile`
-is clean. Phase 1 passes 195 cases / 2,505 assertions in 17.26 seconds. The versioned 100,000-event
-benchmark reads and reduces a 46,766,700-byte input in 6.199 seconds on the checkpoint machine
-(generation 1.010 seconds). The visual gate renders all 9 canonical screens. Final Sol review found
+checkpoint, the full suite passes 499 cases / 5,592 assertions in 47.06 seconds and `just compile`
+is clean. Phase 1 passes 208 cases / 3,661 assertions in 16.45 seconds. The versioned 100,000-event
+benchmark reads and reduces a 46,766,700-byte input in 5.769 seconds on the checkpoint machine
+(generation 0.880 seconds). The visual gate renders all 9 canonical screens; it also caught and
+closed a SwiftPM snapshot crash by making the UserNotifications adapter available only from a real
+application bundle. Final Sol review found
 no remaining must-fix issue after exact cursor/attachment/read authority, local action-time
 revalidation and owner locking, unknown-domain display scrubbing, duplicate non-projection,
 slash-injective Work identity, provider-action causality, exhaustive retained-body decoding,
 structured assistant replay, pre-Start capture/cleanup, source-assembly binding, truncated-source
 replay, metadata-only inspection, parent-qualified legacy selection, multi-Session attention,
 bounded evidence, conflict projection, Work-liveness separation, bounded search allocation, and
-wrapper-only injection findings were remediated.
+wrapper-only injection findings were remediated. A second notification-specific Sol review found no
+P0/P1 blocker after typed turn outcomes, turn/run transition deduplication, per-Session conflict
+isolation, authorization gating, bounded typed routes, and cold-click routing were remediated.
 
 Phase 0 still owes real VoiceOver/keyboard UI automation and broader driver focus/race proof. Phase 1
-still owes the remaining canonical consumer migrations (notification delivery, service recovery,
-and other named legacy readers); individual skill/memory identity and included-versus-listed
+still owes the remaining canonical consumer migrations (service recovery and other named legacy
+readers); individual skill/memory identity and included-versus-listed
 provenance inside the now-durable block-level prompt sources; independent native Work bundles for
 children; actual disk-full and permission fault reachability; and a measured
 peak-RSS budget. The semantic component measure is deliberately not claimed to be provider-specific
@@ -652,12 +669,12 @@ Deliverables:
   and historical views use those projections.
 - Preserve streaming deltas as an explicitly ephemeral overlay until committed text lands; test
   that the overlay collapses into the same durable message.
-- Adapt existing JSONL events into the new reducers by synthesizing a one-session/one-Work
-  relationship for legacy runs. Synthetic IDs are namespaced by journal plus byte offset/raw ID;
-  the raw legacy ID and `legacy_adapted` provenance survive. Preserve each unknown record and its
-  raw payload/position—not merely a count—and keep current transcripts readable. An unterminated
-  final line remains an uncommitted truncated tail; malformed interior records or sequence/chain
-  gaps quarantine the unverifiable suffix while retaining it for inspection.
+- Migrate Aviary-owned JSONL state and fixtures into the canonical Session/Work journals, then
+  remove superseded readers and UI interfaces rather than keeping a parallel compatibility model.
+  Claude Code- and Codex-owned stores remain valuable and read-only; any importer first copies a
+  bounded, provenance-bearing sample into Aviary-owned space and transforms only that copy.
+  Forward-compatible canonical readers still preserve unknown events and their raw payload/position,
+  expose an unterminated final record as an uncommitted tail, and quarantine unverifiable suffixes.
 - Stop discarding writer errors. Define which record failures make execution terminal, which enter a
   clearly visible degraded/read-only state, and what synchronization boundary acknowledges durable
   intent before an Aviary-dispatched action.
@@ -1093,6 +1110,10 @@ visible promise is wired to the wrong operation.
   attachment patterns, and recovery coverage so evidence can justify them later.
 - Do not call a checkpoint complete if it omits shell side effects, manual edits, databases, remote
   services, or other external state.
+- Do not preserve compatibility merely because Aviary generated an older local format. Aviary-owned
+  transcripts, artifacts, caches, and fixtures are disposable development state: migrate or replace
+  them and delete superseded interfaces. Claude Code- and Codex-owned data is valuable/read-only;
+  copy it into Aviary-owned space with source provenance before using it as mutable test/import data.
 
 ## Initial implementation slices
 

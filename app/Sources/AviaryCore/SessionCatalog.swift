@@ -93,6 +93,9 @@ public struct SessionCatalogScanResult: Sendable {
     public let entries: [SessionCatalogProjection]
     public let workInventory: [LocalTimelineCatalog.WorkRow]
     public let diagnostics: [LocalTimelineCatalog.Diagnostic]
+    /// Discovery/read completeness from the native catalog is carried separately because a
+    /// bounded diagnostic list can otherwise hide an omitted journal.
+    public let canonicalNotificationSourceComplete: Bool
     /// Local legacy Session ids whose native journal cannot prove attachment/liveness truth.
     /// Transcript actions must fail closed for these ids even when no canonical companion could
     /// be constructed from the corrupt or ambiguous native record.
@@ -105,12 +108,14 @@ public struct SessionCatalogScanResult: Sendable {
         entries: [SessionCatalogProjection],
         workInventory: [LocalTimelineCatalog.WorkRow],
         diagnostics: [LocalTimelineCatalog.Diagnostic],
+        canonicalNotificationSourceComplete: Bool = true,
         nativeActionBlockedSessionIDs: Set<String> = [],
         nativeCompanionLegacyIDs: Set<String> = []
     ) {
         self.entries = entries
         self.workInventory = workInventory
         self.diagnostics = diagnostics
+        self.canonicalNotificationSourceComplete = canonicalNotificationSourceComplete
         self.nativeActionBlockedSessionIDs = nativeActionBlockedSessionIDs
         self.nativeCompanionLegacyIDs = nativeCompanionLegacyIDs
     }
@@ -271,15 +276,9 @@ public actor SessionCatalog {
             .map(SessionCatalogProjection.canonical))
         return SessionCatalogScanResult(
             entries: entries, workInventory: native.works, diagnostics: diagnostics,
+            canonicalNotificationSourceComplete: native.canonicalNotificationSourceComplete,
             nativeActionBlockedSessionIDs: actionBlockedSessionIDs,
             nativeCompanionLegacyIDs: companionLegacyIDs)
-    }
-
-    /// Compatibility spelling retained for existing callers that need only Session entries.
-    public func scanEntries(
-        progress: (@Sendable (Int, Int) -> Void)? = nil
-    ) -> [SessionCatalogProjection] {
-        scanCatalog(progress: progress).entries
     }
 
     /// Convert the typed boundary into rows the current list can render. Native canonical rows

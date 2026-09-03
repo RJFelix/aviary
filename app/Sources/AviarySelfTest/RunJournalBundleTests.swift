@@ -93,6 +93,43 @@ func test_runJournalBundleFreshGenesisAndExactAssembly() async throws {
     try await bundle.closeChecked()
 }
 
+func test_runJournalBundleFinishedTurnPublishesExactReadyForReviewWhileRunRemainsActive() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let hostID = try persistBundleTestHost(home)
+    let identity = SessionWorkIdentity(
+        sessionID: "notification-live-session",
+        work: WorkRef(workHostID: hostID, workID: "notification-live-work"),
+        runID: "notification-live-run")
+    let bundle = try await RunJournalBundle.openForExecution(
+        home: home, identity: identity, actorID: "notification-live-gui",
+        modelID: "notification-model", makeAttachmentID: { "notification-attachment" })
+
+    _ = try await bundle.commitInput(
+        text: "do the work", deliveryMode: .delivered,
+        command: CommandRef(commandID: "notification-command"))
+    let turn = TurnRef("notification-turn")
+    _ = try await bundle.startTurn(turn)
+    _ = try await bundle.commitAssistantMessage("finished result")
+    let finishCommits = try await bundle.finishTurn(turn)
+    XCTAssertEqual(finishCommits.count, 3)
+    XCTAssertEqual(finishCommits[0].eventRef.journal.kind, .work)
+    XCTAssertEqual(finishCommits[1].eventRef.journal.kind, .session)
+    XCTAssertEqual(finishCommits[2].eventRef.journal.kind, .session)
+
+    let catalog = LocalTimelineCatalog.scan(home: home)
+    let summary = try XCTUnwrap(catalog.sessionSummaries.first)
+    XCTAssertEqual(summary.work.first?.activeRun, RunRef(identity.runID))
+    XCTAssertEqual(summary.work.first?.cursorAlignment, .exact)
+    XCTAssertEqual(summary.effectiveAttention, .review)
+    let candidate = try XCTUnwrap(
+        CanonicalNotificationProjection(summaries: [summary]).candidates.first)
+    XCTAssertEqual(candidate.kind, .readyForReview)
+
+    _ = try await bundle.finishRun(outcome: .canceled)
+    try await bundle.closeChecked()
+}
+
 func test_runJournalBundleExecutionOpenCreatesThenReopensTheMirroredAttachment() async throws {
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
@@ -197,7 +234,7 @@ func test_runJournalBundleInputAndAssistantTipsRemainOneVisibleChain() async thr
                               sessionAttachment: bundleTestAttachment,
                               causalCursor: await bundle.latestWorkCursor)
     let second = try await bundle.commitInput(text: "second", deliveryMode: .queued, command: command2)
-    XCTAssertEqual(second.count, 3)
+    XCTAssertEqual(second.count, 4)
     _ = try await bundle.commitAssistantMessage("answer-2")
     _ = try await bundle.finishTurn(TurnRef("turn-2"))
 
@@ -459,6 +496,78 @@ func test_runJournalBundleTerminalRunOutcomesRemainTyped() async throws {
     }
 }
 
+func test_runJournalBundleTurnOutcomesReachCatalogNotificationsAndDeduplicate() async throws {
+    let cases: [(RunTurnOutcome, SessionAttention, CanonicalNotificationKind?)] = [
+        (.completed, .review, .readyForReview),
+        (.failed, .error, .needsYou),
+        (.canceled, .none, nil)
+    ]
+    for (index, item) in cases.enumerated() {
+        let home = try bundleTestHome()
+        defer { try? FileManager.default.removeItem(at: home.root) }
+        let bundle = try await makeBundle(home: home, runID: "turn-outcome-\(index)")
+        _ = try await bundle.startTurn(TurnRef("turn-outcome"))
+        let turnCommits = try await bundle.finishTurn(
+            TurnRef("turn-outcome"), outcome: item.0)
+        XCTAssertEqual(
+            turnCommits.filter { $0.eventRef.journal == bundle.sessionJournal }.count,
+            item.1 == .none ? 1 : 2)
+        let turnCatalog = LocalTimelineCatalog.scan(home: home)
+        let turnSummary = try XCTUnwrap(turnCatalog.sessions.first?.summary)
+        var delivery = CanonicalNotificationDelivery()
+        _ = delivery.plan(CanonicalNotificationProjection(summaries: []))
+        let turnPlan = delivery.plan(CanonicalNotificationProjection(summaries: [turnSummary]))
+        if let expectedKind = item.2 {
+            XCTAssertEqual(turnPlan.candidates.first?.kind, expectedKind)
+            delivery.commit(try XCTUnwrap(turnPlan.candidates.first))
+        } else {
+            XCTAssertTrue(turnPlan.candidates.isEmpty)
+        }
+        _ = try await bundle.finishRun(
+            outcome: item.0 == .failed ? .failed : item.0 == .canceled ? .canceled : .completed)
+        let catalog = LocalTimelineCatalog.scan(home: home)
+        let summary = try XCTUnwrap(catalog.sessions.first?.summary)
+        XCTAssertEqual(summary.attention, item.1)
+        let projection = CanonicalNotificationProjection(summaries: [summary])
+        if let expectedKind = item.2 {
+            XCTAssertEqual(projection.candidates.first?.kind, expectedKind)
+            XCTAssertTrue(delivery.plan(projection).candidates.isEmpty,
+                          "finishRun must not repeat a turn-boundary notification")
+        } else {
+            XCTAssertEqual(projection.observedStates[CanonicalAttentionIdentity.sessionRow(
+                journal: summary.journal)], CanonicalNotificationState.none)
+        }
+        let sessionEvents = try bundleEvents(
+            home, bundle.sessionJournal, home.timelineV2SessionJournalURL(bundleTestSession))
+        XCTAssertEqual(sessionEvents.filter { $0.type == TimelineEventType.sessionAttention }.count,
+                       item.1 == .none ? 0 : 1,
+                       "finishRun must not append the same attention after finishTurn")
+        try await bundle.closeChecked()
+    }
+
+    let reopenHome = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: reopenHome.root) }
+    let first = try await makeBundle(home: reopenHome, runID: "authored-first")
+    _ = try await first.setAttention(.review)
+    _ = try await first.finishRun(outcome: .completed)
+    try await first.closeChecked()
+    let reopenIDs = BundleTestIDs()
+    let reopened = try await RunJournalBundle.reopen(
+        home: reopenHome, session: bundleTestSession, work: bundleTestWork,
+        workHost: bundleTestHost, sessionAuthority: bundleTestAuthority,
+        sessionAttachment: bundleTestAttachment, run: RunRef("authored-second"),
+        actor: bundleTestActor, eventIDProvider: { "reopen-" + reopenIDs.nextID() },
+        now: { Date(timeIntervalSince1970: 1) })
+    XCTAssertNil(try await reopened.setAttention(.review),
+                 "reopen must seed authored attention from SessionReducer")
+    _ = try await reopened.finishRun(outcome: .completed)
+    let reopenedEvents = try bundleEvents(
+        reopenHome, reopened.sessionJournal,
+        reopenHome.timelineV2SessionJournalURL(bundleTestSession))
+    XCTAssertEqual(reopenedEvents.filter { $0.type == TimelineEventType.sessionAttention }.count, 1)
+    try await reopened.closeChecked()
+}
+
 func test_runJournalBundlePartialPrefixesLatchAndRefusePermits() async throws {
     let firstHome = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: firstHome.root) }
@@ -538,13 +647,16 @@ func test_runJournalBundleReopenNPlusOneAndRefusesIncompletePairsOrActiveWriters
     defer { try? FileManager.default.removeItem(at: home.root) }
     let bundle = try await makeBundle(home: home)
     let finishCommits = try await bundle.finishRun()
-    XCTAssertEqual(finishCommits.map(\.cursor.journal), [bundle.workJournal, bundle.sessionJournal])
+    XCTAssertEqual(finishCommits.map(\.cursor.journal), [
+        bundle.workJournal, bundle.sessionJournal, bundle.sessionJournal])
     let finishedSessionEvents = try bundleEvents(
         home, bundle.sessionJournal, home.timelineV2SessionJournalURL(bundleTestSession))
     let finishedWorkEvents = try bundleEvents(
         home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
-    XCTAssertEqual(finishedSessionEvents.last?.type, TimelineEventType.sessionAttachmentCursorAdvanced)
-    XCTAssertEqual(finishedSessionEvents.last?.payload["cursor"]?["sequence"]?.intValue,
+    let cursorAdvanced = try XCTUnwrap(finishedSessionEvents.last(where: {
+        $0.type == TimelineEventType.sessionAttachmentCursorAdvanced
+    }))
+    XCTAssertEqual(cursorAdvanced.payload["cursor"]?["sequence"]?.intValue,
                    finishedWorkEvents.last?.sequence)
     for operation in 0..<4 {
         do {
@@ -718,7 +830,7 @@ func test_runJournalBundleCheckedCloseReportsPartialClose() async throws {
         guard case .closeFailed(let prefix, _) = error else {
             XCTFail("expected partial close, got \(error)"); return
         }
-        XCTAssertEqual(prefix.sessionEventCount, 3)
+        XCTAssertEqual(prefix.sessionEventCount, 4)
         XCTAssertEqual(prefix.workEventCount, 4)
     }
     let reopened = try await RunJournalBundle.reopen(
@@ -726,6 +838,25 @@ func test_runJournalBundleCheckedCloseReportsPartialClose() async throws {
         sessionAuthority: bundleTestAuthority, sessionAttachment: bundleTestAttachment,
         run: RunRef("run-after-close"), actor: bundleTestActor)
     try await reopened.closeChecked()
+}
+
+func test_runJournalBundleProducesCanonicalAttentionTransitions() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let bundle = try await makeBundle(home: home)
+    _ = try await bundle.commitInput(
+        text: "work on this", deliveryMode: .delivered,
+        command: CommandRef(commandID: "attention-input"))
+    let during: SessionSnapshot = SessionReducer.reduce(
+        try bundleEvents(home, bundle.sessionJournal, home.timelineV2SessionJournalURL(bundle.session)))
+    XCTAssertEqual(during.attention, SessionAttention.none)
+    _ = try await bundle.finishRun(outcome: .completed)
+    let finished: SessionSnapshot = SessionReducer.reduce(
+        try bundleEvents(home, bundle.sessionJournal, home.timelineV2SessionJournalURL(bundle.session)))
+    XCTAssertEqual(finished.attention, SessionAttention.review)
+    XCTAssertTrue(try bundleEvents(home, bundle.sessionJournal, home.timelineV2SessionJournalURL(bundle.session))
+        .contains { $0.type == TimelineEventType.sessionAttention })
+    try await bundle.closeChecked()
 }
 
 func test_runJournalBundleCanceledTaskStillFinishesAndCloses() async throws {

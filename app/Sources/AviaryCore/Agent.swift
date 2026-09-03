@@ -1080,7 +1080,13 @@ public actor Agent {
             await refusePendingInputs(reason: "the active turn failed before delivery: \(detail)")
         }
         do {
-            _ = try await nativeJournal.finishTurn(turn)
+            let turnOutcome: RunTurnOutcome
+            switch outcome {
+            case .completed: turnOutcome = .completed
+            case .cancelled: turnOutcome = .canceled
+            case .failed: turnOutcome = .failed
+            }
+            _ = try await nativeJournal.finishTurn(turn, outcome: turnOutcome)
         } catch {
             latchNativeJournalFailure("the turn outcome", error)
             return .failed(journalFailureDetail ?? error.localizedDescription)

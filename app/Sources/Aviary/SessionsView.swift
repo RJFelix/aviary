@@ -326,6 +326,10 @@ struct SessionsView: View {
 
     private var transcriptPane: some View {
         VStack(spacing: 0) {
+            if let focus = model.canonicalNotificationFocusForSelectedSession {
+                notificationEvidenceFocusCard(focus)
+                Divider()
+            }
             if let t = model.transcript {
                 TranscriptHeader(transcript: t)
                 Divider()
@@ -358,6 +362,54 @@ struct SessionsView: View {
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) { transcriptSearchBar }
+    }
+
+    /// A notification click carries more than a Session selection. Keep its exact Work/action
+    /// identity and source cursors visible at the top of Sessions, including for native rows that
+    /// have no legacy transcript to render.
+    private func notificationEvidenceFocusCard(_ route: CanonicalNotificationRoute) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: route.kind == .failedRecovery
+                ? "exclamationmark.triangle.fill" : "bell.fill")
+                .foregroundStyle(route.kind == .failedRecovery ? Design.danger : Design.accent)
+                .font(.system(size: 13))
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(route.kind == .failedRecovery ? "Failed-recovery evidence"
+                         : "Notification focus")
+                        .font(.system(size: 11, weight: .semibold))
+                    Chip(text: route.kind.rawValue, tint: route.kind == .failedRecovery
+                        ? Design.danger : Design.accent)
+                    Spacer(minLength: 0)
+                }
+                if let work = route.work {
+                    Text("Work " + work.workHostID + "/" + work.workID)
+                        .font(.system(size: 10, design: .monospaced))
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                if let action = route.action {
+                    Text("Action " + action.actionID + " · "
+                        + (route.outcome?.rawValue ?? "outcome unavailable"))
+                        .font(.system(size: 10, design: .monospaced))
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                let sessionEvent = route.sourceSessionEvent?.eventID
+                    ?? route.sourceSessionCursor.eventID
+                    ?? ("sequence " + String(route.sourceSessionCursor.sequence))
+                let workEvidence = route.workCursor.map {
+                    " · Work evidence #\($0.sequence)\($0.eventID.map { " / \($0)" } ?? "")"
+                } ?? ""
+                Text("Session evidence #\(route.sourceSessionCursor.sequence) / \(sessionEvent)\(workEvidence)")
+                    .font(.system(size: 9.5, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            Button("Inspector") { model.showInspector = true }
+                .buttonStyle(.link).font(.system(size: 10))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background((route.kind == .failedRecovery ? Design.danger : Design.accent).opacity(0.08))
     }
 
     @ViewBuilder

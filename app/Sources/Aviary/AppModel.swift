@@ -1,6 +1,17 @@
 import AviaryCore
 import Observation
 import SwiftUI
+import UserNotifications
+
+/// UserNotifications requires a real application bundle on macOS. SwiftPM executables used by
+/// snapshots and CLI diagnostics have no bundle proxy; asking for the current notification center
+/// there raises an Objective-C exception that Swift cannot catch.
+enum CanonicalNotificationPlatform {
+    static var isAvailable: Bool {
+        Bundle.main.bundleURL.pathExtension.lowercased() == "app"
+            && Bundle.main.bundleIdentifier != nil
+    }
+}
 
 /// Top-level navigation destinations.
 enum Section: String, CaseIterable, Identifiable, Hashable {
@@ -101,6 +112,24 @@ final class AppModel {
     /// these values rather than repeatedly joining every Work to every Session during rendering.
     var canonicalFlockInventory: [CanonicalFlockCatalogProjection] = []
     var canonicalAttentionInbox = CanonicalAttentionInboxProjection(summaries: [])
+    /// Native notification candidates are built from the same exact canonical summaries as the
+    /// attention inbox, but keep an independent bound so a display page cannot hide a transition.
+    var canonicalNotificationProjection = CanonicalNotificationProjection(summaries: [])
+    var canonicalNotificationError: String?
+    /// Authorization is observed, never requested, during bootstrap and polling. Preferences is
+    /// the explicit user action that may request it.
+    var canonicalNotificationAuthorization: UNAuthorizationStatus = .notDetermined
+    var canonicalNotificationAuthorizationError: String?
+    /// Canonical journal identity to the actual displayed Session row. Companion rows display
+    /// their legacy transcript id, which must never be reconstructed from the canonical id.
+    private var canonicalNotificationDisplayIDs: [String: String] = [:]
+    private static let maximumPendingCanonicalNotificationRoutes = 32
+    private var pendingCanonicalNotificationRoutes: [CanonicalNotificationRoute] = []
+    private var pendingCanonicalNotificationRouteKeys: Set<String> = []
+    private var canonicalNotificationCatalogScanComplete = false
+    /// The exact route that caused the current Session focus. Unlike a Session id alone, this
+    /// retains the failed action, outcome, and source cursors for the evidence card.
+    var canonicalNotificationFocus: CanonicalNotificationRoute?
     /// Cached bounded lexical documents. Views never rebuild native/legacy search fields on each
     /// keystroke, and the index consumes only conflict-free display projections.
     var canonicalSessionSearchIndex = CanonicalSessionSearchIndex(entries: [])
@@ -352,6 +381,9 @@ final class AppModel {
 
     private var catalog: SessionCatalog?
     private var pollTask: Task<Void, Never>?
+    /// Catalog reads are actor-isolated, but applying a result is MainActor work. Coalesce a
+    /// timer tick with a manual refresh so an older scan cannot overwrite a newer projection.
+    private var catalogRefreshInFlight = false
     private var watcher: SessionWatcher?
 
     var focusedRun: LiveRun? {
@@ -448,7 +480,11 @@ final class AppModel {
 
     func refreshCatalog() async {
         guard let catalog else { return }
+        guard !catalogRefreshInFlight else { return }
+        catalogRefreshInFlight = true
+        defer { catalogRefreshInFlight = false }
         isScanning = true
+        canonicalNotificationCatalogScanComplete = false
         let result = await catalog.scanCatalog { [weak self] done, total in
             Task { @MainActor in self?.scanProgress = (done, total) }
         }
@@ -456,6 +492,19 @@ final class AppModel {
         canonicalCatalogProjections = projectionIndex.canonicalByID
         canonicalCatalogProjectionConflicts = projectionIndex.duplicateIDs
         canonicalSessionSearchIndex = CanonicalSessionSearchIndex(entries: projectionIndex.displayEntries)
+        var duplicateNotificationDisplayKeys: Set<String> = []
+        canonicalNotificationDisplayIDs = projectionIndex.displayEntries.reduce(into: [:]) { result, entry in
+            guard let canonical = entry.canonical, let display = entry.displaySummary else { return }
+            let key = CanonicalAttentionIdentity.sessionRow(journal: canonical.journal)
+            // A duplicate identity is not a safe deep-link target. Leave the key absent rather
+            // than choosing whichever display row happened to be visited last.
+            if !duplicateNotificationDisplayKeys.contains(key), result[key] == nil {
+                result[key] = display.id
+            } else {
+                result.removeValue(forKey: key)
+                duplicateNotificationDisplayKeys.insert(key)
+            }
+        }
         canonicalWorkInventory = result.workInventory
         let nativeSummaries = result.entries.compactMap { entry -> CanonicalSessionCatalogSummary? in
             switch entry {
@@ -467,6 +516,31 @@ final class AppModel {
         canonicalFlockInventory = CanonicalFlockCatalogProjection.project(
             sessions: nativeSummaries, works: result.workInventory)
         canonicalAttentionInbox = CanonicalAttentionInboxProjection(summaries: nativeSummaries)
+        let notifications = CanonicalNotificationProjection(
+            summaries: nativeSummaries,
+            sourceComplete: result.canonicalNotificationSourceComplete)
+        canonicalNotificationProjection = notifications
+        // Scan completeness is about global discovery. Row-local conflicts remain omitted from
+        // the projection, but healthy rows can still resolve cold routes during this pass.
+        canonicalNotificationCatalogScanComplete = result.canonicalNotificationSourceComplete
+        await refreshCanonicalNotificationAuthorization()
+        if !notifications.isComplete {
+            canonicalNotificationError =
+                "Canonical notification state is incomplete; notifications are withheld until the next exact scan."
+        } else if canonicalNotificationDeliveryEnabled {
+            canonicalNotificationError = nil
+            let plan = notificationDelivery.plan(notifications)
+            persistNotificationCheckpoint()
+            for candidate in plan.candidates {
+                deliverCanonicalNotification(candidate)
+            }
+        } else {
+            // Unauthorized observations still advance the baseline. Enabling notifications later
+            // must report only a fresh transition, not every old attention row.
+            notificationDelivery.baseline(notifications)
+            persistNotificationCheckpoint()
+            canonicalNotificationError = nil
+        }
         nativeTimelineCatalogDiagnostics = result.diagnostics
         nativeActionBlockedSessionIDs = result.nativeActionBlockedSessionIDs
         nativeCompanionLegacyIDs = result.nativeCompanionLegacyIDs
@@ -492,6 +566,8 @@ final class AppModel {
         // to the list would give SwiftUI duplicate tags and make selection nondeterministic.
         let found = projectionIndex.displaySummaries
         sessions = found
+        drainPendingCanonicalNotificationRoutes(
+            scanComplete: result.canonicalNotificationSourceComplete)
         tree = AgentTreeReader.read(home: home)
         // Native canonical-only rows are not legacy transcript accounting inputs. Keep them in
         // the list, but do not turn their observe-only zero counters into analytics evidence.
@@ -499,6 +575,179 @@ final class AppModel {
         isScanning = false
         annotateLiveState()
         lastRefresh = Date()
+    }
+
+    private let notificationCheckpointKey = "aviary.canonical-notification-checkpoint.v2"
+    private var notificationDelivery = CanonicalNotificationDelivery(
+        checkpoint: UserDefaults.standard.data(forKey: "aviary.canonical-notification-checkpoint.v2"))
+
+    private func persistNotificationCheckpoint() {
+        guard let data = notificationDelivery.checkpointData else { return }
+        UserDefaults.standard.set(data, forKey: notificationCheckpointKey)
+    }
+
+    var canonicalNotificationDeliveryEnabled: Bool {
+        canonicalNotificationAuthorization == .authorized
+            || canonicalNotificationAuthorization == .provisional
+    }
+
+    var canonicalNotificationNeedsSystemSettings: Bool {
+        canonicalNotificationAuthorization == .denied
+    }
+
+    var canonicalNotificationStatusText: String {
+        switch canonicalNotificationAuthorization {
+        case .authorized: return "Enabled"
+        case .provisional: return "Enabled quietly"
+        case .denied: return "Disabled in System Settings"
+        case .notDetermined: return "Not enabled"
+        @unknown default: return "Status unavailable"
+        }
+    }
+
+    var canonicalNotificationFocusForSelectedSession: CanonicalNotificationRoute? {
+        guard let focus = canonicalNotificationFocus,
+              let rowID = canonicalNotificationDisplayIDs[focus.sessionIdentityKey],
+              rowID == selectedSessionID
+        else { return nil }
+        return focus
+    }
+
+    /// Read authorization without prompting. This is intentionally called before the delivery
+    /// gate so a denied/not-yet-enabled user never sees an add-request error in the poll loop.
+    func refreshCanonicalNotificationAuthorization() async {
+        guard CanonicalNotificationPlatform.isAvailable else {
+            canonicalNotificationAuthorization = .notDetermined
+            canonicalNotificationAuthorizationError = nil
+            return
+        }
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        canonicalNotificationAuthorization = settings.authorizationStatus
+        canonicalNotificationAuthorizationError = nil
+    }
+
+    /// The only code path allowed to ask macOS for notification permission. It is reachable from
+    /// Preferences, never from launch/bootstrap or the polling loop.
+    func requestCanonicalNotificationAuthorization() async {
+        guard CanonicalNotificationPlatform.isAvailable else {
+            canonicalNotificationAuthorizationError =
+                "Notifications are available only from the Aviary app bundle."
+            return
+        }
+        do {
+            _ = try await UNUserNotificationCenter.current()
+                .requestAuthorization(options: [.alert, .sound])
+            await refreshCanonicalNotificationAuthorization()
+        } catch {
+            canonicalNotificationAuthorizationError =
+                "Could not update notification permission: " + error.localizedDescription
+        }
+    }
+
+    /// Deliver only candidates admitted by the core transition gate. The userInfo is the typed
+    /// Session/action identity used by the click handler; no legacy transcript path is involved.
+    private func deliverCanonicalNotification(_ candidate: CanonicalNotificationCandidate) {
+        guard CanonicalNotificationPlatform.isAvailable else {
+            notificationDelivery.rollback(candidate)
+            canonicalNotificationError =
+                "Notification delivery is unavailable outside the Aviary app bundle."
+            return
+        }
+        guard let routeUserInfo = candidate.routeUserInfo else {
+            // A route that cannot fit the bounded OS payload is not retryable. Commit its
+            // transition and surface one truthful status instead of retrying on every poll.
+            notificationDelivery.commit(candidate)
+            persistNotificationCheckpoint()
+            canonicalNotificationError =
+                "Notification withheld because its canonical route exceeded the size limit."
+            return
+        }
+        let content = UNMutableNotificationContent()
+        content.title = candidate.title
+        content.body = candidate.body
+        content.sound = .default
+        content.userInfo = routeUserInfo
+        let request = UNNotificationRequest(
+            identifier: candidate.id, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { [weak self] error in
+            Task { @MainActor in
+                if let error {
+                    self?.notificationDelivery.rollback(candidate)
+                    self?.canonicalNotificationError = "Could not deliver notification: \(error.localizedDescription)"
+                } else {
+                    self?.notificationDelivery.commit(candidate)
+                    self?.persistNotificationCheckpoint()
+                }
+            }
+        }
+    }
+
+    /// Route an already-decoded, identity-validated notification. Cold clicks are bounded until
+    /// the next complete catalog scan can resolve their canonical Session/display join.
+    func openCanonicalNotification(_ route: CanonicalNotificationRoute) {
+        guard route.isValid else {
+            canonicalNotificationError = "Dropped an invalid canonical notification route."
+            return
+        }
+        let rowID = canonicalNotificationDisplayIDs[route.sessionIdentityKey]
+        guard let rowID, let session = sessions.first(where: { $0.id == rowID }) else {
+            if canonicalNotificationCatalogScanComplete {
+                canonicalNotificationError =
+                    "Dropped an unresolved cold notification route after a complete catalog scan."
+                return
+            }
+            enqueuePendingCanonicalNotificationRoute(route)
+            return
+        }
+        section = .sessions
+        selectedSessionIDs = [session.id]
+        selectedSessionID = session.id
+        canonicalNotificationFocus = route
+        selectedItemForSessionSelectionChanged()
+    }
+
+    private func enqueuePendingCanonicalNotificationRoute(_ route: CanonicalNotificationRoute) {
+        let key = route.deduplicationKey
+        guard pendingCanonicalNotificationRouteKeys.insert(key).inserted else { return }
+        pendingCanonicalNotificationRoutes.append(route)
+        if pendingCanonicalNotificationRoutes.count > Self.maximumPendingCanonicalNotificationRoutes,
+           let dropped = pendingCanonicalNotificationRoutes.first
+        {
+            pendingCanonicalNotificationRoutes.removeFirst()
+            pendingCanonicalNotificationRouteKeys.remove(dropped.deduplicationKey)
+            canonicalNotificationError =
+                "Dropped the oldest cold notification route because the queue is full."
+        }
+    }
+
+    private func drainPendingCanonicalNotificationRoutes(scanComplete: Bool) {
+        guard !pendingCanonicalNotificationRoutes.isEmpty else { return }
+        let pending = pendingCanonicalNotificationRoutes
+        pendingCanonicalNotificationRoutes.removeAll()
+        pendingCanonicalNotificationRouteKeys.removeAll()
+        var unresolved = 0
+        for route in pending {
+            guard let rowID = canonicalNotificationDisplayIDs[route.sessionIdentityKey],
+                  let session = sessions.first(where: { $0.id == rowID })
+            else {
+                if !scanComplete {
+                    enqueuePendingCanonicalNotificationRoute(route)
+                    continue
+                }
+                unresolved += 1
+                continue
+            }
+            section = .sessions
+            selectedSessionIDs = [session.id]
+            selectedSessionID = session.id
+            canonicalNotificationFocus = route
+            selectedItemForSessionSelectionChanged()
+        }
+        if unresolved > 0 {
+            canonicalNotificationError =
+                "Dropped " + String(unresolved)
+                    + " unresolved cold notification route(s) after a complete catalog scan."
+        }
     }
 
     /// Mark the catalog rows that belong to a run this process is holding.
@@ -667,6 +916,10 @@ final class AppModel {
                 guard !Task.isCancelled else { return }
                 self.annotateLiveState()
                 self.tree = AgentTreeReader.read(home: self.home)
+                // The canonical journals are the notification producer's source of truth. A
+                // live run can finish or enter review between catalog refreshes, so polling
+                // must consume the projection as well as repainting the in-memory tree.
+                await self.refreshCatalog()
             }
         }
     }
@@ -679,6 +932,7 @@ final class AppModel {
     // MARK: Transcript
 
     func select(session: SessionSummary) {
+        canonicalNotificationFocus = nil
         selectedSessionIDs = [session.id]
         selectedSessionID = session.id
         Task { await loadTranscript(for: session) }
@@ -699,6 +953,11 @@ final class AppModel {
             return sessions.first(where: { selection.contains($0.id) })?.id
         }()
         guard focus != selectedSessionID else { return }
+        if let notificationFocus = canonicalNotificationFocus,
+           canonicalNotificationDisplayIDs[notificationFocus.sessionIdentityKey] != focus
+        {
+            canonicalNotificationFocus = nil
+        }
         selectedSessionID = focus
         selectedItemForSessionSelectionChanged()
     }

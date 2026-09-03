@@ -242,6 +242,22 @@ func test_timelineReducersLiveAndColdPrefixEquivalence() throws {
     XCTAssertEqual(liveSession.snapshot.contextComponents[0].inclusionID, "inclusion-1")
 }
 
+func test_sessionAttentionMalformedPayloadIsUnknownNotNone() throws {
+    let events = [
+        reducerEvent(TimelineEventType.sessionCreated, id: "attention-s1", sequence: 1,
+                     journal: reducerSessionJournal, session: reducerSession),
+        reducerEvent(TimelineEventType.sessionAttention, id: "attention-s2", sequence: 2,
+                     journal: reducerSessionJournal, previous: "attention-s1",
+                     session: reducerSession, payload: .object(["attention": .string("future")]))
+    ]
+    let snapshot = SessionReducer.reduce(events)
+    XCTAssertEqual(snapshot.attention, .none,
+                   "malformed attention must not be interpreted as a clearing transition")
+    XCTAssertTrue(snapshot.unknownDomains.contains(.session))
+    XCTAssertFalse(snapshot.semanticProjectionValid)
+    XCTAssertEqual(snapshot.unknownEvents.map(\.event.eventID), ["attention-s2"])
+}
+
 func test_timelineSessionSupportsManyAttachmentsAndDetachIsolation() throws {
     let secondWork = WorkRef(workHostID: "host-test", workID: "work-two")
     let secondJournal = JournalRef.work(secondWork, journalID: "work-two-journal")
