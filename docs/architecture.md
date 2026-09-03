@@ -747,11 +747,11 @@ running.
 ## The runtime host
 
 Where agent code runs, as of 2026-08-21. A separate process, one isolated interpreter per
-session, a line protocol on stdio — the contract is [runtime-host-protocol.md](runtime-host-protocol.md)
+session, a line protocol on a local Unix socket — the contract is [runtime-host-protocol.md](runtime-host-protocol.md)
 and it is deliberately the *only* thing Aviary knows about a runtime.
 
 ```
-Aviary ──stdio JSONL──▶ runtime-hosts/python3/host.py
+Aviary ──Unix socket JSONL──▶ runtime-hosts/python3/host.py
                           ├── sub-interpreter per session (own GIL, own thread)
                           └── sh() with a persistent cwd and environment
 ```
@@ -765,8 +765,10 @@ Three reasons for this shape, each measured rather than assumed:
   wedged is worth more than direct pointer access.
 - **Sub-interpreters, not processes, per session.** CPython 3.12 gives each its own GIL —
   measured at **3.85× on four concurrent interpreters** — so sessions run genuinely in
-  parallel without a process each, and without a daemon, worker pool, ownership leases or a
-  socket whose version must match whatever the terminal has installed.
+  parallel without a process each, and without a worker pool or ownership lease. The socket
+  handshake carries the protocol and host-instance identity explicitly, so a future client can
+  reconnect without guessing which process it reached. This is transport/API substrate only:
+  the production GUI does not yet persist adoption descriptors or reattach automatically.
 - **A swappable contract.** `runtime-hosts/python3-shared/` is a second host that runs every
   session in one interpreter: no per-session GIL, but `numpy`, `pandas` and `duckdb` import,
   because those declare `Py_mod_multiple_interpreters = NOT_SUPPORTED` and CPython refuses

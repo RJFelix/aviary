@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-A runtime host: one process, one isolated interpreter per session, a line protocol on stdio.
+A runtime host: one process, one isolated interpreter per session, a line protocol on a Unix
+domain socket. Clients may disconnect and later adopt the same host process.
 
 Why this exists, and why it is a separate process rather than a library linked into Aviary:
 
@@ -21,22 +22,29 @@ full `ipykernel_launcher` boot each time (the harness's fork-server is Linux-onl
 always pays it), with namespace introspection that had to execute user-visible code and so
 perturbed the thing it measured.
 
-Protocol: one JSON object per line in, one per line out. Requests carry an `id` and get
-exactly one response with the same `id`. Output arrives as unsolicited `event` lines before
-the response, so a caller can stream. LF only — never \r\n, and never a bare \r.
+Protocol: one JSON object per line over the socket. Requests carry an `id` and get exactly one
+response with the same `id`. Output arrives as unsolicited `event` lines before the response,
+so a caller can stream. LF only — never \r\n, and never a bare \r. The socket client may go
+away without stopping this process or its sessions.
 """
 
 from __future__ import annotations
 
 import json
+import errno
 import os
 import queue
+import select
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import uuid
+from collections import OrderedDict
 
 try:
     import _xxsubinterpreters as subinterpreters  # 3.12
@@ -46,7 +54,20 @@ except ImportError:  # pragma: no cover - newer Pythons renamed it
     except ImportError:
         subinterpreters = None
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
+MAX_FRAME_BYTES = 4 * 1024 * 1024
+MAX_DIAGNOSTIC_BYTES = 500
+MAX_SEND_SECONDS = 1.0
+SEND_CHUNK_BYTES = 512
+
+
+def bounded_diagnostic(value, limit: int = MAX_DIAGNOSTIC_BYTES) -> str:
+    """Return a bounded, text-only diagnostic for the host protocol and stderr tail."""
+    return str(value)[:limit]
+
+
+def encoded_frame_size(obj: dict) -> int:
+    return len(json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")) + 1
 
 # Everything the host puts into the agent's namespace. Listed once, because `inspect` must
 # hide exactly this set: the namespace belongs to the agent, and a host whose own helpers show
@@ -65,6 +86,43 @@ _AVIARY_INJECTED = frozenset({"sh", "cwd", "ask_app", "spawn", "conversation",
 _callbacks: dict = {}
 _callback_lock = threading.Lock()
 _callback_seq = [0]
+_callback_sender = None
+_callback_history = OrderedDict()
+_CALLBACK_HISTORY_LIMIT = 1024
+
+
+def set_callback_sender(sender) -> None:
+    """Install the host's session-aware callback router."""
+    global _callback_sender
+    _callback_sender = sender
+
+
+def _send_callback(session: str, message: dict) -> None:
+    sender = _callback_sender
+    if sender is None:
+        emit(message)
+    else:
+        sender(session, message)
+
+
+def pending_callback_messages(session: str) -> list[dict]:
+    with _callback_lock:
+        return [entry["message"] for entry in _callbacks.values()
+                if entry.get("session") == session and entry.get("result") is None]
+
+
+def _remember_callback_outcome_locked(rid: str, status: str) -> None:
+    """Keep a bounded answer to late callback.result messages.
+
+    A callback is at-least-once across a client disconnect: the same `rid` may be delivered to a
+    new client after an earlier client performed an effect but lost its response. Retaining a
+    small terminal history lets the host distinguish a duplicate result from an unknown/stale
+    one without pretending that this process-local table is durable exactly-once state.
+    """
+    _callback_history[rid] = status
+    _callback_history.move_to_end(rid)
+    while len(_callback_history) > _CALLBACK_HISTORY_LIMIT:
+        _callback_history.popitem(last=False)
 
 
 def request_from_app(kind: str, payload: dict, session: str = "", timeout: float = 900.0) -> dict:
@@ -78,41 +136,74 @@ def request_from_app(kind: str, payload: dict, session: str = "", timeout: float
         _callback_seq[0] += 1
         rid = f"cb-{_callback_seq[0]}"
         event = threading.Event()
-        _callbacks[rid] = {"event": event, "result": None}
+        message = {"event": "callback", "rid": rid, "kind": kind,
+                   "payload": payload, "session": session}
+        _callbacks[rid] = {
+            "event": event, "result": None, "session": session,
+            "message": message,
+        }
     # The session must travel with the request: one host serves many sessions, and a client
     # routing a callback has no other way to know which agent asked.
-    emit({"event": "callback", "rid": rid, "kind": kind, "payload": payload,
-          "session": session})
+    _send_callback(session, message)
     if not event.wait(timeout):
         with _callback_lock:
-            _callbacks.pop(rid, None)
-        return {"error": f"Aviary did not answer the {kind} request within {int(timeout)}s"}
+            entry = _callbacks.get(rid)
+            if entry is not None and entry.get("result") is None:
+                _callbacks.pop(rid, None)
+                _remember_callback_outcome_locked(rid, "stale")
+                return {"error": "Aviary did not answer the %s request within %ss" % (
+                    bounded_diagnostic(kind, 120), int(timeout))}
+            # A result won the timeout race. Return it rather than manufacturing a timeout.
+            entry = _callbacks.pop(rid, None)
+            if entry is not None:
+                _remember_callback_outcome_locked(rid, "accepted")
+                return entry.get("result") or {}
+        return {"error": "Aviary did not answer the %s request within %ss" % (
+            bounded_diagnostic(kind, 120), int(timeout))}
     with _callback_lock:
         entry = _callbacks.pop(rid, None)
+        if entry is not None:
+            _remember_callback_outcome_locked(rid, "accepted")
     return (entry or {}).get("result") or {}
 
 
-def resolve_callback(rid: str, result: dict) -> None:
+def resolve_callback(rid: str, result: dict) -> dict:
+    """Resolve one callback atomically and report whether this result won the race."""
+    if not isinstance(result, dict):
+        return {"delivered": False, "status": "invalid"}
     with _callback_lock:
         entry = _callbacks.get(rid)
-    if entry:
+        if entry is None:
+            status = _callback_history.get(rid)
+            return {"delivered": False,
+                    "status": "duplicate" if status == "accepted" else "stale"}
+        if entry.get("result") is not None:
+            return {"delivered": False, "status": "duplicate"}
         entry["result"] = result
+        _remember_callback_outcome_locked(rid, "accepted")
         entry["event"].set()
+        return {"delivered": True, "status": "accepted"}
 
 # ---------------------------------------------------------------------------
-# Writing to stdout
+# Writing to the client
 # ---------------------------------------------------------------------------
 
 _write_lock = threading.Lock()
+_output_sink = threading.local()
 
 
 def emit(obj: dict) -> None:
-    """One JSON object, one line, flushed.
+    """One JSON object, one line, flushed to the current client.
 
-    Locked because session threads emit output events concurrently; without it two
-    interleaved writes produce a line that parses as neither message.
+    A stdio fallback remains useful while importing this module for diagnostics, but socket
+    serving never depends on a parent-owned pipe. The sink is thread-local because responses and
+    output events from different sessions may be emitted concurrently.
     """
     line = json.dumps(obj, ensure_ascii=False, default=str)
+    sink = getattr(_output_sink, "sink", None)
+    if sink is not None:
+        sink.send_obj(obj)
+        return
     with _write_lock:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
@@ -581,6 +672,10 @@ class Session:
         self.jobs: queue.Queue = queue.Queue()
         self.interp = subinterpreters.create()
         self.closed = False
+        # Admission and destruction share one lock. A dispatcher that has looked up this
+        # session must either enqueue before close's teardown marker or be refused; otherwise a
+        # late exec can land behind the destroy sentinel and wait forever with no response.
+        self.admission_lock = threading.Lock()
         # Where the sub-interpreter drops callback requests. A directory rather than a pipe
         # because a file is the only thing both sides can see without sharing objects, and
         # this is not a hot path — a callback is a sub-agent or a question, not a loop.
@@ -592,8 +687,12 @@ class Session:
         self.thread = threading.Thread(target=self._loop, name=f"session-{sid}", daemon=True)
         self.thread.start()
 
-    def submit(self, job) -> None:
-        self.jobs.put(job)
+    def submit(self, job) -> bool:
+        with self.admission_lock:
+            if self.closed:
+                return False
+            self.jobs.put(job)
+            return True
 
     def _watch_callbacks(self) -> None:
         """Forward callback requests from the interpreter to Aviary and write back replies.
@@ -640,7 +739,7 @@ class Session:
                 job()
             except Exception:
                 emit({"event": "host_error", "session": self.sid,
-                      "detail": traceback.format_exc()})
+                      "detail": bounded_diagnostic(traceback.format_exc())})
 
     def _run(self, body: str, **inputs) -> dict:
         """Run host-authored source in the interpreter and read back its JSON result."""
@@ -671,18 +770,19 @@ class Session:
         the first shutdown attempt here never returned. So the destroy is queued as the
         session's last job and the caller waits briefly for the thread to finish it.
         """
-        if self.closed:
-            return
-        self.closed = True
+        with self.admission_lock:
+            if self.closed:
+                return
+            self.closed = True
 
-        def teardown() -> None:
-            try:
-                subinterpreters.destroy(self.interp)
-            except Exception:
-                pass
+            def teardown() -> None:
+                try:
+                    subinterpreters.destroy(self.interp)
+                except Exception:
+                    pass
 
-        self.jobs.put(teardown)
-        self.jobs.put(None)
+            self.jobs.put(teardown)
+            self.jobs.put(None)
         self.thread.join(timeout=join)
         try:
             import shutil
@@ -696,51 +796,180 @@ class Session:
 # ---------------------------------------------------------------------------
 
 
+class Client:
+    """One socket client; its close never changes host/session lifetime."""
+
+    def __init__(self, connection: socket.socket) -> None:
+        self.connection = connection
+        self.lock = threading.Lock()
+        self.closed = False
+        self.client_id = str(uuid.uuid4())
+
+    def send_obj(self, obj: dict) -> bool:
+        line = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8") + b"\n"
+        callback_oversized = obj.get("event") == "callback" and len(line) > MAX_FRAME_BYTES
+        if len(line) > MAX_FRAME_BYTES:
+            # Preserve request completion when a result itself is too large. An event-only
+            # diagnostic would leave the client's pending request hanging until its much longer
+            # operation timeout. Unsolicited events still get a bounded diagnostic event.
+            if obj.get("id") is not None:
+                obj = {"id": obj.get("id"), "ok": False, "error": {
+                    "code": "response_too_large",
+                    "detail": "response exceeded the runtime frame limit",
+                }}
+            else:
+                obj = {"event": "host_error", "code": "response_too_large",
+                       "detail": "response exceeded the runtime frame limit"}
+            line = json.dumps(obj).encode("utf-8") + b"\n"
+        with self.lock:
+            if self.closed:
+                return False
+            try:
+                deadline = time.monotonic() + MAX_SEND_SECONDS
+                offset = 0
+                while offset < len(line):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("runtime client write timed out")
+                    _, writable, exceptional = select.select(
+                        [], [self.connection], [self.connection], remaining)
+                    if exceptional or not writable:
+                        raise TimeoutError("runtime client write timed out")
+                    try:
+                        sent = self.connection.send(
+                            line[offset:offset + SEND_CHUNK_BYTES])
+                    except InterruptedError:
+                        continue
+                    if sent == 0:
+                        raise OSError(errno.EPIPE, "socket closed")
+                    offset += sent
+                # A deliberately oversized unsolicited callback was not delivered as a callback
+                # frame. Its caller must resolve the rid locally rather than treating the small
+                # host_error diagnostic as successful delivery.
+                return not callback_oversized
+            except OSError:
+                self.closed = True
+                try:
+                    # Wake a sibling makefile.readline/serve thread before closing. Merely closing
+                    # the socket object can leave the duplicated file wrapper blocked forever.
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    self.connection.close()
+                except OSError:
+                    pass
+                return False
+
+    def close(self) -> None:
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+
+
 class Host:
-    def __init__(self) -> None:
+    def __init__(self, host_id: str | None = None) -> None:
         self.sessions: dict[str, Session] = {}
         self.lock = threading.Lock()
         self.hook_interp = None
+        self.host_id = host_id or str(uuid.uuid4())
+        self.instance_id = str(uuid.uuid4())
+        self.session_clients: dict[str, Client] = {}
+        # Serialize callback delivery with attach acknowledgement. A callback emitted after the
+        # mapping changes must not overtake the attach reply that tells a reconnecting GUI where
+        # the session is now routed.
+        self.session_callback_barriers: dict[str, threading.Lock] = {}
+        self.clients: set[Client] = set()
+        self.clients_lock = threading.Lock()
+        self.stopping = threading.Event()
+        self.socket_path: str | None = None
+        set_callback_sender(self._send_callback)
 
     # -- dispatch ----------------------------------------------------------
 
-    def handle(self, msg: dict) -> None:
+    def handle(self, msg: dict, client: Client | None = None) -> None:
+        previous_sink = getattr(_output_sink, "sink", None)
+        _output_sink.sink = client
         rid = msg.get("id")
         op = msg.get("op")
         try:
             if op == "hello":
+                requested_protocol = msg.get("protocol")
+                if requested_protocol is not None and requested_protocol != PROTOCOL_VERSION:
+                    self.fail(rid, "protocol_mismatch",
+                              f"host speaks protocol {PROTOCOL_VERSION}")
+                    return
+                expected = msg.get("expectedIdentity") or {}
+                if expected and (expected.get("hostID") != self.host_id
+                                  or expected.get("instanceID") != self.instance_id):
+                    self.fail(rid, "identity_mismatch", "host instance is not the expected one")
+                    return
                 self.reply(rid, self.capabilities())
             elif op == "session.create":
-                self.reply(rid, self.create(msg))
+                self.reply(rid, self.create(msg, client))
             elif op == "session.destroy":
                 self.reply(rid, self.destroy(msg))
             elif op == "session.list":
                 with self.lock:
                     self.reply(rid, {"sessions": sorted(self.sessions)})
+            elif op == "session.attach":
+                sid = msg.get("session") or ""
+                barrier = self._callback_barrier(sid)
+                with barrier:
+                    self.reply(rid, self.attach(msg, client))
+                    self._replay_pending_callbacks(sid, client)
+            elif op == "session.detach":
+                self.reply(rid, self.detach(msg, client))
             elif op == "hook.load":
                 self.reply(rid, self.load_hooks(msg.get("paths") or []))
             elif op == "hook.call":
                 self.reply(rid, self.call_hook(msg.get("event") or "", msg.get("payload") or {}))
             elif op == "callback.result":
-                resolve_callback(msg.get("rid") or "", msg.get("result") or {})
-                self.reply(rid, {"delivered": True})
+                result = msg.get("result")
+                resolution = resolve_callback(msg.get("rid") or "", result)
+                self.reply(rid, resolution)
             elif op in ("exec", "inspect"):
-                self.dispatch_to_session(rid, op, msg)
+                self.dispatch_to_session(rid, op, msg, client)
             elif op == "shutdown":
                 self.reply(rid, {"stopping": True})
+                # Remove the discoverable endpoint before the potentially slow interpreter
+                # teardown. Existing clients get their acknowledgement; new clients cannot
+                # race the shutdown window and mistake a dying host for an adoptable one.
+                if self.socket_path:
+                    try:
+                        os.unlink(self.socket_path)
+                    except OSError:
+                        pass
                 self.shutdown()
-                # Hard exit, after the reply is already flushed. A helper process has
+                self.stopping.set()
+                # Hard exit, after the reply is synchronously flushed. A helper process has
                 # nothing to persist, and a C extension holding a non-daemon thread would
-                # otherwise keep it alive forever — a hung runtime host is worse than an
-                # abrupt one.
-                sys.stdout.flush()
+                # otherwise keep it alive forever — a hung runtime host is worse than an abrupt
+                # one. This branch is reached only by the explicit shutdown operation.
                 os._exit(0)
             else:
                 self.fail(rid, "unknown_op", f"no such op: {op!r}")
         except SystemExit:
             raise
         except Exception:
-            self.fail(rid, "host_error", traceback.format_exc())
+            self.fail(rid, "host_error", bounded_diagnostic(traceback.format_exc()))
+        finally:
+            if previous_sink is None:
+                try:
+                    del _output_sink.sink
+                except AttributeError:
+                    pass
+            else:
+                _output_sink.sink = previous_sink
 
     # ---- hooks -----------------------------------------------------------
     #
@@ -771,7 +1000,7 @@ class Host:
                     {"path": path, "detail": result.get("detail"),
                      "events": result.get("events") or []})
             except Exception:
-                failed.append({"path": path, "detail": traceback.format_exc()[-400:]})
+                failed.append({"path": path, "detail": bounded_diagnostic(traceback.format_exc(), 400)})
             finally:
                 try:
                     os.unlink(out)
@@ -794,7 +1023,8 @@ class Host:
         except Exception:
             # A broken hook must never stop a run. It is reported and ignored, which is the
             # only safe default: the alternative is one bad extension taking the agent with it.
-            return {"handled": False, "error": traceback.format_exc()[-400:]}
+            return {"handled": False,
+                    "error": bounded_diagnostic(traceback.format_exc(), 400)}
         finally:
             try:
                 os.unlink(out)
@@ -807,6 +1037,9 @@ class Host:
             "runtime": "cpython",
             "runtimeVersion": sys.version.split()[0],
             "implementation": sys.implementation.name,
+            "hostID": self.host_id,
+            "instanceID": self.instance_id,
+            "transport": "unix",
             "features": {
                 # Honest about what is not here. An interrupt that only kills a child
                 # process is not a general interrupt, and claiming otherwise would have a
@@ -825,10 +1058,13 @@ class Host:
                 # Hooks run in their own interpreter, so a broken one cannot reach an agent's
                 # namespace or another hook's state.
                 "hooks": subinterpreters is not None,
+                "adoptableTransport": True,
+                "multipleClients": True,
+                "persistentSessions": True,
             },
         }
 
-    def create(self, msg: dict) -> dict:
+    def create(self, msg: dict, client: Client | None = None) -> dict:
         if subinterpreters is None:
             raise RuntimeError("this Python has no sub-interpreter support")
         sid = msg.get("session") or str(uuid.uuid4())
@@ -837,18 +1073,102 @@ class Host:
             if sid in self.sessions:
                 raise RuntimeError(f"session already exists: {sid}")
             self.sessions[sid] = Session(sid, cwd)
+            if client is not None:
+                self.session_clients[sid] = client
         return {"session": sid, "cwd": cwd}
 
     def destroy(self, msg: dict) -> dict:
         sid = msg.get("session")
         with self.lock:
             session = self.sessions.pop(sid, None)
+            # Remove ownership in the same critical section as the session identity. Otherwise a
+            # concurrent destroy/recreate can delete the newly-created session's client mapping.
+            if session is not None:
+                self.session_clients.pop(sid, None)
         if session is None:
             raise RuntimeError(f"no such session: {sid}")
         session.close()
         return {"session": sid, "destroyed": True}
 
-    def dispatch_to_session(self, rid, op: str, msg: dict) -> None:
+    def attach(self, msg: dict, client: Client | None) -> dict:
+        sid = msg.get("session")
+        if client is None:
+            raise RuntimeError("session.attach requires a socket client")
+        with self.lock:
+            if sid not in self.sessions:
+                raise RuntimeError(f"no such session: {sid}")
+            self.session_clients[sid] = client
+        return {"session": sid, "attached": True}
+
+    def _callback_barrier(self, session: str) -> threading.Lock:
+        with self.lock:
+            barrier = self.session_callback_barriers.get(session)
+            if barrier is None:
+                barrier = threading.Lock()
+                self.session_callback_barriers[session] = barrier
+            return barrier
+
+    def _replay_pending_callbacks(self, session: str, client: Client | None) -> None:
+        if client is None:
+            return
+        # The caller holds this session's barrier, so callbacks emitted after attach cannot send
+        # until the acknowledgement and this replay have been written in order.
+        for message in pending_callback_messages(session):
+            if not self._deliver_callback(client, message):
+                if (message.get("event") == "callback"
+                        and encoded_frame_size(message) > MAX_FRAME_BYTES):
+                    resolve_callback(message.get("rid") or "", {
+                        "error": "callback payload exceeded the runtime frame limit",
+                    })
+
+    @staticmethod
+    def _deliver_callback(client: Client, message: dict) -> bool:
+        return client.send_obj(message)
+
+    def detach(self, msg: dict, client: Client | None) -> dict:
+        sid = msg.get("session")
+        with self.lock:
+            if sid not in self.sessions:
+                raise RuntimeError(f"no such session: {sid}")
+            if self.session_clients.get(sid) is client:
+                self.session_clients.pop(sid, None)
+        return {"session": sid, "detached": True}
+
+    def _send_callback(self, session: str, message: dict) -> None:
+        with self.lock:
+            client = self.session_clients.get(session)
+            barrier = self.session_callback_barriers.get(session)
+        if client is not None:
+            if barrier is None:
+                barrier = self._callback_barrier(session)
+            with barrier:
+                if self._deliver_callback(client, message):
+                    return
+            if message.get("event") == "callback" and encoded_frame_size(message) > MAX_FRAME_BYTES:
+                # The callback body cannot cross this bounded transport. Resolve the waiting
+                # Python call locally with a bounded, actionable result; sending host_error alone
+                # would make the GUI believe delivery succeeded while the agent waited 900s.
+                resolve_callback(message.get("rid") or "", {
+                    "error": "callback payload exceeded the runtime frame limit",
+                })
+                return
+        # No client is currently attached. The request remains in `_callbacks` and is replayed by
+        # the next session.attach; silently dropping it would leave the Python interpreter blocked.
+        if client is not None:
+            with self.lock:
+                if self.session_clients.get(session) is client:
+                    self.session_clients.pop(session, None)
+
+    def _client_disconnected(self, client: Client) -> None:
+        client.close()
+        with self.lock:
+            for sid, owner in list(self.session_clients.items()):
+                if owner is client:
+                    self.session_clients.pop(sid, None)
+        with self.clients_lock:
+            self.clients.discard(client)
+
+    def dispatch_to_session(self, rid, op: str, msg: dict, client: Client | None = None) -> None:
         sid = msg.get("session")
         with self.lock:
             session = self.sessions.get(sid)
@@ -857,6 +1177,8 @@ class Host:
             return
 
         def job() -> None:
+            previous_sink = getattr(_output_sink, "sink", None)
+            _output_sink.sink = client
             try:
                 if op == "exec":
                     code = msg.get("code") or ""
@@ -879,9 +1201,18 @@ class Host:
                 else:
                     self.reply(rid, {"session": sid, **session.inspect()})
             except Exception:
-                self.fail(rid, "exec_failed", traceback.format_exc())
+                self.fail(rid, "exec_failed", bounded_diagnostic(traceback.format_exc()))
+            finally:
+                if previous_sink is None:
+                    try:
+                        del _output_sink.sink
+                    except AttributeError:
+                        pass
+                else:
+                    _output_sink.sink = previous_sink
 
-        session.submit(job)
+        if not session.submit(job):
+            self.fail(rid, "session_closed", "session is being destroyed")
 
     # -- responses ---------------------------------------------------------
 
@@ -889,39 +1220,159 @@ class Host:
         emit({"id": rid, "ok": True, "data": data})
 
     def fail(self, rid, code: str, detail: str) -> None:
-        emit({"id": rid, "ok": False, "error": {"code": code, "detail": detail}})
+        emit({"id": rid, "ok": False, "error": {
+            "code": bounded_diagnostic(code),
+            "detail": bounded_diagnostic(detail),
+        }})
 
     def shutdown(self) -> None:
         with self.lock:
             sessions = list(self.sessions.values())
             self.sessions.clear()
+            self.session_clients.clear()
         for s in sessions:
             s.close()
 
     # -- main loop ---------------------------------------------------------
 
+    def serve_socket(self, path: str) -> None:
+        self.socket_path = path
+        server = self._bind_socket(path)
+        try:
+            while not self.stopping.is_set():
+                try:
+                    connection, _ = server.accept()
+                except OSError:
+                    if self.stopping.is_set():
+                        break
+                    continue
+                client = Client(connection)
+                with self.clients_lock:
+                    self.clients.add(client)
+                client.send_obj({"event": "ready", **self.capabilities()})
+                threading.Thread(
+                    target=self._serve_client, args=(client,),
+                    name=f"runtime-client-{client.client_id}", daemon=True).start()
+        finally:
+            try:
+                server.close()
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def _serve_client(self, client: Client) -> None:
+        try:
+            reader = client.connection.makefile("rb")
+            while not self.stopping.is_set():
+                raw = reader.readline(MAX_FRAME_BYTES + 1)
+                if not raw:
+                    break
+                if len(raw) > MAX_FRAME_BYTES and not raw.endswith(b"\n"):
+                    # Consume only through the next LF, but do not allocate the unbounded frame.
+                    while raw and not raw.endswith(b"\n"):
+                        raw = reader.readline(MAX_FRAME_BYTES + 1)
+                    client.send_obj({"event": "bad_request", "code": "frame_too_large",
+                                     "detail": "request exceeded the runtime frame limit"})
+                    continue
+                if len(raw) > MAX_FRAME_BYTES:
+                    client.send_obj({"event": "bad_request", "code": "frame_too_large",
+                                     "detail": "request exceeded the runtime frame limit"})
+                    continue
+                raw = raw[:-1] if raw.endswith(b"\n") else raw
+                try:
+                    msg = json.loads(raw.decode("utf-8"))
+                except Exception as exc:
+                    detail = bounded_diagnostic(f"{type(exc).__name__}: {exc}")
+                    client.send_obj({"event": "bad_request", "code": "malformed_json",
+                                     "detail": detail})
+                    continue
+                if not isinstance(msg, dict):
+                    client.send_obj({"event": "bad_request", "code": "not_object",
+                                     "detail": "request must be a JSON object"})
+                    continue
+                try:
+                    self.handle(msg, client)
+                except SystemExit:
+                    return
+        except OSError:
+            pass
+        finally:
+            self._client_disconnected(client)
+
+    @staticmethod
+    def _bind_socket(path: str) -> socket.socket:
+        encoded = path.encode("utf-8")
+        if not encoded or len(encoded) > 103:
+            raise RuntimeError("socket path is empty or too long")
+        parent = os.path.dirname(path) or "."
+        # Never silently chmod an arbitrary parent. In particular, `/tmp` is commonly
+        # world-writable; changing it to 0700 would break unrelated processes, while leaving it
+        # open would make a predictable endpoint a local interception opportunity. The Swift
+        # launcher and `just host` each create a dedicated owner-only directory before launch.
+        try:
+            parent_info = os.lstat(parent)
+        except FileNotFoundError:
+            raise RuntimeError("socket parent directory must already exist")
+        except OSError as exc:
+            raise RuntimeError(f"socket parent is not accessible: {exc.strerror or 'I/O error'}")
+        if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+            raise RuntimeError("socket parent must be a real directory")
+        if parent_info.st_uid != os.getuid():
+            raise RuntimeError("socket parent must be owned by the current user")
+        if (parent_info.st_mode & 0o777) != 0o700:
+            raise RuntimeError("socket parent permissions must be 0700")
+        if os.path.lexists(path):
+            if not stat.S_ISSOCK(os.lstat(path).st_mode):
+                raise RuntimeError("socket path is occupied by a non-socket")
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.15)
+            try:
+                probe.connect(path)
+            except OSError as exc:
+                if exc.errno not in (errno.ECONNREFUSED, errno.ENOENT, errno.ECONNRESET):
+                    raise RuntimeError("socket path is occupied or inaccessible")
+                os.unlink(path)
+            else:
+                raise RuntimeError("socket path already serves a live host")
+            finally:
+                probe.close()
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(path)
+            os.chmod(path, 0o600)
+            server.listen(16)
+            return server
+        except Exception:
+            server.close()
+            raise
+
     def serve(self) -> None:
-        emit({"event": "ready", **self.capabilities()})
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except Exception as exc:
-                # A malformed line is reported and skipped. Exiting would make one bad
-                # write from a caller cost every live session in the process.
-                emit({"event": "bad_request", "detail": f"{type(exc).__name__}: {exc}"})
-                continue
-            try:
-                self.handle(msg)
-            except SystemExit:
-                return
-        self.shutdown()
+        """The v3 entry point. A host has no stdio transport; it must be adoptable."""
+        raise RuntimeError("runtime host requires --socket")
 
 
 if __name__ == "__main__":
     try:
-        Host().serve()
+        import argparse
+        parser = argparse.ArgumentParser(description="Aviary adoptable Python runtime host")
+        parser.add_argument("--socket", required=True,
+                            help="Unix-domain socket path for the v3 transport")
+        parser.add_argument("--host-id", default=None,
+                            help="logical host identity supplied by the launcher")
+        args = parser.parse_args()
+        # The socket host must not be tied to the GUI's process group or stdio lifecycle. The
+        # call can fail when the launcher already made us a session leader; in that case the
+        # socket itself still provides the detach boundary.
+        try:
+            os.setsid()
+        except OSError:
+            pass
+        Host(args.host_id).serve_socket(args.socket)
     except KeyboardInterrupt:
         pass
+    except Exception as exc:
+        print(bounded_diagnostic(exc), file=sys.stderr)
+        raise SystemExit(1)

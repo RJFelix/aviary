@@ -187,11 +187,11 @@ public enum ClaudeCodeSession {
         await bridge.offer([await kernel.tool()])
         // `remember`, `recall`, `conversation` and `artifact` come from inside the interpreter,
         // so they arrive as host callbacks rather than as tool calls.
-        await host.onCallback { session, kind, payload in
+        await host.onCallback { session, rid, kind, payload in
             guard session == hostSession else {
                 return .object(["error": .string("Unknown kernel session.")])
             }
-            return await kernel.serveCallback(kind: kind, payload: payload)
+            return await kernel.serveCallback(rid: rid, kind: kind, payload: payload)
         }
 
         return Prepared(

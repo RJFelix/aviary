@@ -356,8 +356,9 @@ public struct AgentHome: Sendable, Hashable {
     }
 
     // The supervisor and worker socket paths were here — `$TMPDIR/prime-agent-<uid>`, the
-    // daemon socket and the ownership-owner directory inside it. Aviary runs its agents in
-    // this process and talks to its runtime host over a pipe, so there is no socket to name.
+    // daemon socket and the ownership-owner directory inside it. Runtime-host sockets now live
+    // in the host's dedicated Application Support directory (`Aviary/k`) and are named by its
+    // adoption descriptor rather than by this durable work home.
 
     public func sessionFile(id: String) -> URL {
         sessionsDir.appending(path: "\(id).jsonl")

@@ -482,22 +482,22 @@ func test_nativeExecutionAgentCallbackEffectsHaveTypedActionReceipts() async thr
     await agent.setMemory(MemoryStore(repoRoot: nil, home: home, cwd: "/tmp"))
     await agent.setArtifacts(ArtifactStore(home: home, sessionID: writer.sessionID))
 
-    XCTAssertNil((await agent.serveCallback(kind: "message", payload: .object([
+    XCTAssertNil((await agent.serveCallback(rid: "callback-message", kind: "message", payload: .object([
         "to": .string("peer-1"), "text": .string("hello"),
     ]))) ["error"])
-    XCTAssertNil((await agent.serveCallback(kind: "notify", payload: .object([
+    XCTAssertNil((await agent.serveCallback(rid: "callback-notify", kind: "notify", payload: .object([
         "text": .string("hello self"),
     ]))) ["error"])
-    XCTAssertNil((await agent.serveCallback(kind: "spawn", payload: .object([
+    XCTAssertNil((await agent.serveCallback(rid: "callback-spawn", kind: "spawn", payload: .object([
         "prompt": .string("do work"),
     ]))) ["error"])
-    XCTAssertNil((await agent.serveCallback(kind: "remember", payload: .object([
+    XCTAssertNil((await agent.serveCallback(rid: "callback-remember", kind: "remember", payload: .object([
         "text": .string("durable fact"),
     ]))) ["error"])
-    XCTAssertNil((await agent.serveCallback(kind: "artifact", payload: .object([
+    XCTAssertNil((await agent.serveCallback(rid: "callback-artifact", kind: "artifact", payload: .object([
         "text": .string("body"), "title": .string("Receipt"), "format": .string("md"),
     ]))) ["error"])
-    let imageReply = await agent.serveCallback(kind: "attach_image", payload: .object([
+    let imageReply = await agent.serveCallback(rid: "callback-image", kind: "attach_image", payload: .object([
         "path": .string(home.root.appending(path: "missing.png").path),
     ]))
     XCTAssertNotNil(imageReply["error"])

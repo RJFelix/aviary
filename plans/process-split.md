@@ -1,6 +1,9 @@
 # Splitting Aviary into GUI, Work Host, and kernels
 
-**Status:** shaping. Nothing implemented. 2026-08-24.
+**Status:** implementation in progress. Stage 1's adoptable runtime transport and the
+transport-neutral Work-service contract are implemented and tested as foundations; no production
+path yet persists adoption descriptors or moves Work ownership out of the GUI. Stages 2–4 remain
+unimplemented. Updated 2026-09-02.
 
 The goals, stated as tests:
 
@@ -27,10 +30,11 @@ transport is a Unix-domain socket.
 work to do in *separating* them. The work is making them **outlive and be re-attachable**, which
 is a different and smaller problem.
 
-The blocker is the transport, not the process model: the runtime-host protocol is
-**line-delimited JSON on stdin and stdout** (`docs/runtime-host-protocol.md`). Pipes are bound
-to the parent that created them. A kernel on stdio cannot be adopted by a new process, no matter
-who spawned it. **This is the keystone constraint for the entire plan.**
+The original blocker was the transport, not the process model: the runtime-host protocol used
+line-delimited JSON on stdin and stdout, whose pipes were bound to the parent that created them.
+Protocol v3 now carries the same bounded JSONL contract over an identity-checked Unix-domain
+socket. This removes the keystone transport constraint, but production discovery and adoption
+still require Stage 2 to persist the descriptor under service-owned Work.
 
 **"The part of the harness that owns sessions" is not the right description of #2.** On the
 in-house engine there is no harness — the loop is Aviary's own `Agent` + `AgentRunner`, running
@@ -85,11 +89,13 @@ host listens on `~/Library/Application Support/Aviary/kernels/<id>.sock` in a 07
 and is started detached (`launchd`, or `posix_spawn` with a new session so it is not in the
 app's process group).
 
-Then:
+This substrate now proves:
 
-- A UI relaunch reconnects to the same kernel and the same interpreter. **Variables survive.**
-- Combined with `SessionResume.replay`, which already exists and already handles a transcript
-  that ends mid-tool-call, a relaunch costs the turn that was in flight and nothing else.
+- A fresh `RuntimeHost` client can adopt the same verified host instance after the original client
+  disconnects. **Variables survive in the tested interpreter.** No GUI path performs this yet.
+- Callback requests keep a stable request ID across at-least-once replay. Late/duplicate results
+  are rejected explicitly; durable effect deduplication belongs to the service-owned Work action
+  boundary in Stage 2.
 - It is needed for **every** later stage: if kernels are children of a service, a service
   restart kills them, and this project restarts services.
 
@@ -97,8 +103,9 @@ Filesystem permissions rather than a token, unlike `KernelBridge`: that one uses
 with a token because the courier's endpoint is passed in `--mcp-config` and argv is visible in
 `ps`. A Unix socket in a 0700 directory has no port to collide and no secret to leak.
 
-Cost: a protocol revision with a documented spec, plus a compatibility window where hosts speak
-both. Small, self-contained, independently valuable.
+The old stdio protocol was replaced rather than retained as a compatibility mode. Aviary-owned
+development state and interfaces are disposable; the v3 socket contract, its safety tests, and its
+adoption descriptor are the only runtime-host path going forward.
 
 ### Stage 2 — `aviaryd` becomes the local Work Host; the GUI becomes a client
 

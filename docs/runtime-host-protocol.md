@@ -6,12 +6,49 @@ than a foundation to commit to. Lua, QuickJS, a WASM sandbox, or a remote runtim
 alternative implementations of the same contract, not rewrites of Aviary.
 
 Reference host: `runtime-hosts/python3/host.py` — CPython, one sub-interpreter per session.
+The bundled hosts speak protocol **3** over a local Unix-domain socket. The socket is the
+client transport; it is not a process-lifetime signal.
 
 ## Shape
 
-One process. Line-delimited JSON on stdin and stdout, **LF only**. A request carries an `id`
-and gets exactly one response with the same `id`. Unsolicited `event` lines may arrive at any
-time, including between a request and its response, so a caller can stream output.
+One process. Line-delimited JSON on a Unix-domain socket, **LF only**. A host may serve many
+clients over the same socket. A request carries an `id` and gets exactly one response with the
+same `id`. Unsolicited `event` lines may arrive at any time, including between a request and its
+response, so a caller can stream output. Frames are bounded at 4 MiB; malformed or oversized
+frames are reported and skipped without taking down the host or its other clients.
+
+The host creates a 0600 socket inside a dedicated, pre-existing 0700 directory owned by the
+current user. A host refuses to create a socket under a missing, symlinked, foreign-owned, or
+group/world-accessible parent; it never chmods an arbitrary parent such as `/tmp`. The path is
+only an endpoint, not an authority. A caller that explicitly retains the typed `{hostID,
+instanceID, protocol}` descriptor returned by the ready handshake can verify it again when
+adopting a socket. The current app does not persist these descriptors or implement production
+GUI reattachment yet. A PID is diagnostic only and is never used to prove identity or ownership.
+
+Those permissions are a local transport precaution, not a sandbox or a complete trust boundary.
+The Python interpreter is intentionally capable of file, process, socket, and network effects;
+hooks and callback approval can shape requests but cannot contain direct Python effects.
+
+The first frame sent to every client is a ready handshake:
+
+```
+← {"event":"ready","protocol":3,"runtime":"cpython","runtimeVersion":"3.14.6",
+   "hostID":"host-1","instanceID":"process-1","transport":"unix",
+   "features":{"adoptableTransport":true,"multipleClients":true,"persistentSessions":true}}
+```
+
+The launcher gives the host null stdin/stdout/stderr, so closing the GUI's client connection does
+not send an EOF through a parent-owned pipe. This is a transport boundary, not a service manager:
+the protocol promises survival across an ordinary client disconnect, but not across a host crash,
+OS termination, or machine shutdown. Closing a client socket is a **disconnect**: sessions,
+variables, Futures and callbacks remain host-owned while that process continues. A new client
+connects to a caller-retained socket path, verifies the same host/process identity, and calls
+`session.attach` for each session it will serve callbacks for. This is an API/test substrate for
+future attachment work, not a claim that the production GUI currently stores or restores these
+descriptors. An explicit `shutdown` request is the only protocol operation that intentionally
+ends the host and destroys its sessions. Orderly host exit removes the endpoint; a crash or hard
+kill may leave a stale socket inode, which a later host may reclaim only after its refused-
+connection probe.
 
 Split on `\n` and nothing else. `\r` is not a delimiter and U+2028/U+2029 are legal inside
 JSON strings — a generic line reader corrupts transcripts that contain them.
@@ -36,10 +73,12 @@ Failure is a response, not a dropped connection:
 | `session.create` | `session?`, `cwd?` | `{session, cwd}` — id is generated if omitted |
 | `session.destroy` | `session` | `{session, destroyed}` |
 | `session.list` | — | `{sessions: [id]}` |
+| `session.attach` | `session` | `{session, attached}` — routes callbacks to this client and replays unresolved callbacks |
+| `session.detach` | `session` | `{session, detached}` — leaves the session alive |
 | `exec` | `session`, `code`, `mode?` (`exec`\|`eval`) | `{stdout, stderr, value, exception}` |
 | `inspect` | `session` | `{names: [{name,type,repr,length}], cwd}` |
 | `shutdown` | — | `{stopping:true}`, then the process exits |
-| `callback.result` | `rid`, `result` | `{delivered:true}` — answers a `callback` event |
+| `callback.result` | `rid`, `result` | `{delivered, status}` — answers or classifies a `callback` event |
 
 `value` is the repr of a trailing expression, the way a REPL echoes one — agents write
 `x.head()` on the last line and expect to see it. `exception` is a formatted traceback.
@@ -48,7 +87,7 @@ down; verified in the suite.
 
 ## Callbacks: the runtime asking the client for something
 
-Protocol 2 added a second direction. The runtime emits
+Protocol 3 carries a second direction. The runtime emits
 
 ```
 ← {"event":"callback","rid":"cb-1","session":"s1","kind":"spawn","payload":{"prompt":"…"}}
@@ -64,10 +103,20 @@ Two rules. **The session id travels with the request** — one host serves many 
 client has no other way to know which agent asked; leaving it out cost a debugging session.
 And **a refusal is a payload with an `error` key, never silence**: the agent is blocked on a
 line of code, so an error it can read beats a nine-minute timeout it cannot.
+Callback admission is bounded. Once that bound is full, the client sends each excess callback a
+bounded `callback.result` refusal directly; if even that bounded write cannot be delivered, it
+closes the transport so the runtime can observe disconnection instead of retaining a silent RID.
 
 A client that serves no callbacks should still answer, saying so. The reference host declares
 `callbacks: true`; a runtime without the channel declares it false and must not offer
-`spawn` in its namespace.
+`spawn` in its namespace. If the serving client disconnects while a callback is unresolved, the
+host retains the callback identity and re-emits it after `session.attach`; it does not silently
+let the Python session hang. Callback delivery is **at-least-once**, so the same `rid` can be
+delivered to more than one client when a response is lost. The host atomically accepts the first
+result and returns `{delivered:false,status:"duplicate"}` for a later result, or
+`{delivered:false,status:"stale"}` when no callback remains. This process-local history is not
+durable exactly-once effect state; consumers performing durable effects must deduplicate by the
+stable `rid` themselves.
 
 ## Capabilities, and why they are declared
 
@@ -77,10 +126,12 @@ it cannot interrupt a running Python loop, and a UI that offered a Stop button o
 of an assumption would be lying to the person pressing it.
 
 ```json
-{"protocol":2,"runtime":"cpython","runtimeVersion":"3.12.9",
+{"protocol":3,"runtime":"cpython","runtimeVersion":"3.14.6","hostID":"host-1",
+ "instanceID":"process-1","transport":"unix",
  "features":{"isolatedSessions":true,"perSessionGIL":true,"namespaceInspection":true,
              "persistentShellState":true,"interruptSubprocess":false,
-             "interruptPython":false,"snapshot":false,"callbacks":true}}
+             "interruptPython":false,"snapshot":false,"callbacks":true,
+             "adoptableTransport":true,"multipleClients":true,"persistentSessions":true}}
 ```
 
 ## What a host must guarantee
@@ -117,6 +168,8 @@ Linking a runtime into Aviary directly would be faster to call and would let the
 interpreter memory. It would also mean a segfault in a C extension takes the window, the
 board and the transcripts with it. Aviary's stated invariant is that it stays usable when the
 agent side is wedged — precisely when you most want to read what happened. A helper process
-keeps that for the price of a pipe, and buys two things besides: a runtime that can be
+keeps that for the price of a local socket, and buys two things besides: a runtime that can be
 swapped without touching the app, and no version coupling between the app and whatever the
-terminal has installed.
+terminal has installed. Unlike a pipe, the socket gives a future client API a way to reconnect
+to the same process and interpreter without pretending that client lifetime is work lifetime;
+production descriptor persistence and GUI reattachment remain future work.

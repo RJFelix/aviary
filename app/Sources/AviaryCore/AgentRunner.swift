@@ -489,21 +489,23 @@ public actor AgentRunner {
     private func installCallbackHandler() async {
         guard !handlerInstalled else { return }
         handlerInstalled = true
-        await host.onCallback { [weak self] session, kind, payload in
+        await host.onCallback { [weak self] session, rid, kind, payload in
             guard let self else {
                 return .object(["error": .string("Aviary is no longer listening.")])
             }
-            return await self.dispatch(session: session, kind: kind, payload: payload)
+            return await self.dispatch(session: session, rid: rid, kind: kind, payload: payload)
         }
     }
 
-    private func dispatch(session: String, kind: String, payload: JSONValue) async -> JSONValue {
+    private func dispatch(
+        session: String, rid: String, kind: String, payload: JSONValue
+    ) async -> JSONValue {
         guard let agent = agentsByHostSession[session] else {
             // Can happen if a runtime session outlives its agent. Answered rather than
             // ignored, so the agent code gets an error instead of a nine-minute timeout.
             return .object(["error": .string("No agent is attached to this runtime session.")])
         }
-        return await agent.serveCallback(kind: kind, payload: payload)
+        return await agent.serveCallback(rid: rid, kind: kind, payload: payload)
     }
 
     // MARK: Children

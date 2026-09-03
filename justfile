@@ -84,16 +84,14 @@ check: test compile
 clean:
     rm -rf {{build_dir}} {{app_dir}}/.build
 
-# Drive a runtime host by hand. `just host` for the default, `just host python3-shared`.
+# Start a runtime host by hand. `just host` for the default, `just host python3-shared`.
 #
-# Reads JSON lines from your terminal and prints the host's replies, which is the fastest way
-# to explore a runtime or to check a new host against docs/runtime-host-protocol.md. Try:
-#   {"id":"1","op":"session.create","session":"s"}
-#   {"id":"2","op":"exec","session":"s","code":"sh('git log --oneline -3')['stdout']"}
-#   {"id":"3","op":"inspect","session":"s"}
+# v3 is socket-only so the process can outlive this terminal. Use a small Unix-socket client
+# (or `RuntimeHost.adopt`) against the printed endpoint; the host removes the socket on explicit
+# shutdown or orderly exit. A later launch can reclaim a proven-stale socket. The dedicated
+# directory is intentionally left behind for inspection and is safe to remove after shutdown.
 host variant="python3":
-    @echo '→ runtime-hosts/{{variant}}/host.py — one JSON object per line, ^D to finish'
-    python3 runtime-hosts/{{variant}}/host.py
+    @dir="$$(mktemp -d "{{app_dir}}/.runtime-host-{{variant}}.XXXXXX")"; socket="$$dir/host.sock"; echo "→ runtime-hosts/{{variant}}/host.py listening on $$socket"; exec python3 runtime-hosts/{{variant}}/host.py --socket "$$socket" --host-id "manual-{{variant}}"
 
 # Compare every bundled host against the same protocol checks
 hosts:

@@ -173,7 +173,10 @@ public actor ClaudeCodeKernel {
     /// `AgentRunner` to build a child agent, and a driven session has no runner. Refused with
     /// a reason rather than silently absent, because agent code that calls `spawn()` and hangs
     /// is worse than agent code that is told no.
-    public func serveCallback(kind: String, payload: JSONValue) async -> JSONValue {
+    /// `rid` is stable across at-least-once runtime replay. The driven kernel currently returns
+    /// callback outcomes directly, but the identifier is kept at this boundary so any durable
+    /// effect consumer can deduplicate without treating transport delivery as exactly-once.
+    public func serveCallback(rid: String, kind: String, payload: JSONValue) async -> JSONValue {
         guard await checkWriter() else {
             return .object(["error": .string(
                 "The Aviary session journal is unavailable; stop this run.")])

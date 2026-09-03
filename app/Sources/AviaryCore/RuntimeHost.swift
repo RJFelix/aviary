@@ -1,4 +1,192 @@
+import Darwin
 import Foundation
+
+private enum UnixSocketFailure: Error {
+    case invalidPath
+    case system(Int32)
+    case closed
+}
+
+/// A small, blocking POSIX socket wrapper. The actor owns the connection's lifecycle; this
+/// object only makes the descriptor's two inherently blocking operations safe to call from
+/// detached read/write callbacks. It deliberately has no process semantics: closing a client
+/// socket is not a request to stop the host process.
+private final class UnixSocketConnection: @unchecked Sendable {
+    let path: String
+    private let handle: FileHandle
+    private let writeLock = NSLock()
+    private var closed = false
+    private var handleClosed = false
+
+    init(path: String) throws {
+        self.path = path
+        let pathData = Data(path.utf8)
+        // Darwin's sockaddr_un has a 104-byte sun_path. Leave one byte for its NUL terminator.
+        guard !pathData.isEmpty, pathData.count <= 103 else {
+            throw UnixSocketFailure.invalidPath
+        }
+
+        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw UnixSocketFailure.system(errno) }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        do {
+            // A peer can disappear while a write is in flight. Prevent SIGPIPE from taking the
+            // entire GUI down; the write must surface as a typed transport failure instead.
+            var noSigPipe: Int32 = 1
+            let noSigPipeResult = withUnsafePointer(to: &noSigPipe) {
+                Darwin.setsockopt(
+                    descriptor, SOL_SOCKET, SO_NOSIGPIPE, $0,
+                    socklen_t(MemoryLayout<Int32>.size))
+            }
+            guard noSigPipeResult == 0 else {
+                throw UnixSocketFailure.system(errno)
+            }
+            var bytes = pathData
+            bytes.append(0)
+            let copied = withUnsafeMutableBytes(of: &address.sun_path) { target in
+                bytes.withUnsafeBytes { source in
+                    target.copyBytes(from: source)
+                }
+                return bytes.count
+            }
+            guard copied == bytes.count else {
+                throw UnixSocketFailure.invalidPath
+            }
+            let result = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+            guard result == 0 else {
+                throw UnixSocketFailure.system(errno)
+            }
+            // Keep the descriptor non-blocking for both directions. FileHandle's readability
+            // callback is only scheduled when data/EOF is available, while writes below can use
+            // poll to impose their own deadline instead of relying on FileHandle's opaque retry
+            // loop (which can ignore SO_SNDTIMEO for a large payload).
+            let flags = Darwin.fcntl(descriptor, F_GETFL)
+            guard flags >= 0,
+                  Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0
+            else {
+                throw UnixSocketFailure.system(errno)
+            }
+        } catch {
+            // This is the sole close path for a descriptor that failed before FileHandle owns it.
+            Darwin.close(descriptor)
+            throw error
+        }
+        handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    }
+
+    func write(_ data: Data) throws {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        guard !closed else { throw UnixSocketFailure.closed }
+        // FileHandle.write can ignore SO_SNDTIMEO while it retries a short socket write. Use
+        // non-blocking send attempts and a bounded poll instead, while leaving the descriptor's
+        // read mode untouched for FileHandle's readability handler.
+        let deadline = DispatchTime.now().uptimeNanoseconds + 1_000_000_000
+        do {
+            try data.withUnsafeBytes { rawBuffer in
+                guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return }
+                var offset = 0
+                while offset < rawBuffer.count {
+                    let sent = Darwin.send(
+                        handle.fileDescriptor, base.advanced(by: offset), rawBuffer.count - offset,
+                        Int32(MSG_DONTWAIT))
+                    if sent > 0 {
+                        offset += sent
+                        continue
+                    }
+                    if sent < 0 && errno == EINTR { continue }
+                    if sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        let now = DispatchTime.now().uptimeNanoseconds
+                        guard now < deadline else { throw UnixSocketFailure.system(EAGAIN) }
+                        var descriptor = pollfd(
+                            fd: handle.fileDescriptor, events: Int16(POLLOUT), revents: 0)
+                        let remainingMilliseconds = Int32(
+                            min(100, max(1, (deadline - now) / 1_000_000)))
+                        let ready = Darwin.poll(&descriptor, 1, remainingMilliseconds)
+                        if ready == 0 { continue }
+                        if ready < 0 {
+                            if errno == EINTR { continue }
+                            throw UnixSocketFailure.system(errno)
+                        }
+                        if descriptor.revents & Int16(POLLERR | POLLHUP | POLLNVAL) != 0 {
+                            throw UnixSocketFailure.system(EPIPE)
+                        }
+                        continue
+                    }
+                    throw UnixSocketFailure.system(errno)
+                }
+            }
+        } catch {
+            closed = true
+            closeHandleLocked()
+            throw error
+        }
+    }
+
+    func startReading(
+        onData: @escaping @Sendable (Data) -> Void,
+        onClose: @escaping @Sendable () -> Void
+    ) {
+        handle.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else {
+                self?.markClosed()
+                onClose()
+                return
+            }
+            onData(chunk)
+        }
+    }
+
+    func close() {
+        writeLock.lock()
+        closed = true
+        closeHandleLocked()
+        writeLock.unlock()
+    }
+
+    private func markClosed() {
+        writeLock.lock()
+        closed = true
+        closeHandleLocked()
+        writeLock.unlock()
+    }
+
+    /// Must be called while `writeLock` is held. Keeping `closed` separate from
+    /// `handleClosed` makes an I/O error followed by lifecycle cleanup idempotent and ensures
+    /// the underlying descriptor is not leaked or accidentally closed twice.
+    private func closeHandleLocked() {
+        guard !handleClosed else { return }
+        handle.readabilityHandler = nil
+        try? handle.close()
+        handleClosed = true
+    }
+}
+
+/// Cancellation handlers run outside the actor, while reply continuations are actor-owned. This
+/// tiny synchronized flag lets the waiting task preserve CancellationError even if finishing an
+/// AsyncThrowingStream is observed as an empty stream on a particular Swift runtime.
+private final class RuntimeHostCancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    func cancel() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+
+    var isCanceled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
 
 /// A client for a runtime host: the process where agent code actually runs.
 ///
@@ -23,11 +211,64 @@ public actor RuntimeHost {
 
     // MARK: Types
 
+    /// The logical host and the particular process instance serving it. `hostID` is supplied by
+    /// the launcher, while `instanceID` is generated by the Python process. A PID is deliberately
+    /// absent: it is a diagnostic and can be reused, never an authority for adoption.
+    public struct HostIdentity: Sendable, Hashable, Codable {
+        public let hostID: String
+        public let instanceID: String
+
+        public init(hostID: String, instanceID: String) {
+            self.hostID = hostID
+            self.instanceID = instanceID
+        }
+    }
+
+    /// A local endpoint that can be persisted with an adoption descriptor. The path is an
+    /// address, not an identity; callers must retain and verify `HostIdentity` as well.
+    public struct SocketEndpoint: Sendable, Hashable, Codable {
+        public let path: String
+
+        public init(path: String) { self.path = path }
+    }
+
+    /// The reconnect material a later GUI needs. It is intentionally Codable and contains no
+    /// PID or bearer token. The host instance identity is checked again during `connect`.
+    public struct AdoptionDescriptor: Sendable, Hashable, Codable {
+        public let endpoint: SocketEndpoint
+        public let identity: HostIdentity
+        public let protocolVersion: Int
+
+        public init(
+            endpoint: SocketEndpoint, identity: HostIdentity, protocolVersion: Int = 3
+        ) {
+            self.endpoint = endpoint
+            self.identity = identity
+            self.protocolVersion = protocolVersion
+        }
+    }
+
+    public static let protocolVersion = 3
+    public static let maxFrameBytes = 4 * 1024 * 1024
+
+    /// A hostile or wedged host must not be able to make the client retain an unbounded number
+    /// of complete frames while the actor catches up. The input pump closes the transport when
+    /// this finite queue fills; dropping a frame would otherwise silently reorder or lose a
+    /// request/event.
+    private static let maxBufferedIncomingFrames = 256
+    /// A callback is application work, not just another input frame. Keep the number of admitted
+    /// handler tasks bounded even when a host emits a callback flood faster than the GUI can
+    /// service it. Excess callbacks receive a small direct refusal through the same bounded socket
+    /// writer; there is no second Task pool that can fill and silently lose the callback RID.
+    private static let maxActiveCallbackTasks = 32
+
     public struct Capabilities: Sendable, Hashable {
         public var protocolVersion: Int
         public var runtime: String
         public var runtimeVersion: String
         public var features: [String: Bool]
+        public var identity: HostIdentity?
+        public var transport: String?
 
         /// Never assume an undeclared capability. A host that cannot interrupt a running loop
         /// says so, and a UI that offered a Stop button anyway would be lying to whoever
@@ -70,14 +311,51 @@ public actor RuntimeHost {
         case rejected(code: String, detail: String)
         case timedOut(op: String)
         case malformedReply
+        case frameTooLarge(op: String, bytes: Int, limit: Int)
+        case transportWriteFailed(op: String, detail: String)
+        case invalidEndpoint(String)
+        case connectionFailed(String)
+        case staleSocket(String)
+        case protocolMismatch(expected: Int, actual: Int)
+        case identityMismatch(expected: HostIdentity, actual: HostIdentity?)
+        case adoptionDescriptorMismatch(expected: Int, actual: Int)
+
+        private static func bounded(_ value: String, limit: Int = 500) -> String {
+            String(value.prefix(limit))
+        }
 
         public var errorDescription: String? {
             switch self {
             case .notRunning: return "The runtime host is not running."
-            case .launchFailed(let s): return "Could not start the runtime host: \(s)"
-            case .rejected(let code, let detail): return "\(code): \(detail)"
-            case .timedOut(let op): return "The runtime host did not answer \(op) in time."
+            case .launchFailed(let s):
+                return "Could not start the runtime host: \(Self.bounded(s, limit: 240))"
+            case .rejected(let code, let detail):
+                return "\(Self.bounded(code, limit: 120)): \(Self.bounded(detail))"
+            case .timedOut(let op):
+                return "The runtime host did not answer \(Self.bounded(op, limit: 120)) in time."
             case .malformedReply: return "The runtime host sent a reply that could not be read."
+            case .frameTooLarge(let op, let bytes, let limit):
+                return "Runtime host \(Self.bounded(op, limit: 120)) request is too large "
+                    + "(\(bytes) bytes; limit \(limit))."
+            case .transportWriteFailed(let op, let detail):
+                return "Runtime host write failed during \(Self.bounded(op, limit: 120)): "
+                    + Self.bounded(detail, limit: 240)
+            case .invalidEndpoint(let detail):
+                return "Invalid runtime host endpoint: \(Self.bounded(detail, limit: 240))"
+            case .connectionFailed(let detail):
+                return "Could not connect to the runtime host: \(Self.bounded(detail, limit: 240))"
+            case .staleSocket(let detail):
+                return "Runtime host socket is stale or occupied: \(Self.bounded(detail, limit: 240))"
+            case .protocolMismatch(let expected, let actual):
+                return "Runtime host protocol mismatch (expected \(expected), got \(actual))."
+            case .identityMismatch(let expected, let actual):
+                let expectedText = "\(Self.bounded(expected.hostID, limit: 120))/\(Self.bounded(expected.instanceID, limit: 120))"
+                let actualText = actual.map {
+                    "\(Self.bounded($0.hostID, limit: 120))/\(Self.bounded($0.instanceID, limit: 120))"
+                } ?? "unknown"
+                return "Runtime host identity mismatch (expected \(expectedText), got \(actualText))."
+            case .adoptionDescriptorMismatch(let expected, let actual):
+                return "Adoption descriptor protocol mismatch (expected \(expected), got \(actual))."
             }
         }
     }
@@ -94,16 +372,21 @@ public actor RuntimeHost {
     /// key is how a refusal reaches the agent as something it can read and react to, rather
     /// than as a hang.
     public typealias CallbackHandler = @Sendable (
-        _ session: String, _ kind: String, _ payload: JSONValue
+        _ session: String, _ rid: String, _ kind: String, _ payload: JSONValue
     ) async throws -> JSONValue
 
     // MARK: State
 
-    private let executable: String
+    private let executable: String?
     private let arguments: [String]
+    private var expectedIdentity: HostIdentity?
+    private let expectedProtocolVersion: Int
     private var process: Process?
-    private var stdin: FileHandle?
-    private var pending: [String: CheckedContinuation<JSONValue?, Error>] = [:]
+    private var socket: UnixSocketConnection?
+    private var endpointStorage: SocketEndpoint?
+    private var identityStorage: HostIdentity?
+    private typealias ReplyStream = AsyncThrowingStream<JSONValue, Error>
+    private var pending: [String: ReplyStream.Continuation] = [:]
     private var nextID = 0
     private var readyContinuation: CheckedContinuation<Capabilities, Error>?
     private var outputHandler: OutputHandler?
@@ -117,16 +400,36 @@ public actor RuntimeHost {
     private var callbackErrors: [Error] = []
     /// Responses to callbacks rejected after admission closes do not run application effects,
     /// but remain tracked so shutdown does not race their protocol reply.
-    private var nextCallbackResponseID = 0
-    private var callbackResponseTasks: [Int: Task<Void, Never>] = [:]
     private var stderrTail: [String] = []
-    /// One consumer for stdout. A Task per line can enter this actor out of wire order even
+    /// One consumer for socket input. A Task per line can enter this actor out of wire order even
     /// though actor mutation itself is serialized; deltas, replies, and callbacks must retain
     /// the order in which the host wrote them.
     private var outputPump: Task<Void, Never>?
+    /// Every socket gets a monotonically increasing generation. Readability callbacks from an
+    /// old socket may run after reconnect; they must not tear down the newly verified transport.
+    private var connectionGeneration: UInt64 = 0
+    /// Every owned process gets its own generation. Process.terminationHandler is delivered
+    /// asynchronously and can arrive after a clean stop has already launched a replacement; an
+    /// old handler must never mark the replacement dead or tear down its connection.
+    private var processGeneration: UInt64 = 0
 
     public private(set) var capabilities: Capabilities?
     public private(set) var isRunning = false
+    /// True only while this client has a live transport. It says nothing about a detached host
+    /// after `disconnect`; use the persisted adoption descriptor to reconnect and verify it.
+    public private(set) var isConnected = false
+    /// The process is known to be ours only for a client that launched it. An adopted client does
+    /// not infer process liveness from a PID or from a successful socket connect.
+    public private(set) var hostProcessIsRunning = false
+
+    public var endpoint: SocketEndpoint? { endpointStorage }
+    public var hostIdentity: HostIdentity? { identityStorage }
+    public var adoptionDescriptor: AdoptionDescriptor? {
+        guard let endpointStorage, let identityStorage else { return nil }
+        return AdoptionDescriptor(
+            endpoint: endpointStorage, identity: identityStorage,
+            protocolVersion: Self.protocolVersion)
+    }
 
     /// Whether newly received runtime callbacks may start their application-side effect.
     public var isCallbackAdmissionOpen: Bool { callbackAdmissionOpen }
@@ -137,6 +440,42 @@ public actor RuntimeHost {
     public init(executable: String, arguments: [String]) {
         self.executable = executable
         self.arguments = arguments
+        self.expectedIdentity = nil
+        self.expectedProtocolVersion = Self.protocolVersion
+        self.endpointStorage = nil
+        self.identityStorage = nil
+    }
+
+    /// Construct a client that can adopt an already-running host. `connect()` validates the
+    /// descriptor's protocol and both identity components before exposing it to callers.
+    public init(endpoint: SocketEndpoint, expectedIdentity: HostIdentity) {
+        self.executable = nil
+        self.arguments = []
+        self.expectedIdentity = expectedIdentity
+        self.expectedProtocolVersion = Self.protocolVersion
+        self.endpointStorage = endpoint
+        self.identityStorage = nil
+    }
+
+    public static func adopt(_ descriptor: AdoptionDescriptor) throws -> RuntimeHost {
+        guard descriptor.protocolVersion == Self.protocolVersion else {
+            throw HostError.adoptionDescriptorMismatch(
+                expected: Self.protocolVersion, actual: descriptor.protocolVersion)
+        }
+        return RuntimeHost(
+            endpoint: descriptor.endpoint, expectedIdentity: descriptor.identity,
+            expectedProtocolVersion: descriptor.protocolVersion)
+    }
+
+    private init(
+        endpoint: SocketEndpoint, expectedIdentity: HostIdentity, expectedProtocolVersion: Int
+    ) {
+        self.executable = nil
+        self.arguments = []
+        self.expectedIdentity = expectedIdentity
+        self.expectedProtocolVersion = expectedProtocolVersion
+        self.endpointStorage = endpoint
+        self.identityStorage = nil
     }
 
     /// The bundled CPython host, if this checkout has it.
@@ -160,15 +499,36 @@ public actor RuntimeHost {
             throw HostError.notRunning
         }
         // A RuntimeHost may be restarted after a clean stop. A stopped instance starts a new
-        // callback admission epoch; no callback from the prior process is retained.
-        callbackAdmissionOpen = true
+        // callback admission epoch only after its fresh ready identity is verified below.
+        callbackAdmissionOpen = false
         callbackErrors.removeAll()
 
+        if executable == nil {
+            return try await connect(timeout: timeout)
+        }
+
+        // This is a new owned process, not a reconnect. `expectedIdentity` is learned from the
+        // previous ready frame and belongs only to reconnect/adoption; retaining it here would
+        // reject the fresh host identity generated below.
+        expectedIdentity = nil
+        identityStorage = nil
+
+        let hostID = UUID().uuidString.lowercased()
+        let directory = try Self.kernelSocketDirectory()
+        // Keep generous headroom under Darwin's 104-byte sun_path limit. The full host ID is
+        // still sent in the handshake; only its first 64 bits name this disposable endpoint.
+        let socketToken = String(hostID.filter { $0 != "-" }.prefix(16))
+        let path = directory.appending(path: "h-\(socketToken).s")
+        try Self.prepareSocketPath(path)
+        endpointStorage = SocketEndpoint(path: path.path)
+
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: executable)
-        p.arguments = arguments
+        processGeneration &+= 1
+        let generation = processGeneration
+        p.executableURL = URL(fileURLWithPath: executable!)
+        p.arguments = arguments + ["--socket", path.path, "--host-id", hostID]
         var env = ProcessEnvironment.shared.snapshot
-        // Unbuffered, or the host's replies sit in a pipe buffer and every call looks hung.
+        // Keep this for Python's own background work; the transport is a socket, not stdio.
         env["PYTHONUNBUFFERED"] = "1"
         // A usable PATH even when the login-shell snapshot has not been taken — otherwise
         // `env python3` cannot find an interpreter and the failure looks like a protocol
@@ -179,65 +539,156 @@ public actor RuntimeHost {
         }
         p.environment = env
 
-        let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
-        p.standardInput = inPipe
-        p.standardOutput = outPipe
-        p.standardError = errPipe
-
-        let framer = LineFramer()
-        let (outputLines, outputContinuation) = AsyncStream<Data>.makeStream(
-            bufferingPolicy: .unbounded)
-        outputPump = Task { [weak self] in
-            for await line in outputLines {
-                guard let self else { return }
-                await self.ingest(line)
-            }
-        }
-        outPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            guard !chunk.isEmpty else {
-                handle.readabilityHandler = nil
-                outputContinuation.finish()
-                return
-            }
-            for line in framer.feed(chunk) {
-                outputContinuation.yield(line)
-            }
-        }
-        errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let chunk = handle.availableData
-            guard !chunk.isEmpty else { handle.readabilityHandler = nil; return }
-            if let s = String(data: chunk, encoding: .utf8) {
-                Task { await self?.noteStderr(s) }
-            }
-        }
+        // No stdin/stdout/stderr pipe belongs to this client. Those descriptors disappear when
+        // the GUI exits and can make a supposedly detached host block or receive EOF. The host
+        // is responsible for its socket and keeps diagnostics bounded on its own side.
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
         p.terminationHandler = { [weak self] _ in
-            Task { await self?.handleExit() }
+            Task { await self?.handleExit(generation: generation) }
         }
 
         do {
             try p.run()
         } catch {
-            outputContinuation.finish()
-            outputPump?.cancel()
-            outputPump = nil
-            throw HostError.launchFailed(error.localizedDescription)
+            try? Self.removeSocketIfSafe(path)
+            endpointStorage = nil
+            throw HostError.launchFailed(Self.boundedErrorDescription(error))
         }
         process = p
-        stdin = inPipe.fileHandleForWriting
-        isRunning = true
+        hostProcessIsRunning = true
 
-        return try await withThrowingTaskGroup(of: Capabilities.self) { group in
-            group.addTask { try await self.awaitReady() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                await self.failReady(HostError.timedOut(op: "startup"))
-                throw HostError.timedOut(op: "startup")
-            }
-            let caps = try await group.next()!
-            group.cancelAll()
-            return caps
+        do {
+            return try await connect(timeout: timeout)
+        } catch {
+            // Startup failed before a client could adopt this process. This is an explicit
+            // cleanup path; an ordinary client disconnect below never does this.
+            await terminateOwnedProcess()
+            try? Self.removeSocketIfSafe(path)
+            endpointStorage = nil
+            throw error
         }
+    }
+
+    /// Connect to the host socket and validate its ready handshake. A newly launched host and a
+    /// later adopter use this exact path, which prevents reconnect from becoming a special,
+    /// weaker code path.
+    @discardableResult
+    public func connect(timeout: TimeInterval = 20) async throws -> Capabilities {
+        guard let endpointStorage else { throw HostError.invalidEndpoint("missing socket path") }
+        guard expectedProtocolVersion == Self.protocolVersion else {
+            throw HostError.adoptionDescriptorMismatch(
+                expected: Self.protocolVersion, actual: expectedProtocolVersion)
+        }
+        try Self.validateSocketPath(endpointStorage.path)
+        guard !isConnected else {
+            if let capabilities { return capabilities }
+            throw HostError.notRunning
+        }
+
+        // `capabilities` belongs to one connection's ready frame. Never let a reconnect reuse a
+        // previous frame and accidentally skip identity/protocol validation for the new socket.
+        capabilities = nil
+        readyContinuation = nil
+        // No unsolicited callback is trusted until this connection's ready identity has been
+        // verified. `ingest` opens the new admission epoch atomically with that verification.
+        callbackAdmissionOpen = false
+        connectionGeneration &+= 1
+        socket?.close()
+        socket = nil
+        outputPump?.cancel()
+        outputPump = nil
+
+        let deadline = Date().addingTimeInterval(max(0.1, timeout))
+        var lastFailure = "endpoint is not ready"
+        while Date() < deadline {
+            var terminalFailure: HostError?
+            do {
+                let connection = try UnixSocketConnection(path: endpointStorage.path)
+                connectionGeneration &+= 1
+                let generation = connectionGeneration
+                socket = connection
+                isConnected = true
+                isRunning = true
+                let framer = LineFramer(maxLineBytes: Self.maxFrameBytes)
+                let (inputLines, inputContinuation) = AsyncStream<Data>.makeStream(
+                    bufferingPolicy: .bufferingOldest(Self.maxBufferedIncomingFrames))
+                outputPump = Task { [weak self] in
+                    for await line in inputLines {
+                        guard let self else { return }
+                        await self.ingest(line, generation: generation)
+                    }
+                }
+                connection.startReading(
+                    onData: { [weak self] chunk in
+                        for line in framer.feed(chunk) {
+                            switch inputContinuation.yield(line) {
+                            case .enqueued:
+                                break
+                            case .dropped:
+                                // Never silently lose an ordered frame. A full bounded pump is
+                                // a transport failure; close it so pending requests fail and a
+                                // later reconnect can establish a clean stream.
+                                inputContinuation.finish()
+                                connection.close()
+                                Task { await self?.handleTransportClose(generation: generation) }
+                                return
+                            case .terminated:
+                                return
+                            @unknown default:
+                                inputContinuation.finish()
+                                connection.close()
+                                Task { await self?.handleTransportClose(generation: generation) }
+                                return
+                            }
+                        }
+                        if framer.takeOverflowCount() > 0 {
+                            // A host frame that cannot be bounded is not a valid response. Close
+                            // this client transport so pending calls fail promptly instead of
+                            // retaining an unbounded partial line or waiting for a timeout.
+                            inputContinuation.finish()
+                            connection.close()
+                            Task { await self?.handleTransportClose(generation: generation) }
+                        }
+                    },
+                    onClose: { [weak self] in
+                        inputContinuation.finish()
+                        Task { await self?.handleTransportClose(generation: generation) }
+                    })
+                let caps = try await awaitReadyWithTimeout(
+                    max(0.1, deadline.timeIntervalSinceNow))
+                return caps
+            } catch let error as HostError {
+                if case .protocolMismatch = error { terminalFailure = error }
+                if case .identityMismatch = error { terminalFailure = error }
+                if case .invalidEndpoint = error { terminalFailure = error }
+                if case .malformedReply = error { terminalFailure = error }
+                lastFailure = error.localizedDescription
+            } catch let error as UnixSocketFailure {
+                lastFailure = Self.socketFailureDescription(error)
+            } catch {
+                lastFailure = Self.boundedErrorDescription(error)
+            }
+            // Clear every per-attempt resource before retrying. In particular, a failed ready
+            // handshake must not leave the old output pump or socket capable of affecting a later
+            // attempt at the same endpoint.
+            closeTransport(HostError.connectionFailed(lastFailure))
+            if let terminalFailure { throw terminalFailure }
+            if Date() >= deadline { break }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        throw HostError.connectionFailed(String(lastFailure.prefix(240)))
+    }
+
+    /// Reconnect this client after an intentional `disconnect`. The host/process identity learned
+    /// before disconnect is still required, so a new process at the same path cannot be adopted.
+    @discardableResult
+    public func reconnect(timeout: TimeInterval = 20) async throws -> Capabilities {
+        guard expectedIdentity != nil || identityStorage != nil else {
+            throw HostError.invalidEndpoint("reconnect requires a verified host identity")
+        }
+        return try await connect(timeout: timeout)
     }
 
     private func awaitReady() async throws -> Capabilities {
@@ -252,45 +703,125 @@ public actor RuntimeHost {
         readyContinuation = nil
     }
 
-    /// Ask the host to stop, then make sure it did.
-    public func stop() async {
+    private func awaitReadyWithTimeout(_ timeout: TimeInterval) async throws -> Capabilities {
+        if let capabilities { return capabilities }
+        return try await withThrowingTaskGroup(of: Capabilities.self) { group in
+            group.addTask { try await self.awaitReady() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(max(0.1, timeout) * 1_000_000_000))
+                await self.failReady(HostError.timedOut(op: "startup"))
+                throw HostError.timedOut(op: "startup")
+            }
+            do {
+                do {
+                    let result = try await group.next()!
+                    group.cancelAll()
+                    if Task.isCancelled { throw CancellationError() }
+                    return result
+                } catch {
+                    group.cancelAll()
+                    if Task.isCancelled { throw CancellationError() }
+                    throw error
+                }
+            } catch {
+                // A throwing timeout child can win before the response iterator. Cancel the
+                // iterator before leaving the group; otherwise structured-task teardown waits
+                // for a stream that is still waiting for a socket frame/EOF.
+                group.cancelAll()
+                throw error
+            }
+        }
+    }
+
+    /// Ask the host to stop, then make sure it did. Callback application code is not trusted to
+    /// return, so the drain has a finite deadline; after it expires, close and owned-process
+    /// termination proceed while the admitted callback remains truthfully observable.
+    public func stop(callbackDrainTimeout: TimeInterval = 2) async {
+        // Invalidate the current process handler before any suspension. A termination callback
+        // from this process may already be queued, and must not race a subsequent start.
+        processGeneration &+= 1
         // The process may emit a callback between the caller deciding to stop and the shutdown
         // request being handled. Close admission first, then wait for effects already admitted,
         // so the shutdown response cannot race a callback's journal writes.
         closeCallbackAdmission()
-        do {
-            try await waitUntilCallbacksQuiescent()
-        } catch {
-            // `stop` predates the throwing drain API and remains a cleanup operation. Preserve
-            // the failure in diagnostics; owners that need typed failure must call the throwing
-            // drain seam before closing their journal.
-            stderrTail.append("callback failed during shutdown: \(error.localizedDescription)\n")
+        let deadline = Date().addingTimeInterval(max(0.001, callbackDrainTimeout))
+        let callbacksDrained = await waitUntilCallbacksQuiescent(until: deadline)
+        if !callbacksDrained {
+            // Do not cancel or remove the task: activeCallbackCount remains a truthful account of
+            // an admitted effect that did not finish. Transport/process teardown must still make
+            // progress, because a callback handler is application code and may never return.
+            noteDiagnostic("callback drain deadline exceeded; \(callbackTasks.count) admitted callback(s) remain")
         }
-        await waitForCallbackResponses()
-        guard isRunning, let p = process else { return }
-        _ = try? await send("shutdown", timeout: 5)
-        try? stdin?.close()
-        stdin = nil
-        for _ in 0..<20 where p.isRunning {
-            try? await Task.sleep(nanoseconds: 100_000_000)
+        // `stop` is the explicit host shutdown operation. `disconnect` below is intentionally
+        // separate and never sends this request or kills a process.
+        if callbacksDrained, isConnected {
+            _ = try? await send("shutdown", timeout: 5)
         }
-        if p.isRunning { p.terminate() }
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        if p.isRunning { kill(p.processIdentifier, SIGKILL) }
-        isRunning = false
-        outputPump?.cancel()
-        outputPump = nil
+        closeTransport(HostError.notRunning)
+        // A callback timeout means the host may be wedged in application code. Do not wait for a
+        // graceful process exit or send a shutdown request that could itself await that callback;
+        // terminate the owned process promptly after closing this client's transport.
+        await terminateOwnedProcess(gracePeriod: callbacksDrained ? 2 : 0)
+        // An owned stop ends this process identity. A later start launches a fresh host and must
+        // not send the old instance ID as an adoption constraint.
+        if executable != nil {
+            expectedIdentity = nil
+            identityStorage = nil
+            endpointStorage = nil
+        }
+    }
+
+    /// Drop this GUI client's transport while leaving the host and all Python namespaces alive.
+    /// The returned adoption descriptor remains valid until the host is explicitly shut down or
+    /// exits; no PID is consulted and no lifecycle message is sent over the socket.
+    public func disconnect() async {
+        closeCallbackAdmission()
+        closeTransport(HostError.notRunning)
+        // A detached host is no longer ours to terminate. Releasing Process also prevents a GUI
+        // teardown path from accidentally treating client ownership as host ownership.
+        process = nil
+        hostProcessIsRunning = false
     }
 
     // MARK: Reading
 
-    private func ingest(_ data: Data) {
+    private func ingest(_ data: Data, generation: UInt64) {
+        guard generation == connectionGeneration else { return }
         guard let v = JSONValue.parse(data) else { return }
 
         if let event = v["event"]?.stringValue {
             switch event {
             case "ready":
+                let protocolVersion = v["protocol"]?.intValue ?? 0
+                guard protocolVersion == Self.protocolVersion else {
+                    let error = HostError.protocolMismatch(
+                        expected: Self.protocolVersion, actual: protocolVersion)
+                    failReady(error)
+                    socket?.close()
+                    return
+                }
                 let caps = Self.capabilities(from: v)
+                guard let actualIdentity = caps.identity else {
+                    let error = HostError.malformedReply
+                    failReady(error)
+                    socket?.close()
+                    return
+                }
+                if let expectedIdentity, expectedIdentity != actualIdentity {
+                    let error = HostError.identityMismatch(
+                        expected: expectedIdentity, actual: actualIdentity)
+                    failReady(error)
+                    socket?.close()
+                    return
+                }
+                identityStorage = actualIdentity
+                // A launched client learns the expected process identity at the first handshake;
+                // later reconnects to the same path must prove it again.
+                if expectedIdentity == nil { expectedIdentity = actualIdentity }
+                // Identity/protocol checks above are the admission gate. Open this fresh epoch
+                // before the ordered pump can ingest the next frame on a reconnect.
+                callbackAdmissionOpen = true
+                callbackErrors.removeAll()
                 capabilities = caps
                 readyContinuation?.resume(returning: caps)
                 readyContinuation = nil
@@ -304,24 +835,15 @@ public actor RuntimeHost {
                     // stopping here, so do not run an application callback merely to answer an
                     // event that arrived after the owner closed its journal. The protocol still
                     // gets an explicit refusal, avoiding a blocked runtime request.
-                    nextCallbackResponseID += 1
-                    let responseID = nextCallbackResponseID
-                    let task = Task { [weak self] in
-                        guard let self else { return }
-                        do {
-                            _ = try await self.send("callback.result", [
-                                "rid": .string(rid),
-                                "result": .object([
-                                    "error": .string(
-                                        "This runtime callback was refused after admission closed."),
-                                ]),
-                            ], timeout: 30)
-                        } catch {
-                            await self.callbackResponseFailed(responseID, error: error)
-                        }
-                        await self.callbackResponseFinished(responseID)
-                    }
-                    callbackResponseTasks[responseID] = task
+                    refuseCallback(
+                        rid: rid,
+                        detail: "This runtime callback was refused after admission closed.")
+                    return
+                }
+                guard callbackTasks.count < Self.maxActiveCallbackTasks else {
+                    refuseCallback(
+                        rid: rid,
+                        detail: "This runtime callback was refused because callback capacity is full.")
                     return
                 }
                 nextCallbackID += 1
@@ -349,7 +871,7 @@ public actor RuntimeHost {
             default:
                 // host_error, bad_request and anything a future host invents. Recorded, not
                 // fatal: an unknown event must never be able to wedge the client.
-                stderrTail.append("event \(event): \(v.prettyPrinted)")
+                noteDiagnostic("event \(event): \(v.prettyPrinted)")
             }
             return
         }
@@ -358,21 +880,34 @@ public actor RuntimeHost {
             return
         }
         if v["ok"]?.boolValue == true {
-            waiter.resume(returning: v["data"])
+            waiter.yield(v["data"] ?? .null)
+            waiter.finish()
         } else {
-            waiter.resume(throwing: HostError.rejected(
+            waiter.finish(throwing: HostError.rejected(
                 code: v.path("error.code")?.stringValue ?? "error",
                 detail: v.path("error.detail")?.stringValue ?? "no detail"))
         }
     }
 
-    private func noteStderr(_ s: String) {
-        stderrTail.append(s)
+    private func noteDiagnostic(_ value: String) {
+        // Diagnostics are for operators, not an unbounded second transport. Keep each entry and
+        // the retained tail bounded even when a host echoes a huge traceback or payload.
+        let entry = String(value.prefix(1_000))
+        guard !entry.isEmpty else { return }
+        stderrTail.append(entry.hasSuffix("\n") ? entry : entry + "\n")
         if stderrTail.count > 100 { stderrTail.removeFirst(stderrTail.count - 100) }
     }
 
-    private func handleExit() {
+    private static func boundedErrorDescription(_ error: Error) -> String {
+        String((error as? LocalizedError)?.errorDescription
+            ?? String(describing: error)).prefix(500).description
+    }
+
+    private func handleExit(generation: UInt64) {
+        guard generation == processGeneration else { return }
+        hostProcessIsRunning = false
         isRunning = false
+        isConnected = false
         // A dead runtime cannot legitimately originate another application effect. Existing
         // callbacks remain tracked and drainable; anything still queued on the output pump is
         // refused by the same admission boundary used for orderly shutdown.
@@ -380,9 +915,34 @@ public actor RuntimeHost {
         outputPump?.cancel()
         outputPump = nil
         let error = HostError.notRunning
-        for (_, waiter) in pending { waiter.resume(throwing: error) }
+        for (_, waiter) in pending { waiter.finish(throwing: error) }
         pending.removeAll()
         failReady(error)
+    }
+
+    private func handleTransportClose(generation: UInt64) {
+        guard generation == connectionGeneration, isConnected else { return }
+        // A client disconnect is not a host shutdown, so do not touch `process` or send a
+        // lifecycle request. Pending request continuations are transport failures only.
+        closeTransport(HostError.notRunning)
+    }
+
+    /// Tear down only this client's transport. This is deliberately separate from process
+    /// termination: an EOF or a failed write must not destroy the host's Python namespaces.
+    /// Incrementing the generation fences late callbacks from the old socket from a newly
+    /// connected socket on the same actor.
+    private func closeTransport(_ error: Error) {
+        connectionGeneration &+= 1
+        socket?.close()
+        socket = nil
+        isConnected = false
+        isRunning = false
+        callbackAdmissionOpen = false
+        for (_, waiter) in pending { waiter.finish(throwing: error) }
+        pending.removeAll()
+        failReady(error)
+        outputPump?.cancel()
+        outputPump = nil
     }
 
     /// Whatever the host wrote to stderr — where a Python traceback from the host itself
@@ -395,7 +955,7 @@ public actor RuntimeHost {
     private func send(
         _ op: String, _ fields: [String: JSONValue] = [:], timeout: TimeInterval = 120
     ) async throws -> JSONValue? {
-        guard isRunning, let stdin else { throw HostError.notRunning }
+        guard isConnected, let socket else { throw HostError.notRunning }
         nextID += 1
         let id = "av-\(nextID)"
         var obj = fields
@@ -408,37 +968,75 @@ public actor RuntimeHost {
             throw HostError.malformedReply
         }
         data.append(UInt8(ascii: "\n"))
+        guard data.count <= Self.maxFrameBytes else {
+            throw HostError.frameTooLarge(op: op, bytes: data.count, limit: Self.maxFrameBytes)
+        }
 
-        return try await withThrowingTaskGroup(of: JSONValue?.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { cont in
-                    Task {
-                        await self.register(id, cont)
-                        do {
-                            try stdin.write(contentsOf: data)
-                        } catch {
-                            await self.fail(id, HostError.notRunning)
+        // Register the reply stream before the first suspension or write. The previous
+        // unstructured registration Task could lose a zero-timeout race: the timeout removed
+        // nothing, then registration installed a continuation nobody could ever resume.
+        let (stream, continuation) = ReplyStream.makeStream(
+            bufferingPolicy: .bufferingOldest(1))
+        pending[id] = continuation
+        if Task.isCancelled {
+            pending.removeValue(forKey: id)?.finish(throwing: CancellationError())
+            throw CancellationError()
+        }
+        do {
+            try socket.write(data)
+        } catch {
+            let failure = HostError.transportWriteFailed(
+                op: op, detail: Self.boundedErrorDescription(error))
+            pending.removeValue(forKey: id)?.finish(throwing: failure)
+            closeTransport(failure)
+            throw failure
+        }
+
+        let cancellationFlag = RuntimeHostCancellationFlag()
+        return try await withTaskCancellationHandler(operation: {
+            try await withThrowingTaskGroup(of: JSONValue.self) { group in
+                group.addTask {
+                    var iterator = stream.makeAsyncIterator()
+                    guard let value = try await iterator.next() else {
+                        if cancellationFlag.isCanceled {
+                            throw CancellationError()
                         }
+                        throw HostError.notRunning
                     }
+                    return value
+                }
+                group.addTask {
+                    let nanoseconds = UInt64(max(0, timeout) * 1_000_000_000)
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                    await self.fail(id, HostError.timedOut(op: op))
+                    throw HostError.timedOut(op: op)
+                }
+                do {
+                    let result = try await group.next()!
+                    group.cancelAll()
+                    if cancellationFlag.isCanceled || Task.isCancelled {
+                        throw CancellationError()
+                    }
+                    return result
+                } catch {
+                    group.cancelAll()
+                    if cancellationFlag.isCanceled || Task.isCancelled {
+                        throw CancellationError()
+                    }
+                    throw error
                 }
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                await self.fail(id, HostError.timedOut(op: op))
-                throw HostError.timedOut(op: op)
-            }
-            let result = try await group.next() ?? nil
-            group.cancelAll()
-            return result
-        }
-    }
-
-    private func register(_ id: String, _ cont: CheckedContinuation<JSONValue?, Error>) {
-        pending[id] = cont
+        }, onCancel: {
+            // The cancellation callback cannot mutate this actor synchronously. Finishing the
+            // one stored continuation is the idempotent cancellation boundary: a reply, timeout,
+            // transport close, and cancellation all remove the same pending ID at most once.
+            cancellationFlag.cancel()
+            Task { await self.fail(id, CancellationError()) }
+        })
     }
 
     private func fail(_ id: String, _ error: Error) {
-        pending.removeValue(forKey: id)?.resume(throwing: error)
+        pending.removeValue(forKey: id)?.finish(throwing: error)
     }
 
     // MARK: Operations
@@ -495,23 +1093,74 @@ public actor RuntimeHost {
         try await waitUntilCallbacksQuiescent()
     }
 
+    /// Poll the actor-owned callback table until a bounded deadline. This deliberately does not
+    /// await callback task values: application callback code is not cancellation-cooperative, so
+    /// a permanently stuck handler must not keep lifecycle teardown from closing the transport or
+    /// terminating an owned process.
+    private func waitUntilCallbacksQuiescent(until deadline: Date) async -> Bool {
+        while true {
+            let currentCallbackID = Self.activeCallbackID
+            let hasOutstanding = callbackTasks.keys.contains { $0 != currentCallbackID }
+            if !hasOutstanding {
+                do {
+                    try await waitUntilCallbacksQuiescent()
+                } catch {
+                    noteDiagnostic(
+                        "callback failed during shutdown: \(Self.boundedErrorDescription(error))")
+                }
+                return true
+            }
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { return false }
+            try? await Task.sleep(nanoseconds: UInt64(min(0.01, remaining) * 1_000_000_000))
+        }
+    }
+
     private func callbackFinished(_ id: Int, error: Error?) {
         callbackTasks.removeValue(forKey: id)
         if let error { callbackErrors.append(error) }
     }
 
-    private func callbackResponseFailed(_ id: Int, error: Error) {
-        stderrTail.append("callback \(id) refusal response failed: \(error.localizedDescription)\n")
-    }
-
-    private func callbackResponseFinished(_ id: Int) {
-        callbackResponseTasks.removeValue(forKey: id)
-    }
-
-    private func waitForCallbackResponses() async {
-        while !callbackResponseTasks.isEmpty {
-            let tasks = Array(callbackResponseTasks.values)
-            for task in tasks { await task.value }
+    private func refuseCallback(rid: String, detail: String) {
+        guard isConnected, let socket else {
+            noteDiagnostic("callback refusal could not be delivered without a live transport")
+            return
+        }
+        // A refusal is already the terminal answer to the host's blocked callback. Do not spend
+        // another long-lived Task waiting for its acknowledgement: that merely moves an overload
+        // from the handler pool into a second pool which can itself saturate and drop RIDs. Send
+        // the small callback.result frame directly through bounded socket I/O. The acknowledgement
+        // carries an unregistered ID and is intentionally ignored by `ingest`.
+        nextID += 1
+        let object: JSONValue = .object([
+            "id": .string("av-\(nextID)"),
+            "op": .string("callback.result"),
+            "rid": .string(rid),
+            "result": .object(["error": .string(detail)]),
+        ])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        guard var data = try? encoder.encode(object) else {
+            let failure = HostError.malformedReply
+            noteDiagnostic("callback refusal encoding failed")
+            closeTransport(failure)
+            return
+        }
+        data.append(UInt8(ascii: "\n"))
+        guard data.count <= Self.maxFrameBytes else {
+            let failure = HostError.frameTooLarge(
+                op: "callback.result", bytes: data.count, limit: Self.maxFrameBytes)
+            noteDiagnostic("callback refusal exceeded the frame limit")
+            closeTransport(failure)
+            return
+        }
+        do {
+            try socket.write(data)
+        } catch {
+            let failure = HostError.transportWriteFailed(
+                op: "callback.result", detail: Self.boundedErrorDescription(error))
+            noteDiagnostic("callback refusal write failed: \(Self.boundedErrorDescription(error))")
+            closeTransport(failure)
         }
     }
 
@@ -521,14 +1170,19 @@ public actor RuntimeHost {
         let result: JSONValue
         if let callbackHandler {
             do {
-                result = try await callbackHandler(session, kind, payload)
+                // `rid` is stable across at-least-once replay. Consumers that perform durable
+                // effects can use it as their idempotency key; the transport itself cannot
+                // promise exactly-once across a client disconnect or process crash.
+                result = try await callbackHandler(session, rid, kind, payload)
             } catch {
                 // Keep the protocol live for the runtime's blocked request, while preserving the
                 // typed handler failure for waitUntilCallbacksQuiescent(). If even this response
                 // cannot be delivered, that transport error is also propagated by the task.
                 _ = try await send("callback.result", [
                     "rid": .string(rid),
-                    "result": .object(["error": .string(error.localizedDescription)]),
+                    "result": .object([
+                        "error": .string(Self.boundedErrorDescription(error)),
+                    ]),
                 ], timeout: 30)
                 throw error
             }
@@ -544,9 +1198,144 @@ public actor RuntimeHost {
         ], timeout: 30)
     }
 
+    private func validateHandshake(_ caps: Capabilities) throws {
+        guard caps.protocolVersion == Self.protocolVersion else {
+            throw HostError.protocolMismatch(
+                expected: Self.protocolVersion, actual: caps.protocolVersion)
+        }
+        guard let actual = caps.identity else { throw HostError.malformedReply }
+        if let expectedIdentity, expectedIdentity != actual {
+            throw HostError.identityMismatch(expected: expectedIdentity, actual: actual)
+        }
+    }
+
+    private static func kernelSocketDirectory() throws -> URL {
+        let base = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let directory = base.appending(path: "Aviary/k", directoryHint: .isDirectory)
+        return try secureKernelSocketDirectory(at: directory)
+    }
+
+    /// Establish the directory in which launcher-owned host endpoints live. This is kept as a
+    /// small internal seam so the path policy can be exercised without mutating a user's real
+    /// Application Support tree. `lstat`/`O_NOFOLLOW` make a pre-existing symlink fail closed;
+    /// `fchmod` changes only the directory opened and verified below, never an arbitrary target
+    /// reached by a path swap.
+    static func secureKernelSocketDirectory(at directory: URL) throws -> URL {
+        do {
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
+        } catch let error as HostError {
+            throw error
+        } catch {
+            throw HostError.invalidEndpoint("cannot create socket directory")
+        }
+
+        // The final component must be an actual directory owned by this user. Opening with
+        // O_NOFOLLOW also closes the lstat -> chmod race for a swapped final path.
+        let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW
+        let descriptor = Darwin.open(directory.path, flags)
+        guard descriptor >= 0 else {
+            throw HostError.invalidEndpoint("socket directory is not a real directory")
+        }
+        defer { Darwin.close(descriptor) }
+
+        var info = stat()
+        guard Darwin.fstat(descriptor, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFDIR,
+              info.st_uid == Darwin.getuid()
+        else {
+            throw HostError.invalidEndpoint("socket directory is not owned by this user")
+        }
+        let mode = info.st_mode & 0o777
+        if mode != 0o700 {
+            guard Darwin.fchmod(descriptor, mode_t(0o700)) == 0 else {
+                throw HostError.invalidEndpoint("cannot secure socket directory")
+            }
+        }
+        return directory
+    }
+
+    private static func validateSocketPath(_ path: String) throws {
+        let bytes = Data(path.utf8)
+        guard !bytes.isEmpty else { throw HostError.invalidEndpoint("empty socket path") }
+        guard bytes.count <= 103 else {
+            throw HostError.invalidEndpoint("socket path is too long")
+        }
+    }
+
+    private static func prepareSocketPath(_ path: URL) throws {
+        try validateSocketPath(path.path)
+        guard FileManager.default.fileExists(atPath: path.path) else { return }
+        var info = stat()
+        guard lstat(path.path, &info) == 0 else {
+            throw HostError.staleSocket("cannot inspect existing endpoint")
+        }
+        guard (info.st_mode & S_IFMT) == S_IFSOCK else {
+            throw HostError.staleSocket("endpoint is not a Unix socket")
+        }
+
+        // A successful probe proves a live endpoint; never unlink it. Refused/no-route means a
+        // stale socket inode and is the only case in which this launcher may remove the path.
+        do {
+            let probe = try UnixSocketConnection(path: path.path)
+            probe.close()
+            throw HostError.staleSocket("endpoint already serves a host")
+        } catch let error as HostError {
+            throw error
+        } catch {
+            try removeSocketIfSafe(path)
+        }
+    }
+
+    private static func removeSocketIfSafe(_ path: URL) throws {
+        guard FileManager.default.fileExists(atPath: path.path) else { return }
+        var info = stat()
+        guard lstat(path.path, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFSOCK
+        else { return }
+        try FileManager.default.removeItem(at: path)
+    }
+
+    private static func socketFailureDescription(_ error: UnixSocketFailure) -> String {
+        switch error {
+        case .invalidPath: return "invalid socket path"
+        case .closed: return "socket closed"
+        case .system(let code):
+            let text = String(cString: strerror(code))
+            return String(text.prefix(160))
+        }
+    }
+
+    private func terminateOwnedProcess(gracePeriod: TimeInterval = 2) async {
+        guard let process else { return }
+        self.process = nil
+        let checks = max(0, Int(gracePeriod / 0.1))
+        for _ in 0..<checks where process.isRunning {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if process.isRunning { process.terminate() }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        hostProcessIsRunning = false
+    }
+
     public func hello() async throws -> Capabilities {
-        guard let data = try await send("hello", timeout: 20) else { throw HostError.malformedReply }
+        var fields: [String: JSONValue] = [
+            "protocol": .number(Double(Self.protocolVersion)),
+        ]
+        if let expectedIdentity {
+            fields["expectedIdentity"] = .object([
+                "hostID": .string(expectedIdentity.hostID),
+                "instanceID": .string(expectedIdentity.instanceID),
+            ])
+        }
+        guard let data = try await send("hello", fields, timeout: 20) else {
+            throw HostError.malformedReply
+        }
         let caps = Self.capabilities(from: data)
+        try validateHandshake(caps)
         capabilities = caps
         return caps
     }
@@ -565,6 +1354,21 @@ public actor RuntimeHost {
 
     public func destroySession(_ id: String) async throws {
         _ = try await send("session.destroy", ["session": .string(id)], timeout: 30)
+    }
+
+    /// Associate a session's callback delivery with this client. A reconnecting GUI should call
+    /// this after verifying the host identity; unanswered callbacks are re-emitted by the host.
+    @discardableResult
+    public func attachSession(_ id: String) async throws -> Bool {
+        guard let data = try await send(
+            "session.attach", ["session": .string(id)], timeout: 30)
+        else { throw HostError.malformedReply }
+        return data["attached"]?.boolValue ?? false
+    }
+
+    /// Stop routing new callback events to this client without destroying the Python session.
+    public func detachSession(_ id: String) async throws {
+        _ = try await send("session.detach", ["session": .string(id)], timeout: 30)
     }
 
     public func sessions() async throws -> [String] {
@@ -649,11 +1453,28 @@ public actor RuntimeHost {
         if case .object(let obj)? = v["features"] {
             for (k, val) in obj { features[k] = val.boolValue ?? false }
         }
+        let identity: HostIdentity?
+        if let hostID = v["hostID"]?.stringValue,
+           let instanceID = v["instanceID"]?.stringValue,
+           !hostID.isEmpty, !instanceID.isEmpty
+        {
+            identity = HostIdentity(hostID: hostID, instanceID: instanceID)
+        } else if let object = v["identity"],
+                  let hostID = object["hostID"]?.stringValue,
+                  let instanceID = object["instanceID"]?.stringValue,
+                  !hostID.isEmpty, !instanceID.isEmpty
+        {
+            identity = HostIdentity(hostID: hostID, instanceID: instanceID)
+        } else {
+            identity = nil
+        }
         return Capabilities(
             protocolVersion: v["protocol"]?.intValue ?? 0,
             runtime: v["runtime"]?.stringValue ?? "unknown",
             runtimeVersion: v["runtimeVersion"]?.stringValue ?? "",
-            features: features)
+            features: features,
+            identity: identity,
+            transport: v["transport"]?.stringValue)
     }
 }
 
@@ -705,7 +1526,7 @@ public struct RuntimeProbe: Sendable {
                 // The host's own stderr, when there is any — a Python traceback says far more
                 // than "did not start".
                 error: diagnostics.isEmpty
-                    ? error.localizedDescription
+                    ? String(error.localizedDescription.prefix(500))
                     : String(diagnostics.suffix(400)))
         }
     }

@@ -123,6 +123,28 @@ public struct RunJournalBundleStatus: Hashable, Sendable {
     }
 }
 
+/// Canonical evidence for one exactly-once terminal Work transaction.
+public struct RunJournalBundleTerminalCommit: Hashable, Sendable {
+    public let workEvent: TimelineEvent
+    public let workCommit: TimelineJournalCommit
+    public let pairedSessionEvent: TimelineEvent?
+    public let pairedSessionCommit: TimelineJournalCommit?
+    public let outstandingHandleIDs: [HandleRef]
+
+    public var sessionPairingVerified: Bool { pairedSessionCommit != nil }
+
+    public init(workEvent: TimelineEvent, workCommit: TimelineJournalCommit,
+                pairedSessionEvent: TimelineEvent?,
+                pairedSessionCommit: TimelineJournalCommit?,
+                outstandingHandleIDs: [HandleRef]) {
+        self.workEvent = workEvent
+        self.workCommit = workCommit
+        self.pairedSessionEvent = pairedSessionEvent
+        self.pairedSessionCommit = pairedSessionCommit
+        self.outstandingHandleIDs = outstandingHandleIDs
+    }
+}
+
 public enum RunJournalBundleError: LocalizedError, Equatable, Sendable {
     case invalidConfiguration(String)
     case missingCounterpart(path: String)
@@ -130,8 +152,10 @@ public enum RunJournalBundleError: LocalizedError, Equatable, Sendable {
     case invalidJournal(journal: JournalRef, reason: String)
     case invalidGenesis(journal: JournalRef, reason: String)
     case unfinishedActions([String])
+    case unfinishedHandles([String])
     case unfinishedCommands([String])
     case alreadyFinished(String)
+    case workTerminal(WorkLifecycle)
     case invalidOperation(String)
     case writer(TimelineJournalWriter.WriterError)
     case initializationFailed(RunJournalBundlePrefix, reason: String)
@@ -146,9 +170,12 @@ public enum RunJournalBundleError: LocalizedError, Equatable, Sendable {
         case .invalidJournal(let journal, let reason): return "Invalid native journal \(journal.journalID): \(reason)"
         case .invalidGenesis(let journal, let reason): return "Invalid journal genesis \(journal.journalID): \(reason)"
         case .unfinishedActions(let ids): return "Cannot resume Run with unfinished actions: \(ids.joined(separator: ", "))"
+        case .unfinishedHandles(let ids): return "Cannot terminalize Work with unfinished Handles: \(ids.joined(separator: ", "))"
         case .unfinishedCommands(let ids):
             return "Cannot finish Run with accepted, undelivered commands: \(ids.joined(separator: ", "))"
         case .alreadyFinished(let reason): return "Run journal bundle is already finished: \(reason)"
+        case .workTerminal(let lifecycle):
+            return "Work is terminal and cannot be mutated: \(lifecycle.rawValue)"
         case .invalidOperation(let reason): return "Invalid Run journal operation: \(reason)"
         case .writer(let error): return error.localizedDescription
         case .initializationFailed(_, let reason): return "Run journal bundle initialization failed: \(reason)"
@@ -189,6 +216,9 @@ public actor RunJournalBundle {
     private var permits: [String: EffectPermit]
     private var activeTurn: TurnRef?
     private var activeRun: RunRef?
+    /// Work remains reusable after every `run.finished`; this only changes after the explicit
+    /// Work terminal transition has been durably paired with the Session cursor.
+    private var workLifecycle: WorkLifecycle
     private var lastMessage: EventRef?
     /// Authored Session attention avoids duplicate evidence edges when a turn and its enclosing
     /// Run settle to the same visible state.
@@ -215,6 +245,7 @@ public actor RunJournalBundle {
         commands: [String: WorkCommandSnapshot] = [:],
         commandAcceptedRefs: [String: EventRef] = [:], permits: [String: EffectPermit] = [:],
         activeTurn: TurnRef? = nil, activeRun: RunRef? = nil,
+        workLifecycle: WorkLifecycle = .active,
         lastMessage: EventRef? = nil,
         authoredAttention: SessionAttention = .none,
         contextDeliveredBytesByRun: [String: Int] = [:]
@@ -242,6 +273,7 @@ public actor RunJournalBundle {
         self.permits = permits
         self.activeTurn = activeTurn
         self.activeRun = activeRun
+        self.workLifecycle = workLifecycle
         self.lastMessage = lastMessage
         self.authoredAttention = authoredAttention
         self.contextDeliveredBytesByRun = contextDeliveredBytesByRun
@@ -489,6 +521,9 @@ public actor RunJournalBundle {
                 throw RunJournalBundleError.invalidOperation(
                     "the previous Run is still active; finish it before cold resume")
             }
+            guard workState.lifecycle == .active else {
+                throw RunJournalBundleError.workTerminal(workState.lifecycle)
+            }
             guard !workEvents.contains(where: { $0.run?.runID == run.runID }) else {
                 throw RunJournalBundleError.invalidOperation(
                     "the replacement Run identity already appears in the Work journal")
@@ -522,6 +557,7 @@ public actor RunJournalBundle {
                         journal: configuration.workJournal, eventID: event.eventID)
                 },
                 activeTurn: workState.activeTurn, activeRun: run,
+                workLifecycle: workState.lifecycle,
                 lastMessage: sessionState.semanticTip ?? sessionState.messageHistory.last.map {
                     EventRef(journal: configuration.sessionJournal, eventID: $0.eventID)
                 },
@@ -559,6 +595,9 @@ public actor RunJournalBundle {
     public var latestSessionCursor: JournalCursor? { sessionCursor }
     public var latestWorkCursor: JournalCursor? { workCursor }
     public var latestHostOrder: Int { hostOrder }
+    /// The durable Work lifecycle as understood by this open bundle. `run.finished` deliberately
+    /// leaves this `active`; only `completeWork` or `destroyWork` changes it.
+    public var lifecycle: WorkLifecycle { workLifecycle }
     public var activeRunContextDeliveredBytes: Int {
         guard let activeRun else { return 0 }
         return contextDeliveredBytesByRun[activeRun.runID] ?? 0
@@ -1569,6 +1608,10 @@ public actor RunJournalBundle {
         guard activeTurn == nil else {
             throw RunJournalBundleError.invalidOperation("finish the active turn before finishing the Run")
         }
+        let activeHandles = try canonicalActiveHandleIDs()
+        guard activeHandles.isEmpty else {
+            throw RunJournalBundleError.unfinishedHandles(activeHandles)
+        }
         var outcomePayload: [String: JSONValue] = ["state": .string(outcome.rawValue)]
         if let detail, !detail.isEmpty { outcomePayload["detail"] = .string(detail) }
         let finished = try await appendWork(TimelineEventDraft(
@@ -1602,13 +1645,376 @@ public actor RunJournalBundle {
         return commits
     }
 
+    /// Record a runtime Handle admission on the active Run. Handles are intentionally opaque to
+    /// this coordinator; their canonical state is reread from the Work journal when the Run or
+    /// Work is terminalized.
+    @discardableResult
+    public func startHandle(
+        _ handle: HandleRef, state: String = "running"
+    ) async throws -> TimelineJournalCommit {
+        try await withSemanticGate {
+            try self.ensureUsable()
+            guard let activeRun = self.activeRun else {
+                throw RunJournalBundleError.alreadyFinished("no active Run")
+            }
+            guard !handle.handleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw RunJournalBundleError.invalidOperation("Handle identity is empty")
+            }
+            guard !state.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw RunJournalBundleError.invalidOperation("Handle state is empty")
+            }
+            let workState = try self.canonicalWorkState()
+            guard workState.handles[handle.handleID] == nil else {
+                throw RunJournalBundleError.invalidOperation("Handle identity has already been used")
+            }
+            return try await self.appendWork(TimelineEventDraft(
+                hostSequence: self.nextHostOrder(), work: self.work, workHost: self.workHost,
+                run: activeRun, handle: handle, type: TimelineEventType.handleStarted,
+                declaredDomains: [.work, .runtime], payload: .object([
+                    "state": .string(state)
+                ])))
+        }
+    }
+
+    /// Record a terminal state for a previously admitted runtime Handle.
+    @discardableResult
+    public func finishHandle(
+        _ handle: HandleRef, state: String = "completed"
+    ) async throws -> TimelineJournalCommit {
+        try await withSemanticGate {
+            try self.ensureUsable()
+            guard let activeRun = self.activeRun else {
+                throw RunJournalBundleError.alreadyFinished("no active Run")
+            }
+            guard !handle.handleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw RunJournalBundleError.invalidOperation("Handle identity is empty")
+            }
+            let terminalStates: Set<String> = ["succeeded", "failed", "canceled", "completed"]
+            guard terminalStates.contains(state) else {
+                throw RunJournalBundleError.invalidOperation(
+                    "Handle outcome must use a terminal state")
+            }
+            let workState = try self.canonicalWorkState()
+            guard let existing = workState.handles[handle.handleID],
+                  !terminalStates.contains(existing.state) else {
+                throw RunJournalBundleError.invalidOperation(
+                    "Handle outcome requires an outstanding Handle")
+            }
+            return try await self.appendWork(TimelineEventDraft(
+                hostSequence: self.nextHostOrder(), work: self.work, workHost: self.workHost,
+                run: activeRun, handle: handle, type: TimelineEventType.handleOutcome,
+                declaredDomains: [.work, .runtime], payload: .object([
+                    "state": .string(state)
+                ])))
+        }
+    }
+
+    /// Explicitly terminalize the Work after its current Run has ended. A finished Run is not a
+    /// finished Work: callers may reopen this same Work and start another Run until this method
+    /// records `work.completed`.
+    ///
+    /// The Work record is appended first, then the mirrored Session attachment cursor is advanced
+    /// to that exact Work prefix. If the paired Session append is ambiguous, the bundle is made
+    /// terminal and unavailable rather than allowing a second completion or exposing a false
+    /// successful pairing.
+    @discardableResult
+    public func completeWork(
+        detail: String? = nil, command: CommandRef
+    ) async throws -> [TimelineJournalCommit] {
+        try await withSemanticGate(respectCancellation: false) {
+            if let existing = try self.terminalCommit(for: command, detail: detail) {
+                guard existing.workEvent.type == TimelineEventType.workCompleted,
+                      let paired = existing.pairedSessionCommit else {
+                    throw RunJournalBundleError.unavailable(
+                        "the terminal Work event is not durably paired with Session")
+                }
+                return [existing.workCommit, paired]
+            }
+            return try await self.completeWorkLocked(detail: detail, command: command)
+        }
+    }
+
+    private func completeWorkLocked(
+        detail: String?, command: CommandRef
+    ) async throws -> [TimelineJournalCommit] {
+        try ensureUsable()
+        try validateTerminalDetail(detail)
+        try ensureWorkQuiescent()
+        let normalized = try normalizedTerminalCommand(command)
+        let event = try await appendWorkTerminalEvent(
+            type: TimelineEventType.workCompleted, detail: detail, tombstone: false,
+            command: normalized)
+        guard let cursor = workCursor else {
+            workLifecycle = .completed
+            markTerminalPairingFailure("work.completed did not produce a Work cursor")
+            throw RunJournalBundleError.invalidOperation(
+                "work.completed did not produce a Work cursor")
+        }
+        do {
+            let advanced = try await appendAttachmentCursorLocked(
+                cursor, causedBy: event.eventRef, command: normalized,
+                terminalType: TimelineEventType.workCompleted, terminalDetail: detail)
+            workLifecycle = .completed
+            return [event, advanced]
+        } catch {
+            // The Work terminal event is already durable. Preserve that fact locally and make
+            // every further mutation fail closed if the Session half could not be paired.
+            workLifecycle = .completed
+            markTerminalPairingFailure(error.localizedDescription)
+            throw error
+        }
+    }
+
+    /// Destructively tombstone this Work. Destruction is intentionally separate from completion
+    /// and requires an explicit service-level statement that host resources have been quiesced;
+    /// the bundle itself only verifies the durable Run/action/Handle/command state.
+    @discardableResult
+    public func destroyWork(
+        resourcesQuiesced: Bool, reason: String? = nil, command: CommandRef
+    ) async throws -> [TimelineJournalCommit] {
+        try await withSemanticGate(respectCancellation: false) {
+            if let existing = try self.terminalCommit(for: command, detail: reason) {
+                guard existing.workEvent.type == TimelineEventType.workDestroyed,
+                      let paired = existing.pairedSessionCommit else {
+                    throw RunJournalBundleError.unavailable(
+                        "the terminal Work event is not durably paired with Session")
+                }
+                return [existing.workCommit, paired]
+            }
+            return try await self.destroyWorkLocked(
+                resourcesQuiesced: resourcesQuiesced, reason: reason, command: command)
+        }
+    }
+
+    private func destroyWorkLocked(
+        resourcesQuiesced: Bool, reason: String?, command: CommandRef
+    ) async throws -> [TimelineJournalCommit] {
+        try ensureUsable()
+        try validateTerminalDetail(reason)
+        guard resourcesQuiesced else {
+            throw RunJournalBundleError.invalidOperation(
+                "destroying Work requires the service to confirm host resources are quiesced")
+        }
+        try ensureWorkQuiescent()
+        let normalized = try normalizedTerminalCommand(command)
+        let event = try await appendWorkTerminalEvent(
+            type: TimelineEventType.workDestroyed, detail: reason, tombstone: true,
+            command: normalized)
+        guard let cursor = workCursor else {
+            workLifecycle = .destroyed
+            markTerminalPairingFailure("work.destroyed did not produce a Work cursor")
+            throw RunJournalBundleError.invalidOperation(
+                "work.destroyed did not produce a Work cursor")
+        }
+        do {
+            let advanced = try await appendAttachmentCursorLocked(
+                cursor, causedBy: event.eventRef, command: normalized,
+                terminalType: TimelineEventType.workDestroyed, terminalDetail: reason)
+            workLifecycle = .destroyed
+            return [event, advanced]
+        } catch {
+            workLifecycle = .destroyed
+            markTerminalPairingFailure(error.localizedDescription)
+            throw error
+        }
+    }
+
+    private func appendWorkTerminalEvent(
+        type: String, detail: String?, tombstone: Bool, command: CommandRef
+    ) async throws -> TimelineJournalCommit {
+        guard type == TimelineEventType.workCompleted || type == TimelineEventType.workDestroyed else {
+            throw RunJournalBundleError.invalidOperation("invalid Work terminal event")
+        }
+        var payload: [String: JSONValue] = [:]
+        if let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            payload["detail"] = .string(detail)
+        }
+        if tombstone { payload["tombstone"] = .bool(true) }
+        return try await appendWork(TimelineEventDraft(
+            hostSequence: nextHostOrder(),
+            idempotencyKey: terminalIdempotencyKey(
+                type: type, command: command, detail: detail),
+            command: command,
+            causedByEventID: command.causalCursor?.eventID.map {
+                EventRef(journal: workJournal, eventID: $0)
+            },
+            session: session, work: work, workHost: workHost,
+            client: command.client, sessionAttachment: sessionAttachment,
+            type: type, declaredDomains: [.work], payload: .object(payload)))
+    }
+
+    private func markTerminalPairingFailure(_ reason: String) {
+        if case .failed = healthState { return }
+        healthState = .failed(reason: "terminal Work event was not paired with Session: \(reason)")
+        failedJournal = sessionJournal
+    }
+
+    private func ensureWorkQuiescent() throws {
+        guard activeRun == nil else {
+            throw RunJournalBundleError.invalidOperation(
+                "Work cannot be terminalized while a Run is active")
+        }
+        guard activeTurn == nil else {
+            throw RunJournalBundleError.invalidOperation(
+                "Work cannot be terminalized while a turn is active")
+        }
+        guard activeActionIDs.isEmpty else {
+            throw RunJournalBundleError.unfinishedActions(activeActionIDs.sorted())
+        }
+        // Handles are produced by the runtime boundary rather than by this coordinator. Read
+        // the just-synchronized Work prefix so completion cannot silently ignore a live Handle
+        // written by another component in the same Work Host.
+        let activeHandles = try canonicalActiveHandleIDs()
+        guard activeHandles.isEmpty else {
+            throw RunJournalBundleError.unfinishedHandles(activeHandles)
+        }
+        let acceptedCommands = commands.values
+            .filter { $0.state == .accepted }
+            .map { $0.command.commandID }
+            .sorted()
+        guard acceptedCommands.isEmpty else {
+            throw RunJournalBundleError.unfinishedCommands(acceptedCommands)
+        }
+    }
+
+    private func canonicalActiveHandleIDs() throws -> [String] {
+        let workState = try canonicalWorkState()
+        let terminalHandleStates: Set<String> = ["succeeded", "failed", "canceled", "completed"]
+        return workState.handles.values
+            .filter { !terminalHandleStates.contains($0.state) }
+            .map { $0.handle.handleID }
+            .sorted()
+    }
+
+    private func canonicalWorkState() throws -> WorkSnapshot {
+        let workEvents = try Self.readNativeJournal(
+            at: workWriter.fileURL, journal: workJournal, actor: actor)
+        let workState = WorkReducer.reduce(workEvents)
+        guard workState.structuralIntegrityValid && workState.semanticProjectionValid else {
+            throw RunJournalBundleError.invalidOperation(
+                "Work cannot be terminalized while its canonical projection is invalid")
+        }
+        return workState
+    }
+
+    /// Read exact terminal evidence from the canonical journals. This remains available after a
+    /// writer error or close so a caller can reconcile a response lost after durable commit.
+    public func terminalCommit(
+        for command: CommandRef, detail: String?
+    ) throws -> RunJournalBundleTerminalCommit? {
+        let workEvents = try Self.readNativeJournal(
+            at: workWriter.fileURL, journal: workJournal, actor: actor)
+        let terminalEvents = workEvents.filter {
+            ($0.type == TimelineEventType.workCompleted
+                || $0.type == TimelineEventType.workDestroyed)
+                && $0.command == command
+        }
+        guard terminalEvents.count <= 1 else {
+            throw RunJournalBundleError.invalidJournal(
+                journal: workJournal,
+                reason: "one terminal command produced multiple Work events")
+        }
+        guard let workEvent = terminalEvents.first else { return nil }
+        let workCommit = TimelineJournalCommit(
+            eventRef: EventRef(journal: workJournal, eventID: workEvent.eventID),
+            cursor: JournalCursor(
+                journal: workJournal, eventID: workEvent.eventID,
+                sequence: workEvent.sequence))
+        guard workEvent.session == session,
+              workEvent.work == work,
+              workEvent.workHost == workHost,
+              workEvent.client == command.client,
+              workEvent.sessionAttachment == sessionAttachment,
+              workEvent.idempotencyKey == terminalIdempotencyKey(
+                  type: workEvent.type, command: command, detail: detail),
+              workEvent.causedByEventID == command.causalCursor?.eventID.map({
+                  EventRef(journal: workJournal, eventID: $0)
+              }) else {
+            throw RunJournalBundleError.invalidJournal(
+                journal: workJournal,
+                reason: "terminal Work event does not match its exact command envelope")
+        }
+
+        let sessionEvents = try Self.readNativeJournal(
+            at: sessionWriter.fileURL, journal: sessionJournal, actor: actor)
+        let paired = sessionEvents.filter {
+            $0.type == TimelineEventType.sessionAttachmentCursorAdvanced
+                && $0.command == command
+                && $0.session == session
+                && $0.client == command.client
+                && $0.sessionAttachment == sessionAttachment
+                && $0.causedByEventID == workCommit.eventRef
+                && $0.idempotencyKey == terminalIdempotencyKey(
+                    type: workEvent.type, command: command, detail: detail) + ":session"
+                && $0.payload["cursor"] == encodeTimelineValue(workCommit.cursor)
+        }
+        guard paired.count <= 1 else {
+            throw RunJournalBundleError.invalidJournal(
+                journal: sessionJournal,
+                reason: "one terminal Work event produced multiple Session cursor pairs")
+        }
+        let pairedEvent = paired.first
+        let pairedCommit = pairedEvent.map {
+            TimelineJournalCommit(
+                eventRef: EventRef(journal: sessionJournal, eventID: $0.eventID),
+                cursor: JournalCursor(
+                    journal: sessionJournal, eventID: $0.eventID, sequence: $0.sequence))
+        }
+        let reduced = WorkReducer.reduce(workEvents)
+        guard reduced.structuralIntegrityValid && reduced.semanticProjectionValid else {
+            throw RunJournalBundleError.invalidJournal(
+                journal: workJournal,
+                reason: reduced.corruptionReasons.joined(separator: "; "))
+        }
+        let terminalHandleStates: Set<String> = ["succeeded", "failed", "canceled", "completed"]
+        let handles = reduced.handles.values
+            .filter { !terminalHandleStates.contains($0.state) }
+            .map(\.handle)
+            .sorted { $0.handleID < $1.handleID }
+        return RunJournalBundleTerminalCommit(
+            workEvent: workEvent, workCommit: workCommit,
+            pairedSessionEvent: pairedEvent, pairedSessionCommit: pairedCommit,
+            outstandingHandleIDs: handles)
+    }
+
+    private func normalizedTerminalCommand(_ command: CommandRef) throws -> CommandRef {
+        guard !command.commandID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let client = command.client,
+              command.sessionAttachment == sessionAttachment,
+              let causal = command.causalCursor,
+              causal == workCursor else {
+            throw RunJournalBundleError.invalidOperation(
+                "terminal command must carry its client, Session attachment, and exact Work cursor")
+        }
+        guard commands[command.commandID] == nil else {
+            throw RunJournalBundleError.invalidOperation(
+                "terminal command identity has already been used")
+        }
+        return CommandRef(
+            commandID: command.commandID, client: client,
+            sessionAttachment: sessionAttachment, causalCursor: causal)
+    }
+
+    private func validateTerminalDetail(_ detail: String?) throws {
+        guard detail?.count ?? 0 <= 4_000 else {
+            throw RunJournalBundleError.invalidOperation(
+                "Work terminal detail exceeds the 4,000-character limit")
+        }
+    }
+
     private func appendAttachmentCursorLocked(
-        _ cursor: JournalCursor, causedBy cause: EventRef
+        _ cursor: JournalCursor, causedBy cause: EventRef,
+        command: CommandRef? = nil, terminalType: String? = nil,
+        terminalDetail: String? = nil
     ) async throws -> TimelineJournalCommit {
         try ensureUsable()
         return try await appendSession(TimelineEventDraft(
-            hostSequence: nextHostOrder(), causedByEventID: cause,
-            session: session, sessionAttachment: sessionAttachment,
+            hostSequence: nextHostOrder(),
+            idempotencyKey: terminalPairIdempotencyKey(
+                type: terminalType, command: command, detail: terminalDetail),
+            command: command, causedByEventID: cause,
+            session: session, client: command?.client,
+            sessionAttachment: sessionAttachment,
             type: TimelineEventType.sessionAttachmentCursorAdvanced,
             declaredDomains: [.session, .work], payload: .object([
                 "cursor": encodeTimelineValue(cursor)
@@ -1752,6 +2158,9 @@ public actor RunJournalBundle {
         guard healthState == .healthy else {
             throw RunJournalBundleError.unavailable("bundle is unavailable")
         }
+        guard workLifecycle == .active else {
+            throw RunJournalBundleError.workTerminal(workLifecycle)
+        }
     }
 
     private func ensureRunActive() throws {
@@ -1867,4 +2276,29 @@ private func encodeTimelineValue<T: Encodable>(_ value: T) -> JSONValue {
         return .null
     }
     return decoded
+}
+
+private func terminalIdempotencyKey(
+    type: String, command: CommandRef, detail: String?
+) -> String {
+    func component(_ value: String) -> String { "\(value.utf8.count):\(value)" }
+    let client = command.client?.clientID ?? ""
+    let attachment = command.sessionAttachment?.attachmentID ?? ""
+    let cursor = command.causalCursor
+    let detailComponent = detail.map { "some:\(component($0))" } ?? "none"
+    return "work-terminal:v1/type:\(component(type))"
+        + "/command:\(component(command.commandID))"
+        + "/client:\(component(client))"
+        + "/attachment:\(component(attachment))"
+        + "/journal:\(component(cursor?.journal.stableKey ?? ""))"
+        + "/sequence:\(cursor?.sequence ?? -1)"
+        + "/event:\(component(cursor?.eventID ?? ""))"
+        + "/detail:\(detailComponent)"
+}
+
+private func terminalPairIdempotencyKey(
+    type: String?, command: CommandRef?, detail: String?
+) -> String? {
+    guard let type, let command else { return nil }
+    return terminalIdempotencyKey(type: type, command: command, detail: detail) + ":session"
 }

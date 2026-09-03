@@ -61,6 +61,17 @@ private func bundleStatus(_ bundle: RunJournalBundle) async -> RunJournalBundleS
     await bundle.status
 }
 
+private func terminalCommand(
+    _ bundle: RunJournalBundle, id: String
+) async throws -> CommandRef {
+    guard let cursor = await bundle.latestWorkCursor else {
+        throw RunJournalBundleError.invalidOperation("test bundle has no Work cursor")
+    }
+    return CommandRef(
+        commandID: id, client: ClientRef("terminal-client"),
+        sessionAttachment: bundle.sessionAttachment, causalCursor: cursor)
+}
+
 func test_runJournalBundleFreshGenesisAndExactAssembly() async throws {
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
@@ -879,4 +890,252 @@ func test_runJournalBundleCanceledTaskStillFinishesAndCloses() async throws {
     XCTAssertEqual(workEvents.last?.type, TimelineEventType.runFinished)
     XCTAssertEqual(workEvents.last?.payload["state"]?.stringValue, RunTerminalOutcome.canceled.rawValue)
     XCTAssertEqual((await bundleStatus(bundle)).health, .closed)
+}
+
+func test_runJournalBundleCompleteWorkIsSeparateFromFinishedRunAndClosesMutation() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let bundle = try await makeBundle(home: home)
+
+    do {
+        _ = try await bundle.completeWork(
+            command: try await terminalCommand(bundle, id: "complete-active"))
+        XCTFail("active Run must be finished before Work completion")
+    } catch { }
+    _ = try await bundle.startHandle(HandleRef("terminal-handle"))
+    do {
+        _ = try await bundle.finishRun()
+        XCTFail("finishRun must reject a live canonical Handle")
+    } catch let error as RunJournalBundleError {
+        guard case .unfinishedHandles(["terminal-handle"]) = error else {
+            XCTFail("wrong live Handle error: \(error)")
+            return
+        }
+    }
+    let beforeHandleFinish = try bundleEvents(
+        home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
+    XCTAssertFalse(beforeHandleFinish.contains { $0.type == TimelineEventType.runFinished })
+    _ = try await bundle.finishHandle(HandleRef("terminal-handle"))
+    _ = try await bundle.finishRun(outcome: .completed)
+    let reusableLifecycle = await bundle.lifecycle
+    XCTAssertEqual(reusableLifecycle, .active)
+    let beforeOversizedDetail = (await bundleStatus(bundle)).durablePrefix
+    do {
+        _ = try await bundle.completeWork(
+            detail: String(repeating: "x", count: 4_001),
+            command: try await terminalCommand(bundle, id: "complete-oversized"))
+        XCTFail("oversized completion detail must be rejected before append")
+    } catch let error as RunJournalBundleError {
+        guard case .invalidOperation = error else {
+            XCTFail("wrong oversized detail error: \(error)")
+            return
+        }
+    }
+    XCTAssertEqual((await bundleStatus(bundle)).durablePrefix, beforeOversizedDetail)
+
+    let completionCommand = try await terminalCommand(bundle, id: "complete-work")
+    let terminal = try await bundle.completeWork(
+        detail: "done for now", command: completionCommand)
+    XCTAssertEqual(terminal.count, 2)
+    XCTAssertEqual(terminal[0].eventRef.journal, bundle.workJournal)
+    let completedLifecycle = await bundle.lifecycle
+    XCTAssertEqual(completedLifecycle, .completed)
+
+    let workEvents = try bundleEvents(
+        home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
+    XCTAssertEqual(workEvents.filter { $0.type == TimelineEventType.workCompleted }.count, 1)
+    XCTAssertEqual(workEvents.last?.type, TimelineEventType.workCompleted)
+    XCTAssertEqual(workEvents.last?.command, completionCommand)
+    XCTAssertNotNil(workEvents.last?.idempotencyKey)
+    XCTAssertEqual(workEvents.last?.payload["detail"]?.stringValue, "done for now")
+    let work = WorkReducer.reduce(workEvents)
+    XCTAssertTrue(work.structuralIntegrityValid && work.semanticProjectionValid)
+    XCTAssertEqual(work.lifecycle, .completed)
+    XCTAssertNil(work.activeRun)
+    let sessionEvents = try bundleEvents(
+        home, bundle.sessionJournal, home.timelineV2SessionJournalURL(bundleTestSession))
+    let session = SessionReducer.reduce(sessionEvents)
+    XCTAssertTrue(session.structuralIntegrityValid && session.semanticProjectionValid)
+    XCTAssertEqual(session.attachments[bundleTestAttachment.attachmentID]?.cursor, terminal[0].cursor)
+    XCTAssertEqual(
+        sessionEvents.last?.causedByEventID,
+        terminal[0].eventRef)
+
+    do {
+        _ = try await bundle.commitInput(
+            text: "must not mutate completed Work", deliveryMode: .queued,
+            command: CommandRef(commandID: "after-complete"))
+        XCTFail("completed Work must reject later mutations")
+    } catch let error as RunJournalBundleError {
+        guard case .workTerminal(.completed) = error else {
+            XCTFail("wrong terminal error: \(error)")
+            return
+        }
+    }
+    try await bundle.closeChecked()
+
+    do {
+        _ = try await RunJournalBundle.reopen(
+            home: home, session: bundleTestSession, work: bundleTestWork,
+            workHost: bundleTestHost, sessionAuthority: bundleTestAuthority,
+            sessionAttachment: bundleTestAttachment, run: RunRef("run-after-complete"),
+            actor: bundleTestActor)
+        XCTFail("completed Work must not accept a replacement Run")
+    } catch let error as RunJournalBundleError {
+        guard case .workTerminal(.completed) = error else {
+            XCTFail("wrong reopen error: \(error)")
+            return
+        }
+    }
+}
+
+func test_runJournalBundleTerminalCommitterRecoversExactRetryWithoutSecondEvent() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let bundle = try await makeBundle(home: home)
+    _ = try await bundle.finishRun(outcome: .completed)
+    let command = try await terminalCommand(bundle, id: "terminal-adapter-complete")
+    let cursor = try XCTUnwrap(command.causalCursor)
+    let request = WorkServiceTerminalCommitRequest(
+        operation: .complete, work: bundle.work, journal: bundle.workJournal,
+        client: try XCTUnwrap(command.client), session: bundle.session,
+        sessionJournal: bundle.sessionJournal,
+        sessionAttachment: bundle.sessionAttachment,
+        causalWorkCursor: cursor, detail: "stable retry", command: command)
+
+    let firstAdapter = RunJournalBundleWorkServiceTerminalCommitter(bundle: bundle)
+    let committed = try await firstAdapter.commit(request)
+    XCTAssertEqual(committed.command, command)
+    XCTAssertEqual(committed.causalWorkCursor, cursor)
+    XCTAssertEqual(committed.terminalEvent.kind, TimelineEventType.workCompleted)
+    XCTAssertEqual(committed.terminalEvent.cursor, committed.resultingWorkCursor)
+    XCTAssertEqual(committed.session, bundle.session)
+    XCTAssertEqual(committed.sessionJournal, bundle.sessionJournal)
+    XCTAssertTrue(committed.sessionPairingVerified)
+    XCTAssertNotNil(committed.pairedSessionCursor)
+
+    // Model the response being lost and the service adapter restarting after its writers close.
+    // Canonical lookup must return the exact prior proof rather than appending a second event.
+    try await bundle.closeChecked()
+    let restartedAdapter = RunJournalBundleWorkServiceTerminalCommitter(bundle: bundle)
+    let recovered = try await restartedAdapter.commit(request)
+    XCTAssertEqual(recovered, committed)
+    XCTAssertEqual(try await restartedAdapter.committedProof(for: request), committed)
+
+    let workEvents = try bundleEvents(
+        home, bundle.workJournal, home.timelineV2WorkJournalURL(bundle.work))
+    XCTAssertEqual(
+        workEvents.filter {
+            $0.type == TimelineEventType.workCompleted && $0.command == command
+        }.count,
+        1)
+    let sessionEvents = try bundleEvents(
+        home, bundle.sessionJournal, home.timelineV2SessionJournalURL(bundle.session))
+    XCTAssertEqual(
+        sessionEvents.filter {
+            $0.type == TimelineEventType.sessionAttachmentCursorAdvanced
+                && $0.command == command
+        }.count,
+        1)
+}
+
+func test_runJournalBundleDestroyWorkRequiresQuiescedResourcesAndWritesOneTombstone() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let bundle = try await makeBundle(home: home)
+    _ = try await bundle.finishRun(outcome: .canceled)
+    let beforeOversizedDetail = (await bundleStatus(bundle)).durablePrefix
+    do {
+        _ = try await bundle.destroyWork(
+            resourcesQuiesced: true, reason: String(repeating: "x", count: 4_001),
+            command: try await terminalCommand(bundle, id: "destroy-oversized"))
+        XCTFail("oversized destruction detail must be rejected before append")
+    } catch let error as RunJournalBundleError {
+        guard case .invalidOperation = error else {
+            XCTFail("wrong oversized destruction detail error: \(error)")
+            return
+        }
+    }
+    XCTAssertEqual((await bundleStatus(bundle)).durablePrefix, beforeOversizedDetail)
+
+    do {
+        _ = try await bundle.destroyWork(
+            resourcesQuiesced: false,
+            command: try await terminalCommand(bundle, id: "destroy-not-quiesced"))
+        XCTFail("destruction must require explicit service resource quiescence")
+    } catch let error as RunJournalBundleError {
+        guard case .invalidOperation(let reason) = error,
+              reason.contains("resources are quiesced") else {
+            XCTFail("wrong non-quiesced destruction error: \(error)")
+            return
+        }
+    }
+
+    let destroyCommand = try await terminalCommand(bundle, id: "destroy-work")
+    let terminal = try await bundle.destroyWork(
+        resourcesQuiesced: true, reason: "deleted", command: destroyCommand)
+    XCTAssertEqual(terminal.count, 2)
+    let destroyedLifecycle = await bundle.lifecycle
+    XCTAssertEqual(destroyedLifecycle, .destroyed)
+    let workEvents = try bundleEvents(
+        home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
+    XCTAssertEqual(workEvents.filter { $0.type == TimelineEventType.workDestroyed }.count, 1)
+    XCTAssertEqual(workEvents.last?.type, TimelineEventType.workDestroyed)
+    XCTAssertEqual(workEvents.last?.command, destroyCommand)
+    XCTAssertNotNil(workEvents.last?.idempotencyKey)
+    XCTAssertEqual(workEvents.last?.payload["tombstone"]?.boolValue, true)
+    XCTAssertEqual(workEvents.last?.payload["detail"]?.stringValue, "deleted")
+    let work = WorkReducer.reduce(workEvents)
+    XCTAssertTrue(work.structuralIntegrityValid && work.semanticProjectionValid)
+    XCTAssertEqual(work.lifecycle, .destroyed)
+
+    do {
+        _ = try await bundle.destroyWork(
+            resourcesQuiesced: true,
+            command: try await terminalCommand(bundle, id: "destroy-again"))
+        XCTFail("destroy must be exactly once")
+    } catch let error as RunJournalBundleError {
+        guard case .workTerminal(.destroyed) = error else {
+            XCTFail("wrong duplicate destruction error: \(error)")
+            return
+        }
+    }
+    try await bundle.closeChecked()
+}
+
+func test_workTerminalReducerRejectsCompletionAndDestructionWithLiveCanonicalHandle() {
+    let work = WorkRef(workHostID: "terminal-handle-host", workID: "terminal-handle-work")
+    let journal = JournalRef.work(work, journalID: "work")
+    let host = WorkHostRef(work.workHostID)
+    let run = RunRef("terminal-handle-run")
+    let handle = HandleRef("terminal-handle")
+    func event(
+        _ type: String, _ id: String, _ sequence: Int,
+        run: RunRef? = nil, handle: HandleRef? = nil,
+        payload: JSONValue = .object([:])
+    ) -> TimelineEvent {
+        TimelineEvent(
+            eventID: id, journal: journal, sequence: sequence,
+            hostSequence: sequence, previousEventID: sequence == 1 ? nil : "e\(sequence - 1)",
+            work: work, workHost: host, run: run, handle: handle,
+            actor: TimelineActor(actorID: "terminal-test", kind: "test"),
+            hostRecordedAt: Date(timeIntervalSince1970: Double(sequence)),
+            type: type, declaredDomains: [.work], payload: payload)
+    }
+
+    let events = [
+        event(TimelineEventType.workCreated, "e1", 1),
+        event(TimelineEventType.runStarted, "e2", 2, run: run),
+        event(TimelineEventType.handleStarted, "e3", 3, run: run, handle: handle,
+              payload: .object(["state": .string("running")])),
+        event(TimelineEventType.workCompleted, "e4", 4),
+        event(TimelineEventType.workDestroyed, "e5", 5),
+    ]
+    let reduced = WorkReducer.reduce(events)
+    XCTAssertFalse(reduced.semanticProjectionValid)
+    XCTAssertEqual(reduced.lifecycle, .active)
+    XCTAssertEqual(reduced.handles[handle.handleID]?.state, "running")
+    XCTAssertEqual(reduced.quarantinedEvents.map(\.type), [
+        TimelineEventType.workCompleted, TimelineEventType.workDestroyed
+    ])
 }

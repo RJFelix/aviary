@@ -1,6 +1,6 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0 and Phase 1 live-producer/local-catalog foundations implemented, phases not complete
+Status: implementation in progress; Phase 0/1 foundations and the Phase 3A adoptable-kernel plus Work-service contract substrate are implemented, phases not complete
 Date: 2026-08-31
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
@@ -20,10 +20,11 @@ The Timeline v2 foundation now has authority-bearing Session and Work journal re
 physical append and semantic conversation chains, structured actors and causal command receipts,
 typed evidence links, explicit six-plane recovery coverage, bounded context crossings, pure
 single-journal reducers, and a Session assembler that attaches multiple Works at exact cursors. Its
-byte reader preserves exact ranges, adapts legacy records deterministically, retains unknown future
+byte reader preserves exact ranges, reads the current canonical schema deterministically, retains unknown future
 events, and quarantines malformed or truncated suffixes without overstating the valid prefix. The
 versioned Reader Census fixture exercises branching, compaction, model change, queued input, child
-completion, late steering, indeterminate actions, unknown events, legacy input, retained bodies, and
+completion, late steering, indeterminate actions, unknown events, pre-canonical migration input,
+retained bodies, and
 malformed/truncated tails across linked Session and Work journals. The production local Timeline
 catalog now joins the Census. The production Flock UI consumes the same source-qualified,
 unknown-aware Work projection exercised by the fixture, and the Sessions list plus command palette
@@ -45,27 +46,42 @@ stores this projection from the same catalog scan used for notifications, but su
 client or host observation. A real reachable-host/reattachment dimension remains Phase 3 service
 work.
 
+Phase 3A now has an adoptable runtime-host protocol over a bounded, identity-checked Unix-domain
+socket. A fresh client can attach to the same live interpreter after the original client disconnects;
+stable callback request identities make at-least-once replay explicit, and late or duplicate results
+do not masquerade as successful delivery. Socket ownership, path length, framing, write bounds,
+connection generations, teardown, and same-Session command serialization have adversarial coverage.
+A transport-neutral `WorkService` executable contract now specifies exact causal cursors,
+many-to-many client/session attachments, per-client authorization, bounded and addressable reads,
+and service-supplied terminal commit proofs. This is substrate only: the production GUI still owns
+`AgentRunner`, no `aviaryd` owns real Work yet, and no GUI currently reconnects to a persisted Work
+Host descriptor.
+
 A canonical catalog adapter now projects authority-qualified Session identities and attached Work
 at independently verified requested/observed cursors. Only attached, exactly aligned Work with
 valid structural and semantic reducer projections can lend the catalog lifecycle, model,
 attention, or action facts; unavailable, stale, ahead, divergent, detached, and corrupt Work
 remain visible without those facts. The production `SessionCatalog` now scans bounded native local
 Session and Work journals, validates their declared owner/authority/locator rather than trusting
-directory names, and publishes Work as an independent inventory. A same-ID legacy transcript joins
-as one companion row: canonical lifecycle/model/attention/Work truth drives the UI while the legacy
-file remains the compatibility target for transcript and artifact actions. Native-only sessions are
-observe-only; legacy-only rows retain their prior behavior; corrupt, tailed, unknown, foreign,
+directory names, and publishes Work as an independent inventory. During the current cutover, a
+same-ID flat transcript can join as one temporary companion row: canonical lifecycle/model/attention/
+Work truth drives the UI while existing transcript and artifact actions still target that disposable
+projection. This is not a compatibility contract; Aviary-owned flat records and their reader/UI
+surfaces will be migrated or deleted as those actions move to canonical bodies and artifacts.
+Canonical-only sessions are observe-only in the present GUI; pre-canonical-only rows retain their
+current behavior only until that cutover. Corrupt, tailed, unknown, foreign,
 duplicate, ambiguous, or symlink-misaligned records remain visible or diagnosed without lending
 facts. Duplicate Work identities are excluded from Session assembly, invalid or tailed Sessions
 publish no canonical summary, recoverable Work-prefix cursors remain explicit but non-projectable,
 and unexpected directory failures are diagnosed rather than appearing as an empty catalog.
-Unknown Session semantics also scrub legacy-derived title, message, usage, model, provider,
-and lifecycle fields from a companion display rather than letting compatibility data refill an
+Unknown Session semantics also scrub flat-transcript-derived title, message, usage, model, provider,
+and lifecycle fields from a companion display rather than letting transitional data refill an
 unknown canonical projection. Continue re-reads native state at its action boundary and the native
 bundle's owner lock remains the final admission guard; Trash holds that same persistent Session
 owner lock across its fresh canonical read and transcript move. The Reader Census registers this
 production consumer. Flock now inventories Work independently of Session, qualifies child identity
-by Work, retains legacy trees only through explicit compatibility provenance, and withholds child
+by Work, and labels any pre-canonical tree as a transitional provenance source pending removal. It
+withholds child
 lifecycle when an unknown Work/runtime/external-effects domain may affect it. A separate bounded,
 client-neutral attention projection retains authored/effective attention, independent Session/Work
 cursors, attachment identity, integrity, tails, and unknowns; its `attentionRequirement` is
@@ -73,10 +89,10 @@ explicitly `unknown`, `none`, or `required`, without implying that the observing
 capability. Duplicate summaries become one unknown conflict row, and attachment, unknown-event,
 and corruption evidence is independently bounded with omission counts. Canonical Session search is
 an ephemeral, conflict-free projection over exact active-branch user/assistant conversation and
-bounded title/model metadata; unknown or invalid native facts fail closed, legacy compatibility is
-sanitized, identity matches are exact-or-prefix by field, and result bounds do not hide later corpus
+bounded title/model metadata; unknown or invalid native facts fail closed, pre-canonical companion
+fields are sanitized, identity matches are exact-or-prefix by field, and result bounds do not hide later corpus
 rows. Search selection retains the GUI action identity and canonical EventRefs, native companion
-rows cannot be refilled by legacy AgentTree prompts, and conversation lifecycle is kept separate
+rows cannot be refilled by pre-canonical AgentTree prompts, and conversation lifecycle is kept separate
 from attached Work liveness. The first notification adapter is now wired for needs-you,
 failed-recovery, and ready-for-review transitions. It observes permission without prompting at
 launch, baselines rather than replays attention accumulated while delivery is disabled, uses bounded
@@ -102,8 +118,9 @@ committed-prefix cursor.
 
 The production GUI and CLI paths now open the native paired Session/Work bundle before Start
 admission and carry that exact bundle through `SessionCommandController`, `AgentRunner`, and
-`Agent`. Native Work acceptance is authority; the legacy transcript is a downstream compatibility
-projection, so a later projection failure cannot rewrite an accepted command as rejected. Exact
+`Agent`. Native Work acceptance is authority; the flat transcript is a disposable downstream
+projection during cutover, so a later projection failure cannot rewrite an accepted command as
+rejected. Exact
 causal cursors survive admission, and accepted commands end in delivered, not-delivered, or
 indeterminate delivery receipts with first-terminal-wins concurrency semantics. Journal ambiguity
 latches the run and blocks later effects. End retains a deliberately degraded local teardown permit
@@ -166,7 +183,7 @@ terminal ordinary provider action, every retained message and tool-schema body, 
 sendable conversation tail. It rejects compaction-provider boundaries, unknown body media, missing
 or corrupt bodies, stale or tailed reads, unrepresented post-boundary actions, dangling tool calls,
 and text-only assistant rows that cannot prove tool-call absence. Native authority never silently
-falls back to the legacy transcript. The replacement Run records the six-plane recovery matrix;
+falls back to the flat transcript. The replacement Run records the six-plane recovery matrix;
 the runner restores retained pinned instructions, verifies the live tool schemas before the first
 provider call, uses a fresh Python namespace, and reports Futures/Handles as lost and repository,
 artifact/memory, and external-effect coverage as unknown. Structured assistant bodies are retained
@@ -176,16 +193,18 @@ creating an empty visible chat row.
 The Apple Swift 6.3.3 compiler accepts the SDK emitted by Apple Swift 6.3.2; the compatibility probe
 configures its own writable module cache and succeeds both directly and through every gate. At this
 checkpoint, the full suite passes 516 cases / 5,776 assertions in 47.45 seconds and `just compile`
-is clean. Phase 1 passes 225 cases / 3,847 assertions in 17.55 seconds. The versioned 100,000-event
-benchmark reads and reduces a 46,766,700-byte input in 5.633 seconds on the checkpoint machine
-(generation 0.892 seconds). The visual gate renders all 9 canonical screens; it also caught and
+is clean. The Phase 3A checkpoint raises that full-suite receipt to 554 cases / 6,203 assertions in
+62.84 seconds, with `just compile`, both Python host syntax checks, and `git diff --check` clean.
+The versioned 100,000-event benchmark reads and reduces a 46,766,700-byte input in 5.769 seconds on
+the checkpoint machine (generation 0.893 seconds). The visual gate renders all 9 canonical screens;
+it also caught and
 closed a SwiftPM snapshot crash by making the UserNotifications adapter available only from a real
 application bundle. Final Sol review found
 no remaining must-fix issue after exact cursor/attachment/read authority, local action-time
 revalidation and owner locking, unknown-domain display scrubbing, duplicate non-projection,
 slash-injective Work identity, provider-action causality, exhaustive retained-body decoding,
 structured assistant replay, pre-Start capture/cleanup, source-assembly binding, truncated-source
-replay, metadata-only inspection, parent-qualified legacy selection, multi-Session attention,
+replay, metadata-only inspection, parent-qualified transitional-record selection, multi-Session attention,
 bounded evidence, conflict projection, Work-liveness separation, bounded search allocation, and
 wrapper-only injection findings were remediated. A second notification-specific Sol review found no
 P0/P1 blocker after typed turn outcomes, turn/run transition deduplication, per-Session conflict
@@ -193,6 +212,11 @@ isolation, authorization gating, bounded typed routes, and cold-click routing we
 third Work-recovery Sol review found no P0; its one-sided attachment, activity-envelope, and absent-
 Work Census findings were then closed with reciprocal Session/Work joins, Run-qualified turn and
 Handle transitions, explicit omission accounting, and an Aviary-owned fixture migration.
+A Work-service seam review found no remaining blocker after terminal reservation, exact retry
+reconciliation, per-principal authorization, Session/attachment binding, bounded body reads, and
+bundle-backed terminal commits were hardened. The final RuntimeHost review found no remaining
+P0/P1/P2 after cancellation cleanup, atomic destroy/recreate, bounded callback admission and
+refusal, unread-peer shutdown, and process-generation fencing were exercised adversarially.
 
 Phase 0 still owes real VoiceOver/keyboard UI automation and broader driver focus/race proof. Phase 1
 still owes the remaining canonical consumer migrations (the Work Host service recovery source and
@@ -238,7 +262,7 @@ guarantee.
 Aviary is not starting from zero. The current code has unusually good raw material:
 
 - `SessionWriter` creates an append-only, complete-line JSONL record before work begins. The
-  legacy Session bridge now synchronizes command intent before dispatch and latches writer
+  temporary flat-Session bridge now synchronizes command intent before dispatch and latches writer
   failure; the native split Session/Work timeline writer and per-action durability denominator
   remain required work.
 - `SessionParser`, `SessionResume`, and the transcript tree reconstruct usable history defensively,
@@ -992,15 +1016,16 @@ adjectival.
 ### Deterministic model tests
 
 - Property-test all legal and illegal session/action/handle state transitions.
-- Fuzz old, new, truncated, duplicated, reordered, and unknown timeline records.
+- Fuzz migrated, current, truncated, duplicated, reordered, and unknown timeline records.
 - Assert live-overlay-to-durable-message convergence and live-versus-replay equivalence.
 - Assert non-vacuity: every fault injection point is reached and every expected terminal state is
   observed.
 
 ### Reader Census
 
-Maintain one adversarial fixture directory: a manifest, linked Session and Work journals, a legacy
-journal, and retained body/artifact fixtures. It contains a branch with explicit tip, unknown event
+Maintain one adversarial fixture directory: a manifest, linked Session and Work journals, a
+pre-canonical migration journal, and retained body/artifact fixtures. It contains a branch with
+explicit tip, unknown event
 with declared affected domains, incomplete tool call, compaction, model change, queued input, child
 completion, late steering, indeterminate action, two clients' concurrent commands in host order,
 attachments, malformed interior suffix, and truncated tail. Run every reader against it, including
@@ -1143,7 +1168,8 @@ The first four shippable slices should be deliberately narrow:
 1. **Truthful composer and live transcript** — live deltas, real steer/queue, capability-gated
    cancellation, queue tray, scroll anchoring, and adapter tests.
 2. **Timeline v2 and linked reducers** — session + Work identities/journals, durable action/turn/
-   attachment state, old-record adapter, live/replay equivalence, incremental cursor.
+   attachment state, one-time Aviary-owned fixture/data migration followed by removal of the old
+   reader, live/replay equivalence, incremental cursor.
 3. **One conversation workspace** — attention inbox, responsive session view, honest in-process
    capability labels, semantic activity, drafts, and stable scroll/focus.
 4. **Relaunch without fear** — adoptable runtime, local Work Host, transport-neutral client,

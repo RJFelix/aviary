@@ -60,7 +60,8 @@ private func childLifecycleEvents(
 
 private func waitForChildToSettle(_ agent: Agent) async -> Agent.ChildStatus? {
     for _ in 0..<100 {
-        let payload = await agent.serveCallback(kind: "children", payload: .object([:]))
+        let payload = await agent.serveCallback(
+            rid: "child-poll", kind: "children", payload: .object([:]))
         if let child = payload.arrayValue?.first,
            let state = child["state"]?.stringValue, state != "running"
         {
@@ -129,7 +130,7 @@ func test_nativeChildStartRefusalIsNotProjectedAsRunning() async throws {
 
     // Teardown closes admission before the callback arrives.
     await fixture.runner.stopBackgroundChildren()
-    let reply = await fixture.agent.serveCallback(kind: "spawn", payload: .object([
+    let reply = await fixture.agent.serveCallback(rid: "child-refusal", kind: "spawn", payload: .object([
         "prompt": .string("late child"), "name": .string("late"),
     ]))
     XCTAssertEqual(reply["state"]?.stringValue, "refused")
@@ -137,7 +138,7 @@ func test_nativeChildStartRefusalIsNotProjectedAsRunning() async throws {
     XCTAssertTrue(
         reply["error"]?.stringValue?.contains("admission is closed") == true)
     let children = await fixture.agent.serveCallback(
-        kind: "children", payload: .object([:]))
+        rid: "child-refusal-list", kind: "children", payload: .object([:]))
     XCTAssertTrue(children.arrayValue?.isEmpty == true)
 
     let events = try childLifecycleEvents(
@@ -155,7 +156,7 @@ func test_nativeChildStartRefusalIsNotProjectedAsRunning() async throws {
 func test_nativeChildRunnerRecordsCompletionWithParentRunProvenance() async throws {
     let fixture = try await prepareChildLifecycleRun(
         provider: ChildLifecycleProvider(mode: .completed), name: "child-complete")
-    let reply = await fixture.agent.serveCallback(kind: "spawn", payload: .object([
+    let reply = await fixture.agent.serveCallback(rid: "child-complete", kind: "spawn", payload: .object([
         "prompt": .string("complete this child"), "name": .string("completer"),
     ]))
     guard let childID = reply["id"]?.stringValue else {
@@ -188,7 +189,7 @@ func test_nativeChildRunnerRecordsCompletionWithParentRunProvenance() async thro
 func test_nativeChildRunnerRecordsFailureAndCancellationDistinctly() async throws {
     let failed = try await prepareChildLifecycleRun(
         provider: ChildLifecycleProvider(mode: .failed), name: "child-failed")
-    _ = await failed.agent.serveCallback(kind: "spawn", payload: .object([
+    _ = await failed.agent.serveCallback(rid: "child-failed", kind: "spawn", payload: .object([
         "prompt": .string("fail this child"), "name": .string("failure"),
     ]))
     let failedChild = try XCTUnwrap(await waitForChildToSettle(failed.agent))
@@ -204,7 +205,7 @@ func test_nativeChildRunnerRecordsFailureAndCancellationDistinctly() async throw
     let canceledProvider = ChildLifecycleProvider(mode: .delayed)
     let canceled = try await prepareChildLifecycleRun(
         provider: canceledProvider, name: "child-canceled")
-    _ = await canceled.agent.serveCallback(kind: "spawn", payload: .object([
+    _ = await canceled.agent.serveCallback(rid: "child-canceled", kind: "spawn", payload: .object([
         "prompt": .string("cancel this child"), "name": .string("cancellation"),
     ]))
     for _ in 0..<100 where canceledProvider.callCount == 0 {
@@ -226,7 +227,7 @@ func test_nativeChildTerminalAppendFailureCannotPresentSuccess() async throws {
     let provider = ChildLifecycleProvider(mode: .delayed)
     let fixture = try await prepareChildLifecycleRun(
         provider: provider, name: "child-terminal-failure")
-    _ = await fixture.agent.serveCallback(kind: "spawn", payload: .object([
+    _ = await fixture.agent.serveCallback(rid: "child-terminal-failure", kind: "spawn", payload: .object([
         "prompt": .string("terminal receipt must fail"), "name": .string("unrecordable"),
     ]))
     for _ in 0..<100 where provider.callCount == 0 {

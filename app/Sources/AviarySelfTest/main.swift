@@ -1055,7 +1055,7 @@ let cases1: [Case] = [
     ("runtimeHost: starts, declares capabilities, and stops", {
         guard let host = try makeHost(.reference) else { return }
         let caps = try await host.start()
-        XCTAssertEqual(caps.protocolVersion, 2)
+        XCTAssertEqual(caps.protocolVersion, 3)
         XCTAssertEqual(caps.runtime, "cpython")
         XCTAssertFalse(caps.runtimeVersion.isEmpty)
         XCTAssertTrue(caps.has("namespaceInspection"))
@@ -1312,14 +1312,14 @@ let cases2: [Case] = [
         // Pure parsing, no process: the one place a wrong default would silently promise a
         // capability the runtime does not have.
         let v = try XCTUnwrap(JSONValue.parse(Data(#"""
-        {"protocol":2,"runtime":"lua","runtimeVersion":"5.4","features":{"snapshot":true}}
+        {"protocol":3,"runtime":"lua","runtimeVersion":"5.4","features":{"snapshot":true}}
         """#.utf8)))
         let caps = RuntimeHost.capabilities(from: v)
-        XCTAssertEqual(caps.protocolVersion, 2)
+        XCTAssertEqual(caps.protocolVersion, 3)
         XCTAssertEqual(caps.runtime, "lua")
         XCTAssertTrue(caps.has("snapshot"))
         XCTAssertFalse(caps.has("perSessionGIL"))
-        XCTAssertEqual(caps.summary, "lua 5.4 · protocol 2")
+        XCTAssertEqual(caps.summary, "lua 5.4 · protocol 3")
     }),
 
     // ------------------------------------------------------------------ provider
@@ -1845,13 +1845,14 @@ let cases2: [Case] = [
         await agent.setSpawnDelegate(RefusingDelegate())
 
         let atCeiling = await agent.serveCallback(
-            kind: "spawn", payload: .object(["prompt": .string("do a thing")]))
+            rid: "spawn-ceiling", kind: "spawn", payload: .object(["prompt": .string("do a thing")]))
         XCTAssertTrue((atCeiling["error"]?.stringValue ?? "").contains("maximum sub-agent depth"))
         XCTAssertTrue((atCeiling["error"]?.stringValue ?? "").contains("yourself"),
                       "tells it what to do instead, not just no")
 
         // And an unknown callback kind is refused rather than hanging the caller.
-        let unknown = await agent.serveCallback(kind: "teleport", payload: .object([:]))
+        let unknown = await agent.serveCallback(
+            rid: "unknown-kind", kind: "teleport", payload: .object([:]))
         XCTAssertTrue((unknown["error"]?.stringValue ?? "").contains("teleport"))
         await writer.close()
     }),
@@ -1879,7 +1880,7 @@ let cases2: [Case] = [
         await agent.send("remember this phrase: albatross")
 
         let history = await agent.serveCallback(
-            kind: "conversation", payload: .object(["limit": .number(10)]))
+            rid: "conversation-history", kind: "conversation", payload: .object(["limit": .number(10)]))
         let entries = try XCTUnwrap(history["messages"]?.arrayValue)
         XCTAssertTrue(entries.count >= 3, "system, user and at least one assistant turn")
         let text = entries.map { $0["text"]?.stringValue ?? "" }.joined(separator: " ")
@@ -2361,14 +2362,15 @@ let cases3: [Case] = [
 
         // Without a store, the verbs refuse rather than silently doing nothing.
         let refused = await agent.serveCallback(
-            kind: "remember", payload: .object(["text": .string("x")]))
+            rid: "remember-empty-store", kind: "remember", payload: .object(["text": .string("x")]))
         XCTAssertTrue((refused["error"]?.stringValue ?? "").contains("no memory store"))
 
         await agent.setMemory(MemoryStore(repoRoot: root, home: home, cwd: "/tmp/proj"))
-        let empty = await agent.serveCallback(kind: "remember", payload: .object([:]))
+        let empty = await agent.serveCallback(
+            rid: "remember-empty", kind: "remember", payload: .object([:]))
         XCTAssertNotNil(empty["error"], "empty text is refused")
 
-        let saved = await agent.serveCallback(kind: "remember", payload: .object([
+        let saved = await agent.serveCallback(rid: "remember-save", kind: "remember", payload: .object([
             "text": .string("the fixture server records requests at /_requests"),
             "scope": .string("project"), "days": .number(7),
             "tags": .array([.string("testing")]),
@@ -2377,7 +2379,7 @@ let cases3: [Case] = [
         XCTAssertEqual(saved["scope"]?.stringValue, "project")
 
         let found = await agent.serveCallback(
-            kind: "recall", payload: .object(["query": .string("fixture requests")]))
+            rid: "remember-recall", kind: "recall", payload: .object(["query": .string("fixture requests")]))
         let hits = try XCTUnwrap(found["memories"]?.arrayValue)
         XCTAssertEqual(hits.count, 1)
         XCTAssertTrue((hits[0]["text"]?.stringValue ?? "").contains("_requests"))
@@ -4884,7 +4886,7 @@ let casesArtifact: [Case] = [
             config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s"))
         await agent.setArtifacts(ArtifactStore(home: home, sessionID: writer.sessionID))
 
-        let bad = await agent.serveCallback(kind: "artifact", payload: .object([
+        let bad = await agent.serveCallback(rid: "artifact-bad-format", kind: "artifact", payload: .object([
             "text": .string("body"), "title": .string("T"), "format": .string("pdf"),
         ]))
         let message = bad["error"]?.stringValue ?? ""
@@ -4893,13 +4895,13 @@ let casesArtifact: [Case] = [
                       "and what would have worked")
         XCTAssertNil(bad["path"])
 
-        let empty = await agent.serveCallback(kind: "artifact", payload: .object([
+        let empty = await agent.serveCallback(rid: "artifact-empty", kind: "artifact", payload: .object([
             "text": .string("   \n"), "format": .string("md"),
         ]))
         XCTAssertTrue((empty["error"]?.stringValue ?? "").contains("text"))
 
         // 'markdown' for 'md' is the mistake that would otherwise lose a finished report.
-        let alias = await agent.serveCallback(kind: "artifact", payload: .object([
+        let alias = await agent.serveCallback(rid: "artifact-alias", kind: "artifact", payload: .object([
             "text": .string("body"), "title": .string("Alias"),
             "format": .string("markdown"),
         ]))
@@ -4919,7 +4921,7 @@ let casesArtifact: [Case] = [
             config: .init(model: fakeModel(), cwd: "/tmp", systemPrompt: "s"))
         await agent.setArtifacts(ArtifactStore(home: home, sessionID: writer.sessionID))
 
-        let reply = await agent.serveCallback(kind: "artifact", payload: .object([
+        let reply = await agent.serveCallback(rid: "artifact-q3", kind: "artifact", payload: .object([
             "text": .string("# Q3\n\nRevenue is up."),
             "title": .string("Q3 review"),
             "format": .string("md"),
@@ -4960,7 +4962,7 @@ let casesArtifact: [Case] = [
         let noted = OutputCollector()
         await kernel.onNote { text, customType in noted.record(stream: customType, text: text) }
 
-        let reply = await kernel.serveCallback(kind: "artifact", payload: .object([
+        let reply = await kernel.serveCallback(rid: "kernel-artifact-ledger", kind: "artifact", payload: .object([
             "text": .string("<h1>Ledger</h1>"), "title": .string("Ledger"),
             "format": .string("html"),
         ]))
@@ -4984,7 +4986,7 @@ let casesArtifact: [Case] = [
         let home = scratchHome()
         defer { try? FileManager.default.removeItem(at: home.root) }
         let store = ArtifactStore(home: home, sessionID: "s-live")
-        await host.onCallback { _, kind, payload in
+        await host.onCallback { _, _, kind, payload in
             guard kind == "artifact" else {
                 return .object(["error": .string("unexpected callback \(kind)")])
             }
@@ -5454,8 +5456,8 @@ let casesDispatched: [Case] = [
         // The channel the prelude's `.notify()` speaks over. Without it the announcement never
         // reaches the agent and the run finishes exactly as it did before the fix — which is
         // how the first version of this test silently passed nothing.
-        await host.onCallback { _, kind, payload in
-            await agent.serveCallback(kind: kind, payload: payload)
+        await host.onCallback { _, rid, kind, payload in
+            await agent.serveCallback(rid: rid, kind: kind, payload: payload)
         }
 
         let log = EventLog()
@@ -5533,7 +5535,7 @@ let casesCrossingLaws: [Case] = [
         _ = try await host.start()
         defer { Task { await host.stop() } }
         let counter = Counter()
-        await host.onCallback { _, kind, payload in
+        await host.onCallback { _, _, kind, payload in
             if kind == "notify" {
                 counter.record(payload["text"]?.stringValue ?? "")
             }
@@ -5557,7 +5559,7 @@ let casesCrossingLaws: [Case] = [
         _ = try await host.start()
         defer { Task { await host.stop() } }
         let counter = Counter()
-        await host.onCallback { _, kind, payload in
+        await host.onCallback { _, _, kind, payload in
             if kind == "notify" { counter.record(payload["text"]?.stringValue ?? "") }
             return .object(["ok": .bool(true)])
         }
@@ -6774,6 +6776,63 @@ let casesCanonicalWorkRecoveryProjection: [Case] = [
     }),
 ]
 
+let casesWorkService: [Case] = [
+    ("phase3 Work service: handshake is versioned and host identity is opaque", {
+        try await test_workServiceHandshakeIsVersionedAndHostIdentityIsOpaque()
+    }),
+    ("phase3 Work service: many-to-many attachments and ordered commands", {
+        try await test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities()
+    }),
+    ("phase3 Work service: run finish, End, and completion stay distinct", {
+        try await test_workServiceRunFinishedIsReusableEndIsTerminalizingAndCompletionIsSeparate()
+    }),
+    ("phase3 Work service: explicit completion and destruction are separate", {
+        try await test_workServiceExplicitCompletionAndDestroyRemainSeparateCommands()
+    }),
+    ("phase3 Work service: terminal proof requires quiescence and Session pairing", {
+        try await test_workServiceTerminalMutationRequiresCanonicalQuiescenceAndSessionPair()
+    }),
+    ("phase3 Work service: terminal reservations serialize concurrent mutations", {
+        try await test_workServiceTerminalReservationSerializesConcurrentCommands()
+    }),
+    ("phase3 Work service: ambiguous terminal commit reconciles on exact retry", {
+        try await test_workServiceAmbiguousTerminalCommitReconcilesExactRetry()
+    }),
+    ("phase3 Work service: invalid terminal proof reconciles on exact retry", {
+        try await test_workServiceInvalidTerminalProofReconcilesExactRetry()
+    }),
+    ("phase3 Work service: authorization is separate from Work identity", {
+        try await test_workServiceAuthorizationIsSeparateFromWorkIdentity()
+    }),
+    ("phase3 Work service: list and describe authorize every principal", {
+        try await test_workServiceListAndDescribeAuthorizeEveryPrincipal()
+    }),
+    ("phase3 Work service: creation carries bounded host policy", {
+        try await test_workServiceCreateCarriesBoundedHostPolicyAndFreshIdentity()
+    }),
+    ("phase3 Work service: create idempotency identity is typed", {
+        try await test_workServiceCreateIdempotencyKeyIsTypedAndInjective()
+    }),
+    ("phase3 Work service: nonzero seeds declare unavailable history", {
+        try await test_workServiceNonzeroSeedDeclaresMissingHistoryOrRejectsCompleteness()
+    }),
+    ("phase3 Work service: incomplete source is visible and non-controlling", {
+        try await test_workServiceIncompleteSourceIsVisibleButCannotAcceptControl()
+    }),
+    ("phase3 Work service: event and artifact surfaces stay bounded", {
+        try await test_workServiceEventsAndArtifactsAreBoundedDescriptors()
+    }),
+    ("phase3 Work service: seed artifact overflow remains an omission", {
+        try await test_workServiceRetainsSeedArtifactOverflowAsAnExplicitOmission()
+    }),
+    ("phase3 Work service: unavailable host does not poison other rows", {
+        try await test_workServiceRegistryDoesNotLetUnavailableHostPoisonOtherRows()
+    }),
+    ("phase3 Work service: omitted unavailable hosts remain explicit", {
+        try await test_workServiceRegistryMarksOmittedUnavailableHostsBeyondBound()
+    }),
+]
+
 let casesTimelineWriter: [Case] = [
     ("phase1 writer: fresh appendBatch bytes, reducer, and reopen", {
         try await test_timelineJournalWriterFreshBatchReopenAndReducer()
@@ -6859,6 +6918,18 @@ let casesRunJournalBundle: [Case] = [
     ("phase1 bundle: canceled teardown still finishes and closes", {
         try await test_runJournalBundleCanceledTaskStillFinishesAndCloses()
     }),
+    ("phase1 bundle: Work completion is separate from finished Run", {
+        try await test_runJournalBundleCompleteWorkIsSeparateFromFinishedRunAndClosesMutation()
+    }),
+    ("phase1 bundle: terminal adapter recovers exact retry without duplicate events", {
+        try await test_runJournalBundleTerminalCommitterRecoversExactRetryWithoutSecondEvent()
+    }),
+    ("phase1 bundle: Work destruction requires quiesced resources", {
+        try await test_runJournalBundleDestroyWorkRequiresQuiescedResourcesAndWritesOneTombstone()
+    }),
+    ("phase1 bundle: terminal Work rejects live canonical Handles", {
+        test_workTerminalReducerRejectsCompletionAndDestructionWithLiveCanonicalHandle()
+    }),
 ]
 
 await Harness.run(
@@ -6872,8 +6943,9 @@ await Harness.run(
         + casesContextManifest + casesPromptProvenance + casesNativeColdResume
         + casesCanonicalSessionSearch
         + casesLocalTimelineCatalog + casesCanonicalWorkRecoveryProjection
+        + casesWorkService
         + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal
         + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel
         + casesNativeIndeterminateEffects + casesChildLifecycle
-        + casesCommandDeliveryOutcome)
+        + casesCommandDeliveryOutcome + casesRuntimeHostAdoption)

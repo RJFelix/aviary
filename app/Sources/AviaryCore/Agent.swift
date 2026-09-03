@@ -433,7 +433,9 @@ public actor Agent {
     ///
     /// Answers with an `error` key rather than throwing, always: the agent asked a question in
     /// code and is blocked on the reply, so a refusal it can read beats a hang it cannot.
-    public func serveCallback(kind: String, payload: JSONValue) async -> JSONValue {
+    /// `rid` is stable across at-least-once transport replay. Durable callback effects can use it
+    /// as their idempotency key; this method does not claim exactly-once semantics by itself.
+    public func serveCallback(rid: String, kind: String, payload: JSONValue) async -> JSONValue {
         guard await requireJournal("callback \(kind)") else {
             return .object(["error": .string(
                 journalFailureDetail ?? "The session journal is unavailable; stop this run.")])
