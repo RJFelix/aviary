@@ -47,6 +47,10 @@ private func reducerEvent(
         type: type, declaredDomains: declaredDomains, links: links, payload: payload)
 }
 
+private func reducerJSON<T: Encodable>(_ value: T) -> JSONValue {
+    JSONValue.parse(try! JSONEncoder().encode(value))!
+}
+
 func test_timelineReducersLinkSessionsAndWork() throws {
     let sessionAttachment = SessionAttachmentRef("session-attachment")
     let client = ClientRef("client-test")
@@ -74,7 +78,8 @@ func test_timelineReducersLinkSessionsAndWork() throws {
         reducerEvent(TimelineEventType.actionStarted, id: "w7", sequence: 7, journal: reducerWorkJournal,
                      previous: "w6", action: action, payload: .object(["state": "running"])),
         reducerEvent(TimelineEventType.handleStarted, id: "w8", sequence: 8, journal: reducerWorkJournal,
-                     previous: "w7", handle: handle),
+                     previous: "w7", run: run, handle: handle,
+                     payload: .object(["state": .string("running")])),
         reducerEvent(TimelineEventType.actionOutcome, id: "w9", sequence: 9, journal: reducerWorkJournal,
                      previous: "w8", action: action, payload: .object([
                          "state": "failed", "failure_kind": "timeout", "retry_safety": "unknown"])),
@@ -190,23 +195,31 @@ func test_timelineReducersPreserveUnknownEventsAndLegacyIdentity() throws {
 
 func test_timelineReducersLiveAndColdPrefixEquivalence() throws {
     let action = ActionRef("equivalence-action")
+    let attachment = SessionAttachmentRef("equivalence-attachment")
+    let run = RunRef("equivalence-run")
     let events = [
         reducerEvent(TimelineEventType.workCreated, id: "p1", sequence: 1, journal: reducerWorkJournal,
                      work: reducerWork),
-        reducerEvent(TimelineEventType.runStarted, id: "p2", sequence: 2, journal: reducerWorkJournal,
-                     previous: "p1", work: reducerWork, run: RunRef("equivalence-run")),
-        reducerEvent(TimelineEventType.actionIntent, id: "p3", sequence: 3, journal: reducerWorkJournal,
-                     previous: "p2", work: reducerWork, action: action,
-                     payload: .object(["state": "proposed"])),
-        reducerEvent(TimelineEventType.actionStarted, id: "p4", sequence: 4, journal: reducerWorkJournal,
+        reducerEvent(TimelineEventType.sessionAttached, id: "p2", sequence: 2,
+                     journal: reducerWorkJournal, previous: "p1", session: reducerSession,
+                     work: reducerWork, sessionAttachment: attachment),
+        reducerEvent(TimelineEventType.runStarted, id: "p3", sequence: 3, journal: reducerWorkJournal,
+                     previous: "p2", work: reducerWork, run: run),
+        reducerEvent(TimelineEventType.actionIntent, id: "p4", sequence: 4, journal: reducerWorkJournal,
                      previous: "p3", work: reducerWork, action: action,
-                     payload: .object(["state": "running"])),
-        reducerEvent(TimelineEventType.actionOutcome, id: "p5", sequence: 5, journal: reducerWorkJournal,
+                     payload: .object(["state": "proposed"])),
+        reducerEvent(TimelineEventType.actionStarted, id: "p5", sequence: 5, journal: reducerWorkJournal,
                      previous: "p4", work: reducerWork, action: action,
+                     payload: .object(["state": "running"])),
+        reducerEvent(TimelineEventType.actionOutcome, id: "p6", sequence: 6, journal: reducerWorkJournal,
+                     previous: "p5", work: reducerWork, action: action,
                      payload: .object(["state": "succeeded", "retry_safety": "idempotent"])),
-        reducerEvent(TimelineEventType.recoveryCoverage, id: "p6", sequence: 6, journal: reducerWorkJournal,
-                     previous: "p5", work: reducerWork, payload: .object([
+        reducerEvent(TimelineEventType.recoveryCoverage, id: "p7", sequence: 7,
+                     journal: reducerWorkJournal, previous: "p6", session: reducerSession,
+                     work: reducerWork, workHost: WorkHostRef(reducerWork.workHostID),
+                     sessionAttachment: attachment, run: run, payload: .object([
                          "operation": "cold_resume",
+                         "work_journal": reducerJSON(reducerWorkJournal),
                          "planes": .object(["timeline": "preserved", "runtime_namespace": "lost"]),
                          "caveats": .array(["host was not reattached"]),
                      ])),
@@ -240,6 +253,282 @@ func test_timelineReducersLiveAndColdPrefixEquivalence() throws {
     XCTAssertEqual(liveSession.snapshot, SessionReducer.reduce(sessionEvents))
     XCTAssertEqual(liveSession.snapshot.contextComponents[0].componentID, "component-1")
     XCTAssertEqual(liveSession.snapshot.contextComponents[0].inclusionID, "inclusion-1")
+}
+
+func test_timelineReducersRejectAttachmentAndRunIdentityReuse() throws {
+    let attachment = SessionAttachmentRef("identity-attachment")
+    let runA = RunRef("identity-run-a")
+    let runB = RunRef("identity-run-b")
+    let coveragePayload: JSONValue = .object([
+        "operation": "cold_resume",
+        "work_journal": reducerJSON(reducerWorkJournal),
+        "planes": .object(Dictionary(uniqueKeysWithValues: RecoveryPlane.allCases.map {
+            ($0.rawValue, JSONValue.string(RecoveryCoverageStatus.preserved.rawValue))
+        }))
+    ])
+    let workEvents = [
+        reducerEvent(TimelineEventType.workCreated, id: "i1", sequence: 1,
+                     journal: reducerWorkJournal, work: reducerWork),
+        reducerEvent(TimelineEventType.sessionAttached, id: "i2", sequence: 2,
+                     journal: reducerWorkJournal, previous: "i1", session: reducerSession,
+                     work: reducerWork, sessionAttachment: attachment),
+        reducerEvent(TimelineEventType.sessionAttached, id: "i3", sequence: 3,
+                     journal: reducerWorkJournal, previous: "i2", session: SessionRef("other-session"),
+                     work: reducerWork, sessionAttachment: attachment),
+        reducerEvent(TimelineEventType.runStarted, id: "i4", sequence: 4,
+                     journal: reducerWorkJournal, previous: "i3", work: reducerWork, run: runA),
+        reducerEvent(TimelineEventType.runStarted, id: "i5", sequence: 5,
+                     journal: reducerWorkJournal, previous: "i4", work: reducerWork, run: runB),
+        reducerEvent(TimelineEventType.runFinished, id: "i6", sequence: 6,
+                     journal: reducerWorkJournal, previous: "i5", work: reducerWork, run: runB),
+        reducerEvent(TimelineEventType.runFinished, id: "i7", sequence: 7,
+                     journal: reducerWorkJournal, previous: "i6", work: reducerWork, run: runA),
+        reducerEvent(TimelineEventType.runStarted, id: "i8", sequence: 8,
+                     journal: reducerWorkJournal, previous: "i7", work: reducerWork, run: runA),
+        reducerEvent(TimelineEventType.sessionDetached, id: "i9", sequence: 9,
+                     journal: reducerWorkJournal, previous: "i8", session: reducerSession,
+                     work: reducerWork, sessionAttachment: attachment),
+        reducerEvent(TimelineEventType.recoveryCoverage, id: "i10", sequence: 10,
+                     journal: reducerWorkJournal, previous: "i9", session: reducerSession,
+                     work: reducerWork, workHost: WorkHostRef(reducerWork.workHostID),
+                     sessionAttachment: attachment, run: runA, payload: coveragePayload),
+    ]
+    let work = WorkReducer.reduce(workEvents)
+    XCTAssertEqual(work.sessionAttachments[attachment.attachmentID]?.session, reducerSession)
+    XCTAssertNil(work.activeRun)
+    XCTAssertEqual(work.observedRunIDs, [runA.runID])
+    XCTAssertTrue(work.recovery.isEmpty)
+    XCTAssertEqual(work.quarantinedEvents.count, 5)
+
+    let otherWork = WorkRef(workHostID: reducerWork.workHostID, workID: "other-work")
+    let sessionEvents = [
+        reducerEvent(TimelineEventType.sessionCreated, id: "j1", sequence: 1,
+                     journal: reducerSessionJournal, session: reducerSession),
+        reducerEvent(TimelineEventType.sessionAttached, id: "j2", sequence: 2,
+                     journal: reducerSessionJournal, previous: "j1", session: reducerSession,
+                     work: reducerWork, sessionAttachment: attachment),
+        reducerEvent(TimelineEventType.sessionAttached, id: "j3", sequence: 3,
+                     journal: reducerSessionJournal, previous: "j2", session: reducerSession,
+                     work: otherWork, sessionAttachment: attachment),
+        reducerEvent(TimelineEventType.sessionDetached, id: "j4", sequence: 4,
+                     journal: reducerSessionJournal, previous: "j3", session: reducerSession,
+                     work: reducerWork, sessionAttachment: attachment),
+        reducerEvent(TimelineEventType.recoveryCoverage, id: "j5", sequence: 5,
+                     journal: reducerSessionJournal, previous: "j4", session: reducerSession,
+                     work: reducerWork, workHost: WorkHostRef(reducerWork.workHostID),
+                     sessionAttachment: attachment, run: runA, payload: coveragePayload),
+    ]
+    let session = SessionReducer.reduce(sessionEvents)
+    XCTAssertEqual(session.attachments[attachment.attachmentID]?.work, reducerWork)
+    XCTAssertTrue(session.recovery.isEmpty)
+    XCTAssertEqual(session.quarantinedEvents.count, 2)
+}
+
+func test_timelineReducersRejectEmptyAttachmentIdentities() throws {
+    let emptySession = SessionRef("")
+    let emptySessionAttachment = SessionAttachmentRef("")
+    let emptyClient = ClientRef("")
+    let emptyClientAttachment = ClientAttachmentRef("")
+    let workEvents = [
+        reducerEvent(TimelineEventType.workCreated, id: "empty-w1", sequence: 1,
+                     journal: reducerWorkJournal, work: reducerWork),
+        reducerEvent(TimelineEventType.sessionAttached, id: "empty-w2", sequence: 2,
+                     journal: reducerWorkJournal, previous: "empty-w1", session: emptySession,
+                     work: reducerWork, sessionAttachment: SessionAttachmentRef("valid")),
+        reducerEvent(TimelineEventType.sessionAttached, id: "empty-w3", sequence: 3,
+                     journal: reducerWorkJournal, previous: "empty-w2", session: reducerSession,
+                     work: reducerWork, sessionAttachment: emptySessionAttachment),
+        reducerEvent(TimelineEventType.clientAttached, id: "empty-w4", sequence: 4,
+                     journal: reducerWorkJournal, previous: "empty-w3", client: emptyClient,
+                     clientAttachment: ClientAttachmentRef("valid")),
+        reducerEvent(TimelineEventType.clientAttached, id: "empty-w5", sequence: 5,
+                     journal: reducerWorkJournal, previous: "empty-w4", client: ClientRef("valid"),
+                     clientAttachment: emptyClientAttachment),
+    ]
+    let work = WorkReducer.reduce(workEvents)
+    XCTAssertTrue(work.sessionAttachments.isEmpty)
+    XCTAssertTrue(work.clientAttachments.isEmpty)
+    XCTAssertEqual(work.quarantinedEvents.count, 4)
+
+    let sessionEvents = [
+        reducerEvent(TimelineEventType.sessionCreated, id: "empty-s1", sequence: 1,
+                     journal: reducerSessionJournal, session: reducerSession),
+        reducerEvent(TimelineEventType.sessionAttached, id: "empty-s2", sequence: 2,
+                     journal: reducerSessionJournal, previous: "empty-s1", session: reducerSession,
+                     work: WorkRef(workHostID: "", workID: "valid"),
+                     sessionAttachment: SessionAttachmentRef("valid")),
+        reducerEvent(TimelineEventType.sessionAttached, id: "empty-s3", sequence: 3,
+                     journal: reducerSessionJournal, previous: "empty-s2", session: reducerSession,
+                     work: reducerWork, sessionAttachment: emptySessionAttachment),
+        reducerEvent(TimelineEventType.clientAttached, id: "empty-s4", sequence: 4,
+                     journal: reducerSessionJournal, previous: "empty-s3", session: reducerSession,
+                     client: emptyClient, clientAttachment: ClientAttachmentRef("valid")),
+        reducerEvent(TimelineEventType.clientAttached, id: "empty-s5", sequence: 5,
+                     journal: reducerSessionJournal, previous: "empty-s4", session: reducerSession,
+                     client: ClientRef("valid"), clientAttachment: emptyClientAttachment),
+    ]
+    let session = SessionReducer.reduce(sessionEvents)
+    XCTAssertTrue(session.attachments.isEmpty)
+    XCTAssertTrue(session.clientAttachments.isEmpty)
+    XCTAssertEqual(session.quarantinedEvents.count, 4)
+}
+
+func test_timelineReducerRejectsEmptyActivityIdentities() throws {
+    let workCreated = reducerEvent(
+        TimelineEventType.workCreated, id: "activity-w1", sequence: 1,
+        journal: reducerWorkJournal, work: reducerWork)
+    let emptyAction = reducerEvent(
+        TimelineEventType.actionIntent, id: "activity-w2", sequence: 2,
+        journal: reducerWorkJournal, previous: "activity-w1", work: reducerWork,
+        action: ActionRef(""), payload: .object(["state": .string("proposed")]))
+    let emptyHandle = reducerEvent(
+        TimelineEventType.handleStarted, id: "activity-w3", sequence: 3,
+        journal: reducerWorkJournal, previous: "activity-w2", work: reducerWork,
+        handle: HandleRef(""), payload: .object(["state": .string("running")]))
+    let causeCursor = JournalCursor(
+        journal: reducerWorkJournal, eventID: workCreated.eventID, sequence: workCreated.sequence)
+    let emptyCommand = reducerEvent(
+        TimelineEventType.commandAccepted, id: "activity-w4", sequence: 4,
+        journal: reducerWorkJournal, hostSequence: 1, previous: "activity-w3",
+        work: reducerWork,
+        command: CommandRef(commandID: "", causalCursor: causeCursor),
+        causedBy: EventRef(journal: reducerWorkJournal, eventID: workCreated.eventID))
+    let snapshot = WorkReducer.reduce([workCreated, emptyAction, emptyHandle, emptyCommand])
+    XCTAssertTrue(snapshot.actions.isEmpty)
+    XCTAssertTrue(snapshot.handles.isEmpty)
+    XCTAssertTrue(snapshot.commands.isEmpty)
+    XCTAssertEqual(snapshot.quarantinedEvents.count, 3)
+}
+
+func test_timelineReducerRejectsInvalidTurnAndHandleActivityEnvelopes() throws {
+    let run = RunRef("activity-run")
+    let foreignRun = RunRef("foreign-run")
+    let turn = TurnRef("activity-turn")
+    let otherTurn = TurnRef("other-turn")
+    let handle = HandleRef("activity-handle")
+
+    let turnEvents = [
+        reducerEvent(TimelineEventType.workCreated, id: "envelope-turn-1", sequence: 1,
+                     journal: reducerWorkJournal, work: reducerWork),
+        reducerEvent(TimelineEventType.runStarted, id: "envelope-turn-2", sequence: 2,
+                     journal: reducerWorkJournal, previous: "envelope-turn-1", work: reducerWork,
+                     run: run),
+        // Every invalid semantic event still advances the journal cursor, but must not alter
+        // the effective activity state. This makes the suffix safe to reduce after quarantine.
+        reducerEvent(TimelineEventType.turnStarted, id: "envelope-turn-3", sequence: 3,
+                     journal: reducerWorkJournal, previous: "envelope-turn-2", work: reducerWork),
+        reducerEvent(TimelineEventType.turnStarted, id: "envelope-turn-4", sequence: 4,
+                     journal: reducerWorkJournal, previous: "envelope-turn-3", work: reducerWork,
+                     run: run, turn: TurnRef("   ")),
+        reducerEvent(TimelineEventType.turnStarted, id: "envelope-turn-5", sequence: 5,
+                     journal: reducerWorkJournal, previous: "envelope-turn-4", work: reducerWork,
+                     run: foreignRun, turn: otherTurn),
+        reducerEvent(TimelineEventType.turnStarted, id: "envelope-turn-6", sequence: 6,
+                     journal: reducerWorkJournal, previous: "envelope-turn-5", work: reducerWork,
+                     run: run, turn: turn),
+        reducerEvent(TimelineEventType.turnStarted, id: "envelope-turn-7", sequence: 7,
+                     journal: reducerWorkJournal, previous: "envelope-turn-6", work: reducerWork,
+                     run: run, turn: otherTurn),
+        reducerEvent(TimelineEventType.turnFinished, id: "envelope-turn-8", sequence: 8,
+                     journal: reducerWorkJournal, previous: "envelope-turn-7", work: reducerWork,
+                     run: run),
+        reducerEvent(TimelineEventType.turnFinished, id: "envelope-turn-9", sequence: 9,
+                     journal: reducerWorkJournal, previous: "envelope-turn-8", work: reducerWork,
+                     run: foreignRun, turn: turn),
+        reducerEvent(TimelineEventType.turnFinished, id: "envelope-turn-10", sequence: 10,
+                     journal: reducerWorkJournal, previous: "envelope-turn-9", work: reducerWork,
+                     run: run, turn: otherTurn),
+        // A mismatched turn finish must not clear the turn, so finishing the Run remains
+        // inadmissible until the matching turn finish arrives.
+        reducerEvent(TimelineEventType.runFinished, id: "envelope-turn-11", sequence: 11,
+                     journal: reducerWorkJournal, previous: "envelope-turn-10", work: reducerWork,
+                     run: run),
+        reducerEvent(TimelineEventType.turnFinished, id: "envelope-turn-12", sequence: 12,
+                     journal: reducerWorkJournal, previous: "envelope-turn-11", work: reducerWork,
+                     run: run, turn: turn),
+        reducerEvent(TimelineEventType.runFinished, id: "envelope-turn-13", sequence: 13,
+                     journal: reducerWorkJournal, previous: "envelope-turn-12", work: reducerWork,
+                     run: run),
+    ]
+    let turns = WorkReducer.reduce(turnEvents)
+    XCTAssertNil(turns.activeRun)
+    XCTAssertNil(turns.activeTurn)
+    XCTAssertEqual(turns.execution, .idle)
+    XCTAssertEqual(
+        turns.quarantinedEvents.map(\.eventID),
+        ["envelope-turn-3", "envelope-turn-4", "envelope-turn-5", "envelope-turn-7",
+         "envelope-turn-8", "envelope-turn-9", "envelope-turn-10", "envelope-turn-11"])
+    XCTAssertTrue(turns.structuralIntegrityValid)
+    XCTAssertFalse(turns.semanticProjectionValid)
+
+    let handleEvents = [
+        reducerEvent(TimelineEventType.workCreated, id: "envelope-handle-1", sequence: 1,
+                     journal: reducerWorkJournal, work: reducerWork),
+        reducerEvent(TimelineEventType.runStarted, id: "envelope-handle-2", sequence: 2,
+                     journal: reducerWorkJournal, previous: "envelope-handle-1", work: reducerWork,
+                     run: run),
+        reducerEvent(TimelineEventType.handleOutcome, id: "envelope-handle-3", sequence: 3,
+                     journal: reducerWorkJournal, previous: "envelope-handle-2", work: reducerWork,
+                     run: run, handle: handle,
+                     payload: .object(["state": .string("succeeded")])),
+        reducerEvent(TimelineEventType.handleStarted, id: "envelope-handle-4", sequence: 4,
+                     journal: reducerWorkJournal, previous: "envelope-handle-3", work: reducerWork,
+                     handle: handle, payload: .object(["state": .string("running")])),
+        reducerEvent(TimelineEventType.handleStarted, id: "envelope-handle-5", sequence: 5,
+                     journal: reducerWorkJournal, previous: "envelope-handle-4", work: reducerWork,
+                     run: run, handle: HandleRef(""),
+                     payload: .object(["state": .string("running")])),
+        reducerEvent(TimelineEventType.handleStarted, id: "envelope-handle-6", sequence: 6,
+                     journal: reducerWorkJournal, previous: "envelope-handle-5", work: reducerWork,
+                     run: foreignRun, handle: HandleRef("foreign-handle"),
+                     payload: .object(["state": .string("running")])),
+        reducerEvent(TimelineEventType.handleStarted, id: "envelope-handle-7", sequence: 7,
+                     journal: reducerWorkJournal, previous: "envelope-handle-6", work: reducerWork,
+                     run: run, handle: HandleRef("empty-state"),
+                     payload: .object(["state": .string("   ")])),
+        reducerEvent(TimelineEventType.handleStarted, id: "envelope-handle-8", sequence: 8,
+                     journal: reducerWorkJournal, previous: "envelope-handle-7", work: reducerWork,
+                     run: run, handle: handle,
+                     payload: .object(["state": .string("running")])),
+        reducerEvent(TimelineEventType.handleStarted, id: "envelope-handle-9", sequence: 9,
+                     journal: reducerWorkJournal, previous: "envelope-handle-8", work: reducerWork,
+                     run: run, handle: handle,
+                     payload: .object(["state": .string("running")])),
+        // The outstanding Handle blocks run.finished; an outcome cannot bypass that boundary.
+        reducerEvent(TimelineEventType.runFinished, id: "envelope-handle-10", sequence: 10,
+                     journal: reducerWorkJournal, previous: "envelope-handle-9", work: reducerWork,
+                     run: run),
+        reducerEvent(TimelineEventType.handleOutcome, id: "envelope-handle-11", sequence: 11,
+                     journal: reducerWorkJournal, previous: "envelope-handle-10", work: reducerWork,
+                     run: foreignRun, handle: handle,
+                     payload: .object(["state": .string("succeeded")])),
+        reducerEvent(TimelineEventType.handleOutcome, id: "envelope-handle-12", sequence: 12,
+                     journal: reducerWorkJournal, previous: "envelope-handle-11", work: reducerWork,
+                     run: run, handle: handle,
+                     payload: .object(["state": .string("   ")])),
+        reducerEvent(TimelineEventType.handleOutcome, id: "envelope-handle-13", sequence: 13,
+                     journal: reducerWorkJournal, previous: "envelope-handle-12", work: reducerWork,
+                     run: run, handle: handle,
+                     payload: .object(["state": .string("succeeded")])),
+        // A terminal Handle cannot be reused or terminalized by a second outcome.
+        reducerEvent(TimelineEventType.handleOutcome, id: "envelope-handle-14", sequence: 14,
+                     journal: reducerWorkJournal, previous: "envelope-handle-13", work: reducerWork,
+                     run: run, handle: handle,
+                     payload: .object(["state": .string("failed")])),
+        reducerEvent(TimelineEventType.runFinished, id: "envelope-handle-15", sequence: 15,
+                     journal: reducerWorkJournal, previous: "envelope-handle-14", work: reducerWork,
+                     run: run),
+    ]
+    let handles = WorkReducer.reduce(handleEvents)
+    XCTAssertNil(handles.activeRun)
+    XCTAssertEqual(handles.handles[handle.handleID]?.state, "succeeded")
+    XCTAssertEqual(handles.quarantinedEvents.map(\.eventID), [
+        "envelope-handle-3", "envelope-handle-4", "envelope-handle-5", "envelope-handle-6",
+        "envelope-handle-7", "envelope-handle-9", "envelope-handle-10", "envelope-handle-11",
+        "envelope-handle-12", "envelope-handle-14",
+    ])
+    XCTAssertTrue(handles.structuralIntegrityValid)
+    XCTAssertFalse(handles.semanticProjectionValid)
 }
 
 func test_sessionAttentionMalformedPayloadIsUnknownNotNone() throws {

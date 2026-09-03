@@ -1043,6 +1043,7 @@ public actor RunJournalBundle {
             }
             var payload: [String: JSONValue] = [
                 "operation": .string(coverage.operation.rawValue),
+                "work_journal": encodeTimelineValue(self.workJournal),
                 "planes": .object(Dictionary(uniqueKeysWithValues:
                     RecoveryPlane.allCases.map { plane in
                         (plane.rawValue, .string(coverage.planes[plane]!.rawValue))
@@ -1057,7 +1058,8 @@ public actor RunJournalBundle {
             }
             return try await self.appendSession(TimelineEventDraft(
                 hostSequence: self.nextHostOrder(), session: self.session,
-                work: self.work, workHost: self.workHost, run: self.activeRun,
+                work: self.work, workHost: self.workHost,
+                sessionAttachment: self.sessionAttachment, run: self.activeRun,
                 type: TimelineEventType.recoveryCoverage,
                 declaredDomains: [.session, .work, .context, .runtime, .externalEffects],
                 payload: .object(payload)))

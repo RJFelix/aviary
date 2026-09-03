@@ -31,6 +31,20 @@ consume a canonical Session search projection exercised by that same fixture. Na
 notifications now consume the same canonical Session/Work projection; service recovery remains
 explicitly unwired.
 
+The first canonical Work-recovery projection is now a bounded, reader-owned join rather than a
+claim of host liveness. It keeps last-recorded durable Work disposition, exact Work-journal
+generation and cursors, Run history, actions/Handles/commands, Session and client attachments,
+source-qualified six-plane recovery claims, unknown domains, corruption, and every omission as
+separate facts. Explicit in-process observations are scoped to one requested client and can report
+that client's attached/detached/reattachable presentation only when they match the current Work,
+Run, Session attachment, and durable client capability; they never prove that a Work Host is alive.
+Two GUIs can therefore disagree about their own attachment state without changing the shared
+durable Work result. Replaced Work journals, duplicate Work facts, reused/empty identities,
+oversized metadata, and recovery claims for another journal generation fail closed. The local GUI
+stores this projection from the same catalog scan used for notifications, but supplies no synthetic
+client or host observation. A real reachable-host/reattachment dimension remains Phase 3 service
+work.
+
 A canonical catalog adapter now projects authority-qualified Session identities and attached Work
 at independently verified requested/observed cursors. Only attached, exactly aligned Work with
 valid structural and semantic reducer projections can lend the catalog lifecycle, model,
@@ -68,8 +82,11 @@ failed-recovery, and ready-for-review transitions. It observes permission withou
 launch, baselines rather than replays attention accumulated while delivery is disabled, uses bounded
 typed cold-click routes,
 and preserves the route's Session/Work/action/cursor identity in the workspace. Session selection is
-re-resolved canonically; reconciling every Work/action/cursor field against the current catalog before
-labeling the focus as exact evidence is part of the Work-recovery follow-up. Unknown, corrupt,
+re-resolved canonically; every Session/Work/attachment/action/cursor field is reconciled against the
+same current catalog before the inspector labels it exact evidence. Stale clicks still select the
+Session but show an explicit current-state warning, and polling clears an already-open evidence card
+as soon as either journal advances or the action resolves. Failed-recovery selection is qualified by
+Work journal and Session attachment rather than a bare action ID. Unknown, corrupt,
 unaligned, or conflicting rows cannot lend notification facts, while unrelated exact Sessions remain
 independently actionable. Delivery checkpoints are bounded and persisted; cold-click queues are
 bounded but currently in memory. An OS-acceptance crash window still provides at-least-once rather
@@ -158,10 +175,10 @@ creating an empty visible chat row.
 
 The Apple Swift 6.3.3 compiler accepts the SDK emitted by Apple Swift 6.3.2; the compatibility probe
 configures its own writable module cache and succeeds both directly and through every gate. At this
-checkpoint, the full suite passes 499 cases / 5,592 assertions in 47.06 seconds and `just compile`
-is clean. Phase 1 passes 208 cases / 3,661 assertions in 16.45 seconds. The versioned 100,000-event
-benchmark reads and reduces a 46,766,700-byte input in 5.769 seconds on the checkpoint machine
-(generation 0.880 seconds). The visual gate renders all 9 canonical screens; it also caught and
+checkpoint, the full suite passes 516 cases / 5,776 assertions in 47.45 seconds and `just compile`
+is clean. Phase 1 passes 225 cases / 3,847 assertions in 17.55 seconds. The versioned 100,000-event
+benchmark reads and reduces a 46,766,700-byte input in 5.633 seconds on the checkpoint machine
+(generation 0.892 seconds). The visual gate renders all 9 canonical screens; it also caught and
 closed a SwiftPM snapshot crash by making the UserNotifications adapter available only from a real
 application bundle. Final Sol review found
 no remaining must-fix issue after exact cursor/attachment/read authority, local action-time
@@ -172,10 +189,14 @@ replay, metadata-only inspection, parent-qualified legacy selection, multi-Sessi
 bounded evidence, conflict projection, Work-liveness separation, bounded search allocation, and
 wrapper-only injection findings were remediated. A second notification-specific Sol review found no
 P0/P1 blocker after typed turn outcomes, turn/run transition deduplication, per-Session conflict
-isolation, authorization gating, bounded typed routes, and cold-click routing were remediated.
+isolation, authorization gating, bounded typed routes, and cold-click routing were remediated. A
+third Work-recovery Sol review found no P0; its one-sided attachment, activity-envelope, and absent-
+Work Census findings were then closed with reciprocal Session/Work joins, Run-qualified turn and
+Handle transitions, explicit omission accounting, and an Aviary-owned fixture migration.
 
 Phase 0 still owes real VoiceOver/keyboard UI automation and broader driver focus/race proof. Phase 1
-still owes the remaining canonical consumer migrations (service recovery and other named legacy
+still owes the remaining canonical consumer migrations (the Work Host service recovery source and
+other named pre-canonical
 readers); individual skill/memory identity and included-versus-listed
 provenance inside the now-durable block-level prompt sources; independent native Work bundles for
 children; actual disk-full and permission fault reachability; and a measured

@@ -212,7 +212,7 @@ public struct CanonicalNotificationRoute: Codable, Hashable, Sendable {
               workCursor.map({ $0.sequence > 0 && ($0.eventID?.isEmpty == false) }) ?? true,
               case .session(let owner) = sessionJournal.owner, owner == session,
               sourceSessionCursor.journal == sessionJournal,
-              sourceSessionEvent?.journal == sessionJournal
+              sourceSessionEvent.map({ $0.journal == sessionJournal }) ?? true
         else { return false }
         if let work {
             guard let workJournal,
@@ -268,6 +268,15 @@ public struct CanonicalNotificationProjection: Codable, Hashable, Sendable {
         sourceComplete && omittedCandidateCount == 0 && omittedStateCount == 0
     }
 
+    /// Resolve the exact route currently supported by this projection. Equality intentionally
+    /// includes Session/Work/action identity plus both evidence cursors, so a stale click cannot
+    /// be treated as the same transition merely because it names the same Session.
+    public func candidate(matching route: CanonicalNotificationRoute)
+        -> CanonicalNotificationCandidate? {
+        guard route.isValid else { return nil }
+        return candidates.first { $0.route == route }
+    }
+
     public init(
         summaries: [CanonicalSessionCatalogSummary],
         maxCandidates: Int = CanonicalNotificationProjection.maximumCandidateCount,
@@ -310,10 +319,24 @@ public struct CanonicalNotificationProjection: Codable, Hashable, Sendable {
             case .error:
                 // An indeterminate effect is a recovery boundary, not an ordinary error. Keep
                 // the action identity when one exists so a click can land on the right card.
-                if let actionID = summary.work.flatMap(\.indeterminateActionIDs).sorted().first {
+                let indeterminateActions = summary.work.flatMap { work in
+                    guard work.canProjectExecution, let journal = work.journal else {
+                        return [(work: CanonicalWorkCatalogSummary, actionID: String, key: String)]()
+                    }
+                    return work.indeterminateActionIDs.map { actionID in
+                        (work: work, actionID: actionID,
+                         key: journal.stableKey
+                            + "|attachment:\(work.attachment.attachmentID.utf8.count):"
+                            + work.attachment.attachmentID
+                            + "|action:\(actionID.utf8.count):" + actionID)
+                    }
+                }.sorted { lhs, rhs in
+                    lhs.key < rhs.key
+                }
+                if let selected = indeterminateActions.first {
                     kind = .failedRecovery
-                    action = ActionRef(actionID)
-                    actionWork = summary.work.first { $0.indeterminateActionIDs.contains(actionID) }
+                    action = ActionRef(selected.actionID)
+                    actionWork = selected.work
                 } else {
                     kind = .needsYou
                     action = nil

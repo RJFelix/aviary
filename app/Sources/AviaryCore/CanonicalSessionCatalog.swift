@@ -41,6 +41,9 @@ public struct CanonicalWorkCatalogSummary: Codable, Hashable, Sendable, Identifi
     public let isAttached: Bool
     /// False when an unknown Session-journal event may have changed attachment semantics.
     public let attachmentProjectionKnown: Bool
+    /// Capabilities declared by this Session attachment. Multiple Session attachments may point
+    /// at one Work; no GUI is treated as the Work owner.
+    public let attachmentCapabilities: [String]
     public let isAvailable: Bool
     public let lifecycle: WorkLifecycle
     public let execution: WorkExecution
@@ -110,6 +113,7 @@ public struct CanonicalWorkCatalogSummary: Codable, Hashable, Sendable, Identifi
             workReadIsCanonical: Self.workReadIsCanonical(workRead, for: trustedWork))
         self.isAttached = attachment.isAttached
         self.attachmentProjectionKnown = attachmentProjectionKnown
+        self.attachmentCapabilities = attachment.capabilities.sorted()
         self.isAvailable = trustedWork != nil
         let aligned = self.cursorAlignment == .exact
         self.structuralIntegrityValid = trustedWork?.structuralIntegrityValid ?? false
@@ -366,6 +370,9 @@ public struct CanonicalSessionCatalogSummary: Codable, Hashable, Sendable, Ident
     public let sessionCursorAlignment: CanonicalWorkCatalogSummary.CursorAlignment
     /// Compatibility cursor for legacy callers. This is the actual read cursor, if any.
     public let sessionCursor: JournalCursor?
+    /// Recovery claims retain their recording event and Work/Run envelope. The coverage's
+    /// evidence cursor is the recovered prefix, not the claim event itself.
+    public let recordedRecoveryCoverage: [RecordedRecoveryCoverage]?
     public let work: [CanonicalWorkCatalogSummary]
     public let assemblyReady: Bool
     public let sessionStructuralIntegrityValid: Bool
@@ -484,6 +491,7 @@ public struct CanonicalSessionCatalogSummary: Codable, Hashable, Sendable, Ident
             duplicateReadEventIDs: duplicateReadEventIDs,
             readHasValidChain: CanonicalWorkCatalogSummary.readHasValidChain(sessionRead))
         self.sessionCursor = readCursor
+        self.recordedRecoveryCoverage = sessionFactsKnown ? session.recordedRecovery : nil
         self.sessionStructuralIntegrityValid = session.structuralIntegrityValid
         self.sessionSemanticProjectionValid = session.semanticProjectionValid
         let readIsExact = self.sessionCursorAlignment == .exact

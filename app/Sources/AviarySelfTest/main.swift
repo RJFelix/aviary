@@ -6283,6 +6283,18 @@ let casesPhase1Timeline: [Case] = [
     ("phase1: live and cold timeline prefixes reduce identically", {
         try test_timelineReducersLiveAndColdPrefixEquivalence()
     }),
+    ("phase1: attachment and Run identities cannot be reused", {
+        try test_timelineReducersRejectAttachmentAndRunIdentityReuse()
+    }),
+    ("phase1: empty attachment identities are quarantined", {
+        try test_timelineReducersRejectEmptyAttachmentIdentities()
+    }),
+    ("phase1: empty action Handle and command identities are quarantined", {
+        try test_timelineReducerRejectsEmptyActivityIdentities()
+    }),
+    ("phase1: turn and Handle activity envelopes fail closed", {
+        try test_timelineReducerRejectsInvalidTurnAndHandleActivityEnvelopes()
+    }),
     ("phase1: malformed Session attention stays unknown", {
         try test_sessionAttentionMalformedPayloadIsUnknownNotNone()
     }),
@@ -6366,6 +6378,12 @@ let casesPhase1Timeline: [Case] = [
     }),
     ("phase1 notifications: routes are bounded and identity validated", {
         try test_canonicalNotificationRouteRejectsOversizedOrForeignPayloads()
+    }),
+    ("phase1 notifications: stale routes do not reconcile", {
+        try test_canonicalNotificationProjectionReconcilesIdenticalRoutesOnly()
+    }),
+    ("phase1 notifications: same Work action is qualified by attachment deterministically", {
+        try test_canonicalNotificationProjectionQualifiesSameWorkActionByAttachment()
     }),
     ("phase1 notifications: checkpoint state stays bounded", {
         try test_canonicalNotificationCheckpointIsBoundedAndCurrentKeysSurvivePruning()
@@ -6720,6 +6738,42 @@ let casesLocalTimelineCatalog: [Case] = [
     }),
 ]
 
+let casesCanonicalWorkRecoveryProjection: [Case] = [
+    ("phase1 Work recovery: durable facts and client-scoped observations", {
+        try test_canonicalWorkRecoveryProjectionUsesDurableWorkEvidenceAndScopesObservers()
+    }),
+    ("phase1 Work recovery: terminal and unknown states fail closed", {
+        try test_canonicalWorkRecoveryProjectionTerminalAndUnknownStatesFailClosed()
+    }),
+    ("phase1 Work recovery: observation without catalog evidence is unverified", {
+        try test_canonicalWorkRecoveryProjectionDoesNotManufactureRecoveryWithoutCatalogEvidence()
+    }),
+    ("phase1 Work recovery: duplicate Work identities are ambiguous", {
+        try test_canonicalWorkRecoveryProjectionDuplicateWorkRefsAcrossJournalsAreAmbiguous()
+    }),
+    ("phase1 Work recovery: catalog retains recovery source envelope", {
+        try test_canonicalWorkRecoveryProjectionCatalogRetainsRecordedRecoveryEnvelope()
+    }),
+    ("phase1 Work recovery: production coverage joins by its full envelope", {
+        try await test_canonicalWorkRecoveryProjectionJoinsProductionRecoveryEnvelope()
+    }),
+    ("phase1 Work recovery: replaced Work journal claims do not cross generations", {
+        try test_canonicalWorkRecoveryProjectionRejectsRecoveryFromAnotherWorkJournalGeneration()
+    }),
+    ("phase1 Work recovery: cursor and Handle metadata honor configured bounds", {
+        try test_canonicalWorkRecoveryProjectionBoundsClientCursorAndHandleMetadata()
+    }),
+    ("phase1 Work recovery: recovery joins retain run membership beyond display cap", {
+        try test_canonicalWorkRecoveryProjectionUsesCompleteRunMembershipBeyondDisplayCap()
+    }),
+    ("phase1 Work recovery: Session claims require reciprocal Work attachments", {
+        try test_canonicalWorkRecoveryProjectionRequiresReciprocalWorkSessionAttachment()
+    }),
+    ("phase1 Work recovery: failed-recovery routes reconcile only while current", {
+        try await test_canonicalWorkRecoveryProjectionReconcilesOnlyCurrentFailedRecoveryRoute()
+    }),
+]
+
 let casesTimelineWriter: [Case] = [
     ("phase1 writer: fresh appendBatch bytes, reducer, and reopen", {
         try await test_timelineJournalWriterFreshBatchReopenAndReducer()
@@ -6817,7 +6871,8 @@ await Harness.run(
         + casesCrossingLaws + casesPhase0SessionControl + casesPhase1Timeline
         + casesContextManifest + casesPromptProvenance + casesNativeColdResume
         + casesCanonicalSessionSearch
-        + casesLocalTimelineCatalog + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
+        + casesLocalTimelineCatalog + casesCanonicalWorkRecoveryProjection
+        + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal
         + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel
         + casesNativeIndeterminateEffects + casesChildLifecycle

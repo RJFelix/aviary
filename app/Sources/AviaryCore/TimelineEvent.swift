@@ -624,6 +624,38 @@ public struct RecoveryCoverage: Codable, Hashable, Sendable {
     }
 }
 
+/// A recovery claim together with the journal event that recorded it. The coverage's evidence
+/// cursor identifies the prefix being recovered; this envelope identifies the Session/Work/Run
+/// that made the claim and is the only safe join key for a cold catalog projection.
+public struct RecordedRecoveryCoverage: Codable, Hashable, Sendable {
+    public let coverage: RecoveryCoverage
+    public let sourceEvent: EventRef
+    public let session: SessionRef
+    public let work: WorkRef
+    /// The exact Work journal generation whose state the recovery claim describes. A WorkRef
+    /// alone is insufficient because its journal can be replaced while retaining the same Work
+    /// identity.
+    public let workJournal: JournalRef
+    public let workHost: WorkHostRef
+    public let sessionAttachment: SessionAttachmentRef
+    public let run: RunRef
+
+    public init(
+        coverage: RecoveryCoverage, sourceEvent: EventRef, session: SessionRef,
+        work: WorkRef, workJournal: JournalRef, workHost: WorkHostRef,
+        sessionAttachment: SessionAttachmentRef, run: RunRef
+    ) {
+        self.coverage = coverage
+        self.sourceEvent = sourceEvent
+        self.session = session
+        self.work = work
+        self.workJournal = workJournal
+        self.workHost = workHost
+        self.sessionAttachment = sessionAttachment
+        self.run = run
+    }
+}
+
 public enum RecoveryOperation: String, Codable, Hashable, Sendable {
     case reattachLiveHost = "reattach_live_host"
     case coldResume = "cold_resume"
@@ -1269,6 +1301,10 @@ public struct WorkSnapshot: Codable, Hashable, Sendable {
     public var attachedClientIDs: Set<String> = []
     public var clientAttachments: [String: ClientAttachmentSnapshot] = [:]
     public var activeRun: RunRef?
+    /// Every Run identity admitted by a canonical `run.started` event. Current liveness remains
+    /// `activeRun`; this history exists so later Session-owned recovery claims can prove which
+    /// execution attempt they describe after that Run finishes.
+    public var observedRunIDs: Set<String> = []
     /// The currently effective model, projected from run/model events rather than inferred by
     /// a secondary reader scanning arbitrary payloads.
     public var modelID: String?
@@ -1282,6 +1318,7 @@ public struct WorkSnapshot: Codable, Hashable, Sendable {
     public var childStates: [String: String] = [:]
     public var lastHostSequence: Int?
     public var recovery: [RecoveryCoverage] = []
+    public var recordedRecovery: [RecordedRecoveryCoverage] = []
     public var semanticTip: EventRef?
     public var unknownDomains: Set<TimelineDomain> = []
     public var lastEventID: String?
@@ -1372,6 +1409,7 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
     /// Child lifecycle is retained on whichever journal records the observation.
     public var childStates: [String: String] = [:]
     public var recovery: [RecoveryCoverage] = []
+    public var recordedRecovery: [RecordedRecoveryCoverage] = []
     public var semanticTip: EventRef?
     public var unknownDomains: Set<TimelineDomain> = []
     public var lastEventID: String?

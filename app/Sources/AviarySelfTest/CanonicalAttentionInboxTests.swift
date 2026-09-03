@@ -82,6 +82,7 @@ private func attentionSummary(
     requestedCursor: JournalCursor? = nil,
     attachmentIDs: [String] = ["attention-attachment"],
     workSnapshot: Bool = true,
+    indeterminateActionID: String? = nil,
     workRead: TimelineJournalReadResult? = nil,
     sessionRead: TimelineJournalReadResult? = attentionRead(
         journal: attentionSessionJournal, eventID: "s1", sequence: 1)
@@ -127,6 +128,11 @@ private func attentionSummary(
         work.eventSequences = ["w1": 1]
         work.unknownDomains = workUnknownDomains
         work.corruptionReasons = workCorruptionReasons
+        if let indeterminateActionID {
+            work.actions[indeterminateActionID] = WorkActionSnapshot(
+                action: ActionRef(indeterminateActionID), state: .indeterminateEffect,
+                failureKind: .indeterminateEffect, retrySafety: .unknown)
+        }
         work.unknownEvents = (0..<workUnknownEventCount).map { index in
             let event = TimelineEvent(
                 eventID: "work-unknown-\(index)", journal: attentionWorkJournal,
@@ -616,6 +622,51 @@ func test_canonicalNotificationRouteRejectsOversizedOrForeignPayloads() throws {
             journal: attentionSessionJournal, eventID: "event", sequence: 1))
     XCTAssertFalse(incoherentFields.isValid,
                    "review routes cannot carry failed-action fields")
+}
+
+func test_canonicalNotificationProjectionReconcilesIdenticalRoutesOnly() throws {
+    let summary = try attentionSummary(
+        workRead: attentionRead(journal: attentionWorkJournal, eventID: "w1", sequence: 1))
+    let projection = CanonicalNotificationProjection(summaries: [summary])
+    let candidate = try XCTUnwrap(projection.candidates.first)
+    XCTAssertTrue(candidate.route.isValid,
+                  "a cursor-backed route does not require a separate attention EventRef")
+    XCTAssertEqual(projection.candidate(matching: candidate.route)?.id, candidate.id)
+
+    let stale = CanonicalNotificationRoute(
+        kind: candidate.kind, session: candidate.actionIdentity.session,
+        sessionJournal: candidate.actionIdentity.sessionJournal,
+        work: candidate.actionIdentity.work, workJournal: candidate.actionIdentity.workJournal,
+        sessionAttachment: candidate.actionIdentity.sessionAttachment,
+        action: candidate.actionIdentity.action, outcome: candidate.actionIdentity.outcome,
+        sourceSessionCursor: JournalCursor(
+            journal: candidate.sourceCursor.journal,
+            eventID: "later-session-event", sequence: candidate.sourceCursor.sequence + 1),
+        sourceSessionEvent: candidate.sourceEvent,
+        workCursor: candidate.workCursor)
+    XCTAssertTrue(stale.isValid)
+    XCTAssertNil(projection.candidate(matching: stale))
+}
+
+func test_canonicalNotificationProjectionQualifiesSameWorkActionByAttachment() throws {
+    let first = try attentionSummary(
+        attention: .error, attachmentIDs: ["z-attachment", "a-attachment"],
+        indeterminateActionID: "shared-action",
+        workRead: attentionRead(journal: attentionWorkJournal, eventID: "w1", sequence: 1))
+    let second = try attentionSummary(
+        attention: .error, attachmentIDs: ["a-attachment", "z-attachment"],
+        indeterminateActionID: "shared-action",
+        workRead: attentionRead(journal: attentionWorkJournal, eventID: "w1", sequence: 1))
+    let firstCandidate = try XCTUnwrap(
+        CanonicalNotificationProjection(summaries: [first]).candidates.first)
+    let secondCandidate = try XCTUnwrap(
+        CanonicalNotificationProjection(summaries: [second]).candidates.first)
+    XCTAssertEqual(firstCandidate.kind, .failedRecovery)
+    XCTAssertEqual(firstCandidate.actionIdentity.sessionAttachment,
+                   SessionAttachmentRef("a-attachment"))
+    XCTAssertEqual(secondCandidate.actionIdentity.sessionAttachment,
+                   SessionAttachmentRef("a-attachment"))
+    XCTAssertEqual(firstCandidate.route, secondCandidate.route)
 }
 
 func test_canonicalNotificationCheckpointIsBoundedAndCurrentKeysSurvivePruning() throws {

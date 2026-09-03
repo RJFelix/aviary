@@ -326,6 +326,11 @@ struct SessionsView: View {
 
     private var transcriptPane: some View {
         VStack(spacing: 0) {
+            if let error = model.canonicalNotificationError {
+                NoticeBanner(
+                    level: .warning, title: "Notification state", message: error)
+                Divider()
+            }
             if let focus = model.canonicalNotificationFocusForSelectedSession {
                 notificationEvidenceFocusCard(focus)
                 Divider()

@@ -60,9 +60,13 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(flock.workHost, WorkHostRef("census-host"))
     XCTAssertEqual(flock.cursor?.eventID, "w21")
     XCTAssertEqual(flock.nodes.map(\.childID), ["child-1"])
-    XCTAssertEqual(flock.nodes[0].state, "completed")
-    XCTAssertNil(flock.nodes[0].name, "fixture omits a display name; Flock must not invent one")
-    XCTAssertEqual(flock.nodes[0].source.eventID, "w19")
+    if let flockNode = flock.nodes.first {
+        XCTAssertEqual(flockNode.state, "completed")
+        XCTAssertNil(flockNode.name, "fixture omits a display name; Flock must not invent one")
+        XCTAssertEqual(flockNode.source.eventID, "w19")
+    } else {
+        XCTFail("fixture Work row should retain its child lifecycle evidence")
+    }
     let flockCatalog = try XCTUnwrap(report.canonicalFlockCatalog.first)
     XCTAssertFalse(flockCatalog.childLifecycleAvailable,
                    "Reader Census must exercise the production Flock projection boundary")
@@ -74,6 +78,7 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
         "production local Timeline catalog", "canonical SessionCatalog projection",
         "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
         "canonical Session search", "canonical notification projection",
+        "canonical Work recovery projection",
     ])
     let search = report.canonicalSessionSearch
     let searchDocument = try XCTUnwrap(search.documents.first)
@@ -115,6 +120,37 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
         ReaderCensusReport.self, from: serializedReport)
     XCTAssertEqual(restoredReport.canonicalNotifications, report.canonicalNotifications,
                    "the notification consumer receipt must survive Reader Census serialization")
+    XCTAssertEqual(restoredReport.canonicalWorkRecovery, report.canonicalWorkRecovery,
+                   "the Work recovery consumer receipt must survive Reader Census serialization")
+    let recoveryProjection = try XCTUnwrap(report.canonicalWorkRecovery.rows.first)
+    XCTAssertEqual(recoveryProjection.work,
+                   WorkRef(workHostID: "census-host", workID: "census-work"))
+    XCTAssertEqual(recoveryProjection.journal, censusWorkJournal)
+    XCTAssertEqual(recoveryProjection.disposition, .uncertain,
+                   "the fixture has complete durable Work facts but an unknown external-effects domain")
+    XCTAssertEqual(recoveryProjection.activeRun, RunRef("run-1"))
+    XCTAssertEqual(recoveryProjection.activeTurn, TurnRef("turn-1"))
+    XCTAssertEqual(recoveryProjection.cursor?.eventID, "w21")
+    XCTAssertEqual(recoveryProjection.committedPrefixCursor?.eventID, "w21")
+    XCTAssertEqual(recoveryProjection.sessionAttachments.map(\.attachment.attachmentID).sorted(),
+                   ["sa-main", "sa-remote"])
+    XCTAssertEqual(recoveryProjection.clientAttachments.map(\.attachment.attachmentID).sorted(),
+                   ["ca-local", "ca-remote"])
+    XCTAssertEqual(recoveryProjection.recoveryCoverage.count, 1)
+    if let recovery = recoveryProjection.recoveryCoverage.first {
+        XCTAssertEqual(recovery.coverage.operation, .coldResume)
+    } else {
+        XCTFail("the bounded Work recovery row should retain its recorded coverage")
+    }
+    XCTAssertEqual(recoveryProjection.unknownEventRefs.map(\.eventID), ["w21"])
+    XCTAssertEqual(recoveryProjection.unknownDomains, [.externalEffects])
+    XCTAssertEqual(recoveryProjection.omittedAttachmentCount, 0)
+    XCTAssertEqual(recoveryProjection.omittedRecoveryCoverageCount, 0)
+    XCTAssertTrue(report.canonicalWorkRecovery.sourceComplete,
+                  "unknown row domains are evidence, not global discovery incompleteness")
+    XCTAssertEqual(report.canonicalWorkRecovery.omittedRowCount, 0)
+    XCTAssertEqual(report.canonicalWorkRecovery.omittedAttachmentCount, 0)
+    XCTAssertEqual(report.canonicalWorkRecovery.omittedObservationCount, 0)
     var notificationDelivery = CanonicalNotificationDelivery()
     XCTAssertTrue(notificationDelivery.plan(report.canonicalNotifications).candidates.isEmpty,
                   "Reader Census must exercise the production delivery gate, not only register its name")
@@ -443,6 +479,9 @@ func test_readerCensusIncrementalChunksMatchWholeRead() throws {
         sessionRead: unattachedSession, workRead: unavailableWork,
         sessionJournal: censusSessionJournal, workJournal: censusWorkJournal)
     XCTAssertTrue(unattachedReport.assemblerReady)
+    XCTAssertTrue(unattachedReport.canonicalWorkRecovery.rows.isEmpty,
+                  "an absent Work page must not manufacture an identity-less recovery row")
+    XCTAssertFalse(unattachedReport.canonicalWorkRecovery.sourceComplete)
 }
 
 func test_readerCensusMalformedAndTruncatedTailsStayVisible() throws {

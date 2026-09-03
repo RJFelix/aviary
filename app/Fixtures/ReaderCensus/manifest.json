@@ -7,6 +7,6 @@
   "legacyJournal": "legacy.jsonl",
   "retainedBodies": ["bodies/tool-result.txt", "bodies/large-artifact.json"],
   "malformedVariants": ["variants/work-malformed.jsonl", "variants/work-truncated.jsonl"],
-  "registeredConsumers": ["production local Timeline catalog", "canonical SessionCatalog projection", "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter", "canonical Session search", "canonical notification projection"],
+  "registeredConsumers": ["production local Timeline catalog", "canonical SessionCatalog projection", "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter", "canonical Session search", "canonical notification projection", "canonical Work recovery projection"],
   "intentionallyUnwiredConsumers": ["service recovery"]
 }

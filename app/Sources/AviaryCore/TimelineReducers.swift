@@ -100,8 +100,14 @@ public struct WorkReducer: Sendable {
             snapshot.activeRun = nil
             snapshot.activeTurn = nil
         case TimelineEventType.sessionAttached:
-            guard let session = event.session, let attachment = event.sessionAttachment else {
+            guard let session = event.session, !session.sessionID.isEmpty,
+                  let attachment = event.sessionAttachment, !attachment.attachmentID.isEmpty else {
                 quarantine(event, reason: "Work session attachment is malformed")
+                return
+            }
+            if let existing = snapshot.sessionAttachments[attachment.attachmentID],
+               existing.session != session {
+                quarantine(event, reason: "Work session attachment identity was reused by another Session")
                 return
             }
             snapshot.attachedSessionIDs.insert(session.sessionID)
@@ -132,8 +138,14 @@ public struct WorkReducer: Sendable {
             state.capabilities = Set(capabilities)
             snapshot.sessionAttachments[attachment.attachmentID] = state
         case TimelineEventType.clientAttached:
-            guard let client = event.client, let attachment = event.clientAttachment else {
+            guard let client = event.client, !client.clientID.isEmpty,
+                  let attachment = event.clientAttachment, !attachment.attachmentID.isEmpty else {
                 quarantine(event, reason: "Work client attachment is malformed")
+                return
+            }
+            if let existing = snapshot.clientAttachments[attachment.attachmentID],
+               existing.client != client {
+                quarantine(event, reason: "Work client attachment identity was reused by another client")
                 return
             }
             snapshot.clientAttachments[attachment.attachmentID] = ClientAttachmentSnapshot(
@@ -173,11 +185,16 @@ public struct WorkReducer: Sendable {
             state.cursor = cursor
             snapshot.clientAttachments[attachment.attachmentID] = state
         case TimelineEventType.runStarted:
-            guard !isTerminalLifecycle else {
-                quarantine(event, reason: "run cannot start on terminal Work")
+            guard !isTerminalLifecycle, snapshot.activeRun == nil,
+                  let run = event.run, !run.runID.isEmpty,
+                  !snapshot.observedRunIDs.contains(run.runID) else {
+                quarantine(
+                    event,
+                    reason: "run cannot start without a fresh identity, while another Run is active, or on terminal Work")
                 return
             }
-            snapshot.activeRun = event.run
+            snapshot.activeRun = run
+            snapshot.observedRunIDs.insert(run.runID)
             snapshot.modelID = event.payload["model_id"]?.stringValue
                 ?? event.payload["model"]?.stringValue
             snapshot.execution = .running
@@ -186,8 +203,10 @@ public struct WorkReducer: Sendable {
             // The active Run is the thing this event is finishing. Requiring
             // `activeRun == nil` here made every run.finished event self-contradictory;
             // only actions, a turn, or live Handles must be quiescent first.
-            guard !hasOutstandingRunWork else {
-                quarantine(event, reason: "run finished while actions, a turn, or Handles remain outstanding")
+            guard let run = event.run, run == snapshot.activeRun, !hasOutstandingRunWork else {
+                quarantine(
+                    event,
+                    reason: "run finish does not match the active Run or Work remains outstanding")
                 return
             }
             snapshot.activeRun = nil
@@ -201,13 +220,27 @@ public struct WorkReducer: Sendable {
             }
             snapshot.modelID = model
         case TimelineEventType.turnStarted:
-            snapshot.activeTurn = event.turn
+            guard let run = event.run, run == snapshot.activeRun,
+                  let turn = event.turn,
+                  !turn.turnID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  snapshot.activeTurn == nil else {
+                quarantine(event, reason: "turn start requires the active Run, a non-empty identity, and no active turn")
+                return
+            }
+            snapshot.activeTurn = turn
             snapshot.execution = .running
         case TimelineEventType.turnFinished:
+            guard let run = event.run, run == snapshot.activeRun,
+                  let turn = event.turn,
+                  !turn.turnID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  turn == snapshot.activeTurn else {
+                quarantine(event, reason: "turn finish must match the active Run and active turn")
+                return
+            }
             snapshot.activeTurn = nil
             if snapshot.activeActionIDs.isEmpty { snapshot.execution = .idle }
         case TimelineEventType.actionStarted:
-            guard let action = event.action,
+            guard let action = event.action, !action.actionID.isEmpty,
                   let existing = snapshot.actions[action.actionID],
                   existing.state == .proposed,
                   let state = event.payload["state"]?.stringValue.flatMap(ActionExecutionState.init(rawValue:)),
@@ -220,7 +253,7 @@ public struct WorkReducer: Sendable {
             snapshot.activeActionIDs.insert(action.actionID)
             snapshot.execution = .running
         case TimelineEventType.actionIntent:
-            guard let action = event.action,
+            guard let action = event.action, !action.actionID.isEmpty,
                   snapshot.actions[action.actionID] == nil,
                   event.payload["state"]?.stringValue.flatMap(ActionExecutionState.init(rawValue:)) == .proposed
             else {
@@ -231,19 +264,56 @@ public struct WorkReducer: Sendable {
         case TimelineEventType.actionOutcome:
             applyActionOutcome(event)
         case TimelineEventType.handleStarted:
-            if let handle = event.handle {
-                snapshot.handles[handle.handleID] = WorkHandleSnapshot(
-                    handle: handle, state: event.payload["state"]?.stringValue ?? "running")
+            guard let run = event.run, run == snapshot.activeRun,
+                  let handle = event.handle,
+                  !handle.handleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  snapshot.handles[handle.handleID] == nil else {
+                quarantine(event, reason: "Handle start requires the active Run, a fresh non-empty identity, and no existing Handle")
+                return
             }
+            guard let state = event.payload["state"]?.stringValue,
+                  !state.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                quarantine(event, reason: "Handle start is missing state")
+                return
+            }
+            snapshot.handles[handle.handleID] = WorkHandleSnapshot(handle: handle, state: state)
         case TimelineEventType.handleOutcome:
-            if let handle = event.handle {
-                snapshot.handles[handle.handleID] = WorkHandleSnapshot(
-                    handle: handle, state: event.payload["state"]?.stringValue ?? "unknown")
+            guard let run = event.run, run == snapshot.activeRun,
+                  let handle = event.handle,
+                  !handle.handleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let existing = snapshot.handles[handle.handleID],
+                  !isTerminalHandleState(existing.state) else {
+                quarantine(event, reason: "Handle outcome requires the active Run and an outstanding Handle")
+                return
             }
+            guard let state = event.payload["state"]?.stringValue,
+                  !state.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                quarantine(event, reason: "Handle outcome is missing state")
+                return
+            }
+            snapshot.handles[handle.handleID] = WorkHandleSnapshot(handle: handle, state: state)
         case TimelineEventType.recoveryCoverage:
-            if let coverage = decodeRecoveryCoverage(event.payload) {
-                snapshot.recovery.append(coverage)
+            guard let coverage = decodeRecoveryCoverage(event.payload),
+                  let session = event.session, !session.sessionID.isEmpty,
+                  let attachment = event.sessionAttachment, !attachment.attachmentID.isEmpty,
+                  let sessionState = snapshot.sessionAttachments[attachment.attachmentID],
+                  sessionState.session == session, sessionState.isAttached,
+                  let work = event.work, work == snapshot.work,
+                  let workJournal: JournalRef = event.payload["work_journal"].flatMap({ decodeTimelineValue($0) }),
+                  workJournal.owner == .work(work),
+                  workJournal.authority.authorityID == work.workHostID,
+                  workJournal == snapshot.journal,
+                  let workHost = event.workHost, workHost.workHostID == work.workHostID,
+                  let run = event.run, run == snapshot.activeRun else {
+                quarantine(event, reason: "Work recovery coverage has an invalid identity envelope")
+                return
             }
+            snapshot.recovery.append(coverage)
+            snapshot.recordedRecovery.append(RecordedRecoveryCoverage(
+                coverage: coverage,
+                sourceEvent: EventRef(journal: event.journal, eventID: event.eventID),
+                session: session, work: work, workJournal: workJournal, workHost: workHost,
+                sessionAttachment: attachment, run: run))
         case TimelineEventType.childLifecycle:
             guard let childID = event.payload["child_id"]?.stringValue,
                   let state = event.payload["state"]?.stringValue,
@@ -256,6 +326,9 @@ public struct WorkReducer: Sendable {
              TimelineEventType.commandDelivered, TimelineEventType.commandNotDelivered,
              TimelineEventType.commandDeliveryIndeterminate:
             guard let command = event.command, let state = commandState(for: event.type),
+                  !command.commandID.isEmpty,
+                  command.client.map({ !$0.clientID.isEmpty }) ?? true,
+                  command.sessionAttachment.map({ !$0.attachmentID.isEmpty }) ?? true,
                   let hostSequence = event.hostSequence,
                   command.client == event.client,
                   command.sessionAttachment == event.sessionAttachment,
@@ -414,7 +487,7 @@ public struct WorkReducer: Sendable {
     }
 
     private mutating func applyActionOutcome(_ event: TimelineEvent) {
-        guard let action = event.action,
+        guard let action = event.action, !action.actionID.isEmpty,
               let existing = snapshot.actions[action.actionID],
               let state = event.payload["state"]?.stringValue.flatMap(ActionExecutionState.init(rawValue:)),
               legalActionTransition(from: existing.state, to: state)
@@ -482,12 +555,16 @@ public struct WorkReducer: Sendable {
 
     private var hasOutstandingWork: Bool {
         if snapshot.activeRun != nil || snapshot.activeTurn != nil || !snapshot.activeActionIDs.isEmpty { return true }
-        return snapshot.handles.values.contains { !["succeeded", "failed", "canceled", "completed"].contains($0.state) }
+        return snapshot.handles.values.contains { !isTerminalHandleState($0.state) }
     }
 
     private var hasOutstandingRunWork: Bool {
         if snapshot.activeTurn != nil || !snapshot.activeActionIDs.isEmpty { return true }
-        return snapshot.handles.values.contains { !["succeeded", "failed", "canceled", "completed"].contains($0.state) }
+        return snapshot.handles.values.contains { !isTerminalHandleState($0.state) }
+    }
+
+    private func isTerminalHandleState(_ state: String) -> Bool {
+        ["succeeded", "failed", "canceled", "completed"].contains(state)
     }
 
     private var isTerminalLifecycle: Bool {
@@ -564,8 +641,14 @@ public struct SessionReducer: Sendable {
         case TimelineEventType.sessionCreated:
             snapshot.lifecycle = .active
         case TimelineEventType.sessionAttached:
-            guard let work = event.work, let attachment = event.sessionAttachment else {
+            guard let work = event.work, !work.workHostID.isEmpty, !work.workID.isEmpty,
+                  let attachment = event.sessionAttachment, !attachment.attachmentID.isEmpty else {
                 quarantine(event, reason: "session attachment missing Work or attachment identity")
+                return
+            }
+            if let existing = snapshot.attachments[attachment.attachmentID],
+               existing.work != work {
+                quarantine(event, reason: "Session attachment identity was reused by another Work")
                 return
             }
             snapshot.attachments[attachment.attachmentID] = SessionAttachmentSnapshot(
@@ -602,8 +685,14 @@ public struct SessionReducer: Sendable {
             state.cursor = cursor
             snapshot.attachments[attachment.attachmentID] = state
         case TimelineEventType.clientAttached:
-            guard let client = event.client, let attachment = event.clientAttachment else {
+            guard let client = event.client, !client.clientID.isEmpty,
+                  let attachment = event.clientAttachment, !attachment.attachmentID.isEmpty else {
                 quarantine(event, reason: "Session client attachment is malformed")
+                return
+            }
+            if let existing = snapshot.clientAttachments[attachment.attachmentID],
+               existing.client != client {
+                quarantine(event, reason: "Session client attachment identity was reused by another client")
                 return
             }
             snapshot.clientAttachments[attachment.attachmentID] = ClientAttachmentSnapshot(
@@ -647,9 +736,26 @@ public struct SessionReducer: Sendable {
         case TimelineEventType.messageCommitted:
             appendMessage(event, role: event.payload["role"]?.stringValue ?? "assistant")
         case TimelineEventType.recoveryCoverage:
-            if let coverage = decodeRecoveryCoverage(event.payload) {
-                snapshot.recovery.append(coverage)
+            guard let coverage = decodeRecoveryCoverage(event.payload),
+                  let session = event.session, session == snapshot.session,
+                  let attachment = event.sessionAttachment, !attachment.attachmentID.isEmpty,
+                  let work = event.work,
+                  let workJournal: JournalRef = event.payload["work_journal"].flatMap({ decodeTimelineValue($0) }),
+                  workJournal.owner == .work(work),
+                  workJournal.authority.authorityID == work.workHostID,
+                  let attachmentState = snapshot.attachments[attachment.attachmentID],
+                  attachmentState.work == work, attachmentState.isAttached,
+                  let workHost = event.workHost, workHost.workHostID == work.workHostID,
+                  let run = event.run, !run.runID.isEmpty else {
+                quarantine(event, reason: "Session recovery coverage has an invalid identity envelope")
+                return
             }
+            snapshot.recovery.append(coverage)
+            snapshot.recordedRecovery.append(RecordedRecoveryCoverage(
+                coverage: coverage,
+                sourceEvent: EventRef(journal: event.journal, eventID: event.eventID),
+                session: session, work: work, workJournal: workJournal, workHost: workHost,
+                sessionAttachment: attachment, run: run))
         case TimelineEventType.childLifecycle:
             guard let childID = event.payload["child_id"]?.stringValue,
                   let state = event.payload["state"]?.stringValue,

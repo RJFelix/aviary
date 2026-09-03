@@ -110,12 +110,27 @@ public enum LocalTimelineCatalog {
         /// deliberately separate from the legacy AgentTree; an unavailable or unaligned read
         /// yields an unavailable projection and never lends child state to the UI.
         public let canonicalFlock: CanonicalFlockProjection?
+        /// Exact many-to-many attachment facts from the Work journal. These are facts about
+        /// who is attached, not ownership claims about any one GUI.
+        public let sessionAttachments: [WorkSessionAttachmentSnapshot]
+        public let clientAttachments: [ClientAttachmentSnapshot]
+        public let omittedSessionAttachmentCount: Int
+        public let omittedClientAttachmentCount: Int
+        /// Work-recorded recovery claims retain their source event and full identity envelope;
+        /// Session-recorded claims are joined separately through canonical Session summaries.
+        public let recoveryCoverage: [RecordedRecoveryCoverage]
+        public let omittedRecoveryCoverageCount: Int
+        public let runHistory: [RunRef]
+        public let omittedRunCount: Int
+        /// Complete membership proof retained inside AviaryCore for exact recovery-envelope
+        /// joins. Public consumers receive only the bounded `runHistory` projection above.
+        internal let observedRunIDs: Set<String>
         public let unknownEventRefs: [EventRef]
         public let unknownDomains: [TimelineDomain]
         public let tailBytes: Int
         public let corruptionReasons: [String]
 
-        fileprivate init(locatorID: String, work declaredWork: WorkRef?, journal: JournalRef?,
+        internal init(locatorID: String, work declaredWork: WorkRef?, journal: JournalRef?,
                          snapshot: WorkSnapshot?,
                          read: TimelineJournalReadResult?, available: Bool, reasons: [String],
                          limit: Int, presentationID: String? = nil) {
@@ -144,6 +159,51 @@ public enum LocalTimelineCatalog {
                 canonicalFlock = AgentTreeReader.canonicalProjection(work: snapshot, read: read)
             } else {
                 canonicalFlock = nil
+            }
+            let attachmentLimit = 256
+            if exact, let snapshot,
+               !snapshot.unknownDomains.contains(.work),
+               !snapshot.unknownDomains.contains(.session) {
+                let orderedSessions = snapshot.sessionAttachments.values.sorted {
+                    $0.attachment.attachmentID < $1.attachment.attachmentID
+                }
+                sessionAttachments = Array(orderedSessions.prefix(attachmentLimit))
+                omittedSessionAttachmentCount = max(0, orderedSessions.count - attachmentLimit)
+            } else {
+                sessionAttachments = []
+                omittedSessionAttachmentCount = 0
+            }
+            if exact, let snapshot, !snapshot.unknownDomains.contains(.work) {
+                let orderedClients = snapshot.clientAttachments.values.sorted {
+                    $0.attachment.attachmentID < $1.attachment.attachmentID
+                }
+                clientAttachments = Array(orderedClients.prefix(attachmentLimit))
+                omittedClientAttachmentCount = max(0, orderedClients.count - attachmentLimit)
+                let runLimit = 256
+                let orderedRuns = snapshot.observedRunIDs.sorted().map(RunRef.init)
+                runHistory = Array(orderedRuns.prefix(runLimit))
+                omittedRunCount = max(0, orderedRuns.count - runLimit)
+                observedRunIDs = snapshot.observedRunIDs
+            } else {
+                clientAttachments = []
+                omittedClientAttachmentCount = 0
+                runHistory = []
+                omittedRunCount = 0
+                observedRunIDs = []
+            }
+            // Recovery claims are themselves typed Work facts. Preserve bounded, envelope-
+            // qualified claims when another domain is unknown; that uncertainty remains visible
+            // on the Work recovery row rather than erasing the claim and its source evidence.
+            if exact, let snapshot, !snapshot.unknownDomains.contains(.work) {
+                let orderedRecovery = snapshot.recordedRecovery.sorted {
+                    Self.recoveryKey($0) < Self.recoveryKey($1)
+                }
+                let recoveryLimit = 64
+                recoveryCoverage = Array(orderedRecovery.prefix(recoveryLimit))
+                omittedRecoveryCoverageCount = max(0, orderedRecovery.count - recoveryLimit)
+            } else {
+                recoveryCoverage = []
+                omittedRecoveryCoverageCount = 0
             }
             if exact, let snapshot {
                 let workFactsKnown = !snapshot.unknownDomains.contains(.work)
@@ -184,6 +244,10 @@ public enum LocalTimelineCatalog {
             tailBytes = (read?.truncatedTail?.rawBytes.count ?? 0)
                 + (read?.quarantinedSuffix?.rawBytes.count ?? 0)
             corruptionReasons = reasons.prefix(limit).map { String($0.prefix(512)) }
+        }
+
+        private static func recoveryKey(_ value: RecordedRecoveryCoverage) -> String {
+            value.sourceEvent.journal.stableKey + "|" + value.sourceEvent.eventID
         }
     }
 

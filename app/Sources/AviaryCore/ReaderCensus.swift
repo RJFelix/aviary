@@ -492,6 +492,11 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
     /// makes notification behavior part of the fixture receipt rather than a test-only computed
     /// convenience that disappears when the census is serialized.
     public let canonicalNotifications: CanonicalNotificationProjection
+    /// Canonical Work recovery rows built from the same reduced native Work/Session prefixes as
+    /// the other Census consumers. This is deliberately retained in the report so current Run,
+    /// attachment, recovery, unknown-domain, and omission evidence cannot drift between tests
+    /// and the production projection boundary.
+    public let canonicalWorkRecovery: CanonicalWorkRecoveryProjection
     public let registeredConsumers: [String]
     public let intentionallyUnwiredConsumers: [String]
 
@@ -545,6 +550,7 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         canonicalFlockCatalog: [CanonicalFlockCatalogProjection] = [],
         canonicalAttentionInbox: CanonicalAttentionInboxProjection = .init(summaries: []),
         canonicalNotifications: CanonicalNotificationProjection = .init(summaries: []),
+        canonicalWorkRecovery: CanonicalWorkRecoveryProjection = .init(works: []),
         registeredConsumers: [String] = [],
         intentionallyUnwiredConsumers: [String]
     ) {
@@ -591,6 +597,7 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         self.canonicalFlockCatalog = canonicalFlockCatalog
         self.canonicalAttentionInbox = canonicalAttentionInbox
         self.canonicalNotifications = canonicalNotifications
+        self.canonicalWorkRecovery = canonicalWorkRecovery
         self.registeredConsumers = registeredConsumers
         self.intentionallyUnwiredConsumers = intentionallyUnwiredConsumers
     }
@@ -606,6 +613,7 @@ public enum ReaderCensus {
         "production local Timeline catalog", "canonical SessionCatalog projection",
         "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
         "canonical Session search", "canonical notification projection",
+        "canonical Work recovery projection",
     ]
     public static func read(
         _ data: Data,
@@ -683,6 +691,7 @@ public enum ReaderCensus {
             "production local Timeline catalog", "canonical SessionCatalog projection",
             "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
             "canonical Session search", "canonical notification projection",
+            "canonical Work recovery projection",
         ],
         intentionallyUnwiredConsumers: [String] = []
     ) -> ReaderCensusReport {
@@ -763,6 +772,31 @@ public enum ReaderCensus {
             summaries: canonicalSessionCatalog.map { [$0] } ?? [])
         let canonicalNotifications = CanonicalNotificationProjection(
             summaries: canonicalSessionCatalog.map { [$0] } ?? [])
+        // Reader Census has no filesystem discovery layer, so its explicit source-completeness
+        // boundary is the pair of supplied native reads. Unknown domains remain row evidence and
+        // do not make discovery incomplete; tails, quarantine, or reducer integrity failures do.
+        let canonicalWorkRecovery: CanonicalWorkRecoveryProjection
+        if workRead.records.isEmpty {
+            // An absent Work page is an incomplete source, not an identity-less Work row. Keep
+            // the Session-side report useful while withholding every recovery disposition.
+            canonicalWorkRecovery = CanonicalWorkRecoveryProjection(
+                works: [], sessions: canonicalSessionCatalog.map { [$0] } ?? [],
+                sourceComplete: false)
+        } else {
+            let canonicalWorkRow = LocalTimelineCatalog.WorkRow(
+                locatorID: "reader-census-work",
+                work: work.work,
+                journal: work.journal,
+                snapshot: work,
+                read: workRead,
+                available: workIntegrity,
+                reasons: workIntegrity ? [] : ["Reader Census Work source is incomplete"],
+                limit: 16)
+            canonicalWorkRecovery = CanonicalWorkRecoveryProjection(
+                works: [canonicalWorkRow],
+                sessions: canonicalSessionCatalog.map { [$0] } ?? [],
+                sourceComplete: sessionIntegrity && workIntegrity)
+        }
 
         let allEvents = sessionEvents + workEvents
         let allEventRefs = Set(allEvents.map { EventRef(journal: $0.journal, eventID: $0.eventID) })
@@ -872,6 +906,7 @@ public enum ReaderCensus {
             canonicalFlockCatalog: canonicalFlockCatalog,
             canonicalAttentionInbox: canonicalAttentionInbox,
             canonicalNotifications: canonicalNotifications,
+            canonicalWorkRecovery: canonicalWorkRecovery,
             registeredConsumers: registeredConsumers,
             intentionallyUnwiredConsumers: intentionallyUnwiredConsumers)
     }

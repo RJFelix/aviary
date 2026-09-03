@@ -108,6 +108,11 @@ final class AppModel {
     /// remain observable before any GUI attaches, and so future GUIs do not need to manufacture
     /// Work state from their own in-memory runs.
     var canonicalWorkInventory: [LocalTimelineCatalog.WorkRow] = []
+    /// Recovery is projected from the same catalog scan as notification candidates. No local GUI
+    /// observation is supplied here, so in-process attachment presentation never becomes global
+    /// host truth; a clicked failed-recovery route must reconcile against this exact snapshot.
+    var canonicalWorkRecoveryProjection = CanonicalWorkRecoveryProjection(
+        works: [], sourceComplete: false)
     /// Bounded reader projections are assembled once at the catalog boundary. Views consume
     /// these values rather than repeatedly joining every Work to every Session during rendering.
     var canonicalFlockInventory: [CanonicalFlockCatalogProjection] = []
@@ -519,6 +524,9 @@ final class AppModel {
         let notifications = CanonicalNotificationProjection(
             summaries: nativeSummaries,
             sourceComplete: result.canonicalNotificationSourceComplete)
+        canonicalWorkRecoveryProjection = CanonicalWorkRecoveryProjection(
+            works: result.workInventory, sessions: nativeSummaries,
+            sourceComplete: result.canonicalNotificationSourceComplete)
         canonicalNotificationProjection = notifications
         // Scan completeness is about global discovery. Row-local conflicts remain omitted from
         // the projection, but healthy rows can still resolve cold routes during this pass.
@@ -566,6 +574,18 @@ final class AppModel {
         // to the list would give SwiftUI duplicate tags and make selection nondeterministic.
         let found = projectionIndex.displaySummaries
         sessions = found
+        // A route is exact evidence only for the catalog snapshot that admitted it. Polling can
+        // resolve an indeterminate action or advance either journal while the inspector remains
+        // open, so revalidate the focus on every scan instead of waiting for another click.
+        if let focus = canonicalNotificationFocus,
+           let staleReason = canonicalNotificationStaleReason(focus)
+        {
+            canonicalNotificationFocus = nil
+            canonicalNotificationError = staleReason
+            if !canonicalNotificationCatalogScanComplete {
+                enqueuePendingCanonicalNotificationRoute(focus)
+            }
+        }
         drainPendingCanonicalNotificationRoutes(
             scanComplete: result.canonicalNotificationSourceComplete)
         tree = AgentTreeReader.read(home: home)
@@ -686,9 +706,11 @@ final class AppModel {
     /// the next complete catalog scan can resolve their canonical Session/display join.
     func openCanonicalNotification(_ route: CanonicalNotificationRoute) {
         guard route.isValid else {
+            canonicalNotificationFocus = nil
             canonicalNotificationError = "Dropped an invalid canonical notification route."
             return
         }
+        canonicalNotificationFocus = nil
         let rowID = canonicalNotificationDisplayIDs[route.sessionIdentityKey]
         guard let rowID, let session = sessions.first(where: { $0.id == rowID }) else {
             if canonicalNotificationCatalogScanComplete {
@@ -702,7 +724,15 @@ final class AppModel {
         section = .sessions
         selectedSessionIDs = [session.id]
         selectedSessionID = session.id
-        canonicalNotificationFocus = route
+        if let staleReason = canonicalNotificationStaleReason(route) {
+            canonicalNotificationError = staleReason
+            if !canonicalNotificationCatalogScanComplete {
+                enqueuePendingCanonicalNotificationRoute(route)
+            }
+        } else {
+            canonicalNotificationFocus = route
+            canonicalNotificationError = nil
+        }
         selectedItemForSessionSelectionChanged()
     }
 
@@ -740,7 +770,23 @@ final class AppModel {
             section = .sessions
             selectedSessionIDs = [session.id]
             selectedSessionID = session.id
-            canonicalNotificationFocus = route
+            canonicalNotificationFocus = nil
+            if !scanComplete {
+                // The Session join is useful immediately, but an incomplete catalog cannot
+                // establish whether the old route is current or stale. Keep the route for the
+                // next complete scan instead of consuming it as a false stale click.
+                canonicalNotificationError =
+                    "Notification evidence is pending a complete catalog scan."
+                enqueuePendingCanonicalNotificationRoute(route)
+                selectedItemForSessionSelectionChanged()
+                continue
+            }
+            if let staleReason = canonicalNotificationStaleReason(route) {
+                canonicalNotificationError = staleReason
+            } else {
+                canonicalNotificationFocus = route
+                canonicalNotificationError = nil
+            }
             selectedItemForSessionSelectionChanged()
         }
         if unresolved > 0 {
@@ -748,6 +794,33 @@ final class AppModel {
                 "Dropped " + String(unresolved)
                     + " unresolved cold notification route(s) after a complete catalog scan."
         }
+    }
+
+    /// Return nil only when the route is still an exact current canonical candidate. Session
+    /// selection remains useful for stale clicks, but the evidence card must never present an
+    /// old action/cursor as if it were current.
+    private func canonicalNotificationStaleReason(
+        _ route: CanonicalNotificationRoute
+    ) -> String? {
+        guard canonicalNotificationCatalogScanComplete else {
+            return "Notification evidence is pending a complete catalog scan."
+        }
+        guard canonicalNotificationProjection.isComplete else {
+            return "Notification evidence is incomplete; Aviary selected the Session only."
+        }
+        guard canonicalNotificationProjection.candidate(matching: route) != nil else {
+            return "Notification is stale; Aviary selected the Session without old evidence."
+        }
+        if route.kind == .failedRecovery {
+            guard canonicalWorkRecoveryProjection.isComplete else {
+                return "Recovery evidence is incomplete; Aviary selected the Session only."
+            }
+            guard let reconciliation = canonicalWorkRecoveryProjection.reconcile(
+                notificationRoute: route), reconciliation.exact else {
+                return "Recovery evidence is stale; Aviary selected the Session only."
+            }
+        }
+        return nil
     }
 
     /// Mark the catalog rows that belong to a run this process is holding.
