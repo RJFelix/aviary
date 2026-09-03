@@ -286,6 +286,9 @@ public struct AgentHome: Sendable, Hashable {
             kind = .work
             ownerKey = "work\u{00}\(work.workHostID.utf8.count):\(work.workHostID)"
                 + "\u{00}\(work.workID.utf8.count):\(work.workID)"
+        case .workHost(let workHost):
+            kind = .workHost
+            ownerKey = "work-host\u{00}\(workHost.workHostID.utf8.count):\(workHost.workHostID)"
         }
         let digest = SHA256.hash(data: Data(ownerKey.utf8))
             .map { String(format: "%02x", $0) }
@@ -349,6 +352,24 @@ public struct AgentHome: Sendable, Hashable {
 
     public func timelineV2WorkJournal(workHostID: String, workID: String) -> URL {
         timelineV2WorkJournalURL(workHostID: workHostID, workID: workID)
+    }
+
+    /// The Work Host control journal is separate from every Work journal. Its durable records
+    /// describe client attachments and read acknowledgements, so observing completed Work can
+    /// advance this journal without mutating the immutable Work outcome.
+    public func timelineV2WorkHostControlJournalURL(workHostID: String) -> URL {
+        timelineV2WorkHostsDir
+            .appending(path: Self.timelineV2PathComponent(workHostID), directoryHint: .isDirectory)
+            .appending(path: "control", directoryHint: .isDirectory)
+            .appending(path: "journal.jsonl", directoryHint: .notDirectory)
+    }
+
+    public func timelineV2WorkHostControlJournalURL(_ workHost: WorkHostRef) -> URL {
+        timelineV2WorkHostControlJournalURL(workHostID: workHost.workHostID)
+    }
+
+    public func timelineV2WorkHostControlJournal(_ workHost: WorkHostRef) -> URL {
+        timelineV2WorkHostControlJournalURL(workHost)
     }
 
     public var exists: Bool {

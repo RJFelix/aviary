@@ -245,6 +245,7 @@ public actor TimelineJournalWriter {
         journal: JournalRef,
         actor: TimelineActor,
         home: AgentHome? = nil,
+        recoveryCommittedByteCount: (@Sendable (Data) throws -> Int)? = nil,
         failurePlan: FailurePlan = .none,
         eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
         now: @escaping @Sendable () -> Date = { Date() },
@@ -252,7 +253,8 @@ public actor TimelineJournalWriter {
     ) throws {
         let opened = try Self.openExistingWriter(
             fileURL, journal: journal, actor: actor,
-            home: home ?? Self.inferHome(for: fileURL))
+            home: home ?? Self.inferHome(for: fileURL),
+            recoveryCommittedByteCount: recoveryCommittedByteCount)
         self.journal = journal
         self.hostActor = actor
         self.fileURL = fileURL
@@ -305,13 +307,16 @@ public actor TimelineJournalWriter {
         journal: JournalRef,
         actor: TimelineActor,
         home: AgentHome? = nil,
+        recoveryCommittedByteCount: (@Sendable (Data) throws -> Int)? = nil,
         failurePlan: FailurePlan = .none,
         eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
         now: @escaping @Sendable () -> Date = { Date() },
         didSynchronize: (@Sendable () -> Void)? = nil
     ) throws -> TimelineJournalWriter {
         try TimelineJournalWriter(reopening: fileURL, journal: journal, actor: actor,
-                                  home: home, failurePlan: failurePlan,
+                                  home: home,
+                                  recoveryCommittedByteCount: recoveryCommittedByteCount,
+                                  failurePlan: failurePlan,
                                   eventIDProvider: eventIDProvider, now: now,
                                   didSynchronize: didSynchronize)
     }
@@ -565,12 +570,15 @@ public actor TimelineJournalWriter {
     }
 
     private static func openExistingWriter(
-        _ url: URL, journal: JournalRef, actor: TimelineActor, home: AgentHome
+        _ url: URL, journal: JournalRef, actor: TimelineActor, home: AgentHome,
+        recoveryCommittedByteCount: (@Sendable (Data) throws -> Int)?
     ) throws -> OpenedWriter {
         let lockURL = home.timelineV2JournalLockURL(for: journal)
         let lock = try openLock(at: lockURL, reporting: url)
         do {
-            let opened = try openExistingFile(url, journal: journal, actor: actor)
+            let opened = try openExistingFile(
+                url, journal: journal, actor: actor,
+                recoveryCommittedByteCount: recoveryCommittedByteCount)
             return OpenedWriter(journal: opened, lockHandle: lock, lockURL: lockURL)
         } catch {
             try? lock.close()
@@ -633,7 +641,8 @@ public actor TimelineJournalWriter {
     }
 
     private static func openExistingFile(
-        _ url: URL, journal: JournalRef, actor: TimelineActor
+        _ url: URL, journal: JournalRef, actor: TimelineActor,
+        recoveryCommittedByteCount: (@Sendable (Data) throws -> Int)? = nil
     ) throws -> OpenedJournal {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw WriterError.missing(path: url.path)
@@ -649,6 +658,30 @@ public actor TimelineJournalWriter {
             var bytes = Data()
             while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
                 bytes.append(chunk)
+            }
+            if let recoveryCommittedByteCount {
+                let committedByteCount = try recoveryCommittedByteCount(bytes)
+                guard committedByteCount >= 0, committedByteCount <= bytes.count else {
+                    throw WriterError.invalidJournal(
+                        reason: "recovery prefix is outside the readable journal")
+                }
+                if committedByteCount < bytes.count {
+                    var descriptorStatus = Darwin.stat()
+                    var pathStatus = Darwin.stat()
+                    let pathResult = url.path.withCString { Darwin.lstat($0, &pathStatus) }
+                    guard Darwin.fstat(handle.fileDescriptor, &descriptorStatus) == 0,
+                          pathResult == 0,
+                          (descriptorStatus.st_mode & S_IFMT) == S_IFREG,
+                          descriptorStatus.st_dev == pathStatus.st_dev,
+                          descriptorStatus.st_ino == pathStatus.st_ino,
+                          Darwin.ftruncate(
+                              handle.fileDescriptor, off_t(committedByteCount)) == 0 else {
+                        throw WriterError.invalidJournal(
+                            reason: "uncommitted journal suffix could not be discarded safely")
+                    }
+                    try handle.synchronize()
+                    bytes = Data(bytes.prefix(committedByteCount))
+                }
             }
             if bytes.isEmpty {
                 // A fresh journal is created before its first genesis event. A process crash in
@@ -751,7 +784,13 @@ public actor TimelineJournalWriter {
             return "Work and Work Host identities disagree"
         }
         if workHost != nil, work == nil {
-            return "Work Host identity requires a Work identity"
+            // A Work Host control journal is itself owned by the Work Host, so host-level
+            // records may carry the typed host identity without naming one Work.
+            if case .workHost = journal.owner {
+                // Valid for host-level control records.
+            } else {
+                return "Work Host identity requires a Work identity"
+            }
         }
 
         switch journal.owner {
@@ -768,6 +807,16 @@ public actor TimelineJournalWriter {
             }
             // Work is intentionally not required to equal anything in a Session journal. A
             // session may attach remote Work from a different Work Host.
+        case .workHost(let ownerHost):
+            guard let workHost else {
+                return "Work Host control event requires its Work Host identity"
+            }
+            if workHost != ownerHost {
+                return "event Work Host does not match control journal owner"
+            }
+            if let work, work.workHostID != ownerHost.workHostID {
+                return "event Work does not belong to control journal owner"
+            }
         }
         return nil
     }

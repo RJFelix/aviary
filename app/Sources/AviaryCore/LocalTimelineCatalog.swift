@@ -16,15 +16,24 @@ public enum LocalTimelineCatalog {
         public let maxJournalBytes: Int
         public let maxDiagnostics: Int
         public let maxCorruptionReasonsPerRow: Int
+        public let maxWorkHostControlJournals: Int
+        public let maxClientAttachmentsPerControl: Int
+        public let maxReadAcknowledgementsPerControl: Int
 
         public init(maxSessionJournals: Int = 512, maxWorkJournals: Int = 2_048,
                     maxJournalBytes: Int = 64 * 1024 * 1024, maxDiagnostics: Int = 128,
-                    maxCorruptionReasonsPerRow: Int = 16) {
+                    maxCorruptionReasonsPerRow: Int = 16,
+                    maxWorkHostControlJournals: Int = 512,
+                    maxClientAttachmentsPerControl: Int = 256,
+                    maxReadAcknowledgementsPerControl: Int = 256) {
             self.maxSessionJournals = max(1, maxSessionJournals)
             self.maxWorkJournals = max(1, maxWorkJournals)
             self.maxJournalBytes = max(1, maxJournalBytes)
             self.maxDiagnostics = max(1, maxDiagnostics)
             self.maxCorruptionReasonsPerRow = max(1, maxCorruptionReasonsPerRow)
+            self.maxWorkHostControlJournals = max(1, maxWorkHostControlJournals)
+            self.maxClientAttachmentsPerControl = max(1, maxClientAttachmentsPerControl)
+            self.maxReadAcknowledgementsPerControl = max(1, maxReadAcknowledgementsPerControl)
         }
     }
 
@@ -113,7 +122,9 @@ public enum LocalTimelineCatalog {
         /// Exact many-to-many attachment facts from the Work journal. These are facts about
         /// who is attached, not ownership claims about any one GUI.
         public let sessionAttachments: [WorkSessionAttachmentSnapshot]
-        public let clientAttachments: [ClientAttachmentSnapshot]
+        /// Durable client attachment facts joined from the Work Host control journal. Work and
+        /// Session journals intentionally never populate this field.
+        public let clientAttachments: [WorkHostClientAttachmentSnapshot]
         public let omittedSessionAttachmentCount: Int
         public let omittedClientAttachmentCount: Int
         /// Work-recorded recovery claims retain their source event and full identity envelope;
@@ -133,7 +144,10 @@ public enum LocalTimelineCatalog {
         internal init(locatorID: String, work declaredWork: WorkRef?, journal: JournalRef?,
                          snapshot: WorkSnapshot?,
                          read: TimelineJournalReadResult?, available: Bool, reasons: [String],
-                         limit: Int, presentationID: String? = nil) {
+                         limit: Int, presentationID: String? = nil,
+                         controlClientAttachments: [WorkHostClientAttachmentSnapshot] = [],
+                         omittedControlClientAttachmentCount: Int = 0,
+                         attachmentLimit: Int = 256) {
             id = presentationID ?? declaredWork.map { LocalTimelineCatalog.qualifiedWork($0) } ?? locatorID
             self.locatorID = locatorID
             work = declaredWork
@@ -160,7 +174,7 @@ public enum LocalTimelineCatalog {
             } else {
                 canonicalFlock = nil
             }
-            let attachmentLimit = 256
+            let attachmentLimit = max(1, attachmentLimit)
             if exact, let snapshot,
                !snapshot.unknownDomains.contains(.work),
                !snapshot.unknownDomains.contains(.session) {
@@ -174,22 +188,27 @@ public enum LocalTimelineCatalog {
                 omittedSessionAttachmentCount = 0
             }
             if exact, let snapshot, !snapshot.unknownDomains.contains(.work) {
-                let orderedClients = snapshot.clientAttachments.values.sorted {
-                    $0.attachment.attachmentID < $1.attachment.attachmentID
-                }
-                clientAttachments = Array(orderedClients.prefix(attachmentLimit))
-                omittedClientAttachmentCount = max(0, orderedClients.count - attachmentLimit)
                 let runLimit = 256
                 let orderedRuns = snapshot.observedRunIDs.sorted().map(RunRef.init)
                 runHistory = Array(orderedRuns.prefix(runLimit))
                 omittedRunCount = max(0, orderedRuns.count - runLimit)
                 observedRunIDs = snapshot.observedRunIDs
             } else {
-                clientAttachments = []
-                omittedClientAttachmentCount = 0
                 runHistory = []
                 omittedRunCount = 0
                 observedRunIDs = []
+            }
+            if exact, !controlClientAttachments.isEmpty,
+               let snapshot, !snapshot.unknownDomains.contains(.work) {
+                let orderedClients = controlClientAttachments.sorted {
+                    $0.attachment.attachmentID < $1.attachment.attachmentID
+                }
+                clientAttachments = Array(orderedClients.prefix(attachmentLimit))
+                omittedClientAttachmentCount = max(0, orderedClients.count - attachmentLimit)
+                    + max(0, omittedControlClientAttachmentCount)
+            } else {
+                clientAttachments = []
+                omittedClientAttachmentCount = 0
             }
             // Recovery claims are themselves typed Work facts. Preserve bounded, envelope-
             // qualified claims when another domain is unknown; that uncertainty remains visible
@@ -249,6 +268,139 @@ public enum LocalTimelineCatalog {
         private static func recoveryKey(_ value: RecordedRecoveryCoverage) -> String {
             value.sourceEvent.journal.stableKey + "|" + value.sourceEvent.eventID
         }
+
+        fileprivate func withControlClientAttachments(
+            _ values: [WorkHostClientAttachmentSnapshot],
+            snapshot: WorkSnapshot?,
+            read: TimelineJournalReadResult?,
+            reasonLimit: Int,
+            omittedControlClientAttachmentCount: Int = 0,
+            attachmentLimit: Int
+        ) -> WorkRow {
+            WorkRow(
+                locatorID: locatorID ?? id, work: work, journal: journal, snapshot: snapshot,
+                read: read, available: isAvailable, reasons: corruptionReasons,
+                limit: reasonLimit, presentationID: id,
+                controlClientAttachments: values,
+                omittedControlClientAttachmentCount: omittedControlClientAttachmentCount,
+                attachmentLimit: attachmentLimit)
+        }
+    }
+
+    /// One discovered Work Host control journal. Control rows remain visible when the journal
+    /// is unreadable or semantically incomplete, but their client/read facts are unavailable in
+    /// that case. A control row is never inferred from Work or Session records.
+    public struct WorkHostControlRow: Codable, Hashable, Sendable, Identifiable {
+        public let id: String
+        public let locatorID: String
+        public let workHost: WorkHostRef?
+        public let journal: JournalRef?
+        public let cursor: JournalCursor?
+        public let isAvailable: Bool
+        public let clientAttachments: [WorkHostClientAttachmentSnapshot]
+        public let omittedClientAttachmentCount: Int
+        public let readAcknowledgements: [WorkHostReadAcknowledgementSnapshot]
+        public let omittedReadAcknowledgementCount: Int
+        public let unknownEventRefs: [EventRef]
+        public let unknownDomains: [TimelineDomain]
+        /// Bytes after the last independently synchronized Work Host control seal. They are
+        /// visible recovery evidence but never projected as attachment or read-ack facts.
+        public let unsealedSuffixBytes: Int
+        public let tailBytes: Int
+        public let corruptionReasons: [String]
+
+        internal init(
+            locatorID: String,
+            workHost: WorkHostRef?,
+            journal: JournalRef?,
+            snapshot: WorkHostControlSnapshot?,
+            read: TimelineJournalReadResult?,
+            available: Bool,
+            reasons: [String],
+            limits: Limits,
+            presentationID: String? = nil,
+            unsealedSuffixBytes: Int = 0
+        ) {
+            self.locatorID = locatorID
+            self.workHost = workHost
+            self.journal = journal
+            id = presentationID ?? journal?.stableKey ?? locatorID
+            let exact = available && snapshot != nil
+            if exact, let journal, let last = read?.records.last {
+                cursor = JournalCursor(
+                    journal: journal, eventID: last.event.eventID, sequence: last.event.sequence)
+            } else {
+                cursor = nil
+            }
+            let attachmentValues = snapshot?.clientAttachments.values.sorted {
+                if $0.attachment.attachmentID != $1.attachment.attachmentID {
+                    return $0.attachment.attachmentID < $1.attachment.attachmentID
+                }
+                return $0.client.clientID < $1.client.clientID
+            } ?? []
+            let readValues = snapshot?.readAcknowledgements.values.sorted {
+                if $0.client.clientID != $1.client.clientID {
+                    return $0.client.clientID < $1.client.clientID
+                }
+                if $0.attachment.attachmentID != $1.attachment.attachmentID {
+                    return $0.attachment.attachmentID < $1.attachment.attachmentID
+                }
+                return $0.targetJournal.stableKey < $1.targetJournal.stableKey
+            } ?? []
+            var boundedAttachments: [WorkHostClientAttachmentSnapshot]
+            var omittedAttachments: Int
+            var boundedAcknowledgements: [WorkHostReadAcknowledgementSnapshot]
+            var omittedAcknowledgements: Int
+            if exact {
+                boundedAttachments = Array(attachmentValues.prefix(limits.maxClientAttachmentsPerControl))
+                omittedAttachments = max(
+                    0, attachmentValues.count - boundedAttachments.count)
+                boundedAcknowledgements = Array(
+                    readValues.prefix(limits.maxReadAcknowledgementsPerControl))
+                omittedAcknowledgements = max(
+                    0, readValues.count - boundedAcknowledgements.count)
+            } else {
+                boundedAttachments = []
+                omittedAttachments = 0
+                boundedAcknowledgements = []
+                omittedAcknowledgements = 0
+            }
+            unknownEventRefs = snapshot?.unknownEvents.map {
+                EventRef(journal: $0.event.journal, eventID: $0.event.eventID)
+            }.sorted { lhs, rhs in
+                if lhs.journal.stableKey != rhs.journal.stableKey {
+                    return lhs.journal.stableKey < rhs.journal.stableKey
+                }
+                return lhs.eventID < rhs.eventID
+            } ?? []
+            unknownDomains = Array(Set(snapshot?.unknownEvents.flatMap {
+                Array($0.affectedDomains)
+            } ?? [])).sorted { $0.rawValue < $1.rawValue }
+            self.unsealedSuffixBytes = max(0, unsealedSuffixBytes)
+            tailBytes = self.unsealedSuffixBytes
+                + (read?.truncatedTail?.rawBytes.count ?? 0)
+                + (read?.quarantinedSuffix?.rawBytes.count ?? 0)
+            var allReasons = reasons
+            if !(snapshot?.unknownEvents.isEmpty ?? true) {
+                allReasons.append("control journal contains unknown events")
+            }
+            var rowAvailable = exact && allReasons.isEmpty
+            if !allReasons.isEmpty || !exact {
+                // Unknown control events may supersede an attachment or acknowledgement. The
+                // row remains visible as evidence but its bounded facts cannot be used.
+                rowAvailable = false
+                boundedAttachments = []
+                omittedAttachments = 0
+                boundedAcknowledgements = []
+                omittedAcknowledgements = 0
+            }
+            isAvailable = rowAvailable
+            clientAttachments = boundedAttachments
+            omittedClientAttachmentCount = omittedAttachments
+            readAcknowledgements = boundedAcknowledgements
+            omittedReadAcknowledgementCount = omittedAcknowledgements
+            corruptionReasons = Array(allReasons.prefix(limits.maxCorruptionReasonsPerRow))
+        }
     }
 
     /// One Session locator and its canonical adapter result. Invalid Session files stay visible
@@ -284,15 +436,18 @@ public enum LocalTimelineCatalog {
         public let sessions: [SessionRow]
         public let sessionSummaries: [CanonicalSessionCatalogSummary]
         public let works: [WorkRow]
+        public let workHostControls: [WorkHostControlRow]
         public let diagnostics: [Diagnostic]
         public let diagnosticsTruncated: Bool
 
-        fileprivate init(sessions: [SessionRow], works: [WorkRow], diagnostics: [Diagnostic],
+        fileprivate init(sessions: [SessionRow], works: [WorkRow],
+                         workHostControls: [WorkHostControlRow], diagnostics: [Diagnostic],
                          diagnosticsTruncated: Bool) {
             self.sessions = sessions
             sessionSummaries = sessions.compactMap(\SessionRow.summary)
                 .sorted { $0.id < $1.id }
             self.works = works
+            self.workHostControls = workHostControls
             self.diagnostics = diagnostics
             self.diagnosticsTruncated = diagnosticsTruncated
         }
@@ -315,11 +470,54 @@ public enum LocalTimelineCatalog {
         let candidates = discover(home: home, limits: limits, diagnostics: &diagnostics)
         let sessionCandidates = candidates.filter { $0.kind == .session }
         let workCandidates = candidates.filter { $0.kind == .work }
+        let controlCandidates = candidates.filter { $0.kind == .control }
+
+        var controlRecords: [ControlRecord] = []
+        for candidate in controlCandidates {
+            controlRecords.append(readControl(candidate, home: home, limits: limits,
+                                               diagnostics: &diagnostics))
+        }
+        let controlCounts = Dictionary(grouping: controlRecords.compactMap { record in
+            record.row.workHost.map { ($0, record) }
+        }, by: { $0.0 }).mapValues(\.count)
+        let conflictedControlHosts = Set(
+            controlCounts.compactMap { $0.value > 1 ? $0.key : nil })
+        for host in conflictedControlHosts.sorted(by: { $0.workHostID < $1.workHostID }) {
+            diagnostics.append(
+                kind: "duplicate_work_host_control",
+                message: "duplicate Work Host control journal (\(host.workHostID)); no client facts can project")
+        }
 
         var workRecords: [WorkRecord] = []
         for candidate in workCandidates {
             workRecords.append(readWork(candidate, home: home, limits: limits,
                                         diagnostics: &diagnostics))
+        }
+        // Enrich Work rows only after their journal has established the authority-qualified
+        // WorkRef. Directory names are not identities, and a control row is usable only when it
+        // is the unique available journal for that Work Host.
+        workRecords = workRecords.map { record in
+            guard let work = record.row.work,
+                  let control = controlRecords.first(where: {
+                      $0.row.workHost == WorkHostRef(work.workHostID)
+                  }), controlRecords.filter({ $0.row.workHost == control.row.workHost }).count == 1,
+                  control.row.isAvailable,
+                  let journal = record.row.journal else { return record }
+            let attachments = control.row.clientAttachments.filter {
+                $0.work == work && $0.workJournal == journal
+            }
+            guard !attachments.isEmpty else { return record }
+            let allMatchingAttachments = control.snapshot?.clientAttachments.values.filter {
+                $0.work == work && $0.workJournal == journal
+            }.count ?? attachments.count
+            let enriched = record.row.withControlClientAttachments(
+                attachments, snapshot: record.snapshot, read: record.read,
+                reasonLimit: limits.maxCorruptionReasonsPerRow,
+                omittedControlClientAttachmentCount: max(
+                    0, allMatchingAttachments - attachments.count),
+                attachmentLimit: limits.maxClientAttachmentsPerControl)
+            return WorkRecord(locatorID: record.locatorID, row: enriched,
+                              snapshot: record.snapshot, read: record.read)
         }
         let workCounts = Dictionary(grouping: workRecords.compactMap { record in
             record.row.work.map { ($0, record) }
@@ -397,6 +595,7 @@ public enum LocalTimelineCatalog {
         let sessionRows = sessionRecords.map(\.row)
 
         return Snapshot(sessions: sessionRows, works: workRecords.map(\WorkRecord.row),
+                        workHostControls: controlRecords.map(\.row),
                         diagnostics: diagnostics.values, diagnosticsTruncated: diagnostics.didOmit)
     }
 
@@ -444,7 +643,7 @@ public enum LocalTimelineCatalog {
         return summary.hasOngoingOrUncertainAttachedWork
     }
 
-    private enum Kind { case session, work }
+    private enum Kind { case session, work, control }
     private struct Candidate {
         let kind: Kind
         let url: URL
@@ -459,6 +658,12 @@ public enum LocalTimelineCatalog {
     private struct SessionRecord {
         let locatorID: String
         let row: SessionRow
+        let read: TimelineJournalReadResult?
+    }
+    private struct ControlRecord {
+        let locatorID: String
+        let row: WorkHostControlRow
+        let snapshot: WorkHostControlSnapshot?
         let read: TimelineJournalReadResult?
     }
     private struct DiagnosticSink {
@@ -516,20 +721,28 @@ public enum LocalTimelineCatalog {
             }
         }
         var works = 0
+        var controls = 0
         for host in children(
             of: home.timelineV2WorkHostsDir, label: "Work Host directory",
-            maximum: limits.maxWorkJournals, diagnostics: &diagnostics)
+            maximum: max(limits.maxWorkJournals, limits.maxWorkHostControlJournals),
+            diagnostics: &diagnostics)
         {
-            guard works < limits.maxWorkJournals else { break }
-            let worksDir = host.appending(path: "works", directoryHint: .isDirectory)
-            for work in children(
-                of: worksDir, label: "Work journal directory",
-                maximum: limits.maxWorkJournals - works, diagnostics: &diagnostics)
-            {
-                let journal = work.appending(path: "journal.jsonl", directoryHint: .notDirectory)
-                if fm.fileExists(atPath: journal.path) {
-                    add(.work, journal, &works, limits.maxWorkJournals)
+            if works < limits.maxWorkJournals {
+                let worksDir = host.appending(path: "works", directoryHint: .isDirectory)
+                for work in children(
+                    of: worksDir, label: "Work journal directory",
+                    maximum: limits.maxWorkJournals - works, diagnostics: &diagnostics)
+                {
+                    let journal = work.appending(path: "journal.jsonl", directoryHint: .notDirectory)
+                    if fm.fileExists(atPath: journal.path) {
+                        add(.work, journal, &works, limits.maxWorkJournals)
+                    }
                 }
+            }
+            let control = host.appending(path: "control", directoryHint: .isDirectory)
+                .appending(path: "journal.jsonl", directoryHint: .notDirectory)
+            if fm.fileExists(atPath: control.path) {
+                add(.control, control, &controls, limits.maxWorkHostControlJournals)
             }
         }
         return result.sorted { $0.locatorID < $1.locatorID }
@@ -590,6 +803,86 @@ public enum LocalTimelineCatalog {
         if !available { diagnostics.append(kind: "unavailable_work", message: "\(row.id): \(reasons.joined(separator: "; "))") }
         return WorkRecord(locatorID: candidate.locatorID, row: row,
                           snapshot: snapshot, read: read)
+    }
+
+    private static func readControl(
+        _ candidate: Candidate,
+        home: AgentHome,
+        limits: Limits,
+        diagnostics: inout DiagnosticSink
+    ) -> ControlRecord {
+        let failureID = candidate.locatorID
+        guard let data = boundedData(candidate.url, maxBytes: limits.maxJournalBytes) else {
+            let reason = "control journal is unreadable or exceeds the catalog byte bound"
+            diagnostics.append(kind: "unavailable_work_host_control",
+                               message: "\(failureID): \(reason)")
+            return ControlRecord(
+                locatorID: failureID,
+                row: WorkHostControlRow(locatorID: failureID, workHost: nil, journal: nil,
+                                        snapshot: nil, read: nil, available: false,
+                                        reasons: [reason], limits: limits),
+                snapshot: nil, read: nil)
+        }
+        guard let declared = firstJournalRef(in: data),
+              case .workHost(let workHost) = declared.owner,
+              declared.authority.authorityID == workHost.workHostID,
+              safeEqual(candidate.url, home.timelineV2WorkHostControlJournalURL(workHost))
+        else {
+            let reason = "declared Work Host control owner, authority, or locator does not round-trip"
+            diagnostics.append(kind: "unavailable_work_host_control",
+                               message: "\(failureID): \(reason)")
+            return ControlRecord(
+                locatorID: failureID,
+                row: WorkHostControlRow(locatorID: failureID, workHost: nil, journal: nil,
+                                        snapshot: nil, read: nil, available: false,
+                                        reasons: [reason], limits: limits),
+                snapshot: nil, read: nil)
+        }
+        let committedData: Data
+        do {
+            committedData = try WorkHostControlJournal.committedPrefixData(
+                for: candidate.url, journal: declared, data: data)
+        } catch {
+            let reason = "Work Host control durability seal is missing or does not match the journal"
+            diagnostics.append(kind: "unavailable_work_host_control",
+                               message: "\(failureID): \(reason)")
+            return ControlRecord(
+                locatorID: failureID,
+                row: WorkHostControlRow(
+                    locatorID: failureID, workHost: workHost, journal: declared,
+                    snapshot: nil, read: nil, available: false,
+                    reasons: [reason], limits: limits),
+                snapshot: nil, read: nil)
+        }
+        let unsealedSuffixBytes = max(0, data.count - committedData.count)
+        if unsealedSuffixBytes > 0 {
+            diagnostics.append(
+                kind: "unsealed_work_host_control_suffix",
+                message: "\(failureID): \(unsealedSuffixBytes) uncommitted suffix bytes were withheld")
+        }
+        let read = TimelineJournalReader.read(
+            committedData, journal: declared,
+            actor: TimelineActor(actorID: "local-catalog", kind: "reader"),
+            hostRecordedAt: Date(timeIntervalSince1970: 0))
+        let snapshot = WorkHostControlReducer.reduce(
+            read.records.map(\.event),
+            initial: WorkHostControlSnapshot(journal: declared))
+        var reasons = integrityReasons(read: read, snapshot: snapshot)
+        if snapshot.journal != declared || snapshot.workHost != workHost {
+            reasons.append("Work Host control reducer identity does not match the declared journal")
+        }
+        let row = WorkHostControlRow(
+            locatorID: candidate.locatorID, workHost: workHost, journal: declared,
+            snapshot: snapshot, read: read, available: reasons.isEmpty,
+            reasons: unique(reasons), limits: limits,
+            unsealedSuffixBytes: unsealedSuffixBytes)
+        if !row.isAvailable {
+            diagnostics.append(
+                kind: "unavailable_work_host_control",
+                message: "\(row.id): \(row.corruptionReasons.joined(separator: "; "))")
+        }
+        return ControlRecord(locatorID: candidate.locatorID, row: row,
+                             snapshot: snapshot, read: read)
     }
 
     private static func readSession(_ candidate: Candidate, home: AgentHome, limits: Limits,
@@ -682,6 +975,20 @@ public enum LocalTimelineCatalog {
         if read.quarantinedSuffix != nil { reasons.append("journal has a quarantined suffix") }
         if !snapshot.structuralIntegrityValid { reasons.append(contentsOf: snapshot.corruptionReasons) }
         if !snapshot.semanticProjectionValid { reasons.append("semantic projection is invalid") }
+        return unique(reasons)
+    }
+
+    private static func integrityReasons(
+        read: TimelineJournalReadResult,
+        snapshot: WorkHostControlSnapshot
+    ) -> [String] {
+        var reasons: [String] = []
+        if read.records.isEmpty { reasons.append("journal has no committed records") }
+        if read.truncatedTail != nil { reasons.append("journal has an uncommitted truncated tail") }
+        if read.quarantinedSuffix != nil { reasons.append("journal has a quarantined suffix") }
+        if !snapshot.causalOrderValid { reasons.append("control journal causal order is invalid") }
+        if !snapshot.structuralIntegrityValid { reasons.append(contentsOf: snapshot.corruptionReasons) }
+        if !snapshot.semanticProjectionValid { reasons.append("control semantic projection is invalid") }
         return unique(reasons)
     }
 

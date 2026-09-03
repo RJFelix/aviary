@@ -53,8 +53,6 @@ private func reducerJSON<T: Encodable>(_ value: T) -> JSONValue {
 
 func test_timelineReducersLinkSessionsAndWork() throws {
     let sessionAttachment = SessionAttachmentRef("session-attachment")
-    let client = ClientRef("client-test")
-    let clientAttachment = ClientAttachmentRef("client-attachment")
     let run = RunRef("run-test")
     let turn = TurnRef("turn-test")
     let action = ActionRef("action-test")
@@ -66,35 +64,30 @@ func test_timelineReducersLinkSessionsAndWork() throws {
         reducerEvent(TimelineEventType.sessionAttached, id: "w2", sequence: 2, journal: reducerWorkJournal,
                      previous: "w1", session: reducerSession, work: reducerWork,
                      sessionAttachment: sessionAttachment),
-        reducerEvent(TimelineEventType.clientAttached, id: "w3", sequence: 3, journal: reducerWorkJournal,
-                     previous: "w2", client: client, clientAttachment: clientAttachment,
-                     payload: .object(["capabilities": .array(["observe", "control"])])),
-        reducerEvent(TimelineEventType.runStarted, id: "w4", sequence: 4, journal: reducerWorkJournal,
-                     previous: "w3", run: run),
-        reducerEvent(TimelineEventType.turnStarted, id: "w5", sequence: 5, journal: reducerWorkJournal,
-                     previous: "w4", run: run, turn: turn),
-        reducerEvent(TimelineEventType.actionIntent, id: "w6", sequence: 6, journal: reducerWorkJournal,
-                     previous: "w5", action: action, payload: .object(["state": "proposed"])),
-        reducerEvent(TimelineEventType.actionStarted, id: "w7", sequence: 7, journal: reducerWorkJournal,
-                     previous: "w6", action: action, payload: .object(["state": "running"])),
-        reducerEvent(TimelineEventType.handleStarted, id: "w8", sequence: 8, journal: reducerWorkJournal,
-                     previous: "w7", run: run, handle: handle,
+        reducerEvent(TimelineEventType.runStarted, id: "w3", sequence: 3, journal: reducerWorkJournal,
+                     previous: "w2", run: run),
+        reducerEvent(TimelineEventType.turnStarted, id: "w4", sequence: 4, journal: reducerWorkJournal,
+                     previous: "w3", run: run, turn: turn),
+        reducerEvent(TimelineEventType.actionIntent, id: "w5", sequence: 5, journal: reducerWorkJournal,
+                     previous: "w4", action: action, payload: .object(["state": "proposed"])),
+        reducerEvent(TimelineEventType.actionStarted, id: "w6", sequence: 6, journal: reducerWorkJournal,
+                     previous: "w5", action: action, payload: .object(["state": "running"])),
+        reducerEvent(TimelineEventType.handleStarted, id: "w7", sequence: 7, journal: reducerWorkJournal,
+                     previous: "w6", run: run, handle: handle,
                      payload: .object(["state": .string("running")])),
-        reducerEvent(TimelineEventType.actionOutcome, id: "w9", sequence: 9, journal: reducerWorkJournal,
-                     previous: "w8", action: action, payload: .object([
+        reducerEvent(TimelineEventType.actionOutcome, id: "w8", sequence: 8, journal: reducerWorkJournal,
+                     previous: "w7", action: action, payload: .object([
                          "state": "failed", "failure_kind": "timeout", "retry_safety": "unknown"])),
     ]
     let work = WorkReducer.reduce(workEvents)
     XCTAssertEqual(work.work, reducerWork)
     XCTAssertEqual(work.workHost, WorkHostRef(reducerWork.workHostID))
     XCTAssertEqual(work.attachedSessionIDs, [reducerSession.sessionID])
-    XCTAssertEqual(work.attachedClientIDs, [client.clientID])
     XCTAssertEqual(work.activeRun, run)
     XCTAssertEqual(work.activeTurn, turn)
     XCTAssertEqual(work.actions[action.actionID]?.failureKind, .timeout)
     XCTAssertEqual(work.actions[action.actionID]?.retrySafety, .unknown)
     XCTAssertEqual(work.handles[handle.handleID]?.state, "running")
-    XCTAssertEqual(work.clientAttachments[clientAttachment.attachmentID]?.capabilities, ["observe", "control"])
     XCTAssertTrue(work.causalOrderValid)
 
     let sessionEvents = [
@@ -103,21 +96,17 @@ func test_timelineReducersLinkSessionsAndWork() throws {
         reducerEvent(TimelineEventType.sessionAttached, id: "s2", sequence: 2, journal: reducerSessionJournal,
                      previous: "s1", session: reducerSession, work: reducerWork,
                      sessionAttachment: sessionAttachment),
-        reducerEvent(TimelineEventType.clientAttached, id: "s3", sequence: 3, journal: reducerSessionJournal,
-                     previous: "s2", session: reducerSession, client: client,
-                     clientAttachment: clientAttachment),
     ]
     let session = SessionReducer.reduce(sessionEvents)
     XCTAssertEqual(session.session, reducerSession)
     XCTAssertEqual(session.attachedWork, reducerWork)
     XCTAssertEqual(session.attachedSessionAttachment, sessionAttachment)
-    XCTAssertEqual(session.attachedClientIDs, [client.clientID])
     XCTAssertTrue(session.unknownEvents.isEmpty)
-    let cursor = JournalCursor(journal: work.journal!, eventID: "w9", sequence: 9)
+    let cursor = JournalCursor(journal: work.journal!, eventID: "w8", sequence: 8)
     XCTAssertNotNil(SessionAssembler.assemble(session: session, work: work, at: cursor))
     XCTAssertNil(SessionAssembler.assemble(
         session: session, work: work,
-        at: JournalCursor(journal: reducerSessionJournal, eventID: "s3", sequence: 3)))
+        at: JournalCursor(journal: reducerSessionJournal, eventID: "s2", sequence: 2)))
 }
 
 func test_timelineReducerTracksCausalOrderAndBoundsLinks() throws {
@@ -327,8 +316,6 @@ func test_timelineReducersRejectAttachmentAndRunIdentityReuse() throws {
 func test_timelineReducersRejectEmptyAttachmentIdentities() throws {
     let emptySession = SessionRef("")
     let emptySessionAttachment = SessionAttachmentRef("")
-    let emptyClient = ClientRef("")
-    let emptyClientAttachment = ClientAttachmentRef("")
     let workEvents = [
         reducerEvent(TimelineEventType.workCreated, id: "empty-w1", sequence: 1,
                      journal: reducerWorkJournal, work: reducerWork),
@@ -338,17 +325,10 @@ func test_timelineReducersRejectEmptyAttachmentIdentities() throws {
         reducerEvent(TimelineEventType.sessionAttached, id: "empty-w3", sequence: 3,
                      journal: reducerWorkJournal, previous: "empty-w2", session: reducerSession,
                      work: reducerWork, sessionAttachment: emptySessionAttachment),
-        reducerEvent(TimelineEventType.clientAttached, id: "empty-w4", sequence: 4,
-                     journal: reducerWorkJournal, previous: "empty-w3", client: emptyClient,
-                     clientAttachment: ClientAttachmentRef("valid")),
-        reducerEvent(TimelineEventType.clientAttached, id: "empty-w5", sequence: 5,
-                     journal: reducerWorkJournal, previous: "empty-w4", client: ClientRef("valid"),
-                     clientAttachment: emptyClientAttachment),
     ]
     let work = WorkReducer.reduce(workEvents)
     XCTAssertTrue(work.sessionAttachments.isEmpty)
-    XCTAssertTrue(work.clientAttachments.isEmpty)
-    XCTAssertEqual(work.quarantinedEvents.count, 4)
+    XCTAssertEqual(work.quarantinedEvents.count, 2)
 
     let sessionEvents = [
         reducerEvent(TimelineEventType.sessionCreated, id: "empty-s1", sequence: 1,
@@ -360,17 +340,10 @@ func test_timelineReducersRejectEmptyAttachmentIdentities() throws {
         reducerEvent(TimelineEventType.sessionAttached, id: "empty-s3", sequence: 3,
                      journal: reducerSessionJournal, previous: "empty-s2", session: reducerSession,
                      work: reducerWork, sessionAttachment: emptySessionAttachment),
-        reducerEvent(TimelineEventType.clientAttached, id: "empty-s4", sequence: 4,
-                     journal: reducerSessionJournal, previous: "empty-s3", session: reducerSession,
-                     client: emptyClient, clientAttachment: ClientAttachmentRef("valid")),
-        reducerEvent(TimelineEventType.clientAttached, id: "empty-s5", sequence: 5,
-                     journal: reducerSessionJournal, previous: "empty-s4", session: reducerSession,
-                     client: ClientRef("valid"), clientAttachment: emptyClientAttachment),
     ]
     let session = SessionReducer.reduce(sessionEvents)
     XCTAssertTrue(session.attachments.isEmpty)
-    XCTAssertTrue(session.clientAttachments.isEmpty)
-    XCTAssertEqual(session.quarantinedEvents.count, 4)
+    XCTAssertEqual(session.quarantinedEvents.count, 2)
 }
 
 func test_timelineReducerRejectsEmptyActivityIdentities() throws {

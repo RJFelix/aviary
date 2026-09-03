@@ -12,6 +12,10 @@ build/
 # ── macOS ──
 .DS_Store
 
+# ── Python build output ──
+__pycache__/
+*.py[cod]
+
 # ── Local state ──
 *.local
 .env

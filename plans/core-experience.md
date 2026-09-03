@@ -1,6 +1,6 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0/1 foundations and the Phase 3A adoptable-kernel plus Work-service contract substrate are implemented, phases not complete
+Status: implementation in progress; Phase 0/1 foundations, Phase 3A adoptable kernels, and the Phase 3B service-owned Work/control substrate are implemented; production service composition and GUI cutover remain
 Date: 2026-08-31
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
@@ -34,7 +34,8 @@ explicitly unwired.
 
 The first canonical Work-recovery projection is now a bounded, reader-owned join rather than a
 claim of host liveness. It keeps last-recorded durable Work disposition, exact Work-journal
-generation and cursors, Run history, actions/Handles/commands, Session and client attachments,
+generation and cursors, Run history, actions/Handles/commands, Session attachments, and the
+current transitional client-attachment projection,
 source-qualified six-plane recovery claims, unknown domains, corruption, and every omission as
 separate facts. Explicit in-process observations are scoped to one requested client and can report
 that client's attached/detached/reattachable presentation only when they match the current Work,
@@ -46,6 +47,20 @@ stores this projection from the same catalog scan used for notifications, but su
 client or host observation. A real reachable-host/reattachment dimension remains Phase 3 service
 work.
 
+Phase 3B protocol correction (2026-09-02): GUI/client attachment, capability, and read-acknowledgement
+facts belong to a separate Work-Host control journal, not a Work or Session journal. Otherwise
+opening completed Work would mutate its immutable record, and merely reading a page would advance
+the same cursor used to order control commands. Work/Session reducers no longer project the earlier
+placement; all Aviary-owned fixtures and consumers are migrated in place rather than retained as a
+compatibility path before a production service claims durable reattachment.
+
+The service protocol must expose that split too: attach/detach/capability mutations return the
+Work-Host control cursor they committed, while execution commands retain an exact causal Work
+cursor. Snapshot and event reads are side-effect free; a separate acknowledgement operation advances
+one attachment's cursor for one exact target-journal generation in the control journal. Handshake
+or host description exposes the control-journal identity/current cursor so a client can order those
+mutations without treating a Work tip as control-plane state.
+
 Phase 3A now has an adoptable runtime-host protocol over a bounded, identity-checked Unix-domain
 socket. A fresh client can attach to the same live interpreter after the original client disconnects;
 stable callback request identities make at-least-once replay explicit, and late or duplicate results
@@ -56,6 +71,22 @@ many-to-many client/session attachments, per-client authorization, bounded and a
 and service-supplied terminal commit proofs. This is substrate only: the production GUI still owns
 `AgentRunner`, no `aviaryd` owns real Work yet, and no GUI currently reconnects to a persisted Work
 Host descriptor.
+
+The Phase 3B ownership substrate now includes a service-owned `HostedInHouseWork` actor whose
+Agent/runner/runtime lifetime is independent of any observing client, plus a bounded Unix-socket
+Work-service transport and a separately durable Work-Host control journal. Start admission reserves
+the actor before suspension, End can overtake preparation without launching a late runtime, and
+terminal state absorbs late disconnect/reconnect/update and turn completion. Client-qualified
+commands, multiple observers, detach, stale retries, and terminal teardown are deterministic and
+bounded. The control journal is the sole authority for client attachments, capabilities, and exact
+per-journal read acknowledgements; mutation admission is serialized across disk suspension and
+canonical target reads cannot be forged by a caller-supplied snapshot. A synchronized commit seal
+records the exact durable prefix, so live and cold readers project previously sealed truth while
+reporting an unsealed suffix rather than inventing a successful mutation. Reopen acquires one
+continuous owner lock before inspecting or truncating that suffix, including the fresh-empty crash
+window. This still is substrate: the next slice must compose the registry, journal-backed service,
+execution factory, and `aviaryd`, then route the GUI through them before GUI loss actually leaves
+production Work running.
 
 A canonical catalog adapter now projects authority-qualified Session identities and attached Work
 at independently verified requested/observed cursors. Only attached, exactly aligned Work with
@@ -217,6 +248,13 @@ reconciliation, per-principal authorization, Session/attachment binding, bounded
 bundle-backed terminal commits were hardened. The final RuntimeHost review found no remaining
 P0/P1/P2 after cancellation cleanup, atomic destroy/recreate, bounded callback admission and
 refusal, unread-peer shutdown, and process-generation fencing were exercised adversarially.
+The Phase 3B ownership/control checkpoint passes 583 cases / 6,522 assertions in 75.48 seconds,
+with `just compile`, both Python-host syntax parses, `git diff --check`, and all 9 visually inspected
+snapshot screens clean. Its 100,000-event run encoded 46,766,700 bytes in 1.279 seconds and read plus
+reduced them in 6.817 seconds on the checkpoint machine. Final Sol review found no remaining P0 or
+P1 issue after the continuous-lock recovery interval, empty-journal seal recovery, pre-suspension
+Start reservation, absorbing terminal state, exact target-journal acknowledgement, UTF-8 bounds,
+connection fencing, and bounded shutdown paths were hardened.
 
 Phase 0 still owes real VoiceOver/keyboard UI automation and broader driver focus/race proof. Phase 1
 still owes the remaining canonical consumer migrations (the Work Host service recovery source and
@@ -554,6 +592,7 @@ reconstructed | referenced | unknown | lost | not_applicable`), its evidence/cur
 | State plane | Authoritative placement | Coverage question |
 |---|---|---|
 | Session and Work timelines | host-side journals | Are exact events/tips present and replayable? |
+| GUI/client attachments and read acknowledgements | Work-Host control journal | Which client attachment and per-journal cursors are durable, and is connectivity only ephemeral? |
 | Effective next-model context | versioned context snapshot | Will the model receive the same selected instructions, history, summary, attachments, and omissions? |
 | Runtime/Python working state | live kernel or declared reconstruction | Is the namespace live, reconstructed, inspectable only, or lost? |
 | Futures/Handles/background Work | Work Host/Handle store | Which identities remain running, terminal, reaped, or indeterminate? |
@@ -694,10 +733,12 @@ Deliverables:
 - Record user-input acceptance and its delivery mode, turn lifecycle, model activity, action intent
   and outcome, human decision requests, artifacts, child/handle lifecycle, compaction, recovery,
   and completion.
-- Record session-attachment and client-attachment creation/detachment, observe/control capabilities,
-  source session/client, durable cursor, and capability changes. Record every control command's
-  causal cursor and host-assigned order. A lost connection changes connectivity, not ownership or
-  other clients' control capability.
+- Record Session-to-Work attachment creation/detachment and its exact Work cursor in the Session
+  journal. Record GUI/client attachment creation, explicit detachment, observe/control capability,
+  and per-target read acknowledgement in a separate Work-Host control journal that may evolve after
+  Work becomes terminal. Record every control command's causal Work cursor and host-assigned order.
+  A lost connection changes ephemeral connectivity, not durable attachment or other clients'
+  control capability.
 - Treat provider/model requests and Claude CLI execution as external-cost/data actions alongside
   Python, MCP, and child work; they are part of the audit denominator.
 - Include the minimum fields required for honest semantic action/confirmation cards now:
@@ -846,15 +887,33 @@ Deliverables:
   update this client's observe/control capability, snapshot/events-after-cursor, fetch artifact,
   start/send/steer/queue, hold, supported cancellation, and explicit end/destroy commands.
 - Persist Work/session/run registry, stable Work Host identity, runtime endpoint, process start
-  identity, protocol version, environment provenance, session/client attachments, command actor and
-  causal cursor, and durable read cursors. PID is diagnostic, not ownership.
+  identity, protocol version, environment provenance, Session attachments, command actor and causal
+  Work cursor, plus client attachments and per-journal read cursors in the Work-Host control journal.
+  PID is diagnostic, not ownership.
 - Automatically reattach on launch or reconnect; distinguish client detached, network disconnected,
   Work alive, Work Host recovering, dead-with-complete-record, indeterminate, and orphaned.
+- Make canonical command identity client-qualified rather than indexing by a caller-local command ID
+  alone, and bind its idempotency digest to kind, full body reference, Session attachment, and causal
+  Work cursor. Reconcile an exact duplicate before stale-cursor validation; same identity with
+  different contents is a durable conflict.
 - Add command IDs and idempotent acknowledgement for the commands that exist at this phase: send,
   steer, queue, hold-after-boundary, supported cancellation, detach, and end-run. Journal acceptance
-  before execution and version the protocol so confirmation/retry commands can arrive later.
+  before execution; keep accepted, dispatch-started, delivered/not-delivered, and indeterminate as
+  distinct durable outcomes; and version the protocol so confirmation/retry commands can arrive
+  later.
+- Return send, steer, queue, and cancellation service calls at a durable receipt boundary rather
+  than waiting for the entire agent turn. This keeps later steering and cancellation reachable on
+  the same ordered client connection while execution continues under the service-owned Work actor.
 - Define GUI/Work-Host/runtime version negotiation and a drain/restart policy for incompatible
   hosts. Never migrate live Work across a version boundary implicitly.
+- State the transport trust level precisely. The first private Unix socket proves only same-local-
+  user access; its `ClientRef` is a self-claimed routing identity, not an authenticated principal or
+  sandbox boundary. Keep a transport-principal-to-client binding seam for later remote/device auth,
+  and require clients to verify the expected Work Host identity during reattachment.
+- Preserve wire admission order with one bounded input pump per connection, fence every callback by
+  connection generation, bound queued response bytes as well as items, and make listener/endpoint
+  shutdown identity-checked and globally deadline-bounded. Timeout or cancellation must not let one
+  late response poison unrelated requests.
 - Make window close, GUI quit, application relaunch, network loss, and client-device sleep detach
   events only. Work continues under host-side lifetime/resource policy until an explicit durable
   terminate command or policy deadline.

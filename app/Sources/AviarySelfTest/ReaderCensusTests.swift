@@ -25,6 +25,8 @@ private let censusSessionJournal = JournalRef.session(
     authority: TimelineAuthorityRef("session-authority"))
 private let censusWorkJournal = JournalRef.work(
     WorkRef(workHostID: "census-host", workID: "census-work"), journalID: "work-journal")
+private let censusControlJournal = JournalRef.workHost(
+    WorkHostRef("census-host"), journalID: "control-journal")
 
 private func prefixLines(_ data: Data, count: Int) -> Data {
     var result = Data()
@@ -37,16 +39,22 @@ private func prefixLines(_ data: Data, count: Int) -> Data {
 
 func test_readerCensusFixtureProjectsCorePlanes() throws {
     let manifest = try ReaderCensusFixtureFiles.manifest()
+    let controlData = try ReaderCensusFixtureFiles.data(manifest.controlJournal)
+    try WorkHostControlJournal.validateDurabilitySeal(
+        for: ReaderCensusFixtureFiles.root.appending(path: manifest.controlJournal),
+        journal: censusControlJournal, data: controlData)
     let report = ReaderCensus.report(
         sessionData: try ReaderCensusFixtureFiles.data(manifest.sessionJournal),
         sessionJournal: censusSessionJournal,
         workData: try ReaderCensusFixtureFiles.data(manifest.workJournal),
         workJournal: censusWorkJournal,
+        controlData: controlData,
+        controlJournal: censusControlJournal,
         manifest: manifest)
 
     XCTAssertEqual(report.projectionRulesVersion, 1)
-    XCTAssertEqual(report.sessionCommittedEventIDs.count, 20)
-    XCTAssertEqual(report.workCommittedEventIDs.count, 21)
+    XCTAssertEqual(report.sessionCommittedEventIDs.count, 18)
+    XCTAssertEqual(report.workCommittedEventIDs.count, 19)
     XCTAssertTrue(report.sessionIntegrityValid)
     XCTAssertTrue(report.workIntegrityValid)
     XCTAssertTrue(report.sessionStructuralIntegrityValid)
@@ -136,6 +144,20 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
                    ["sa-main", "sa-remote"])
     XCTAssertEqual(recoveryProjection.clientAttachments.map(\.attachment.attachmentID).sorted(),
                    ["ca-local", "ca-remote"])
+    let localRecoveryClient = try XCTUnwrap(recoveryProjection.clientAttachments.first {
+        $0.client == ClientRef("client-local")
+    })
+    XCTAssertEqual(localRecoveryClient.readAcknowledgements.count, 1)
+    XCTAssertEqual(localRecoveryClient.readAcknowledgements.first?.targetJournal,
+                   censusWorkJournal)
+    XCTAssertEqual(localRecoveryClient.readAcknowledgements.first?.cursor.eventID, "w21")
+    let remoteRecoveryClient = try XCTUnwrap(recoveryProjection.clientAttachments.first {
+        $0.client == ClientRef("client-remote")
+    })
+    XCTAssertEqual(remoteRecoveryClient.readAcknowledgements.count, 1)
+    XCTAssertEqual(remoteRecoveryClient.readAcknowledgements.first?.targetJournal,
+                   censusSessionJournal)
+    XCTAssertEqual(remoteRecoveryClient.readAcknowledgements.first?.cursor.eventID, "s19")
     XCTAssertEqual(recoveryProjection.recoveryCoverage.count, 1)
     if let recovery = recoveryProjection.recoveryCoverage.first {
         XCTAssertEqual(recovery.coverage.operation, .coldResume)
@@ -170,11 +192,11 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(report.recovery.count, 1)
     XCTAssertEqual(report.recovery[0].journal, censusWorkJournal)
     XCTAssertEqual(report.recovery[0].coverage.planes[.runtimeNamespace], .lost)
-    XCTAssertEqual(report.attachments.count, 6)
+    XCTAssertEqual(report.attachments.count, 4)
     XCTAssertEqual(
-        report.attachments.filter { $0.journal == censusSessionJournal }.count, 4)
+        report.attachments.filter { $0.journal == censusSessionJournal }.count, 2)
     XCTAssertEqual(
-        report.attachments.filter { $0.journal == censusWorkJournal }.count, 2)
+        report.attachments.filter { $0.journal == censusControlJournal }.count, 2)
     XCTAssertTrue(report.unknownEventRefs.contains { $0.eventID == "w21" })
     XCTAssertEqual(report.unknownEventRefs.count, 2)
     XCTAssertEqual(
@@ -461,9 +483,9 @@ func test_readerCensusIncrementalChunksMatchWholeRead() throws {
     // Session has already recorded a cursor for Work w21 while the remote Work page ends at w20.
     // The assembler must not silently substitute the older Work cursor and claim attachment.
     let delayedSession = ReaderCensus.read(
-        prefixLines(sessionData, count: 19), journal: censusSessionJournal)
+        prefixLines(sessionData, count: 18), journal: censusSessionJournal)
     let delayedWork = ReaderCensus.read(
-        prefixLines(workData, count: 20), journal: censusWorkJournal)
+        prefixLines(workData, count: 18), journal: censusWorkJournal)
     let delayedReport = ReaderCensus.report(
         sessionRead: delayedSession, workRead: delayedWork,
         sessionJournal: censusSessionJournal, workJournal: censusWorkJournal)

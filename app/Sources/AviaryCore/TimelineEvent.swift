@@ -178,11 +178,19 @@ public struct WorkCommandSnapshot: Codable, Hashable, Sendable {
 public enum TimelineJournalOwner: Codable, Hashable, Sendable {
     case work(WorkRef)
     case session(SessionRef)
+    /// Control state for one Work Host. This journal is intentionally separate from both the
+    /// Work journal and every Session journal: GUI/client attachments and read acknowledgements
+    /// are observer state, and may continue to change after the Work's immutable outcome.
+    case workHost(WorkHostRef)
 }
 
 public enum TimelineJournalKind: String, Codable, Hashable, Sendable {
     case work
     case session
+    case workHost = "work_host"
+
+    /// Descriptive spelling for callers working at the control-plane layer.
+    public static var workHostControl: TimelineJournalKind { .workHost }
 }
 
 /// The durable namespace responsible for a journal. This is intentionally separate from a
@@ -200,11 +208,14 @@ public struct JournalRef: Codable, Hashable, Sendable {
 
     public enum ConstructionError: LocalizedError, Equatable, Sendable {
         case workAuthorityMismatch(expected: String, actual: String)
+        case workHostAuthorityMismatch(expected: String, actual: String)
 
         public var errorDescription: String? {
             switch self {
             case .workAuthorityMismatch(let expected, let actual):
                 return "Work journal authority must equal Work Host (expected \(expected), got \(actual))."
+            case .workHostAuthorityMismatch(let expected, let actual):
+                return "Work Host control journal authority must equal Work Host (expected \(expected), got \(actual))."
             }
         }
     }
@@ -216,6 +227,11 @@ public struct JournalRef: Codable, Hashable, Sendable {
             guard authority.authorityID == work.workHostID else {
                 throw ConstructionError.workAuthorityMismatch(
                     expected: work.workHostID, actual: authority.authorityID)
+            }
+        } else if case .workHost(let workHost) = owner {
+            guard authority.authorityID == workHost.workHostID else {
+                throw ConstructionError.workHostAuthorityMismatch(
+                    expected: workHost.workHostID, actual: authority.authorityID)
             }
         }
         self.init(uncheckedJournalID: journalID, authority: authority, owner: owner)
@@ -241,6 +257,24 @@ public struct JournalRef: Codable, Hashable, Sendable {
         JournalRef(uncheckedJournalID: journalID, authority: authority, owner: .session(session))
     }
 
+    /// The durable control journal owned by one Work Host. Unlike a Work journal, it may accept
+    /// attachment and read-acknowledgement events after that Work reaches a terminal outcome.
+    public static func workHost(
+        _ workHost: WorkHostRef,
+        journalID: String = "control"
+    ) -> JournalRef {
+        JournalRef(uncheckedJournalID: journalID,
+                   authority: TimelineAuthorityRef(workHost.workHostID), owner: .workHost(workHost))
+    }
+
+    /// Explicit spelling for control-plane call sites.
+    public static func workHostControl(
+        _ workHost: WorkHostRef,
+        journalID: String = "control"
+    ) -> JournalRef {
+        JournalRef.workHost(workHost, journalID: journalID)
+    }
+
     /// Stable, non-secret, injective namespace for synthetic IDs and cross-journal references.
     ///
     /// Timeline identifiers are unrestricted strings, so delimiter-only concatenation is not a
@@ -256,6 +290,10 @@ public struct JournalRef: Codable, Hashable, Sendable {
             return "journal:v1/authority:\(Self.identityComponent(authority.authorityID))"
                 + "/kind:session/session:\(Self.identityComponent(session.sessionID))"
                 + "/journal:\(Self.identityComponent(journalID))"
+        case .workHost(let workHost):
+            return "journal:v1/authority:\(Self.identityComponent(authority.authorityID))"
+                + "/kind:work-host/work-host:\(Self.identityComponent(workHost.workHostID))"
+                + "/journal:\(Self.identityComponent(journalID))"
         }
     }
 
@@ -267,6 +305,7 @@ public struct JournalRef: Codable, Hashable, Sendable {
         switch owner {
         case .work: return .work
         case .session: return .session
+        case .workHost: return .workHost
         }
     }
 
@@ -300,6 +339,14 @@ public struct JournalRef: Codable, Hashable, Sendable {
         case .session:
             self.init(uncheckedJournalID: journalID, authority: authority,
                       owner: .session(SessionRef(try oc.decode(String.self, forKey: .sessionID))))
+        case .workHost:
+            let workHostID = try oc.decode(String.self, forKey: .workHostID)
+            guard authority.authorityID == workHostID else {
+                throw DecodingError.dataCorruptedError(forKey: .authority, in: c,
+                                                       debugDescription: "Work Host control journal authority must equal Work Host")
+            }
+            self.init(uncheckedJournalID: journalID, authority: authority,
+                      owner: .workHost(WorkHostRef(workHostID)))
         }
     }
 
@@ -317,6 +364,9 @@ public struct JournalRef: Codable, Hashable, Sendable {
         case .session(let session):
             try ownerContainer.encode(TimelineJournalKind.session, forKey: .kind)
             try ownerContainer.encode(session.sessionID, forKey: .sessionID)
+        case .workHost(let workHost):
+            try ownerContainer.encode(TimelineJournalKind.workHost, forKey: .kind)
+            try ownerContainer.encode(workHost.workHostID, forKey: .workHostID)
         }
     }
 }
@@ -474,6 +524,9 @@ public enum TimelineEventType {
     public static let clientDetached = "client.detached"
     public static let clientCapabilityChanged = "client.capability_changed"
     public static let clientCursorAdvanced = "client.cursor_advanced"
+    /// A control-journal acknowledgement of the exact cursor a client has consumed. It is
+    /// deliberately distinct from the Work/Session execution records it acknowledges.
+    public static let clientReadAcknowledged = "client.read_acknowledged"
     public static let runStarted = "run.started"
     public static let runFinished = "run.finished"
     public static let turnStarted = "turn.started"
@@ -918,7 +971,7 @@ public struct TimelineEvent: Codable, Hashable, Sendable {
         TimelineEventType.sessionDetached, TimelineEventType.sessionAttachmentCapabilityChanged,
         TimelineEventType.sessionAttachmentCursorAdvanced, TimelineEventType.clientAttached,
         TimelineEventType.clientDetached, TimelineEventType.clientCapabilityChanged,
-        TimelineEventType.clientCursorAdvanced,
+        TimelineEventType.clientCursorAdvanced, TimelineEventType.clientReadAcknowledged,
         TimelineEventType.runStarted,
         TimelineEventType.runFinished, TimelineEventType.turnStarted,
         TimelineEventType.turnFinished, TimelineEventType.inputAccepted,
@@ -1231,28 +1284,6 @@ public struct WorkHandleSnapshot: Codable, Hashable, Sendable {
     }
 }
 
-public struct ClientAttachmentSnapshot: Codable, Hashable, Sendable {
-    public let attachment: ClientAttachmentRef
-    public let client: ClientRef
-    public var cursor: JournalCursor?
-    public var capabilities: Set<String>
-    public var isAttached: Bool
-
-    public init(
-        attachment: ClientAttachmentRef,
-        client: ClientRef,
-        cursor: JournalCursor? = nil,
-        isAttached: Bool = true,
-        capabilities: Set<String> = []
-    ) {
-        self.attachment = attachment
-        self.client = client
-        self.cursor = cursor
-        self.isAttached = isAttached
-        self.capabilities = capabilities
-    }
-}
-
 public struct SessionAttachmentSnapshot: Codable, Hashable, Sendable {
     public let attachment: SessionAttachmentRef
     public let work: WorkRef
@@ -1298,8 +1329,6 @@ public struct WorkSnapshot: Codable, Hashable, Sendable {
     public var execution: WorkExecution = .idle
     public var attachedSessionIDs: Set<String> = []
     public var sessionAttachments: [String: WorkSessionAttachmentSnapshot] = [:]
-    public var attachedClientIDs: Set<String> = []
-    public var clientAttachments: [String: ClientAttachmentSnapshot] = [:]
     public var activeRun: RunRef?
     /// Every Run identity admitted by a canonical `run.started` event. Current liveness remains
     /// `activeRun`; this history exists so later Session-owned recovery claims can prove which
@@ -1368,8 +1397,6 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
     public var journal: JournalRef?
     public var session: SessionRef?
     public var attachments: [String: SessionAttachmentSnapshot] = [:]
-    public var attachedClientIDs: Set<String> = []
-    public var clientAttachments: [String: ClientAttachmentSnapshot] = [:]
     public var lifecycle: SessionLifecycle = .unknown
     /// Reserved for session-local lifecycle projections. Work execution is supplied by
     /// SessionAssembler from the attached WorkSnapshot, never reduced here.
@@ -1379,7 +1406,6 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
     /// Keeping this separate from the conversation tip prevents notification provenance from
     /// pointing at an unrelated message.
     public var attentionEvent: EventRef?
-    /// Kept for compatibility with early consumers; these are not populated by SessionReducer.
     public var activeRun: RunRef?
     public var modelID: String?
     public var activeTurn: TurnRef?

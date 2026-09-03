@@ -137,53 +137,6 @@ public struct WorkReducer: Sendable {
             }
             state.capabilities = Set(capabilities)
             snapshot.sessionAttachments[attachment.attachmentID] = state
-        case TimelineEventType.clientAttached:
-            guard let client = event.client, !client.clientID.isEmpty,
-                  let attachment = event.clientAttachment, !attachment.attachmentID.isEmpty else {
-                quarantine(event, reason: "Work client attachment is malformed")
-                return
-            }
-            if let existing = snapshot.clientAttachments[attachment.attachmentID],
-               existing.client != client {
-                quarantine(event, reason: "Work client attachment identity was reused by another client")
-                return
-            }
-            snapshot.clientAttachments[attachment.attachmentID] = ClientAttachmentSnapshot(
-                attachment: attachment, client: client,
-                capabilities: Set(event.payload["capabilities"]?.arrayValue?.compactMap(\.stringValue) ?? []))
-            refreshClientIDs()
-        case TimelineEventType.clientDetached:
-            guard let client = event.client, let attachment = event.clientAttachment,
-                  var state = snapshot.clientAttachments[attachment.attachmentID], state.client == client
-            else {
-                quarantine(event, reason: "Work client detach references the wrong attachment")
-                return
-            }
-            state.isAttached = false
-            snapshot.clientAttachments[attachment.attachmentID] = state
-            refreshClientIDs()
-        case TimelineEventType.clientCapabilityChanged:
-            guard let client = event.client,
-                  let attachment = event.clientAttachment,
-                  var state = snapshot.clientAttachments[attachment.attachmentID], state.client == client,
-                  let capabilities = event.payload["capabilities"]?.arrayValue?.compactMap(\.stringValue)
-            else {
-                quarantine(event, reason: "Work client capability change is malformed")
-                return
-            }
-            state.capabilities = Set(capabilities)
-            snapshot.clientAttachments[attachment.attachmentID] = state
-        case TimelineEventType.clientCursorAdvanced:
-            guard let client = event.client, let attachment = event.clientAttachment,
-                  var state = snapshot.clientAttachments[attachment.attachmentID], state.client == client,
-                  let cursor: JournalCursor = event.payload["cursor"].flatMap({ decodeTimelineValue($0) }),
-                  cursor.journal == snapshot.journal
-            else {
-                quarantine(event, reason: "Work client cursor is malformed or for another journal")
-                return
-            }
-            state.cursor = cursor
-            snapshot.clientAttachments[attachment.attachmentID] = state
         case TimelineEventType.runStarted:
             guard !isTerminalLifecycle, snapshot.activeRun == nil,
                   let run = event.run, !run.runID.isEmpty,
@@ -604,9 +557,6 @@ public struct WorkReducer: Sendable {
         return snapshot.eventSequences[eventID] == cursor.sequence
     }
 
-    private mutating func refreshClientIDs() {
-        snapshot.attachedClientIDs = Set(snapshot.clientAttachments.values.filter(\.isAttached).map { $0.client.clientID })
-    }
 }
 
 /// Pure projection of a Session journal. Work identity and attachment state are kept separate
@@ -684,53 +634,6 @@ public struct SessionReducer: Sendable {
             }
             state.cursor = cursor
             snapshot.attachments[attachment.attachmentID] = state
-        case TimelineEventType.clientAttached:
-            guard let client = event.client, !client.clientID.isEmpty,
-                  let attachment = event.clientAttachment, !attachment.attachmentID.isEmpty else {
-                quarantine(event, reason: "Session client attachment is malformed")
-                return
-            }
-            if let existing = snapshot.clientAttachments[attachment.attachmentID],
-               existing.client != client {
-                quarantine(event, reason: "Session client attachment identity was reused by another client")
-                return
-            }
-            snapshot.clientAttachments[attachment.attachmentID] = ClientAttachmentSnapshot(
-                attachment: attachment, client: client,
-                capabilities: Set(event.payload["capabilities"]?.arrayValue?.compactMap(\.stringValue) ?? []))
-            refreshClientIDs()
-        case TimelineEventType.clientDetached:
-            guard let client = event.client, let attachment = event.clientAttachment,
-                  var state = snapshot.clientAttachments[attachment.attachmentID], state.client == client
-            else {
-                quarantine(event, reason: "Session client detach references the wrong attachment")
-                return
-            }
-            state.isAttached = false
-            snapshot.clientAttachments[attachment.attachmentID] = state
-            refreshClientIDs()
-        case TimelineEventType.clientCapabilityChanged:
-            guard let client = event.client,
-                  let attachment = event.clientAttachment,
-                  var state = snapshot.clientAttachments[attachment.attachmentID], state.client == client,
-                  let capabilities = event.payload["capabilities"]?.arrayValue?.compactMap(\.stringValue)
-            else {
-                quarantine(event, reason: "client capability change is malformed")
-                return
-            }
-            state.capabilities = Set(capabilities)
-            snapshot.clientAttachments[attachment.attachmentID] = state
-        case TimelineEventType.clientCursorAdvanced:
-            guard let client = event.client, let attachment = event.clientAttachment,
-                  var state = snapshot.clientAttachments[attachment.attachmentID], state.client == client,
-                  let cursor: JournalCursor = event.payload["cursor"].flatMap({ decodeTimelineValue($0) }),
-                  cursor.journal == snapshot.journal
-            else {
-                quarantine(event, reason: "Session client cursor is malformed or for another journal")
-                return
-            }
-            state.cursor = cursor
-            snapshot.clientAttachments[attachment.attachmentID] = state
         case TimelineEventType.inputAccepted:
             appendMessage(event, role: "user")
         case TimelineEventType.messageCommitted:
@@ -1041,14 +944,6 @@ public struct SessionReducer: Sendable {
             }
         }
         return true
-    }
-
-    private mutating func refreshClientIDs() {
-        snapshot.attachedClientIDs = Set(
-            snapshot.clientAttachments.values
-                .filter(\.isAttached)
-                .map { $0.client.clientID }
-        )
     }
 
 }

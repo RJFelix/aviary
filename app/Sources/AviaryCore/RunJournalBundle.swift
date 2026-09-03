@@ -624,6 +624,11 @@ public actor RunJournalBundle {
         switch journal {
         case .session: await sessionWriter.injectFailure(point)
         case .work: await workWriter.injectFailure(point)
+        case .workHost:
+            // The paired bundle owns only the Session and Work journals. Work Host control
+            // state has its own writer and failure-injection surface.
+            preconditionFailure(
+                "RunJournalBundle does not own a Work Host control journal; inject failure through WorkHostControlJournal")
         }
     }
 

@@ -50,7 +50,7 @@ func test_canonicalFlockCatalogQualifiesChildIDsAndSessionLinks() throws {
     defer { try? FileManager.default.removeItem(at: home.root) }
     let sessionData = try FlockCatalogFixture.data("session.jsonl")
     let workData = FlockCatalogFixture.prefixLines(
-        try FlockCatalogFixture.data("work.jsonl"), count: 19)
+        try FlockCatalogFixture.data("work.jsonl"), count: 18)
     try flockWrite(sessionData, to: home.timelineV2SessionJournalURL(
         sessionID: FlockCatalogFixture.session.sessionID))
     try flockWrite(workData, to: home.timelineV2WorkJournalURL(FlockCatalogFixture.work))
@@ -63,9 +63,10 @@ func test_canonicalFlockCatalogQualifiesChildIDsAndSessionLinks() throws {
 
     XCTAssertTrue(projection.childLifecycleAvailable)
     XCTAssertEqual(projection.children.map(\.childID), ["child-1"])
-    XCTAssertTrue(projection.children[0].id.hasPrefix("work:11:census-host:11:census-work/child:"))
+    let child = try XCTUnwrap(projection.children.first)
+    XCTAssertTrue(child.id.hasPrefix("work:11:census-host:11:census-work/child:"))
     XCTAssertEqual(projection.sessions.map(\.id), [FlockCatalogFixture.sessionJournal.stableKey])
-    XCTAssertEqual(projection.sessions[0].session, FlockCatalogFixture.session)
+    XCTAssertEqual(try XCTUnwrap(projection.sessions.first).session, FlockCatalogFixture.session)
 }
 
 func test_canonicalFlockCatalogSuppressesChildrenForUnknownAffectedDomains() throws {

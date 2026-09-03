@@ -555,15 +555,18 @@ public struct WorkServiceSnapshotRequest: Codable, Hashable, Sendable {
     public let work: WorkRef
     public let journal: JournalRef
     public let attachment: ClientAttachmentRef
+    public let client: ClientRef
     public let afterCursor: JournalCursor?
     public let limit: Int
 
     public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
+                client: ClientRef,
                 afterCursor: JournalCursor? = nil,
                 limit: Int = WorkServiceBounds.maxEventsPerPage) {
         self.work = work
         self.journal = journal
         self.attachment = attachment
+        self.client = client
         self.afterCursor = afterCursor
         self.limit = limit
     }
@@ -588,14 +591,17 @@ public struct WorkServiceEventsRequest: Codable, Hashable, Sendable {
     public let work: WorkRef
     public let journal: JournalRef
     public let attachment: ClientAttachmentRef
+    public let client: ClientRef
     public let afterCursor: JournalCursor
     public let limit: Int
 
     public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
+                client: ClientRef,
                 afterCursor: JournalCursor, limit: Int = WorkServiceBounds.maxEventsPerPage) {
         self.work = work
         self.journal = journal
         self.attachment = attachment
+        self.client = client
         self.afterCursor = afterCursor
         self.limit = limit
     }
@@ -714,20 +720,40 @@ public enum WorkServiceBodyStatus: String, Codable, Hashable, Sendable {
     case unavailable
 }
 
+public struct WorkServiceArtifactRequest: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let journal: JournalRef
+    public let attachment: ClientAttachmentRef
+    public let client: ClientRef
+    public let artifactID: String
+
+    public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
+                client: ClientRef, artifactID: String) {
+        self.work = work
+        self.journal = journal
+        self.attachment = attachment
+        self.client = client
+        self.artifactID = artifactID
+    }
+}
+
 public struct WorkServiceBodyRequest: Codable, Hashable, Sendable {
     public let work: WorkRef
     public let journal: JournalRef
     public let attachment: ClientAttachmentRef
+    public let client: ClientRef
     public let reference: TimelineBodyReference
     public let offset: Int
     public let limit: Int
 
     public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
+                client: ClientRef,
                 reference: TimelineBodyReference, offset: Int = 0,
                 limit: Int = WorkServiceBounds.maxBodyChunkBytes) {
         self.work = work
         self.journal = journal
         self.attachment = attachment
+        self.client = client
         self.reference = reference
         self.offset = offset
         self.limit = limit
@@ -1092,8 +1118,8 @@ public protocol WorkServiceClient: Sendable {
     func detach(_ request: WorkServiceDetachRequest) async throws -> WorkServiceDetachResponse
     func snapshot(_ request: WorkServiceSnapshotRequest) async throws -> WorkServiceSnapshot
     func eventsAfterCursor(_ request: WorkServiceEventsRequest) async throws -> WorkServiceEventPage
-    func fetchArtifact(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
-                       artifactID: String) async throws -> WorkServiceArtifactDescriptor
+    func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws
+        -> WorkServiceArtifactDescriptor
     func fetchBody(_ request: WorkServiceBodyRequest) async throws -> WorkServiceBodyResponse
     func command(_ request: WorkServiceCommandRequest) async throws -> WorkServiceCommandReceipt
 }
@@ -1623,7 +1649,8 @@ public actor InMemoryWorkService: WorkServiceClient {
 
     public func snapshot(_ request: WorkServiceSnapshotRequest) async throws -> WorkServiceSnapshot {
         try requireReachable()
-        var state = try attachedState(work: request.work, journal: request.journal, attachment: request.attachment,
+        var state = try attachedState(work: request.work, journal: request.journal,
+                                      attachment: request.attachment, client: request.client,
                                       requiring: .observe)
         let after = try validatedAfter(request.afterCursor, state: state)
         let limit = try boundedPageSize(request.limit, max: WorkServiceBounds.maxEventsPerPage)
@@ -1644,7 +1671,8 @@ public actor InMemoryWorkService: WorkServiceClient {
 
     public func eventsAfterCursor(_ request: WorkServiceEventsRequest) async throws -> WorkServiceEventPage {
         try requireReachable()
-        var state = try attachedState(work: request.work, journal: request.journal, attachment: request.attachment,
+        var state = try attachedState(work: request.work, journal: request.journal,
+                                      attachment: request.attachment, client: request.client,
                                       requiring: .observe)
         let after = try validatedAfter(request.afterCursor, state: state)
         let limit = try boundedPageSize(request.limit, max: WorkServiceBounds.maxEventsPerPage)
@@ -1662,15 +1690,17 @@ public actor InMemoryWorkService: WorkServiceClient {
             omissions: hasMore ? [WorkServiceOmission(category: "events", count: available.count - events.count)] : [])
     }
 
-    public func fetchArtifact(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
-                              artifactID: String) async throws -> WorkServiceArtifactDescriptor {
+    public func fetchArtifact(
+        _ request: WorkServiceArtifactRequest
+    ) async throws -> WorkServiceArtifactDescriptor {
         try requireReachable()
-        guard validIdentity(artifactID) else {
+        guard validIdentity(request.artifactID) else {
             throw WorkServiceProtocolError.invalidRequest("artifact identity is not bounded")
         }
-        let state = try attachedState(work: work, journal: journal, attachment: attachment,
+        let state = try attachedState(work: request.work, journal: request.journal,
+                                      attachment: request.attachment, client: request.client,
                                       requiring: .inspectArtifacts)
-        guard let artifact = state.artifacts.first(where: { $0.artifactID == artifactID }) else {
+        guard let artifact = state.artifacts.first(where: { $0.artifactID == request.artifactID }) else {
             throw WorkServiceProtocolError.artifactNotFound
         }
         return artifact
@@ -1682,7 +1712,8 @@ public actor InMemoryWorkService: WorkServiceClient {
         // Artifact bodies are sensitive and are therefore covered by the artifact inspection
         // capability, even though their references may be visible in an observe-only descriptor.
         let state = try attachedState(work: request.work, journal: request.journal,
-                                      attachment: request.attachment, requiring: .observe)
+                                      attachment: request.attachment, client: request.client,
+                                      requiring: .observe)
         guard request.reference.authority == state.journal else {
             throw WorkServiceProtocolError.journalMismatch
         }
@@ -2018,11 +2049,15 @@ public actor InMemoryWorkService: WorkServiceClient {
 
     private func attachedState(work: WorkRef, journal: JournalRef,
                                attachment: ClientAttachmentRef,
+                               client: ClientRef,
                                requiring capability: WorkServiceCapability) throws -> WorkState {
         guard let state = works[work] else { throw WorkServiceProtocolError.workNotFound(work) }
         guard state.journal == journal else { throw WorkServiceProtocolError.journalMismatch }
-        guard let client = state.attachments[attachment] else { throw WorkServiceProtocolError.attachmentNotFound }
-        guard client.attachment.authorization.allows(capability) else {
+        guard let attachmentState = state.attachments[attachment],
+              attachmentState.attachment.client == client else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
+        guard attachmentState.attachment.authorization.allows(capability) else {
             throw WorkServiceProtocolError.capabilityDenied(capability)
         }
         return state

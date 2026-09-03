@@ -10,6 +10,7 @@ public struct ReaderCensusManifest: Codable, Hashable, Sendable {
     public let fixtureID: String
     public let sessionJournal: String
     public let workJournal: String
+    public let controlJournal: String
     public let legacyJournal: String
     public let retainedBodies: [String]
     public let malformedVariants: [String]
@@ -22,6 +23,7 @@ public struct ReaderCensusManifest: Codable, Hashable, Sendable {
         fixtureID: String,
         sessionJournal: String,
         workJournal: String,
+        controlJournal: String,
         legacyJournal: String,
         retainedBodies: [String] = [],
         malformedVariants: [String] = [],
@@ -33,6 +35,7 @@ public struct ReaderCensusManifest: Codable, Hashable, Sendable {
         self.fixtureID = fixtureID
         self.sessionJournal = sessionJournal
         self.workJournal = workJournal
+        self.controlJournal = controlJournal
         self.legacyJournal = legacyJournal
         self.retainedBodies = retainedBodies
         self.malformedVariants = malformedVariants
@@ -668,15 +671,24 @@ public enum ReaderCensus {
         sessionJournal: JournalRef,
         workData: Data,
         workJournal: JournalRef,
+        controlData: Data? = nil,
+        controlJournal: JournalRef? = nil,
         manifest: ReaderCensusManifest? = nil,
         actor: TimelineActor = TimelineActor(actorID: "reader-census", kind: "self-test"),
         at date: Date = Date(timeIntervalSince1970: 0)
     ) -> ReaderCensusReport {
         let sessionRead = read(sessionData, journal: sessionJournal, actor: actor, at: date)
         let workRead = read(workData, journal: workJournal, actor: actor, at: date)
+        let controlRead: TimelineJournalReadResult?
+        if let controlData, let controlJournal {
+            controlRead = read(controlData, journal: controlJournal, actor: actor, at: date)
+        } else {
+            controlRead = nil
+        }
         return report(
             sessionRead: sessionRead, workRead: workRead,
             sessionJournal: sessionJournal, workJournal: workJournal,
+            controlRead: controlRead, controlJournal: controlJournal,
             registeredConsumers: manifest?.registeredConsumers ?? defaultRegisteredConsumers,
             intentionallyUnwiredConsumers: manifest?.intentionallyUnwiredConsumers
                 ?? defaultIntentionallyUnwiredConsumers)
@@ -687,6 +699,8 @@ public enum ReaderCensus {
         workRead: TimelineJournalReadResult,
         sessionJournal: JournalRef,
         workJournal: JournalRef,
+        controlRead: TimelineJournalReadResult? = nil,
+        controlJournal: JournalRef? = nil,
         registeredConsumers: [String] = [
             "production local Timeline catalog", "canonical SessionCatalog projection",
             "canonical Flock adapter", "canonical Flock catalog projection", "canonical attention adapter",
@@ -699,6 +713,14 @@ public enum ReaderCensus {
         let workEvents = workRead.records.map(\.event)
         let session = SessionReducer.reduce(sessionEvents)
         let work = WorkReducer.reduce(workEvents)
+        let control: WorkHostControlSnapshot?
+        if let controlRead, let controlJournal {
+            control = WorkHostControlReducer.reduce(
+                controlRead.records.map(\.event),
+                initial: WorkHostControlSnapshot(journal: controlJournal))
+        } else {
+            control = nil
+        }
         let workCursor = workRead.records.last.map {
             JournalCursor(journal: workJournal, eventID: $0.event.eventID, sequence: $0.event.sequence)
         }
@@ -732,6 +754,16 @@ public enum ReaderCensus {
             && workRead.quarantinedSuffix == nil
             && work.structuralIntegrityValid
             && work.semanticProjectionValid
+        let controlIntegrity: Bool?
+        if let controlRead, let control {
+            controlIntegrity = controlRead.truncatedTail == nil
+                && controlRead.quarantinedSuffix == nil
+                && control.structuralIntegrityValid
+                && control.semanticProjectionValid
+                && control.unknownEvents.isEmpty
+        } else {
+            controlIntegrity = nil
+        }
 
         let contextInclusions = session.contextComponents
             .filter { !$0.omitted && $0.mode != .omitted }
@@ -781,8 +813,25 @@ public enum ReaderCensus {
             // the Session-side report useful while withholding every recovery disposition.
             canonicalWorkRecovery = CanonicalWorkRecoveryProjection(
                 works: [], sessions: canonicalSessionCatalog.map { [$0] } ?? [],
-                sourceComplete: false)
+                controls: [], sourceComplete: false)
         } else {
+            let canonicalControlRow: LocalTimelineCatalog.WorkHostControlRow?
+            if let controlRead, let controlJournal, let control {
+                let controlHost: WorkHostRef?
+                if case .workHost(let host) = controlJournal.owner {
+                    controlHost = host
+                } else {
+                    controlHost = nil
+                }
+                canonicalControlRow = LocalTimelineCatalog.WorkHostControlRow(
+                    locatorID: "reader-census-control", workHost: controlHost,
+                    journal: controlJournal, snapshot: control, read: controlRead,
+                    available: controlIntegrity == true, reasons: controlIntegrity == true
+                        ? [] : ["Reader Census Work Host control source is incomplete"],
+                    limits: LocalTimelineCatalog.Limits())
+            } else {
+                canonicalControlRow = nil
+            }
             let canonicalWorkRow = LocalTimelineCatalog.WorkRow(
                 locatorID: "reader-census-work",
                 work: work.work,
@@ -791,26 +840,34 @@ public enum ReaderCensus {
                 read: workRead,
                 available: workIntegrity,
                 reasons: workIntegrity ? [] : ["Reader Census Work source is incomplete"],
-                limit: 16)
+                limit: 16,
+                controlClientAttachments: canonicalControlRow?.clientAttachments ?? [])
             canonicalWorkRecovery = CanonicalWorkRecoveryProjection(
                 works: [canonicalWorkRow],
                 sessions: canonicalSessionCatalog.map { [$0] } ?? [],
-                sourceComplete: sessionIntegrity && workIntegrity)
+                controls: canonicalControlRow.map { [$0] } ?? [],
+                sourceComplete: sessionIntegrity && workIntegrity && controlIntegrity == true)
         }
 
-        let allEvents = sessionEvents + workEvents
+        let controlEvents = controlRead?.records.map(\.event) ?? []
+        let allEvents = sessionEvents + workEvents + controlEvents
         let allEventRefs = Set(allEvents.map { EventRef(journal: $0.journal, eventID: $0.eventID) })
         let unknownEventRefs = (session.unknownEvents.map {
             EventRef(journal: sessionJournal, eventID: $0.event.eventID)
         } + work.unknownEvents.map {
             EventRef(journal: workJournal, eventID: $0.event.eventID)
-        }).sorted {
+        } + (control?.unknownEvents.map {
+            EventRef(journal: controlJournal ?? $0.event.journal, eventID: $0.event.eventID)
+        } ?? [])).sorted {
             if $0.journal.stableKey != $1.journal.stableKey {
                 return $0.journal.stableKey < $1.journal.stableKey
             }
             return $0.eventID < $1.eventID
         }
-        let unknownDomains = Set(session.unknownDomains).union(work.unknownDomains)
+        let controlUnknownDomains = Set(control?.unknownEvents.flatMap { $0.affectedDomains } ?? [])
+        let unknownDomains = Set(session.unknownDomains)
+            .union(work.unknownDomains)
+            .union(controlUnknownDomains)
         let references = allEvents.flatMap { event -> [EventRef] in
             let primary = [event.causedByEventID, event.parentActivityID, event.conversationParent]
                 .compactMap { $0 }
@@ -834,17 +891,16 @@ public enum ReaderCensus {
                 sessionAttachment: $0.attachment, work: $0.work,
                 capabilities: $0.capabilities.sorted(), isAttached: $0.isAttached)
         }
-        attachments += session.clientAttachments.values.map {
-            ReaderCensusAttachment(
-                journal: sessionJournal, id: $0.attachment.attachmentID, kind: .client,
-                clientAttachment: $0.attachment, client: $0.client,
-                capabilities: $0.capabilities.sorted(), isAttached: $0.isAttached)
-        }
-        attachments += work.clientAttachments.values.map {
-            ReaderCensusAttachment(
-                journal: workJournal, id: $0.attachment.attachmentID, kind: .client,
-                clientAttachment: $0.attachment, client: $0.client,
-                capabilities: $0.capabilities.sorted(), isAttached: $0.isAttached)
+        if let control, let controlJournal, controlIntegrity == true {
+            attachments += control.clientAttachments.values.filter {
+                $0.work == work.work && $0.workJournal == workJournal
+            }.map {
+                ReaderCensusAttachment(
+                    journal: controlJournal, id: $0.attachment.attachmentID, kind: .client,
+                    clientAttachment: $0.attachment, work: $0.work, client: $0.client,
+                    capabilities: $0.capabilities.sorted(),
+                    isAttached: $0.isAttached)
+            }
         }
         attachments.sort {
             if $0.kind.rawValue != $1.kind.rawValue {

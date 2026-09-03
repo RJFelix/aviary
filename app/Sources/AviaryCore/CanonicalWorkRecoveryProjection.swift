@@ -16,6 +16,7 @@ public struct CanonicalWorkRecoveryObservation: Codable, Hashable, Sendable {
     public let work: WorkRef
     public let workJournal: JournalRef
     public let session: SessionRef
+    public let sessionJournal: JournalRef
     public let sessionAttachment: SessionAttachmentRef
     public let run: RunRef
     public let client: ClientRef
@@ -26,7 +27,7 @@ public struct CanonicalWorkRecoveryObservation: Codable, Hashable, Sendable {
 
     public init(
         work: WorkRef, workJournal: JournalRef, session: SessionRef,
-        sessionAttachment: SessionAttachmentRef, run: RunRef,
+        sessionJournal: JournalRef, sessionAttachment: SessionAttachmentRef, run: RunRef,
         client: ClientRef, clientAttachment: ClientAttachmentRef,
         presentation: CanonicalWorkRecoveryObservationPresentation,
         canReattach: Bool, canControl: Bool
@@ -34,6 +35,7 @@ public struct CanonicalWorkRecoveryObservation: Codable, Hashable, Sendable {
         self.work = work
         self.workJournal = workJournal
         self.session = session
+        self.sessionJournal = sessionJournal
         self.sessionAttachment = sessionAttachment
         self.run = run
         self.client = client
@@ -45,7 +47,8 @@ public struct CanonicalWorkRecoveryObservation: Codable, Hashable, Sendable {
 
     fileprivate var observerKey: String {
         [
-            workJournal.stableKey, session.sessionID, sessionAttachment.attachmentID,
+            workJournal.stableKey, session.sessionID, sessionJournal.stableKey,
+            sessionAttachment.attachmentID,
             run.runID, client.clientID, clientAttachment.attachmentID
         ].map { "\($0.utf8.count):\($0)" }.joined(separator: "/")
     }
@@ -53,14 +56,19 @@ public struct CanonicalWorkRecoveryObservation: Codable, Hashable, Sendable {
     fileprivate func identityIsValid(maxCharacters: Int) -> Bool {
         guard !work.workHostID.isEmpty, !work.workID.isEmpty,
               !workJournal.journalID.isEmpty, !workJournal.authority.authorityID.isEmpty,
-              !session.sessionID.isEmpty, !sessionAttachment.attachmentID.isEmpty,
+              !session.sessionID.isEmpty, !sessionJournal.journalID.isEmpty,
+              !sessionJournal.authority.authorityID.isEmpty,
+              !sessionAttachment.attachmentID.isEmpty,
               !run.runID.isEmpty,
               case .work(let owner) = workJournal.owner, owner == work,
-              workJournal.authority.authorityID == work.workHostID
+              workJournal.authority.authorityID == work.workHostID,
+              case .session(let sessionOwner) = sessionJournal.owner,
+              sessionOwner == session
         else { return false }
         guard !client.clientID.isEmpty, !clientAttachment.attachmentID.isEmpty else { return false }
         let fields = [work.workHostID, work.workID, workJournal.journalID,
                       workJournal.authority.authorityID, session.sessionID,
+                      sessionJournal.journalID, sessionJournal.authority.authorityID,
                       sessionAttachment.attachmentID, run.runID,
                       client.clientID, clientAttachment.attachmentID]
         return fields.allSatisfy { $0.utf8.count <= maxCharacters }
@@ -121,17 +129,43 @@ public struct CanonicalWorkRecoverySessionAttachment: Codable, Hashable, Sendabl
     }
 }
 
-/// A bounded Work-side client attachment fact. It does not assign ownership to that client.
+/// A bounded read acknowledgement for one target journal. The acknowledgement is control-plane
+/// state, not a cursor written into the target Work or Session journal.
+public struct CanonicalWorkRecoveryReadAcknowledgement: Codable, Hashable, Sendable, Identifiable {
+    public let targetJournal: JournalRef
+    public let cursor: JournalCursor
+    public let acknowledgedEvent: EventRef
+
+    public var id: String {
+        return CanonicalWorkRecoveryProjection.digest(
+            targetJournal.stableKey + "|" + String(cursor.sequence) + "|"
+                + (cursor.eventID ?? "") + "|" + acknowledgedEvent.eventID)
+    }
+}
+
+/// A bounded Work Host-control client attachment fact. It does not assign ownership to that
+/// client and never originates from a Work or Session reducer snapshot.
 public struct CanonicalWorkRecoveryClientAttachment: Codable, Hashable, Sendable, Identifiable {
     public let client: ClientRef
     public let attachment: ClientAttachmentRef
-    public let cursor: JournalCursor?
-    public let omittedCursorCount: Int
+    public let session: SessionRef?
+    public let sessionJournal: JournalRef?
+    public let sessionAttachment: SessionAttachmentRef?
     public let capabilities: [String]
     public let omittedCapabilityCount: Int
     public let isAttached: Bool
+    public let readAcknowledgements: [CanonicalWorkRecoveryReadAcknowledgement]
+    public let omittedReadAcknowledgementCount: Int
 
-    public var id: String { attachment.attachmentID }
+    public var id: String {
+        let sessionID = session?.sessionID ?? ""
+        let sessionJournalKey = sessionJournal?.stableKey ?? ""
+        let sessionAttachmentID = sessionAttachment?.attachmentID ?? ""
+        return CanonicalWorkRecoveryProjection.digest(
+            "client:\(client.clientID)|attachment:\(attachment.attachmentID)|"
+                + "session:\(sessionID)|sessionJournal:\(sessionJournalKey)|"
+                + "sessionAttachment:\(sessionAttachmentID)")
+    }
 }
 
 /// Result of reconciling a notification route against the current Work catalog. This is a
@@ -255,6 +289,7 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
     public init(
         works: [LocalTimelineCatalog.WorkRow],
         sessions: [CanonicalSessionCatalogSummary] = [],
+        controls: [LocalTimelineCatalog.WorkHostControlRow] = [],
         observations: [CanonicalWorkRecoveryObservation] = [],
         sourceComplete: Bool = true,
         limits: Limits = Limits(),
@@ -292,7 +327,8 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
             }
             let row = Self.makeRow(
                 identity: identity, group: group, representative: representative,
-                sessions: sessions, observations: observationsByWork[identity] ?? [],
+                sessions: sessions, controls: controls,
+                observations: observationsByWork[identity] ?? [],
                 duplicateFacts: duplicateFacts,
                 validIdentity: validIdentity, limits: limits,
                 observingClient: safeObservingClient,
@@ -374,12 +410,14 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
     public init(
         catalog: LocalTimelineCatalog.Snapshot,
         sessions: [CanonicalSessionCatalogSummary]? = nil,
+        controls: [LocalTimelineCatalog.WorkHostControlRow]? = nil,
         observations: [CanonicalWorkRecoveryObservation] = [],
         limits: Limits = Limits(), observingClient: ClientRef? = nil
     ) {
         self.init(
             works: catalog.works,
             sessions: sessions ?? catalog.sessionSummaries,
+            controls: controls ?? catalog.workHostControls,
             observations: observations,
             sourceComplete: catalog.canonicalNotificationSourceComplete,
             limits: limits, observingClient: observingClient)
@@ -463,6 +501,7 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
     private static func makeRow(
         identity: String, group: [LocalTimelineCatalog.WorkRow],
         representative: LocalTimelineCatalog.WorkRow?, sessions: [CanonicalSessionCatalogSummary],
+        controls: [LocalTimelineCatalog.WorkHostControlRow],
         observations: [CanonicalWorkRecoveryObservation], duplicateFacts: Bool,
         validIdentity: Bool, limits: Limits, observingClient: ClientRef?,
         observingClientWasInvalid: Bool
@@ -628,24 +667,86 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
         let sessionFacts = sessionGroups.map { $0.0 }
             .sorted { $0.id < $1.id }
         let limitedSessions = Array(sessionFacts.prefix(limits.maxAttachmentsPerRow))
-        let rawWorkClients = row?.clientAttachments ?? []
+        let controlRows: [LocalTimelineCatalog.WorkHostControlRow]
+        if let work {
+            let host = WorkHostRef(work.workHostID)
+            controlRows = controls.filter { $0.workHost == host }
+        } else {
+            controlRows = []
+        }
+        let usableControlRows = controlRows.filter { control in
+            guard control.isAvailable, let controlJournal = control.journal,
+                  case .workHost(let controlHost) = controlJournal.owner,
+                  let work,
+                  controlHost == WorkHostRef(work.workHostID) else { return false }
+            return true
+        }
+        let controlSourceAvailable = controlRows.count == 1 && usableControlRows.count == 1
+        let controlSourceConflict = controlRows.count > 1
+        var rawWorkClients: [WorkHostClientAttachmentSnapshot] = []
+        var rawReadAcknowledgements: [WorkHostReadAcknowledgementSnapshot] = []
+        if let work, let journal {
+            for control in usableControlRows {
+                rawWorkClients.append(contentsOf: control.clientAttachments.filter {
+                    $0.work == work && $0.workJournal == journal
+                })
+            }
+            for control in usableControlRows {
+                rawReadAcknowledgements.append(contentsOf: control.readAcknowledgements.filter {
+                    acknowledgement in
+                    guard acknowledgement.work == work else { return false }
+                    return rawWorkClients.contains { client in
+                        client.client == acknowledgement.client
+                            && client.attachment == acknowledgement.attachment
+                    }
+                })
+            }
+        }
         let workClients: [CanonicalWorkRecoveryClientAttachment] = rawWorkClients.compactMap {
-            (value: ClientAttachmentSnapshot) -> CanonicalWorkRecoveryClientAttachment? in
-            guard !value.client.clientID.isEmpty,
-                  value.client.clientID.utf8.count <= limits.maxIdentityCharacters,
-                  !value.attachment.attachmentID.isEmpty,
-                  value.attachment.attachmentID.utf8.count <= limits.maxIdentityCharacters else {
+            (value: WorkHostClientAttachmentSnapshot) -> CanonicalWorkRecoveryClientAttachment? in
+            guard Self.controlClientIdentityFits(
+                value, maxCharacters: limits.maxIdentityCharacters) else {
                 return nil
             }
             let (capabilities, omittedCapabilities) = boundedStrings(
                 Array(value.capabilities), limit: limits.maxCapabilitiesPerAttachment,
                 maxCharacters: limits.maxIdentityCharacters)
-            let cursor = boundedCursor(value.cursor, maxCharacters: limits.maxIdentityCharacters)
+            let acknowledgements = rawReadAcknowledgements.filter {
+                guard $0.client == value.client && $0.attachment == value.attachment else {
+                    return false
+                }
+                switch $0.targetJournal.owner {
+                case .work(let targetWork):
+                    return targetWork == value.work && $0.targetJournal == value.workJournal
+                case .session(let targetSession):
+                    return value.session == targetSession
+                        && value.sessionJournal == $0.targetJournal
+                case .workHost:
+                    return false
+                }
+            }.sorted {
+                if $0.targetJournal.stableKey != $1.targetJournal.stableKey {
+                    return $0.targetJournal.stableKey < $1.targetJournal.stableKey
+                }
+                if $0.cursor.sequence != $1.cursor.sequence {
+                    return $0.cursor.sequence < $1.cursor.sequence
+                }
+                return ($0.cursor.eventID ?? "") < ($1.cursor.eventID ?? "")
+            }
+            let boundedAcknowledgements = acknowledgements.compactMap {
+                boundedReadAcknowledgement($0, maxCharacters: limits.maxIdentityCharacters)
+            }
             return CanonicalWorkRecoveryClientAttachment(
-                client: value.client, attachment: value.attachment, cursor: cursor,
-                omittedCursorCount: value.cursor != nil && cursor == nil ? 1 : 0,
+                client: value.client, attachment: value.attachment,
+                session: value.session, sessionJournal: value.sessionJournal,
+                sessionAttachment: value.sessionAttachment,
                 capabilities: capabilities, omittedCapabilityCount: omittedCapabilities,
-                isAttached: value.isAttached)
+                isAttached: value.isAttached,
+                readAcknowledgements: Array(
+                    boundedAcknowledgements.prefix(limits.maxAttachmentsPerRow)),
+                omittedReadAcknowledgementCount: max(
+                    0, acknowledgements.count - boundedAcknowledgements.count)
+                    + max(0, boundedAcknowledgements.count - limits.maxAttachmentsPerRow))
         }
         let limitedClients = Array(workClients.prefix(limits.maxAttachmentsPerRow))
         let deduplication = deduplicatedObservations(observations)
@@ -662,12 +763,16 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
                   let activeRun = row?.activeRun, observation.run == activeRun,
                   sessionFacts.contains(where: {
                       $0.session == observation.session
+                          && $0.sessionJournal == observation.sessionJournal
                           && $0.attachment == observation.sessionAttachment
                           && $0.isAttached
                   }),
                   let clientFact = workClients.first(where: {
                       $0.client == observation.client
                           && $0.attachment == observation.clientAttachment
+                          && $0.session == observation.session
+                          && $0.sessionJournal == observation.sessionJournal
+                          && $0.sessionAttachment == observation.sessionAttachment
                   })
             else { return false }
             switch observation.presentation {
@@ -687,7 +792,10 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
 
         let disposition: CanonicalWorkRecoveryDisposition
         var reasons = row?.corruptionReasons ?? []
-        if duplicateFacts || duplicateSessionJoin {
+        if controlSourceConflict {
+            disposition = .ambiguous
+            reasons.append("duplicate Work Host control journals")
+        } else if duplicateFacts || duplicateSessionJoin {
             disposition = .ambiguous
             if duplicateFacts { reasons.append("duplicate Work fact") }
             if duplicateSessionJoin { reasons.append("duplicate Session attachment join") }
@@ -701,6 +809,9 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
             reasons.append("Work/runtime/external-effects facts are unknown")
         } else {
             disposition = Self.durableDisposition(row)
+        }
+        if !controlSourceAvailable && disposition != .corrupt && disposition != .ambiguous {
+            reasons.append("Work Host control journal is unavailable; client attachment facts are unknown")
         }
         if disposition == .ambiguous { reasons.append("recovery facts cannot be selected safely") }
 
@@ -725,6 +836,9 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
                     && workClients.contains(where: {
                         $0.client == observation.client
                             && $0.attachment == observation.clientAttachment
+                            && $0.session == observation.session
+                            && $0.sessionJournal == observation.sessionJournal
+                            && $0.sessionAttachment == observation.sessionAttachment
                             && $0.capabilities.contains("control")
                     })
             }
@@ -739,6 +853,9 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
                     && workClients.contains(where: {
                         $0.client == observation.client
                             && $0.attachment == observation.clientAttachment
+                            && $0.session == observation.session
+                            && $0.sessionJournal == observation.sessionJournal
+                            && $0.sessionAttachment == observation.sessionAttachment
                             && $0.capabilities.contains("control")
                     })
             }
@@ -810,9 +927,13 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
         let operationalFactsProjectable = disposition != .ambiguous && disposition != .corrupt
         let sessionOmissions = max(0, sessionFacts.count - limitedSessions.count)
             + omittedSessionIdentityCount + (row?.omittedSessionAttachmentCount ?? 0)
-        let clientOmissions = max(0, workClients.count - limitedClients.count)
+        let limitedClientCount = limitedClients.count
+        let clientOmissions = max(0, workClients.count - limitedClientCount)
             + max(0, rawWorkClients.count - workClients.count)
             + (row?.omittedClientAttachmentCount ?? 0)
+            + controlRows.reduce(0) { partial, control in
+                partial + control.omittedClientAttachmentCount
+            }
         return Row(
             id: identity, work: safeWork, journal: safeJournal,
             workHost: safeWork.map { WorkHostRef($0.workHostID) }, disposition: disposition,
@@ -935,6 +1056,7 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
         [
             value.work.workHostID, value.work.workID, value.workJournal.journalID,
             value.workJournal.authority.authorityID, value.session.sessionID,
+            value.sessionJournal.journalID, value.sessionJournal.authority.authorityID,
             value.sessionAttachment.attachmentID, value.run.runID, value.client.clientID,
             value.clientAttachment.attachmentID
         ].allSatisfy { !$0.isEmpty && $0.utf8.count <= maxCharacters }
@@ -1009,6 +1131,80 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
               value.eventID.map({ !$0.isEmpty && $0.utf8.count <= maxCharacters }) ?? false
         else { return nil }
         return value
+    }
+
+    private static func controlClientIdentityFits(
+        _ value: WorkHostClientAttachmentSnapshot, maxCharacters: Int
+    ) -> Bool {
+        let workIdentityFits = !value.work.workHostID.isEmpty
+            && value.work.workHostID.utf8.count <= maxCharacters
+            && !value.work.workID.isEmpty
+            && value.work.workID.utf8.count <= maxCharacters
+        let workJournalFits: Bool
+        if case .work(let owner) = value.workJournal.owner {
+            workJournalFits = owner == value.work
+                && !value.workJournal.journalID.isEmpty
+                && value.workJournal.journalID.utf8.count <= maxCharacters
+                && !value.workJournal.authority.authorityID.isEmpty
+                && value.workJournal.authority.authorityID.utf8.count <= maxCharacters
+                && value.workJournal.authority.authorityID == value.work.workHostID
+        } else {
+            workJournalFits = false
+        }
+        let sessionIdentityFits: Bool
+        switch (value.session, value.sessionJournal, value.sessionAttachment) {
+        case (nil, nil, nil):
+            sessionIdentityFits = true
+        case (.some(let session), .some(let sessionJournal), .some(let attachment)):
+            let ownerMatches: Bool
+            if case .session(let owner) = sessionJournal.owner {
+                ownerMatches = owner == session
+            } else {
+                ownerMatches = false
+            }
+            sessionIdentityFits = !session.sessionID.isEmpty
+                && session.sessionID.utf8.count <= maxCharacters
+                && ownerMatches
+                && !sessionJournal.journalID.isEmpty
+                && sessionJournal.journalID.utf8.count <= maxCharacters
+                && !sessionJournal.authority.authorityID.isEmpty
+                && sessionJournal.authority.authorityID.utf8.count <= maxCharacters
+                && !attachment.attachmentID.isEmpty
+                && attachment.attachmentID.utf8.count <= maxCharacters
+        default:
+            sessionIdentityFits = false
+        }
+        return workIdentityFits && workJournalFits && sessionIdentityFits
+            && !value.client.clientID.isEmpty
+            && value.client.clientID.utf8.count <= maxCharacters
+            && !value.attachment.attachmentID.isEmpty
+            && value.attachment.attachmentID.utf8.count <= maxCharacters
+    }
+
+    private static func boundedReadAcknowledgement(
+        _ value: WorkHostReadAcknowledgementSnapshot,
+        maxCharacters: Int
+    ) -> CanonicalWorkRecoveryReadAcknowledgement? {
+        let cursorEventFits: Bool
+        if value.cursor.sequence == 0 {
+            cursorEventFits = value.cursor.eventID == nil
+        } else {
+            cursorEventFits = value.cursor.eventID.map {
+                !$0.isEmpty && $0.utf8.count <= maxCharacters
+            } ?? false
+        }
+        guard value.targetJournal.journalID.utf8.count <= maxCharacters,
+              value.targetJournal.authority.authorityID.utf8.count <= maxCharacters,
+              value.cursor.journal == value.targetJournal,
+              value.cursor.sequence >= 0,
+              cursorEventFits,
+              value.acknowledgedEvent.eventID.utf8.count <= maxCharacters,
+              value.acknowledgedEvent.journal.journalID.utf8.count <= maxCharacters,
+              value.acknowledgedEvent.journal.authority.authorityID.utf8.count <= maxCharacters
+        else { return nil }
+        return CanonicalWorkRecoveryReadAcknowledgement(
+            targetJournal: value.targetJournal, cursor: value.cursor,
+            acknowledgedEvent: value.acknowledgedEvent)
     }
 
     private static func boundedRun(_ value: RunRef?, maxCharacters: Int) -> RunRef? {

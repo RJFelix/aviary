@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 @testable import AviaryCore
 
 private let recoveryProjectionActor = TimelineActor(actorID: "recovery-projection-test", kind: "test")
@@ -38,14 +39,43 @@ private func recoveryProjectionWrite(_ data: Data, to url: URL) throws {
     try data.write(to: url, options: .atomic)
 }
 
+private struct RecoveryProjectionControlDurabilitySeal: Codable {
+    let schemaVersion: Int
+    let journal: JournalRef
+    let cursor: JournalCursor
+    let byteCount: Int
+    let sha256: String
+}
+
+private func recoveryProjectionWriteControl(
+    _ data: Data, journal: JournalRef, to url: URL
+) throws {
+    try recoveryProjectionWrite(data, to: url)
+    let read = TimelineJournalReader.read(
+        data, journal: journal, actor: recoveryProjectionActor,
+        hostRecordedAt: Date(timeIntervalSince1970: 0))
+    let last = read.records.last?.event
+    let cursor = JournalCursor(
+        journal: journal, eventID: last?.eventID, sequence: last?.sequence ?? 0)
+    let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    let seal = RecoveryProjectionControlDurabilitySeal(
+        schemaVersion: 1, journal: journal, cursor: cursor,
+        byteCount: data.count, sha256: digest)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    var sealData = try encoder.encode(seal)
+    sealData.append(0x0A)
+    try sealData.write(
+        to: WorkHostControlJournal.durabilitySealURL(for: url), options: .atomic)
+}
+
 private func recoveryProjectionJSON<T: Encodable>(_ value: T) throws -> JSONValue {
     try XCTUnwrap(JSONValue.parse(JSONEncoder().encode(value)))
 }
 
 private func recoveryProjectionWorkData(
     work: WorkRef, journal: JournalRef, terminal: Bool = false,
-    unknownRuntime: Bool = false, unknownSession: Bool = false,
-    includeDetachedSecondClient: Bool = false
+    unknownRuntime: Bool = false, unknownSession: Bool = false
 ) throws -> Data {
     var data = try recoveryProjectionEvent(
         id: "w1", journal: journal, sequence: 1, type: TimelineEventType.workCreated,
@@ -57,31 +87,8 @@ private func recoveryProjectionWorkData(
         sessionAttachment: SessionAttachmentRef("recovery-attachment"),
         declaredDomains: [.work, .session],
         payload: .object(["capabilities": .array([.string("observe")])])))
-    data.append(try recoveryProjectionEvent(
-        id: "w3", journal: journal, sequence: 3, previous: "w2",
-        type: TimelineEventType.clientAttached, work: work,
-        workHost: WorkHostRef(work.workHostID), client: ClientRef("gui-a"),
-        clientAttachment: ClientAttachmentRef("client-a"), declaredDomains: [.work],
-        payload: .object(["capabilities": .array([.string("observe"), .string("control")])])))
-    var lastID = "w3"
-    var sequence = 3
-    if includeDetachedSecondClient {
-        sequence += 1
-        data.append(try recoveryProjectionEvent(
-            id: "w\(sequence)", journal: journal, sequence: sequence, previous: lastID,
-            type: TimelineEventType.clientAttached, work: work,
-            workHost: WorkHostRef(work.workHostID), client: ClientRef("gui-b"),
-            clientAttachment: ClientAttachmentRef("client-b"), declaredDomains: [.work],
-            payload: .object(["capabilities": .array([.string("observe"), .string("control")])])))
-        lastID = "w\(sequence)"
-        sequence += 1
-        data.append(try recoveryProjectionEvent(
-            id: "w\(sequence)", journal: journal, sequence: sequence, previous: lastID,
-            type: TimelineEventType.clientDetached, work: work,
-            workHost: WorkHostRef(work.workHostID), client: ClientRef("gui-b"),
-            clientAttachment: ClientAttachmentRef("client-b"), declaredDomains: [.work]))
-        lastID = "w\(sequence)"
-    }
+    let lastID = "w2"
+    var sequence = 2
     sequence += 1
     let stateID = "w\(sequence)"
     if unknownRuntime {
@@ -111,26 +118,99 @@ private func recoveryProjectionWorkData(
     return data
 }
 
+private func recoveryProjectionControlData(
+    work: WorkRef, workJournal: JournalRef,
+    includeDetachedSecondClient: Bool = false,
+    sessionJournalOverride: JournalRef? = nil
+) throws -> (journal: JournalRef, data: Data) {
+    let workHost = WorkHostRef(work.workHostID)
+    let controlJournal = JournalRef.workHost(workHost, journalID: "control-journal")
+    let session = SessionRef("recovery-session")
+    let sessionJournal = JournalRef.session(
+        session, journalID: "recovery-session-journal",
+        authority: TimelineAuthorityRef("recovery-session-service"))
+    let sessionAttachment = SessionAttachmentRef("recovery-attachment")
+    let basePayload: JSONValue = .object([
+        "work_journal": try recoveryProjectionJSON(workJournal),
+        "session_journal": try recoveryProjectionJSON(sessionJournalOverride ?? sessionJournal),
+        "capabilities": .array([.string("observe"), .string("control")]),
+    ])
+    var data = try recoveryProjectionEvent(
+        id: "c1", journal: controlJournal, sequence: 1,
+        type: TimelineEventType.clientAttached, session: session, work: work,
+        workHost: workHost, sessionAttachment: sessionAttachment,
+        client: ClientRef("gui-a"), clientAttachment: ClientAttachmentRef("client-a"),
+        declaredDomains: [.work], payload: basePayload)
+    if includeDetachedSecondClient {
+        let secondPayload: JSONValue = .object([
+            "work_journal": try recoveryProjectionJSON(workJournal),
+            "session_journal": try recoveryProjectionJSON(sessionJournalOverride ?? sessionJournal),
+            "capabilities": .array([.string("observe"), .string("control")]),
+        ])
+        data.append(try recoveryProjectionEvent(
+            id: "c2", journal: controlJournal, sequence: 2, previous: "c1",
+            type: TimelineEventType.clientAttached, session: session, work: work,
+            workHost: workHost, sessionAttachment: sessionAttachment,
+            client: ClientRef("gui-b"), clientAttachment: ClientAttachmentRef("client-b"),
+            declaredDomains: [.work], payload: secondPayload))
+        data.append(try recoveryProjectionEvent(
+            id: "c3", journal: controlJournal, sequence: 3, previous: "c2",
+            type: TimelineEventType.clientDetached, session: session, work: work,
+            workHost: workHost, sessionAttachment: sessionAttachment,
+            client: ClientRef("gui-b"), clientAttachment: ClientAttachmentRef("client-b"),
+            declaredDomains: [.work], payload: .object([
+                "work_journal": try recoveryProjectionJSON(workJournal),
+                "session_journal": try recoveryProjectionJSON(sessionJournalOverride ?? sessionJournal),
+            ])))
+    }
+    return (controlJournal, data)
+}
+
 func test_canonicalWorkRecoveryProjectionUsesDurableWorkEvidenceAndScopesObservers() throws {
     let home = try recoveryProjectionHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
     let work = WorkRef(workHostID: "recovery-host", workID: "active-work")
     let journal = JournalRef.work(work)
+    let sessionJournal = JournalRef.session(
+        SessionRef("recovery-session"), journalID: "recovery-session-journal",
+        authority: TimelineAuthorityRef("recovery-session-service"))
     try recoveryProjectionWrite(
         recoveryProjectionWorkData(
-            work: work, journal: journal, includeDetachedSecondClient: true),
+            work: work, journal: journal),
         to: home.timelineV2WorkJournalURL(work))
+    var sessionData = try recoveryProjectionEvent(
+        id: "s1", journal: sessionJournal, sequence: 1,
+        type: TimelineEventType.sessionCreated, session: SessionRef("recovery-session"),
+        declaredDomains: [.session])
+    sessionData.append(try recoveryProjectionEvent(
+        id: "s2", journal: sessionJournal, sequence: 2, previous: "s1",
+        type: TimelineEventType.sessionAttached, session: SessionRef("recovery-session"),
+        work: work, sessionAttachment: SessionAttachmentRef("recovery-attachment"),
+        declaredDomains: [.session, .work]))
+    try recoveryProjectionWrite(
+        sessionData,
+        to: home.timelineV2SessionJournalURL(sessionID: "recovery-session"))
+    let control = try recoveryProjectionControlData(
+        work: work, workJournal: journal, includeDetachedSecondClient: true)
+    try recoveryProjectionWriteControl(
+        control.data, journal: control.journal,
+        to: home.timelineV2WorkHostControlJournalURL(workHostID: work.workHostID))
 
     let catalog = LocalTimelineCatalog.scan(home: home)
     let row = try XCTUnwrap(catalog.works.first { $0.work == work })
     XCTAssertTrue(row.isAvailable)
     XCTAssertEqual(row.sessionAttachments.count, 1)
     XCTAssertEqual(row.sessionAttachments[0].session, SessionRef("recovery-session"))
+    XCTAssertEqual(row.clientAttachments.map(\.attachment.attachmentID).sorted(),
+                   ["client-a", "client-b"])
+    XCTAssertEqual(catalog.workHostControls.count, 1)
+    XCTAssertTrue(catalog.workHostControls[0].isAvailable)
     XCTAssertEqual(row.lifecycle, .active)
     XCTAssertEqual(row.activeRun, RunRef("recovery-run"))
 
     let observation = CanonicalWorkRecoveryObservation(
         work: work, workJournal: journal, session: SessionRef("recovery-session"),
+        sessionJournal: sessionJournal,
         sessionAttachment: SessionAttachmentRef("recovery-attachment"), run: RunRef("recovery-run"),
         client: ClientRef("gui-a"), clientAttachment: ClientAttachmentRef("client-a"),
         presentation: .attached, canReattach: true, canControl: true)
@@ -147,6 +227,12 @@ func test_canonicalWorkRecoveryProjectionUsesDurableWorkEvidenceAndScopesObserve
     XCTAssertEqual(scoped.rows.first?.disposition, .recordedActive)
     XCTAssertEqual(scoped.rows.first?.clientDisposition, .observedAttached)
     XCTAssertTrue(scoped.rows.first?.clientCanControl ?? false)
+    let scopedClient = try XCTUnwrap(scoped.rows.first?.clientAttachments.first {
+        $0.client == ClientRef("gui-a")
+    })
+    XCTAssertEqual(scopedClient.session, SessionRef("recovery-session"))
+    XCTAssertEqual(scopedClient.sessionJournal, sessionJournal)
+    XCTAssertEqual(scopedClient.sessionAttachment, SessionAttachmentRef("recovery-attachment"))
 
     let duplicate = CanonicalWorkRecoveryProjection(
         catalog: catalog, observations: [observation, observation],
@@ -156,6 +242,7 @@ func test_canonicalWorkRecoveryProjectionUsesDurableWorkEvidenceAndScopesObserve
     XCTAssertEqual(duplicate.rows.first?.omittedObservationCount, 1)
     let conflicting = CanonicalWorkRecoveryObservation(
         work: work, workJournal: journal, session: SessionRef("recovery-session"),
+        sessionJournal: sessionJournal,
         sessionAttachment: SessionAttachmentRef("recovery-attachment"), run: RunRef("recovery-run"),
         client: ClientRef("gui-a"), clientAttachment: ClientAttachmentRef("client-a"),
         presentation: .detached, canReattach: false, canControl: false)
@@ -168,6 +255,7 @@ func test_canonicalWorkRecoveryProjectionUsesDurableWorkEvidenceAndScopesObserve
 
     let otherClientDetached = CanonicalWorkRecoveryObservation(
         work: work, workJournal: journal, session: SessionRef("recovery-session"),
+        sessionJournal: sessionJournal,
         sessionAttachment: SessionAttachmentRef("recovery-attachment"), run: RunRef("recovery-run"),
         client: ClientRef("gui-b"), clientAttachment: ClientAttachmentRef("client-b"),
         presentation: .detached, canReattach: true, canControl: true)
@@ -186,6 +274,7 @@ func test_canonicalWorkRecoveryProjectionUsesDurableWorkEvidenceAndScopesObserve
 
     let malformedOtherClient = CanonicalWorkRecoveryObservation(
         work: work, workJournal: journal, session: SessionRef("recovery-session"),
+        sessionJournal: sessionJournal,
         sessionAttachment: SessionAttachmentRef("recovery-attachment"), run: RunRef("recovery-run"),
         client: ClientRef("gui-b"), clientAttachment: ClientAttachmentRef(""),
         presentation: .attached, canReattach: true, canControl: true)
@@ -195,6 +284,70 @@ func test_canonicalWorkRecoveryProjectionUsesDurableWorkEvidenceAndScopesObserve
     XCTAssertEqual(isolatedMalformedClient.rows.first?.disposition, .recordedActive)
     XCTAssertEqual(isolatedMalformedClient.rows.first?.clientDisposition, .observedAttached)
     XCTAssertTrue(isolatedMalformedClient.rows.first?.observationReasons.isEmpty == false)
+
+    let swappedSession = SessionRef("other-session")
+    let swappedSessionJournal = JournalRef.session(
+        swappedSession, journalID: "other-session-journal",
+        authority: TimelineAuthorityRef("other-session-service"))
+    let swappedSessionObservation = CanonicalWorkRecoveryObservation(
+        work: work, workJournal: journal, session: swappedSession,
+        sessionJournal: swappedSessionJournal,
+        sessionAttachment: SessionAttachmentRef("recovery-attachment"),
+        run: RunRef("recovery-run"), client: ClientRef("gui-a"),
+        clientAttachment: ClientAttachmentRef("client-a"),
+        presentation: .attached, canReattach: true, canControl: true)
+    let swappedSessionProjection = CanonicalWorkRecoveryProjection(
+        catalog: catalog, observations: [swappedSessionObservation],
+        observingClient: ClientRef("gui-a"))
+    XCTAssertEqual(swappedSessionProjection.rows.first?.clientDisposition, .unverified)
+    XCTAssertFalse(swappedSessionProjection.rows.first?.clientCanControl ?? true)
+
+    // The Session ID and attachment ID can survive a Session-journal replacement. A control
+    // attachment from the old journal generation must not authorize an observation against the
+    // current canonical Session summary merely because those two display identities match.
+    let staleHome = try recoveryProjectionHome()
+    defer { try? FileManager.default.removeItem(at: staleHome.root) }
+    let staleWork = WorkRef(workHostID: "stale-session-generation-host", workID: "stale-work")
+    let staleWorkJournal = JournalRef.work(staleWork)
+    try recoveryProjectionWrite(
+        recoveryProjectionWorkData(work: staleWork, journal: staleWorkJournal),
+        to: staleHome.timelineV2WorkJournalURL(staleWork))
+    let stableSession = SessionRef("recovery-session")
+    let stableSessionJournal = JournalRef.session(
+        stableSession, journalID: "stable-session-journal",
+        authority: TimelineAuthorityRef("stable-session-service"))
+    let stableSessionAttachment = SessionAttachmentRef("recovery-attachment")
+    var stableSessionData = try recoveryProjectionEvent(
+        id: "ss1", journal: stableSessionJournal, sequence: 1,
+        type: TimelineEventType.sessionCreated, session: stableSession,
+        declaredDomains: [.session])
+    stableSessionData.append(try recoveryProjectionEvent(
+        id: "ss2", journal: stableSessionJournal, sequence: 2, previous: "ss1",
+        type: TimelineEventType.sessionAttached, session: stableSession, work: staleWork,
+        sessionAttachment: stableSessionAttachment, declaredDomains: [.session, .work]))
+    try recoveryProjectionWrite(
+        stableSessionData, to: staleHome.timelineV2SessionJournalURL(stableSession))
+    let staleSessionJournal = JournalRef.session(
+        stableSession, journalID: "replaced-session-journal",
+        authority: TimelineAuthorityRef("replaced-session-service"))
+    let staleControl = try recoveryProjectionControlData(
+        work: staleWork, workJournal: staleWorkJournal,
+        sessionJournalOverride: staleSessionJournal)
+    try recoveryProjectionWriteControl(
+        staleControl.data, journal: staleControl.journal,
+        to: staleHome.timelineV2WorkHostControlJournalURL(workHostID: staleWork.workHostID))
+    let staleObservation = CanonicalWorkRecoveryObservation(
+        work: staleWork, workJournal: staleWorkJournal, session: stableSession,
+        sessionJournal: staleSessionJournal, sessionAttachment: stableSessionAttachment,
+        run: RunRef("recovery-run"), client: ClientRef("gui-a"),
+        clientAttachment: ClientAttachmentRef("client-a"), presentation: .attached,
+        canReattach: true, canControl: true)
+    let staleProjection = CanonicalWorkRecoveryProjection(
+        catalog: LocalTimelineCatalog.scan(home: staleHome),
+        observations: [staleObservation], observingClient: ClientRef("gui-a"))
+    XCTAssertEqual(staleProjection.rows.first?.disposition, .recordedActive)
+    XCTAssertEqual(staleProjection.rows.first?.clientDisposition, .unverified)
+    XCTAssertFalse(staleProjection.rows.first?.clientCanControl ?? true)
 }
 
 func test_canonicalWorkRecoveryProjectionTerminalAndUnknownStatesFailClosed() throws {
@@ -229,6 +382,12 @@ func test_canonicalWorkRecoveryProjectionTerminalAndUnknownStatesFailClosed() th
         recoveryProjectionWorkData(
             work: unknownSessionWork, journal: unknownSessionJournal, unknownSession: true),
         to: unknownSessionHome.timelineV2WorkJournalURL(unknownSessionWork))
+    let unknownSessionControl = try recoveryProjectionControlData(
+        work: unknownSessionWork, workJournal: unknownSessionJournal)
+    try recoveryProjectionWriteControl(
+        unknownSessionControl.data, journal: unknownSessionControl.journal,
+        to: unknownSessionHome.timelineV2WorkHostControlJournalURL(
+            workHostID: unknownSessionWork.workHostID))
     let unknownSessionCatalog = LocalTimelineCatalog.scan(home: unknownSessionHome)
     let unknownSessionRow = try XCTUnwrap(unknownSessionCatalog.works.first)
     XCTAssertTrue(unknownSessionRow.sessionAttachments.isEmpty)
@@ -239,9 +398,13 @@ func test_canonicalWorkRecoveryProjectionTerminalAndUnknownStatesFailClosed() th
 
 func test_canonicalWorkRecoveryProjectionDoesNotManufactureRecoveryWithoutCatalogEvidence() throws {
     let work = WorkRef(workHostID: "recovery-host", workID: "observation-only-work")
+    let session = SessionRef("observation-only-session")
+    let sessionJournal = JournalRef.session(
+        session, journalID: "observation-only-session-journal",
+        authority: TimelineAuthorityRef("observation-only-session-service"))
     let observation = CanonicalWorkRecoveryObservation(
-        work: work, workJournal: JournalRef.work(work),
-        session: SessionRef("observation-only-session"),
+        work: work, workJournal: JournalRef.work(work), session: session,
+        sessionJournal: sessionJournal,
         sessionAttachment: SessionAttachmentRef("observation-only-session-attachment"),
         run: RunRef("observation-only-run"), client: ClientRef("gui-a"),
         clientAttachment: ClientAttachmentRef("observation-only-client-attachment"),

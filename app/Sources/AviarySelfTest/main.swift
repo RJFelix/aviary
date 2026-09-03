@@ -6943,7 +6943,8 @@ await Harness.run(
         + casesContextManifest + casesPromptProvenance + casesNativeColdResume
         + casesCanonicalSessionSearch
         + casesLocalTimelineCatalog + casesCanonicalWorkRecoveryProjection
-        + casesWorkService
+        + casesWorkService + casesWorkHostControlJournal
+        + casesHostedInHouseWork + casesWorkServiceTransport
         + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal
         + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel

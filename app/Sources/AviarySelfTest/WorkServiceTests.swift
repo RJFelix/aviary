@@ -310,6 +310,7 @@ func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities(
     XCTAssertNotEqual(attachmentA.attachment.attachmentID, attachmentB.attachment.attachmentID)
     let aSnapshot = try await service.snapshot(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachmentA.attachment,
+        client: clientA,
         afterCursor: attachmentCursor))
     let aCursor = try XCTUnwrap(aSnapshot.servedCursor)
 
@@ -332,6 +333,7 @@ func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities(
 
     let bSnapshot = try await service.snapshot(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachmentB.attachment,
+        client: clientB,
         afterCursor: bAttachmentCursor))
     XCTAssertEqual(bSnapshot.events.count, 1)
     XCTAssertEqual(bSnapshot.servedCursor, runningCursor)
@@ -471,6 +473,7 @@ func test_workServiceExplicitCompletionAndDestroyRemainSeparateCommands() async 
     XCTAssertEqual(completion.terminalProof?.command.commandID, "complete-1")
     let completionEvents = try await service.eventsAfterCursor(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
+        client: client,
         afterCursor: try XCTUnwrap(attachment.cursor), limit: 1))
     XCTAssertEqual(completionEvents.events.count, 1)
     XCTAssertEqual(completionEvents.events[0], completion.terminalProof?.terminalEvent)
@@ -520,6 +523,7 @@ func test_workServiceExplicitCompletionAndDestroyRemainSeparateCommands() async 
     let destroyEvents = try await destroyService.eventsAfterCursor(.init(
         work: destroyWork, journal: destroyJournal,
         attachment: destroyAttachmentValue.attachment,
+        client: client,
         afterCursor: try XCTUnwrap(destroyAttachmentValue.cursor), limit: 1))
     XCTAssertEqual(destroyEvents.events.count, 1)
     XCTAssertEqual(destroyEvents.events[0], destroy.terminalProof?.terminalEvent)
@@ -1013,6 +1017,7 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
     let sentCursor = try XCTUnwrap(sent.resultingCursor)
     let firstPage = try await service.eventsAfterCursor(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
+        client: client,
         afterCursor: attachmentCursor, limit: 1))
     XCTAssertEqual(firstPage.events.count, 1)
     XCTAssertEqual(firstPage.events[0].cursor, running)
@@ -1025,6 +1030,7 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
     XCTAssertEqual(firstPage.omissions.first?.count, 1)
     let secondPage = try await service.eventsAfterCursor(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
+        client: client,
         afterCursor: try XCTUnwrap(firstPage.nextCursor), limit: 1))
     XCTAssertEqual(secondPage.events.count, 1)
     XCTAssertEqual(secondPage.events[0].cursor, sentCursor)
@@ -1032,6 +1038,7 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
     let eventBodyReference = try XCTUnwrap(secondPage.events[0].bodyReference)
     let eventBody = try await service.fetchBody(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
+        client: client,
         reference: eventBodyReference))
     XCTAssertEqual(eventBody.status, .retained)
     XCTAssertEqual(eventBody.data, Data("page two".utf8))
@@ -1046,20 +1053,22 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
     do {
         _ = try await service.eventsAfterCursor(.init(
             work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
+            client: client,
             afterCursor: forgedCursor, limit: 1))
         XCTFail("a cursor with a foreign event identity must be rejected")
     } catch WorkServiceProtocolError.invalidRequest(let diagnostic) {
         XCTAssertTrue(diagnostic.contains("identity"))
     }
-    let artifact = try await service.fetchArtifact(
+    let artifact = try await service.fetchArtifact(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
-        artifactID: "artifact-1")
+        client: client, artifactID: "artifact-1"))
     XCTAssertEqual(artifact.artifactID, "artifact-1")
     XCTAssertEqual(artifact.byteCount, 12)
     XCTAssertFalse(artifact.digest?.contains("secret") == true)
     let bodyReference = try XCTUnwrap(artifact.bodyReference)
     let bodyPage = try await service.fetchBody(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
+        client: client,
         reference: bodyReference, limit: 5))
     XCTAssertEqual(bodyPage.status, .retained)
     XCTAssertEqual(bodyPage.offset, 0)
@@ -1067,6 +1076,7 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
     XCTAssertEqual(bodyPage.nextOffset, 5)
     let bodyTail = try await service.fetchBody(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
+        client: client,
         reference: bodyReference, offset: try XCTUnwrap(bodyPage.nextOffset), limit: 64))
     XCTAssertEqual(bodyTail.status, .retained)
     XCTAssertEqual(bodyTail.data, Data(" world!".utf8))
@@ -1076,6 +1086,7 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
         digest: "sha256:" + String(repeating: "0", count: 64))
     let mismatch = try await service.fetchBody(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
+        client: client,
         reference: mismatchReference))
     XCTAssertEqual(mismatch.status, .unavailable)
     XCTAssertTrue(mismatch.diagnostic?.contains("digest") == true)
@@ -1084,9 +1095,48 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
         commandID: "attach-observe-only", causalCursor: sentCursor,
         requestedCapabilities: [.observe, .control]))
     let observeOnly = try XCTUnwrap(observeOnlyResponse.attachment)
+    // Attachment IDs are addressable projection identities, never bearer authority. Even a
+    // directly embedded client must name the principal that owns the attachment on every read.
+    do {
+        _ = try await service.snapshot(.init(
+            work: serviceWork, journal: serviceJournal,
+            attachment: attachment.attachment, client: ClientRef("observe-only"),
+            afterCursor: sentCursor, limit: 1))
+        XCTFail("another client reused a visible attachment for snapshot")
+    } catch WorkServiceProtocolError.attachmentNotFound {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try await service.eventsAfterCursor(.init(
+            work: serviceWork, journal: serviceJournal,
+            attachment: attachment.attachment, client: ClientRef("observe-only"),
+            afterCursor: sentCursor, limit: 1))
+        XCTFail("another client reused a visible attachment for event reads")
+    } catch WorkServiceProtocolError.attachmentNotFound {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try await service.fetchArtifact(.init(
+            work: serviceWork, journal: serviceJournal,
+            attachment: attachment.attachment, client: ClientRef("observe-only"),
+            artifactID: "artifact-1"))
+        XCTFail("another client inherited artifact inspection capability")
+    } catch WorkServiceProtocolError.attachmentNotFound {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try await service.fetchBody(.init(
+            work: serviceWork, journal: serviceJournal,
+            attachment: attachment.attachment, client: ClientRef("observe-only"),
+            reference: bodyReference))
+        XCTFail("another client reused a visible attachment for retained body")
+    } catch WorkServiceProtocolError.attachmentNotFound {
+        XCTAssertTrue(true)
+    }
     do {
         _ = try await service.fetchBody(.init(
             work: serviceWork, journal: serviceJournal, attachment: observeOnly.attachment,
+            client: ClientRef("observe-only"),
             reference: bodyReference))
         XCTFail("observe-only clients must not recover artifact bodies")
     } catch WorkServiceProtocolError.capabilityDenied(.inspectArtifacts) {

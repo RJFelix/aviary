@@ -27,6 +27,10 @@ private func attentionRead(
         session = nil
         work = value
         host = WorkHostRef(value.workHostID)
+    case .workHost(let value):
+        session = nil
+        work = nil
+        host = value
     }
     let event = TimelineEvent(
         eventID: eventID, journal: actualJournal, sequence: sequence,
@@ -56,6 +60,10 @@ private func attentionReadChain(
             session = nil
             work = value
             host = WorkHostRef(value.workHostID)
+        case .workHost(let value):
+            session = nil
+            work = nil
+            host = value
         }
         let event = TimelineEvent(
             eventID: point.0, journal: journal, sequence: point.1,
