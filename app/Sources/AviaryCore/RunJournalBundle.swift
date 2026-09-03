@@ -145,6 +145,60 @@ public struct RunJournalBundleTerminalCommit: Hashable, Sendable {
     }
 }
 
+/// Durable identities that exist before any execution Run is admitted. Work creation is a
+/// control-plane operation; it must not manufacture a Run identity or start provider/runtime
+/// effects merely so the Session and Work become addressable.
+public struct WorkBinding: Codable, Hashable, Sendable {
+    public let session: SessionRef
+    public let work: WorkRef
+    public let workHost: WorkHostRef
+    public let sessionAttachment: SessionAttachmentRef
+
+    public init(session: SessionRef, work: WorkRef, workHost: WorkHostRef,
+                sessionAttachment: SessionAttachmentRef) {
+        self.session = session
+        self.work = work
+        self.workHost = workHost
+        self.sessionAttachment = sessionAttachment
+    }
+
+    public var sessionJournal: JournalRef {
+        .session(
+            session, journalID: "session",
+            authority: TimelineAuthorityRef(workHost.workHostID))
+    }
+
+    public var workJournal: JournalRef { .work(work, journalID: "work") }
+}
+
+/// One execution generation admitted against an existing durable Work binding.
+public struct WorkRunBinding: Codable, Hashable, Sendable {
+    public let workBinding: WorkBinding
+    public let run: RunRef
+
+    public init(workBinding: WorkBinding, run: RunRef) {
+        self.workBinding = workBinding
+        self.run = run
+    }
+}
+
+/// Exact genesis receipts for an idle Work. Both writers are closed before this value is
+/// returned, so a service can durably register the pair without retaining execution ownership.
+public struct IdleWorkCreation: Codable, Hashable, Sendable {
+    public let binding: WorkBinding
+    public let sessionCursor: JournalCursor
+    public let workCursor: JournalCursor
+    public let commits: [TimelineJournalCommit]
+
+    public init(binding: WorkBinding, sessionCursor: JournalCursor,
+                workCursor: JournalCursor, commits: [TimelineJournalCommit]) {
+        self.binding = binding
+        self.sessionCursor = sessionCursor
+        self.workCursor = workCursor
+        self.commits = commits
+    }
+}
+
 public enum RunJournalBundleError: LocalizedError, Equatable, Sendable {
     case invalidConfiguration(String)
     case missingCounterpart(path: String)
@@ -279,6 +333,184 @@ public actor RunJournalBundle {
         self.contextDeliveredBytesByRun = contextDeliveredBytesByRun
     }
 
+    /// Create and close the canonical Session/Work genesis pair without starting a Run. This is
+    /// the storage half of a service Create transaction: the Work Host control journal reserves
+    /// identities before this call and registers these exact cursors after it returns.
+    public static func createIdleWork(
+        home: AgentHome,
+        binding: WorkBinding,
+        actorID: String,
+        actorKind: String = "work-host-control",
+        failurePlan: (session: TimelineJournalWriter.FailurePlan,
+                      work: TimelineJournalWriter.FailurePlan) = (.none, .none),
+        eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) async throws -> IdleWorkCreation {
+        let persistedHost = try home.requirePersistedWorkHost()
+        guard binding.workHost == persistedHost,
+              binding.work.workHostID == persistedHost.workHostID else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "the idle Work binding does not belong to this AgentHome's persisted authority")
+        }
+        guard !actorID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "the idle Work creator identity is empty")
+        }
+        let configuration = try makeJournalConfiguration(
+            session: binding.session,
+            work: binding.work,
+            workHost: binding.workHost,
+            sessionAuthority: TimelineAuthorityRef(binding.workHost.workHostID),
+            sessionAttachment: binding.sessionAttachment)
+        let actor = TimelineActor(actorID: actorID, kind: actorKind)
+        let sessionURL = home.timelineV2SessionJournalURL(binding.session)
+        let workURL = home.timelineV2WorkJournalURL(binding.work)
+
+        let sessionWriter: TimelineJournalWriter
+        do {
+            sessionWriter = try TimelineJournalWriter(
+                freshAt: sessionURL,
+                journal: configuration.sessionJournal,
+                actor: actor,
+                home: home,
+                failurePlan: failurePlan.session,
+                eventIDProvider: eventIDProvider,
+                now: now)
+        } catch let error as TimelineJournalWriter.WriterError {
+            throw mapWriterOpenError(error)
+        }
+        let workWriter: TimelineJournalWriter
+        do {
+            workWriter = try TimelineJournalWriter(
+                freshAt: workURL,
+                journal: configuration.workJournal,
+                actor: actor,
+                home: home,
+                failurePlan: failurePlan.work,
+                eventIDProvider: eventIDProvider,
+                now: now)
+        } catch {
+            try? await sessionWriter.closeChecked()
+            let reason = error.localizedDescription
+            throw RunJournalBundleError.initializationFailed(
+                RunJournalBundlePrefix(
+                    sessionCursor: nil,
+                    workCursor: nil,
+                    sessionEventCount: 0,
+                    workEventCount: 0,
+                    hostOrder: 0,
+                    failedJournal: configuration.workJournal,
+                    failureReason: reason),
+                reason: reason)
+        }
+
+        var sessionCursor: JournalCursor?
+        var workCursor: JournalCursor?
+        var sessionEventCount = 0
+        var workEventCount = 0
+        var hostOrder = 0
+        var commits: [TimelineJournalCommit] = []
+        var failedJournal: JournalRef?
+
+        func prefix(reason: String? = nil) -> RunJournalBundlePrefix {
+            RunJournalBundlePrefix(
+                sessionCursor: sessionCursor,
+                workCursor: workCursor,
+                sessionEventCount: sessionEventCount,
+                workEventCount: workEventCount,
+                hostOrder: hostOrder,
+                failedJournal: failedJournal,
+                failureReason: reason)
+        }
+
+        do {
+            hostOrder += 1
+            failedJournal = configuration.sessionJournal
+            let sessionCreated = try await sessionWriter.append(TimelineEventDraft(
+                hostSequence: hostOrder,
+                session: binding.session,
+                type: TimelineEventType.sessionCreated,
+                declaredDomains: [.session]))
+            sessionCursor = sessionCreated.cursor
+            sessionEventCount += 1
+            commits.append(sessionCreated)
+
+            hostOrder += 1
+            failedJournal = configuration.workJournal
+            let workCreated = try await workWriter.append(TimelineEventDraft(
+                hostSequence: hostOrder,
+                work: binding.work,
+                workHost: binding.workHost,
+                type: TimelineEventType.workCreated,
+                declaredDomains: [.work]))
+            workCursor = workCreated.cursor
+            workEventCount += 1
+            commits.append(workCreated)
+
+            hostOrder += 1
+            failedJournal = configuration.sessionJournal
+            let sessionAttached = try await sessionWriter.append(TimelineEventDraft(
+                hostSequence: hostOrder,
+                session: binding.session,
+                work: binding.work,
+                sessionAttachment: binding.sessionAttachment,
+                type: TimelineEventType.sessionAttached,
+                declaredDomains: [.session, .work],
+                payload: .object(["capabilities": .array([])])))
+            sessionCursor = sessionAttached.cursor
+            sessionEventCount += 1
+            commits.append(sessionAttached)
+
+            hostOrder += 1
+            failedJournal = configuration.workJournal
+            let workAttached = try await workWriter.append(TimelineEventDraft(
+                hostSequence: hostOrder,
+                causedByEventID: sessionAttached.eventRef,
+                session: binding.session,
+                work: binding.work,
+                workHost: binding.workHost,
+                sessionAttachment: binding.sessionAttachment,
+                type: TimelineEventType.sessionAttached,
+                declaredDomains: [.work, .session],
+                payload: .object(["capabilities": .array([])])))
+            workCursor = workAttached.cursor
+            workEventCount += 1
+            commits.append(workAttached)
+            failedJournal = nil
+        } catch {
+            let reason = error.localizedDescription
+            try? await sessionWriter.closeChecked()
+            try? await workWriter.closeChecked()
+            throw RunJournalBundleError.initializationFailed(prefix(reason: reason), reason: reason)
+        }
+
+        var closeFailure: Error?
+        do { try await sessionWriter.closeChecked() } catch {
+            closeFailure = error
+            failedJournal = configuration.sessionJournal
+        }
+        do { try await workWriter.closeChecked() } catch {
+            if closeFailure == nil {
+                closeFailure = error
+                failedJournal = configuration.workJournal
+            }
+        }
+        if let closeFailure {
+            let reason = closeFailure.localizedDescription
+            throw RunJournalBundleError.closeFailed(prefix(reason: reason), reason: reason)
+        }
+        guard let sessionCursor, let workCursor else {
+            throw RunJournalBundleError.initializationFailed(
+                prefix(reason: "idle Work genesis did not produce both cursors"),
+                reason: "idle Work genesis did not produce both cursors")
+        }
+        return IdleWorkCreation(
+            binding: binding,
+            sessionCursor: sessionCursor,
+            workCursor: workCursor,
+            commits: commits)
+    }
+
     /// Open the one native journal pair owned by an existing launch identity.
     ///
     /// Fresh and resumed execution deliberately share this entry point. If neither journal
@@ -368,6 +600,45 @@ public actor RunJournalBundle {
             eventIDProvider: eventIDProvider, now: now)
     }
 
+    /// Start one new execution generation against a separately created idle Work binding.
+    /// Unlike the combined launch helper above, this API cannot create Work as a side effect.
+    public static func openForExecution(
+        home: AgentHome,
+        binding: WorkRunBinding,
+        actorID: String,
+        actorKind: String = "work-host",
+        modelID: String? = nil,
+        failurePlan: (session: TimelineJournalWriter.FailurePlan,
+                      work: TimelineJournalWriter.FailurePlan) = (.none, .none),
+        eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) async throws -> RunJournalBundle {
+        let persistedHost = try home.requirePersistedWorkHost()
+        let workBinding = binding.workBinding
+        guard workBinding.workHost == persistedHost,
+              workBinding.work.workHostID == persistedHost.workHostID else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "the execution Work binding does not belong to this AgentHome's persisted authority")
+        }
+        guard !actorID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "the execution actor identity is empty")
+        }
+        return try await reopen(
+            home: home,
+            session: workBinding.session,
+            work: workBinding.work,
+            workHost: workBinding.workHost,
+            sessionAuthority: TimelineAuthorityRef(workBinding.workHost.workHostID),
+            sessionAttachment: workBinding.sessionAttachment,
+            run: binding.run,
+            actor: TimelineActor(actorID: actorID, kind: actorKind),
+            modelID: modelID,
+            failurePlan: failurePlan,
+            eventIDProvider: eventIDProvider,
+            now: now)
+    }
+
     /// Open and lock both journals before writing the first semantic event.
     public static func createFresh(
         home: AgentHome,
@@ -455,6 +726,106 @@ public actor RunJournalBundle {
         eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
         now: @escaping @Sendable () -> Date = { Date() }
     ) async throws -> RunJournalBundle {
+        try await openExisting(
+            home: home, session: session, work: work, workHost: workHost,
+            sessionAuthority: sessionAuthority, sessionAttachment: sessionAttachment, run: run,
+            actor: actor, modelID: modelID, startsRun: true,
+            failurePlan: failurePlan, eventIDProvider: eventIDProvider, now: now)
+    }
+
+    /// Open one idle Session/Work pair solely to commit an explicit Work terminal
+    /// transition. Unlike ``reopen``, this does not append `run.started`: completion and
+    /// destruction happen after the execution Run has ended, and must not manufacture another
+    /// Run merely to obtain the two canonical writer locks.
+    /// Exact lost-response reconciliation uses ``readTerminalCommit`` and never acquires a writer.
+    public static func openForTerminalMutation(
+        home: AgentHome,
+        identity: SessionWorkIdentity,
+        sessionAttachment: SessionAttachmentRef,
+        actorID: String,
+        actorKind: String = "work-host-terminal",
+        failurePlan: (session: TimelineJournalWriter.FailurePlan,
+                      work: TimelineJournalWriter.FailurePlan) = (.none, .none),
+        eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) async throws -> RunJournalBundle {
+        let persistedHost = try home.requirePersistedWorkHost()
+        guard identity.workHostID == persistedHost.workHostID else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "the terminal Work Host does not match this AgentHome's persisted authority")
+        }
+        guard !actorID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RunJournalBundleError.invalidConfiguration("the terminal actor identity is empty")
+        }
+        return try await openExisting(
+            home: home,
+            session: SessionRef(identity.sessionID),
+            work: identity.work,
+            workHost: persistedHost,
+            sessionAuthority: TimelineAuthorityRef(persistedHost.workHostID),
+            sessionAttachment: sessionAttachment,
+            run: RunRef(identity.runID),
+            actor: TimelineActor(actorID: actorID, kind: actorKind),
+            modelID: nil,
+            startsRun: false,
+            failurePlan: failurePlan,
+            eventIDProvider: eventIDProvider,
+            now: now)
+    }
+
+    /// Terminal mutation variant for callers that already carry the split Work/Run binding.
+    public static func openForTerminalMutation(
+        home: AgentHome,
+        binding: WorkRunBinding,
+        actorID: String,
+        actorKind: String = "work-host-terminal",
+        failurePlan: (session: TimelineJournalWriter.FailurePlan,
+                      work: TimelineJournalWriter.FailurePlan) = (.none, .none),
+        eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) async throws -> RunJournalBundle {
+        let workBinding = binding.workBinding
+        let persistedHost = try home.requirePersistedWorkHost()
+        guard workBinding.workHost == persistedHost,
+              workBinding.work.workHostID == persistedHost.workHostID else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "the terminal Work binding does not belong to this AgentHome's persisted authority")
+        }
+        guard !actorID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RunJournalBundleError.invalidConfiguration("the terminal actor identity is empty")
+        }
+        return try await openExisting(
+            home: home,
+            session: workBinding.session,
+            work: workBinding.work,
+            workHost: workBinding.workHost,
+            sessionAuthority: TimelineAuthorityRef(workBinding.workHost.workHostID),
+            sessionAttachment: workBinding.sessionAttachment,
+            run: binding.run,
+            actor: TimelineActor(actorID: actorID, kind: actorKind),
+            modelID: nil,
+            startsRun: false,
+            failurePlan: failurePlan,
+            eventIDProvider: eventIDProvider,
+            now: now)
+    }
+
+    private static func openExisting(
+        home: AgentHome,
+        session: SessionRef,
+        work: WorkRef,
+        workHost: WorkHostRef,
+        sessionAuthority: TimelineAuthorityRef,
+        sessionAttachment: SessionAttachmentRef,
+        run: RunRef,
+        actor: TimelineActor,
+        modelID: String?,
+        startsRun: Bool,
+        failurePlan: (session: TimelineJournalWriter.FailurePlan,
+                      work: TimelineJournalWriter.FailurePlan),
+        eventIDProvider: @escaping @Sendable () -> String,
+        now: @escaping @Sendable () -> Date
+    ) async throws -> RunJournalBundle {
         let configuration = try makeConfiguration(
             session: session, work: work, workHost: workHost,
             sessionAuthority: sessionAuthority, sessionAttachment: sessionAttachment, run: run)
@@ -524,9 +895,26 @@ public actor RunJournalBundle {
             guard workState.lifecycle == .active else {
                 throw RunJournalBundleError.workTerminal(workState.lifecycle)
             }
-            guard !workEvents.contains(where: { $0.run?.runID == run.runID }) else {
-                throw RunJournalBundleError.invalidOperation(
-                    "the replacement Run identity already appears in the Work journal")
+            if startsRun {
+                guard !workEvents.contains(where: { $0.run?.runID == run.runID }) else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "the replacement Run identity already appears in the Work journal")
+                }
+            } else {
+                let startedRuns = workEvents.compactMap { event -> RunRef? in
+                    guard event.type == TimelineEventType.runStarted else { return nil }
+                    return event.run
+                }
+                guard startedRuns.last == run else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "terminal mutation requires the latest canonical Run generation")
+                }
+                guard workEvents.contains(where: {
+                    $0.type == TimelineEventType.runFinished && $0.run == run
+                }) else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "terminal mutation requires a canonically finished Run")
+                }
             }
             try validatePairedAttachment(
                 sessionEvents: sessionEvents, workEvents: workEvents,
@@ -556,7 +944,7 @@ public actor RunJournalBundle {
                     refs[command.commandID] = EventRef(
                         journal: configuration.workJournal, eventID: event.eventID)
                 },
-                activeTurn: workState.activeTurn, activeRun: run,
+                activeTurn: workState.activeTurn, activeRun: startsRun ? run : nil,
                 workLifecycle: workState.lifecycle,
                 lastMessage: sessionState.semanticTip ?? sessionState.messageHistory.last.map {
                     EventRef(journal: configuration.sessionJournal, eventID: $0.eventID)
@@ -564,14 +952,18 @@ public actor RunJournalBundle {
                 authoredAttention: sessionState.attention,
                 contextDeliveredBytesByRun:
                     sessionState.contextCumulativeDeliveredBytesByRun ?? [:])
-            do {
-                try await bundle.appendRunStarted(modelID: modelID ?? workState.modelID)
-                return bundle
-            } catch {
-                let prefix = await bundle.status.durablePrefix
-                try? await bundle.closeChecked()
-                throw RunJournalBundleError.initializationFailed(prefix, reason: error.localizedDescription)
+            if startsRun {
+                do {
+                    try await bundle.appendRunStarted(modelID: modelID ?? workState.modelID)
+                    return bundle
+                } catch {
+                    let prefix = await bundle.status.durablePrefix
+                    try? await bundle.closeChecked()
+                    throw RunJournalBundleError.initializationFailed(
+                        prefix, reason: error.localizedDescription)
+                }
             }
+            return bundle
         } catch {
             try? await sessionWriter.closeChecked()
             try? await workWriter.closeChecked()
@@ -1831,7 +2223,11 @@ public actor RunJournalBundle {
             throw RunJournalBundleError.invalidOperation("invalid Work terminal event")
         }
         var payload: [String: JSONValue] = [:]
-        if let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        // Preserve the optionality exactly. Empty/whitespace detail is still a caller-supplied
+        // value and participates in the terminal idempotency key; omitting it here would make a
+        // cold proof reconstruction turn nonnil detail into nil and reject an otherwise exact
+        // retry. Nil remains absent from the payload.
+        if let detail {
             payload["detail"] = .string(detail)
         }
         if tombstone { payload["tombstone"] = .bool(true) }
@@ -1909,6 +2305,111 @@ public actor RunJournalBundle {
     ) throws -> RunJournalBundleTerminalCommit? {
         let workEvents = try Self.readNativeJournal(
             at: workWriter.fileURL, journal: workJournal, actor: actor)
+        let sessionEvents = try Self.readNativeJournal(
+            at: sessionWriter.fileURL, journal: sessionJournal, actor: actor)
+        return try Self.terminalCommit(
+            workEvents: workEvents,
+            sessionEvents: sessionEvents,
+            session: session,
+            work: work,
+            workHost: workHost,
+            workJournal: workJournal,
+            sessionJournal: sessionJournal,
+            sessionAttachment: sessionAttachment,
+            command: command,
+            detail: detail)
+    }
+
+    /// Resolve one exact terminal transaction without acquiring either writer lock. This is the
+    /// recovery path for a response lost after durable commit: opening a writer merely to read
+    /// proof would make reconciliation fail whenever another legitimate owner already exists.
+    public static func readTerminalCommit(
+        home: AgentHome,
+        identity: SessionWorkIdentity,
+        sessionAttachment: SessionAttachmentRef,
+        command: CommandRef,
+        detail: String?,
+        actorID: String = "work-host-terminal-reader"
+    ) throws -> RunJournalBundleTerminalCommit? {
+        let persistedHost = try home.requirePersistedWorkHost()
+        guard identity.workHostID == persistedHost.workHostID else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "the terminal proof Work Host does not match this AgentHome's persisted authority")
+        }
+        guard !actorID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "the terminal proof reader identity is empty")
+        }
+        let session = SessionRef(identity.sessionID)
+        let authority = TimelineAuthorityRef(persistedHost.workHostID)
+        let configuration = try makeConfiguration(
+            session: session,
+            work: identity.work,
+            workHost: persistedHost,
+            sessionAuthority: authority,
+            sessionAttachment: sessionAttachment,
+            run: RunRef(identity.runID))
+        let actor = TimelineActor(actorID: actorID, kind: "work-host-terminal-reader")
+        let sessionEvents = try readNativeJournal(
+            at: home.timelineV2SessionJournalURL(session),
+            journal: configuration.sessionJournal,
+            actor: actor)
+        let workEvents = try readNativeJournal(
+            at: home.timelineV2WorkJournalURL(identity.work),
+            journal: configuration.workJournal,
+            actor: actor)
+        try validateGenesis(
+            sessionEvents,
+            journal: configuration.sessionJournal,
+            expectedType: TimelineEventType.sessionCreated)
+        try validateGenesis(
+            workEvents,
+            journal: configuration.workJournal,
+            expectedType: TimelineEventType.workCreated)
+        let sessionState = SessionReducer.reduce(sessionEvents)
+        let workState = WorkReducer.reduce(workEvents)
+        guard sessionState.structuralIntegrityValid && sessionState.semanticProjectionValid else {
+            throw RunJournalBundleError.invalidJournal(
+                journal: configuration.sessionJournal,
+                reason: sessionState.corruptionReasons.joined(separator: "; "))
+        }
+        guard workState.structuralIntegrityValid && workState.semanticProjectionValid else {
+            throw RunJournalBundleError.invalidJournal(
+                journal: configuration.workJournal,
+                reason: workState.corruptionReasons.joined(separator: "; "))
+        }
+        try validatePairedAttachment(
+            sessionEvents: sessionEvents,
+            workEvents: workEvents,
+            session: session,
+            work: identity.work,
+            attachment: sessionAttachment,
+            sessionJournal: configuration.sessionJournal)
+        return try terminalCommit(
+            workEvents: workEvents,
+            sessionEvents: sessionEvents,
+            session: session,
+            work: identity.work,
+            workHost: persistedHost,
+            workJournal: configuration.workJournal,
+            sessionJournal: configuration.sessionJournal,
+            sessionAttachment: sessionAttachment,
+            command: command,
+            detail: detail)
+    }
+
+    private static func terminalCommit(
+        workEvents: [TimelineEvent],
+        sessionEvents: [TimelineEvent],
+        session: SessionRef,
+        work: WorkRef,
+        workHost: WorkHostRef,
+        workJournal: JournalRef,
+        sessionJournal: JournalRef,
+        sessionAttachment: SessionAttachmentRef,
+        command: CommandRef,
+        detail: String?
+    ) throws -> RunJournalBundleTerminalCommit? {
         let terminalEvents = workEvents.filter {
             ($0.type == TimelineEventType.workCompleted
                 || $0.type == TimelineEventType.workDestroyed)
@@ -1940,8 +2441,6 @@ public actor RunJournalBundle {
                 reason: "terminal Work event does not match its exact command envelope")
         }
 
-        let sessionEvents = try Self.readNativeJournal(
-            at: sessionWriter.fileURL, journal: sessionJournal, actor: actor)
         let paired = sessionEvents.filter {
             $0.type == TimelineEventType.sessionAttachmentCursorAdvanced
                 && $0.command == command
@@ -2001,9 +2500,9 @@ public actor RunJournalBundle {
     }
 
     private func validateTerminalDetail(_ detail: String?) throws {
-        guard detail?.count ?? 0 <= 4_000 else {
+        guard detail?.utf8.count ?? 0 <= 4_000 else {
             throw RunJournalBundleError.invalidOperation(
-                "Work terminal detail exceeds the 4,000-character limit")
+                "Work terminal detail exceeds the 4,000-byte limit")
         }
     }
 
@@ -2195,9 +2694,30 @@ public actor RunJournalBundle {
         sessionAuthority: TimelineAuthorityRef, sessionAttachment: SessionAttachmentRef,
         run: RunRef
     ) throws -> Configuration {
-        guard !session.sessionID.isEmpty, !work.workID.isEmpty,
-              !workHost.workHostID.isEmpty, work.workHostID == workHost.workHostID,
-              !sessionAttachment.attachmentID.isEmpty, !run.runID.isEmpty else {
+        guard !run.runID.isEmpty else {
+            throw RunJournalBundleError.invalidConfiguration("all identities are required")
+        }
+        return try makeJournalConfiguration(
+            session: session,
+            work: work,
+            workHost: workHost,
+            sessionAuthority: sessionAuthority,
+            sessionAttachment: sessionAttachment)
+    }
+
+    private static func makeJournalConfiguration(
+        session: SessionRef,
+        work: WorkRef,
+        workHost: WorkHostRef,
+        sessionAuthority: TimelineAuthorityRef,
+        sessionAttachment: SessionAttachmentRef
+    ) throws -> Configuration {
+        guard !session.sessionID.isEmpty,
+              !work.workID.isEmpty,
+              !workHost.workHostID.isEmpty,
+              work.workHostID == workHost.workHostID,
+              !sessionAuthority.authorityID.isEmpty,
+              !sessionAttachment.attachmentID.isEmpty else {
             throw RunJournalBundleError.invalidConfiguration("all identities are required")
         }
         let sessionJournal = JournalRef.session(

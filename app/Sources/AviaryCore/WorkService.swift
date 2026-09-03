@@ -20,10 +20,16 @@ public enum WorkServiceBounds {
     public static let maxCommandValueCharacters = 8_192
     public static let maxPageSize = 64
     public static let maxEventsPerPage = 128
+    /// A page is bounded by encoded canonical envelope bytes as well as event count. This keeps a
+    /// single large payload from consuming the entire response budget.
+    public static let maxEventPageBytes = 256 * 1024
     public static let maxBodyChunkBytes = 64 * 1024
     public static let maxTerminalProofHandles = 128
     public static let maxArtifactsPerWork = 128
     public static let maxAttachmentsPerWork = 64
+    /// One client attachment currently has at most a Work target and its bound Session target.
+    /// Keep this independently bounded so descriptor reconstruction cannot grow without limit.
+    public static let maxReadAcknowledgementsPerAttachment = 2
     public static let maxOmissions = 32
 }
 
@@ -36,6 +42,7 @@ public enum WorkServiceProtocolError: Error, Equatable, Sendable {
     case attachmentNotFound
     case capabilityDenied(WorkServiceCapability)
     case artifactNotFound
+    case eventPageCannotProgress(requiredBytes: Int, maximumBytes: Int)
     case staleCursor(expected: JournalCursor, actual: JournalCursor)
     case sourceIncomplete
 }
@@ -59,18 +66,98 @@ public struct WorkServiceHandshakeResponse: Codable, Hashable, Sendable {
     public let supportedRange: ClosedRange<Int>
     public let host: WorkHostRef
     public let hostInstance: WorkHostInstanceRef
+    /// The separate Work Host control journal orders attachment, capability, and read
+    /// acknowledgement mutations. It is never the Work journal and never a host sequence
+    /// projected from a Work event.
+    public let controlJournal: JournalRef
+    public let controlCursor: JournalCursor
     public let capabilities: Set<WorkServiceCapability>
     public let diagnostic: String?
 
     public init(accepted: Bool, negotiatedVersion: Int?, supportedRange: ClosedRange<Int>,
                 host: WorkHostRef, hostInstance: WorkHostInstanceRef,
+                controlJournal: JournalRef, controlCursor: JournalCursor,
                 capabilities: Set<WorkServiceCapability>, diagnostic: String? = nil) {
         self.accepted = accepted
         self.negotiatedVersion = negotiatedVersion
         self.supportedRange = supportedRange
         self.host = host
         self.hostInstance = hostInstance
+        self.controlJournal = controlJournal
+        self.controlCursor = controlCursor
         self.capabilities = capabilities
+        self.diagnostic = WorkServiceText.bound(diagnostic)
+    }
+}
+
+/// The target journal of a bounded snapshot or event-page read. A Work Host client must name
+/// the Work that owns the attachment separately on every request; a Session target is accepted
+/// only when that Session tuple is the one durably attached to that Work.
+public enum WorkServiceReadTarget: Codable, Hashable, Sendable {
+    case work(journal: JournalRef)
+    case session(session: SessionRef, journal: JournalRef)
+
+    public var journal: JournalRef {
+        switch self {
+        case .work(let journal), .session(_, let journal): return journal
+        }
+    }
+
+    public var session: SessionRef? {
+        switch self {
+        case .work: return nil
+        case .session(let session, _): return session
+        }
+    }
+}
+
+public enum WorkServiceControlOperation: String, Codable, Hashable, Sendable {
+    case createWork = "create_work"
+    case attach
+    case detach
+    case updateCapabilities = "update_capabilities"
+    case acknowledgeRead = "acknowledge_read"
+}
+
+public enum WorkServiceControlOutcome: String, Codable, Hashable, Sendable {
+    case created
+    case attached
+    case detached
+    case capabilitiesUpdated = "capabilities_updated"
+    case readAcknowledged = "read_acknowledged"
+}
+
+/// Receipt for a mutation in the Work Host control journal. Control commits do not have a Work
+/// host sequence: only execution events in the Work journal may carry that ordering evidence.
+public struct WorkServiceControlReceipt: Codable, Hashable, Sendable {
+    public let operation: WorkServiceControlOperation
+    public let work: WorkRef
+    public let commandID: String
+    public let state: WorkServiceCommandReceiptState
+    public let host: WorkHostInstanceRef
+    public let causalControlCursor: JournalCursor
+    public let resultingControlCursor: JournalCursor
+    public let authorization: WorkServiceAuthorizationOutcome
+    public let outcome: WorkServiceControlOutcome?
+    public let rejection: WorkServiceCommandRejection?
+    public let diagnostic: String?
+
+    public init(operation: WorkServiceControlOperation, work: WorkRef, commandID: String,
+                state: WorkServiceCommandReceiptState, host: WorkHostInstanceRef,
+                causalControlCursor: JournalCursor, resultingControlCursor: JournalCursor,
+                authorization: WorkServiceAuthorizationOutcome,
+                outcome: WorkServiceControlOutcome? = nil,
+                rejection: WorkServiceCommandRejection? = nil, diagnostic: String? = nil) {
+        self.operation = operation
+        self.work = work
+        self.commandID = commandID
+        self.state = state
+        self.host = host
+        self.causalControlCursor = causalControlCursor
+        self.resultingControlCursor = resultingControlCursor
+        self.authorization = authorization
+        self.outcome = outcome
+        self.rejection = rejection
         self.diagnostic = WorkServiceText.bound(diagnostic)
     }
 }
@@ -215,6 +302,18 @@ public struct WorkServiceAuthorizationOutcome: Codable, Hashable, Sendable {
     }
 }
 
+/// One durable read position for one exact target-journal generation. A Work cursor and a Session
+/// cursor are independent; neither is an alias for the Work Host control cursor.
+public struct WorkServiceReadAcknowledgement: Codable, Hashable, Sendable {
+    public let target: WorkServiceReadTarget
+    public let cursor: JournalCursor
+
+    public init(target: WorkServiceReadTarget, cursor: JournalCursor) {
+        self.target = target
+        self.cursor = cursor
+    }
+}
+
 public struct WorkServiceClientAttachment: Codable, Hashable, Sendable {
     public let attachment: ClientAttachmentRef
     public let client: ClientRef
@@ -222,18 +321,20 @@ public struct WorkServiceClientAttachment: Codable, Hashable, Sendable {
     public let sessionJournal: JournalRef?
     public let sessionAttachment: SessionAttachmentRef?
     public let authorization: WorkServiceAuthorizationOutcome
-    public let cursor: JournalCursor?
+    public let readAcknowledgements: [WorkServiceReadAcknowledgement]
 
     public init(attachment: ClientAttachmentRef, client: ClientRef, session: SessionRef?,
                 sessionJournal: JournalRef?, sessionAttachment: SessionAttachmentRef?,
-                authorization: WorkServiceAuthorizationOutcome, cursor: JournalCursor?) {
+                authorization: WorkServiceAuthorizationOutcome,
+                readAcknowledgements: [WorkServiceReadAcknowledgement] = []) {
         self.attachment = attachment
         self.client = client
         self.session = session
         self.sessionJournal = sessionJournal
         self.sessionAttachment = sessionAttachment
         self.authorization = authorization
-        self.cursor = cursor
+        self.readAcknowledgements = Array(readAcknowledgements.prefix(
+            WorkServiceBounds.maxReadAcknowledgementsPerAttachment))
     }
 }
 
@@ -317,14 +418,14 @@ public struct WorkServiceAttachRequest: Codable, Hashable, Sendable {
     public let sessionAttachment: SessionAttachmentRef?
     /// Stable caller identity for retries. It is scoped to the client and Work.
     public let commandID: String
-    /// Exact Work cursor observed before the attach event is appended.
-    public let causalCursor: JournalCursor
+    /// Exact Work Host control cursor observed before the attach event is appended.
+    public let causalControlCursor: JournalCursor
     public let requestedCapabilities: Set<WorkServiceCapability>
 
     public init(work: WorkRef, journal: JournalRef, client: ClientRef,
                 session: SessionRef? = nil, sessionJournal: JournalRef? = nil,
                 sessionAttachment: SessionAttachmentRef? = nil,
-                commandID: String, causalCursor: JournalCursor,
+                commandID: String, causalControlCursor: JournalCursor,
                 requestedCapabilities: Set<WorkServiceCapability> = [.observe]) {
         self.work = work
         self.journal = journal
@@ -333,7 +434,7 @@ public struct WorkServiceAttachRequest: Codable, Hashable, Sendable {
         self.sessionJournal = sessionJournal
         self.sessionAttachment = sessionAttachment
         self.commandID = commandID
-        self.causalCursor = causalCursor
+        self.causalControlCursor = causalControlCursor
         self.requestedCapabilities = requestedCapabilities
     }
 }
@@ -346,16 +447,18 @@ public struct WorkServiceAttachResponse: Codable, Hashable, Sendable {
     public let commandID: String
     public let state: WorkServiceCommandReceiptState
     public let host: WorkHostInstanceRef
-    public let hostSequence: Int
-    public let resultingCursor: JournalCursor?
+    public let causalControlCursor: JournalCursor
+    public let resultingControlCursor: JournalCursor
+    public let receipt: WorkServiceControlReceipt
     public let rejection: WorkServiceCommandRejection?
     public let diagnostic: String?
 
     public init(work: WorkServiceWorkDescriptor, attachment: WorkServiceClientAttachment?,
                 authorization: WorkServiceAuthorizationOutcome, commandID: String,
                 state: WorkServiceCommandReceiptState = .accepted,
-                host: WorkHostInstanceRef, hostSequence: Int,
-                resultingCursor: JournalCursor? = nil,
+                host: WorkHostInstanceRef, causalControlCursor: JournalCursor,
+                resultingControlCursor: JournalCursor,
+                receipt: WorkServiceControlReceipt? = nil,
                 rejection: WorkServiceCommandRejection? = nil, diagnostic: String? = nil) {
         self.work = work
         self.attachment = attachment
@@ -363,8 +466,14 @@ public struct WorkServiceAttachResponse: Codable, Hashable, Sendable {
         self.commandID = commandID
         self.state = state
         self.host = host
-        self.hostSequence = hostSequence
-        self.resultingCursor = resultingCursor
+        self.causalControlCursor = causalControlCursor
+        self.resultingControlCursor = resultingControlCursor
+        self.receipt = receipt ?? WorkServiceControlReceipt(
+            operation: .attach, work: work.work, commandID: commandID, state: state,
+            host: host, causalControlCursor: causalControlCursor,
+            resultingControlCursor: resultingControlCursor, authorization: authorization,
+            outcome: state == .accepted ? .attached : nil, rejection: rejection,
+            diagnostic: diagnostic)
         self.rejection = rejection
         self.diagnostic = WorkServiceText.bound(diagnostic)
     }
@@ -437,31 +546,40 @@ public struct WorkServiceWorkConfiguration: Codable, Hashable, Sendable {
     fileprivate var hasInvalidBodyBounds: Bool {
         wasTruncated || [providerID, modelID, thinkingLevel, contextPolicy,
                          workingDirectoryPolicy, resumePolicy, initialPrompt]
-            .contains { ($0?.count ?? 0) > WorkServiceBounds.maxCommandValueCharacters }
+            .contains { ($0?.utf8.count ?? 0) > WorkServiceBounds.maxCommandValueCharacters }
+    }
+
+    /// The host retains the initial prompt for execution and exact retry comparison, but Work
+    /// descriptors are inventory/projection data and must not echo retained request bodies.
+    fileprivate var observableDescriptorConfiguration: WorkServiceWorkConfiguration {
+        WorkServiceWorkConfiguration(
+            providerID: providerID,
+            modelID: modelID,
+            thinkingLevel: thinkingLevel,
+            contextPolicy: contextPolicy,
+            workingDirectoryPolicy: workingDirectoryPolicy,
+            includeContextFiles: includeContextFiles,
+            recordPayloads: recordPayloads,
+            resumePolicy: resumePolicy,
+            initialPrompt: nil)
     }
 }
 
 public struct WorkServiceCreateWorkRequest: Codable, Hashable, Sendable {
-    public let work: WorkRef
-    public let journal: JournalRef
     public let client: ClientRef
     public let commandID: String
-    /// Fresh Work starts from an explicit, exact empty-journal cursor. Keeping this required
-    /// makes creation subject to the same causal discipline as every other mutation while
-    /// still allowing a host to mint the initial Work identity.
-    public let causalCursor: JournalCursor
+    /// Creation is a Work Host control mutation. The host mints the Work and Session identities;
+    /// callers cannot select an identity or smuggle in an execution-journal cursor.
+    public let causalControlCursor: JournalCursor
     public let configuration: WorkServiceWorkConfiguration
     public let requestedCapabilities: Set<WorkServiceCapability>
 
-    public init(work: WorkRef, journal: JournalRef, client: ClientRef,
-                commandID: String, causalCursor: JournalCursor,
+    public init(client: ClientRef, commandID: String, causalControlCursor: JournalCursor,
                 configuration: WorkServiceWorkConfiguration = .init(),
                 requestedCapabilities: Set<WorkServiceCapability> = [.observe, .control]) {
-        self.work = work
-        self.journal = journal
         self.client = client
         self.commandID = commandID
-        self.causalCursor = causalCursor
+        self.causalControlCursor = causalControlCursor
         self.configuration = configuration
         self.requestedCapabilities = requestedCapabilities
     }
@@ -469,17 +587,38 @@ public struct WorkServiceCreateWorkRequest: Codable, Hashable, Sendable {
 
 public struct WorkServiceCreateWorkResponse: Codable, Hashable, Sendable {
     public let work: WorkServiceWorkDescriptor
+    public let session: SessionRef
+    public let sessionJournal: JournalRef
+    public let sessionAttachment: SessionAttachmentRef
+    public let attachment: WorkServiceClientAttachment
+    public let workCursor: JournalCursor
+    public let sessionCursor: JournalCursor
+    public let controlCursor: JournalCursor
     public let authorization: WorkServiceAuthorizationOutcome
-    /// Creation is a host-ordered mutation too; its receipt carries the exact empty-journal
-    /// cause and the cursor of the canonical `work.created` event.
-    public let receipt: WorkServiceCommandReceipt
+    public let receipt: WorkServiceControlReceipt
 
     public init(work: WorkServiceWorkDescriptor, authorization: WorkServiceAuthorizationOutcome,
-                receipt: WorkServiceCommandReceipt) {
+                session: SessionRef, sessionJournal: JournalRef,
+                sessionAttachment: SessionAttachmentRef,
+                attachment: WorkServiceClientAttachment,
+                workCursor: JournalCursor, sessionCursor: JournalCursor,
+                controlCursor: JournalCursor, receipt: WorkServiceControlReceipt) {
         self.work = work
+        self.session = session
+        self.sessionJournal = sessionJournal
+        self.sessionAttachment = sessionAttachment
+        self.attachment = attachment
+        self.workCursor = workCursor
+        self.sessionCursor = sessionCursor
+        self.controlCursor = controlCursor
         self.authorization = authorization
         self.receipt = receipt
     }
+
+    public var resultingWorkCursor: JournalCursor { workCursor }
+    public var resultingSessionCursor: JournalCursor { sessionCursor }
+    public var resultingControlCursor: JournalCursor { controlCursor }
+    public var clientAttachment: WorkServiceClientAttachment { attachment }
 }
 
 public struct WorkServiceCompleteWorkRequest: Codable, Hashable, Sendable {
@@ -487,19 +626,19 @@ public struct WorkServiceCompleteWorkRequest: Codable, Hashable, Sendable {
     public let journal: JournalRef
     public let attachment: ClientAttachmentRef
     public let command: CommandRef
-    public let causalCursor: JournalCursor
+    public let causalWorkCursor: JournalCursor
 
     public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
                 commandID: String, client: ClientRef,
                 sessionAttachment: SessionAttachmentRef? = nil,
-                causalCursor: JournalCursor) {
+                causalWorkCursor: JournalCursor) {
         self.work = work
         self.journal = journal
         self.attachment = attachment
-        self.causalCursor = causalCursor
+        self.causalWorkCursor = causalWorkCursor
         self.command = CommandRef(commandID: commandID, client: client,
                                   sessionAttachment: sessionAttachment,
-                                  causalCursor: causalCursor)
+                                  causalCursor: causalWorkCursor)
     }
 }
 
@@ -510,17 +649,17 @@ public struct WorkServiceDetachRequest: Codable, Hashable, Sendable {
     public let client: ClientRef
     /// Stable caller identity for retries. It is scoped to the client and Work.
     public let commandID: String
-    /// Exact cursor observed before the detach event is appended.
-    public let causalCursor: JournalCursor
+    /// Exact Work Host control cursor observed before the detach event is appended.
+    public let causalControlCursor: JournalCursor
 
     public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
-                client: ClientRef, commandID: String, causalCursor: JournalCursor) {
+                client: ClientRef, commandID: String, causalControlCursor: JournalCursor) {
         self.work = work
         self.journal = journal
         self.attachment = attachment
         self.client = client
         self.commandID = commandID
-        self.causalCursor = causalCursor
+        self.causalControlCursor = causalControlCursor
     }
 }
 
@@ -529,23 +668,30 @@ public struct WorkServiceDetachResponse: Codable, Hashable, Sendable {
     public let commandID: String
     public let state: WorkServiceCommandReceiptState
     public let host: WorkHostInstanceRef
-    public let hostSequence: Int
-    public let causalCursor: JournalCursor
-    public let resultingCursor: JournalCursor?
+    public let causalControlCursor: JournalCursor
+    public let resultingControlCursor: JournalCursor
+    public let receipt: WorkServiceControlReceipt
     public let rejection: WorkServiceCommandRejection?
     public let diagnostic: String?
 
     public init(work: WorkRef, commandID: String, state: WorkServiceCommandReceiptState,
-                host: WorkHostInstanceRef, hostSequence: Int,
-                causalCursor: JournalCursor, resultingCursor: JournalCursor?,
+                host: WorkHostInstanceRef, causalControlCursor: JournalCursor,
+                resultingControlCursor: JournalCursor,
+                receipt: WorkServiceControlReceipt? = nil,
                 rejection: WorkServiceCommandRejection? = nil, diagnostic: String? = nil) {
         self.work = work
         self.commandID = commandID
         self.state = state
         self.host = host
-        self.hostSequence = hostSequence
-        self.causalCursor = causalCursor
-        self.resultingCursor = resultingCursor
+        self.causalControlCursor = causalControlCursor
+        self.resultingControlCursor = resultingControlCursor
+        self.receipt = receipt ?? WorkServiceControlReceipt(
+            operation: .detach, work: work, commandID: commandID, state: state,
+            host: host, causalControlCursor: causalControlCursor,
+            resultingControlCursor: resultingControlCursor,
+            authorization: WorkServiceAuthorizationOutcome(
+                requested: [], granted: [], denied: []), outcome: state == .accepted ? .detached : nil,
+            rejection: rejection, diagnostic: diagnostic)
         self.rejection = rejection
         self.diagnostic = WorkServiceText.bound(diagnostic)
     }
@@ -556,32 +702,43 @@ public struct WorkServiceSnapshotRequest: Codable, Hashable, Sendable {
     public let journal: JournalRef
     public let attachment: ClientAttachmentRef
     public let client: ClientRef
+    public let target: WorkServiceReadTarget
     public let afterCursor: JournalCursor?
     public let limit: Int
+    public let maxBytes: Int
 
     public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
                 client: ClientRef,
+                target: WorkServiceReadTarget,
                 afterCursor: JournalCursor? = nil,
-                limit: Int = WorkServiceBounds.maxEventsPerPage) {
+                limit: Int = WorkServiceBounds.maxEventsPerPage,
+                maxBytes: Int = WorkServiceBounds.maxEventPageBytes) {
         self.work = work
         self.journal = journal
         self.attachment = attachment
         self.client = client
+        self.target = target
         self.afterCursor = afterCursor
         self.limit = limit
+        self.maxBytes = maxBytes
     }
 }
 
 public struct WorkServiceSnapshot: Codable, Hashable, Sendable {
     public let work: WorkServiceWorkDescriptor
-    public let events: [WorkServiceEventDescriptor]
+    public let target: WorkServiceReadTarget
+    /// Canonical timeline envelopes are returned intact. The service may bound the page, but it
+    /// must not reduce an event to a lossy display descriptor before the caller can inspect it.
+    public let events: [TimelineEvent]
     public let servedCursor: JournalCursor?
     public let omissions: [WorkServiceOmission]
 
-    public init(work: WorkServiceWorkDescriptor, events: [WorkServiceEventDescriptor],
-                servedCursor: JournalCursor?, omissions: [WorkServiceOmission] = []) {
+    public init(work: WorkServiceWorkDescriptor, events: [TimelineEvent],
+                target: WorkServiceReadTarget, servedCursor: JournalCursor?,
+                omissions: [WorkServiceOmission] = []) {
         self.work = work
         self.events = events
+        self.target = target
         self.servedCursor = servedCursor
         self.omissions = omissions
     }
@@ -592,18 +749,147 @@ public struct WorkServiceEventsRequest: Codable, Hashable, Sendable {
     public let journal: JournalRef
     public let attachment: ClientAttachmentRef
     public let client: ClientRef
+    public let target: WorkServiceReadTarget
     public let afterCursor: JournalCursor
     public let limit: Int
+    public let maxBytes: Int
 
     public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
                 client: ClientRef,
-                afterCursor: JournalCursor, limit: Int = WorkServiceBounds.maxEventsPerPage) {
+                target: WorkServiceReadTarget,
+                afterCursor: JournalCursor, limit: Int = WorkServiceBounds.maxEventsPerPage,
+                maxBytes: Int = WorkServiceBounds.maxEventPageBytes) {
         self.work = work
         self.journal = journal
         self.attachment = attachment
         self.client = client
+        self.target = target
         self.afterCursor = afterCursor
         self.limit = limit
+        self.maxBytes = maxBytes
+    }
+}
+
+public struct WorkServiceUpdateCapabilitiesRequest: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let journal: JournalRef
+    public let attachment: ClientAttachmentRef
+    public let client: ClientRef
+    public let requestedCapabilities: Set<WorkServiceCapability>
+    public let commandID: String
+    public let causalControlCursor: JournalCursor
+
+    public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
+                client: ClientRef, requestedCapabilities: Set<WorkServiceCapability>,
+                commandID: String, causalControlCursor: JournalCursor) {
+        self.work = work
+        self.journal = journal
+        self.attachment = attachment
+        self.client = client
+        self.requestedCapabilities = requestedCapabilities
+        self.commandID = commandID
+        self.causalControlCursor = causalControlCursor
+    }
+}
+
+public struct WorkServiceUpdateCapabilitiesResponse: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let attachment: WorkServiceClientAttachment?
+    public let authorization: WorkServiceAuthorizationOutcome
+    public let commandID: String
+    public let state: WorkServiceCommandReceiptState
+    public let host: WorkHostInstanceRef
+    public let causalControlCursor: JournalCursor
+    public let resultingControlCursor: JournalCursor
+    public let receipt: WorkServiceControlReceipt
+    public let rejection: WorkServiceCommandRejection?
+    public let diagnostic: String?
+
+    public init(work: WorkRef, attachment: WorkServiceClientAttachment?,
+                authorization: WorkServiceAuthorizationOutcome, commandID: String,
+                state: WorkServiceCommandReceiptState, host: WorkHostInstanceRef,
+                causalControlCursor: JournalCursor, resultingControlCursor: JournalCursor,
+                receipt: WorkServiceControlReceipt? = nil,
+                rejection: WorkServiceCommandRejection? = nil, diagnostic: String? = nil) {
+        self.work = work
+        self.attachment = attachment
+        self.authorization = authorization
+        self.commandID = commandID
+        self.state = state
+        self.host = host
+        self.causalControlCursor = causalControlCursor
+        self.resultingControlCursor = resultingControlCursor
+        self.receipt = receipt ?? WorkServiceControlReceipt(
+            operation: .updateCapabilities, work: work, commandID: commandID, state: state,
+            host: host, causalControlCursor: causalControlCursor,
+            resultingControlCursor: resultingControlCursor, authorization: authorization,
+            outcome: state == .accepted ? .capabilitiesUpdated : nil, rejection: rejection,
+            diagnostic: diagnostic)
+        self.rejection = rejection
+        self.diagnostic = WorkServiceText.bound(diagnostic)
+    }
+}
+
+public struct WorkServiceAcknowledgeReadRequest: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let journal: JournalRef
+    public let attachment: ClientAttachmentRef
+    public let client: ClientRef
+    public let target: WorkServiceReadTarget
+    public let cursor: JournalCursor
+    public let commandID: String
+    public let causalControlCursor: JournalCursor
+
+    public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
+                client: ClientRef, target: WorkServiceReadTarget, cursor: JournalCursor,
+                commandID: String, causalControlCursor: JournalCursor) {
+        self.work = work
+        self.journal = journal
+        self.attachment = attachment
+        self.client = client
+        self.target = target
+        self.cursor = cursor
+        self.commandID = commandID
+        self.causalControlCursor = causalControlCursor
+    }
+}
+
+public struct WorkServiceAcknowledgeReadResponse: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let target: WorkServiceReadTarget
+    public let cursor: JournalCursor
+    public let commandID: String
+    public let state: WorkServiceCommandReceiptState
+    public let host: WorkHostInstanceRef
+    public let causalControlCursor: JournalCursor
+    public let resultingControlCursor: JournalCursor
+    public let receipt: WorkServiceControlReceipt
+    public let rejection: WorkServiceCommandRejection?
+    public let diagnostic: String?
+
+    public init(work: WorkRef, target: WorkServiceReadTarget, cursor: JournalCursor,
+                commandID: String, state: WorkServiceCommandReceiptState,
+                host: WorkHostInstanceRef, causalControlCursor: JournalCursor,
+                resultingControlCursor: JournalCursor,
+                authorization: WorkServiceAuthorizationOutcome,
+                receipt: WorkServiceControlReceipt? = nil,
+                rejection: WorkServiceCommandRejection? = nil, diagnostic: String? = nil) {
+        self.work = work
+        self.target = target
+        self.cursor = cursor
+        self.commandID = commandID
+        self.state = state
+        self.host = host
+        self.causalControlCursor = causalControlCursor
+        self.resultingControlCursor = resultingControlCursor
+        self.receipt = receipt ?? WorkServiceControlReceipt(
+            operation: .acknowledgeRead, work: work, commandID: commandID, state: state,
+            host: host, causalControlCursor: causalControlCursor,
+            resultingControlCursor: resultingControlCursor, authorization: authorization,
+            outcome: state == .accepted ? .readAcknowledged : nil, rejection: rejection,
+            diagnostic: diagnostic)
+        self.rejection = rejection
+        self.diagnostic = WorkServiceText.bound(diagnostic)
     }
 }
 
@@ -640,14 +926,19 @@ public struct WorkServiceEventDescriptor: Codable, Hashable, Sendable {
 }
 
 public struct WorkServiceEventPage: Codable, Hashable, Sendable {
-    public let events: [WorkServiceEventDescriptor]
+    /// Canonical timeline envelopes are returned intact; presentation can derive descriptors
+    /// without making the protocol discard causal or payload fields.
+    public let events: [TimelineEvent]
+    public let target: WorkServiceReadTarget
     public let servedCursor: JournalCursor?
     public let nextCursor: JournalCursor?
     public let omissions: [WorkServiceOmission]
 
-    public init(events: [WorkServiceEventDescriptor], servedCursor: JournalCursor?,
+    public init(events: [TimelineEvent], target: WorkServiceReadTarget,
+                servedCursor: JournalCursor?,
                 nextCursor: JournalCursor?, omissions: [WorkServiceOmission] = []) {
         self.events = events
+        self.target = target
         self.servedCursor = servedCursor
         self.nextCursor = nextCursor
         self.omissions = omissions
@@ -678,7 +969,7 @@ public struct WorkServiceArtifactDescriptor: Codable, Hashable, Sendable {
         self.artifactID = artifactID
         self.work = work
         self.metadataWasTruncated = [label, mediaType, digest]
-            .contains { ($0?.count ?? 0) > WorkServiceBounds.maxDiagnosticCharacters }
+            .contains { ($0?.utf8.count ?? 0) > WorkServiceBounds.maxDiagnosticCharacters }
         self.label = WorkServiceText.bound(label) ?? "artifact"
         self.mediaType = WorkServiceText.bound(mediaType)
         self.byteCount = byteCount.map { max(0, $0) }
@@ -799,7 +1090,7 @@ public struct WorkServiceTerminalCommitProof: Codable, Hashable, Sendable {
     /// The canonical Work cursor written by the terminal transaction. The service projects this
     /// cursor; it must not fabricate a second terminal event after the committer returns.
     public let resultingWorkCursor: JournalCursor
-    public let terminalEvent: WorkServiceEventDescriptor
+    public let terminalEvent: TimelineEvent
     public let session: SessionRef
     public let sessionJournal: JournalRef
     public let sessionAttachment: SessionAttachmentRef
@@ -813,7 +1104,7 @@ public struct WorkServiceTerminalCommitProof: Codable, Hashable, Sendable {
     public init(operation: WorkServiceTerminalOperation, work: WorkRef, journal: JournalRef,
                 command: CommandRef, causalWorkCursor: JournalCursor,
                 resultingWorkCursor: JournalCursor,
-                terminalEvent: WorkServiceEventDescriptor,
+                terminalEvent: TimelineEvent,
                 session: SessionRef, sessionJournal: JournalRef,
                 sessionAttachment: SessionAttachmentRef,
                 pairedSessionCursor: JournalCursor?, sessionPairingVerified: Bool,
@@ -832,6 +1123,66 @@ public struct WorkServiceTerminalCommitProof: Codable, Hashable, Sendable {
         self.sessionPairingVerified = sessionPairingVerified
         self.outstandingHandleIDs = Array(outstandingHandleIDs.prefix(WorkServiceBounds.maxTerminalProofHandles))
         self.commitID = WorkServiceText.bound(commitID) ?? "unknown"
+    }
+
+    /// Project one canonical terminal record into the transport proof without reopening or
+    /// mutating the journals. The static reader in ``RunJournalBundle`` and the live bundle
+    /// committer both use this exact projection, so a lost-response reconciliation cannot invent
+    /// a second event or silently drop the canonical envelope's identity checks.
+    public static func makeProof(
+        record: RunJournalBundleTerminalCommit,
+        request: WorkServiceTerminalCommitRequest
+    ) throws -> WorkServiceTerminalCommitProof {
+        let event = record.workEvent
+        let expectedCausalEvent = request.causalWorkCursor.eventID.map {
+            EventRef(journal: request.journal, eventID: $0)
+        }
+        guard event.type == request.operation.eventKind,
+              event.journal == request.journal,
+              event.work == request.work,
+              event.workHost == WorkHostRef(request.work.workHostID),
+              event.session == request.session,
+              event.client == request.client,
+              event.sessionAttachment == request.sessionAttachment,
+              event.command == request.command,
+              event.idempotencyKey == terminalIdempotencyKey(
+                  type: event.type, command: request.command, detail: request.detail),
+              event.causedByEventID == expectedCausalEvent,
+              record.workCommit.cursor.journal == request.journal,
+              record.workCommit.cursor.eventID == event.eventID,
+              record.workCommit.cursor.sequence == event.sequence else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "canonical terminal record does not match the exact command envelope")
+        }
+        return WorkServiceTerminalCommitProof(
+            operation: request.operation, work: request.work, journal: request.journal,
+            command: request.command, causalWorkCursor: request.causalWorkCursor,
+            resultingWorkCursor: record.workCommit.cursor,
+            terminalEvent: event,
+            session: request.session, sessionJournal: request.sessionJournal,
+            sessionAttachment: request.sessionAttachment,
+            pairedSessionCursor: record.pairedSessionCommit?.cursor,
+            sessionPairingVerified: record.sessionPairingVerified,
+            outstandingHandleIDs: record.outstandingHandleIDs,
+            commitID: event.eventID)
+    }
+
+    fileprivate static func terminalIdempotencyKey(
+        type: String, command: CommandRef, detail: String?
+    ) -> String {
+        func component(_ value: String) -> String { "\(value.utf8.count):\(value)" }
+        let client = command.client?.clientID ?? ""
+        let attachment = command.sessionAttachment?.attachmentID ?? ""
+        let cursor = command.causalCursor
+        let detailComponent = detail.map { "some:\(component($0))" } ?? "none"
+        return "work-terminal:v1/type:\(component(type))"
+            + "/command:\(component(command.commandID))"
+            + "/client:\(component(client))"
+            + "/attachment:\(component(attachment))"
+            + "/journal:\(component(cursor?.journal.stableKey ?? ""))"
+            + "/sequence:\(cursor?.sequence ?? -1)"
+            + "/event:\(component(cursor?.eventID ?? ""))"
+            + "/detail:\(detailComponent)"
     }
 }
 
@@ -923,25 +1274,7 @@ public actor RunJournalBundleWorkServiceTerminalCommitter: WorkServiceTerminalCo
         try validateBundleIdentity(request)
         guard let record = try await bundle.terminalCommit(
             for: request.command, detail: request.detail) else { return nil }
-        guard record.workEvent.type == request.operation.eventKind else {
-            throw WorkServiceProtocolError.invalidRequest(
-                "terminal command was already used for another operation")
-        }
-        let event = record.workEvent
-        return WorkServiceTerminalCommitProof(
-            operation: request.operation, work: request.work, journal: request.journal,
-            command: request.command, causalWorkCursor: request.causalWorkCursor,
-            resultingWorkCursor: record.workCommit.cursor,
-            terminalEvent: WorkServiceEventDescriptor(
-                eventID: event.eventID, kind: event.type, cursor: record.workCommit.cursor,
-                commandID: event.command?.commandID, run: event.run,
-                provenance: record.workCommit.eventRef, bodyStatus: .manifest),
-            session: request.session, sessionJournal: request.sessionJournal,
-            sessionAttachment: request.sessionAttachment,
-            pairedSessionCursor: record.pairedSessionCommit?.cursor,
-            sessionPairingVerified: record.sessionPairingVerified,
-            outstandingHandleIDs: record.outstandingHandleIDs,
-            commitID: event.eventID)
+        return try WorkServiceTerminalCommitProof.makeProof(record: record, request: request)
     }
 
     private func validateBundleIdentity(
@@ -1003,7 +1336,7 @@ public struct WorkServiceCommandRequest: Codable, Hashable, Sendable {
     public let command: CommandRef
     /// Required duplicate of the command envelope's causal cursor so decoding cannot silently
     /// turn a terminal or lifecycle mutation into an unconditional operation.
-    public let causalCursor: JournalCursor
+    public let causalWorkCursor: JournalCursor
     public let kind: WorkServiceCommandKind
     public let value: String?
     public let valueWasTruncated: Bool
@@ -1011,17 +1344,17 @@ public struct WorkServiceCommandRequest: Codable, Hashable, Sendable {
     public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
                 commandID: String, client: ClientRef,
                 sessionAttachment: SessionAttachmentRef? = nil,
-                causalCursor: JournalCursor,
+                causalWorkCursor: JournalCursor,
                 kind: WorkServiceCommandKind, value: String? = nil) {
         self.work = work
         self.journal = journal
         self.attachment = attachment
-        self.causalCursor = causalCursor
+        self.causalWorkCursor = causalWorkCursor
         self.command = CommandRef(commandID: commandID, client: client,
                                   sessionAttachment: sessionAttachment,
-                                  causalCursor: causalCursor)
+                                  causalCursor: causalWorkCursor)
         self.kind = kind
-        if let value, value.count > WorkServiceBounds.maxCommandValueCharacters {
+        if let value, value.utf8.count > WorkServiceBounds.maxCommandValueCharacters {
             // Keep the caller's exact value so command identity and retries cannot collapse two
             // distinct oversized payloads onto the same prefix. The effect boundary rejects it
             // using this explicit marker and the actual count.
@@ -1069,9 +1402,11 @@ public struct WorkServiceCommandReceipt: Codable, Hashable, Sendable {
     public let commandID: String
     public let state: WorkServiceCommandReceiptState
     public let host: WorkHostInstanceRef
-    public let hostSequence: Int
-    public let causalCursor: JournalCursor
-    public let resultingCursor: JournalCursor?
+    /// Work host order exists only for an accepted execution-journal commit. Rejections have no
+    /// Work event and therefore carry no synthetic host sequence.
+    public let hostSequence: Int?
+    public let causalWorkCursor: JournalCursor
+    public let resultingWorkCursor: JournalCursor?
     public let authorization: WorkServiceAuthorizationOutcome
     public let outcome: WorkServiceCommandOutcome?
     public let rejection: WorkServiceCommandRejection?
@@ -1079,8 +1414,8 @@ public struct WorkServiceCommandReceipt: Codable, Hashable, Sendable {
     public let diagnostic: String?
 
     public init(work: WorkRef, commandID: String, state: WorkServiceCommandReceiptState,
-                host: WorkHostInstanceRef, hostSequence: Int,
-                causalCursor: JournalCursor, resultingCursor: JournalCursor?,
+                host: WorkHostInstanceRef, hostSequence: Int? = nil,
+                causalWorkCursor: JournalCursor, resultingWorkCursor: JournalCursor?,
                 authorization: WorkServiceAuthorizationOutcome,
                 outcome: WorkServiceCommandOutcome? = nil,
                 rejection: WorkServiceCommandRejection? = nil,
@@ -1091,8 +1426,8 @@ public struct WorkServiceCommandReceipt: Codable, Hashable, Sendable {
         self.state = state
         self.host = host
         self.hostSequence = hostSequence
-        self.causalCursor = causalCursor
-        self.resultingCursor = resultingCursor
+        self.causalWorkCursor = causalWorkCursor
+        self.resultingWorkCursor = resultingWorkCursor
         self.authorization = authorization
         self.outcome = outcome
         self.rejection = rejection
@@ -1116,6 +1451,10 @@ public protocol WorkServiceClient: Sendable {
     func completeWork(_ request: WorkServiceCompleteWorkRequest) async throws -> WorkServiceCommandReceipt
     func attach(_ request: WorkServiceAttachRequest) async throws -> WorkServiceAttachResponse
     func detach(_ request: WorkServiceDetachRequest) async throws -> WorkServiceDetachResponse
+    func updateCapabilities(_ request: WorkServiceUpdateCapabilitiesRequest) async throws
+        -> WorkServiceUpdateCapabilitiesResponse
+    func acknowledgeRead(_ request: WorkServiceAcknowledgeReadRequest) async throws
+        -> WorkServiceAcknowledgeReadResponse
     func snapshot(_ request: WorkServiceSnapshotRequest) async throws -> WorkServiceSnapshot
     func eventsAfterCursor(_ request: WorkServiceEventsRequest) async throws -> WorkServiceEventPage
     func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws
@@ -1139,6 +1478,12 @@ public actor InMemoryWorkService: WorkServiceClient {
         public let currentRun: RunRef?
         public let configuration: WorkServiceWorkConfiguration
         public let cursor: JournalCursor?
+        public let session: SessionRef?
+        public let sessionJournal: JournalRef?
+        public let sessionAttachment: SessionAttachmentRef?
+        public let sessionCursor: JournalCursor?
+        public let events: [TimelineEvent]
+        public let sessionEvents: [TimelineEvent]
         public let sourceCompleteness: WorkServiceSourceCompleteness
         public let artifacts: [WorkServiceArtifactDescriptor]
         public let bodies: [TimelineBodyReference: Data]
@@ -1147,6 +1492,11 @@ public actor InMemoryWorkService: WorkServiceClient {
                     disposition: WorkServiceRecordedDisposition = .reusable,
                     execution: WorkServiceExecutionState = .idle,
                     currentRun: RunRef? = nil, cursor: JournalCursor? = nil,
+                    session: SessionRef? = nil, sessionJournal: JournalRef? = nil,
+                    sessionAttachment: SessionAttachmentRef? = nil,
+                    sessionCursor: JournalCursor? = nil,
+                    events: [TimelineEvent] = [],
+                    sessionEvents: [TimelineEvent] = [],
                     configuration: WorkServiceWorkConfiguration = .init(),
                     sourceCompleteness: WorkServiceSourceCompleteness = .complete,
                     artifacts: [WorkServiceArtifactDescriptor] = [],
@@ -1158,6 +1508,12 @@ public actor InMemoryWorkService: WorkServiceClient {
             self.currentRun = currentRun
             self.configuration = configuration
             self.cursor = cursor
+            self.session = session
+            self.sessionJournal = sessionJournal
+            self.sessionAttachment = sessionAttachment
+            self.sessionCursor = sessionCursor
+            self.events = events
+            self.sessionEvents = sessionEvents
             self.sourceCompleteness = sourceCompleteness
             self.artifacts = artifacts
             self.bodies = bodies
@@ -1175,7 +1531,6 @@ public actor InMemoryWorkService: WorkServiceClient {
     }
 
     private struct CreateCommandKey: Hashable, Sendable {
-        let work: WorkRef
         let client: ClientRef
         let commandID: String
     }
@@ -1184,6 +1539,11 @@ public actor InMemoryWorkService: WorkServiceClient {
         let work: WorkRef
         let client: ClientRef
         let commandID: String
+    }
+
+    private struct ReadAcknowledgementKey: Hashable, Sendable {
+        let attachment: ClientAttachmentRef
+        let targetJournal: JournalRef
     }
 
     private struct StoredCommand: Sendable {
@@ -1204,6 +1564,16 @@ public actor InMemoryWorkService: WorkServiceClient {
     private struct StoredDetach: Sendable {
         let request: WorkServiceDetachRequest
         let response: WorkServiceDetachResponse
+    }
+
+    private struct StoredCapabilities: Sendable {
+        let request: WorkServiceUpdateCapabilitiesRequest
+        let response: WorkServiceUpdateCapabilitiesResponse
+    }
+
+    private struct StoredReadAcknowledgement: Sendable {
+        let request: WorkServiceAcknowledgeReadRequest
+        let response: WorkServiceAcknowledgeReadResponse
     }
 
     private enum TerminalAttempt: Sendable {
@@ -1233,8 +1603,15 @@ public actor InMemoryWorkService: WorkServiceClient {
     private var createCommands: [CreateCommandKey: StoredCreate] = [:]
     private var attachCommands: [AttachmentCommandKey: StoredAttach] = [:]
     private var detachCommands: [AttachmentCommandKey: StoredDetach] = [:]
+    private var capabilityCommands: [AttachmentCommandKey: StoredCapabilities] = [:]
+    private var readAcknowledgementCommands: [AttachmentCommandKey: StoredReadAcknowledgement] = [:]
     private var terminalTasks: [WorkRef: Task<TerminalAttempt, Never>] = [:]
     private var nextAttachmentOrdinal = 1
+    private var nextWorkOrdinal = 1
+    private var nextSessionOrdinal = 1
+
+    private let controlJournal: JournalRef
+    private var controlCursor: JournalCursor
 
     private struct WorkState: Sendable {
         let work: WorkRef
@@ -1244,13 +1621,20 @@ public actor InMemoryWorkService: WorkServiceClient {
         var currentRun: RunRef?
         var configuration: WorkServiceWorkConfiguration
         var cursor: JournalCursor?
+        var session: SessionRef?
+        var sessionJournal: JournalRef?
+        var sessionAttachment: SessionAttachmentRef?
+        var sessionCursor: JournalCursor?
         var sourceCompleteness: WorkServiceSourceCompleteness
         var artifacts: [WorkServiceArtifactDescriptor]
         var bodies: [TimelineBodyReference: Data]
         var omissions: [WorkServiceOmission]
         var attachments: [ClientAttachmentRef: ClientState]
-        var events: [WorkServiceEventDescriptor]
+        var events: [TimelineEvent]
+        var sessionEvents: [TimelineEvent]
+        var readAcknowledgements: [ReadAcknowledgementKey: JournalCursor]
         var nextEventSequence: Int
+        var nextSessionEventSequence: Int
         var nextRunOrdinal: Int
         var nextHostSequence: Int
         var commands: [CommandKey: StoredCommand]
@@ -1266,6 +1650,8 @@ public actor InMemoryWorkService: WorkServiceClient {
                                                 startIdentity: startIdentity)
         self.authorizer = authorizer
         self.terminalCommitter = terminalCommitter
+        self.controlJournal = JournalRef.workHost(host)
+        self.controlCursor = JournalCursor(journal: JournalRef.workHost(host), sequence: 0)
     }
 
     public func register(_ seed: Seed) throws {
@@ -1275,26 +1661,89 @@ public actor InMemoryWorkService: WorkServiceClient {
               seed.journal.kind == .work else {
             throw WorkServiceProtocolError.journalMismatch
         }
-        guard WorkServiceText.valid(seed.work.workHostID), seed.work.workHostID.count <= WorkServiceBounds.maxIdentityCharacters,
-              WorkServiceText.valid(seed.work.workID), seed.work.workID.count <= WorkServiceBounds.maxIdentityCharacters,
-              WorkServiceText.valid(seed.journal.journalID), seed.journal.journalID.count <= WorkServiceBounds.maxIdentityCharacters,
-              seed.journal.authority.authorityID.count <= WorkServiceBounds.maxIdentityCharacters,
+        guard WorkServiceText.valid(seed.work.workHostID), seed.work.workHostID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
+              WorkServiceText.valid(seed.work.workID), seed.work.workID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
+              WorkServiceText.valid(seed.journal.journalID), seed.journal.journalID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
+              seed.journal.authority.authorityID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
               (seed.cursor?.journal == nil || seed.cursor?.journal == seed.journal),
               (seed.cursor?.sequence ?? 0) >= 0, (seed.cursor?.sequence ?? 0) < Int.max,
               (seed.cursor?.sequence ?? 0) != 0 || seed.cursor?.eventID == nil,
               (seed.cursor?.sequence ?? 0) == 0 || (seed.cursor?.eventID.map(validIdentity) ?? false),
+              (seed.session == nil) == (seed.sessionJournal == nil),
+              (seed.session == nil) == (seed.sessionAttachment == nil),
+              (seed.session.map { validIdentity($0.sessionID) } ?? true),
+              (seed.sessionJournal.map {
+                  $0.kind == .session && $0.owner == .session(seed.session!)
+                      && $0.authority.authorityID == host.workHostID
+              } ?? true),
+              (seed.sessionAttachment.map { validIdentity($0.attachmentID) } ?? true),
+              (seed.sessionCursor?.journal == nil || seed.sessionCursor?.journal == seed.sessionJournal),
+              (seed.sessionCursor?.sequence ?? 0) >= 0,
+              (seed.sessionCursor?.sequence ?? 0) < Int.max,
+              (seed.sessionCursor?.sequence ?? 0) != 0 || seed.sessionCursor?.eventID == nil,
+              (seed.sessionCursor?.sequence ?? 0) == 0
+                  || (seed.sessionCursor?.eventID.map(validIdentity) ?? false),
+              (seed.events.allSatisfy {
+                  $0.journal == seed.journal
+                      && $0.sequence > 0
+                      && validIdentity($0.eventID)
+              }),
+              (seed.sessionEvents.allSatisfy {
+                  $0.journal == seed.sessionJournal
+                      && $0.sequence > 0
+                      && validIdentity($0.eventID)
+              }),
               (seed.artifacts.allSatisfy {
                   validIdentity($0.artifactID)
                       && ($0.bodyReference.map { validBodyReference($0, journal: seed.journal) } ?? true)
               }),
-              (seed.bodies.keys.allSatisfy { validBodyReference($0, journal: seed.journal) }),
+              (seed.bodies.keys.allSatisfy { reference in
+                  validBodyReference(reference, journal: seed.journal)
+                      || (seed.sessionJournal.map { sessionJournal in
+                          validBodyReference(reference, journal: sessionJournal)
+                      } ?? false)
+              }),
+              (seed.bodies.allSatisfy({ reference, data in
+                  reference.byteCount == data.count
+              })),
               !seed.configuration.hasInvalidBodyBounds else {
             throw WorkServiceProtocolError.invalidRequest("invalid Work or cursor identity")
         }
         let cursor = seed.cursor ?? JournalCursor(journal: seed.journal, sequence: 0)
+        let sessionCursor: JournalCursor? = seed.session == nil
+            ? nil
+            : (seed.sessionCursor ?? JournalCursor(journal: seed.sessionJournal!, sequence: 0))
         guard cursor.sequence == 0 || seed.sourceCompleteness != .complete else {
             throw WorkServiceProtocolError.invalidRequest(
                 "a complete nonzero seed requires retained event history")
+        }
+        guard cursor.sequence == 0 || seed.events.last.map({
+            $0.journal == seed.journal && $0.sequence == cursor.sequence
+                && $0.eventID == cursor.eventID
+        }) == true || seed.sourceCompleteness != .complete else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "the complete seed cursor does not match its retained Work event history")
+        }
+        guard seed.events.isEmpty || seed.events.last.map({
+            $0.journal == seed.journal && $0.sequence == cursor.sequence
+                && $0.eventID == cursor.eventID
+        }) == true else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "retained Work events must end at the advertised cursor")
+        }
+        guard sessionCursor == nil || sessionCursor?.sequence == 0 || seed.sessionEvents.last.map({
+            $0.journal == seed.sessionJournal && $0.sequence == sessionCursor?.sequence
+                && $0.eventID == sessionCursor?.eventID
+        }) == true || seed.sourceCompleteness != .complete else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "the complete seed cursor does not match its retained Session event history")
+        }
+        guard seed.sessionEvents.isEmpty || sessionCursor == nil || seed.sessionEvents.last.map({
+            $0.journal == seed.sessionJournal && $0.sequence == sessionCursor?.sequence
+                && $0.eventID == sessionCursor?.eventID
+        }) == true else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "retained Session events must end at the advertised cursor")
         }
         guard seed.disposition == .reusable
                 || (seed.execution == .idle && seed.currentRun == nil) else {
@@ -1325,11 +1774,25 @@ public actor InMemoryWorkService: WorkServiceClient {
         works[seed.work] = WorkState(
             work: seed.work, journal: seed.journal, disposition: seed.disposition,
             execution: seed.execution, currentRun: seed.currentRun, configuration: seed.configuration, cursor: cursor,
+            session: seed.session, sessionJournal: seed.sessionJournal,
+            sessionAttachment: seed.sessionAttachment, sessionCursor: sessionCursor,
             sourceCompleteness: seed.sourceCompleteness, artifacts: artifacts, bodies: seed.bodies,
             omissions: omissions,
             attachments: [:],
-            events: [], nextEventSequence: cursor.sequence + 1,
+            events: seed.events, sessionEvents: seed.sessionEvents,
+            readAcknowledgements: [:],
+            nextEventSequence: cursor.sequence + 1,
+            nextSessionEventSequence: (sessionCursor?.sequence ?? 0) + 1,
             nextRunOrdinal: 1, nextHostSequence: 1, commands: [:], terminalReservation: nil)
+        if let workOrdinal = Int(seed.work.workID.split(separator: "-").last ?? ""),
+           workOrdinal >= nextWorkOrdinal {
+            nextWorkOrdinal = workOrdinal + 1
+        }
+        if let sessionID = seed.session?.sessionID,
+           let sessionOrdinal = Int(sessionID.split(separator: "-").last ?? ""),
+           sessionOrdinal >= nextSessionOrdinal {
+            nextSessionOrdinal = sessionOrdinal + 1
+        }
     }
 
     public func setReachable(_ value: Bool) {
@@ -1337,7 +1800,7 @@ public actor InMemoryWorkService: WorkServiceClient {
     }
 
     public func handshake(_ request: WorkServiceHandshakeRequest) async throws -> WorkServiceHandshakeResponse {
-        guard WorkServiceText.valid(request.client.clientID), request.client.clientID.count <= WorkServiceBounds.maxIdentityCharacters else {
+        guard WorkServiceText.valid(request.client.clientID), request.client.clientID.utf8.count <= WorkServiceBounds.maxIdentityCharacters else {
             throw WorkServiceProtocolError.invalidRequest("invalid client identity")
         }
         let accepted = (WorkServiceProtocol.minimumSupportedVersion...WorkServiceProtocol.maximumSupportedVersion)
@@ -1347,6 +1810,7 @@ public actor InMemoryWorkService: WorkServiceClient {
             accepted: true, negotiatedVersion: request.protocolVersion,
             supportedRange: WorkServiceProtocol.minimumSupportedVersion...WorkServiceProtocol.maximumSupportedVersion,
             host: host, hostInstance: hostInstance,
+            controlJournal: controlJournal, controlCursor: controlCursor,
             capabilities: supportedCapabilities())
     }
 
@@ -1389,55 +1853,88 @@ public actor InMemoryWorkService: WorkServiceClient {
         guard validIdentity(request.client.clientID) else {
             throw WorkServiceProtocolError.invalidRequest("invalid client identity")
         }
-        guard validIdentity(request.commandID), request.commandID.count <= WorkServiceBounds.maxIdentityCharacters else {
+        guard validIdentity(request.commandID), request.commandID.utf8.count <= WorkServiceBounds.maxIdentityCharacters else {
             throw WorkServiceProtocolError.invalidRequest("invalid create command identity")
         }
         guard !request.configuration.hasInvalidBodyBounds else {
             throw WorkServiceProtocolError.invalidRequest("Work configuration exceeds a bounded body limit")
         }
-        guard request.work.workHostID == host.workHostID,
-              request.journal.owner == .work(request.work),
-              request.journal.authority.authorityID == host.workHostID else {
-            throw WorkServiceProtocolError.journalMismatch
-        }
-        guard request.causalCursor.journal == request.journal,
-              request.causalCursor.sequence == 0,
-              request.causalCursor.eventID == nil else {
-            throw WorkServiceProtocolError.invalidRequest(
-                "create must carry the exact empty-journal causal cursor")
-        }
-        let authorization = authorization(
-            for: request.client, requested: request.requestedCapabilities)
-        guard authorization.allows(.control) else {
-            throw WorkServiceProtocolError.capabilityDenied(.control)
-        }
-        let createKey = CreateCommandKey(
-            work: request.work, client: request.client, commandID: request.commandID)
+        let createKey = CreateCommandKey(client: request.client, commandID: request.commandID)
         if let prior = createCommands[createKey] {
             guard prior.request == request else {
                 throw WorkServiceProtocolError.invalidRequest("create command ID was already used with different contents")
             }
             return prior.response
         }
-        try register(.init(work: request.work, journal: request.journal,
-                           configuration: request.configuration))
-        guard var state = works[request.work] else {
-            throw WorkServiceProtocolError.workNotFound(request.work)
+        let authorization = authorization(
+            for: request.client, requested: request.requestedCapabilities)
+        guard authorization.allows(.control) else {
+            throw WorkServiceProtocolError.capabilityDenied(.control)
         }
-        _ = appendEvent(kind: "work.created", commandID: request.commandID, state: &state)
-        let resultingCursor = state.cursor
-        let hostSequence = state.nextHostSequence
-        state.nextHostSequence += 1
-        let receipt = WorkServiceCommandReceipt(
-            work: state.work, commandID: request.commandID, state: .accepted,
-            host: hostInstance, hostSequence: hostSequence,
-            causalCursor: request.causalCursor, resultingCursor: resultingCursor,
+        guard request.causalControlCursor == controlCursor else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "create causal control cursor is not current")
+        }
+        var workID: String
+        repeat {
+            workID = "work-\(nextWorkOrdinal)"
+            nextWorkOrdinal += 1
+        } while works.keys.contains(WorkRef(workHostID: host.workHostID, workID: workID))
+        let work = WorkRef(workHostID: host.workHostID, workID: workID)
+        let workJournal = JournalRef.work(work)
+        let session = SessionRef("session-\(nextSessionOrdinal)")
+        nextSessionOrdinal += 1
+        let sessionJournal = JournalRef.session(
+            session, authority: TimelineAuthorityRef(host.workHostID))
+        let sessionAttachment = SessionAttachmentRef("session-attachment-\(nextAttachmentOrdinal)")
+        let attachmentID = ClientAttachmentRef("attachment-\(nextAttachmentOrdinal)")
+        nextAttachmentOrdinal += 1
+        var state = WorkState(
+            work: work, journal: workJournal, disposition: .reusable, execution: .idle,
+            currentRun: nil, configuration: request.configuration,
+            cursor: JournalCursor(journal: workJournal, sequence: 0),
+            session: session, sessionJournal: sessionJournal,
+            sessionAttachment: sessionAttachment,
+            sessionCursor: JournalCursor(journal: sessionJournal, sequence: 0),
+            sourceCompleteness: .complete, artifacts: [], bodies: [:], omissions: [],
+            attachments: [:], events: [], sessionEvents: [], readAcknowledgements: [:],
+            nextEventSequence: 1, nextSessionEventSequence: 1, nextRunOrdinal: 1,
+            nextHostSequence: 1, commands: [:], terminalReservation: nil)
+        let createCommand = CommandRef(
+            commandID: request.commandID, client: request.client,
+            sessionAttachment: sessionAttachment,
+            causalCursor: state.cursor)
+        _ = appendEvent(kind: TimelineEventType.workCreated,
+                        commandID: request.commandID, command: createCommand,
+                        state: &state)
+        _ = appendSessionEvent(kind: TimelineEventType.sessionCreated,
+                                commandID: request.commandID, command: createCommand,
+                                state: &state)
+        _ = appendSessionEvent(kind: TimelineEventType.sessionAttached,
+                                commandID: request.commandID, command: createCommand,
+                                state: &state)
+        let workCursor = state.cursor!
+        let attachment = WorkServiceClientAttachment(
+            attachment: attachmentID, client: request.client, session: session,
+            sessionJournal: sessionJournal, sessionAttachment: sessionAttachment,
+            authorization: authorization)
+        state.attachments[attachmentID] = ClientState(attachment: attachment)
+        works[work] = state
+        let resultingControlCursor = appendControlEvent()
+        let receipt = WorkServiceControlReceipt(
+            operation: .createWork, work: work, commandID: request.commandID,
+            state: .accepted, host: hostInstance,
+            causalControlCursor: request.causalControlCursor,
+            resultingControlCursor: resultingControlCursor,
             authorization: authorization, outcome: .created)
-        works[request.work] = state
         let response = WorkServiceCreateWorkResponse(
-            work: try await describeWork(.init(
-                work: request.work, journal: request.journal, client: request.client)),
-            authorization: authorization, receipt: receipt)
+            work: descriptor(for: work, includeObservation: true)!, authorization: authorization,
+            session: session, sessionJournal: sessionJournal,
+            sessionAttachment: sessionAttachment, attachment: attachment,
+            workCursor: workCursor,
+            sessionCursor: state.sessionCursor
+                ?? JournalCursor(journal: sessionJournal, sequence: 0),
+            controlCursor: resultingControlCursor, receipt: receipt)
         createCommands[createKey] = StoredCreate(request: request, response: response)
         return response
     }
@@ -1446,14 +1943,14 @@ public actor InMemoryWorkService: WorkServiceClient {
         guard let client = request.command.client else {
             throw WorkServiceProtocolError.invalidRequest("completion must carry a client identity")
         }
-        guard request.command.causalCursor == request.causalCursor else {
+        guard request.command.causalCursor == request.causalWorkCursor else {
             throw WorkServiceProtocolError.invalidRequest("completion causal cursor is inconsistent")
         }
         let command = WorkServiceCommandRequest(
             work: request.work, journal: request.journal, attachment: request.attachment,
             commandID: request.command.commandID, client: client,
             sessionAttachment: request.command.sessionAttachment,
-            causalCursor: request.causalCursor, kind: .complete)
+            causalWorkCursor: request.causalWorkCursor, kind: .complete)
         return try await self.command(command)
     }
 
@@ -1461,7 +1958,8 @@ public actor InMemoryWorkService: WorkServiceClient {
         try requireReachable()
         guard var state = works[request.work] else { throw WorkServiceProtocolError.workNotFound(request.work) }
         guard request.journal == state.journal else { throw WorkServiceProtocolError.journalMismatch }
-        guard validIdentity(request.client.clientID), validIdentity(request.commandID) else {
+        guard validIdentity(request.client.clientID), validIdentity(request.commandID),
+              validCursor(request.causalControlCursor, journal: controlJournal) else {
             throw WorkServiceProtocolError.invalidRequest("invalid client identity")
         }
         let key = AttachmentCommandKey(work: request.work, client: request.client,
@@ -1472,18 +1970,28 @@ public actor InMemoryWorkService: WorkServiceClient {
                     work: prior.response.work, attachment: nil,
                     authorization: prior.response.authorization, commandID: request.commandID,
                     state: .rejected, host: prior.response.host,
-                    hostSequence: prior.response.hostSequence,
-                    resultingCursor: prior.response.resultingCursor,
+                    causalControlCursor: request.causalControlCursor,
+                    resultingControlCursor: prior.response.resultingControlCursor,
+                    receipt: controlReceipt(
+                        operation: .attach, work: prior.response.work.work,
+                        commandID: request.commandID, state: .rejected,
+                        causalControlCursor: request.causalControlCursor,
+                        resultingControlCursor: prior.response.resultingControlCursor,
+                        authorization: prior.response.authorization,
+                        rejection: .conflictingCommand,
+                        diagnostic: "attachment command ID was already used with different contents"),
                     rejection: .conflictingCommand,
                     diagnostic: "attachment command ID was already used with different contents")
             }
+            let duplicateReceipt = duplicateControl(of: prior.response.receipt)
             return WorkServiceAttachResponse(
                 work: prior.response.work, attachment: prior.response.attachment,
                 authorization: prior.response.authorization, commandID: request.commandID,
                 state: prior.response.state == .rejected ? .rejected : .duplicate,
                 host: prior.response.host,
-                hostSequence: prior.response.hostSequence,
-                resultingCursor: prior.response.resultingCursor,
+                causalControlCursor: prior.response.causalControlCursor,
+                resultingControlCursor: prior.response.resultingControlCursor,
+                receipt: duplicateReceipt,
                 rejection: prior.response.rejection,
                 diagnostic: prior.response.state == .rejected
                     ? prior.response.diagnostic : "idempotent duplicate")
@@ -1493,10 +2001,19 @@ public actor InMemoryWorkService: WorkServiceClient {
               (request.session.map { validIdentity($0.sessionID) } ?? true),
               (request.sessionJournal.map {
                   $0.kind == .session && $0.owner == .session(request.session!)
+                      && $0.authority.authorityID == host.workHostID
               } ?? true),
               (request.sessionAttachment.map { validIdentity($0.attachmentID) } ?? true) else {
             throw WorkServiceProtocolError.invalidRequest(
                 "Session, Session journal, and attachment identity must be complete and bounded")
+        }
+        if let existingSession = state.session {
+            guard request.session == existingSession,
+                  request.sessionJournal == state.sessionJournal,
+                  request.sessionAttachment == state.sessionAttachment else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "attach Session tuple does not match the Work's canonical Session relationship")
+            }
         }
         let authorization = authorization(
             for: request.client, requested: request.requestedCapabilities)
@@ -1504,8 +2021,8 @@ public actor InMemoryWorkService: WorkServiceClient {
             let response = WorkServiceAttachResponse(
                 work: descriptor(for: state.work, includeObservation: true)!, attachment: nil,
                 authorization: authorization, commandID: request.commandID, state: .rejected,
-                host: hostInstance, hostSequence: max(0, state.nextHostSequence - 1),
-                resultingCursor: state.cursor, rejection: .terminalProofUnavailable,
+                host: hostInstance, causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor, rejection: .terminalProofUnavailable,
                 diagnostic: "a terminal Work transaction is already in progress")
             attachCommands[key] = StoredAttach(request: request, response: response)
             works[state.work] = state
@@ -1515,21 +2032,20 @@ public actor InMemoryWorkService: WorkServiceClient {
             let response = WorkServiceAttachResponse(
                 work: descriptor(for: state.work, includeObservation: true)!, attachment: nil,
                 authorization: authorization, commandID: request.commandID, state: .rejected,
-                host: hostInstance, hostSequence: max(0, state.nextHostSequence - 1),
-                resultingCursor: state.cursor, rejection: .sourceIncomplete,
+                host: hostInstance, causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor, rejection: .sourceIncomplete,
                 diagnostic: "host source is not complete enough to attach canonically")
             attachCommands[key] = StoredAttach(request: request, response: response)
             // No attachment, event, cursor, or host-order mutation is claimed.
             works[state.work] = state
             return response
         }
-        if request.causalCursor != state.cursor {
-            let hostSequence = state.nextHostSequence
-            state.nextHostSequence += 1
+        if request.causalControlCursor != controlCursor {
             let response = WorkServiceAttachResponse(
                 work: descriptor(for: state.work, includeObservation: true)!, attachment: nil,
                 authorization: authorization, commandID: request.commandID, state: .rejected,
-                host: hostInstance, hostSequence: hostSequence, resultingCursor: state.cursor,
+                host: hostInstance, causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor,
                 rejection: .staleCursor, diagnostic: "attach causal cursor is not current")
             attachCommands[key] = StoredAttach(request: request, response: response)
             works[state.work] = state
@@ -1537,30 +2053,20 @@ public actor InMemoryWorkService: WorkServiceClient {
         }
         let id = ClientAttachmentRef("attachment-\(nextAttachmentOrdinal)")
         nextAttachmentOrdinal += 1
-        var attachment = WorkServiceClientAttachment(
+        let attachment = WorkServiceClientAttachment(
             attachment: id, client: request.client, session: request.session,
             sessionJournal: request.sessionJournal,
             sessionAttachment: request.sessionAttachment, authorization: authorization,
-            cursor: state.cursor)
-        state.attachments[id] = ClientState(attachment: attachment)
-        // A production service must append the canonical attachment event before returning.
-        // The reference service models that event in its cursor-based manifest.
-        let eventCursor = appendEvent(kind: "client_attachment.attached",
-                                      commandID: request.commandID, state: &state)
-        let hostSequence = state.nextHostSequence
-        state.nextHostSequence += 1
-        attachment = WorkServiceClientAttachment(
-            attachment: id, client: request.client, session: request.session,
-            sessionJournal: request.sessionJournal,
-            sessionAttachment: request.sessionAttachment, authorization: authorization,
-            cursor: state.cursor)
+            readAcknowledgements: [])
         state.attachments[id] = ClientState(attachment: attachment)
         works[request.work] = state
+        let resultingControlCursor = appendControlEvent()
         let response = WorkServiceAttachResponse(
             work: descriptor(for: state.work, includeObservation: true)!,
             attachment: attachment, authorization: authorization,
-            commandID: request.commandID, host: hostInstance, hostSequence: hostSequence,
-            resultingCursor: eventCursor)
+            commandID: request.commandID, host: hostInstance,
+            causalControlCursor: request.causalControlCursor,
+            resultingControlCursor: resultingControlCursor)
         attachCommands[key] = StoredAttach(request: request, response: response)
         return response
     }
@@ -1569,7 +2075,8 @@ public actor InMemoryWorkService: WorkServiceClient {
         try requireReachable()
         guard var state = works[request.work] else { throw WorkServiceProtocolError.workNotFound(request.work) }
         guard request.journal == state.journal else { throw WorkServiceProtocolError.journalMismatch }
-        guard validIdentity(request.client.clientID), validIdentity(request.commandID) else {
+        guard validIdentity(request.client.clientID), validIdentity(request.commandID),
+              validCursor(request.causalControlCursor, journal: controlJournal) else {
             throw WorkServiceProtocolError.invalidRequest("invalid detach client or command identity")
         }
         let key = AttachmentCommandKey(work: request.work, client: request.client,
@@ -1578,18 +2085,28 @@ public actor InMemoryWorkService: WorkServiceClient {
             guard prior.request == request else {
                 return WorkServiceDetachResponse(
                     work: prior.response.work, commandID: request.commandID, state: .rejected,
-                    host: prior.response.host, hostSequence: prior.response.hostSequence,
-                    causalCursor: prior.response.causalCursor,
-                    resultingCursor: prior.response.resultingCursor,
+                    host: prior.response.host,
+                    causalControlCursor: request.causalControlCursor,
+                    resultingControlCursor: prior.response.resultingControlCursor,
+                    receipt: controlReceipt(
+                        operation: .detach, work: prior.response.work,
+                        commandID: request.commandID, state: .rejected,
+                        causalControlCursor: request.causalControlCursor,
+                        resultingControlCursor: prior.response.resultingControlCursor,
+                        authorization: prior.response.receipt.authorization,
+                        rejection: .conflictingCommand,
+                        diagnostic: "detach command ID was already used with different contents"),
                     rejection: .conflictingCommand,
                     diagnostic: "detach command ID was already used with different contents")
             }
+            let duplicateReceipt = duplicateControl(of: prior.response.receipt)
             return WorkServiceDetachResponse(
                 work: prior.response.work, commandID: request.commandID,
                 state: prior.response.state == .rejected ? .rejected : .duplicate,
-                host: prior.response.host, hostSequence: prior.response.hostSequence,
-                causalCursor: prior.response.causalCursor,
-                resultingCursor: prior.response.resultingCursor,
+                host: prior.response.host,
+                causalControlCursor: prior.response.causalControlCursor,
+                resultingControlCursor: prior.response.resultingControlCursor,
+                receipt: duplicateReceipt,
                 rejection: prior.response.rejection,
                 diagnostic: prior.response.state == .rejected
                     ? prior.response.diagnostic : "idempotent duplicate")
@@ -1600,8 +2117,8 @@ public actor InMemoryWorkService: WorkServiceClient {
         if state.terminalReservation != nil {
             let response = WorkServiceDetachResponse(
                 work: request.work, commandID: request.commandID, state: .rejected,
-                host: hostInstance, hostSequence: max(0, state.nextHostSequence - 1),
-                causalCursor: request.causalCursor, resultingCursor: state.cursor,
+                host: hostInstance, causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor,
                 rejection: .terminalProofUnavailable,
                 diagnostic: "a terminal Work transaction is already in progress")
             detachCommands[key] = StoredDetach(request: request, response: response)
@@ -1611,8 +2128,8 @@ public actor InMemoryWorkService: WorkServiceClient {
         guard state.sourceCompleteness == .complete else {
             let response = WorkServiceDetachResponse(
                 work: request.work, commandID: request.commandID, state: .rejected,
-                host: hostInstance, hostSequence: max(0, state.nextHostSequence - 1),
-                causalCursor: request.causalCursor, resultingCursor: state.cursor,
+                host: hostInstance, causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor,
                 rejection: .sourceIncomplete,
                 diagnostic: "host source is not complete enough to detach canonically")
             detachCommands[key] = StoredDetach(request: request, response: response)
@@ -1620,74 +2137,321 @@ public actor InMemoryWorkService: WorkServiceClient {
             works[state.work] = state
             return response
         }
-        if request.causalCursor != state.cursor {
-            let hostSequence = state.nextHostSequence
-            state.nextHostSequence += 1
+        if request.causalControlCursor != controlCursor {
             let response = WorkServiceDetachResponse(
                 work: request.work, commandID: request.commandID, state: .rejected,
-                host: hostInstance, hostSequence: hostSequence,
-                causalCursor: request.causalCursor, resultingCursor: state.cursor,
+                host: hostInstance, causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor,
                 rejection: .staleCursor, diagnostic: "detach causal cursor is not current")
             detachCommands[key] = StoredDetach(request: request, response: response)
             works[state.work] = state
             return response
         }
-        // A production service must append the canonical detach event before acknowledging.
-        let eventCursor = appendEvent(kind: "client_attachment.detached",
-                                      commandID: request.commandID, state: &state)
-        let hostSequence = state.nextHostSequence
-        state.nextHostSequence += 1
         state.attachments.removeValue(forKey: request.attachment)
+        state.readAcknowledgements = state.readAcknowledgements.filter {
+            $0.key.attachment != request.attachment
+        }
         works[request.work] = state
+        let resultingControlCursor = appendControlEvent()
         let response = WorkServiceDetachResponse(
             work: request.work, commandID: request.commandID, state: .accepted,
-            host: hostInstance, hostSequence: hostSequence,
-            causalCursor: request.causalCursor, resultingCursor: eventCursor)
+            host: hostInstance, causalControlCursor: request.causalControlCursor,
+            resultingControlCursor: resultingControlCursor)
         detachCommands[key] = StoredDetach(request: request, response: response)
         return response
     }
 
     public func snapshot(_ request: WorkServiceSnapshotRequest) async throws -> WorkServiceSnapshot {
         try requireReachable()
-        var state = try attachedState(work: request.work, journal: request.journal,
+        let state = try attachedState(work: request.work, journal: request.journal,
                                       attachment: request.attachment, client: request.client,
                                       requiring: .observe)
-        let after = try validatedAfter(request.afterCursor, state: state)
+        let target = try readTarget(request.target, for: state, attachment: request.attachment)
+        let after = try validatedAfter(request.afterCursor, journal: target.journal,
+                                       cursor: target.cursor, events: target.events)
         let limit = try boundedPageSize(request.limit, max: WorkServiceBounds.maxEventsPerPage)
-        let events = Array(state.events.filter { $0.cursor.sequence > after }.prefix(limit))
-        let next = events.last?.cursor
-        var omissions: [WorkServiceOmission] = []
-        if state.events.contains(where: { $0.cursor.sequence > (next?.sequence ?? after) }) {
-            omissions.append(WorkServiceOmission(category: "events", count: 1, diagnostic: "more events available"))
+        let (events, bytesLimited) = try boundedEventPage(
+            target.events, after: after, limit: limit, maxBytes: request.maxBytes)
+        let next = events.last.map {
+            JournalCursor(journal: target.journal, eventID: $0.eventID, sequence: $0.sequence)
         }
-        let servedCursor = events.last?.cursor
-            ?? state.attachments[request.attachment]?.attachment.cursor
-        updateClientCursor(request.attachment, to: servedCursor, state: &state)
-        let deliveredCursor = state.attachments[request.attachment]?.attachment.cursor
-        works[state.work] = state
+        var omissions: [WorkServiceOmission] = []
+        if bytesLimited {
+            omissions.append(WorkServiceOmission(
+                category: "event_bytes", count: 1,
+                diagnostic: "event page byte limit stopped the page"))
+        } else if target.events.contains(where: { $0.sequence > (next?.sequence ?? after) }) {
+            omissions.append(WorkServiceOmission(
+                category: "events", count: 1, diagnostic: "more events available"))
+        }
+        let baselineCursor = request.afterCursor
+            ?? JournalCursor(journal: target.journal, sequence: 0)
         return WorkServiceSnapshot(work: descriptor(for: state.work, includeObservation: true)!,
-                                   events: events, servedCursor: deliveredCursor, omissions: omissions)
+                                   events: events, target: request.target,
+                                   servedCursor: events.last.map {
+                                       JournalCursor(journal: target.journal,
+                                                     eventID: $0.eventID, sequence: $0.sequence)
+                                   } ?? baselineCursor,
+                                   omissions: omissions)
     }
 
     public func eventsAfterCursor(_ request: WorkServiceEventsRequest) async throws -> WorkServiceEventPage {
         try requireReachable()
-        var state = try attachedState(work: request.work, journal: request.journal,
+        let state = try attachedState(work: request.work, journal: request.journal,
                                       attachment: request.attachment, client: request.client,
                                       requiring: .observe)
-        let after = try validatedAfter(request.afterCursor, state: state)
+        let target = try readTarget(request.target, for: state, attachment: request.attachment)
+        let after = try validatedAfter(request.afterCursor, journal: target.journal,
+                                       cursor: target.cursor, events: target.events)
         let limit = try boundedPageSize(request.limit, max: WorkServiceBounds.maxEventsPerPage)
-        let available = state.events.filter { $0.cursor.sequence > after }
-        let events = Array(available.prefix(limit))
-        let next = events.last?.cursor
-        let hasMore = available.count > events.count
-        let servedCursor = events.last?.cursor
-            ?? state.attachments[request.attachment]?.attachment.cursor
-        updateClientCursor(request.attachment, to: servedCursor, state: &state)
-        let deliveredCursor = state.attachments[request.attachment]?.attachment.cursor
-        works[state.work] = state
+        let (events, bytesLimited) = try boundedEventPage(
+            target.events, after: after, limit: limit, maxBytes: request.maxBytes)
+        let next = events.last.map {
+            JournalCursor(journal: target.journal, eventID: $0.eventID, sequence: $0.sequence)
+        }
+        let availableCount = target.events.reduce(into: 0) { count, event in
+            if event.sequence > after { count += 1 }
+        }
+        let hasMore = availableCount > events.count
         return WorkServiceEventPage(
-            events: events, servedCursor: deliveredCursor, nextCursor: hasMore ? next : nil,
-            omissions: hasMore ? [WorkServiceOmission(category: "events", count: available.count - events.count)] : [])
+            events: events, target: request.target,
+            servedCursor: events.last.map {
+                JournalCursor(journal: target.journal, eventID: $0.eventID, sequence: $0.sequence)
+            } ?? request.afterCursor,
+            nextCursor: hasMore ? next : nil,
+            omissions: hasMore
+                ? [WorkServiceOmission(
+                    category: bytesLimited ? "event_bytes" : "events",
+                    count: bytesLimited ? 1 : availableCount - events.count,
+                    diagnostic: bytesLimited
+                        ? "event page byte limit stopped the page" : nil)]
+                : [])
+    }
+
+    public func updateCapabilities(
+        _ request: WorkServiceUpdateCapabilitiesRequest
+    ) async throws -> WorkServiceUpdateCapabilitiesResponse {
+        try requireReachable()
+        guard var state = works[request.work] else {
+            throw WorkServiceProtocolError.workNotFound(request.work)
+        }
+        guard request.journal == state.journal else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
+        guard validIdentity(request.client.clientID), validIdentity(request.commandID),
+              validCursor(request.causalControlCursor, journal: controlJournal) else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "invalid capability mutation identity")
+        }
+        let key = AttachmentCommandKey(
+            work: request.work, client: request.client, commandID: request.commandID)
+        if let prior = capabilityCommands[key] {
+            guard prior.request == request else {
+                let receipt = controlReceipt(
+                    operation: .updateCapabilities, work: request.work,
+                    commandID: request.commandID, state: .rejected,
+                    causalControlCursor: request.causalControlCursor,
+                    resultingControlCursor: prior.response.resultingControlCursor,
+                    authorization: prior.response.authorization,
+                    rejection: .conflictingCommand,
+                    diagnostic: "capability command ID was already used with different contents")
+                return WorkServiceUpdateCapabilitiesResponse(
+                    work: request.work, attachment: nil,
+                    authorization: prior.response.authorization, commandID: request.commandID,
+                    state: .rejected, host: prior.response.host,
+                    causalControlCursor: request.causalControlCursor,
+                    resultingControlCursor: prior.response.resultingControlCursor,
+                    receipt: receipt, rejection: .conflictingCommand,
+                    diagnostic: "capability command ID was already used with different contents")
+            }
+            let duplicate = duplicateControl(of: prior.response.receipt)
+            return WorkServiceUpdateCapabilitiesResponse(
+                work: prior.response.work, attachment: prior.response.attachment,
+                authorization: prior.response.authorization, commandID: request.commandID,
+                state: prior.response.state == .rejected ? .rejected : .duplicate,
+                host: prior.response.host,
+                causalControlCursor: prior.response.causalControlCursor,
+                resultingControlCursor: prior.response.resultingControlCursor,
+                receipt: duplicate, rejection: prior.response.rejection,
+                diagnostic: prior.response.state == .rejected
+                    ? prior.response.diagnostic : "idempotent duplicate")
+        }
+        guard let current = state.attachments[request.attachment],
+              current.attachment.client == request.client else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
+        let authorization = authorization(
+            for: request.client, requested: request.requestedCapabilities)
+        func rejected(
+            _ rejection: WorkServiceCommandRejection, _ diagnostic: String
+        ) -> WorkServiceUpdateCapabilitiesResponse {
+            let receipt = controlReceipt(
+                operation: .updateCapabilities, work: request.work,
+                commandID: request.commandID, state: .rejected,
+                causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor, authorization: authorization,
+                rejection: rejection, diagnostic: diagnostic)
+            let response = WorkServiceUpdateCapabilitiesResponse(
+                work: request.work, attachment: nil, authorization: authorization,
+                commandID: request.commandID, state: .rejected, host: hostInstance,
+                causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor, receipt: receipt,
+                rejection: rejection, diagnostic: diagnostic)
+            capabilityCommands[key] = StoredCapabilities(request: request, response: response)
+            works[state.work] = state
+            return response
+        }
+        guard current.attachment.authorization.allows(.control) else {
+            return rejected(.authorizationDenied,
+                            "client attachment does not grant capability control")
+        }
+        guard request.causalControlCursor == controlCursor else {
+            return rejected(.staleCursor,
+                            "capability causal control cursor is not current")
+        }
+        let updated = WorkServiceClientAttachment(
+            attachment: current.attachment.attachment, client: current.attachment.client,
+            session: current.attachment.session, sessionJournal: current.attachment.sessionJournal,
+            sessionAttachment: current.attachment.sessionAttachment,
+            authorization: authorization,
+            readAcknowledgements: readAcknowledgements(
+                for: current.attachment.attachment, state: state))
+        state.attachments[request.attachment] = ClientState(attachment: updated)
+        works[state.work] = state
+        let resultingControlCursor = appendControlEvent()
+        let receipt = controlReceipt(
+            operation: .updateCapabilities, work: request.work,
+            commandID: request.commandID, state: .accepted,
+            causalControlCursor: request.causalControlCursor,
+            resultingControlCursor: resultingControlCursor,
+            authorization: authorization, outcome: .capabilitiesUpdated)
+        let response = WorkServiceUpdateCapabilitiesResponse(
+            work: request.work, attachment: updated, authorization: authorization,
+            commandID: request.commandID, state: .accepted, host: hostInstance,
+            causalControlCursor: request.causalControlCursor,
+            resultingControlCursor: resultingControlCursor, receipt: receipt)
+        capabilityCommands[key] = StoredCapabilities(request: request, response: response)
+        return response
+    }
+
+    public func acknowledgeRead(
+        _ request: WorkServiceAcknowledgeReadRequest
+    ) async throws -> WorkServiceAcknowledgeReadResponse {
+        try requireReachable()
+        guard var state = works[request.work] else {
+            throw WorkServiceProtocolError.workNotFound(request.work)
+        }
+        guard request.journal == state.journal else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
+        guard validIdentity(request.client.clientID), validIdentity(request.commandID),
+              validCursor(request.causalControlCursor, journal: controlJournal) else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "invalid read acknowledgement identity")
+        }
+        let key = AttachmentCommandKey(
+            work: request.work, client: request.client, commandID: request.commandID)
+        if let prior = readAcknowledgementCommands[key] {
+            guard prior.request == request else {
+                let receipt = controlReceipt(
+                    operation: .acknowledgeRead, work: request.work,
+                    commandID: request.commandID, state: .rejected,
+                    causalControlCursor: request.causalControlCursor,
+                    resultingControlCursor: prior.response.resultingControlCursor,
+                    authorization: prior.response.receipt.authorization,
+                    rejection: .conflictingCommand,
+                    diagnostic: "read acknowledgement ID was already used with different contents")
+                return WorkServiceAcknowledgeReadResponse(
+                    work: request.work, target: request.target, cursor: request.cursor,
+                    commandID: request.commandID, state: .rejected, host: prior.response.host,
+                    causalControlCursor: request.causalControlCursor,
+                    resultingControlCursor: prior.response.resultingControlCursor,
+                    authorization: prior.response.receipt.authorization, receipt: receipt,
+                    rejection: .conflictingCommand,
+                    diagnostic: "read acknowledgement ID was already used with different contents")
+            }
+            let duplicate = duplicateControl(of: prior.response.receipt)
+            return WorkServiceAcknowledgeReadResponse(
+                work: prior.response.work, target: prior.response.target, cursor: prior.response.cursor,
+                commandID: request.commandID,
+                state: prior.response.state == .rejected ? .rejected : .duplicate,
+                host: prior.response.host, causalControlCursor: prior.response.causalControlCursor,
+                resultingControlCursor: prior.response.resultingControlCursor,
+                authorization: prior.response.receipt.authorization, receipt: duplicate,
+                rejection: prior.response.rejection,
+                diagnostic: prior.response.state == .rejected
+                    ? prior.response.diagnostic : "idempotent duplicate")
+        }
+        guard let current = state.attachments[request.attachment],
+              current.attachment.client == request.client else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
+        let authorization = current.attachment.authorization
+        func rejected(
+            _ rejection: WorkServiceCommandRejection, _ diagnostic: String
+        ) -> WorkServiceAcknowledgeReadResponse {
+            let receipt = controlReceipt(
+                operation: .acknowledgeRead, work: request.work,
+                commandID: request.commandID, state: .rejected,
+                causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor, authorization: authorization,
+                rejection: rejection, diagnostic: diagnostic)
+            let response = WorkServiceAcknowledgeReadResponse(
+                work: request.work, target: request.target, cursor: request.cursor,
+                commandID: request.commandID, state: .rejected, host: hostInstance,
+                causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor, authorization: authorization,
+                receipt: receipt, rejection: rejection, diagnostic: diagnostic)
+            readAcknowledgementCommands[key] = StoredReadAcknowledgement(
+                request: request, response: response)
+            works[state.work] = state
+            return response
+        }
+        guard current.attachment.authorization.allows(.observe) else {
+            return rejected(.authorizationDenied,
+                            "client attachment does not grant observation")
+        }
+        let target = try readTarget(request.target, for: state, attachment: request.attachment)
+        guard request.cursor.journal == target.journal else {
+            return rejected(.malformedRequest,
+                            "read acknowledgement cursor belongs to another journal")
+        }
+        _ = try validatedAfter(request.cursor, journal: target.journal,
+                               cursor: target.cursor, events: target.events)
+        let ackKey = ReadAcknowledgementKey(
+            attachment: request.attachment, targetJournal: target.journal)
+        if let previous = state.readAcknowledgements[ackKey] {
+            guard request.cursor.sequence >= previous.sequence else {
+                return rejected(.staleCursor, "read acknowledgement moved backwards")
+            }
+            if request.cursor.sequence == previous.sequence,
+               request.cursor.eventID != previous.eventID {
+                return rejected(.conflictingCommand,
+                                "read acknowledgement conflicts at one sequence")
+            }
+        }
+        guard request.causalControlCursor == controlCursor else {
+            return rejected(.staleCursor,
+                            "read acknowledgement causal control cursor is not current")
+        }
+        state.readAcknowledgements[ackKey] = request.cursor
+        works[state.work] = state
+        let resultingControlCursor = appendControlEvent()
+        let receipt = controlReceipt(
+            operation: .acknowledgeRead, work: request.work,
+            commandID: request.commandID, state: .accepted,
+            causalControlCursor: request.causalControlCursor,
+            resultingControlCursor: resultingControlCursor,
+            authorization: authorization, outcome: .readAcknowledged)
+        let response = WorkServiceAcknowledgeReadResponse(
+            work: request.work, target: request.target, cursor: request.cursor,
+            commandID: request.commandID, state: .accepted, host: hostInstance,
+            causalControlCursor: request.causalControlCursor,
+            resultingControlCursor: resultingControlCursor, authorization: authorization,
+            receipt: receipt)
+        readAcknowledgementCommands[key] = StoredReadAcknowledgement(
+            request: request, response: response)
+        return response
     }
 
     public func fetchArtifact(
@@ -1714,10 +2478,11 @@ public actor InMemoryWorkService: WorkServiceClient {
         let state = try attachedState(work: request.work, journal: request.journal,
                                       attachment: request.attachment, client: request.client,
                                       requiring: .observe)
-        guard request.reference.authority == state.journal else {
+        let bodyJournal = request.reference.authority
+        guard bodyJournal == state.journal || bodyJournal == state.sessionJournal else {
             throw WorkServiceProtocolError.journalMismatch
         }
-        guard validBodyReference(request.reference, journal: state.journal) else {
+        guard validBodyReference(request.reference, journal: bodyJournal) else {
             throw WorkServiceProtocolError.invalidRequest("body reference identity is not bounded")
         }
         if state.artifacts.contains(where: { $0.bodyReference == request.reference }),
@@ -1764,9 +2529,9 @@ public actor InMemoryWorkService: WorkServiceClient {
         try requireReachable()
         guard var state = works[request.work] else { throw WorkServiceProtocolError.workNotFound(request.work) }
         guard request.journal == state.journal else { throw WorkServiceProtocolError.journalMismatch }
-        guard validIdentity(request.command.commandID), request.command.commandID.count <= WorkServiceBounds.maxIdentityCharacters,
+        guard validIdentity(request.command.commandID), request.command.commandID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
               let clientID = request.command.client,
-              request.command.causalCursor == request.causalCursor else {
+              request.command.causalCursor == request.causalWorkCursor else {
             throw WorkServiceProtocolError.invalidRequest("command must carry a bounded client and command identity")
         }
         guard let clientState = state.attachments[request.attachment], clientState.attachment.client == clientID else {
@@ -1779,7 +2544,8 @@ public actor InMemoryWorkService: WorkServiceClient {
                 work: prior.receipt.work, commandID: prior.receipt.commandID,
                 state: prior.receipt.state == .rejected ? .rejected : .duplicate,
                 host: prior.receipt.host, hostSequence: prior.receipt.hostSequence,
-                causalCursor: prior.receipt.causalCursor, resultingCursor: prior.receipt.resultingCursor,
+                causalWorkCursor: prior.receipt.causalWorkCursor,
+                resultingWorkCursor: prior.receipt.resultingWorkCursor,
                 authorization: prior.receipt.authorization, outcome: prior.receipt.outcome,
                 rejection: prior.receipt.rejection, terminalProof: prior.receipt.terminalProof,
                 diagnostic: prior.receipt.state == .rejected
@@ -1809,7 +2575,7 @@ public actor InMemoryWorkService: WorkServiceClient {
             return receipt
         }
         if request.valueWasTruncated
-            || (request.value?.count ?? 0) > WorkServiceBounds.maxCommandValueCharacters {
+            || (request.value?.utf8.count ?? 0) > WorkServiceBounds.maxCommandValueCharacters {
             let authorization = clientState.attachment.authorization
             let receipt = makeReceipt(state: &state, request: request, authorization: authorization,
                                       state: .rejected, rejection: .malformedRequest,
@@ -1852,7 +2618,7 @@ public actor InMemoryWorkService: WorkServiceClient {
             works[state.work] = state
             return receipt
         }
-        let causal = request.causalCursor
+        let causal = request.causalWorkCursor
         guard causal.journal == state.journal, causal == state.cursor else {
             let receipt = makeReceipt(state: &state, request: request, authorization: authorization,
                                       state: .rejected, rejection: .staleCursor,
@@ -1931,15 +2697,16 @@ public actor InMemoryWorkService: WorkServiceClient {
             works[state.work] = state
             return receipt
         }
-        let eventCursor = appendEvent(
-            kind: request.kind.rawValue, commandID: request.command.commandID,
-            body: request.value, state: &state)
         let hostSequence = state.nextHostSequence
         state.nextHostSequence += 1
+        let eventCursor = appendEvent(
+            kind: request.kind.rawValue, commandID: request.command.commandID,
+            command: request.command, body: request.value, hostSequence: hostSequence,
+            state: &state)
         let receipt = WorkServiceCommandReceipt(
             work: state.work, commandID: request.command.commandID, state: .accepted,
             host: hostInstance, hostSequence: hostSequence,
-            causalCursor: request.causalCursor, resultingCursor: eventCursor,
+            causalWorkCursor: request.causalWorkCursor, resultingWorkCursor: eventCursor,
             authorization: authorization, outcome: outcome)
         state.commands[key] = StoredCommand(request: request, receipt: receipt)
         works[state.work] = state
@@ -1997,14 +2764,22 @@ public actor InMemoryWorkService: WorkServiceClient {
     }
 
     private func validIdentity(_ value: String) -> Bool {
-        WorkServiceText.valid(value) && value.count <= WorkServiceBounds.maxIdentityCharacters
+        WorkServiceText.valid(value) && value.utf8.count <= WorkServiceBounds.maxIdentityCharacters
+    }
+
+    private func validCursor(_ cursor: JournalCursor, journal: JournalRef) -> Bool {
+        cursor.journal == journal
+            && cursor.sequence >= 0 && cursor.sequence < Int.max
+            && (cursor.sequence == 0
+                ? cursor.eventID == nil
+                : (cursor.eventID.map(validIdentity) ?? false))
     }
 
     private func validBodyReference(_ reference: TimelineBodyReference, journal: JournalRef) -> Bool {
         reference.authority == journal
             && validIdentity(reference.referenceID)
-            && (reference.mediaType?.count ?? 0) <= WorkServiceBounds.maxDiagnosticCharacters
-            && (reference.byteCount == nil || (reference.byteCount ?? -1) >= 0)
+            && (reference.mediaType?.utf8.count ?? 0) <= WorkServiceBounds.maxDiagnosticCharacters
+            && (reference.byteCount ?? -1) >= 0
             && (reference.digest == nil || ContextBodyStore.isValidDigest(reference.digest ?? ""))
     }
 
@@ -2021,10 +2796,45 @@ public actor InMemoryWorkService: WorkServiceClient {
         return offset
     }
 
-    private func validatedAfter(_ after: JournalCursor?, state: WorkState) throws -> Int {
+    private func readTarget(
+        _ target: WorkServiceReadTarget,
+        for state: WorkState,
+        attachment: ClientAttachmentRef
+    ) throws -> (journal: JournalRef, cursor: JournalCursor, events: [TimelineEvent]) {
+        guard let attachmentState = state.attachments[attachment] else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
+        switch target {
+        case .work(let journal):
+            guard journal == state.journal else {
+                throw WorkServiceProtocolError.journalMismatch
+            }
+            return (journal, state.cursor ?? JournalCursor(journal: journal, sequence: 0), state.events)
+        case .session(let session, let journal):
+            guard attachmentState.attachment.session == session,
+                  attachmentState.attachment.sessionJournal == journal,
+                  journal.owner == .session(session) else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "Session read target is not attached to this Work/client attachment")
+            }
+            let cursor = state.session == session && state.sessionJournal == journal
+                ? (state.sessionCursor ?? JournalCursor(journal: journal, sequence: 0))
+                : JournalCursor(journal: journal, sequence: 0)
+            let events = state.session == session && state.sessionJournal == journal
+                ? state.sessionEvents : []
+            return (journal, cursor, events)
+        }
+    }
+
+    private func validatedAfter(
+        _ after: JournalCursor?,
+        journal: JournalRef,
+        cursor: JournalCursor,
+        events: [TimelineEvent]
+    ) throws -> Int {
         guard let after else { return 0 }
-        guard after.journal == state.journal, after.sequence >= 0,
-              after.sequence <= (state.cursor?.sequence ?? 0) else {
+        guard after.journal == journal, after.sequence >= 0,
+              after.sequence <= cursor.sequence else {
             throw WorkServiceProtocolError.invalidRequest("cursor is foreign or ahead")
         }
         // Sequence alone is not an event identity. The zero baseline is the only cursor that
@@ -2039,12 +2849,80 @@ public actor InMemoryWorkService: WorkServiceClient {
         guard let eventID = after.eventID, validIdentity(eventID) else {
             throw WorkServiceProtocolError.invalidRequest("non-baseline cursor must carry an event identity")
         }
-        if after == state.cursor { return after.sequence }
-        guard let event = state.events.first(where: { $0.cursor.sequence == after.sequence }),
-              event.cursor == after else {
+        if after == cursor { return after.sequence }
+        guard let event = events.first(where: { $0.sequence == after.sequence }),
+              event.journal == after.journal,
+              event.eventID == after.eventID else {
             throw WorkServiceProtocolError.invalidRequest("cursor event identity is unknown")
         }
         return after.sequence
+    }
+
+    private func boundedEventPage(
+        _ events: [TimelineEvent], after: Int, limit: Int, maxBytes: Int
+    ) throws -> (events: [TimelineEvent], bytesLimited: Bool) {
+        guard maxBytes > 0 else {
+            throw WorkServiceProtocolError.invalidRequest("event page byte limit must be positive")
+        }
+        let byteLimit = min(maxBytes, WorkServiceBounds.maxEventPageBytes)
+        var selected: [TimelineEvent] = []
+        var encodedBytes = 0
+        var bytesLimited = false
+        for event in events where event.sequence > after {
+            if selected.count >= limit { break }
+            let eventBytes = try JSONEncoder().encode(event).count
+            guard eventBytes <= byteLimit - encodedBytes else {
+                if selected.isEmpty {
+                    throw WorkServiceProtocolError.eventPageCannotProgress(
+                        requiredBytes: eventBytes, maximumBytes: byteLimit)
+                }
+                bytesLimited = true
+                break
+            }
+            selected.append(event)
+            encodedBytes += eventBytes
+        }
+        return (selected, bytesLimited)
+    }
+
+    private func readAcknowledgements(
+        for attachment: ClientAttachmentRef,
+        state: WorkState
+    ) -> [WorkServiceReadAcknowledgement] {
+        guard let clientAttachment = state.attachments[attachment]?.attachment else { return [] }
+        return state.readAcknowledgements.compactMap {
+            entry -> WorkServiceReadAcknowledgement? in
+            let (key, cursor) = entry
+            guard key.attachment == attachment else { return nil }
+            let target: WorkServiceReadTarget
+            if key.targetJournal == state.journal {
+                target = .work(journal: state.journal)
+            } else if let session = clientAttachment.session,
+                      let sessionJournal = clientAttachment.sessionJournal,
+                      key.targetJournal == sessionJournal {
+                target = .session(session: session, journal: sessionJournal)
+            } else {
+                return nil
+            }
+            return WorkServiceReadAcknowledgement(target: target, cursor: cursor)
+        }.sorted { lhs, rhs in
+            lhs.target.journal.stableKey < rhs.target.journal.stableKey
+        }
+    }
+
+    private func attachmentProjection(
+        _ attachment: WorkServiceClientAttachment,
+        state: WorkState
+    ) -> WorkServiceClientAttachment {
+        WorkServiceClientAttachment(
+            attachment: attachment.attachment,
+            client: attachment.client,
+            session: attachment.session,
+            sessionJournal: attachment.sessionJournal,
+            sessionAttachment: attachment.sessionAttachment,
+            authorization: attachment.authorization,
+            readAcknowledgements: readAcknowledgements(
+                for: attachment.attachment, state: state))
     }
 
     private func attachedState(work: WorkRef, journal: JournalRef,
@@ -2063,24 +2941,15 @@ public actor InMemoryWorkService: WorkServiceClient {
         return state
     }
 
-    private func updateClientCursor(_ attachment: ClientAttachmentRef, to cursor: JournalCursor?,
-                                    state: inout WorkState) {
-        guard let cursor, let current = state.attachments[attachment] else { return }
-        let observed = current.attachment.cursor.map { $0.sequence >= cursor.sequence ? $0 : cursor } ?? cursor
-        state.attachments[attachment] = ClientState(attachment: WorkServiceClientAttachment(
-            attachment: current.attachment.attachment, client: current.attachment.client,
-            session: current.attachment.session, sessionJournal: current.attachment.sessionJournal,
-            sessionAttachment: current.attachment.sessionAttachment,
-            authorization: current.attachment.authorization, cursor: observed))
-    }
-
     private func descriptor(for work: WorkRef, includeObservation: Bool) -> WorkServiceWorkDescriptor? {
         guard let state = works[work] else { return nil }
         let observation = includeObservation ? WorkServiceHostObservation(
             instance: hostInstance, reachability: reachable ? .observedReachable : .unavailable,
             currentRun: state.currentRun, servedCursor: state.cursor,
             sourceCompleteness: state.sourceCompleteness) : nil
-        let clients = Array(state.attachments.values.map(\.attachment)
+        let clients = Array(state.attachments.values.map {
+            attachmentProjection($0.attachment, state: state)
+        }
             .sorted { $0.attachment.attachmentID < $1.attachment.attachmentID }
             .prefix(WorkServiceBounds.maxAttachmentsPerWork))
         var omissions: [WorkServiceOmission] = state.omissions
@@ -2094,7 +2963,7 @@ public actor InMemoryWorkService: WorkServiceClient {
         return WorkServiceWorkDescriptor(
             work: state.work, journal: state.journal, recordedDisposition: state.disposition,
             execution: state.execution, currentRun: state.currentRun,
-            configuration: state.configuration,
+            configuration: state.configuration.observableDescriptorConfiguration,
             hostObservation: observation, attachments: clients, artifacts: artifacts,
             omissions: WorkServiceText.boundedOmissions(omissions))
     }
@@ -2145,7 +3014,7 @@ public actor InMemoryWorkService: WorkServiceClient {
         request: WorkServiceTerminalCommitRequest,
         state: WorkState
     ) -> Bool {
-        let expectedProvenance = proof.resultingWorkCursor.eventID.map {
+        let expectedCausalEvent = proof.causalWorkCursor.eventID.map {
             EventRef(journal: request.journal, eventID: $0)
         }
         guard proof.operation == request.operation,
@@ -2159,11 +3028,21 @@ public actor InMemoryWorkService: WorkServiceClient {
               proof.resultingWorkCursor.sequence == request.causalWorkCursor.sequence + 1,
               proof.resultingWorkCursor.sequence < Int.max,
               validIdentity(proof.resultingWorkCursor.eventID ?? ""),
-              proof.terminalEvent.cursor == proof.resultingWorkCursor,
+              proof.terminalEvent.journal == proof.resultingWorkCursor.journal,
+              proof.terminalEvent.sequence == proof.resultingWorkCursor.sequence,
               proof.terminalEvent.eventID == proof.resultingWorkCursor.eventID,
-              proof.terminalEvent.kind == request.operation.eventKind,
-              proof.terminalEvent.commandID == request.command.commandID,
-              proof.terminalEvent.provenance == expectedProvenance,
+              proof.terminalEvent.type == request.operation.eventKind,
+              proof.terminalEvent.idempotencyKey
+                  == WorkServiceTerminalCommitProof.terminalIdempotencyKey(
+                      type: proof.terminalEvent.type, command: request.command,
+                      detail: request.detail),
+              proof.terminalEvent.work == request.work,
+              proof.terminalEvent.workHost == WorkHostRef(request.work.workHostID),
+              proof.terminalEvent.session == request.session,
+              proof.terminalEvent.client == request.client,
+              proof.terminalEvent.sessionAttachment == request.sessionAttachment,
+              proof.terminalEvent.command == request.command,
+              proof.terminalEvent.causedByEventID == expectedCausalEvent,
               proof.session == request.session,
               proof.sessionJournal == request.sessionJournal,
               proof.sessionJournal.owner == .session(request.session),
@@ -2212,9 +3091,9 @@ public actor InMemoryWorkService: WorkServiceClient {
               reservation.key == key else {
             return WorkServiceCommandReceipt(
                 work: work, commandID: key.commandID, state: .rejected,
-                host: hostInstance, hostSequence: 0,
-                causalCursor: JournalCursor(journal: .work(work), sequence: 0),
-                resultingCursor: nil, authorization: authorization,
+                host: hostInstance,
+                causalWorkCursor: JournalCursor(journal: .work(work), sequence: 0),
+                resultingWorkCursor: nil, authorization: authorization,
                 rejection: .terminalProofUnavailable,
                 diagnostic: "terminal reservation disappeared before reconciliation")
         }
@@ -2243,9 +3122,9 @@ public actor InMemoryWorkService: WorkServiceClient {
             }
             return reservation.unavailableReceipt ?? WorkServiceCommandReceipt(
                 work: work, commandID: key.commandID, state: .rejected,
-                host: hostInstance, hostSequence: 0,
-                causalCursor: reservation.request.causalCursor,
-                resultingCursor: state.cursor, authorization: authorization,
+                host: hostInstance,
+                causalWorkCursor: reservation.request.causalWorkCursor,
+                resultingWorkCursor: state.cursor, authorization: authorization,
                 rejection: .terminalProofUnavailable,
                 diagnostic: "terminal reservation could not be reconciled")
         }
@@ -2267,8 +3146,8 @@ public actor InMemoryWorkService: WorkServiceClient {
                 work: latest.work,
                 commandID: latestReservation.request.command.commandID,
                 state: .accepted, host: hostInstance, hostSequence: hostSequence,
-                causalCursor: latestReservation.request.causalCursor,
-                resultingCursor: proof.resultingWorkCursor,
+                causalWorkCursor: latestReservation.request.causalWorkCursor,
+                resultingWorkCursor: proof.resultingWorkCursor,
                 authorization: authorization, outcome: outcome, terminalProof: proof)
             latest.commands[key] = StoredCommand(
                 request: latestReservation.request, receipt: receipt)
@@ -2295,13 +3174,15 @@ public actor InMemoryWorkService: WorkServiceClient {
             work: receipt.work, commandID: receipt.commandID,
             state: receipt.state == .rejected ? .rejected : .duplicate,
             host: receipt.host, hostSequence: receipt.hostSequence,
-            causalCursor: receipt.causalCursor, resultingCursor: receipt.resultingCursor,
+            causalWorkCursor: receipt.causalWorkCursor,
+            resultingWorkCursor: receipt.resultingWorkCursor,
             authorization: receipt.authorization, outcome: receipt.outcome,
             rejection: receipt.rejection, terminalProof: receipt.terminalProof,
             diagnostic: receipt.state == .rejected ? receipt.diagnostic : "idempotent duplicate")
     }
 
-    private func appendEvent(kind: String, commandID: String?, body: String? = nil,
+    private func appendEvent(kind: String, commandID: String?, command: CommandRef? = nil,
+                             body: String? = nil, hostSequence: Int? = nil,
                              state: inout WorkState) -> JournalCursor {
         let sequence = state.nextEventSequence
         state.nextEventSequence += 1
@@ -2320,12 +3201,58 @@ public actor InMemoryWorkService: WorkServiceClient {
             bodyReference = nil
         }
         state.cursor = cursor
-        state.events.append(WorkServiceEventDescriptor(
-            eventID: eventID, kind: WorkServiceText.bound(kind) ?? "unknown",
-            cursor: cursor, commandID: commandID, run: state.currentRun,
-            provenance: EventRef(journal: state.journal, eventID: eventID),
-            bodyReference: bodyReference,
-            bodyStatus: bodyReference == nil ? .manifest : .retainedBody))
+        let payload: JSONValue
+        if let bodyReference,
+           let encoded = try? JSONEncoder().encode(bodyReference),
+           let referenceValue = JSONValue.parse(encoded) {
+            // Keep sensitive/large command text in the retained body store only. The canonical
+            // event envelope carries the authority-bearing reference so a reader can fetch the
+            // exact bytes without retaining a second raw copy in the timeline page.
+            payload = .object(["body_reference": referenceValue])
+        } else {
+            // Never copy the body into the event as a serialization fallback.  The body store
+            // remains the only place where command text is retained; an unexpected reference
+            // encoding failure is represented by a bounded marker instead of leaking raw text.
+            payload = body == nil
+                ? .object([:])
+                : .object(["body_reference_unavailable": .bool(true)])
+        }
+        state.events.append(TimelineEvent(
+            eventID: eventID, journal: state.journal, sequence: sequence,
+            hostSequence: hostSequence, idempotencyKey: commandID, command: command,
+            previousEventID: state.events.last?.eventID,
+            session: state.session, work: state.work, workHost: host,
+            client: command?.client, sessionAttachment: command?.sessionAttachment,
+            run: state.currentRun,
+            actor: TimelineActor(actorID: hostInstance.instanceID, kind: "work-service"),
+            hostRecordedAt: Date(), type: WorkServiceText.bound(kind) ?? "unknown",
+            payload: payload))
+        return cursor
+    }
+
+    private func appendSessionEvent(kind: String, commandID: String?, command: CommandRef? = nil,
+                                    body: String? = nil, state: inout WorkState) -> JournalCursor? {
+        guard let session = state.session, let journal = state.sessionJournal else { return nil }
+        let sequence = state.nextSessionEventSequence
+        state.nextSessionEventSequence += 1
+        let eventID = "service-session-event-" + String(sequence)
+        let cursor = JournalCursor(journal: journal, eventID: eventID, sequence: sequence)
+        state.sessionCursor = cursor
+        let payload: JSONValue
+        if let body, !body.isEmpty {
+            payload = .object(["value": .string(body)])
+        } else {
+            payload = .object([:])
+        }
+        state.sessionEvents.append(TimelineEvent(
+            eventID: eventID, journal: journal, sequence: sequence,
+            idempotencyKey: commandID, command: command,
+            previousEventID: state.sessionEvents.last?.eventID, session: session,
+            work: state.work, workHost: host, client: command?.client,
+            sessionAttachment: state.sessionAttachment ?? command?.sessionAttachment,
+            actor: TimelineActor(actorID: hostInstance.instanceID, kind: "work-service"),
+            hostRecordedAt: Date(), type: WorkServiceText.bound(kind) ?? "unknown",
+            payload: payload))
         return cursor
     }
 
@@ -2334,13 +3261,52 @@ public actor InMemoryWorkService: WorkServiceClient {
                              state receiptState: WorkServiceCommandReceiptState,
                              rejection: WorkServiceCommandRejection,
                              diagnostic: String) -> WorkServiceCommandReceipt {
-        let hostSequence = state.nextHostSequence
-        state.nextHostSequence += 1
         return WorkServiceCommandReceipt(
             work: state.work, commandID: request.command.commandID, state: receiptState,
-            host: hostInstance, hostSequence: hostSequence,
-            causalCursor: request.causalCursor, resultingCursor: state.cursor,
+            host: hostInstance,
+            causalWorkCursor: request.causalWorkCursor, resultingWorkCursor: state.cursor,
             authorization: authorization, rejection: rejection, diagnostic: diagnostic)
+    }
+
+    private func appendControlEvent() -> JournalCursor {
+        let next = controlCursor.sequence == Int.max ? Int.max : controlCursor.sequence + 1
+        let eventID = "control-event-\(next)"
+        controlCursor = JournalCursor(
+            journal: controlJournal, eventID: eventID, sequence: next)
+        return controlCursor
+    }
+
+    private func controlReceipt(
+        operation: WorkServiceControlOperation,
+        work: WorkRef,
+        commandID: String,
+        state: WorkServiceCommandReceiptState,
+        causalControlCursor: JournalCursor,
+        resultingControlCursor: JournalCursor,
+        authorization: WorkServiceAuthorizationOutcome,
+        outcome: WorkServiceControlOutcome? = nil,
+        rejection: WorkServiceCommandRejection? = nil,
+        diagnostic: String? = nil
+    ) -> WorkServiceControlReceipt {
+        WorkServiceControlReceipt(
+            operation: operation, work: work, commandID: commandID, state: state,
+            host: hostInstance, causalControlCursor: causalControlCursor,
+            resultingControlCursor: resultingControlCursor, authorization: authorization,
+            outcome: outcome, rejection: rejection, diagnostic: diagnostic)
+    }
+
+    private func duplicateControl(
+        of receipt: WorkServiceControlReceipt
+    ) -> WorkServiceControlReceipt {
+        WorkServiceControlReceipt(
+            operation: receipt.operation, work: receipt.work, commandID: receipt.commandID,
+            state: receipt.state == .rejected ? .rejected : .duplicate,
+            host: receipt.host, causalControlCursor: receipt.causalControlCursor,
+            resultingControlCursor: receipt.resultingControlCursor,
+            authorization: receipt.authorization, outcome: receipt.outcome,
+            rejection: receipt.rejection,
+            diagnostic: receipt.state == .rejected
+                ? receipt.diagnostic : "idempotent duplicate")
     }
 
     private static func precedes(_ lhs: WorkRef, _ rhs: WorkRef) -> Bool {
@@ -2421,13 +3387,13 @@ private enum WorkServiceText {
 
     static func bound(_ value: String?) -> String? {
         guard let value else { return nil }
-        guard value.count > WorkServiceBounds.maxDiagnosticCharacters else { return value }
-        return String(value.prefix(WorkServiceBounds.maxDiagnosticCharacters))
+        guard value.utf8.count > WorkServiceBounds.maxDiagnosticCharacters else { return value }
+        return String(decoding: value.utf8.prefix(WorkServiceBounds.maxDiagnosticCharacters), as: UTF8.self)
     }
 
     static func boundCommand(_ value: String?) -> BoundedCommandValue {
         guard let value else { return BoundedCommandValue(value: nil, wasTruncated: false) }
-        guard value.count > WorkServiceBounds.maxCommandValueCharacters else {
+        guard value.utf8.count > WorkServiceBounds.maxCommandValueCharacters else {
             return BoundedCommandValue(value: value, wasTruncated: false)
         }
         // Do not mutate command/configuration bodies merely to make them fit a diagnostic bound.

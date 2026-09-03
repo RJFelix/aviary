@@ -57,6 +57,52 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
             home: home, identity: identity, actorID: actorID, actorKind: actorKind,
             modelID: modelID)
         do {
+            let resumeSeed: NativeColdResumeResult?
+            if resumingLegacySession {
+                resumeSeed = try captureResumeSeed(
+                    home: home, identity: identity, bundle: bundle)
+            } else {
+                resumeSeed = nil
+            }
+            if let resumeSeed {
+                _ = try await bundle.recordRecoveryCoverage(resumeSeed.coverage)
+            }
+            return try NativeSessionCommandJournal(
+                identity: identity, nativeJournal: bundle,
+                legacyProjection: legacyProjection, resumeSeed: resumeSeed)
+        } catch {
+            _ = try? await bundle.finishRun(
+                outcome: .failed,
+                detail: "native cold-resume validation or command journal installation failed")
+            try? await bundle.closeChecked()
+            throw error
+        }
+    }
+
+    /// Open an execution generation against a service-created idle Work binding. Unlike the
+    /// identity-based launch path, this method never creates the Session/Work journals or mints
+    /// their attachment; those facts must already be durable before a Hosted actor is returned.
+    public static func openForRun(
+        home: AgentHome,
+        binding: WorkRunBinding,
+        legacyProjection: SessionWriter,
+        actorID: String,
+        actorKind: String = "work-host",
+        modelID: String? = nil,
+        resumingLegacySession: Bool
+    ) async throws -> NativeSessionCommandJournal {
+        let identity = SessionWorkIdentity(
+            sessionID: binding.workBinding.session.sessionID,
+            work: binding.workBinding.work,
+            runID: binding.run.runID)
+        guard legacyProjection.identity == identity else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "the legacy Session projection does not match the Work Run binding")
+        }
+        let bundle = try await RunJournalBundle.openForExecution(
+            home: home, binding: binding, actorID: actorID, actorKind: actorKind,
+            modelID: modelID)
+        do {
             let resumeSeed = try resumingLegacySession
                 ? captureResumeSeed(home: home, identity: identity, bundle: bundle)
                 : nil

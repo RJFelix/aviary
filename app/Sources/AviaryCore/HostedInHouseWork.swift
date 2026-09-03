@@ -3,7 +3,7 @@ import Foundation
 private enum HostedInHouseWorkLimits {
     /// Timeline identities are caller supplied. Keep malformed remote/client input from turning
     /// command keys, diagnostics, or subscription state into an unbounded allocation.
-    static let maxIdentifierCharacters = 256
+    static let maxIdentifierBytes = 256
     static let maxSubscriptions = 64
 }
 
@@ -238,11 +238,11 @@ public struct HostedInHouseWorkCommand: Codable, Hashable, Sendable {
         ]
         guard identifiers.allSatisfy({
             let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !trimmed.isEmpty && trimmed.count <= HostedInHouseWorkLimits.maxIdentifierCharacters
+            return !trimmed.isEmpty && $0.utf8.count <= HostedInHouseWorkLimits.maxIdentifierBytes
         }) else {
             throw HostedInHouseWorkError.invalidCommand(
                 "command identity fields must be nonempty and at most "
-                    + "\(HostedInHouseWorkLimits.maxIdentifierCharacters) characters")
+                    + "\(HostedInHouseWorkLimits.maxIdentifierBytes) UTF-8 bytes")
         }
         guard work == identity.work,
               session == SessionRef(identity.sessionID),
@@ -337,7 +337,9 @@ public struct HostedInHouseWorkConfiguration: Sendable {
     public let model: ModelSpec
     public let provider: any ChatProvider
     public let runtimeHost: RuntimeHost
-    public let identity: SessionWorkIdentity
+    /// The service-created Work binding and the new execution generation. Start is only legal
+    /// against this existing pair; opening a Hosted actor never allocates Work or Session IDs.
+    public let workRunBinding: WorkRunBinding
     public let serviceActorID: String
     public let actorKind: String
     public let systemPrompt: String
@@ -367,7 +369,7 @@ public struct HostedInHouseWorkConfiguration: Sendable {
         model: ModelSpec,
         provider: any ChatProvider,
         runtimeHost: RuntimeHost,
-        identity: SessionWorkIdentity,
+        workRunBinding: WorkRunBinding,
         serviceActorID: String,
         actorKind: String = "work-host",
         systemPrompt: String,
@@ -390,7 +392,7 @@ public struct HostedInHouseWorkConfiguration: Sendable {
         self.model = model
         self.provider = provider
         self.runtimeHost = runtimeHost
-        self.identity = identity
+        self.workRunBinding = workRunBinding
         self.serviceActorID = serviceActorID
         self.actorKind = actorKind
         self.systemPrompt = systemPrompt
@@ -474,7 +476,7 @@ public struct HostedInHouseWorkSnapshot: Codable, Hashable, Sendable {
 /// its only presentation crossing is a bounded event stream, while canonical state remains in
 /// the paired native journals. Retaining this actor after every GUI unsubscribes is safe; neither
 /// a stream cancellation nor a RuntimeHost transport disconnect calls End or closes the Work.
-public actor HostedInHouseWork {
+public actor HostedInHouseWork: WorkServiceTerminalCommitter {
     public nonisolated let identity: SessionWorkIdentity
     public nonisolated let sessionAttachment: SessionAttachmentRef
 
@@ -505,6 +507,17 @@ public actor HostedInHouseWork {
     private var endRequested = false
     private var activeAgentCommandID: String?
     private var activeSendTask: Task<Void, Never>?
+    /// Work completion/destruction is a separate transaction after this per-Run actor has ended
+    /// and released its original writer locks. Attempting is not durable: a failed attempt rolls
+    /// back unless canonical read-only reconciliation proves the exact transaction committed.
+    private enum TerminalMutationState {
+        case idle
+        case attempting(WorkServiceTerminalCommitRequest)
+        case committed(WorkServiceTerminalCommitRequest, WorkServiceTerminalCommitProof)
+    }
+    private var terminalMutationState: TerminalMutationState = .idle
+    private var terminalMutationGateHeld = false
+    private var terminalMutationGateWaiters: [CheckedContinuation<Void, Never>] = []
     private var subscriptions: [String: AsyncStream<HostedInHouseWorkEvent>.Continuation] = [:]
     private var subscriptionClients: [String: ClientRef] = [:]
 
@@ -514,7 +527,10 @@ public actor HostedInHouseWork {
         controller: SessionCommandController
     ) {
         self.configuration = configuration
-        self.identity = configuration.identity
+        self.identity = SessionWorkIdentity(
+            sessionID: configuration.workRunBinding.workBinding.session.sessionID,
+            work: configuration.workRunBinding.workBinding.work,
+            runID: configuration.workRunBinding.run.runID)
         self.sessionAttachment = bridge.nativeJournal.sessionAttachment
         self.bridge = bridge
         self.controller = controller
@@ -528,7 +544,11 @@ public actor HostedInHouseWork {
     public static func open(
         configuration: HostedInHouseWorkConfiguration
     ) async throws -> HostedInHouseWork {
-        let identity = configuration.identity
+        let binding = configuration.workRunBinding
+        let identity = SessionWorkIdentity(
+            sessionID: binding.workBinding.session.sessionID,
+            work: binding.workBinding.work,
+            runID: binding.run.runID)
         let home = configuration.home
         let configurationIdentifiers = [
             identity.sessionID,
@@ -539,11 +559,22 @@ public actor HostedInHouseWork {
         ]
         guard configurationIdentifiers.allSatisfy({
             let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !trimmed.isEmpty && trimmed.count <= HostedInHouseWorkLimits.maxIdentifierCharacters
+            return !trimmed.isEmpty && $0.utf8.count <= HostedInHouseWorkLimits.maxIdentifierBytes
         }) else {
             throw HostedInHouseWorkError.invalidConfiguration(
                 "Work, Session, Run, and service actor identities must be nonempty and at most "
-                    + "\(HostedInHouseWorkLimits.maxIdentifierCharacters) characters")
+                    + "\(HostedInHouseWorkLimits.maxIdentifierBytes) UTF-8 bytes")
+        }
+        let persistedHost = try home.requirePersistedWorkHost()
+        guard binding.workBinding.workHost == persistedHost,
+              binding.workBinding.work.workHostID == persistedHost.workHostID else {
+            throw HostedInHouseWorkError.invalidConfiguration(
+                "execution Work binding does not belong to this AgentHome's persisted authority")
+        }
+        guard binding.workBinding.sessionJournal.authority ==
+                TimelineAuthorityRef(persistedHost.workHostID) else {
+            throw HostedInHouseWorkError.invalidConfiguration(
+                "execution Session authority must be the persisted Work Host authority")
         }
         let sessionURL = home.timelineV2SessionJournalURL(SessionRef(identity.sessionID))
         let workURL = home.timelineV2WorkJournalURL(identity.work)
@@ -552,19 +583,19 @@ public actor HostedInHouseWork {
         let sessionProjectionExists = FileManager.default.fileExists(
             atPath: home.sessionFile(id: identity.sessionID).path)
 
-        guard sessionExists == workExists else {
+        guard sessionExists && workExists else {
             throw HostedInHouseWorkError.invalidConfiguration(
-                "native Session/Work journals must exist together")
+                "Hosted Work requires a separately created canonical idle Session/Work pair")
         }
         if configuration.resume {
-            guard sessionExists else {
+            guard sessionProjectionExists else {
                 throw HostedInHouseWorkError.invalidConfiguration(
-                    "resume requires an existing native Session/Work pair")
+                    "resume requires an existing Session projection")
             }
         } else {
-            guard !sessionExists && !workExists && !sessionProjectionExists else {
+            guard !sessionProjectionExists else {
                 throw HostedInHouseWorkError.invalidConfiguration(
-                    "fresh hosted Work identity already has durable state")
+                    "a fresh Hosted run cannot replace an existing Session projection")
             }
         }
 
@@ -580,29 +611,36 @@ public actor HostedInHouseWork {
                     identity: identity)
             }
         } catch {
+            // A fresh projection is disposable and did not exist at admission. If its header
+            // write fails, do not leave a misleading half-created flat session behind; the
+            // canonical idle pair remains the source of truth for a later retry.
+            if !configuration.resume && !sessionProjectionExists {
+                try? FileManager.default.removeItem(at: home.sessionFile(id: identity.sessionID))
+            }
             throw HostedInHouseWorkError.invalidConfiguration(
                 "could not open Session projection: \(Self.bounded(error.localizedDescription))")
         }
 
         do {
-            guard let bridge = try await NativeSessionCommandJournal.openForLaunch(
+            let bridge = try await NativeSessionCommandJournal.openForRun(
                 home: home,
-                identity: identity,
+                binding: binding,
                 legacyProjection: writer,
                 actorID: configuration.serviceActorID,
                 actorKind: configuration.actorKind,
                 modelID: configuration.model.qualifiedID,
                 resumingLegacySession: configuration.resume)
-            else {
-                throw HostedInHouseWorkError.invalidConfiguration(
-                    "hosted Work requires native Session/Work authority")
-            }
             let controller = SessionCommandController(
                 identity: identity, capabilities: Agent.inHouseCommandCapabilities, journal: bridge)
             return HostedInHouseWork(
                 configuration: configuration, bridge: bridge, controller: controller)
         } catch {
             await writer.close()
+            // Native admission is canonical. A failed open must not strand the new disposable
+            // projection as if a Hosted run had actually been adopted.
+            if !configuration.resume && !sessionProjectionExists {
+                try? FileManager.default.removeItem(at: home.sessionFile(id: identity.sessionID))
+            }
             throw error
         }
     }
@@ -615,7 +653,7 @@ public actor HostedInHouseWork {
             bufferingPolicy: .bufferingNewest(256))
         let trimmedClientID = client.clientID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedClientID.isEmpty,
-              client.clientID.count <= HostedInHouseWorkLimits.maxIdentifierCharacters else {
+              client.clientID.utf8.count <= HostedInHouseWorkLimits.maxIdentifierBytes else {
             continuation.finish()
             return HostedInHouseWorkSubscription(
                 id: id,
@@ -623,7 +661,7 @@ public actor HostedInHouseWork {
                 events: events,
                 accepted: false,
                 rejectionReason: "client identity must be nonempty and at most "
-                    + "\(HostedInHouseWorkLimits.maxIdentifierCharacters) characters")
+                    + "\(HostedInHouseWorkLimits.maxIdentifierBytes) UTF-8 bytes")
         }
         guard subscriptions.count < HostedInHouseWorkLimits.maxSubscriptions else {
             continuation.finish()
@@ -809,6 +847,116 @@ public actor HostedInHouseWork {
 
     public var observerCount: Int { subscriptions.count }
 
+    // MARK: Work terminalization
+
+    /// Commit an explicit Work completion or destruction after End has quiesced the run. End
+    /// closes the per-Run writers so this actor never monopolizes the Work merely because a GUI
+    /// remains attached; this method reacquires both canonical journals for one bounded terminal
+    /// transaction and closes them again before returning.
+    public func commit(
+        _ request: WorkServiceTerminalCommitRequest
+    ) async throws -> WorkServiceTerminalCommitProof {
+        await acquireTerminalMutationGate()
+        defer { releaseTerminalMutationGate() }
+        try validateTerminalMutationState()
+        try validateTerminalMutationIdentity(request)
+        switch terminalMutationState {
+        case .committed(let previous, let proof):
+            guard previous == request else { throw terminalMutationConflict() }
+            return proof
+        case .attempting(let previous):
+            guard previous == request else { throw terminalMutationConflict() }
+            if let proof = try readTerminalProof(for: request) {
+                terminalMutationState = .committed(request, proof)
+                return proof
+            }
+            terminalMutationState = .idle
+        case .idle:
+            break
+        }
+
+        terminalMutationState = .attempting(request)
+        do {
+            let proof = try await withTerminalMutationBundle { committer in
+                try await committer.commit(request)
+            }
+            terminalMutationState = .committed(request, proof)
+            return proof
+        } catch {
+            // A writer close can fail after both terminal events are durable. Resolve that
+            // ambiguity through the canonical read-only path before deciding this attempt failed.
+            if let proof = try? readTerminalProof(for: request) {
+                terminalMutationState = .committed(request, proof)
+                return proof
+            }
+            terminalMutationState = .idle
+            throw error
+        }
+    }
+
+    /// Reconcile a possibly committed terminal request from canonical storage. This deliberately
+    /// works after the short-lived terminal writer has closed; a lost service response cannot
+    /// force another terminal append or turn a durable success into an unknown result.
+    public func committedProof(
+        for request: WorkServiceTerminalCommitRequest
+    ) async throws -> WorkServiceTerminalCommitProof? {
+        await acquireTerminalMutationGate()
+        defer { releaseTerminalMutationGate() }
+        try validateTerminalMutationIdentity(request)
+        switch terminalMutationState {
+        case .committed(let previous, let proof):
+            guard previous == request else { throw terminalMutationConflict() }
+            return proof
+        case .attempting(let previous):
+            guard previous == request else { throw terminalMutationConflict() }
+        case .idle:
+            break
+        }
+        guard let proof = try readTerminalProof(for: request) else { return nil }
+        terminalMutationState = .committed(request, proof)
+        return proof
+    }
+
+    private func readTerminalProof(
+        for request: WorkServiceTerminalCommitRequest
+    ) throws -> WorkServiceTerminalCommitProof? {
+        guard let record = try RunJournalBundle.readTerminalCommit(
+            home: configuration.home,
+            identity: identity,
+            sessionAttachment: sessionAttachment,
+            command: request.command,
+            detail: request.detail,
+            actorID: configuration.serviceActorID + ":terminal-reader") else { return nil }
+        return try WorkServiceTerminalCommitProof.makeProof(record: record, request: request)
+    }
+
+    /// Verify a terminal proof against the exact canonical bytes owned by this Hosted Work. A
+    /// proof is transport data and may be forged or stale even when its DTO fields look coherent;
+    /// registry release therefore calls this read-only seam before converting the live slot to
+    /// historical state.
+    public func verifyCanonicalTerminalProof(
+        _ proof: WorkServiceTerminalCommitProof
+    ) async -> Bool {
+        guard proof.work == identity.work,
+              proof.session == SessionRef(identity.sessionID),
+              proof.sessionAttachment == sessionAttachment,
+              let client = proof.command.client else { return false }
+        let detail = proof.terminalEvent.payload["detail"]?.stringValue
+        let request = WorkServiceTerminalCommitRequest(
+            operation: proof.operation,
+            work: proof.work,
+            journal: proof.journal,
+            client: client,
+            session: proof.session,
+            sessionJournal: proof.sessionJournal,
+            sessionAttachment: proof.sessionAttachment,
+            causalWorkCursor: proof.causalWorkCursor,
+            detail: detail,
+            command: proof.command)
+        guard let canonical = try? await committedProof(for: request) else { return false }
+        return canonical == proof
+    }
+
     // MARK: Command execution
 
     private func admitAndDispatch(
@@ -947,10 +1095,10 @@ public actor HostedInHouseWork {
                     recordPayloads: configuration.recordPayloads,
                     goal: configuration.goal,
                     hookPaths: configuration.hookPaths,
-                    resume: configuration.resume ? configuration.identity.sessionID : nil,
+                    resume: configuration.resume ? identity.sessionID : nil,
                     peerDelegate: nil,
                     selfDelegate: nil,
-                    identity: configuration.identity,
+                    identity: identity,
                     reasoningEffort: configuration.reasoningEffort,
                     writer: bridge.legacyProjection,
                     nativeJournal: bridge.nativeJournal,
@@ -1109,13 +1257,11 @@ public actor HostedInHouseWork {
         if let runner { await runner.stopMCPServers() }
 
         await runtimeHost.closeCallbackAdmission()
-        let callbackDrainFailed: Bool
         do {
             try await runtimeHost.waitUntilCallbacksQuiescent()
-            callbackDrainFailed = false
         } catch {
-            callbackDrainFailed = true
-            lastFailure = "Runtime callback drain failed: \(Self.bounded(error.localizedDescription))"
+            appendFailure(
+                "Runtime callback drain failed: " + Self.bounded(error.localizedDescription))
         }
         await runtimeHost.stop()
         runtimeTransportConnected = false
@@ -1138,22 +1284,39 @@ public actor HostedInHouseWork {
             source: "command.delivered", commandID: command.commandID, client: command.client)
 
         let outcome: RunTerminalOutcome = lastFailure == nil ? .completed : .failed
+        var canonicalRunFinished = false
         do {
             let commits = try await bridge.nativeJournal.finishRun(
                 outcome: outcome, detail: lastFailure)
+            canonicalRunFinished = true
             await emitDurable(
                 source: "run.finished", commits: commits,
                 commandID: command.commandID, client: command.client)
-            try await bridge.nativeJournal.closeChecked()
-            try await bridge.legacyProjection.closeChecked()
             _ = await controller.acknowledgeEnd(commandID: controllerCommandID(for: command))
-            transition(to: .ended, reason: "Explicit End completed")
+            // `run.finished` is the canonical End fact. Disposable projection teardown below may
+            // report a failure, but it cannot rewrite an already durable native outcome.
+            transition(to: .ended, reason: "Canonical run.finished committed")
         } catch {
             lastFailure = Self.bounded(error.localizedDescription)
             transition(to: .failed, reason: lastFailure)
         }
-        if callbackDrainFailed, lastFailure == nil {
-            lastFailure = "Runtime callback drain reported an error"
+
+        // Close canonical and presentation writers independently. A native close failure remains
+        // visible in journal health/lastFailure, while a projection close failure never demotes a
+        // canonical End or prevents read-only terminal proof reconciliation.
+        if canonicalRunFinished {
+            do {
+                try await bridge.nativeJournal.closeChecked()
+            } catch {
+                appendFailure(
+                    "native journal close failed: " + Self.bounded(error.localizedDescription))
+            }
+            do {
+                try await bridge.legacyProjection.closeChecked()
+            } catch {
+                appendFailure(
+                    "Session projection close failed: " + Self.bounded(error.localizedDescription))
+            }
         }
         if lifecycle == .ended {
             finishSubscriptions()
@@ -1482,9 +1645,19 @@ public actor HostedInHouseWork {
         }
     }
 
+    private func appendFailure(_ detail: String) {
+        let bounded = Self.bounded(detail)
+        if let lastFailure, !lastFailure.isEmpty {
+            self.lastFailure = Self.bounded(lastFailure + "; " + bounded)
+        } else {
+            lastFailure = bounded
+        }
+    }
+
     private var runtimeShutdownIsAbsorbing: Bool {
         // Once End is durably accepted, runtime teardown is irreversible even if a later journal
-        // close/finalization step fails and the presentation lifecycle becomes `.failed`.
+        // close/finalization step fails; canonical lifecycle remains ended and the failure is
+        // exposed separately through journal health/lastFailure.
         endRequested || lifecycle == .ending || lifecycle == .ended
     }
 
@@ -1538,6 +1711,95 @@ public actor HostedInHouseWork {
         }
     }
 
+    private func validateTerminalMutationState() throws {
+        guard endRequested,
+              lifecycle == .ended,
+              runtimeState == .stopped,
+              !runtimeTransportConnected,
+              !ownedRuntimeProcessKnownAlive,
+              agent == nil,
+              runner == nil,
+              !preparationInProgress else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "Work completion or destruction requires an explicitly ended, quiescent Run")
+        }
+    }
+
+    private func validateTerminalMutationIdentity(
+        _ request: WorkServiceTerminalCommitRequest
+    ) throws {
+        let session = SessionRef(identity.sessionID)
+        let authority = TimelineAuthorityRef(identity.workHostID)
+        guard request.work == identity.work,
+              request.journal == JournalRef.work(identity.work),
+              request.session == session,
+              request.sessionJournal == JournalRef.session(session, authority: authority),
+              request.sessionAttachment == sessionAttachment,
+              request.command.client == request.client,
+              request.command.sessionAttachment == sessionAttachment,
+              request.command.causalCursor == request.causalWorkCursor else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "terminal request does not name this ended Session/Work execution")
+        }
+    }
+
+    private func terminalMutationConflict() -> WorkServiceProtocolError {
+        .invalidRequest("Work terminal command conflicts with the committed terminal request")
+    }
+
+    private func withTerminalMutationBundle<T>(
+        _ body: (RunJournalBundleWorkServiceTerminalCommitter) async throws -> T
+    ) async throws -> T {
+        let terminalBundle = try await RunJournalBundle.openForTerminalMutation(
+            home: configuration.home,
+            identity: identity,
+            sessionAttachment: sessionAttachment,
+            actorID: configuration.serviceActorID)
+        let committer = RunJournalBundleWorkServiceTerminalCommitter(
+            bundle: terminalBundle,
+            destroyResourcesAreQuiesced: { [weak self] in
+                guard let self else { return false }
+                return await self.terminalResourcesAreQuiesced()
+            })
+        do {
+            let result = try await body(committer)
+            try await terminalBundle.closeChecked()
+            return result
+        } catch {
+            try? await terminalBundle.closeChecked()
+            throw error
+        }
+    }
+
+    private func terminalResourcesAreQuiesced() -> Bool {
+        endRequested
+            && lifecycle == .ended
+            && runtimeState == .stopped
+            && !runtimeTransportConnected
+            && !ownedRuntimeProcessKnownAlive
+            && agent == nil
+            && runner == nil
+            && !preparationInProgress
+    }
+
+    private func acquireTerminalMutationGate() async {
+        if !terminalMutationGateHeld {
+            terminalMutationGateHeld = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            terminalMutationGateWaiters.append(continuation)
+        }
+    }
+
+    private func releaseTerminalMutationGate() {
+        if terminalMutationGateWaiters.isEmpty {
+            terminalMutationGateHeld = false
+            return
+        }
+        terminalMutationGateWaiters.removeFirst().resume()
+    }
+
     private func receipt(for command: HostedInHouseWorkCommand) async -> HostedInHouseWorkReceipt {
         let commandReceipt = await controller.receipt(for: controllerCommandID(for: command))
             ?? SessionCommandReceipt(
@@ -1581,15 +1843,27 @@ public actor HostedInHouseWork {
     }
 
     private static func adoptionCaveat(_ descriptor: RuntimeHost.AdoptionDescriptor) -> String {
-        let endpoint = String(descriptor.endpoint.path.prefix(240))
-        let host = String(descriptor.identity.hostID.prefix(120))
-        let instance = String(descriptor.identity.instanceID.prefix(120))
+        let host = boundedUTF8(descriptor.identity.hostID, limit: 120)
+        let instance = boundedUTF8(descriptor.identity.instanceID, limit: 120)
         return "runtime_adoption_descriptor=v1;protocol=\(descriptor.protocolVersion);"
-            + "endpoint=\(endpoint);host_id=\(host);instance_id=\(instance);"
+            + "endpoint_present=true;host_id=\(host);instance_id=\(instance);"
             + "liveness_proof=false"
     }
 
     private static func bounded(_ detail: String, limit: Int = 1_000) -> String {
-        String(detail.prefix(limit)).trimmingCharacters(in: .whitespacesAndNewlines)
+        boundedUTF8(detail, limit: limit).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func boundedUTF8(_ value: String, limit: Int) -> String {
+        guard value.utf8.count > limit else { return value }
+        var result = String()
+        var used = 0
+        for scalar in value.unicodeScalars {
+            let bytes = String(scalar).utf8.count
+            guard used + bytes <= limit else { break }
+            result.unicodeScalars.append(scalar)
+            used += bytes
+        }
+        return result
     }
 }

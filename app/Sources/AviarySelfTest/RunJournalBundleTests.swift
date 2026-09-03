@@ -72,6 +72,92 @@ private func terminalCommand(
         sessionAttachment: bundle.sessionAttachment, causalCursor: cursor)
 }
 
+private let terminalDetailRoundTripMatrix: [String?] = [
+    nil,
+    "",
+    " \t",
+    String(repeating: "é", count: 2_000), // exactly 4,000 UTF-8 bytes
+]
+
+/// Exercise the response-loss path with the values most likely to disagree between a live
+/// request and a cold proof reconstruction. In particular, empty and whitespace details are
+/// nonnil values and must remain present in both the event payload and idempotency key.
+private func assertTerminalDetailRoundTrip(
+    operation: WorkServiceTerminalOperation, detail: String?, index: Int
+) async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let hostID = try home.requirePersistedWorkHostID()
+    let work = WorkRef(
+        workHostID: hostID,
+        workID: "terminal-detail-\(operation.rawValue)-work-\(index)")
+    let identity = SessionWorkIdentity(
+        sessionID: "terminal-detail-\(operation.rawValue)-session-\(index)",
+        work: work,
+        runID: "terminal-detail-\(operation.rawValue)-run-\(index)")
+    let execution = try await RunJournalBundle.openForExecution(
+        home: home, identity: identity, actorID: "terminal-detail-execution-\(index)",
+        makeAttachmentID: { "terminal-detail-attachment-\(index)" })
+    _ = try await execution.finishRun(outcome: .completed)
+    let attachment = execution.sessionAttachment
+    let latestExecutionCursor = await execution.latestWorkCursor
+    let causal = try XCTUnwrap(latestExecutionCursor)
+    try await execution.closeChecked()
+
+    let terminal = try await RunJournalBundle.openForTerminalMutation(
+        home: home, identity: identity, sessionAttachment: attachment,
+        actorID: "terminal-detail-committer-\(index)")
+    let client = ClientRef("terminal-detail-client-\(index)")
+    let command = CommandRef(
+        commandID: "terminal-detail-\(operation.rawValue)-command-\(index)",
+        client: client, sessionAttachment: attachment, causalCursor: causal)
+    let commits: [TimelineJournalCommit]
+    switch operation {
+    case .complete:
+        commits = try await terminal.completeWork(detail: detail, command: command)
+    case .destroy:
+        commits = try await terminal.destroyWork(
+            resourcesQuiesced: true, reason: detail, command: command)
+    }
+    XCTAssertEqual(commits.count, 2)
+    let request = WorkServiceTerminalCommitRequest(
+        operation: operation,
+        work: terminal.work,
+        journal: terminal.workJournal,
+        client: client,
+        session: terminal.session,
+        sessionJournal: terminal.sessionJournal,
+        sessionAttachment: attachment,
+        causalWorkCursor: causal,
+        detail: detail,
+        command: command)
+    try await terminal.closeChecked()
+
+    // A response can be lost after both appends are durable. The adapter must recover the exact
+    // pair from closed canonical files without appending another terminal event.
+    let recoveredByAdapter = try await RunJournalBundleWorkServiceTerminalCommitter(
+        bundle: terminal).commit(request)
+    let recoveredByStaticRead = try XCTUnwrap(
+        try RunJournalBundle.readTerminalCommit(
+            home: home, identity: identity, sessionAttachment: attachment,
+            command: command, detail: detail))
+    XCTAssertEqual(recoveredByAdapter.terminalEvent, recoveredByStaticRead.workEvent)
+    XCTAssertEqual(
+        recoveredByAdapter.resultingWorkCursor, recoveredByStaticRead.workCommit.cursor)
+    XCTAssertEqual(
+        recoveredByAdapter.pairedSessionCursor,
+        recoveredByStaticRead.pairedSessionCommit?.cursor)
+    XCTAssertEqual(recoveredByAdapter.resultingWorkCursor, commits[0].cursor)
+    XCTAssertEqual(recoveredByAdapter.pairedSessionCursor, commits[1].cursor)
+    XCTAssertEqual(recoveredByAdapter.terminalEvent.payload["detail"]?.stringValue, detail)
+
+    let workEvents = try bundleEvents(
+        home, terminal.workJournal, home.timelineV2WorkJournalURL(identity.work))
+    let terminalType = operation == .complete
+        ? TimelineEventType.workCompleted : TimelineEventType.workDestroyed
+    XCTAssertEqual(workEvents.filter { $0.type == terminalType }.count, 1)
+}
+
 func test_runJournalBundleFreshGenesisAndExactAssembly() async throws {
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
@@ -987,6 +1073,11 @@ func test_runJournalBundleCompleteWorkIsSeparateFromFinishedRunAndClosesMutation
             return
         }
     }
+
+    for (index, detail) in terminalDetailRoundTripMatrix.enumerated() {
+        try await assertTerminalDetailRoundTrip(
+            operation: .complete, detail: detail, index: index)
+    }
 }
 
 func test_runJournalBundleTerminalCommitterRecoversExactRetryWithoutSecondEvent() async throws {
@@ -1007,8 +1098,10 @@ func test_runJournalBundleTerminalCommitterRecoversExactRetryWithoutSecondEvent(
     let committed = try await firstAdapter.commit(request)
     XCTAssertEqual(committed.command, command)
     XCTAssertEqual(committed.causalWorkCursor, cursor)
-    XCTAssertEqual(committed.terminalEvent.kind, TimelineEventType.workCompleted)
-    XCTAssertEqual(committed.terminalEvent.cursor, committed.resultingWorkCursor)
+    XCTAssertEqual(committed.terminalEvent.type, TimelineEventType.workCompleted)
+    XCTAssertEqual(committed.terminalEvent.journal, committed.resultingWorkCursor.journal)
+    XCTAssertEqual(committed.terminalEvent.eventID, committed.resultingWorkCursor.eventID)
+    XCTAssertEqual(committed.terminalEvent.sequence, committed.resultingWorkCursor.sequence)
     XCTAssertEqual(committed.session, bundle.session)
     XCTAssertEqual(committed.sessionJournal, bundle.sessionJournal)
     XCTAssertTrue(committed.sessionPairingVerified)
@@ -1039,6 +1132,176 @@ func test_runJournalBundleTerminalCommitterRecoversExactRetryWithoutSecondEvent(
         1)
 }
 
+func test_runJournalBundleTerminalMutationReopensWithoutStartingAnotherRun() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let hostID = try home.requirePersistedWorkHostID()
+    let identity = SessionWorkIdentity(
+        sessionID: "terminal-reopen-session",
+        work: WorkRef(workHostID: hostID, workID: "terminal-reopen-work"),
+        runID: "terminal-reopen-run")
+    let execution = try await RunJournalBundle.openForExecution(
+        home: home, identity: identity, actorID: "terminal-reopen-execution",
+        makeAttachmentID: { "terminal-reopen-attachment" })
+    _ = try await execution.finishRun(outcome: .completed)
+    let finishedCursor = await execution.latestWorkCursor
+    let causal = try XCTUnwrap(finishedCursor)
+    let attachment = execution.sessionAttachment
+    let workJournal = execution.workJournal
+    let sessionJournal = execution.sessionJournal
+    try await execution.closeChecked()
+
+    let terminal = try await RunJournalBundle.openForTerminalMutation(
+        home: home, identity: identity, sessionAttachment: attachment,
+        actorID: "terminal-reopen-committer")
+    XCTAssertEqual(await terminal.latestWorkCursor, causal)
+    XCTAssertEqual(await terminal.lifecycle, .active)
+    let command = CommandRef(
+        commandID: "terminal-reopen-complete", client: ClientRef("terminal-reopen-client"),
+        sessionAttachment: attachment, causalCursor: causal)
+    let commits = try await terminal.completeWork(detail: "complete after End", command: command)
+    XCTAssertEqual(commits.count, 2)
+    try await terminal.closeChecked()
+
+    // A service restart/lost response reads the already-terminal pair without acquiring writer
+    // ownership or appending a replacement Run.
+    let proof = try XCTUnwrap(
+        try RunJournalBundle.readTerminalCommit(
+            home: home, identity: identity, sessionAttachment: attachment,
+            command: command, detail: "complete after End"))
+    XCTAssertEqual(proof.workCommit, commits[0])
+    XCTAssertEqual(proof.pairedSessionCommit, commits[1])
+
+    do {
+        _ = try await RunJournalBundle.openForTerminalMutation(
+            home: home, identity: identity, sessionAttachment: attachment,
+            actorID: "terminal-reopen-writer-proof")
+        XCTFail("terminal proof lookup must not reopen a writer on terminal Work")
+    } catch let error as RunJournalBundleError {
+        guard case .workTerminal(.completed) = error else {
+            XCTFail("wrong terminal writer proof error: \(error)")
+            return
+        }
+    }
+
+    let workEvents = try bundleEvents(
+        home, workJournal, home.timelineV2WorkJournalURL(identity.work))
+    XCTAssertEqual(workEvents.filter { $0.type == TimelineEventType.runStarted }.count, 1)
+    XCTAssertEqual(workEvents.filter { $0.type == TimelineEventType.runFinished }.count, 1)
+    XCTAssertEqual(workEvents.filter { $0.type == TimelineEventType.workCompleted }.count, 1)
+    let sessionEvents = try bundleEvents(
+        home, sessionJournal, home.timelineV2SessionJournalURL(SessionRef(identity.sessionID)))
+    XCTAssertEqual(
+        sessionEvents.filter {
+            $0.type == TimelineEventType.sessionAttachmentCursorAdvanced
+                && $0.command == command
+        }.count,
+        1)
+}
+
+func test_runJournalBundleCreatesIdleWorkBeforeAnyRunStarts() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let host = try home.requirePersistedWorkHost()
+    let session = SessionRef("idle-create-session")
+    let work = WorkRef(workHostID: host.workHostID, workID: "idle-create-work")
+    let attachment = SessionAttachmentRef("idle-create-attachment")
+    let binding = WorkBinding(
+        session: session,
+        work: work,
+        workHost: host,
+        sessionAttachment: attachment)
+
+    let created = try await RunJournalBundle.createIdleWork(
+        home: home,
+        binding: binding,
+        actorID: "idle-create-control")
+    XCTAssertEqual(created.binding, binding)
+    XCTAssertEqual(created.commits.count, 4)
+    XCTAssertEqual(created.sessionCursor.sequence, 2)
+    XCTAssertEqual(created.workCursor.sequence, 2)
+
+    let workEvents = try bundleEvents(
+        home, binding.workJournal, home.timelineV2WorkJournalURL(work))
+    XCTAssertEqual(workEvents.map(\.type), [
+        TimelineEventType.workCreated,
+        TimelineEventType.sessionAttached,
+    ])
+    XCTAssertFalse(workEvents.contains { $0.type == TimelineEventType.runStarted })
+    let reducedWork = WorkReducer.reduce(workEvents)
+    XCTAssertTrue(reducedWork.structuralIntegrityValid)
+    XCTAssertTrue(reducedWork.semanticProjectionValid)
+    XCTAssertNil(reducedWork.activeRun)
+    XCTAssertEqual(reducedWork.lifecycle, .active)
+
+    let sessionEvents = try bundleEvents(
+        home, binding.sessionJournal, home.timelineV2SessionJournalURL(session))
+    XCTAssertEqual(sessionEvents.map(\.type), [
+        TimelineEventType.sessionCreated,
+        TimelineEventType.sessionAttached,
+    ])
+    let reducedSession = SessionReducer.reduce(sessionEvents)
+    XCTAssertTrue(reducedSession.structuralIntegrityValid)
+    XCTAssertTrue(reducedSession.semanticProjectionValid)
+
+    // Start is a distinct later ownership transition with its own host-minted Run identity.
+    let executionBinding = WorkRunBinding(
+        workBinding: binding,
+        run: RunRef("idle-create-run"))
+    let execution = try await RunJournalBundle.openForExecution(
+        home: home,
+        binding: executionBinding,
+        actorID: "idle-create-execution")
+    let executionAttachment = execution.sessionAttachment
+    XCTAssertEqual(executionAttachment, attachment)
+    let afterStart = try bundleEvents(
+        home, binding.workJournal, home.timelineV2WorkJournalURL(work))
+    XCTAssertEqual(afterStart.filter { $0.type == TimelineEventType.runStarted }.count, 1)
+    XCTAssertEqual(afterStart.last?.run, RunRef("idle-create-run"))
+    _ = try await execution.finishRun(outcome: .canceled)
+    try await execution.closeChecked()
+}
+
+func test_runJournalBundleTerminalMutationRejectsStaleRunGeneration() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let hostID = try home.requirePersistedWorkHostID()
+    let work = WorkRef(workHostID: hostID, workID: "terminal-generation-work")
+    let firstIdentity = SessionWorkIdentity(
+        sessionID: "terminal-generation-session", work: work, runID: "terminal-run-1")
+    let first = try await RunJournalBundle.openForExecution(
+        home: home, identity: firstIdentity, actorID: "terminal-generation-first",
+        makeAttachmentID: { "terminal-generation-attachment" })
+    _ = try await first.finishRun(outcome: .completed)
+    let attachment = first.sessionAttachment
+    try await first.closeChecked()
+
+    let latestIdentity = SessionWorkIdentity(
+        sessionID: firstIdentity.sessionID, work: work, runID: "terminal-run-2")
+    let latest = try await RunJournalBundle.openForExecution(
+        home: home, identity: latestIdentity, actorID: "terminal-generation-latest")
+    _ = try await latest.finishRun(outcome: .completed)
+    try await latest.closeChecked()
+
+    do {
+        _ = try await RunJournalBundle.openForTerminalMutation(
+            home: home, identity: firstIdentity, sessionAttachment: attachment,
+            actorID: "terminal-generation-stale")
+        XCTFail("an earlier Run generation must not terminalize Work after a later Run")
+    } catch let error as RunJournalBundleError {
+        guard case .invalidOperation(let reason) = error,
+              reason.contains("latest canonical Run") else {
+            XCTFail("wrong stale terminal generation error: \(error)")
+            return
+        }
+    }
+
+    let terminal = try await RunJournalBundle.openForTerminalMutation(
+        home: home, identity: latestIdentity, sessionAttachment: attachment,
+        actorID: "terminal-generation-current")
+    try await terminal.closeChecked()
+}
+
 func test_runJournalBundleDestroyWorkRequiresQuiescedResourcesAndWritesOneTombstone() async throws {
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
@@ -1053,6 +1316,22 @@ func test_runJournalBundleDestroyWorkRequiresQuiescedResourcesAndWritesOneTombst
     } catch let error as RunJournalBundleError {
         guard case .invalidOperation = error else {
             XCTFail("wrong oversized destruction detail error: \(error)")
+            return
+        }
+    }
+    XCTAssertEqual((await bundleStatus(bundle)).durablePrefix, beforeOversizedDetail)
+
+    // The limit is on the encoded durable body, not Swift Character count. Two thousand and
+    // one two-byte scalars fit the character-shaped bound but exceed 4,000 UTF-8 bytes.
+    do {
+        _ = try await bundle.destroyWork(
+            resourcesQuiesced: true,
+            reason: String(repeating: "é", count: 2_001),
+            command: try await terminalCommand(bundle, id: "destroy-multibyte-oversized"))
+        XCTFail("multibyte destruction detail must be rejected by UTF-8 byte size")
+    } catch let error as RunJournalBundleError {
+        guard case .invalidOperation = error else {
+            XCTFail("wrong multibyte destruction detail error: \(error)")
             return
         }
     }
@@ -1101,6 +1380,11 @@ func test_runJournalBundleDestroyWorkRequiresQuiescedResourcesAndWritesOneTombst
         }
     }
     try await bundle.closeChecked()
+
+    for (index, detail) in terminalDetailRoundTripMatrix.enumerated() {
+        try await assertTerminalDetailRoundTrip(
+            operation: .destroy, detail: detail, index: index)
+    }
 }
 
 func test_workTerminalReducerRejectsCompletionAndDestructionWithLiveCanonicalHandle() {

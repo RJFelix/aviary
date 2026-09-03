@@ -589,6 +589,9 @@ func test_timelineJournalWriterDeterministicSeamsAndAgentHomeAuthority() async t
     let authority = try home.requirePersistedWorkHostID()
     XCTAssertEqual(authority, home.persistedWorkHostID)
     XCTAssertEqual(try home.requirePersistedWorkHost().workHostID, authority)
+    // Creation publishes a complete record before the directory sync receipt is returned.
+    XCTAssertEqual(
+        try String(contentsOf: home.workHostIDFile, encoding: .utf8), authority + "\n")
     let nativeWorkURL = try home.timelineV2WorkJournalURL(workID: "native-work")
     XCTAssertTrue(nativeWorkURL.path.contains("/work-hosts/\(authority)/"))
 
@@ -664,5 +667,38 @@ func test_timelineJournalWriterDeterministicSeamsAndAgentHomeAuthority() async t
         XCTAssertEqual(
             try String(contentsOf: malformedHome.workHostIDFile, encoding: .utf8),
             "malformed\nidentity")
+    }
+
+    // Persisted authority is deliberately stricter than a trimmed display string. Reject path,
+    // control, Unicode, and oversized values rather than allowing an external file to become the
+    // Work Host authority for this home.
+    let validUUID = "abcdefab-cdef-4abc-8def-abcdefabcdef"
+    let malformedIdentities = [
+        "not-host-\(validUUID)",
+        "host-\(validUUID.uppercased())",
+        " host-\(validUUID)",
+        "host-\(validUUID) ",
+        "host-\(validUUID)\nsecond",
+        String(repeating: "é", count: 100), // 200 UTF-8 bytes before framing
+    ]
+    for identity in malformedIdentities {
+        try Data((identity + "\n").utf8).write(to: malformedHome.workHostIDFile)
+        do {
+            _ = try malformedHome.requirePersistedWorkHostID()
+            XCTFail("malformed persisted authority must fail closed: \(identity.debugDescription)")
+        } catch let error as AgentHomeError {
+            XCTAssertEqual(error, .invalidPersistedWorkHostID)
+        }
+    }
+
+    // The reader has a bounded admission read: a hostile multi-megabyte authority record is
+    // rejected without loading its complete contents into a String.
+    let multiMegabyteAuthority = Data(repeating: 0x78, count: 4 * 1024 * 1024)
+    try multiMegabyteAuthority.write(to: malformedHome.workHostIDFile)
+    do {
+        _ = try malformedHome.requirePersistedWorkHostID()
+        XCTFail("oversized persisted authority must fail closed")
+    } catch let error as AgentHomeError {
+        XCTAssertEqual(error, .invalidPersistedWorkHostID)
     }
 }

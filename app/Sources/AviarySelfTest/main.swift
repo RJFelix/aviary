@@ -6833,6 +6833,33 @@ let casesWorkService: [Case] = [
     }),
 ]
 
+let casesWorkHostRegistry: [Case] = [
+    ("phase3 Work Host registry: full identity and stable instance ownership", {
+        try await test_workHostRegistryOwnsFullWorkRefsAndStableInstanceIdentity()
+    }),
+    ("phase3 Work Host registry: duplicate and divergent identities are rejected", {
+        try await test_workHostRegistryRejectsDuplicateAndDivergentIdentity()
+    }),
+    ("phase3 Work Host registry: canonical history does not claim liveness", {
+        try await test_workHostRegistrySeparatesCanonicalFactsFromLiveLiveness()
+    }),
+    ("phase3 Work Host registry: GUI disconnect does not release Work", {
+        try await test_workHostRegistryIgnoresClientDisconnects()
+    }),
+    ("phase3 Work Host registry: terminal proof and release race are bounded", {
+        try await test_workHostRegistryRequiresCanonicalProofAndSerializesReleaseRace()
+    }),
+    ("phase3 Work Host registry: metadata identity capacity and paging are bounded", {
+        try await test_workHostRegistryBoundsMetadataIdentityCapacityAndPaging()
+    }),
+    ("phase3 Work Host registry: concurrent duplicate registration is serialized", {
+        try await test_workHostRegistrySerializesConcurrentDuplicateRegistration()
+    }),
+    ("phase3 Work Host registry: actor ownership ends after terminal release", {
+        try await test_workHostRegistryStrongOwnershipEndsAtExplicitRelease()
+    }),
+]
+
 let casesTimelineWriter: [Case] = [
     ("phase1 writer: fresh appendBatch bytes, reducer, and reopen", {
         try await test_timelineJournalWriterFreshBatchReopenAndReducer()
@@ -6924,6 +6951,15 @@ let casesRunJournalBundle: [Case] = [
     ("phase1 bundle: terminal adapter recovers exact retry without duplicate events", {
         try await test_runJournalBundleTerminalCommitterRecoversExactRetryWithoutSecondEvent()
     }),
+    ("phase1 bundle: terminal mutation reopens without starting another Run", {
+        try await test_runJournalBundleTerminalMutationReopensWithoutStartingAnotherRun()
+    }),
+    ("phase1 bundle: idle Work creation precedes Run Start", {
+        try await test_runJournalBundleCreatesIdleWorkBeforeAnyRunStarts()
+    }),
+    ("phase1 bundle: terminal mutation rejects stale Run generation", {
+        try await test_runJournalBundleTerminalMutationRejectsStaleRunGeneration()
+    }),
     ("phase1 bundle: Work destruction requires quiesced resources", {
         try await test_runJournalBundleDestroyWorkRequiresQuiescedResourcesAndWritesOneTombstone()
     }),
@@ -6943,7 +6979,8 @@ await Harness.run(
         + casesContextManifest + casesPromptProvenance + casesNativeColdResume
         + casesCanonicalSessionSearch
         + casesLocalTimelineCatalog + casesCanonicalWorkRecoveryProjection
-        + casesWorkService + casesWorkHostControlJournal
+        + casesWorkService + casesWorkHostControlJournal + casesWorkHostControlCreation
+        + casesWorkHostRegistry
         + casesHostedInHouseWork + casesWorkServiceTransport
         + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal

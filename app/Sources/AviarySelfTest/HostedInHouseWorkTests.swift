@@ -132,19 +132,36 @@ private final class HostedEventCollector: @unchecked Sendable {
     }
 }
 
+private func hostedWorkRunBinding(
+    home: AgentHome,
+    identity: SessionWorkIdentity
+) async throws -> WorkRunBinding {
+    let host = try home.requirePersistedWorkHost()
+    let binding = WorkBinding(
+        session: SessionRef(identity.sessionID),
+        work: identity.work,
+        workHost: host,
+        sessionAttachment: SessionAttachmentRef(
+            "hosted-attachment-\(identity.work.workID)"))
+    _ = try await RunJournalBundle.createIdleWork(
+        home: home, binding: binding, actorID: "hosted-control-\(identity.work.workID)")
+    return WorkRunBinding(workBinding: binding, run: RunRef(identity.runID))
+}
+
 private func hostedConfiguration(
     home: AgentHome,
     identity: SessionWorkIdentity,
     host: RuntimeHost,
     startAdmissionGate: (@Sendable () async -> Void)? = nil
-) -> HostedInHouseWorkConfiguration {
-    HostedInHouseWorkConfiguration(
+) async throws -> HostedInHouseWorkConfiguration {
+    let workRunBinding = try await hostedWorkRunBinding(home: home, identity: identity)
+    return HostedInHouseWorkConfiguration(
         home: home,
         cwd: "/tmp",
         model: fakeModel(),
         provider: HostedImmediateProvider(),
         runtimeHost: host,
-        identity: identity,
+        workRunBinding: workRunBinding,
         serviceActorID: "hosted-work-service",
         systemPrompt: "You are a test agent.",
         maxIterations: 2,
@@ -191,7 +208,7 @@ func test_hostedInHouseWorkOwnsRunBeyondObserverDetach() async throws {
         work: WorkRef(workHostID: hostID, workID: "hosted-detach-work"),
         runID: "hosted-detach-run")
     let work = try await HostedInHouseWork.open(
-        configuration: hostedConfiguration(home: home, identity: identity, host: host))
+        configuration: try await hostedConfiguration(home: home, identity: identity, host: host))
     let prepared = await work.snapshot()
     XCTAssertEqual(prepared.lifecycle, .prepared)
     XCTAssertEqual(prepared.runtimeState, .notStarted)
@@ -237,6 +254,15 @@ func test_hostedInHouseWorkOwnsRunBeyondObserverDetach() async throws {
         live.recoveryCoverage.planes[.memoriesArtifactsRepository], .referenced)
     XCTAssertEqual(
         live.recoveryCoverage.planes[.externalEffects], .unknown)
+    let runtimeEndpoint = try XCTUnwrap(live.adoptionDescriptor?.endpoint.path)
+    let canonicalWorkBytes = try Data(
+        contentsOf: home.timelineV2WorkJournalURL(identity.work))
+    let canonicalSessionBytes = try Data(
+        contentsOf: home.timelineV2SessionJournalURL(SessionRef(identity.sessionID)))
+    let canonicalTimelineText = String(
+        decoding: canonicalWorkBytes + canonicalSessionBytes, as: UTF8.self)
+    XCTAssertFalse(canonicalTimelineText.contains(runtimeEndpoint))
+    XCTAssertTrue(canonicalTimelineText.contains("endpoint_present=true"))
 
     await work.unsubscribe(subscription.id)
     await eventTask.value
@@ -320,6 +346,87 @@ func test_hostedInHouseWorkOwnsRunBeyondObserverDetach() async throws {
     XCTAssertFalse(afterLateRuntimeCalls.ownedRuntimeProcessKnownAlive)
 }
 
+func test_hostedInHouseWorkRejectsMultibyteIdentityOverByteBound() async throws {
+    guard let host = try makeHost(.reference) else { return }
+    let home = scratchHome()
+    let hostID = try home.requirePersistedWorkHostID()
+    let identity = SessionWorkIdentity(
+        sessionID: "hosted-bounded-session",
+        work: WorkRef(
+            workHostID: hostID,
+            workID: String(repeating: "🦆", count: 100)),
+        runID: "hosted-bounded-run")
+    let invalidBinding = WorkBinding(
+        session: SessionRef(identity.sessionID),
+        work: identity.work,
+        workHost: try home.requirePersistedWorkHost(),
+        sessionAttachment: SessionAttachmentRef("hosted-bounded-attachment"))
+    let invalidConfiguration = HostedInHouseWorkConfiguration(
+        home: home,
+        cwd: "/tmp",
+        model: fakeModel(),
+        provider: HostedImmediateProvider(),
+        runtimeHost: host,
+        workRunBinding: WorkRunBinding(
+            workBinding: invalidBinding, run: RunRef(identity.runID)),
+        serviceActorID: "hosted-work-service",
+        systemPrompt: "You are a test agent.",
+        maxIterations: 1)
+    do {
+        _ = try await HostedInHouseWork.open(configuration: invalidConfiguration)
+        XCTFail("multibyte identity beyond the byte bound must be rejected")
+    } catch let error as HostedInHouseWorkError {
+        guard case .invalidConfiguration(let detail) = error,
+              detail.contains("UTF-8 bytes") else {
+            XCTFail("wrong multibyte identity error: \(error)")
+            return
+        }
+    }
+
+    // A native writer collision can happen after the disposable projection has been created.
+    // Failed Hosted admission must remove that fresh projection rather than leave a transcript
+    // that falsely suggests this Run was adopted.
+    let cleanupIdentity = SessionWorkIdentity(
+        sessionID: "hosted-open-cleanup-session",
+        work: WorkRef(workHostID: hostID, workID: "hosted-open-cleanup-work"),
+        runID: "hosted-open-cleanup-run")
+    let cleanupHost = try home.requirePersistedWorkHost()
+    let cleanupBinding = WorkBinding(
+        session: SessionRef(cleanupIdentity.sessionID),
+        work: cleanupIdentity.work,
+        workHost: cleanupHost,
+        sessionAttachment: SessionAttachmentRef("hosted-open-cleanup-attachment"))
+    _ = try await RunJournalBundle.createIdleWork(
+        home: home, binding: cleanupBinding, actorID: "hosted-open-cleanup-control")
+    let blockingRun = try await RunJournalBundle.openForExecution(
+        home: home,
+        binding: WorkRunBinding(
+            workBinding: cleanupBinding, run: RunRef(cleanupIdentity.runID)),
+        actorID: "hosted-open-cleanup-blocker")
+    let projectionURL = home.sessionFile(id: cleanupIdentity.sessionID)
+    let cleanupConfiguration = HostedInHouseWorkConfiguration(
+        home: home,
+        cwd: "/tmp",
+        model: fakeModel(),
+        provider: HostedImmediateProvider(),
+        runtimeHost: try XCTUnwrap(makeHost(.reference)),
+        workRunBinding: WorkRunBinding(
+            workBinding: cleanupBinding, run: RunRef(cleanupIdentity.runID)),
+        serviceActorID: "hosted-open-cleanup-service",
+        systemPrompt: "You are a test agent.",
+        maxIterations: 1)
+    do {
+        _ = try await HostedInHouseWork.open(configuration: cleanupConfiguration)
+        XCTFail("a canonical writer collision must reject Hosted admission")
+    } catch {
+        // The exact writer-collision shape belongs to the native seam; this test is about the
+        // projection cleanup guarantee on every failed native admission.
+    }
+    XCTAssertFalse(FileManager.default.fileExists(atPath: projectionURL.path))
+    _ = try await blockingRun.finishRun(outcome: .canceled)
+    try await blockingRun.closeChecked()
+}
+
 func test_hostedInHouseWorkRejectsStaleCommandWithoutRunningIt() async throws {
     guard let host = try makeHost(.reference) else { return }
     let home = scratchHome()
@@ -329,7 +436,7 @@ func test_hostedInHouseWorkRejectsStaleCommandWithoutRunningIt() async throws {
         work: WorkRef(workHostID: hostID, workID: "hosted-stale-work"),
         runID: "hosted-stale-run")
     let work = try await HostedInHouseWork.open(
-        configuration: hostedConfiguration(home: home, identity: identity, host: host))
+        configuration: try await hostedConfiguration(home: home, identity: identity, host: host))
     let before = await work.snapshot()
     let oldCursor = before.latestWorkCursor!
 
@@ -390,7 +497,7 @@ func test_hostedInHouseWorkQualifiesCommandIdentityPerClient() async throws {
         work: WorkRef(workHostID: hostID, workID: "hosted-client-identity-work"),
         runID: "hosted-client-identity-run")
     let work = try await HostedInHouseWork.open(
-        configuration: hostedConfiguration(home: home, identity: identity, host: host))
+        configuration: try await hostedConfiguration(home: home, identity: identity, host: host))
     let initial = await work.snapshot()
 
     let started = try await work.submit(hostedCommand(
@@ -446,7 +553,7 @@ func test_hostedInHouseWorkStartReservationPreventsEndRuntimeLaunch() async thro
         work: WorkRef(workHostID: hostID, workID: "hosted-start-reservation-work"),
         runID: "hosted-start-reservation-run")
     let admissionGate = HostedAdmissionGate()
-    let work = try await HostedInHouseWork.open(configuration: hostedConfiguration(
+    let work = try await HostedInHouseWork.open(configuration: try await hostedConfiguration(
         home: home,
         identity: identity,
         host: host,
@@ -498,13 +605,14 @@ func test_hostedInHouseWorkEndAbsorbsLateTurnResult() async throws {
         work: WorkRef(workHostID: hostID, workID: "hosted-terminal-race-work"),
         runID: "hosted-terminal-race-run")
     let gate = HostedProviderGate()
+    let workRunBinding = try await hostedWorkRunBinding(home: home, identity: identity)
     let configuration = HostedInHouseWorkConfiguration(
         home: home,
         cwd: "/tmp",
         model: fakeModel(),
         provider: HostedBlockingProvider(gate: gate),
         runtimeHost: host,
-        identity: identity,
+        workRunBinding: workRunBinding,
         serviceActorID: "hosted-work-service",
         systemPrompt: "You are a test agent.",
         maxIterations: 2)
@@ -552,6 +660,103 @@ func test_hostedInHouseWorkEndAbsorbsLateTurnResult() async throws {
     XCTAssertFalse(final.agentAvailable)
 }
 
+func test_hostedInHouseWorkTerminalizesAfterEndAndReconcilesExactRetry() async throws {
+    guard let host = try makeHost(.reference) else { return }
+    let home = scratchHome()
+    let hostID = try home.requirePersistedWorkHostID()
+    let identity = SessionWorkIdentity(
+        sessionID: "hosted-terminalization-session",
+        work: WorkRef(workHostID: hostID, workID: "hosted-terminalization-work"),
+        runID: "hosted-terminalization-run")
+    let work = try await HostedInHouseWork.open(
+        configuration: try await hostedConfiguration(home: home, identity: identity, host: host))
+    let initial = await work.snapshot()
+    _ = try await work.submit(hostedCommand(
+        initial, commandID: "hosted-terminalization-start", command: .start(prompt: "")))
+    _ = await hostedWaitForLifecycle(work, .idle)
+
+    let beforeEnd = await work.snapshot()
+    let ended = try await work.submit(hostedCommand(
+        beforeEnd, commandID: "hosted-terminalization-end", command: .endRun))
+    XCTAssertEqual(ended.lifecycle, .ended)
+    let endedSnapshot = await work.snapshot()
+    XCTAssertEqual(endedSnapshot.journalHealth, .closed)
+    XCTAssertEqual(endedSnapshot.runtimeState, .stopped)
+    let causal = try XCTUnwrap(endedSnapshot.latestWorkCursor)
+    let session = SessionRef(identity.sessionID)
+    let sessionJournal = JournalRef.session(
+        session, authority: TimelineAuthorityRef(identity.workHostID))
+    let client = ClientRef("hosted-terminalization-client")
+    let command = CommandRef(
+        commandID: "hosted-terminalization-complete", client: client,
+        sessionAttachment: endedSnapshot.sessionAttachment, causalCursor: causal)
+    let request = WorkServiceTerminalCommitRequest(
+        operation: .complete,
+        work: identity.work,
+        journal: JournalRef.work(identity.work),
+        client: client,
+        session: session,
+        sessionJournal: sessionJournal,
+        sessionAttachment: endedSnapshot.sessionAttachment,
+        causalWorkCursor: causal,
+        detail: "reviewed and complete",
+        command: command)
+
+    // A transient writer collision is a failed attempt, not a permanent reservation. Once the
+    // legitimate owner releases the canonical pair, the exact same request can still commit.
+    let blockingWriter = try await RunJournalBundle.openForTerminalMutation(
+        home: home,
+        identity: identity,
+        sessionAttachment: endedSnapshot.sessionAttachment,
+        actorID: "hosted-terminalization-blocker")
+    do {
+        _ = try await work.commit(request)
+        XCTFail("terminalization must not bypass an existing canonical writer")
+    } catch let error as RunJournalBundleError {
+        guard case .duplicateActiveWriter = error else {
+            XCTFail("wrong terminal writer collision error: \(error)")
+            return
+        }
+    }
+    try await blockingWriter.closeChecked()
+
+    async let first = work.commit(request)
+    async let duplicate = work.commit(request)
+    let (firstProof, duplicateProof) = try await (first, duplicate)
+    XCTAssertEqual(firstProof, duplicateProof)
+    XCTAssertEqual(firstProof.operation, .complete)
+    XCTAssertTrue(firstProof.sessionPairingVerified)
+    let reconciled = try await work.committedProof(for: request)
+    XCTAssertEqual(reconciled, firstProof)
+
+    let catalog = LocalTimelineCatalog.scan(home: home)
+    let row = try XCTUnwrap(catalog.works.first { $0.work == identity.work })
+    XCTAssertTrue(row.isAvailable)
+    XCTAssertEqual(row.lifecycle, .completed)
+    XCTAssertNil(row.activeRun)
+
+    let conflicting = WorkServiceTerminalCommitRequest(
+        operation: .complete,
+        work: identity.work,
+        journal: JournalRef.work(identity.work),
+        client: client,
+        session: session,
+        sessionJournal: sessionJournal,
+        sessionAttachment: endedSnapshot.sessionAttachment,
+        causalWorkCursor: causal,
+        detail: "different retry envelope",
+        command: command)
+    do {
+        _ = try await work.commit(conflicting)
+        XCTFail("changed terminal retry must conflict")
+    } catch let error as WorkServiceProtocolError {
+        guard case .invalidRequest = error else {
+            XCTFail("wrong changed terminal retry error: \(error)")
+            return
+        }
+    }
+}
+
 let casesHostedInHouseWork: [Case] = [
     (
         "hostedInHouseWorkOwnsRunBeyondObserverDetach",
@@ -563,9 +768,15 @@ let casesHostedInHouseWork: [Case] = [
         "hostedInHouseWorkQualifiesCommandIdentityPerClient",
         { try await test_hostedInHouseWorkQualifiesCommandIdentityPerClient() }),
     (
+        "hostedInHouseWorkRejectsMultibyteIdentityOverByteBound",
+        { try await test_hostedInHouseWorkRejectsMultibyteIdentityOverByteBound() }),
+    (
         "hostedInHouseWorkStartReservationPreventsEndRuntimeLaunch",
         { try await test_hostedInHouseWorkStartReservationPreventsEndRuntimeLaunch() }),
     (
         "hostedInHouseWorkEndAbsorbsLateTurnResult",
         { try await test_hostedInHouseWorkEndAbsorbsLateTurnResult() }),
+    (
+        "hostedInHouseWorkTerminalizesAfterEndAndReconcilesExactRetry",
+        { try await test_hostedInHouseWorkTerminalizesAfterEndAndReconcilesExactRetry() }),
 ]

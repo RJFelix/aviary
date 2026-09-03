@@ -1,6 +1,6 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0/1 foundations, Phase 3A adoptable kernels, and the Phase 3B service-owned Work/control substrate are implemented; production service composition and GUI cutover remain
+Status: implementation in progress; Phase 0/1 foundations, Phase 3A adoptable kernels, and the Phase 3B service protocol/ownership checkpoint are implemented; journal-backed service composition, an out-of-process Work Host, and GUI cutover remain
 Date: 2026-08-31
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
@@ -87,6 +87,26 @@ continuous owner lock before inspecting or truncating that suffix, including the
 window. This still is substrate: the next slice must compose the registry, journal-backed service,
 execution factory, and `aviaryd`, then route the GUI through them before GUI loss actually leaves
 production Work running.
+
+The Phase 3B service protocol/ownership checkpoint (2026-09-03) closes the remaining substrate
+contracts needed for that composition. Create is a two-stage, host-minted transaction: the control
+journal reserves collision-checked Work, Session, attachment, and command identity; real paired
+journals are then created and registered only after their exact canonical prefix verifies. Cold
+verification rereads those files and distinguishes the registered creation pair from valid later
+many-to-many Session/Work attachments; reducer corruption, unknown semantics, foreign authority,
+or an unsealed prefix fail closed. Verified creation state remains actor-owned rather than escaping
+as a stale reusable receipt. A Work Host registry now separates live ownership, durable history,
+recovery-required state, and unavailable evidence; releasing or replacing ownership requires exact
+canonical terminal proof. `HostedInHouseWork` can start from the pre-created idle Work/Session/Run
+binding without silently minting another identity, and its runtime remains owned by the actor rather
+than by an observer. The transport now carries complete canonical Timeline events, proves contiguous
+page chains and bounded body progress, rejects undeclared retained-body sizes, fences every response
+to the negotiated host instance (including empty responses), and rechecks the backing service
+instance on every request. Agent Home persists and synchronizes one strict host-instance identity.
+`InMemoryWorkService` remains a conformance harness, not the production composition. The next slice
+must bind these pieces to real journals and execution factories inside `aviaryd`, then prove that a
+second client can attach after the first GUI process exits before changing the user-facing survival
+claim.
 
 A canonical catalog adapter now projects authority-qualified Session identities and attached Work
 at independently verified requested/observed cursors. Only attached, exactly aligned Work with
@@ -255,6 +275,15 @@ reduced them in 6.817 seconds on the checkpoint machine. Final Sol review found 
 P1 issue after the continuous-lock recovery interval, empty-journal seal recovery, pre-suspension
 Start reservation, absorbing terminal state, exact target-journal acknowledgement, UTF-8 bounds,
 connection fencing, and bounded shutdown paths were hardened.
+The completed Phase 3B service protocol/ownership checkpoint raises the full-suite receipt to 605
+cases / 7,081 assertions in 74.56 seconds. `just compile`, both Python-host syntax checks,
+`git diff --check`, and all 9 freshly rendered and visually inspected snapshot screens are clean.
+Its 100,000-event benchmark encoded 46,766,700 bytes in 0.901 seconds and read plus reduced them in
+5.766 seconds on the checkpoint machine. Final independent Sol review found no remaining P0/P1
+after host-minted creation and cold source verification, suffix-safe many-to-many attachment,
+actor-owned proof state, canonical registry release, pre-created Work adoption, exact event/body
+transport correlation, retained-body length validation, and per-response host-instance fencing were
+closed adversarially.
 
 Phase 0 still owes real VoiceOver/keyboard UI automation and broader driver focus/race proof. Phase 1
 still owes the remaining canonical consumer migrations (the Work Host service recovery source and

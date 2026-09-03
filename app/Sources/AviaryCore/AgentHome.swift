@@ -130,15 +130,70 @@ public struct AgentHome: Sendable, Hashable {
         root.appending(path: "work-host-id.lock", directoryHint: .notDirectory)
     }
 
+    /// The identity is a local authority, not an arbitrary label. Keep its wire representation
+    /// deliberately small and restricted to the format this home mints (`host-<UUID>`). Besides
+    /// making malformed records fail closed, this bounds all diagnostics and avoids accepting
+    /// path/control characters from a hand-edited or corrupted authority file.
+    private static let persistedWorkHostIDMaximumBytes = 128
+
+    private static func isValidPersistedWorkHostID(_ value: String) -> Bool {
+        guard value.utf8.count <= persistedWorkHostIDMaximumBytes,
+              value.hasPrefix("host-") else {
+            return false
+        }
+
+        let suffix = String(value.dropFirst("host-".count))
+        let scalars = Array(suffix.unicodeScalars)
+        guard scalars.count == 36 else { return false }
+
+        for (index, scalar) in scalars.enumerated() {
+            if [8, 13, 18, 23].contains(index) {
+                guard scalar.value == 0x2D else { return false }
+            } else {
+                let isDigit = scalar.value >= 0x30 && scalar.value <= 0x39
+                let isLowerHex = scalar.value >= 0x61 && scalar.value <= 0x66
+                guard isDigit || isLowerHex else { return false }
+            }
+        }
+        return UUID(uuidString: suffix) != nil
+    }
+
     private static func persistedWorkHostIDState(from url: URL) -> PersistedWorkHostIDState {
-        guard let existing = try? String(contentsOf: url, encoding: .utf8) else {
+        // Do not use String(contentsOf:) here: this file is an authority boundary, so a corrupt
+        // multi-megabyte record must not be materialized merely to discover that it is too large.
+        let maximumFramedBytes = persistedWorkHostIDMaximumBytes + 2 // optional CRLF framing
+        let data: Data
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            guard let bounded = try handle.read(
+                upToCount: maximumFramedBytes + 1) else {
+                return .malformed
+            }
+            guard bounded.count <= maximumFramedBytes else { return .malformed }
+            data = bounded
+        } catch {
             return FileManager.default.fileExists(atPath: url.path) ? .malformed : .missing
         }
-        let trimmed = existing.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !trimmed.contains("\n"), !trimmed.contains("\r") else {
+        guard let existing = String(data: data, encoding: .utf8) else {
             return .malformed
         }
-        return .valid(trimmed)
+
+        // The file is newline-terminated by the publisher. Accept exactly one LF (or CRLF)
+        // framing suffix, but do not trim arbitrary spaces or additional records: otherwise two
+        // distinct on-disk authorities could be silently treated as the same value.
+        var candidate = existing
+        if candidate.hasSuffix("\n") {
+            candidate.removeLast()
+            if candidate.hasSuffix("\r") { candidate.removeLast() }
+        }
+        guard !candidate.isEmpty,
+              !candidate.contains("\n"), !candidate.contains("\r"),
+              candidate == candidate.trimmingCharacters(in: .whitespacesAndNewlines),
+              Self.isValidPersistedWorkHostID(candidate) else {
+            return .malformed
+        }
+        return .valid(candidate)
     }
 
     /// A competing first-use caller can observe the exclusive file while its winner is still
@@ -213,10 +268,31 @@ public struct AgentHome: Sendable, Hashable {
                     "could not publish identity: \(String(cString: strerror(code)))")
             }
 
+            // The link is the atomic publication point. Fsync the containing directory before
+            // reporting success so a power loss cannot acknowledge an identity whose directory
+            // entry was still only in the filesystem cache.
+            try Self.synchronizeDirectory(containing: workHostIDFile)
+
             guard case .valid(let persisted) = Self.persistedWorkHostIDState(from: workHostIDFile) else {
                 throw AgentHomeError.workHostIDUnavailable("the published identity could not be read back")
             }
             return persisted
+        }
+    }
+
+    private static func synchronizeDirectory(containing fileURL: URL) throws {
+        let directory = fileURL.deletingLastPathComponent()
+        let descriptor = directory.path.withCString {
+            Darwin.open($0, O_RDONLY | O_DIRECTORY)
+        }
+        guard descriptor >= 0 else {
+            throw AgentHomeError.workHostIDUnavailable(
+                "could not open identity directory for synchronization: \(String(cString: strerror(errno)))")
+        }
+        defer { _ = Darwin.close(descriptor) }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw AgentHomeError.workHostIDUnavailable(
+                "could not synchronize identity directory: \(String(cString: strerror(errno)))")
         }
     }
 
