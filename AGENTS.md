@@ -1,24 +1,25 @@
 # Working in Aviary
 
-A native macOS app plus a hard fork of the Prime Agent harness. Read `README.md` first for
+A native macOS app plus its cross-platform Work Host and runtime. Read `README.md` first for
 what it does; this file is how to work on it without relearning the traps.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `app/Sources/AviaryCore/` | Pure Swift, no SwiftUI. Everything that reads or writes harness state. Testable, and where new behaviour should land by default. |
+| `app/Sources/AviaryCore/` | Pure Swift, no SwiftUI. Everything that reads or writes agent state. Testable, and where new behaviour should land by default. |
 | `app/Sources/Aviary/` | SwiftUI. Views, the app model, the design system, the headless snapshot renderer. |
 | `app/Sources/AviarySelfTest/` | The test suite, as an executable. |
-| `harness/` | The forked engine. See `harness/FORK.md`. |
+| `app/Sources/aviaryd/` | The headless Work Host process. It owns in-house runs independently of any GUI. |
+| `runtime-hosts/` | The Python runtime-host processes used by in-house Work. |
 | `scripts/` | `bundle-app.sh` assembles the `.app`; `make-icon.py` draws the icon. |
 
 ## Ground rules
 
 - **New logic goes in `AviaryCore`.** If a view needs to parse, scan, resolve, or diagnose
   something, that belongs in the core with a test. Views should read prepared data.
-- **Parse defensively, always.** The session format is versioned, extension-extensible, and
-  changes between harness releases. Everything is decoded through `JSONValue` with
+- **Parse defensively, always.** Session formats are versioned, extension-extensible, and include
+  externally owned Claude Code records. Everything is decoded through `JSONValue` with
   forgiving accessors: an unknown field is invisible, never fatal. `Transcript.unparsedLines`
   is surfaced in the UI precisely so a format drift shows up instead of silently truncating.
 - **Never put a credential on screen.** `auth.json` is read for provider names and auth
@@ -43,10 +44,9 @@ what it does; this file is how to work on it without relearning the traps.
   default; keep it that way.
 - **`pgrep -fl`, never `ps aux | grep`.** The latter has been observed returning nothing
   while four engine processes were running.
-- **A wedged daemon still answers `doctor`.** It completes the handshake and reports
-  `status: current` while refusing every real command. `DaemonInspector` cross-checks with a
-  `list` call, which goes through the ownership assertion. `doctor --fix` deliberately skips
-  this case; only `shutdown --force` clears it.
+- **A socket or PID is not Work Host health.** `aviaryd` may accept a connection while its
+  journal-backed service cannot serve canonical Work. Verify an accepted identity-fenced
+  handshake and a real bounded service read; transport reachability is not execution recovery.
 - **A blank snapshot is a capture-path bug before it is a view bug.** Captures go through
   ScreenCaptureKit because `cacheDisplay` only sees NSView drawing, and most SwiftUI
   content — every chart, every material — is layer-only. A screen that looks fine in the
@@ -103,11 +103,10 @@ what it does; this file is how to work on it without relearning the traps.
   a **copy**: `~/.prime` is still there and untouched, and the harness's own directories
   (`kernel-venv` at 297MB, `daemon-workers`, `session-leases`, `bin`, `logs`) were deliberately
   not carried across because nothing reads them. A test asserts they stay absent.
-- **There is no harness.** Aviary ran on a vendored Prime Agent fork until 2026-08-24. The
-  fork, `RPCClient`, `Daemon`, the supervisor surfaces and the `harness/` checkout are all
-  gone, and `harness/` is gitignored so a stray reinstall cannot creep back. Anything you find
-  that still mentions a daemon, a worker, an ownership lease or a kernel pool is stale prose,
-  not behaviour — fix it rather than working around it.
+- **There is no inherited harness.** Aviary ran on a vendored Prime Agent fork until 2026-08-24.
+  The fork, `RPCClient`, old `Daemon`, supervisor surfaces, and `harness/` checkout are gone;
+  references to those are stale. The current `aviaryd` is Aviary's own Work Host and is not that
+  retired daemon: it owns journal-backed Work so GUI loss does not imply termination.
 - **There are three Aviary binaries, and only one of them is the app.** `swift build` makes
   `app/.build/debug/Aviary`, `just shot` renders from `app/.build/release/Aviary`, and the
   thing double-clicked is `build/Aviary.app`, produced by `just build`. Verifying a UI change

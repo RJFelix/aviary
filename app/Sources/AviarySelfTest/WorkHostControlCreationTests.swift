@@ -438,7 +438,9 @@ func test_workHostControlCreationVerifierRequiresCanonicalMirroredSources() asyn
         actorID: "creation-later")
     _ = try await later.commitInput(
         text: "a later input", deliveryMode: .delivered,
-        command: CommandRef(commandID: "post-registration-command"))
+        command: CommandRef(
+            commandID: "post-registration-command",
+            causalCursor: await later.latestWorkCursor))
     try await later.closeChecked()
 
     let workURL = home.timelineV2WorkJournalURL(binding.work)

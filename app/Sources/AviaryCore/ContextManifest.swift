@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 #if canImport(Darwin)
 import Darwin
@@ -353,7 +352,7 @@ public struct ContextManifest: Codable, Hashable, Sendable {
     }
 
     private static func digest(_ data: Data) -> String {
-        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        "sha256:" + AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Apply the same semantic contract at the live writer and cold reducer boundaries.
@@ -754,7 +753,7 @@ public struct ContextBodyStore: Sendable, Hashable {
     }
 
     private static func digest(_ data: Data) -> String {
-        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        "sha256:" + AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     static func isValidDigest(_ digest: String) -> Bool {
@@ -774,12 +773,12 @@ public struct ContextBodyStore: Sendable, Hashable {
 
     private static func synchronizeDirectory(_ directory: URL) throws {
 #if canImport(Darwin)
-        let descriptor = Darwin.open(directory.path, O_RDONLY)
+        let descriptor = open(directory.path, O_RDONLY)
         guard descriptor >= 0 else {
             throw ContextBodyStoreError.writeFailed("could not open retained body directory")
         }
-        defer { _ = Darwin.close(descriptor) }
-        guard Darwin.fsync(descriptor) == 0 else {
+        defer { _ = close(descriptor) }
+        guard fsync(descriptor) == 0 else {
             throw ContextBodyStoreError.writeFailed("could not synchronize retained body directory")
         }
 #elseif canImport(Glibc)

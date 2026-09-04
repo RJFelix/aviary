@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 /// The result of reconstructing a native conversation from the durable journals.
@@ -15,10 +14,9 @@ public struct NativeColdResumeResult: Sendable {
     public let tools: [ChatTool]
     public let modelID: String
     public let contextManifest: ContextManifest
-    /// The retained producer-side decomposition of the pinned system prompt, when this native
-    /// crossing carried source metadata. Legacy manifests deliberately leave this nil: replay
-    /// never guesses by rebuilding the current working directory.
-    public let systemPromptAssembly: SystemPromptAssembly?
+    /// The retained producer-side decomposition of the pinned system prompt. Native cold resume
+    /// is source-aware by contract; a legacy/source-less crossing is not resumable.
+    public let systemPromptAssembly: SystemPromptAssembly
     public let contextBoundary: EventRef
     public let sessionCursor: JournalCursor
     public let workCursor: JournalCursor
@@ -30,7 +28,7 @@ public struct NativeColdResumeResult: Sendable {
     public init(
         pinnedMessages: [ChatMessage], messages: [ChatMessage], tools: [ChatTool],
         modelID: String, contextManifest: ContextManifest,
-        systemPromptAssembly: SystemPromptAssembly? = nil,
+        systemPromptAssembly: SystemPromptAssembly,
         contextBoundary: EventRef, sessionCursor: JournalCursor, workCursor: JournalCursor,
         coverage: RecoveryCoverage, caveats: [String] = []
     ) {
@@ -358,7 +356,7 @@ public enum NativeColdResume {
             guard manifest.systemPromptAssemblyID == nil, !hasContextSourceMetadata else {
                 throw NativeColdResumeError.contextBoundaryMalformed
             }
-            return nil
+            throw NativeColdResumeError.noCompleteContextManifest
         }
 
         guard let assemblyID = manifest.systemPromptAssemblyID,
@@ -459,8 +457,10 @@ public enum NativeColdResume {
         bodyStore: ContextBodyStore,
         journal: JournalRef,
         sourceObservation: EventRef?
-    ) throws -> SystemPromptAssembly? {
-        guard sourceObservation != nil else { return nil }
+    ) throws -> SystemPromptAssembly {
+        guard sourceObservation != nil else {
+            throw NativeColdResumeError.noCompleteContextManifest
+        }
         guard let sources = manifest.systemPromptSources,
               let assemblyID = manifest.systemPromptAssemblyID else {
             throw NativeColdResumeError.contextBoundaryMalformed
@@ -598,7 +598,7 @@ public enum NativeColdResume {
     }
 
     private static func digest(_ data: Data) -> String {
-        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        "sha256:" + AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func decodeManifest(

@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 // MARK: - Model & provider records
 
@@ -213,6 +216,18 @@ public struct AuthInfo: Sendable {
     public var kinds: [String: String] = [:]
     public var fileExists: Bool = false
     public var permissionsAreTight: Bool = true
+
+    public init(
+        providers: Set<String> = [],
+        kinds: [String: String] = [:],
+        fileExists: Bool = false,
+        permissionsAreTight: Bool = true
+    ) {
+        self.providers = providers
+        self.kinds = kinds
+        self.fileExists = fileExists
+        self.permissionsAreTight = permissionsAreTight
+    }
 
     public static func load(home: AgentHome) -> AuthInfo {
         var info = AuthInfo()
@@ -620,6 +635,7 @@ public enum ChatProviderRouting {
         sessionID: String = UUID().uuidString,
         resolveSecret: (String?) async -> String? = { await ModelCatalogBuilder.resolveSecret($0) }
     ) async -> Result<ChatProvider, RoutingError> {
+        #if !os(Linux)
         if spec.api == "openai-codex-responses" {
             // OAuth rather than a key, and resolved up front so a missing login is an error at
             // launch rather than a 401 three turns in.
@@ -631,6 +647,7 @@ public enum ChatProviderRouting {
                 id: spec.id, store: store, model: model,
                 baseURL: spec.baseURL, sessionID: sessionID))
         }
+        #endif
         guard let baseURL = spec.baseURL.flatMap(URL.init(string:)) else {
             return .failure(.noBaseURL(spec.id))
         }

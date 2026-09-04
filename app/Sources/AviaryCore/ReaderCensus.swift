@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 /// The fixture manifest is intentionally data-only. It is useful to external readers and
@@ -271,7 +270,7 @@ public struct ReaderCensusPromptSourceProjection: Codable, Hashable, Sendable {
     }
 
     private static func opaqueID(_ value: String, namespace: String) -> String {
-        let digest = SHA256.hash(data: Data(value.utf8))
+        let digest = AviarySHA256.hash(data: Data(value.utf8))
             .map { String(format: "%02x", $0) }.joined()
         return "\(namespace)-sha256:\(digest)"
     }
@@ -403,7 +402,7 @@ public struct ReaderCensusContextProjection: Codable, Hashable, Sendable {
         if let compactionSummary {
             let bytes = Data(compactionSummary.utf8)
             compactionSummaryByteCount = bytes.count
-            compactionSummaryDigest = "sha256:" + SHA256.hash(data: bytes)
+            compactionSummaryDigest = "sha256:" + AviarySHA256.hash(data: bytes)
                 .map { String(format: "%02x", $0) }.joined()
             compactionSummaryInspectionRequired = true
         } else {

@@ -117,7 +117,7 @@ public struct MemoryStore: Sendable {
         var data = try encoder.encode(JSONValue.object(obj))
         data.append(UInt8(ascii: "\n"))
         if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
+            _ = FileManager.default.createFile(atPath: url.path, contents: nil)
         }
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }
@@ -151,7 +151,17 @@ public struct MemoryStore: Sendable {
         guard let v = JSONValue.parse(Data(line.utf8)),
               let id = v["id"]?.stringValue
         else { return nil }
+        #if os(Linux)
+        let at = AviaryDateParsing.parseDate(v["at"]?.stringValue)
+            ?? Date(timeIntervalSince1970: 0)
+        #else
         let at = WorkshopLog.parseDate(v["at"]?.stringValue) ?? Date(timeIntervalSince1970: 0)
+        #endif
+        #if os(Linux)
+        let expiresAt = AviaryDateParsing.parseDate(v["expiresAt"]?.stringValue)
+        #else
+        let expiresAt = WorkshopLog.parseDate(v["expiresAt"]?.stringValue)
+        #endif
         return MemoryEntry(
             id: id,
             scope: MemoryScope(rawValue: v["scope"]?.stringValue ?? "") ?? scope,
@@ -159,7 +169,7 @@ public struct MemoryStore: Sendable {
             tags: (v["tags"]?.arrayValue ?? []).compactMap { $0.stringValue },
             createdAt: at,
             updatedAt: at,
-            expiresAt: WorkshopLog.parseDate(v["expiresAt"]?.stringValue),
+            expiresAt: expiresAt,
             sessionID: v["sessionId"]?.stringValue,
             provenance: v["provenance"]?.stringValue,
             retired: v["event"]?.stringValue == "retire")

@@ -31,9 +31,31 @@ private func nativeResumeManifest(
             ContextManifest.toolsData(for: request.tools), authority: bundle.sessionJournal,
             mediaType: "application/vnd.aviary.tool-schema-manifest+json")
     }
-    return try ContextManifest.build(
+    let retained = try ContextManifest.build(
         request: request, manifestID: base.manifestID, requestID: base.requestID,
         bodyReferences: refs)
+    guard request.messages.count == 2,
+          case .text(let systemText) = request.messages[0].content[0] else {
+        throw NativeColdResumeError.contextBoundaryMalformed
+    }
+    let promptSource = try PromptSource(
+        sourceID: "native-resume-system", kind: .generated, label: "Native test system",
+        fullBody: systemText, deliveredBody: systemText, renderedBody: systemText)
+    let promptBody = try store.retain(
+        Data(systemText.utf8), authority: bundle.sessionJournal,
+        mediaType: "application/vnd.aviary.prompt-source+utf8")
+    let promptAssembly = try SystemPromptAssembly(text: systemText, sources: [promptSource])
+    let promptManifestSource = ContextManifestSource(
+        source: promptSource, inclusionID: "native-resume-system",
+        fullBodyReference: promptBody, deliveredBodyReference: promptBody,
+        renderedBodyReference: promptBody)
+    return ContextManifest(
+        schemaVersion: retained.schemaVersion, manifestID: retained.manifestID,
+        requestID: retained.requestID, modelID: retained.modelID,
+        measuredBy: retained.measuredBy, components: retained.components,
+        omissions: retained.omissions, cumulativeDeliveredBytes: retained.cumulativeDeliveredBytes,
+        systemPromptAssemblyID: promptAssembly.digest,
+        systemPromptSources: [promptManifestSource])
 }
 
 private func nativeResumeRead(
@@ -98,7 +120,9 @@ private func makeNativeResumeFixture(
         let commandID = "suffix-input-command"
         _ = try await bundle.commitInput(
             text: suffixInput, deliveryMode: .queued,
-            command: CommandRef(commandID: commandID, client: ClientRef("test-client")))
+            command: CommandRef(
+                commandID: commandID, client: ClientRef("test-client"),
+                causalCursor: await bundle.latestWorkCursor))
         _ = try await bundle.markCommandDelivered(commandID: commandID)
     }
     if addUnrepresentedAction {
@@ -375,7 +399,7 @@ func test_nativeLaunchCapturesPreStartSeedAndRunnerNeverFallsBackToLegacy() asyn
     let bridge = try XCTUnwrap(try await NativeSessionCommandJournal.openForLaunch(
         home: fixture.home, identity: resumedIdentity, legacyProjection: legacy,
         actorID: "native-resume-launch", modelID: model.qualifiedID,
-        resumingLegacySession: true))
+        modelContextMode: .exactColdResume))
     let seed = try XCTUnwrap(bridge.resumeSeed)
     XCTAssertEqual(
         seed.messages.map(\.plainText),
@@ -393,14 +417,18 @@ func test_nativeLaunchCapturesPreStartSeedAndRunnerNeverFallsBackToLegacy() asyn
     let commandID = "native-resume-start-command"
     _ = try await bridge.nativeJournal.commitInput(
         text: prompt, deliveryMode: .queued,
-        command: CommandRef(commandID: commandID, client: ClientRef("resume-client")))
+        command: CommandRef(
+            commandID: commandID, client: ClientRef("resume-client"),
+            causalCursor: await bridge.nativeJournal.latestWorkCursor))
 
     let recorder = NativeResumeRequestRecorder()
+    let seedAssembly = seed.systemPromptAssembly
     let runner = AgentRunner(
         provider: NativeResumeRecordingProvider(recorder: recorder), host: host,
         settings: .init(
             home: fixture.home, cwd: cwd, model: model,
-            systemPrompt: "fresh prompt must not replace retained instructions",
+            systemPrompt: seedAssembly.flattenedText,
+            systemPromptAssembly: seedAssembly,
             resume: fixture.identity.sessionID, identity: resumedIdentity,
             writer: legacy, nativeJournal: bridge.nativeJournal,
             nativeResumeSeed: seed))
@@ -425,6 +453,95 @@ func test_nativeLaunchCapturesPreStartSeedAndRunnerNeverFallsBackToLegacy() asyn
     try await legacy.closeChecked()
 }
 
+private func assertNativeRunnerRefusesAssembly(
+    configuredAssembly: SystemPromptAssembly,
+    configuredPrompt: String
+) async throws {
+    let fixture = try await makeNativeResumeFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.home.root) }
+    guard let host = try makeHost(.reference) else {
+        print("      skipped: no reference runtime host")
+        return
+    }
+    _ = try await host.start()
+
+    let resumedIdentity = SessionWorkIdentity(
+        sessionID: fixture.identity.sessionID, work: fixture.identity.work,
+        runID: "native-assembly-mismatch-run")
+    let legacy = try SessionWriter(
+        home: fixture.home, resuming: fixture.identity.sessionID, cwd: "/tmp",
+        model: fakeModel(), identity: resumedIdentity)
+    let bridge = try await NativeSessionCommandJournal.openForLaunch(
+        home: fixture.home, identity: resumedIdentity, legacyProjection: legacy,
+        actorID: "native-assembly-mismatch", modelID: fakeModel().qualifiedID,
+        modelContextMode: .exactColdResume)
+    let seed = try XCTUnwrap(bridge.resumeSeed)
+    let recorder = NativeResumeRequestRecorder()
+    let runner = AgentRunner(
+        provider: NativeResumeRecordingProvider(recorder: recorder), host: host,
+        settings: .init(
+            home: fixture.home, cwd: "/tmp", model: fakeModel(),
+            systemPrompt: configuredPrompt, systemPromptAssembly: configuredAssembly,
+            resume: fixture.identity.sessionID, identity: resumedIdentity,
+            writer: legacy, nativeJournal: bridge.nativeJournal,
+            nativeResumeSeed: seed))
+
+    do {
+        _ = try await runner.prepare()
+        XCTFail("native cold resume must reject mismatched prompt assembly before runtime effect")
+    } catch RunJournalBundleError.invalidConfiguration {
+        XCTAssertTrue(true)
+    }
+    XCTAssertTrue(await recorder.requests.isEmpty)
+    let workRead = try nativeResumeRead(
+        home: fixture.home, journal: fixture.workJournal,
+        url: fixture.home.timelineV2WorkJournalURL(fixture.identity.work))
+    let replacementEvents = workRead.records.map(\.event).filter {
+        $0.run == RunRef(resumedIdentity.runID)
+    }
+    XCTAssertEqual(replacementEvents.map(\.type), [TimelineEventType.runStarted])
+    _ = try? await bridge.nativeJournal.finishRun(
+        outcome: .failed, detail: "assembly mismatch test cleanup")
+    try? await bridge.nativeJournal.closeChecked()
+    try? await legacy.closeChecked()
+    await host.stop()
+}
+
+func test_nativeColdResumeRefusesSameTextDifferentSourceAssembly() async throws {
+    let base = try SystemPromptAssembly(
+        text: "instructions",
+        sources: [try PromptSource(
+            sourceID: "native-resume-system", kind: .generated,
+            label: "Native test system", fullBody: "instructions",
+            deliveredBody: "instructions", renderedBody: "instructions")])
+    let differentSources = try SystemPromptAssembly(
+        text: base.flattenedText,
+        sources: [try PromptSource(
+            sourceID: "different-native-source", kind: .generated,
+            label: "different source", fullBody: base.flattenedText,
+            deliveredBody: base.flattenedText, renderedBody: base.flattenedText)])
+    try await assertNativeRunnerRefusesAssembly(
+        configuredAssembly: differentSources, configuredPrompt: base.flattenedText)
+}
+
+func test_nativeColdResumeRefusesDifferentPromptBytes() async throws {
+    let differentPrompt = "a different pinned system prompt"
+    let differentAssembly = try SystemPromptAssembly(
+        text: differentPrompt,
+        sources: [try PromptSource(
+            sourceID: "different-native-prompt", kind: .generated,
+            label: "different prompt", fullBody: differentPrompt,
+            deliveredBody: differentPrompt, renderedBody: differentPrompt)])
+    try await assertNativeRunnerRefusesAssembly(
+        configuredAssembly: differentAssembly, configuredPrompt: differentPrompt)
+}
+
+func test_nativeColdResumeRefusesSourceLessEmptyAssembly() async throws {
+    let emptyAssembly = try SystemPromptAssembly(text: "", sources: [])
+    try await assertNativeRunnerRefusesAssembly(
+        configuredAssembly: emptyAssembly, configuredPrompt: "")
+}
+
 func test_nativeLaunchRefusesUnavailableSeedBeforeCommandOrRuntimeEffect() async throws {
     let fixture = try await makeNativeResumeFixture()
     defer { try? FileManager.default.removeItem(at: fixture.home.root) }
@@ -443,7 +560,7 @@ func test_nativeLaunchRefusesUnavailableSeedBeforeCommandOrRuntimeEffect() async
         _ = try await NativeSessionCommandJournal.openForLaunch(
             home: fixture.home, identity: resumedIdentity, legacyProjection: legacy,
             actorID: "native-corrupt-resume", modelID: fakeModel().qualifiedID,
-            resumingLegacySession: true)
+            modelContextMode: .exactColdResume)
         XCTFail("corrupt retained context must refuse native launch")
     } catch let error as NativeColdResumeError {
         guard case .retainedBodyUnavailable = error else {
@@ -460,7 +577,8 @@ func test_nativeLaunchRefusesUnavailableSeedBeforeCommandOrRuntimeEffect() async
     }
     XCTAssertEqual(
         failedRunEvents.map(\.type),
-        [TimelineEventType.runStarted, TimelineEventType.runFinished])
+        [TimelineEventType.runStarted],
+        "pre-effect cold-resume refusal leaves the exact Start reservation retryable")
     XCTAssertFalse(failedRunEvents.contains(where: { $0.command != nil || $0.action != nil }))
 }
 

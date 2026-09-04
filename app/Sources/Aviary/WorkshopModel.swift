@@ -195,14 +195,14 @@ extension AppModel {
         // the honest verb for "when you are next idle".
         if let run = workshopRun, !run.hasExited {
             let wasStreaming = run.isStreaming
-            let receipt: SessionCommandReceipt
+            let receipt: LiveRunCommandResult
             if wasStreaming {
                 receipt = await run.queueFollowUp(message)
             } else {
                 receipt = await run.send(message)
             }
             guard receipt.wasHandedOff else {
-                let detail = receipt.delivery.detail ?? "the Work did not accept the input"
+                let detail = receipt.detail ?? "the Work did not accept the input"
                 recordAttachedHandoff(
                     request.id, note: "Delivery was not confirmed: \(detail)")
                 show(
@@ -235,13 +235,37 @@ extension AppModel {
         // Nothing attached. Resume the remembered session, or open a new one, and
         // deliver as the first prompt.
         let resume = workshopSessionID
-        let first =
-            resume == nil
-            ? bootstrapPrompt(repoRoot: repoRoot) + "\n\n---\n\n" + message
-            : message
+        let first: String?
+        if resume == nil {
+            first = bootstrapPrompt(repoRoot: repoRoot) + "\n\n---\n\n" + message
+        } else if engineChoice == .claudeCode {
+            // Claude Code cannot be cold-reopened by Aviary, so this path creates a fresh
+            // process and still needs this request as its first prompt.
+            first = message
+        } else {
+            first = nil
+        }
 
+        // Reopening a remembered Session is not itself delivery. The old in-process path
+        // focused the existing run and then the caller treated its historical first message
+        // as proof that this new Workshop request arrived. Keep the launch/reopen boundary
+        // separate: after the attachment is available, send this request and inspect its own
+        // receipt.
         startWorkshopRun(repoRoot: repoRoot, resume: resume, firstPrompt: first)
         section = .workshop
+
+        if resume != nil && engineChoice == .inHouse {
+            guard let run = await waitForWorkshopRunAssociation() else {
+                recordDeliveryFailure(request.id)
+                return
+            }
+            let wasHandedOff = await handoffWorkshopMessage(
+                requestID: request.id, message: message, to: run)
+            if !wasHandedOff {
+                return
+            }
+            return
+        }
 
         // Wait for Work to acknowledge the first input at its durable delivery seam before
         // claiming the request. Allocating a session proves only preparation: a process may
@@ -297,14 +321,60 @@ extension AppModel {
     /// received the request.
     private func initialRequestWasDelivered() async -> Bool {
         for _ in 0..<60 {
-            guard let run = workshopRun else { return false }
-            if run.initialPromptDelivered { return true }
-            if run.hasExited || run.errorBanner != nil || run.commandState == .failed {
-                return false
+            if let run = workshopRun {
+                if run.initialPromptDelivered { return true }
+                if run.hasExited || run.errorBanner != nil || run.commandState == .failed {
+                    return false
+                }
             }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         return false
+    }
+
+    /// Wait for a run row to become associated with a newly restored/created Workshop Work.
+    /// Association can legitimately lag the service admission response, so a missing row is
+    /// not an immediate delivery failure. The bounded timeout still reports a real launch or
+    /// catalog problem instead of waiting forever.
+    private func waitForWorkshopRunAssociation() async -> LiveRun? {
+        for _ in 0..<60 {
+            if let run = workshopRun, !run.hasExited { return run }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return nil
+    }
+
+    /// Deliver a Workshop request to an already-associated run and preserve the service
+    /// receipt's exact handed-off/queued distinction. In particular, a historical Session
+    /// message or a successful reopen does not count as delivery for this request.
+    private func handoffWorkshopMessage(
+        requestID: String, message: String, to run: LiveRun
+    ) async -> Bool {
+        let receipt: LiveRunCommandResult
+        if run.isStreaming {
+            receipt = await run.queueFollowUp(message)
+        } else {
+            receipt = await run.send(message)
+        }
+        guard receipt.wasHandedOff else {
+            let detail = receipt.detail ?? "the Work did not accept the input"
+            recordAttachedHandoff(
+                requestID, note: "Delivery was not confirmed: \(detail)")
+            show(
+                "Filed \(requestID), but delivery was not confirmed. The request remains open.",
+                isError: true)
+            return false
+        }
+        if receipt.isQueued {
+            recordAttachedHandoff(
+                requestID,
+                note: "Queued to the attached workshop Work; awaiting agent acknowledgement.")
+            show("Queued \(requestID). It remains open until the agent acknowledges it.")
+            return true
+        }
+        markDelivered(requestID, session: run.sessionID)
+        show("Sent \(requestID) to the workshop agent.")
+        return true
     }
 
     /// Leave the request open, and write down why it did not get through.
@@ -547,9 +617,15 @@ extension AppModel {
                 // An in-house run with no prompt prepares and waits, which is exactly what
                 // attaching to an existing session wants.
                 prompt: firstPrompt ?? "",
-                resume: resume, title: "Workshop")
+                resume: resume, title: "Workshop",
+                onCreated: { [weak self] run in
+                    self?.workshopRunID = run.id
+                })
         }
-        workshopRunID = runs.last?.id
+        if engineChoice == .claudeCode {
+            // Claude Code is still created synchronously by its process-owned path.
+            workshopRunID = runs.last?.id
+        }
     }
 
     /// Attach to the remembered workshop session without filing anything.
@@ -567,12 +643,14 @@ extension AppModel {
         startWorkshopRun(
             repoRoot: repoRoot, resume: workshopSessionID,
             firstPrompt: workshopSessionID == nil ? bootstrapPrompt(repoRoot: repoRoot) : nil)
-        Task {
-            if let run = workshopRun {
-                for _ in 0..<40 where run.sessionID == nil {
-                    try? await Task.sleep(nanoseconds: 250_000_000)
+        Task { @MainActor [weak self] in
+            for _ in 0..<40 {
+                guard let self else { return }
+                if let run = self.workshopRun, let sid = run.sessionID {
+                    self.workshopSessionID = sid
+                    return
                 }
-                if let sid = run.sessionID { workshopSessionID = sid }
+                try? await Task.sleep(nanoseconds: 250_000_000)
             }
         }
     }
@@ -811,15 +889,30 @@ extension AppModel {
     /// finished it is usually still attached and holding a live interpreter — and that is
     /// exactly the moment you want to reload. So the price is stated and the choice is yours.
     var reloadCost: String? {
-        let streaming = workRuns.filter { $0.isStreaming && !$0.hasExited }
-        let retained = workRuns.filter { !$0.hasExited }
+        let processOwned = workRuns.filter { !$0.isServiceBacked }
+        let streaming = processOwned.filter { $0.isStreaming && !$0.hasExited }
+        let retained = processOwned.filter { !$0.hasExited }
+        let serviceCount = workRuns.filter { $0.isServiceBacked && !$0.hasExited }.count
         if !streaming.isEmpty {
-            return "\(streaming.count) run\(streaming.count == 1 ? "" : "s") still working — "
-                + "relaunching stops \(streaming.count == 1 ? "it" : "them") mid-turn"
+            let processMessage =
+                "\(streaming.count) process-owned run\(streaming.count == 1 ? "" : "s") still working — "
+                    + "relaunching stops \(streaming.count == 1 ? "it" : "them") mid-turn"
+            if serviceCount > 0 {
+                return processMessage + "; \(serviceCount) Work Host run\(serviceCount == 1 ? "" : "s") remain durable and will be reattached"
+            }
+            return processMessage
         }
         if !retained.isEmpty {
-            return "\(retained.count) live run\(retained.count == 1 ? "" : "s") will end; "
-                + "the transcript survives, the interpreter's variables do not"
+            let processMessage =
+                "\(retained.count) process-owned run\(retained.count == 1 ? "" : "s") will end; "
+                    + "the transcript survives, the interpreter's variables do not"
+            if serviceCount > 0 {
+                return processMessage + "; \(serviceCount) Work Host run\(serviceCount == 1 ? "" : "s") remain durable and will be reattached"
+            }
+            return processMessage
+        }
+        if serviceCount > 0 {
+            return "\(serviceCount) Work Host run\(serviceCount == 1 ? "" : "s") remain durable and will be reattached after reload"
         }
         return nil
     }

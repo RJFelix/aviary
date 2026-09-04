@@ -1,5 +1,9 @@
-import Darwin
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 // MARK: - Wire values
 
@@ -263,12 +267,16 @@ public enum WorkServiceTransportCodec {
                 try validateWorkDescriptor(data["work"] ?? .null)
                 try validateArray(data["events"], maxCount: WorkServiceBounds.maxEventsPerPage)
                 try validateArray(data["omissions"], maxCount: WorkServiceBounds.maxOmissions)
+                try validatePrefixDigest(data["basePrefixDigest"])
+                try validatePrefixDigest(data["prefixDigest"])
                 for event in data["events"]?.arrayValue ?? [] {
                     try validateTimelineEvent(event)
                 }
             case .eventsAfterCursor:
                 try validateArray(data["events"], maxCount: WorkServiceBounds.maxEventsPerPage)
                 try validateArray(data["omissions"], maxCount: WorkServiceBounds.maxOmissions)
+                try validatePrefixDigest(data["basePrefixDigest"])
+                try validatePrefixDigest(data["prefixDigest"])
                 for event in data["events"]?.arrayValue ?? [] {
                     try validateTimelineEvent(event)
                 }
@@ -278,6 +286,7 @@ public enum WorkServiceTransportCodec {
                 try validateHostInstance(data["hostInstance"], required: true)
                 try validateJournalReference(data["controlJournal"] ?? .null)
                 try validateCursor(data["controlCursor"], required: true)
+                try validateWorkspaceCatalog(data["workspaceCatalog"] ?? .null)
                 try validateDiagnostic(data["diagnostic"])
             case .attach:
                 try validateArray(data["work"]?["attachments"],
@@ -402,19 +411,31 @@ public enum WorkServiceTransportCodec {
             let request: WorkServiceCreateWorkRequest = try decodeRequestValue(
                 WorkServiceCreateWorkRequest.self, from: request.payload)
             guard response.receipt.operation == .createWork,
+                  response.receipt.state == .accepted || response.receipt.state == .duplicate,
+                  response.receipt.outcome == .created,
+                  response.receipt.rejection == nil,
                   response.receipt.work == response.work.work,
                   response.receipt.commandID == request.commandID,
                   response.receipt.causalControlCursor == request.causalControlCursor,
                   response.controlCursor == response.receipt.resultingControlCursor,
+                  response.authorization == response.receipt.authorization,
                   response.session == response.attachment.session,
                   response.sessionJournal == response.attachment.sessionJournal,
                   response.sessionAttachment == response.attachment.sessionAttachment,
                   response.attachment.client == request.client,
+                  response.attachment.authorization == response.authorization,
                   response.work.journal.owner == .work(response.work.work),
                   response.workCursor.journal == response.work.journal,
-                  response.sessionCursor.journal == response.sessionJournal else {
+                  response.sessionCursor.journal == response.sessionJournal,
+                  response.work.attachments.contains(response.attachment) else {
                 throw WorkServiceTransportError.invalidResponse
             }
+            try validateRequestedAuthorization(
+                response.authorization, requested: request.requestedCapabilities)
+            try validateControlResultCursor(
+                response.receipt.resultingControlCursor,
+                causal: request.causalControlCursor, state: response.receipt.state,
+                expectedHostInstance: expectedHostInstance)
             if let expectedHostInstance {
                 try validateDescriptorHost(response.work, expected: expectedHostInstance)
                 try validateHost(response.receipt.host, expected: expectedHostInstance)
@@ -432,14 +453,18 @@ public enum WorkServiceTransportCodec {
                 WorkServiceCommandReceipt.self, from: data)
             let request: WorkServiceCompleteWorkRequest = try decodeRequestValue(
                 WorkServiceCompleteWorkRequest.self, from: request.payload)
-            guard response.work == request.work,
-                  response.commandID == request.command.commandID,
-                  response.causalWorkCursor == request.causalWorkCursor else {
+            guard let client = request.command.client else {
                 throw WorkServiceTransportError.invalidResponse
             }
+            let command = WorkServiceCommandRequest(
+                work: request.work, journal: request.journal, attachment: request.attachment,
+                commandID: request.command.commandID, client: client,
+                sessionAttachment: request.command.sessionAttachment,
+                causalWorkCursor: request.causalWorkCursor, kind: .complete)
+            try validateCommandReceipt(response, request: command,
+                                       expectedHostInstance: expectedHostInstance)
             if let expectedHostInstance {
                 try validateHost(response.host, expected: expectedHostInstance)
-                try validateTerminalProof(response.terminalProof, expected: expectedHostInstance)
             }
         case .attach:
             let response: WorkServiceAttachResponse = try decodeResponseValue(
@@ -451,21 +476,51 @@ public enum WorkServiceTransportCodec {
                   response.commandID == request.commandID,
                   response.causalControlCursor == request.causalControlCursor,
                   response.receipt.operation == .attach,
+                  response.state == response.receipt.state,
+                  response.host == response.receipt.host,
+                  response.authorization == response.receipt.authorization,
+                  response.rejection == response.receipt.rejection,
                   response.receipt.work == request.work,
                   response.receipt.commandID == request.commandID,
                   response.receipt.causalControlCursor == request.causalControlCursor,
                   response.receipt.resultingControlCursor == response.resultingControlCursor else {
                 throw WorkServiceTransportError.invalidResponse
             }
+            switch response.state {
+            case .accepted, .duplicate:
+                guard let attachment = response.attachment,
+                      response.receipt.outcome == .attached,
+                      response.receipt.rejection == nil,
+                      response.rejection == nil,
+                      attachment.client == request.client,
+                      attachment.session == request.session,
+                      attachment.sessionJournal == request.sessionJournal,
+                      attachment.sessionAttachment == request.sessionAttachment,
+                      attachment.authorization == response.authorization,
+                      response.work.attachments.contains(attachment) else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+                try validateRequestedAuthorization(
+                    response.authorization, requested: request.requestedCapabilities)
+                try validateControlResultCursor(
+                    response.resultingControlCursor,
+                    causal: request.causalControlCursor, state: response.state,
+                    expectedHostInstance: expectedHostInstance)
+            case .rejected:
+                try validateControlResultCursor(
+                    response.resultingControlCursor,
+                    causal: request.causalControlCursor, state: response.state,
+                    expectedHostInstance: expectedHostInstance)
+                guard response.attachment == nil,
+                      response.receipt.outcome == nil,
+                      response.rejection != nil else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+            }
             if let expectedHostInstance {
                 try validateDescriptorHost(response.work, expected: expectedHostInstance)
                 try validateHost(response.host, expected: expectedHostInstance)
                 try validateHost(response.receipt.host, expected: expectedHostInstance)
-            }
-            if let attachment = response.attachment {
-                guard attachment.client == request.client else {
-                    throw WorkServiceTransportError.invalidResponse
-                }
             }
         case .detach:
             let response: WorkServiceDetachResponse = try decodeResponseValue(
@@ -476,11 +531,35 @@ public enum WorkServiceTransportCodec {
                   response.commandID == request.commandID,
                   response.causalControlCursor == request.causalControlCursor,
                   response.receipt.operation == .detach,
+                  response.state == response.receipt.state,
+                  response.host == response.receipt.host,
+                  response.rejection == response.receipt.rejection,
                   response.receipt.work == request.work,
                   response.receipt.commandID == request.commandID,
                   response.receipt.causalControlCursor == request.causalControlCursor,
                   response.receipt.resultingControlCursor == response.resultingControlCursor else {
                 throw WorkServiceTransportError.invalidResponse
+            }
+            switch response.state {
+            case .accepted, .duplicate:
+                guard response.receipt.outcome == .detached,
+                      response.rejection == nil,
+                      response.receipt.rejection == nil else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+                try validateControlResultCursor(
+                    response.resultingControlCursor,
+                    causal: request.causalControlCursor, state: response.state,
+                    expectedHostInstance: expectedHostInstance)
+            case .rejected:
+                try validateControlResultCursor(
+                    response.resultingControlCursor,
+                    causal: request.causalControlCursor, state: response.state,
+                    expectedHostInstance: expectedHostInstance)
+                guard response.receipt.outcome == nil,
+                      response.rejection != nil else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
             }
             if let expectedHostInstance {
                 try validateHost(response.host, expected: expectedHostInstance)
@@ -495,11 +574,41 @@ public enum WorkServiceTransportCodec {
                   response.commandID == request.commandID,
                   response.causalControlCursor == request.causalControlCursor,
                   response.receipt.operation == .updateCapabilities,
+                  response.state == response.receipt.state,
+                  response.host == response.receipt.host,
+                  response.authorization == response.receipt.authorization,
+                  response.rejection == response.receipt.rejection,
                   response.receipt.work == request.work,
                   response.receipt.commandID == request.commandID,
                   response.receipt.causalControlCursor == request.causalControlCursor,
                   response.receipt.resultingControlCursor == response.resultingControlCursor else {
                 throw WorkServiceTransportError.invalidResponse
+            }
+            switch response.state {
+            case .accepted, .duplicate:
+                guard response.receipt.outcome == .capabilitiesUpdated,
+                      response.rejection == nil,
+                      response.receipt.rejection == nil,
+                      response.attachment?.client == request.client,
+                      response.attachment?.authorization == response.authorization else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+                try validateRequestedAuthorization(
+                    response.authorization, requested: request.requestedCapabilities)
+                try validateControlResultCursor(
+                    response.resultingControlCursor,
+                    causal: request.causalControlCursor, state: response.state,
+                    expectedHostInstance: expectedHostInstance)
+            case .rejected:
+                try validateControlResultCursor(
+                    response.resultingControlCursor,
+                    causal: request.causalControlCursor, state: response.state,
+                    expectedHostInstance: expectedHostInstance)
+                guard response.attachment == nil,
+                      response.receipt.outcome == nil,
+                      response.rejection != nil else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
             }
             if let expectedHostInstance {
                 try validateHost(response.host, expected: expectedHostInstance)
@@ -521,11 +630,35 @@ public enum WorkServiceTransportCodec {
                   response.commandID == request.commandID,
                   response.causalControlCursor == request.causalControlCursor,
                   response.receipt.operation == .acknowledgeRead,
+                  response.state == response.receipt.state,
+                  response.host == response.receipt.host,
+                  response.rejection == response.receipt.rejection,
                   response.receipt.work == request.work,
                   response.receipt.commandID == request.commandID,
                   response.receipt.causalControlCursor == request.causalControlCursor,
                   response.receipt.resultingControlCursor == response.resultingControlCursor else {
                 throw WorkServiceTransportError.invalidResponse
+            }
+            switch response.state {
+            case .accepted, .duplicate:
+                guard response.receipt.outcome == .readAcknowledged,
+                      response.rejection == nil,
+                      response.receipt.rejection == nil else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+                try validateControlResultCursor(
+                    response.resultingControlCursor,
+                    causal: request.causalControlCursor, state: response.state,
+                    expectedHostInstance: expectedHostInstance)
+            case .rejected:
+                try validateControlResultCursor(
+                    response.resultingControlCursor,
+                    causal: request.causalControlCursor, state: response.state,
+                    expectedHostInstance: expectedHostInstance)
+                guard response.receipt.outcome == nil,
+                      response.rejection != nil else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
             }
             if let expectedHostInstance {
                 try validateHost(response.host, expected: expectedHostInstance)
@@ -614,16 +747,191 @@ public enum WorkServiceTransportCodec {
                 WorkServiceCommandReceipt.self, from: data)
             let request: WorkServiceCommandRequest = try decodeRequestValue(
                 WorkServiceCommandRequest.self, from: request.payload)
-            guard response.work == request.work,
-                  response.commandID == request.command.commandID,
-                  response.causalWorkCursor == request.causalWorkCursor else {
-                throw WorkServiceTransportError.invalidResponse
-            }
+            try validateCommandReceipt(response, request: request,
+                                       expectedHostInstance: expectedHostInstance)
             if let expectedHostInstance {
                 try validateHost(response.host, expected: expectedHostInstance)
-                try validateTerminalProof(response.terminalProof, expected: expectedHostInstance)
             }
         }
+    }
+
+    private static func validateRequestedAuthorization(
+        _ authorization: WorkServiceAuthorizationOutcome,
+        requested: Set<WorkServiceCapability>
+    ) throws {
+        guard authorization.requested == requested,
+              authorization.granted.union(authorization.denied) == requested,
+              authorization.granted.isDisjoint(with: authorization.denied) else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+    }
+
+    private static func validateControlResultCursor(
+        _ resulting: JournalCursor,
+        causal: JournalCursor,
+        state: WorkServiceCommandReceiptState,
+        expectedHostInstance: WorkHostInstanceRef?
+    ) throws {
+        guard resulting.journal == causal.journal,
+              case .workHost(let controlHost) = resulting.journal.owner,
+              resulting.journal.authority.authorityID == controlHost.workHostID,
+              resulting.sequence >= 0,
+              (resulting.sequence == 0 ? resulting.eventID == nil : resulting.eventID != nil) else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        if let expectedHostInstance {
+            guard controlHost == expectedHostInstance.host,
+                  resulting.journal.authority.authorityID == expectedHostInstance.host.workHostID else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
+        switch state {
+        case .accepted, .duplicate:
+            guard resulting.sequence > causal.sequence, resulting.eventID != nil else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        case .rejected:
+            guard resulting.sequence >= causal.sequence else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+            if resulting.sequence == causal.sequence {
+                guard resulting.eventID == causal.eventID else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+            }
+        }
+    }
+
+    private static func validateCommandReceipt(
+        _ receipt: WorkServiceCommandReceipt,
+        request: WorkServiceCommandRequest,
+        expectedHostInstance: WorkHostInstanceRef?
+    ) throws {
+        guard receipt.work == request.work,
+              receipt.commandID == request.command.commandID,
+              receipt.causalWorkCursor == request.causalWorkCursor else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        switch receipt.state {
+        case .accepted, .duplicate:
+            guard let outcome = receipt.outcome,
+                  receipt.rejection == nil,
+                  receipt.hostSequence != nil,
+                  let resulting = receipt.resultingWorkCursor,
+                  resulting.journal == request.journal,
+                  resulting.sequence > request.causalWorkCursor.sequence,
+                  resulting.eventID != nil else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+            let expectedOutcome: WorkServiceCommandOutcome
+            switch request.kind {
+            case .start: expectedOutcome = outcome == .startRecoveryRequired
+                    ? .startRecoveryRequired : .started
+            case .send: expectedOutcome = .inputAccepted
+            case .steer: expectedOutcome = .steeringAccepted
+            case .queue: expectedOutcome = .queued
+            case .hold: expectedOutcome = .holdRequested
+            case .cancel: expectedOutcome = .cancellationRequested
+            case .end: expectedOutcome = .endRequested
+            case .destroy: expectedOutcome = .destroyed
+            case .complete: expectedOutcome = .completed
+            }
+            guard outcome == expectedOutcome else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+            if request.kind == .complete || request.kind == .destroy {
+                guard let proof = receipt.terminalProof else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+                try validateTerminalProof(
+                    proof, request: request, receipt: receipt,
+                    expectedHostInstance: expectedHostInstance)
+            } else {
+                guard receipt.terminalProof == nil else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+            }
+        case .rejected:
+            guard receipt.outcome == nil,
+                  receipt.rejection != nil,
+                  receipt.terminalProof == nil,
+                  receipt.hostSequence == nil else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+            try validateCursorJournal(receipt.resultingWorkCursor, journal: request.journal)
+        }
+    }
+
+    private static func validateTerminalProof(
+        _ proof: WorkServiceTerminalCommitProof,
+        request: WorkServiceCommandRequest,
+        receipt: WorkServiceCommandReceipt,
+        expectedHostInstance: WorkHostInstanceRef?
+    ) throws {
+        let expectedCausalEvent = request.causalWorkCursor.eventID.map {
+            EventRef(journal: request.journal, eventID: $0)
+        }
+        guard let client = request.command.client,
+              let resulting = receipt.resultingWorkCursor,
+              proof.operation == (request.kind == .complete ? .complete : .destroy),
+              proof.work == request.work,
+              proof.journal == request.journal,
+              proof.command.commandID == WorkServiceCommandLedgerIdentity.commandID(
+                  client: client, commandID: request.command.commandID),
+              proof.command.client == client,
+              proof.command.sessionAttachment == request.command.sessionAttachment,
+              proof.command.causalCursor == request.causalWorkCursor,
+              proof.causalWorkCursor == request.causalWorkCursor,
+              proof.resultingWorkCursor == resulting,
+              proof.terminalEvent.journal == request.journal,
+              proof.terminalEvent.sequence == resulting.sequence,
+              proof.terminalEvent.eventID == resulting.eventID,
+              proof.terminalEvent.previousEventID == request.causalWorkCursor.eventID,
+              proof.terminalEvent.causedByEventID == expectedCausalEvent,
+              proof.terminalEvent.work == request.work,
+              proof.terminalEvent.workHost == WorkHostRef(request.work.workHostID),
+              proof.terminalEvent.command == proof.command,
+              proof.terminalEvent.client == client,
+              proof.terminalEvent.session == proof.session,
+              proof.terminalEvent.sessionAttachment == proof.sessionAttachment,
+              proof.terminalEvent.type == (request.kind == .complete
+                  ? TimelineEventType.workCompleted : TimelineEventType.workDestroyed),
+              proof.terminalEvent.idempotencyKey == terminalIdempotencyKey(
+                  type: proof.terminalEvent.type, command: proof.command,
+                  causalCursor: request.causalWorkCursor, detail: request.value),
+              proof.commitID == proof.terminalEvent.eventID,
+              proof.sessionJournal.owner == .session(proof.session),
+              proof.sessionJournal.authority.authorityID == request.work.workHostID,
+              request.command.sessionAttachment == Optional(proof.sessionAttachment),
+              proof.sessionPairingVerified,
+              let paired = proof.pairedSessionCursor,
+              paired.journal == proof.sessionJournal,
+              proof.outstandingHandleIDs.isEmpty else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        if let expectedHostInstance {
+            guard proof.terminalEvent.workHost == expectedHostInstance.host,
+                  proof.sessionJournal.authority.authorityID == expectedHostInstance.host.workHostID else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
+    }
+
+    private static func terminalIdempotencyKey(
+        type: String, command: CommandRef, causalCursor: JournalCursor, detail: String?
+    ) -> String {
+        func component(_ value: String) -> String { "\(value.utf8.count):\(value)" }
+        let client = command.client?.clientID ?? ""
+        let attachment = command.sessionAttachment?.attachmentID ?? ""
+        let detailComponent = detail.map { "some:\(component($0))" } ?? "none"
+        return "work-terminal:v1/type:\(component(type))"
+            + "/command:\(component(command.commandID))"
+            + "/client:\(component(client))"
+            + "/attachment:\(component(attachment))"
+            + "/journal:\(component(causalCursor.journal.stableKey))"
+            + "/sequence:\(causalCursor.sequence)"
+            + "/event:\(component(causalCursor.eventID ?? ""))"
+            + "/detail:\(detailComponent)"
     }
 
     private static func validateHost(
@@ -645,6 +953,45 @@ public enum WorkServiceTransportCodec {
         }
     }
 
+    /// Validate the path-free workspace projection before Codable decoding can discard unknown
+    /// fields. A future/host-private `path`, `url`, or `canonicalPath` field must never silently
+    /// cross the normal WorkService wire just because the current client ignores it.
+    private static func validateWorkspaceCatalog(_ value: JSONValue) throws {
+        guard case .object(let catalog) = value,
+              let entries = catalog["entries"],
+              let revision = catalog["revision"],
+              let complete = catalog["isComplete"],
+              catalog.keys.allSatisfy({ ["entries", "revision", "isComplete"].contains($0) }),
+              entries.arrayValue != nil,
+              revision.intValue != nil,
+              complete.boolValue != nil,
+              entries.arrayValue!.count <= WorkHostWorkspaceRegistry.maximumEntries else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        for entry in entries.arrayValue! {
+            guard case .object(let fields) = entry,
+                  fields.keys.allSatisfy({
+                      ["workspaceID", "label", "isDefault", "availability", "capabilities"]
+                          .contains($0)
+                  }) else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+            // Codable validates the typed ID, label, availability, and capability set below;
+            // this decode is deliberately after the unknown-key/path check above.
+            do {
+                _ = try decodeResponseValue(
+                    WorkHostWorkspaceDescriptor.self, from: entry)
+            } catch {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
+        do {
+            _ = try decodeResponseValue(WorkHostWorkspaceCatalog.self, from: value)
+        } catch {
+            throw WorkServiceTransportError.invalidResponse
+        }
+    }
+
     private static func validateTerminalProof(
         _ proof: WorkServiceTerminalCommitProof?, expected: WorkHostInstanceRef
     ) throws {
@@ -661,8 +1008,15 @@ public enum WorkServiceTransportCodec {
     ) throws {
         guard descriptor.work.workHostID == expected.host.workHostID,
               descriptor.journal.authority.authorityID == expected.host.workHostID,
-              descriptor.journal.owner == .work(descriptor.work),
-              descriptor.hostObservation?.instance == expected else {
+              descriptor.journal.owner == .work(descriptor.work) else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        // The response envelope already proves which service instance answered this request.
+        // A descriptor-level observation is deliberately optional: a newly created idle Work,
+        // historical Work, or recovery projection may have no live actor observation. When an
+        // observation is present it is still fenced to the negotiated instance.
+        if let observation = descriptor.hostObservation,
+           observation.instance != expected {
             throw WorkServiceTransportError.invalidResponse
         }
         for attachment in descriptor.attachments {
@@ -833,18 +1187,14 @@ public enum WorkServiceTransportCodec {
     ) throws {
         guard maxBytes > 0 else { throw WorkServiceTransportError.invalidResponse }
         let byteLimit = min(maxBytes, WorkServiceBounds.maxEventPageBytes)
-        var total = 0
-        for event in events {
-            let bytes: Int
-            do {
-                bytes = try JSONEncoder().encode(event).count
-            } catch {
-                throw WorkServiceTransportError.invalidResponse
-            }
-            guard bytes <= byteLimit - total else {
-                throw WorkServiceTransportError.invalidResponse
-            }
-            total += bytes
+        let total: Int
+        do {
+            total = try WorkServiceEventPageSizing.encodedByteCount(of: events)
+        } catch {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        guard total <= byteLimit else {
+            throw WorkServiceTransportError.invalidResponse
         }
     }
 
@@ -879,6 +1229,16 @@ public enum WorkServiceTransportCodec {
         guard let value else { return }
         guard let string = value.stringValue,
               string.utf8.count <= WorkServiceBounds.maxDiagnosticCharacters else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+    }
+
+    private static func validatePrefixDigest(_ value: JSONValue?) throws {
+        guard let value else { return }
+        guard let digest = value.stringValue,
+              digest.hasPrefix("sha256:"),
+              digest.dropFirst("sha256:".count).count == 64,
+              digest.dropFirst("sha256:".count).allSatisfy({ $0.isHexDigit }) else {
             throw WorkServiceTransportError.invalidResponse
         }
     }
@@ -1062,12 +1422,10 @@ public enum WorkServiceTransportCodec {
         try validateJournalReference(object["journal"] ?? .null)
         let workJournal = try decodeResponseValue(
             JournalRef.self, from: object["journal"] ?? .null)
-        if let configuration = object["configuration"] {
-            guard case .object(let fields) = configuration,
-                  fields["initialPrompt"] == nil || fields["initialPrompt"]?.isNull == true else {
-                throw WorkServiceTransportError.invalidResponse
-            }
-        }
+        // Decode the configuration explicitly so a path-shaped or otherwise unknown workspace
+        // field cannot be silently discarded by the descriptor's surrounding Codable object.
+        _ = try decodeResponseValue(
+            WorkServiceWorkConfiguration.self, from: object["configuration"] ?? .null)
         try validateArray(object["attachments"], maxCount: WorkServiceBounds.maxAttachmentsPerWork)
         try validateArray(object["artifacts"], maxCount: WorkServiceBounds.maxArtifactsPerWork)
         try validateArray(object["omissions"], maxCount: WorkServiceBounds.maxOmissions)
@@ -1399,8 +1757,8 @@ private func workServiceSocketAddress(path: String) throws -> sockaddr_un {
 }
 
 private func workServiceMakeNonBlocking(_ descriptor: Int32) throws {
-    let flags = Darwin.fcntl(descriptor, F_GETFL)
-    guard flags >= 0, Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+    let flags = fcntl(descriptor, F_GETFL)
+    guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
         throw WorkServiceUnixSocketFailure.system(errno)
     }
 }
@@ -1414,7 +1772,7 @@ private func workServiceConnect(
     while true {
         let result = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
         if result == 0 { return }
@@ -1432,7 +1790,7 @@ private func workServiceConnect(
                 fd: descriptor, events: Int16(POLLOUT), revents: 0)
             let remaining = Int32(
                 min(100, max(1, (deadline - now) / 1_000_000)))
-            let ready = Darwin.poll(&descriptorState, 1, remaining)
+            let ready = poll(&descriptorState, 1, remaining)
             if ready == 0 { continue }
             if ready < 0 {
                 if errno == EINTR { continue }
@@ -1440,7 +1798,7 @@ private func workServiceConnect(
             }
             var socketError: Int32 = 0
             var socketErrorLength = socklen_t(MemoryLayout<Int32>.size)
-            guard Darwin.getsockopt(
+            guard getsockopt(
                 descriptor, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorLength) == 0 else {
                 throw WorkServiceUnixSocketFailure.system(errno)
             }
@@ -1453,11 +1811,7 @@ private func workServiceConnect(
 }
 
 private func workServiceNoSigPipe(_ descriptor: Int32) throws {
-    var enabled: Int32 = 1
-    let result = withUnsafePointer(to: &enabled) {
-        Darwin.setsockopt(
-            descriptor, SOL_SOCKET, SO_NOSIGPIPE, $0, socklen_t(MemoryLayout<Int32>.size))
-    }
+    let result = AviaryPOSIX.setNoSigPipe(descriptor)
     guard result == 0 else { throw WorkServiceUnixSocketFailure.system(errno) }
 }
 
@@ -1482,7 +1836,7 @@ private func workServiceRemoveOwnedSocket(
     guard let identity,
           let current = workServiceSocketIdentity(path: path),
           current.device == identity.device, current.inode == identity.inode else { return }
-    _ = Darwin.unlink(path)
+    _ = unlink(path)
 }
 
 /// An accepted or connected endpoint.  Reads are surfaced as complete LF records; writes are
@@ -1528,21 +1882,25 @@ private final class WorkServiceUnixSocketPeer: @unchecked Sendable {
             var shouldStop = false
             var buffer = [UInt8](repeating: 0, count: 64 * 1024)
             while !shouldStop {
-                let count = Darwin.recv(
+                let count = recv(
                     self.handle.fileDescriptor, &buffer, buffer.count, Int32(MSG_DONTWAIT))
                 if count > 0 {
                     let lines = self.framer.feed(Data(buffer[0..<count]))
                     for line in lines {
                         guard onFrame(line) else {
                             onInputOverload()
-                            self.stopReading()
+                            // Foundation's readability-handler setter synchronizes with the
+                            // dispatch source. Calling it from inside this callback traps on
+                            // Linux (the source queue is already executing). Defer the setter
+                            // until this callback has returned.
+                            self.deferStopReading()
                             shouldStop = true
                             break
                         }
                     }
                     if self.framer.takeOverflowCount() > 0 {
                         onOverflow()
-                        self.stopReading()
+                        self.deferStopReading()
                         // Do not continue draining bytes after the frame bound has been
                         // violated. Valid lines already handed to the pump remain ordered;
                         // unread bytes are discarded when the connection is closed.
@@ -1566,6 +1924,12 @@ private final class WorkServiceUnixSocketPeer: @unchecked Sendable {
     /// descriptor remains the responsibility of ``close()`` after the chosen stop policy elapses.
     func stopReading() {
         handle.readabilityHandler = nil
+    }
+
+    private func deferStopReading() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.stopReading()
+        }
     }
 
     /// Enqueue a barrier after all writes accepted by this peer.  The caller races this barrier
@@ -1629,9 +1993,9 @@ private final class WorkServiceUnixSocketPeer: @unchecked Sendable {
             guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return }
             var offset = 0
             while offset < rawBuffer.count {
-                let sent = Darwin.send(
+                let sent = send(
                     handle.fileDescriptor, base.advanced(by: offset), rawBuffer.count - offset,
-                    Int32(MSG_DONTWAIT))
+                    AviaryPOSIX.sendFlags)
                 if sent > 0 {
                     offset += sent
                     continue
@@ -1646,7 +2010,7 @@ private final class WorkServiceUnixSocketPeer: @unchecked Sendable {
                         fd: handle.fileDescriptor, events: Int16(POLLOUT), revents: 0)
                     let remaining = Int32(
                         min(100, max(1, (deadline - now) / 1_000_000)))
-                    let ready = Darwin.poll(&descriptor, 1, remaining)
+                    let ready = poll(&descriptor, 1, remaining)
                     if ready == 0 { continue }
                     if ready < 0 {
                         if errno == EINTR { continue }
@@ -1664,6 +2028,12 @@ private final class WorkServiceUnixSocketPeer: @unchecked Sendable {
 
     @discardableResult
     func close() -> Bool {
+        guard claimClosed() else { return false }
+        finishClose()
+        return true
+    }
+
+    private func claimClosed() -> Bool {
         stateLock.lock()
         guard !closed else {
             stateLock.unlock()
@@ -1671,6 +2041,10 @@ private final class WorkServiceUnixSocketPeer: @unchecked Sendable {
         }
         closed = true
         stateLock.unlock()
+        return true
+    }
+
+    private func finishClose() {
         writeLock.lock()
         if !handleClosed {
             handle.readabilityHandler = nil
@@ -1678,10 +2052,18 @@ private final class WorkServiceUnixSocketPeer: @unchecked Sendable {
             handleClosed = true
         }
         writeLock.unlock()
-        return true
     }
 
-    private func markClosed() -> Bool { close() }
+    private func markClosed() -> Bool {
+        guard claimClosed() else { return false }
+        // ``markClosed`` runs on Foundation's readability callback queue. Defer the
+        // readability-handler mutation and descriptor close to avoid a reentrant dispatch_sync
+        // in swift-corelibs-foundation's FileHandle implementation.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.finishClose()
+        }
+        return true
+    }
 
     private func isClosed() -> Bool {
         stateLock.lock()
@@ -1715,7 +2097,7 @@ private final class WorkServiceUnixSocketListener: @unchecked Sendable {
         guard errno == ENOENT else {
             throw WorkServiceUnixSocketFailure.system(errno)
         }
-        let socket = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        let socket = AviaryPOSIX.streamSocket()
         guard socket >= 0 else { throw WorkServiceUnixSocketFailure.system(errno) }
         var createdIdentity: WorkServiceSocketIdentity? = nil
         do {
@@ -1724,7 +2106,7 @@ private final class WorkServiceUnixSocketListener: @unchecked Sendable {
             var address = try workServiceSocketAddress(path: path)
             let bound = withUnsafePointer(to: &address) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.bind(socket, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    bind(socket, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
                 }
             }
             guard bound == 0 else { throw WorkServiceUnixSocketFailure.system(errno) }
@@ -1735,14 +2117,14 @@ private final class WorkServiceUnixSocketListener: @unchecked Sendable {
             guard createdIdentity != nil else {
                 throw WorkServiceUnixSocketFailure.system(EIO)
             }
-            guard Darwin.chmod(path, mode_t(0o600)) == 0 else {
+            guard chmod(path, mode_t(0o600)) == 0 else {
                 throw WorkServiceUnixSocketFailure.system(errno)
             }
-            guard Darwin.listen(socket, 32) == 0 else {
+            guard listen(socket, 32) == 0 else {
                 throw WorkServiceUnixSocketFailure.system(errno)
             }
         } catch {
-            Darwin.close(socket)
+            _ = AviaryPOSIX.close(socket)
             workServiceRemoveOwnedSocket(path: path, identity: createdIdentity)
             throw error
         }
@@ -1750,14 +2132,14 @@ private final class WorkServiceUnixSocketListener: @unchecked Sendable {
         self.descriptor = socket
         self.source = DispatchSource.makeReadSource(fileDescriptor: socket, queue: .global(qos: .utility))
         self.socketIdentity = createdIdentity
-        self.source.setCancelHandler { Darwin.close(socket) }
+        self.source.setCancelHandler { _ = AviaryPOSIX.close(socket) }
     }
 
     func start(onAccept: @escaping @Sendable (Int32) -> Void) {
         source.setEventHandler { [weak self] in
             guard let self else { return }
             while true {
-                let accepted = Darwin.accept(self.descriptor, nil, nil)
+                let accepted = accept(self.descriptor, nil, nil)
                 if accepted >= 0 {
                     onAccept(accepted)
                     continue
@@ -2226,7 +2608,7 @@ public actor WorkServiceUnixSocketServer {
 
     private func accept(descriptor: Int32) {
         guard accepting, connections.count < maxClients else {
-            Darwin.close(descriptor)
+            close(descriptor)
             return
         }
         do {
@@ -2273,7 +2655,7 @@ public actor WorkServiceUnixSocketServer {
                     }
                 })
         } catch {
-            Darwin.close(descriptor)
+            close(descriptor)
         }
     }
 
@@ -2448,10 +2830,6 @@ public actor WorkServiceUnixSocketServer {
         }
         switch envelope.operation {
         case .handshake:
-            guard clientIdentities[connectionID] == nil else {
-                throw WorkServiceTransportError.remote(
-                    code: .handshakeRejected, detail: "handshake may be sent only once")
-            }
             let request = try WorkServiceTransportCodec.decodePayload(
                 WorkServiceHandshakeRequest.self, from: envelope.payload)
             guard WorkServiceTransportText.validIdentity(request.client),
@@ -2470,8 +2848,17 @@ public actor WorkServiceUnixSocketServer {
                 throw WorkServiceTransportError.remote(
                     code: .handshakeRejected, detail: response.diagnostic)
             }
-            clientIdentities[connectionID] = request.client
-            hostInstances[connectionID] = response.hostInstance
+            if let existingClient = clientIdentities[connectionID] {
+                guard existingClient == request.client,
+                      hostInstances[connectionID] == response.hostInstance else {
+                    throw WorkServiceTransportError.remote(
+                        code: .identityMismatch,
+                        detail: "repeated handshake changed the bound client or Work Host instance")
+                }
+            } else {
+                clientIdentities[connectionID] = request.client
+                hostInstances[connectionID] = response.hostInstance
+            }
             return try success(id: envelope.id, value: response, connectionID: connectionID)
 
         default:
@@ -2557,8 +2944,11 @@ public actor WorkServiceUnixSocketServer {
                 guard request.command.client == client else { throw identityMismatch() }
                 return try success(id: envelope.id, value: try await service.command(request), connectionID: connectionID)
             case .handshake:
+                // Handshakes are handled above so that the same client can refresh the
+                // control-journal cursor on an established connection.  This branch remains
+                // unreachable for a well-formed dispatch call.
                 throw WorkServiceTransportError.remote(
-                    code: .handshakeRejected, detail: "handshake may be sent only once")
+                    code: .handshakeRejected, detail: "handshake dispatch fell through")
             }
         }
     }
@@ -2710,6 +3100,27 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
             throw WorkServiceTransportError.remote(
                 code: .identityMismatch, detail: "handshake client differs from this transport")
         }
+        if let handshakeResponse, connected {
+            do {
+                let response = try await performHandshake(request)
+                try validateHandshake(response)
+                guard response.hostInstance == handshakeResponse.hostInstance else {
+                    closeTransport(WorkServiceTransportError.remote(
+                        code: .identityMismatch,
+                        detail: "repeated handshake changed the Work Host instance"))
+                    throw WorkServiceTransportError.remote(
+                        code: .identityMismatch,
+                        detail: "repeated handshake changed the Work Host instance")
+                }
+                self.handshakeResponse = response
+                return response
+            } catch {
+                if connected, Self.shouldFenceHandshake(error) {
+                    closeTransport(error)
+                }
+                throw error
+            }
+        }
         if let handshakeResponse { return handshakeResponse }
         guard !connected else { throw WorkServiceTransportError.alreadyConnected }
         try openSocket()
@@ -2721,6 +3132,21 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
         } catch {
             closeTransport(error)
             throw error
+        }
+    }
+
+    private static func shouldFenceHandshake(_ error: Error) -> Bool {
+        guard let transport = error as? WorkServiceTransportError else { return false }
+        switch transport {
+        case .notConnected, .disconnected, .invalidFrame, .invalidResponse,
+             .duplicateResponseID, .writeFailed:
+            return true
+        case .remote(let code, _):
+            return code == .identityMismatch || code == .transportClosed
+                || code == .serverStopping || code == .serviceUnavailable
+        case .invalidEndpoint, .endpointOccupied, .alreadyConnected, .frameTooLarge,
+             .tooManyPendingRequests, .timedOut, .canceled:
+            return false
         }
     }
 
@@ -2801,7 +3227,7 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
     private func openSocket() throws {
         guard !connected else { throw WorkServiceTransportError.alreadyConnected }
         do {
-            let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+            let descriptor = AviaryPOSIX.streamSocket()
             guard descriptor >= 0 else { throw WorkServiceUnixSocketFailure.system(errno) }
             do {
                 try workServiceNoSigPipe(descriptor)
@@ -2851,7 +3277,7 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
                         }
                     })
             } catch {
-                Darwin.close(descriptor)
+                _ = AviaryPOSIX.close(descriptor)
                 throw error
             }
         } catch WorkServiceUnixSocketFailure.invalidPath {
@@ -2879,6 +3305,10 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
               response.controlCursor.sequence == 0
                   ? response.controlCursor.eventID == nil
                   : response.controlCursor.eventID != nil else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        guard response.workspaceCatalog.entries.isEmpty
+            || response.capabilities.contains(.workspaceCatalog) else {
             throw WorkServiceTransportError.invalidResponse
         }
         if let expectedHost, expectedHost != response.host {

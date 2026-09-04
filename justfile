@@ -32,15 +32,17 @@ signing-cert:
 run: build
     open {{build_dir}}/Aviary.app
 
-# Build the app binary only, no bundle (fast inner loop)
+# Build the app and its Work Host helper, no bundle (fast inner loop)
 compile:
     ./scripts/check-swift-toolchain.sh
     cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} swift build --product Aviary
+    cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} swift build --product aviaryd
 
 # Run the core test suite. Not `swift test`: a Command Line Tools toolchain ships no
 # XCTest, so the suite is an executable. See app/Sources/AviarySelfTest/Harness.swift.
 test:
     ./scripts/check-swift-toolchain.sh
+    cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} swift build --product aviaryd
     cd {{app_dir}} && env CLANG_MODULE_CACHE_PATH={{module_cache}} SWIFT_MODULECACHE_PATH={{module_cache}} swift run AviarySelfTest
 
 # Reproduce the versioned 100,000-event Timeline v2 scale baseline.

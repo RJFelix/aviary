@@ -27,7 +27,7 @@ struct FlockView: View {
                     EmptyStateView(
                         symbol: "bird",
                         title: "No delegated Work yet",
-                        message: "Native Work and legacy child records will appear here when "
+                        message: "Native Work and imported child records will appear here when "
                             + "they are available.")
                 } else {
                     treeList
@@ -131,7 +131,7 @@ struct FlockView: View {
             StatTile(
                 label: "children", value: "\(canonicalAllWorks.flatMap(\.children).count)",
                 caption: legacyChildren.isEmpty ? "canonical lifecycle"
-                    : "\(legacyChildren.count) legacy",
+                    : "\(legacyChildren.count) imported",
                 symbol: "arrow.triangle.branch")
             StatTile(
                 label: "attention",
@@ -162,7 +162,7 @@ struct FlockView: View {
                 }
 
                 if !legacyRoots.isEmpty {
-                    Text("Legacy compatibility")
+                    Text("Imported child history")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.secondary)
                         .padding(.top, canonicalWorks.isEmpty ? 0 : 5)
@@ -226,8 +226,8 @@ struct FlockView: View {
         } else {
             EmptyStateView(
                 symbol: "sidebar.right",
-                title: "Pick Work or a legacy child",
-                message: "Canonical Work is authoritative for lifecycle and attention. Legacy "
+                title: "Pick Work or imported child activity",
+                message: "Canonical Work is authoritative for lifecycle and attention. Imported "
                     + "child details remain available only where no native projection exists.")
         }
     }

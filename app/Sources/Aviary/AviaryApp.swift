@@ -139,9 +139,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
 
-    /// AppKit's terminate request is synchronous, while Work teardown is not. Returning
-    /// `terminateLater` keeps the process alive until Claude Code, the runtime host, session
-    /// writers, and their readers have actually quiesced. This is intentionally not invoked
+    /// AppKit's terminate request is synchronous, while process-owned Claude Code cleanup is
+    /// not. Returning `terminateLater` keeps the process alive until those resources quiesce;
+    /// `AppModel.stopAllWork()` only disconnects service-backed GUI attachments, so quitting
+    /// never sends End or stops durable Work on a Work Host. This is intentionally not invoked
     /// for last-window close: that event has no user intent to end Work.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let prepareForTermination else { return .terminateNow }

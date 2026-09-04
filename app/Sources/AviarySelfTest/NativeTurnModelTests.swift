@@ -53,7 +53,8 @@ func test_nativeAgentRecordsTurnPrefixesAndEffectiveModelSwitch() async throws {
     _ = try await bundle.commitInput(
         text: "first", deliveryMode: .delivered,
         command: CommandRef(
-            commandID: "turn-model-first", client: ClientRef("turn-model-client")))
+            commandID: "turn-model-first", client: ClientRef("turn-model-client"),
+            causalCursor: await bundle.latestWorkCursor))
     XCTAssertEqual(await agent.send("first"), .completed)
 
     var secondModel = fakeModel()
@@ -68,7 +69,8 @@ func test_nativeAgentRecordsTurnPrefixesAndEffectiveModelSwitch() async throws {
     _ = try await bundle.commitInput(
         text: "second", deliveryMode: .delivered,
         command: CommandRef(
-            commandID: "turn-model-second", client: ClientRef("turn-model-client")))
+            commandID: "turn-model-second", client: ClientRef("turn-model-client"),
+            causalCursor: await bundle.latestWorkCursor))
     XCTAssertEqual(await agent.send("second"), .completed)
 
     try await host.destroySession(hostSession)

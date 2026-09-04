@@ -1,6 +1,9 @@
 import Foundation
-import CryptoKit
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 public enum AgentHomeError: LocalizedError, Equatable, Sendable {
     case workHostIDNotPersisted
@@ -253,7 +256,7 @@ public struct AgentHome: Sendable, Hashable {
 
             let linkResult = temporary.path.withCString { source in
                 workHostIDFile.path.withCString { destination in
-                    Darwin.link(source, destination)
+                    link(source, destination)
                 }
             }
             guard linkResult == 0 else {
@@ -283,14 +286,14 @@ public struct AgentHome: Sendable, Hashable {
     private static func synchronizeDirectory(containing fileURL: URL) throws {
         let directory = fileURL.deletingLastPathComponent()
         let descriptor = directory.path.withCString {
-            Darwin.open($0, O_RDONLY | O_DIRECTORY)
+            open($0, O_RDONLY | O_DIRECTORY)
         }
         guard descriptor >= 0 else {
             throw AgentHomeError.workHostIDUnavailable(
                 "could not open identity directory for synchronization: \(String(cString: strerror(errno)))")
         }
-        defer { _ = Darwin.close(descriptor) }
-        guard Darwin.fsync(descriptor) == 0 else {
+        defer { _ = close(descriptor) }
+        guard fsync(descriptor) == 0 else {
             throw AgentHomeError.workHostIDUnavailable(
                 "could not synchronize identity directory: \(String(cString: strerror(errno)))")
         }
@@ -304,7 +307,8 @@ public struct AgentHome: Sendable, Hashable {
         }
 
         let descriptor = workHostIDLockFile.path.withCString {
-            Darwin.open($0, O_RDWR | O_CREAT | O_EXLOCK, S_IRUSR | S_IWUSR)
+            AviaryPOSIX.openExclusiveLock(
+                $0, flags: O_RDWR | O_CREAT, mode: mode_t(S_IRUSR | S_IWUSR))
         }
         guard descriptor >= 0 else {
             throw AgentHomeError.workHostIDUnavailable(
@@ -366,7 +370,7 @@ public struct AgentHome: Sendable, Hashable {
             kind = .workHost
             ownerKey = "work-host\u{00}\(workHost.workHostID.utf8.count):\(workHost.workHostID)"
         }
-        let digest = SHA256.hash(data: Data(ownerKey.utf8))
+        let digest = AviarySHA256.hash(data: Data(ownerKey.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
         return timelineV2LocksDir
@@ -537,6 +541,10 @@ public enum EngineLocator {
     /// without a runtime host is no use to any caller.
     static let rootMarker = "runtime-hosts/python3/host.py"
 
+    /// Find only an Aviary source checkout. Callers that need the shipped Python runtime rather
+    /// than other repository content should use ``runtimeRoot(startingAt:)`` so a bundled daemon
+    /// does not accidentally depend on the developer's checkout remaining at a conventional path.
+
     /// Walk up from a starting directory looking for the Aviary repo root.
     public static func repoRoot(startingAt start: URL = URL(fileURLWithPath: Bundle.main.bundlePath)) -> URL? {
         var dir = start
@@ -552,6 +560,137 @@ public enum EngineLocator {
         if FileManager.default.fileExists(
             atPath: conventional.appending(path: rootMarker).path) { return conventional }
         return nil
+    }
+
+    /// Find the directory which owns `runtime-hosts/` in either a source checkout or an app
+    /// bundle. This convenience is intentionally only a local source/build inspection helper;
+    /// a launched Work Host should use ``runtimeRoot(forExecutable:)`` so a damaged bundle can
+    /// never fall through to a developer checkout.
+    public static func runtimeRoot(
+        startingAt start: URL = URL(fileURLWithPath: Bundle.main.bundlePath)
+    ) -> URL? {
+        var dir = start.standardizedFileURL
+        for _ in 0..<12 {
+            if isRuntimeRoot(dir, requireCheckout: false) { return dir }
+
+            let resources = dir.appending(path: "Contents/Resources", directoryHint: .isDirectory)
+            if isRuntimeRoot(resources, requireCheckout: false) { return resources }
+
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path { break }
+            dir = parent
+        }
+        // Never consult a conventional checkout here. A path-independent caller must provide
+        // its actual executable origin; guessing `~/duckbill/aviary` is exactly the stale-host
+        // fallback this locator is intended to prevent.
+        return nil
+    }
+
+    /// Resolve runtime assets for the executable which will own a Work Host.
+    ///
+    /// A bundled helper is coupled to its own app's `Contents/Resources` payload. It is never
+    /// allowed to search ancestors or a source checkout when that payload is absent or damaged.
+    /// A SwiftPM product is accepted only when it is visibly below `.build` and its enclosing
+    /// Aviary checkout contains both the runtime marker and the package manifest. This keeps a
+    /// copied executable from silently acquiring a different checkout's Python host.
+    public static func runtimeRoot(forExecutable executable: URL) -> URL? {
+        let executable = executable.standardizedFileURL
+        guard executable.isFileURL, executable.path.hasPrefix("/"),
+              !executable.path.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            return nil
+        }
+        var executableInfo = stat()
+        guard executable.path.withCString({ lstat($0, &executableInfo) }) == 0,
+              (executableInfo.st_mode & S_IFMT) == S_IFREG else {
+            return nil
+        }
+
+        if let contents = bundleContents(containing: executable) {
+            let resources = contents.appending(
+                path: "Resources", directoryHint: .isDirectory)
+            return isRuntimeRoot(resources, requireCheckout: false) ? resources : nil
+        }
+
+        let components = executable.path.split(separator: "/").map(String.init)
+        guard components.contains(".build") else { return nil }
+        guard let checkout = repoRootWithoutFallback(
+            startingAt: executable.deletingLastPathComponent()) else { return nil }
+        return isRuntimeRoot(checkout, requireCheckout: true) ? checkout : nil
+    }
+
+    private static func bundleContents(containing executable: URL) -> URL? {
+        let components = executable.standardizedFileURL.path.split(separator: "/")
+            .map(String.init)
+        guard let contentsIndex = components.lastIndex(of: "Contents"), contentsIndex > 0,
+              contentsIndex + 1 < components.count,
+              (components[contentsIndex + 1] == "Helpers"
+                || components[contentsIndex + 1] == "MacOS"),
+              components[contentsIndex - 1].hasSuffix(".app") else {
+            return nil
+        }
+        guard !bundleOriginPathContainsSymlink(components) else { return nil }
+        var contents = executable.standardizedFileURL
+        while contents.lastPathComponent != "Contents" {
+            let parent = contents.deletingLastPathComponent()
+            guard parent.path != contents.path else { return nil }
+            contents = parent
+        }
+        return contents
+    }
+
+    private static func bundleOriginPathContainsSymlink(_ components: [String]) -> Bool {
+        guard let appIndex = components.lastIndex(where: { $0.hasSuffix(".app") }) else {
+            return false
+        }
+        var current = URL(fileURLWithPath: "/", isDirectory: true)
+        for (index, component) in components.enumerated() {
+            current.appendPathComponent(component)
+            guard index >= appIndex else { continue }
+            var information = stat()
+            guard lstat(current.path, &information) == 0 else { continue }
+            if information.st_mode & S_IFMT == S_IFLNK { return true }
+        }
+        return false
+    }
+
+    private static func repoRootWithoutFallback(startingAt start: URL) -> URL? {
+        var dir = start.standardizedFileURL
+        for _ in 0..<12 {
+            if isRuntimeRoot(dir, requireCheckout: true) { return dir }
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path { break }
+            dir = parent
+        }
+        return nil
+    }
+
+    private static func isRuntimeRoot(_ root: URL, requireCheckout: Bool) -> Bool {
+        guard root.isFileURL, root.path.hasPrefix("/"), !root.path.isEmpty else { return false }
+        // Check only the origin-relative path.  Rejecting every symlink back to `/` would reject
+        // normal macOS aliases such as `/var`, while accepting a symlinked `runtime-hosts` would
+        // let a bundled helper acquire Python code from an unrelated checkout.
+        guard directoryIsReal(root) else { return false }
+        let runtimeHosts = root.appending(path: "runtime-hosts", directoryHint: .isDirectory)
+        let runtimeVariant = runtimeHosts.appending(path: "python3", directoryHint: .isDirectory)
+        guard directoryIsReal(runtimeHosts), directoryIsReal(runtimeVariant) else { return false }
+        let marker = runtimeVariant.appending(path: "host.py", directoryHint: .notDirectory)
+        var markerInfo = stat()
+        guard marker.path.withCString({ lstat($0, &markerInfo) }) == 0,
+              (markerInfo.st_mode & S_IFMT) == S_IFREG,
+              markerInfo.st_mode & mode_t(0o444) != 0 else { return false }
+        if requireCheckout {
+            let package = root.appending(path: "app/Package.swift", directoryHint: .notDirectory)
+            var packageInfo = stat()
+            guard package.path.withCString({ lstat($0, &packageInfo) }) == 0,
+                  (packageInfo.st_mode & S_IFMT) == S_IFREG else { return false }
+        }
+        return true
+    }
+
+    private static func directoryIsReal(_ url: URL) -> Bool {
+        var info = stat()
+        guard url.path.withCString({ lstat($0, &info) }) == 0 else { return false }
+        return (info.st_mode & S_IFMT) == S_IFDIR
     }
 
     public static func discover(customPath: String? = nil) async -> [EngineLocation] {

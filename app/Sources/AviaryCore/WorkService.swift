@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 // MARK: - Transport-neutral Work service contract
@@ -20,8 +19,9 @@ public enum WorkServiceBounds {
     public static let maxCommandValueCharacters = 8_192
     public static let maxPageSize = 64
     public static let maxEventsPerPage = 128
-    /// A page is bounded by encoded canonical envelope bytes as well as event count. This keeps a
-    /// single large payload from consuming the entire response budget.
+    /// A page is bounded by the sum of its standalone canonical event-envelope encodings as well
+    /// as event count. Array delimiters, transport framing, and journal newlines are deliberately
+    /// excluded so every service, transport, and reader can enforce the same limit.
     public static let maxEventPageBytes = 256 * 1024
     public static let maxBodyChunkBytes = 64 * 1024
     public static let maxTerminalProofHandles = 128
@@ -31,6 +31,57 @@ public enum WorkServiceBounds {
     /// Keep this independently bounded so descriptor reconstruction cannot grow without limit.
     public static let maxReadAcknowledgementsPerAttachment = 2
     public static let maxOmissions = 32
+}
+
+/// The single protocol byte metric for a Work event page. Keeping this outside any transport or
+/// journal implementation prevents a valid exact-boundary page from changing size as it crosses
+/// from durable JSONL, through a response envelope, into a controller.
+public enum WorkServiceEventPageSizing {
+    public static func encodedByteCount(of event: TimelineEvent) throws -> Int {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(event).count
+    }
+
+    public static func encodedByteCount(of events: [TimelineEvent]) throws -> Int {
+        var total = 0
+        for event in events {
+            let count = try encodedByteCount(of: event)
+            let (next, overflow) = total.addingReportingOverflow(count)
+            guard !overflow else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "event page encoded byte count overflowed")
+            }
+            total = next
+        }
+        return total
+    }
+}
+
+/// Maps a caller-local command identity into the single canonical Work-ledger namespace shared by
+/// every attached client. External requests and receipts retain the caller's original ID; only
+/// Timeline command records use this bounded, client-qualified identity.
+public enum WorkServiceCommandLedgerIdentity {
+    public static func commandID(client: ClientRef, commandID: String) -> String {
+        var material = Data("work-command-ledger-v1\u{0}".utf8)
+        material.append(Data("\(client.clientID.utf8.count):".utf8))
+        material.append(Data(client.clientID.utf8))
+        material.append(0)
+        material.append(Data("\(commandID.utf8.count):".utf8))
+        material.append(Data(commandID.utf8))
+        let digest = AviarySHA256.hash(data: material).map {
+            String(format: "%02x", $0)
+        }.joined()
+        return "work-command-v1." + digest
+    }
+
+    public static func command(from external: CommandRef, client: ClientRef) -> CommandRef {
+        CommandRef(
+            commandID: commandID(client: client, commandID: external.commandID),
+            client: client,
+            sessionAttachment: external.sessionAttachment,
+            causalCursor: external.causalCursor)
+    }
 }
 
 public enum WorkServiceProtocolError: Error, Equatable, Sendable {
@@ -72,12 +123,17 @@ public struct WorkServiceHandshakeResponse: Codable, Hashable, Sendable {
     public let controlJournal: JournalRef
     public let controlCursor: JournalCursor
     public let capabilities: Set<WorkServiceCapability>
+    /// A bounded, path-free inventory of workspaces this Host is willing to resolve. The host
+    /// mints each identity; clients may select only one of these opaque IDs in Create.
+    public let workspaceCatalog: WorkHostWorkspaceCatalog
     public let diagnostic: String?
 
     public init(accepted: Bool, negotiatedVersion: Int?, supportedRange: ClosedRange<Int>,
                 host: WorkHostRef, hostInstance: WorkHostInstanceRef,
                 controlJournal: JournalRef, controlCursor: JournalCursor,
-                capabilities: Set<WorkServiceCapability>, diagnostic: String? = nil) {
+                capabilities: Set<WorkServiceCapability>,
+                workspaceCatalog: WorkHostWorkspaceCatalog = .empty,
+                diagnostic: String? = nil) {
         self.accepted = accepted
         self.negotiatedVersion = negotiatedVersion
         self.supportedRange = supportedRange
@@ -86,6 +142,7 @@ public struct WorkServiceHandshakeResponse: Codable, Hashable, Sendable {
         self.controlJournal = controlJournal
         self.controlCursor = controlCursor
         self.capabilities = capabilities
+        self.workspaceCatalog = workspaceCatalog
         self.diagnostic = WorkServiceText.bound(diagnostic)
     }
 }
@@ -224,6 +281,12 @@ public enum WorkServiceExecutionState: String, Codable, Hashable, Sendable {
     case canceling
     /// Explicit End is terminalizing execution. It is not the same thing as destroying Work.
     case ending
+    /// Durable execution evidence exists, but this service has not proved that a live actor can
+    /// safely continue it. This is deliberately non-actionable: it must never be treated as idle.
+    case recoveryRequired = "recovery_required"
+    /// The durable reducer/source could not project an execution state that this protocol knows.
+    /// Unknown state is also non-actionable and must not be guessed into idle.
+    case unknown
 }
 
 public struct WorkServiceOmission: Codable, Hashable, Sendable {
@@ -251,6 +314,8 @@ public enum WorkServiceCapability: String, Codable, CaseIterable, Hashable, Send
     case destroy
     case complete
     case inspectArtifacts = "inspect_artifacts"
+    /// The host can advertise and resolve opaque workspace identities.
+    case workspaceCatalog = "workspace_catalog"
 }
 
 /// Authorization is injected at the host boundary. A transport may authenticate a principal
@@ -416,7 +481,10 @@ public struct WorkServiceAttachRequest: Codable, Hashable, Sendable {
     public let session: SessionRef?
     public let sessionJournal: JournalRef?
     public let sessionAttachment: SessionAttachmentRef?
-    /// Stable caller identity for retries. It is scoped to the client and Work.
+    /// Stable caller identity for one logical Attach epoch. Callers must bind it to the exact
+    /// causal control cursor, Session tuple, and requested capability envelope. Repeating the
+    /// identical request aliases a lost response; a later Attach after a durable Detach has a
+    /// different control cursor and therefore a different identity.
     public let commandID: String
     /// Exact Work Host control cursor observed before the attach event is appended.
     public let causalControlCursor: JournalCursor
@@ -486,66 +554,82 @@ public struct WorkServiceWorkConfiguration: Codable, Hashable, Sendable {
     public let modelID: String?
     public let thinkingLevel: String?
     public let contextPolicy: String?
-    public let workingDirectoryPolicy: String?
+    /// A host-minted identity from the handshake catalog. It is intentionally not a path or a
+    /// policy string. A nil value is permitted in value fixtures/inventory records, but a
+    /// Create/Start-capable host must reject it at its effect boundary.
+    public let workspaceID: WorkHostWorkspaceID?
     public let includeContextFiles: Bool
     public let recordPayloads: Bool
     public let resumePolicy: String?
-    public let initialPrompt: String?
     public let wasTruncated: Bool
 
-    private enum CodingKeys: String, CodingKey {
-        case providerID, modelID, thinkingLevel, contextPolicy, workingDirectoryPolicy
-        case includeContextFiles, recordPayloads, resumePolicy, initialPrompt, wasTruncated
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case providerID, modelID, thinkingLevel, contextPolicy, workspaceID
+        case includeContextFiles, recordPayloads, resumePolicy, wasTruncated
+    }
+
+    private struct AnyCodingKey: CodingKey {
+        let stringValue: String
+        let intValue: Int? = nil
+
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
     }
 
     public init(providerID: String? = nil, modelID: String? = nil,
                 thinkingLevel: String? = nil, contextPolicy: String? = nil,
-                workingDirectoryPolicy: String? = nil, includeContextFiles: Bool = true,
-                recordPayloads: Bool = false, resumePolicy: String? = nil,
-                initialPrompt: String? = nil) {
+                workspaceID: WorkHostWorkspaceID? = nil, includeContextFiles: Bool = true,
+                recordPayloads: Bool = false, resumePolicy: String? = nil) {
         let boundedProvider = WorkServiceText.boundCommand(providerID)
         let boundedModel = WorkServiceText.boundCommand(modelID)
         let boundedThinking = WorkServiceText.boundCommand(thinkingLevel)
         let boundedPolicy = WorkServiceText.boundCommand(contextPolicy)
-        let boundedDirectory = WorkServiceText.boundCommand(workingDirectoryPolicy)
         let boundedResume = WorkServiceText.boundCommand(resumePolicy)
-        let boundedPrompt = WorkServiceText.boundCommand(initialPrompt)
         self.providerID = boundedProvider.value
         self.modelID = boundedModel.value
         self.thinkingLevel = boundedThinking.value
         self.contextPolicy = boundedPolicy.value
-        self.workingDirectoryPolicy = boundedDirectory.value
+        self.workspaceID = workspaceID
         self.includeContextFiles = includeContextFiles
         self.recordPayloads = recordPayloads
         self.resumePolicy = boundedResume.value
-        self.initialPrompt = boundedPrompt.value
         self.wasTruncated = boundedProvider.wasTruncated || boundedModel.wasTruncated
             || boundedThinking.wasTruncated || boundedPolicy.wasTruncated
-            || boundedDirectory.wasTruncated || boundedResume.wasTruncated
-            || boundedPrompt.wasTruncated
+            || boundedResume.wasTruncated
     }
 
     public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        // Preserve decoded bytes exactly. The host validates these values before any effect;
-        // decoding must not silently truncate an adversarial transport payload.
-        providerID = try container.decodeIfPresent(String.self, forKey: .providerID)
-        modelID = try container.decodeIfPresent(String.self, forKey: .modelID)
-        thinkingLevel = try container.decodeIfPresent(String.self, forKey: .thinkingLevel)
-        contextPolicy = try container.decodeIfPresent(String.self, forKey: .contextPolicy)
-        workingDirectoryPolicy = try container.decodeIfPresent(String.self, forKey: .workingDirectoryPolicy)
-        includeContextFiles = try container.decodeIfPresent(Bool.self, forKey: .includeContextFiles) ?? true
-        recordPayloads = try container.decodeIfPresent(Bool.self, forKey: .recordPayloads) ?? false
-        resumePolicy = try container.decodeIfPresent(String.self, forKey: .resumePolicy)
-        initialPrompt = try container.decodeIfPresent(String.self, forKey: .initialPrompt)
-        wasTruncated = try container.decodeIfPresent(Bool.self, forKey: .wasTruncated) ?? false
+        // A keyed container constrained to CodingKeys silently discards unknown JSON members.
+        // Inspect a dynamic container first so a peer cannot send a path-shaped field (or any
+        // future host-private field) alongside a valid workspaceID and have it accepted by an
+        // older client. This is a deliberately closed, early-stage protocol surface.
+        let dynamic = try decoder.container(keyedBy: AnyCodingKey.self)
+        guard let unknown = dynamic.allKeys.first(where: {
+            CodingKeys(rawValue: $0.stringValue) == nil
+        }) else {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            // Preserve decoded bytes exactly. The host validates these values before any effect;
+            // decoding must not silently truncate an adversarial transport payload.
+            providerID = try container.decodeIfPresent(String.self, forKey: .providerID)
+            modelID = try container.decodeIfPresent(String.self, forKey: .modelID)
+            thinkingLevel = try container.decodeIfPresent(String.self, forKey: .thinkingLevel)
+            contextPolicy = try container.decodeIfPresent(String.self, forKey: .contextPolicy)
+            workspaceID = try container.decodeIfPresent(WorkHostWorkspaceID.self, forKey: .workspaceID)
+            includeContextFiles = try container.decodeIfPresent(Bool.self, forKey: .includeContextFiles) ?? true
+            recordPayloads = try container.decodeIfPresent(Bool.self, forKey: .recordPayloads) ?? false
+            resumePolicy = try container.decodeIfPresent(String.self, forKey: .resumePolicy)
+            wasTruncated = try container.decodeIfPresent(Bool.self, forKey: .wasTruncated) ?? false
+            return
+        }
+        throw DecodingError.dataCorruptedError(
+            forKey: unknown, in: dynamic,
+            debugDescription: "Work configuration contains an unknown field")
     }
 
     /// Decoding is intentionally checked at the effect boundary. Synthesized Codable can
     /// construct a value whose strings exceed the bound while claiming `wasTruncated == false`.
     fileprivate var hasInvalidBodyBounds: Bool {
-        wasTruncated || [providerID, modelID, thinkingLevel, contextPolicy,
-                         workingDirectoryPolicy, resumePolicy, initialPrompt]
+        wasTruncated || [providerID, modelID, thinkingLevel, contextPolicy, resumePolicy]
             .contains { ($0?.utf8.count ?? 0) > WorkServiceBounds.maxCommandValueCharacters }
     }
 
@@ -557,11 +641,10 @@ public struct WorkServiceWorkConfiguration: Codable, Hashable, Sendable {
             modelID: modelID,
             thinkingLevel: thinkingLevel,
             contextPolicy: contextPolicy,
-            workingDirectoryPolicy: workingDirectoryPolicy,
+            workspaceID: workspaceID,
             includeContextFiles: includeContextFiles,
             recordPayloads: recordPayloads,
-            resumePolicy: resumePolicy,
-            initialPrompt: nil)
+            resumePolicy: resumePolicy)
     }
 }
 
@@ -731,15 +814,23 @@ public struct WorkServiceSnapshot: Codable, Hashable, Sendable {
     /// must not reduce an event to a lossy display descriptor before the caller can inspect it.
     public let events: [TimelineEvent]
     public let servedCursor: JournalCursor?
+    /// Service-issued digest of the canonical prefix at `afterCursor` and at `servedCursor`.
+    /// A client may use a durable reducer checkpoint to skip history only when the next read's
+    /// base digest matches the checkpoint's result digest.
+    public let basePrefixDigest: String?
+    public let prefixDigest: String?
     public let omissions: [WorkServiceOmission]
 
     public init(work: WorkServiceWorkDescriptor, events: [TimelineEvent],
                 target: WorkServiceReadTarget, servedCursor: JournalCursor?,
+                basePrefixDigest: String? = nil, prefixDigest: String? = nil,
                 omissions: [WorkServiceOmission] = []) {
         self.work = work
         self.events = events
         self.target = target
         self.servedCursor = servedCursor
+        self.basePrefixDigest = basePrefixDigest
+        self.prefixDigest = prefixDigest
         self.omissions = omissions
     }
 }
@@ -932,15 +1023,22 @@ public struct WorkServiceEventPage: Codable, Hashable, Sendable {
     public let target: WorkServiceReadTarget
     public let servedCursor: JournalCursor?
     public let nextCursor: JournalCursor?
+    /// Service-issued digest of the canonical prefix before and after this page. The controller
+    /// validates the base against its checkpoint/previous page before reducing the events.
+    public let basePrefixDigest: String?
+    public let prefixDigest: String?
     public let omissions: [WorkServiceOmission]
 
     public init(events: [TimelineEvent], target: WorkServiceReadTarget,
                 servedCursor: JournalCursor?,
-                nextCursor: JournalCursor?, omissions: [WorkServiceOmission] = []) {
+                nextCursor: JournalCursor?, basePrefixDigest: String? = nil,
+                prefixDigest: String? = nil, omissions: [WorkServiceOmission] = []) {
         self.events = events
         self.target = target
         self.servedCursor = servedCursor
         self.nextCursor = nextCursor
+        self.basePrefixDigest = basePrefixDigest
+        self.prefixDigest = prefixDigest
         self.omissions = omissions
     }
 }
@@ -1083,8 +1181,9 @@ public struct WorkServiceTerminalCommitProof: Codable, Hashable, Sendable {
     public let operation: WorkServiceTerminalOperation
     public let work: WorkRef
     public let journal: JournalRef
-    /// The exact caller command admitted by the Work service. A proof cannot be replayed for a
-    /// different command ID, client, Session attachment, or causal cursor.
+    /// The exact client-qualified command written to the canonical Work ledger. The external
+    /// receipt retains the caller-local ID; this proof cannot collide with another client's same
+    /// local ID or be replayed across client, Session attachment, or causal cursor.
     public let command: CommandRef
     public let causalWorkCursor: JournalCursor
     /// The canonical Work cursor written by the terminal transaction. The service projects this
@@ -1196,8 +1295,8 @@ public struct WorkServiceTerminalCommitRequest: Codable, Hashable, Sendable {
     public let sessionAttachment: SessionAttachmentRef
     public let causalWorkCursor: JournalCursor
     public let detail: String?
-    /// The exact command envelope, including caller/session/cursor identity, is part of the
-    /// terminal transaction's durable idempotency key.
+    /// The exact client-qualified canonical command envelope, including caller/session/cursor
+    /// identity, is part of the terminal transaction's durable idempotency key.
     public let command: CommandRef
 
     public init(operation: WorkServiceTerminalOperation, work: WorkRef, journal: JournalRef,
@@ -1376,6 +1475,9 @@ public enum WorkServiceCommandReceiptState: String, Codable, Hashable, Sendable 
 public enum WorkServiceCommandOutcome: String, Codable, Hashable, Sendable {
     case created
     case started
+    /// The command has a durable acceptance/delivery record, but no fresh runtime liveness proof
+    /// exists after a host restart. Clients must surface recovery rather than redispatching it.
+    case startRecoveryRequired = "start_recovery_required"
     case inputAccepted = "input_accepted"
     case steeringAccepted = "steering_accepted"
     case queued
@@ -1397,11 +1499,21 @@ public enum WorkServiceCommandRejection: String, Codable, Hashable, Sendable {
     case terminalProofUnavailable = "terminal_proof_unavailable"
 }
 
+/// Provenance of the host-instance value carried by a command receipt. A cold duplicate can
+/// replay the canonical acceptance cursor and host sequence, but older journal schemas do not
+/// carry the accepting Work Host instance. Such a receipt must not present a new daemon instance
+/// as the original author.
+public enum WorkServiceReceiptHostProvenance: String, Codable, Hashable, Sendable {
+    case current
+    case unknown
+}
+
 public struct WorkServiceCommandReceipt: Codable, Hashable, Sendable {
     public let work: WorkRef
     public let commandID: String
     public let state: WorkServiceCommandReceiptState
     public let host: WorkHostInstanceRef
+    public let hostProvenance: WorkServiceReceiptHostProvenance
     /// Work host order exists only for an accepted execution-journal commit. Rejections have no
     /// Work event and therefore carry no synthetic host sequence.
     public let hostSequence: Int?
@@ -1410,27 +1522,33 @@ public struct WorkServiceCommandReceipt: Codable, Hashable, Sendable {
     public let authorization: WorkServiceAuthorizationOutcome
     public let outcome: WorkServiceCommandOutcome?
     public let rejection: WorkServiceCommandRejection?
+    /// Durable command delivery state when a duplicate Start cannot safely claim a live actor.
+    public let recoveryState: CommandDeliveryState?
     public let terminalProof: WorkServiceTerminalCommitProof?
     public let diagnostic: String?
 
     public init(work: WorkRef, commandID: String, state: WorkServiceCommandReceiptState,
                 host: WorkHostInstanceRef, hostSequence: Int? = nil,
+                hostProvenance: WorkServiceReceiptHostProvenance = .current,
                 causalWorkCursor: JournalCursor, resultingWorkCursor: JournalCursor?,
                 authorization: WorkServiceAuthorizationOutcome,
                 outcome: WorkServiceCommandOutcome? = nil,
                 rejection: WorkServiceCommandRejection? = nil,
+                recoveryState: CommandDeliveryState? = nil,
                 terminalProof: WorkServiceTerminalCommitProof? = nil,
                 diagnostic: String? = nil) {
         self.work = work
         self.commandID = commandID
         self.state = state
         self.host = host
+        self.hostProvenance = hostProvenance
         self.hostSequence = hostSequence
         self.causalWorkCursor = causalWorkCursor
         self.resultingWorkCursor = resultingWorkCursor
         self.authorization = authorization
         self.outcome = outcome
         self.rejection = rejection
+        self.recoveryState = recoveryState
         self.terminalProof = terminalProof
         self.diagnostic = WorkServiceText.bound(diagnostic)
     }
@@ -1598,6 +1716,9 @@ public actor InMemoryWorkService: WorkServiceClient {
     public let hostInstance: WorkHostInstanceRef
     private let authorizer: any WorkServiceAuthorizer
     private let terminalCommitter: (any WorkServiceTerminalCommitter)?
+    /// The path-free workspace projection advertised to clients. InMemory hosts default to an
+    /// empty catalog because they do not own a host-local filesystem registry.
+    public let workspaceCatalog: WorkHostWorkspaceCatalog
     private var reachable = true
     private var works: [WorkRef: WorkState] = [:]
     private var createCommands: [CreateCommandKey: StoredCreate] = [:]
@@ -1644,12 +1765,14 @@ public actor InMemoryWorkService: WorkServiceClient {
     public init(host: WorkHostRef, instanceID: String = "instance-1",
                 startIdentity: String = "start-1",
                 authorizer: any WorkServiceAuthorizer,
-                terminalCommitter: (any WorkServiceTerminalCommitter)? = nil) {
+                terminalCommitter: (any WorkServiceTerminalCommitter)? = nil,
+                workspaceCatalog: WorkHostWorkspaceCatalog = .empty) {
         self.host = host
         self.hostInstance = WorkHostInstanceRef(host: host, instanceID: instanceID,
                                                 startIdentity: startIdentity)
         self.authorizer = authorizer
         self.terminalCommitter = terminalCommitter
+        self.workspaceCatalog = workspaceCatalog
         self.controlJournal = JournalRef.workHost(host)
         self.controlCursor = JournalCursor(journal: JournalRef.workHost(host), sequence: 0)
     }
@@ -1745,7 +1868,19 @@ public actor InMemoryWorkService: WorkServiceClient {
             throw WorkServiceProtocolError.invalidRequest(
                 "retained Session events must end at the advertised cursor")
         }
-        guard seed.disposition == .reusable
+        let validExecutionRunCombination: Bool
+        switch seed.execution {
+        case .idle:
+            validExecutionRunCombination = seed.currentRun == nil
+        case .running, .held, .canceling, .ending:
+            validExecutionRunCombination = seed.currentRun != nil
+        case .recoveryRequired, .unknown:
+            // These states are intentionally seedable so a conformance test can verify their
+            // non-actionable projection. They never become commandable through any apply guard.
+            validExecutionRunCombination = true
+        }
+        guard validExecutionRunCombination,
+              seed.disposition == .reusable
                 || (seed.execution == .idle && seed.currentRun == nil) else {
             throw WorkServiceProtocolError.invalidRequest("invalid execution/run combination")
         }
@@ -1811,7 +1946,7 @@ public actor InMemoryWorkService: WorkServiceClient {
             supportedRange: WorkServiceProtocol.minimumSupportedVersion...WorkServiceProtocol.maximumSupportedVersion,
             host: host, hostInstance: hostInstance,
             controlJournal: controlJournal, controlCursor: controlCursor,
-            capabilities: supportedCapabilities())
+            capabilities: supportedCapabilities(), workspaceCatalog: workspaceCatalog)
     }
 
     public func listWorks(_ request: WorkServiceListRequest) async throws -> WorkServiceWorkPage {
@@ -1875,6 +2010,7 @@ public actor InMemoryWorkService: WorkServiceClient {
             throw WorkServiceProtocolError.invalidRequest(
                 "create causal control cursor is not current")
         }
+        try validateWorkspaceSelection(request.configuration)
         var workID: String
         repeat {
             workID = "work-\(nextWorkOrdinal)"
@@ -2186,12 +2322,14 @@ public actor InMemoryWorkService: WorkServiceClient {
         }
         let baselineCursor = request.afterCursor
             ?? JournalCursor(journal: target.journal, sequence: 0)
+        let servedCursor = events.last.map {
+            JournalCursor(journal: target.journal, eventID: $0.eventID, sequence: $0.sequence)
+        } ?? baselineCursor
         return WorkServiceSnapshot(work: descriptor(for: state.work, includeObservation: true)!,
                                    events: events, target: request.target,
-                                   servedCursor: events.last.map {
-                                       JournalCursor(journal: target.journal,
-                                                     eventID: $0.eventID, sequence: $0.sequence)
-                                   } ?? baselineCursor,
+                                   servedCursor: servedCursor,
+                                   basePrefixDigest: prefixDigest(target.events, cursor: baselineCursor),
+                                   prefixDigest: prefixDigest(target.events, cursor: servedCursor),
                                    omissions: omissions)
     }
 
@@ -2213,12 +2351,16 @@ public actor InMemoryWorkService: WorkServiceClient {
             if event.sequence > after { count += 1 }
         }
         let hasMore = availableCount > events.count
+        let baselineCursor = request.afterCursor
+        let servedCursor = events.last.map {
+            JournalCursor(journal: target.journal, eventID: $0.eventID, sequence: $0.sequence)
+        } ?? baselineCursor
         return WorkServiceEventPage(
             events: events, target: request.target,
-            servedCursor: events.last.map {
-                JournalCursor(journal: target.journal, eventID: $0.eventID, sequence: $0.sequence)
-            } ?? request.afterCursor,
+            servedCursor: servedCursor,
             nextCursor: hasMore ? next : nil,
+            basePrefixDigest: prefixDigest(target.events, cursor: baselineCursor),
+            prefixDigest: prefixDigest(target.events, cursor: servedCursor),
             omissions: hasMore
                 ? [WorkServiceOmission(
                     category: bytesLimited ? "event_bytes" : "events",
@@ -2675,11 +2817,13 @@ public actor InMemoryWorkService: WorkServiceClient {
                 return receipt
             }
             let operation: WorkServiceTerminalOperation = request.kind == .complete ? .complete : .destroy
+            let canonicalCommand = WorkServiceCommandLedgerIdentity.command(
+                from: request.command, client: clientID)
             let proofRequest = WorkServiceTerminalCommitRequest(
                 operation: operation, work: state.work, journal: state.journal,
                 client: clientID, session: session, sessionJournal: sessionJournal,
                 sessionAttachment: sessionAttachment,
-                causalWorkCursor: causal, detail: request.value, command: request.command)
+                causalWorkCursor: causal, detail: request.value, command: canonicalCommand)
             state.terminalReservation = TerminalReservation(
                 key: key, request: request, proofRequest: proofRequest,
                 phase: .committing, unavailableReceipt: nil)
@@ -2699,9 +2843,16 @@ public actor InMemoryWorkService: WorkServiceClient {
         }
         let hostSequence = state.nextHostSequence
         state.nextHostSequence += 1
+        let canonicalCommand = WorkServiceCommandLedgerIdentity.command(
+            from: request.command, client: clientID)
+        if request.kind == .start {
+            _ = appendEvent(
+                kind: TimelineEventType.runStarted, commandID: nil,
+                command: nil, body: nil, hostSequence: nil, state: &state)
+        }
         let eventCursor = appendEvent(
-            kind: request.kind.rawValue, commandID: request.command.commandID,
-            command: request.command, body: request.value, hostSequence: hostSequence,
+            kind: TimelineEventType.commandAccepted, commandID: canonicalCommand.commandID,
+            command: canonicalCommand, body: request.value, hostSequence: hostSequence,
             state: &state)
         let receipt = WorkServiceCommandReceipt(
             work: state.work, commandID: request.command.commandID, state: .accepted,
@@ -2726,9 +2877,12 @@ public actor InMemoryWorkService: WorkServiceClient {
         guard state.execution == .running || state.execution == .held || state.execution == .canceling || state.execution == .ending else {
             throw WorkServiceProtocolError.invalidRequest("run is not finishable")
         }
+        // The terminal Run identity belongs on the canonical event. Clear the live projection
+        // only after appending it; otherwise a cold reducer sees `run.finished` with no Run and
+        // correctly quarantines the Work.
+        _ = appendEvent(kind: TimelineEventType.runFinished, commandID: nil, state: &state)
         state.execution = .idle
         state.currentRun = nil
-        _ = appendEvent(kind: "run.finished", commandID: nil, state: &state)
         works[work] = state
     }
 
@@ -2870,7 +3024,7 @@ public actor InMemoryWorkService: WorkServiceClient {
         var bytesLimited = false
         for event in events where event.sequence > after {
             if selected.count >= limit { break }
-            let eventBytes = try JSONEncoder().encode(event).count
+            let eventBytes = try WorkServiceEventPageSizing.encodedByteCount(of: event)
             guard eventBytes <= byteLimit - encodedBytes else {
                 if selected.isEmpty {
                     throw WorkServiceProtocolError.eventPageCannotProgress(
@@ -2883,6 +3037,24 @@ public actor InMemoryWorkService: WorkServiceClient {
             encodedBytes += eventBytes
         }
         return (selected, bytesLimited)
+    }
+
+    /// Digest the canonical event prefix, including the exact journal and cursor identity. This
+    /// is service-issued evidence for a local reducer checkpoint; it is not a client-computed
+    /// substitute for reading and validating the events during the current refresh.
+    private func prefixDigest(_ events: [TimelineEvent], cursor: JournalCursor) -> String {
+        var data = Data()
+        data.append(Data((cursor.journal.stableKey + "\u{0}" + String(cursor.sequence)
+            + "\u{0}" + (cursor.eventID ?? "") + "\u{0}").utf8))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        for event in events where event.sequence <= cursor.sequence {
+            if let encoded = try? encoder.encode(event) {
+                data.append(encoded)
+                data.append(0)
+            }
+        }
+        return WorkServiceText.digest(data)
     }
 
     private func readAcknowledgements(
@@ -2978,7 +3150,8 @@ public actor InMemoryWorkService: WorkServiceClient {
             state.execution = .running
             return .started
         case .send:
-            guard state.execution == .running, state.currentRun != nil else { return nil }
+            guard (state.execution == .running || state.execution == .idle),
+                  state.currentRun != nil else { return nil }
             return .inputAccepted
         case .steer:
             guard state.execution == .running, state.currentRun != nil else { return nil }
@@ -2995,7 +3168,9 @@ public actor InMemoryWorkService: WorkServiceClient {
             state.execution = .canceling
             return .cancellationRequested
         case .end:
-            guard state.execution == .running || state.execution == .held || state.execution == .canceling else { return nil }
+            guard state.execution == .running || state.execution == .held
+                    || state.execution == .canceling
+                    || (state.execution == .idle && state.currentRun != nil) else { return nil }
             state.execution = .ending
             return .endRequested
         case .destroy:
@@ -3181,6 +3356,25 @@ public actor InMemoryWorkService: WorkServiceClient {
             diagnostic: receipt.state == .rejected ? receipt.diagnostic : "idempotent duplicate")
     }
 
+    /// In-memory hosts with a catalog model the same opaque-ID admission rule as the durable
+    /// host. An empty catalog is an explicit conformance-host choice and remains permissive; once
+    /// a host advertises entries, Create must name one currently resolvable entry and may not
+    /// smuggle a path-shaped selector through an untyped field.
+    private func validateWorkspaceSelection(
+        _ configuration: WorkServiceWorkConfiguration
+    ) throws {
+        guard !workspaceCatalog.entries.isEmpty else { return }
+        guard let workspaceID = configuration.workspaceID,
+              let descriptor = workspaceCatalog.entries.first(where: {
+                  $0.workspaceID == workspaceID
+              }),
+              descriptor.availability == .available,
+              descriptor.capabilities.contains(.resolve) else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "Create requires an available workspaceID advertised by this Work Host")
+        }
+    }
+
     private func appendEvent(kind: String, commandID: String?, command: CommandRef? = nil,
                              body: String? = nil, hostSequence: Int? = nil,
                              state: inout WorkState) -> JournalCursor {
@@ -3221,6 +3415,9 @@ public actor InMemoryWorkService: WorkServiceClient {
             eventID: eventID, journal: state.journal, sequence: sequence,
             hostSequence: hostSequence, idempotencyKey: commandID, command: command,
             previousEventID: state.events.last?.eventID,
+            causedByEventID: command?.causalCursor?.eventID.map {
+                EventRef(journal: state.journal, eventID: $0)
+            },
             session: state.session, work: state.work, workHost: host,
             client: command?.client, sessionAttachment: command?.sessionAttachment,
             run: state.currentRun,
@@ -3411,7 +3608,7 @@ private enum WorkServiceText {
     }
 
     static func digest(_ data: Data) -> String {
-        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        "sha256:" + AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     static func precedes(_ lhs: WorkRef, _ rhs: WorkRef) -> Bool {

@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 @testable import AviaryCore
 
 private enum ReaderCensusFixtureFiles {
@@ -217,7 +216,7 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
     XCTAssertEqual(workEvents.first { $0.eventID == "w14" }?.payload["delivery_mode"]?.stringValue, "queued")
     XCTAssertEqual(workEvents.first { $0.eventID == "w15" }?.payload["command_kind"]?.stringValue, "steer")
     XCTAssertEqual(workEvents.first { $0.eventID == "w15" }?.payload["late"]?.boolValue, true)
-    XCTAssertEqual(workEvents.first { $0.eventID == "w11" }?.payload["action_kind"]?.stringValue, "tool")
+    XCTAssertEqual(workEvents.first { $0.eventID == "w11" }?.payload["kind"]?.stringValue, "mcp")
     XCTAssertEqual(workEvents.first { $0.eventID == "w11" }?.payload["tool_name"]?.stringValue, "shell")
 
     // Every retained body named by the manifest is addressable by a context body reference, and
@@ -236,7 +235,7 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
         })
         XCTAssertEqual(component.bodyReference?.byteCount, body.count)
         XCTAssertEqual(component.fullByteCount, body.count)
-        let digest = SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
+        let digest = AviarySHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
         XCTAssertEqual(component.bodyReference?.digest, "sha256:\(digest)")
     }
 
@@ -553,6 +552,6 @@ func test_readerCensusManifestAndRetainedBodiesRoundTrip() throws {
         }
         XCTAssertEqual(body.count, expected.0)
         XCTAssertEqual(
-            SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined(), expected.1)
+            AviarySHA256.hash(data: body).map { String(format: "%02x", $0) }.joined(), expected.1)
     }
 }

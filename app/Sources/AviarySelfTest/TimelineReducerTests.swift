@@ -28,6 +28,7 @@ private func reducerEvent(
     causedBy: EventRef? = nil,
     parent: EventRef? = nil,
     conversationParent: EventRef? = nil,
+    clientTimestamp: Date? = nil,
     schemaVersion: Int = TimelineEvent.currentSchemaVersion,
     payloadVersion: Int = 1,
     declaredDomains: Set<TimelineDomain> = [],
@@ -43,6 +44,7 @@ private func reducerEvent(
         clientAttachment: clientAttachment, run: run, turn: turn, action: action,
         handle: handle, actor: TimelineActor(actorID: "self-test", kind: "test"),
         hostRecordedAt: Date(timeIntervalSince1970: Double(sequence)),
+        clientTimestamp: clientTimestamp,
         schemaVersion: schemaVersion, payloadVersion: payloadVersion,
         type: type, declaredDomains: declaredDomains, links: links, payload: payload)
 }
@@ -69,9 +71,13 @@ func test_timelineReducersLinkSessionsAndWork() throws {
         reducerEvent(TimelineEventType.turnStarted, id: "w4", sequence: 4, journal: reducerWorkJournal,
                      previous: "w3", run: run, turn: turn),
         reducerEvent(TimelineEventType.actionIntent, id: "w5", sequence: 5, journal: reducerWorkJournal,
-                     previous: "w4", action: action, payload: .object(["state": "proposed"])),
+                     previous: "w4", action: action, payload: .object([
+                         "state": "proposed", "kind": "python", "intent": "run fixture action"
+                     ])),
         reducerEvent(TimelineEventType.actionStarted, id: "w6", sequence: 6, journal: reducerWorkJournal,
-                     previous: "w5", action: action, payload: .object(["state": "running"])),
+                     previous: "w5", action: action, payload: .object([
+                         "state": "running", "kind": "python"
+                     ])),
         reducerEvent(TimelineEventType.handleStarted, id: "w7", sequence: 7, journal: reducerWorkJournal,
                      previous: "w6", run: run, handle: handle,
                      payload: .object(["state": .string("running")])),
@@ -196,10 +202,12 @@ func test_timelineReducersLiveAndColdPrefixEquivalence() throws {
                      previous: "p2", work: reducerWork, run: run),
         reducerEvent(TimelineEventType.actionIntent, id: "p4", sequence: 4, journal: reducerWorkJournal,
                      previous: "p3", work: reducerWork, action: action,
-                     payload: .object(["state": "proposed"])),
+                     payload: .object([
+                         "state": "proposed", "kind": "python", "intent": "equivalence action"
+                     ])),
         reducerEvent(TimelineEventType.actionStarted, id: "p5", sequence: 5, journal: reducerWorkJournal,
                      previous: "p4", work: reducerWork, action: action,
-                     payload: .object(["state": "running"])),
+                     payload: .object(["state": "running", "kind": "python"])),
         reducerEvent(TimelineEventType.actionOutcome, id: "p6", sequence: 6, journal: reducerWorkJournal,
                      previous: "p5", work: reducerWork, action: action,
                      payload: .object(["state": "succeeded", "retry_safety": "idempotent"])),
@@ -371,6 +379,167 @@ func test_timelineReducerRejectsEmptyActivityIdentities() throws {
     XCTAssertTrue(snapshot.handles.isEmpty)
     XCTAssertTrue(snapshot.commands.isEmpty)
     XCTAssertEqual(snapshot.quarantinedEvents.count, 3)
+}
+
+func test_sessionReducerAppendsUnselectedMessagesAndRebuildsOnlyAtTipSelection() throws {
+    let created = reducerEvent(
+        TimelineEventType.sessionCreated, id: "projection-created", sequence: 1,
+        journal: reducerSessionJournal, session: reducerSession)
+    let toolOnly = reducerEvent(
+        TimelineEventType.messageCommitted, id: "projection-tool", sequence: 2,
+        journal: reducerSessionJournal, previous: created.eventID, session: reducerSession,
+        payload: .object(["role": .string("assistant"), "text": .string("")]))
+    let root = reducerEvent(
+        TimelineEventType.messageCommitted, id: "projection-root", sequence: 3,
+        journal: reducerSessionJournal, previous: toolOnly.eventID, session: reducerSession,
+        payload: .object(["role": .string("user"), "text": .string("root")]))
+    let child = reducerEvent(
+        TimelineEventType.messageCommitted, id: "projection-child", sequence: 4,
+        journal: reducerSessionJournal, previous: root.eventID, session: reducerSession,
+        conversationParent: EventRef(journal: reducerSessionJournal, eventID: root.eventID),
+        payload: .object(["role": .string("assistant"), "text": .string("child")]))
+    let selectRoot = reducerEvent(
+        TimelineEventType.sessionTipSelected, id: "projection-select-root", sequence: 5,
+        journal: reducerSessionJournal, previous: child.eventID, session: reducerSession,
+        conversationParent: EventRef(journal: reducerSessionJournal, eventID: root.eventID))
+    let selectedBranchMessage = reducerEvent(
+        TimelineEventType.messageCommitted, id: "projection-branch-child", sequence: 6,
+        journal: reducerSessionJournal, previous: selectRoot.eventID, session: reducerSession,
+        conversationParent: EventRef(journal: reducerSessionJournal, eventID: child.eventID),
+        payload: .object(["role": .string("assistant"), "text": .string("selected later")]))
+    let unselectedBranchMessage = reducerEvent(
+        TimelineEventType.messageCommitted, id: "projection-other-branch", sequence: 7,
+        journal: reducerSessionJournal, previous: selectedBranchMessage.eventID,
+        session: reducerSession,
+        conversationParent: EventRef(journal: reducerSessionJournal, eventID: root.eventID),
+        payload: .object(["role": .string("assistant"), "text": .string("other branch")]))
+    let compaction = reducerEvent(
+        TimelineEventType.compaction, id: "projection-compaction", sequence: 8,
+        journal: reducerSessionJournal, previous: unselectedBranchMessage.eventID,
+        session: reducerSession, payload: .object(["summary": .string("root remains selected")]))
+    let selectChild = reducerEvent(
+        TimelineEventType.sessionTipSelected, id: "projection-select-child", sequence: 9,
+        journal: reducerSessionJournal, previous: compaction.eventID,
+        session: reducerSession,
+        conversationParent: EventRef(journal: reducerSessionJournal, eventID: child.eventID))
+
+    var reducer = SessionReducer()
+    for event in [created, toolOnly, root, child, selectRoot] { reducer.apply(event) }
+    XCTAssertEqual(reducer.snapshot.messages.map(\.text), ["root"])
+    XCTAssertEqual(reducer.visibleProjectionRebuildCount, 1)
+    XCTAssertEqual(reducer.visibleProjectionMessagesScanned, 3)
+
+    reducer.apply(selectedBranchMessage)
+    reducer.apply(unselectedBranchMessage)
+    // A selected branch is stable while unrelated/new messages arrive.
+    XCTAssertEqual(reducer.snapshot.messages.map(\.text), ["root"])
+    XCTAssertEqual(reducer.visibleProjectionRebuildCount, 1)
+    XCTAssertEqual(reducer.visibleProjectionMessagesScanned, 3)
+
+    reducer.apply(compaction)
+    XCTAssertEqual(reducer.snapshot.messages.map(\.text), ["root"])
+    XCTAssertEqual(reducer.visibleProjectionRebuildCount, 1)
+    XCTAssertEqual(reducer.visibleProjectionMessagesScanned, 3)
+
+    reducer.apply(selectChild)
+    XCTAssertEqual(reducer.snapshot.messages.map(\.text), ["root", "child"])
+    XCTAssertEqual(reducer.visibleProjectionRebuildCount, 1)
+    XCTAssertEqual(reducer.visibleProjectionMessagesScanned, 3)
+    XCTAssertEqual(reducer.visibleProjectionFastPathCount, 1)
+
+    // The same prefix reduced cold must produce the same durable projection.  The instrumentation
+    // is intentionally not part of SessionSnapshot and therefore does not affect this equality.
+    let cold = SessionReducer.reduce(
+        [created, toolOnly, root, child, selectRoot, selectedBranchMessage, unselectedBranchMessage,
+         compaction, selectChild])
+    XCTAssertEqual(cold, reducer.snapshot)
+}
+
+func test_sessionReducerMessageAppendScaleUsesNoHistoryRescan() throws {
+    let messageCount = 2_048
+    let created = reducerEvent(
+        TimelineEventType.sessionCreated, id: "scale-created", sequence: 1,
+        journal: reducerSessionJournal, session: reducerSession)
+    var events = [created]
+    events.reserveCapacity(messageCount + 1)
+    var previous = created.eventID
+    var parent: EventRef?
+    for index in 0..<messageCount {
+        let id = "scale-message-\(index)"
+        let event = reducerEvent(
+            TimelineEventType.messageCommitted, id: id, sequence: index + 2,
+            journal: reducerSessionJournal, previous: previous, session: reducerSession,
+            conversationParent: parent,
+            payload: .object([
+                "role": .string(index.isMultiple(of: 2) ? "user" : "assistant"),
+                "text": .string("message-\(index)"),
+            ]))
+        events.append(event)
+        previous = id
+        parent = EventRef(journal: reducerSessionJournal, eventID: id)
+    }
+
+    var live = SessionReducer()
+    for event in events { live.apply(event) }
+    XCTAssertEqual(live.snapshot.messageHistory.count, messageCount)
+    XCTAssertEqual(live.snapshot.messages.count, messageCount)
+    XCTAssertEqual(live.visibleProjectionRebuildCount, 0)
+    XCTAssertEqual(live.visibleProjectionMessagesScanned, 0)
+
+    // Selecting a tip is the explicit semantic operation that pays the linear branch-validation
+    // and rebuild cost once; ordinary appends above must not accumulate that cost quadratically.
+    let selectTip = reducerEvent(
+        TimelineEventType.sessionTipSelected, id: "scale-tip", sequence: messageCount + 2,
+        journal: reducerSessionJournal, previous: previous, session: reducerSession,
+        conversationParent: parent)
+    live.apply(selectTip)
+    XCTAssertEqual(live.snapshot.messages.count, messageCount)
+    XCTAssertEqual(live.visibleProjectionRebuildCount, 1)
+    XCTAssertEqual(live.visibleProjectionMessagesScanned, messageCount)
+}
+
+func test_sessionReducerProducerMessageTipSequenceStaysLinear() throws {
+    let messageCount = 2_048
+    let created = reducerEvent(
+        TimelineEventType.sessionCreated, id: "producer-created", sequence: 1,
+        journal: reducerSessionJournal, session: reducerSession)
+
+    var reducer = SessionReducer()
+    reducer.apply(created)
+    var previousEventID = created.eventID
+    var previousMessage: EventRef?
+
+    for index in 0..<messageCount {
+        let messageID = "producer-message-\(index)"
+        let message = reducerEvent(
+            TimelineEventType.messageCommitted, id: messageID, sequence: index * 2 + 2,
+            journal: reducerSessionJournal, previous: previousEventID, session: reducerSession,
+            conversationParent: previousMessage,
+            payload: .object([
+                "role": .string(index.isMultiple(of: 2) ? "user" : "assistant"),
+                "text": .string("producer-message-\(index)"),
+            ]))
+        reducer.apply(message)
+
+        let tip = reducerEvent(
+            TimelineEventType.sessionTipSelected, id: "producer-tip-\(index)", sequence: index * 2 + 3,
+            journal: reducerSessionJournal, previous: messageID, session: reducerSession,
+            conversationParent: EventRef(journal: reducerSessionJournal, eventID: messageID))
+        reducer.apply(tip)
+        previousEventID = tip.eventID
+        previousMessage = EventRef(journal: reducerSessionJournal, eventID: messageID)
+    }
+
+    XCTAssertEqual(reducer.snapshot.messageHistory.count, messageCount)
+    XCTAssertEqual(reducer.snapshot.messages.count, messageCount)
+    XCTAssertEqual(reducer.snapshot.messages.map(\.eventID).last, "producer-message-\(messageCount - 1)")
+    // The first selection builds the initial branch. Every native producer-shaped subsequent
+    // message+tip pair extends that branch and must not rescan the historical message list.
+    XCTAssertEqual(reducer.visibleProjectionRebuildCount, 1)
+    XCTAssertEqual(reducer.visibleProjectionMessagesScanned, 1)
+    XCTAssertEqual(reducer.visibleProjectionFastPathCount, messageCount - 1)
+    XCTAssertTrue(reducer.visibleProjectionMessagesScanned + reducer.visibleProjectionFastPathCount
+                  <= messageCount + 1)
 }
 
 func test_timelineReducerRejectsInvalidTurnAndHandleActivityEnvelopes() throws {
@@ -663,7 +832,9 @@ func test_timelineValidatesActionLifecycleContextAndSemanticTip() throws {
                                     payload: .object(["state": "running"]))
     let intent = reducerEvent(TimelineEventType.actionIntent, id: "v2", sequence: 1,
                               journal: reducerWorkJournal, action: action,
-                              payload: .object(["state": "proposed"]))
+                              payload: .object([
+                                  "state": "proposed", "kind": "python", "intent": "outstanding action"
+                              ]))
     var invalidWork = WorkReducer()
     invalidWork.apply(invalidStart)
     XCTAssertEqual(invalidWork.snapshot.quarantinedEvents, [invalidStart])
@@ -732,6 +903,161 @@ func test_timelineValidatesActionLifecycleContextAndSemanticTip() throws {
     branchSession.apply(child)
     branchSession.apply(select)
     XCTAssertEqual(branchSession.snapshot.messages.map(\.text), ["root", "child"])
+}
+
+func test_timelineProjectsCanonicalMessageAndActionMetadataAcrossIncrementalPages() throws {
+    let run = RunRef("metadata-run")
+    let turn = TurnRef("metadata-turn")
+    let action = ActionRef("metadata-action")
+    let causedBy = EventRef(journal: reducerWorkJournal, eventID: "metadata-run-start")
+    let links = [TimelineLink(kind: .supports, target: causedBy)]
+    let workEvents = [
+        reducerEvent(TimelineEventType.workCreated, id: "metadata-work-1", sequence: 1,
+                     journal: reducerWorkJournal, work: reducerWork,
+                     workHost: WorkHostRef(reducerWork.workHostID)),
+        reducerEvent(TimelineEventType.runStarted, id: "metadata-run-start", sequence: 2,
+                     journal: reducerWorkJournal, previous: "metadata-work-1", work: reducerWork,
+                     run: run, payload: .object(["model_id": .string("model-metadata")])),
+        reducerEvent(TimelineEventType.turnStarted, id: "metadata-turn-start", sequence: 3,
+                     journal: reducerWorkJournal, previous: "metadata-run-start", work: reducerWork,
+                     run: run, turn: turn),
+        reducerEvent(TimelineEventType.actionIntent, id: "metadata-action-intent", sequence: 4,
+                     journal: reducerWorkJournal, previous: "metadata-turn-start", work: reducerWork,
+                     run: run, turn: turn, action: action, causedBy: causedBy,
+                     clientTimestamp: Date(timeIntervalSince1970: 104), links: links,
+                     payload: .object([
+                         "state": .string("proposed"), "kind": .string("python"),
+                         "intent": .string("run the checked script"),
+                         "target": .string("workspace"), "scope": .string("turn"),
+                         "metadata": .object([
+                             "argv": .array([.string("python"), .string("script.py")]),
+                             "attempt": .number(1), "structured": .object(["safe": .bool(true)])
+                         ])
+                     ])),
+        reducerEvent(TimelineEventType.actionStarted, id: "metadata-action-started", sequence: 5,
+                     journal: reducerWorkJournal, previous: "metadata-action-intent", work: reducerWork,
+                     run: run, turn: turn, action: action,
+                     causedBy: EventRef(journal: reducerWorkJournal, eventID: "metadata-action-intent"),
+                     parent: EventRef(journal: reducerWorkJournal, eventID: "metadata-action-intent"),
+                     clientTimestamp: Date(timeIntervalSince1970: 105),
+                     payload: .object(["state": .string("running"), "kind": .string("python")])),
+        reducerEvent(TimelineEventType.actionOutcome, id: "metadata-action-outcome", sequence: 6,
+                     journal: reducerWorkJournal, previous: "metadata-action-started", work: reducerWork,
+                     run: run, turn: turn, action: action,
+                     causedBy: EventRef(journal: reducerWorkJournal, eventID: "metadata-action-started"),
+                     parent: EventRef(journal: reducerWorkJournal, eventID: "metadata-action-started"),
+                     clientTimestamp: Date(timeIntervalSince1970: 106),
+                     links: [TimelineLink(kind: .produced,
+                                          target: EventRef(journal: reducerWorkJournal,
+                                                           eventID: "metadata-action-intent"))],
+                     payload: .object([
+                         "state": .string("failed"), "kind": .string("python"),
+                         "failure_kind": .string("timeout"), "retry_safety": .string("unknown")
+                     ])),
+    ]
+
+    var liveWork = WorkReducer()
+    for event in workEvents { liveWork.apply(event) }
+    let coldWork = WorkReducer.reduce(workEvents)
+    XCTAssertEqual(liveWork.snapshot, coldWork)
+    let projectedAction = try XCTUnwrap(coldWork.actions[action.actionID])
+    XCTAssertEqual(projectedAction.kind, .python)
+    XCTAssertEqual(projectedAction.intent, "run the checked script")
+    XCTAssertEqual(projectedAction.target, "workspace")
+    XCTAssertEqual(projectedAction.scope, "turn")
+    XCTAssertEqual(projectedAction.metadata["attempt"], .number(1))
+    XCTAssertEqual(projectedAction.metadata["argv"], .array([.string("python"), .string("script.py")]))
+    XCTAssertEqual(projectedAction.state, .failed)
+    XCTAssertEqual(projectedAction.failureKind, .timeout)
+    XCTAssertEqual(projectedAction.retrySafety, .unknown)
+    XCTAssertEqual(projectedAction.intentEvent?.sourceEvent.eventID, "metadata-action-intent")
+    XCTAssertEqual(projectedAction.intentEvent?.run, run)
+    XCTAssertEqual(projectedAction.intentEvent?.turn, turn)
+    XCTAssertEqual(projectedAction.intentEvent?.hostRecordedAt,
+                   Date(timeIntervalSince1970: 4))
+    XCTAssertEqual(projectedAction.intentEvent?.clientTimestamp,
+                   Date(timeIntervalSince1970: 104))
+    XCTAssertEqual(projectedAction.intentEvent?.causedBy, causedBy)
+    XCTAssertEqual(projectedAction.intentEvent?.links, links)
+    XCTAssertEqual(projectedAction.startedEvent?.sourceEvent.eventID, "metadata-action-started")
+    XCTAssertEqual(projectedAction.startedEvent?.parentActivity?.eventID, "metadata-action-intent")
+    XCTAssertEqual(projectedAction.startedEvent?.clientTimestamp,
+                   Date(timeIntervalSince1970: 105))
+    XCTAssertEqual(projectedAction.outcomeEvent?.sourceEvent.eventID, "metadata-action-outcome")
+    XCTAssertEqual(projectedAction.outcomeEvent?.turn, turn)
+    XCTAssertEqual(projectedAction.outcomeEvent?.hostRecordedAt,
+                   Date(timeIntervalSince1970: 6))
+    XCTAssertEqual(projectedAction.outcomeEvent?.clientTimestamp,
+                   Date(timeIntervalSince1970: 106))
+
+    let clientTime = Date(timeIntervalSince1970: 987_654)
+    let userEvent = reducerEvent(
+        TimelineEventType.inputAccepted, id: "metadata-user", sequence: 2,
+        journal: reducerSessionJournal, previous: "metadata-session", session: reducerSession,
+        run: run, turn: turn,
+        causedBy: EventRef(journal: reducerSessionJournal, eventID: "metadata-command"),
+        parent: EventRef(journal: reducerWorkJournal, eventID: "metadata-action-outcome"),
+        clientTimestamp: clientTime,
+        payload: .object(["text": .string("exact user message")]))
+    let assistantEvent = reducerEvent(
+        TimelineEventType.messageCommitted, id: "metadata-assistant", sequence: 3,
+        journal: reducerSessionJournal, previous: userEvent.eventID, session: reducerSession,
+        run: run, turn: turn,
+        causedBy: EventRef(journal: reducerSessionJournal, eventID: userEvent.eventID),
+        parent: EventRef(journal: reducerWorkJournal, eventID: "metadata-action-outcome"),
+        conversationParent: EventRef(journal: reducerSessionJournal, eventID: userEvent.eventID),
+        links: [TimelineLink(kind: .produced,
+                             target: EventRef(journal: reducerWorkJournal,
+                                              eventID: "metadata-action-outcome"))],
+        payload: .object(["role": .string("assistant"), "text": .string("exact assistant message")]))
+    let tip = reducerEvent(
+        TimelineEventType.sessionTipSelected, id: "metadata-tip", sequence: 4,
+        journal: reducerSessionJournal, previous: assistantEvent.eventID, session: reducerSession,
+        conversationParent: EventRef(journal: reducerSessionJournal, eventID: assistantEvent.eventID))
+    let sessionEvents = [
+        reducerEvent(TimelineEventType.sessionCreated, id: "metadata-session", sequence: 1,
+                     journal: reducerSessionJournal, session: reducerSession),
+        userEvent, assistantEvent, tip,
+    ]
+    var liveSession = SessionReducer()
+    for event in sessionEvents { liveSession.apply(event) }
+    let coldSession = SessionReducer.reduce(sessionEvents)
+    XCTAssertEqual(liveSession.snapshot, coldSession)
+    XCTAssertEqual(coldSession.messages.map(\.text), ["exact user message", "exact assistant message"])
+    let user = try XCTUnwrap(coldSession.messages.first)
+    let assistant = try XCTUnwrap(coldSession.messages.last)
+    XCTAssertEqual(user.sourceEvent, EventRef(journal: reducerSessionJournal, eventID: userEvent.eventID))
+    XCTAssertEqual(user.hostRecordedAt, Date(timeIntervalSince1970: 2))
+    XCTAssertEqual(user.clientTimestamp, clientTime)
+    XCTAssertEqual(user.run, run)
+    XCTAssertEqual(user.turn, turn)
+    XCTAssertEqual(user.causedBy?.eventID, "metadata-command")
+    XCTAssertEqual(user.parentActivity?.eventID, "metadata-action-outcome")
+    XCTAssertEqual(assistant.sourceEvent?.eventID, assistantEvent.eventID)
+    XCTAssertEqual(assistant.conversationParent?.eventID, userEvent.eventID)
+    XCTAssertEqual(assistant.links.first?.kind, .produced)
+    XCTAssertEqual(assistant.links.first?.target, .event(
+        EventRef(journal: reducerWorkJournal, eventID: "metadata-action-outcome")))
+    XCTAssertNil(assistant.clientTimestamp)
+
+    // Bounds are measured in UTF-8 bytes, but truncation never bisects a Unicode scalar or
+    // grapheme cluster. The marker-like metadata remains structured producer data, not a wire
+    // parser heuristic.
+    let unicode = String(repeating: "🙂", count: WorkActionSnapshot.maxTextBytes)
+    let bounded = WorkActionSnapshot(
+        action: ActionRef("unicode-action"), kind: .mcp, intent: unicode,
+        metadata: ["unicode": .string(unicode)])
+    XCTAssertTrue((bounded.intent?.utf8.count ?? Int.max) <= WorkActionSnapshot.maxTextBytes)
+    XCTAssertFalse(bounded.intent?.contains("�") ?? true)
+    XCTAssertTrue(bounded.metadataWasTruncated)
+    if case .string(let value) = bounded.metadata["unicode"] {
+        XCTAssertTrue(value.utf8.count <= 512)
+        XCTAssertFalse(value.contains("�"))
+        let expectedPrefix = String(repeating: "🙂", count: 512 / "🙂".utf8.count)
+        XCTAssertEqual(value, expectedPrefix)
+    } else {
+        XCTFail("bounded structured metadata should retain its typed string value")
+    }
 }
 
 func test_timelineProjectsCommandReceiptsAndRejectsHostReordering() throws {

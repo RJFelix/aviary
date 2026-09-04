@@ -196,24 +196,34 @@ public struct WorkReducer: Sendable {
             guard let action = event.action, !action.actionID.isEmpty,
                   let existing = snapshot.actions[action.actionID],
                   existing.state == .proposed,
+                  validActionEventPayload(event),
+                  event.payload["kind"] == nil || actionKind(in: event) == existing.kind,
                   let state = event.payload["state"]?.stringValue.flatMap(ActionExecutionState.init(rawValue:)),
                   state == .queued || state == .running
             else {
                 quarantine(event, reason: "action start requires a prior action intent")
                 return
             }
-            snapshot.actions[action.actionID] = WorkActionSnapshot(action: action, state: state)
+            snapshot.actions[action.actionID] = existing.withStarted(event, state: state)
             snapshot.activeActionIDs.insert(action.actionID)
             snapshot.execution = .running
         case TimelineEventType.actionIntent:
             guard let action = event.action, !action.actionID.isEmpty,
                   snapshot.actions[action.actionID] == nil,
+                  validActionEventPayload(event),
+                  actionKind(in: event) != nil,
+                  let intent = event.payload["intent"]?.stringValue,
+                  !intent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   event.payload["state"]?.stringValue.flatMap(ActionExecutionState.init(rawValue:)) == .proposed
             else {
                 quarantine(event, reason: "action intent is malformed or duplicated")
                 return
             }
-            snapshot.actions[action.actionID] = WorkActionSnapshot(action: action, state: .proposed)
+            guard let projected = WorkActionSnapshot(intent: event) else {
+                quarantine(event, reason: "action intent is missing a known kind or identity")
+                return
+            }
+            snapshot.actions[action.actionID] = projected
         case TimelineEventType.actionOutcome:
             applyActionOutcome(event)
         case TimelineEventType.handleStarted:
@@ -442,6 +452,8 @@ public struct WorkReducer: Sendable {
     private mutating func applyActionOutcome(_ event: TimelineEvent) {
         guard let action = event.action, !action.actionID.isEmpty,
               let existing = snapshot.actions[action.actionID],
+              validActionEventPayload(event),
+              event.payload["kind"] == nil || actionKind(in: event) == existing.kind,
               let state = event.payload["state"]?.stringValue.flatMap(ActionExecutionState.init(rawValue:)),
               legalActionTransition(from: existing.state, to: state)
         else {
@@ -468,8 +480,8 @@ public struct WorkReducer: Sendable {
             quarantine(event, reason: "failed, canceled, or indeterminate action must declare failure kind")
             return
         }
-        snapshot.actions[action.actionID] = WorkActionSnapshot(
-            action: action, state: state, failureKind: failureKind, retrySafety: retrySafety)
+        snapshot.actions[action.actionID] = existing.withOutcome(
+            event, state: state, failureKind: failureKind, retrySafety: retrySafety)
         if state.isTerminal {
             snapshot.activeActionIDs.remove(action.actionID)
             if snapshot.activeActionIDs.isEmpty, snapshot.activeTurn == nil {
@@ -494,6 +506,29 @@ public struct WorkReducer: Sendable {
         default:
             return false
         }
+    }
+
+    /// Action lifecycle records use a typed vocabulary where present. Omitting optional intent
+    /// fields is valid on a start/outcome, but a present malformed value must quarantine the
+    /// record rather than silently dropping producer facts. The envelope's Run/Turn identities
+    /// are also checked against the currently active execution when supplied.
+    private func validActionEventPayload(_ event: TimelineEvent) -> Bool {
+        if event.payload["kind"] != nil && actionKind(in: event) == nil { return false }
+        for key in ["intent", "target", "scope"] where event.payload[key] != nil {
+            guard event.payload[key]?.stringValue != nil else { return false }
+        }
+        if event.payload["metadata"] != nil && event.payload["metadata"]?.objectValue == nil {
+            return false
+        }
+        if let run = event.run, run != snapshot.activeRun { return false }
+        if let turn = event.turn {
+            guard event.run == snapshot.activeRun, turn == snapshot.activeTurn else { return false }
+        }
+        return true
+    }
+
+    private func actionKind(in event: TimelineEvent) -> ActionKind? {
+        event.payload["kind"]?.stringValue.flatMap(ActionKind.init(rawValue:))
     }
 
     private func executionAfterRun(_ payload: JSONValue) -> WorkExecution {
@@ -564,8 +599,37 @@ public struct WorkReducer: Sendable {
 public struct SessionReducer: Sendable {
     public private(set) var snapshot: SessionSnapshot
 
+    // This is deliberately reducer-local instrumentation rather than persisted projection
+    // state.  It makes the cost of an explicit branch rebuild observable in scale tests without
+    // changing the SessionSnapshot contract or its Codable/Hashable representation.
+    internal private(set) var visibleProjectionRebuildCount: Int = 0
+    internal private(set) var visibleProjectionMessagesScanned: Int = 0
+    internal private(set) var visibleProjectionFastPathCount: Int = 0
+
+    // Message identity and conversation validity are indexed as events arrive.  A tip-selection
+    // event is common in the native producer path, so rebuilding a dictionary and walking the
+    // entire ancestry for every tip would make an ordinary linear conversation quadratic.
+    private var messageByID: [String: SessionMessageSnapshot]
+    private var conversationValidityByMessageID: [String: Bool]
+
     public init(snapshot: SessionSnapshot = SessionSnapshot()) {
         self.snapshot = snapshot
+        var indexedMessages: [String: SessionMessageSnapshot] = [:]
+        var indexedValidity: [String: Bool] = [:]
+        for message in snapshot.messageHistory {
+            indexedMessages[message.eventID] = message
+            let valid: Bool
+            if let parent = message.conversationParent {
+                valid = parent.journal == snapshot.journal
+                    && indexedMessages[parent.eventID] != nil
+                    && indexedValidity[parent.eventID] == true
+            } else {
+                valid = true
+            }
+            indexedValidity[message.eventID] = valid
+        }
+        self.messageByID = indexedMessages
+        self.conversationValidityByMessageID = indexedValidity
     }
 
     public static func reduce<S: Sequence>(
@@ -820,8 +884,9 @@ public struct SessionReducer: Sendable {
                 quarantine(event, reason: "semantic tip is not a known acyclic Session node")
                 return
             }
+            let previousTip = snapshot.semanticTip
             snapshot.semanticTip = tip
-            rebuildVisibleMessages()
+            rebuildVisibleMessages(from: previousTip)
         default:
             recordUnknown(event)
         }
@@ -892,26 +957,65 @@ public struct SessionReducer: Sendable {
     }
 
     private mutating func appendMessage(_ event: TimelineEvent, role: String) {
-        let text = event.payload["text"]?.stringValue ?? ""
+        guard let text = event.payload["text"]?.stringValue else {
+            quarantine(event, reason: "message is missing text")
+            return
+        }
         let parent = event.conversationParent
             ?? event.payload["conversation_parent"].flatMap { decodeTimelineValue($0) }
+        if event.payload["conversation_parent"] != nil && parent == nil {
+            quarantine(event, reason: "message conversation parent is malformed")
+            return
+        }
         let message = SessionMessageSnapshot(eventID: event.eventID, role: role, text: text,
-                                             conversationParent: parent)
+                                             conversationParent: parent,
+                                             sourceEvent: EventRef(journal: event.journal, eventID: event.eventID),
+                                             hostRecordedAt: event.hostRecordedAt,
+                                             clientTimestamp: event.clientTimestamp,
+                                             run: event.run, turn: event.turn, actor: event.actor,
+                                             causedBy: event.causedByEventID,
+                                             parentActivity: event.parentActivityID,
+                                             provenance: event.provenance, links: event.links)
         snapshot.messageHistory.append(message)
-        rebuildVisibleMessages()
+        messageByID[message.eventID] = message
+        if let parent = message.conversationParent {
+            conversationValidityByMessageID[message.eventID] =
+                parent.journal == snapshot.journal
+                && messageByID[parent.eventID] != nil
+                && conversationValidityByMessageID[parent.eventID] == true
+        } else {
+            conversationValidityByMessageID[message.eventID] = true
+        }
+        // With no explicit semantic tip, journal order is the presentation order.  Appending
+        // the new visible row is both exact and constant-time; filtering the complete history
+        // here made a long ordinary conversation quadratic.  Once a tip is selected, the
+        // selected branch is authoritative until another tip-selection event explicitly asks
+        // us to validate and rebuild it, so later messages must not perturb that projection.
+        if snapshot.semanticTip == nil, isPresentationVisible(message) {
+            snapshot.messages.append(message)
+        }
     }
 
-    private mutating func rebuildVisibleMessages() {
+    private mutating func rebuildVisibleMessages(from previousTip: EventRef?) {
+        if let previousTip, let extensionMessages = selectedBranchExtension(
+            from: previousTip, to: snapshot.semanticTip) {
+            if !extensionMessages.isEmpty {
+                snapshot.messages.append(contentsOf: extensionMessages.filter(isPresentationVisible))
+            }
+            visibleProjectionFastPathCount += 1
+            return
+        }
+        visibleProjectionRebuildCount += 1
+        visibleProjectionMessagesScanned += snapshot.messageHistory.count
         guard let tip = snapshot.semanticTip else {
             snapshot.messages = snapshot.messageHistory.filter(isPresentationVisible)
             return
         }
-        let byID = Dictionary(uniqueKeysWithValues: snapshot.messageHistory.map { ($0.eventID, $0) })
         var current: EventRef? = tip
         var visible: [SessionMessageSnapshot] = []
         var visited: Set<String> = []
         while let ref = current, visited.insert(ref.eventID).inserted {
-            guard let message = byID[ref.eventID] else { break }
+            guard let message = messageByID[ref.eventID] else { break }
             if isPresentationVisible(message) { visible.append(message) }
             current = message.conversationParent
         }
@@ -927,23 +1031,35 @@ public struct SessionReducer: Sendable {
     }
 
     private func validateConversationTip(_ tip: EventRef) -> Bool {
-        guard tip.journal == snapshot.journal, snapshot.seenEventIDs.contains(tip.eventID) else { return false }
-        let byID = Dictionary(uniqueKeysWithValues: snapshot.messageHistory.map { ($0.eventID, $0) })
-        var current: EventRef? = tip
+        tip.journal == snapshot.journal
+            && snapshot.seenEventIDs.contains(tip.eventID)
+            && messageByID[tip.eventID] != nil
+            && conversationValidityByMessageID[tip.eventID] == true
+    }
+
+    /// Returns the messages newly selected when `to` extends the previously selected tip.  The
+    /// walk is proportional only to the extension, and a failed walk falls back to the full
+    /// branch rebuild for arbitrary branch switches.
+    private func selectedBranchExtension(
+        from previousTip: EventRef, to newTip: EventRef?
+    ) -> [SessionMessageSnapshot]? {
+        guard let newTip else { return nil }
+        if previousTip == newTip { return [] }
+        var current: EventRef? = newTip
         var visited: Set<String> = []
-        while let ref = current {
-            guard ref.journal == snapshot.journal, visited.insert(ref.eventID).inserted else { return false }
-            guard let message = byID[ref.eventID] else { return false }
-            if let parent = message.conversationParent {
-                guard parent.journal == snapshot.journal, snapshot.seenEventIDs.contains(parent.eventID) else {
-                    return false
-                }
-                current = parent
-            } else {
-                current = nil
+        var extensionMessages: [SessionMessageSnapshot] = []
+        while let ref = current, ref != previousTip {
+            guard ref.journal == snapshot.journal,
+                  visited.insert(ref.eventID).inserted,
+                  conversationValidityByMessageID[ref.eventID] == true,
+                  let message = messageByID[ref.eventID] else {
+                return nil
             }
+            extensionMessages.append(message)
+            current = message.conversationParent
         }
-        return true
+        guard current == previousTip else { return nil }
+        return extensionMessages.reversed()
     }
 
 }

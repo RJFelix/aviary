@@ -62,6 +62,61 @@ MAX_SEND_SECONDS = 1.0
 SEND_CHUNK_BYTES = 512
 
 
+def install_parent_lifetime_lease(parent_pid: int | None, socket_path: str) -> None:
+    """Exit this test-owned host when its launching process goes away.
+
+    This is deliberately opt-in and activated only by RuntimeHost's test launch flag. Normal
+    hosts have no parent-lifetime lease: a GUI/client disconnect must leave real Work alive for a
+    later adopter.
+    """
+    if parent_pid is None:
+        return
+    if parent_pid <= 0 or os.getppid() != parent_pid:
+        raise RuntimeError("invalid parent lifetime lease")
+
+    def watch() -> None:
+        # Capture the exact socket inode after the host has bound it. On lease expiry, unlink
+        # only that same user-owned Unix socket; never remove a path that another process may
+        # have installed after this host exited. The short lstat/unlink race is contained by the
+        # private, mode-0700 runtime directory and the inode check immediately before unlink.
+        owned_socket: tuple[int, int] | None = None
+
+        def observe_owned_socket() -> tuple[int, int] | None:
+            try:
+                current = os.lstat(socket_path)
+                if (stat.S_ISSOCK(current.st_mode)
+                        and current.st_uid == os.getuid()):
+                    return (current.st_dev, current.st_ino)
+            except OSError:
+                pass
+            return None
+
+        while os.getppid() == parent_pid:
+            if owned_socket is None:
+                owned_socket = observe_owned_socket()
+            time.sleep(0.1)
+        # The launcher can disappear immediately after observing bind, before this 100 ms
+        # watcher has sampled the inode. The host is still serving at this point, so take one
+        # final ownership sample before the identity-checked unlink instead of leaving a stale
+        # endpoint behind merely because the parent lifetime was very short.
+        if owned_socket is None:
+            owned_socket = observe_owned_socket()
+        if owned_socket is not None:
+            try:
+                current = os.lstat(socket_path)
+                if (stat.S_ISSOCK(current.st_mode)
+                        and current.st_uid == os.getuid()
+                        and (current.st_dev, current.st_ino) == owned_socket):
+                    os.unlink(socket_path)
+            except OSError:
+                pass
+        # This path is intentionally abrupt and test-only. It prevents a dead SelfTest parent
+        # from leaving an adoptable host running with no durable owner.
+        os._exit(0)
+
+    threading.Thread(target=watch, name="parent-lifetime-lease", daemon=True).start()
+
+
 def bounded_diagnostic(value, limit: int = MAX_DIAGNOSTIC_BYTES) -> str:
     """Return a bounded, text-only diagnostic for the host protocol and stderr tail."""
     return str(value)[:limit]
@@ -974,7 +1029,10 @@ if __name__ == "__main__":
                             help="Unix-domain socket path for the v3 transport")
         parser.add_argument("--host-id", default=None,
                             help="logical host identity supplied by the launcher")
+        parser.add_argument("--parent-lifetime-pid", type=int, default=None,
+                            help=argparse.SUPPRESS)
         args = parser.parse_args()
+        install_parent_lifetime_lease(args.parent_lifetime_pid, args.socket)
         try:
             os.setsid()
         except OSError:

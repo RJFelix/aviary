@@ -1255,22 +1255,311 @@ public enum WorkExecution: String, Codable, Hashable, Sendable {
     case failed
 }
 
+/// The bounded, typed observation of one action lifecycle event.
+///
+/// This is intentionally an observation rather than a reconstructed timestamp: `sourceEvent` and
+/// `hostRecordedAt` are copied from the validated canonical envelope. `clientTimestamp` is supplied
+/// by a client and is therefore explicitly untrusted; it must never be used to order activity.
+public struct WorkActionObservation: Codable, Hashable, Sendable {
+    public let sourceEvent: EventRef
+    /// Canonical append position of the source event. This is the only ordering key used for
+    /// activity presentation; client timestamps are never used for ordering.
+    public let sequence: Int?
+    public let hostSequence: Int?
+    public let run: RunRef?
+    public let turn: TurnRef?
+    public let actor: TimelineActor
+    public let hostRecordedAt: Date
+    /// Optional client-provided time. This is untrusted metadata, not journal order or host time.
+    public let clientTimestamp: Date?
+    public let causedBy: EventRef?
+    public let parentActivity: EventRef?
+    public let provenance: TimelineEventProvenance
+    public let links: [TimelineLink]
+
+    public init(
+        sourceEvent: EventRef,
+        sequence: Int? = nil,
+        hostSequence: Int? = nil,
+        run: RunRef? = nil,
+        turn: TurnRef? = nil,
+        actor: TimelineActor,
+        hostRecordedAt: Date,
+        clientTimestamp: Date? = nil,
+        causedBy: EventRef? = nil,
+        parentActivity: EventRef? = nil,
+        provenance: TimelineEventProvenance = .native,
+        links: [TimelineLink] = []
+    ) {
+        self.sourceEvent = sourceEvent
+        self.sequence = sequence
+        self.hostSequence = hostSequence
+        self.run = run
+        self.turn = turn
+        self.actor = actor
+        self.hostRecordedAt = hostRecordedAt
+        self.clientTimestamp = clientTimestamp
+        self.causedBy = causedBy
+        self.parentActivity = parentActivity
+        self.provenance = provenance
+        self.links = Array(links.prefix(TimelineEvent.maxEvidenceLinks))
+    }
+
+    public init(_ event: TimelineEvent) {
+        self.init(
+            sourceEvent: EventRef(journal: event.journal, eventID: event.eventID),
+            sequence: event.sequence,
+            hostSequence: event.hostSequence,
+            run: event.run, turn: event.turn, actor: event.actor,
+            hostRecordedAt: event.hostRecordedAt, clientTimestamp: event.clientTimestamp,
+            causedBy: event.causedByEventID, parentActivity: event.parentActivityID,
+            provenance: event.provenance, links: event.links)
+    }
+
+}
+
 public struct WorkActionSnapshot: Codable, Hashable, Sendable {
+    public static let maxMetadataEntries = 32
+    public static let maxMetadataBytes = 4_096
+    /// Maximum UTF-8 bytes retained for each scalar action field.
+    public static let maxTextBytes = 4_096
+
     public let action: ActionRef
+    /// The producer's bounded action kind. A known action event with an unknown kind is not
+    /// projectable; a truly newer event type is retained through the normal unknown-event path.
+    public let kind: ActionKind
+    public let intent: String?
+    public let target: String?
+    public let scope: String?
+    /// Structured producer metadata retained at this projection boundary. Values are bounded by
+    /// deterministic entry/depth/byte limits; producer schemas, rather than key-name guessing,
+    /// are responsible for deciding whether a value is safe to record.
+    public let metadata: [String: JSONValue]
+    public let metadataWasTruncated: Bool
     public var state: ActionExecutionState
     public var failureKind: ActionFailureKind?
     public var retrySafety: ActionRetrySafety?
+    public let intentEvent: WorkActionObservation?
+    public let startedEvent: WorkActionObservation?
+    public let outcomeEvent: WorkActionObservation?
 
     public init(
         action: ActionRef,
         state: ActionExecutionState = .proposed,
         failureKind: ActionFailureKind? = nil,
-        retrySafety: ActionRetrySafety? = nil
+        retrySafety: ActionRetrySafety? = nil,
+        kind: ActionKind,
+        intent: String? = nil,
+        target: String? = nil,
+        scope: String? = nil,
+        metadata: [String: JSONValue] = [:],
+        metadataWasTruncated: Bool = false,
+        intentEvent: WorkActionObservation? = nil,
+        startedEvent: WorkActionObservation? = nil,
+        outcomeEvent: WorkActionObservation? = nil
     ) {
         self.action = action
+        self.kind = kind
+        self.intent = Self.boundedText(intent)
+        self.target = Self.boundedText(target)
+        self.scope = Self.boundedText(scope)
+        let bounded = Self.boundedMetadata(metadata)
+        self.metadata = bounded.values
+        self.metadataWasTruncated = metadataWasTruncated || bounded.wasTruncated
+            || intent.map { Self.boundedText($0) != $0 } ?? false
+            || target.map { Self.boundedText($0) != $0 } ?? false
+            || scope.map { Self.boundedText($0) != $0 } ?? false
         self.state = state
         self.failureKind = failureKind
         self.retrySafety = retrySafety
+        self.intentEvent = intentEvent
+        self.startedEvent = startedEvent
+        self.outcomeEvent = outcomeEvent
+    }
+
+    /// Build a projection from an intent event. The reducer uses this for the first lifecycle
+    /// record so later start/outcome records can merge into it without losing intent facts.
+    public init?(intent event: TimelineEvent) {
+        let fields = Self.fields(from: event)
+        guard let action = event.action, !action.actionID.isEmpty,
+              let kind = fields.kind else { return nil }
+        self.init(
+            action: action, state: .proposed,
+            kind: kind, intent: fields.intent, target: fields.target, scope: fields.scope,
+            metadata: fields.metadata, metadataWasTruncated: fields.metadataWasTruncated,
+            intentEvent: WorkActionObservation(event))
+    }
+
+    /// Return a copy with the canonical started observation while retaining all intent fields.
+    public func withStarted(_ event: TimelineEvent, state: ActionExecutionState) -> WorkActionSnapshot {
+        return WorkActionSnapshot(
+            action: action, state: state, failureKind: failureKind, retrySafety: retrySafety,
+            kind: kind, intent: intent, target: target, scope: scope, metadata: metadata,
+            metadataWasTruncated: metadataWasTruncated,
+            intentEvent: intentEvent, startedEvent: WorkActionObservation(event),
+            outcomeEvent: outcomeEvent)
+    }
+
+    /// Return a copy with the canonical outcome observation while retaining intent/start facts.
+    public func withOutcome(
+        _ event: TimelineEvent, state: ActionExecutionState,
+        failureKind: ActionFailureKind?, retrySafety: ActionRetrySafety?
+    ) -> WorkActionSnapshot {
+        return WorkActionSnapshot(
+            action: action, state: state, failureKind: failureKind, retrySafety: retrySafety,
+            kind: kind, intent: intent, target: target, scope: scope, metadata: metadata,
+            metadataWasTruncated: metadataWasTruncated,
+            intentEvent: intentEvent, startedEvent: startedEvent,
+            outcomeEvent: WorkActionObservation(event))
+    }
+
+    private struct Fields {
+        let kind: ActionKind?
+        let intent: String?
+        let target: String?
+        let scope: String?
+        let metadata: [String: JSONValue]
+        let metadataWasTruncated: Bool
+    }
+
+    private static func fields(from event: TimelineEvent) -> Fields {
+        let metadata = event.payload["metadata"]?.objectValue ?? [:]
+        let bounded = boundedMetadata(metadata)
+        return Fields(
+            kind: event.payload["kind"]?.stringValue.flatMap(ActionKind.init(rawValue:)),
+            intent: event.payload["intent"]?.stringValue,
+            target: event.payload["target"]?.stringValue,
+            scope: event.payload["scope"]?.stringValue,
+            metadata: bounded.values, metadataWasTruncated: bounded.wasTruncated)
+    }
+
+    private static func boundedText(_ value: String?) -> String? {
+        guard let value else { return nil }
+        return boundedUTF8(value, maxBytes: maxTextBytes).value
+    }
+
+    /// Bound by UTF-8 bytes without slicing through a Unicode scalar or grapheme cluster. A raw
+    /// byte prefix can decode with U+FFFD and even grow beyond the advertised bound, so iterate
+    /// String indices and only retain complete Characters.
+    private static func boundedUTF8(
+        _ value: String, maxBytes: Int
+    ) -> (value: String, wasTruncated: Bool) {
+        guard value.utf8.count > maxBytes else { return (value, false) }
+        var result = String()
+        result.reserveCapacity(maxBytes)
+        var bytes = 0
+        for character in value {
+            let characterBytes = String(character).utf8.count
+            guard bytes + characterBytes <= maxBytes else { break }
+            result.append(character)
+            bytes += characterBytes
+        }
+        return (result, result != value)
+    }
+
+    private static func boundedMetadata(
+        _ metadata: [String: JSONValue]
+    ) -> (values: [String: JSONValue], wasTruncated: Bool) {
+        var values: [String: JSONValue] = [:]
+        var truncated = false
+        for key in metadata.keys.sorted().prefix(maxMetadataEntries) {
+            guard key.utf8.count <= 128,
+                  let bounded = boundedMetadataValue(metadata[key]!, depth: 0) else {
+                truncated = true
+                continue
+            }
+            values[key] = bounded.value
+            truncated = truncated || bounded.wasTruncated
+        }
+        if metadata.count > maxMetadataEntries { truncated = true }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        while let encoded = try? encoder.encode(values), encoded.count > maxMetadataBytes,
+              let key = values.keys.sorted().last {
+            values.removeValue(forKey: key)
+            truncated = true
+        }
+        return (values, truncated)
+    }
+
+    private static func boundedMetadataValue(
+        _ value: JSONValue, depth: Int
+    ) -> (value: JSONValue, wasTruncated: Bool)? {
+        guard depth <= 4 else { return nil }
+        switch value {
+        case .null, .bool, .number: return (value, false)
+        case .string(let string):
+            let bounded = boundedUTF8(string, maxBytes: 512)
+            return (.string(bounded.value), bounded.wasTruncated)
+        case .array(let values):
+            var truncated = values.count > 16
+            let bounded = values.prefix(16).compactMap { value -> JSONValue? in
+                guard let item = boundedMetadataValue(value, depth: depth + 1) else {
+                    truncated = true
+                    return nil
+                }
+                truncated = truncated || item.wasTruncated
+                return item.value
+            }
+            return (.array(bounded), truncated)
+        case .object(let object):
+            var result: [String: JSONValue] = [:]
+            var truncated = object.count > 32
+            for key in object.keys.sorted().prefix(32) {
+                guard key.utf8.count <= 128,
+                      let bounded = boundedMetadataValue(object[key]!, depth: depth + 1) else {
+                    truncated = true
+                    continue
+                }
+                result[key] = bounded.value
+                truncated = truncated || bounded.wasTruncated
+            }
+            return (.object(result), truncated)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case action, kind, intent, target, scope, metadata
+        case metadataWasTruncated = "metadata_was_truncated"
+        case state, failureKind = "failure_kind", retrySafety = "retry_safety"
+        case intentEvent = "intent_event"
+        case startedEvent = "started_event"
+        case outcomeEvent = "outcome_event"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            action: try container.decode(ActionRef.self, forKey: .action),
+            state: try container.decodeIfPresent(ActionExecutionState.self, forKey: .state) ?? .proposed,
+            failureKind: try container.decodeIfPresent(ActionFailureKind.self, forKey: .failureKind),
+            retrySafety: try container.decodeIfPresent(ActionRetrySafety.self, forKey: .retrySafety),
+            kind: try container.decode(ActionKind.self, forKey: .kind),
+            intent: try container.decodeIfPresent(String.self, forKey: .intent),
+            target: try container.decodeIfPresent(String.self, forKey: .target),
+            scope: try container.decodeIfPresent(String.self, forKey: .scope),
+            metadata: try container.decodeIfPresent([String: JSONValue].self, forKey: .metadata) ?? [:],
+            metadataWasTruncated: try container.decodeIfPresent(Bool.self, forKey: .metadataWasTruncated) ?? false,
+            intentEvent: try container.decodeIfPresent(WorkActionObservation.self, forKey: .intentEvent),
+            startedEvent: try container.decodeIfPresent(WorkActionObservation.self, forKey: .startedEvent),
+            outcomeEvent: try container.decodeIfPresent(WorkActionObservation.self, forKey: .outcomeEvent))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(action, forKey: .action)
+        try container.encode(kind, forKey: .kind)
+        try container.encodeIfPresent(intent, forKey: .intent)
+        try container.encodeIfPresent(target, forKey: .target)
+        try container.encodeIfPresent(scope, forKey: .scope)
+        try container.encode(metadata, forKey: .metadata)
+        try container.encode(metadataWasTruncated, forKey: .metadataWasTruncated)
+        try container.encode(state, forKey: .state)
+        try container.encodeIfPresent(failureKind, forKey: .failureKind)
+        try container.encodeIfPresent(retrySafety, forKey: .retrySafety)
+        try container.encodeIfPresent(intentEvent, forKey: .intentEvent)
+        try container.encodeIfPresent(startedEvent, forKey: .startedEvent)
+        try container.encodeIfPresent(outcomeEvent, forKey: .outcomeEvent)
     }
 }
 
@@ -1369,12 +1658,53 @@ public struct SessionMessageSnapshot: Codable, Hashable, Sendable {
     public let role: String
     public let text: String
     public let conversationParent: EventRef?
+    /// The canonical event that supplied this message. Nil is reserved for synthetic
+    /// non-journal summaries; reducer-produced messages always carry this reference.
+    public let sourceEvent: EventRef?
+    /// Host time copied from the canonical event. It is optional only for synthetic summaries;
+    /// no neutral timestamp is invented when a source event is absent.
+    public let hostRecordedAt: Date?
+    /// Client supplied time, retained only as explicitly untrusted metadata. It never orders
+    /// messages or substitutes for hostRecordedAt.
+    public let clientTimestamp: Date?
+    public let run: RunRef?
+    public let turn: TurnRef?
+    public let actor: TimelineActor?
+    public let causedBy: EventRef?
+    public let parentActivity: EventRef?
+    public let provenance: TimelineEventProvenance?
+    public let links: [TimelineLink]
 
-    public init(eventID: String, role: String, text: String, conversationParent: EventRef? = nil) {
+    public init(
+        eventID: String,
+        role: String,
+        text: String,
+        conversationParent: EventRef? = nil,
+        sourceEvent: EventRef? = nil,
+        hostRecordedAt: Date? = nil,
+        clientTimestamp: Date? = nil,
+        run: RunRef? = nil,
+        turn: TurnRef? = nil,
+        actor: TimelineActor? = nil,
+        causedBy: EventRef? = nil,
+        parentActivity: EventRef? = nil,
+        provenance: TimelineEventProvenance? = nil,
+        links: [TimelineLink] = []
+    ) {
         self.eventID = eventID
         self.role = role
         self.text = text
         self.conversationParent = conversationParent
+        self.sourceEvent = sourceEvent
+        self.hostRecordedAt = hostRecordedAt
+        self.clientTimestamp = clientTimestamp
+        self.run = run
+        self.turn = turn
+        self.actor = actor
+        self.causedBy = causedBy
+        self.parentActivity = parentActivity
+        self.provenance = provenance
+        self.links = Array(links.prefix(TimelineEvent.maxEvidenceLinks))
     }
 }
 

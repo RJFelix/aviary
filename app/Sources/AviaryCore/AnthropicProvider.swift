@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// The `anthropic-messages` wire format.
 ///
@@ -59,10 +62,11 @@ public struct AnthropicMessagesProvider: ChatProvider {
         req.timeoutInterval = 600
         yield(.requestBody(payload))
 
-        let (bytes, response) = try await session.bytes(for: req)
+        let (bytes, response) = try await AviaryURLSession.bytes(for: req, using: session)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             var body = Data()
             for try await b in bytes { body.append(b); if body.count > 16_384 { break } }
+            bytes.cancel()
             throw ChatError.http(
                 status: http.statusCode, body: String(data: body, encoding: .utf8) ?? "")
         }

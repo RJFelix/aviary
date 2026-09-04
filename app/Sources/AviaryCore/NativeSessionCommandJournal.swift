@@ -11,7 +11,8 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
     public nonisolated let nativeJournal: RunJournalBundle
     public nonisolated let legacyProjection: SessionWriter
     /// Immutable native history captured after the journal pair is locked and before the new
-    /// Start command can append its prompt. Nil for fresh runs and legacy-only resumes.
+    /// Start command can append its prompt. Nil for launch-fresh runs; exact cold resume always
+    /// carries a reconstructed seed.
     public nonisolated let resumeSeed: NativeColdResumeResult?
 
     public init(
@@ -35,9 +36,9 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
 
     /// Open the canonical launch journal when this execution has a complete native history.
     ///
-    /// Fresh runs create the pair. Native resumes reopen the pair. A legacy-only resume returns
-    /// nil instead of creating a misleading Timeline v2 tail halfway through the conversation;
-    /// one-sided native state still throws through `RunJournalBundle.openForExecution`.
+    /// Fresh runs create the pair. Exact cold resumes must reopen a complete native pair; a
+    /// missing or one-sided pair fails through `RunJournalBundle.openForExecution` rather than
+    /// falling back to the legacy SessionWriter transcript.
     public static func openForLaunch(
         home: AgentHome,
         identity: SessionWorkIdentity,
@@ -45,20 +46,32 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
         actorID: String,
         actorKind: String = "client",
         modelID: String? = nil,
-        resumingLegacySession: Bool
-    ) async throws -> NativeSessionCommandJournal? {
-        let sessionExists = FileManager.default.fileExists(
-            atPath: home.timelineV2SessionJournalURL(sessionID: identity.sessionID).path)
-        let workExists = FileManager.default.fileExists(
-            atPath: home.timelineV2WorkJournalURL(identity.work).path)
-        if resumingLegacySession, !sessionExists, !workExists { return nil }
-
+        modelContextMode: WorkLaunchContextMode
+    ) async throws -> NativeSessionCommandJournal {
+        if modelContextMode == .exactColdResume {
+            let sessionExists = FileManager.default.fileExists(
+                atPath: home.timelineV2SessionJournalURL(sessionID: identity.sessionID).path)
+            let workExists = FileManager.default.fileExists(
+                atPath: home.timelineV2WorkJournalURL(identity.work).path)
+            guard sessionExists && workExists else {
+                if sessionExists != workExists {
+                    throw RunJournalBundleError.missingCounterpart(
+                        path: (!sessionExists
+                            ? home.timelineV2SessionJournalURL(sessionID: identity.sessionID)
+                            : home.timelineV2WorkJournalURL(identity.work)).path)
+                }
+                // Exact cold resume is a native reconstruction contract. With no canonical pair
+                // there is no prior context to reconstruct, and opening a new Run would make a
+                // failed legacy fallback look like a valid cold launch.
+                throw NativeColdResumeError.noCompleteContextManifest
+            }
+        }
         let bundle = try await RunJournalBundle.openForExecution(
             home: home, identity: identity, actorID: actorID, actorKind: actorKind,
             modelID: modelID)
         do {
             let resumeSeed: NativeColdResumeResult?
-            if resumingLegacySession {
+            if modelContextMode == .exactColdResume {
                 resumeSeed = try captureResumeSeed(
                     home: home, identity: identity, bundle: bundle)
             } else {
@@ -71,9 +84,16 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
                 identity: identity, nativeJournal: bundle,
                 legacyProjection: legacyProjection, resumeSeed: resumeSeed)
         } catch {
-            _ = try? await bundle.finishRun(
-                outcome: .failed,
-                detail: "native cold-resume validation or command journal installation failed")
+            // A replacement Run can fail during pre-command reconstruction (for example when a
+            // retained context body is unavailable) after its exact marker has been appended.
+            // Keep that untouched reservation recoverable; terminalizing it here would leave the
+            // durable Start pointer naming a finished Run that a retry can never reopen. Once any
+            // command/turn/effect evidence exists, preserve the existing failed-run behavior.
+            if !(await bundle.isUntouchedStartedRun) {
+                _ = try? await bundle.finishRun(
+                    outcome: .failed,
+                    detail: "native cold-resume validation or command journal installation failed")
+            }
             try? await bundle.closeChecked()
             throw error
         }
@@ -89,7 +109,7 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
         actorID: String,
         actorKind: String = "work-host",
         modelID: String? = nil,
-        resumingLegacySession: Bool
+        modelContextMode: WorkLaunchContextMode
     ) async throws -> NativeSessionCommandJournal {
         let identity = SessionWorkIdentity(
             sessionID: binding.workBinding.session.sessionID,
@@ -103,7 +123,7 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
             home: home, binding: binding, actorID: actorID, actorKind: actorKind,
             modelID: modelID)
         do {
-            let resumeSeed = try resumingLegacySession
+            let resumeSeed = try modelContextMode == .exactColdResume
                 ? captureResumeSeed(home: home, identity: identity, bundle: bundle)
                 : nil
             if let resumeSeed {
@@ -113,11 +133,68 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
                 identity: identity, nativeJournal: bundle,
                 legacyProjection: legacyProjection, resumeSeed: resumeSeed)
         } catch {
-            _ = try? await bundle.finishRun(
-                outcome: .failed,
-                detail: "native cold-resume validation or command journal installation failed")
+            // Keep an exact, untouched `run.started` reservation recoverable.  In particular,
+            // cold-resume validation can fail after the paired marker was committed but before
+            // any command crossed the runtime boundary; appending `run.finished` here would
+            // poison the durable Start pointer and make an exact retry impossible.  Once the
+            // marker has any later canonical activity, terminalize it as before.
+            if !(await bundle.isUntouchedStartedRun) {
+                _ = try? await bundle.finishRun(
+                    outcome: .failed,
+                    detail: "native cold-resume validation or command journal installation failed")
+            }
             try? await bundle.closeChecked()
             throw error
+        }
+    }
+
+    /// Inspect the completed predecessor without opening writers or appending a replacement Run.
+    /// `nil` means there is no recorded context crossing (the normal Start(empty) case); every
+    /// other failure is meaningful corruption or incompleteness and must fail closed before a
+    /// replacement manifest is published.
+    public static func preflightPriorContext(
+        home: AgentHome,
+        binding: WorkBinding
+    ) throws -> NativeColdResumeResult? {
+        let sessionURL = home.timelineV2SessionJournalURL(binding.session)
+        let workURL = home.timelineV2WorkJournalURL(binding.work)
+        guard FileManager.default.fileExists(atPath: sessionURL.path),
+              FileManager.default.fileExists(atPath: workURL.path) else {
+            throw NativeColdResumeError.emptyJournal(binding.sessionJournal)
+        }
+        let actor = TimelineActor(actorID: "native-resume-preflight", kind: "work-host")
+        let sessionData: Data
+        let workData: Data
+        do {
+            sessionData = try Data(contentsOf: sessionURL)
+            workData = try Data(contentsOf: workURL)
+        } catch {
+            throw NativeColdResumeError.workStateUnavailable(
+                "native predecessor journal could not be read")
+        }
+        let sessionRead = TimelineJournalReader.read(
+            sessionData, journal: binding.sessionJournal, actor: actor,
+            hostRecordedAt: Date(timeIntervalSince1970: 0))
+        let workRead = TimelineJournalReader.read(
+            workData, journal: binding.workJournal, actor: actor,
+            hostRecordedAt: Date(timeIntervalSince1970: 0))
+        guard let sessionTip = sessionRead.records.last?.event,
+              let workTip = workRead.records.last?.event else {
+            throw NativeColdResumeError.emptyJournal(binding.sessionJournal)
+        }
+        do {
+            return try NativeColdResume.resume(
+                sessionRead: sessionRead,
+                expectedSessionCursor: JournalCursor(
+                    journal: binding.sessionJournal, eventID: sessionTip.eventID,
+                    sequence: sessionTip.sequence),
+                workRead: workRead,
+                expectedWorkCursor: JournalCursor(
+                    journal: binding.workJournal, eventID: workTip.eventID,
+                    sequence: workTip.sequence),
+                bodyStore: ContextBodyStore(home: home))
+        } catch NativeColdResumeError.noCompleteContextManifest {
+            return nil
         }
     }
 
@@ -168,24 +245,41 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
 
     public func commitIntent(_ intent: SessionCommandIntent) async throws {
         try validate(intent)
+        guard let causalCursor = intent.causalCursor else {
+            throw SessionCommandJournalError.causalConflict(
+                commandID: intent.commandID,
+                expected: await nativeJournal.latestWorkCursor,
+                received: nil)
+        }
         let client = ClientRef(intent.actorID)
-        // Preserve a caller's observed Work cursor exactly. RunJournalBundle may fill a missing
-        // cursor for legacy callers, but it must never overwrite a supplied one.
+        // Native command admission always carries the exact caller-observed Work cursor. The
+        // flat SessionWriter compatibility path remains separate and may use its own defaults.
         let command = CommandRef(
-            commandID: intent.commandID, client: client, causalCursor: intent.causalCursor)
+            commandID: intent.commandID, client: client, causalCursor: causalCursor)
         var metadata: [String: JSONValue] = [
             "command_kind": .string(intent.command.label),
             "controller_sequence": .number(Double(intent.sequence)),
             "actor_id": .string(intent.actorID),
             "controller_state": .string(intent.state.rawValue),
-            // Keep cursor provenance observable even when the compatibility API omits a cursor
-            // and the bundle supplies its legacy "latest" fallback.
-            "caller_causal_cursor_supplied": .bool(intent.causalCursor != nil),
+            "caller_causal_cursor_supplied": .bool(true),
         ]
         do {
+            var committedInitialStart = false
+            if case .start(let prompt) = intent.command {
+                // A service observes the idle Work cursor before this bridge opens the Run, so
+                // `run.started` may already be one event newer by the time Start is committed.
+                // Let the bundle validate and preserve that exact predecessor only for this first
+                // Start; all other commands continue through the current-cursor check below.
+                if try await nativeJournal.commitInitialStartIfEligible(
+                    prompt: prompt, deliveryMode: .queued, command: command,
+                    metadata: metadata) != nil {
+                    committedInitialStart = true
+                }
+            }
             // Refuse a stale caller cursor before entering the bundle. This gives the controller a
             // typed conflict result instead of treating a lost race as an unavailable journal.
-            if let received = intent.causalCursor {
+            if !committedInitialStart {
+                let received = causalCursor
                 let expected = await nativeJournal.latestWorkCursor
                 guard received == expected else {
                     if received.journal == nativeJournal.workJournal {
@@ -214,35 +308,38 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
                         commandID: intent.commandID, expected: expected, received: received)
                 }
             }
-            switch intent.command {
-            case .start(let prompt):
-                if prompt.isEmpty {
-                    _ = try await nativeJournal.commitCommand(
-                        label: intent.command.label, deliveryMode: .queued,
-                        command: command, metadata: metadata)
-                } else {
+            if !committedInitialStart {
+                switch intent.command {
+                case .start(let prompt):
+                    if prompt.isEmpty {
+                        _ = try await nativeJournal.commitCommand(
+                            label: intent.command.label, deliveryMode: .queued,
+                            command: command, metadata: metadata)
+                    } else {
+                        _ = try await nativeJournal.commitInput(
+                            text: prompt, deliveryMode: .queued, command: command,
+                            metadata: metadata)
+                    }
+                case .send(let prompt):
                     _ = try await nativeJournal.commitInput(
                         text: prompt, deliveryMode: .queued, command: command,
                         metadata: metadata)
+                case .steer(let text), .queueFollowUp(let text):
+                    _ = try await nativeJournal.commitInput(
+                        text: text, deliveryMode: .queued, command: command,
+                        metadata: metadata)
+                case .cancel(let scope):
+                    metadata["cancellation_scope"] = .string(scope.rawValue)
+                    _ = try await nativeJournal.commitCommand(
+                        label: intent.command.label, deliveryMode: .queued,
+                        command: command, metadata: metadata)
+                case .endRun:
+                    _ = try await nativeJournal.commitCommand(
+                        label: intent.command.label, deliveryMode: .queued,
+                        command: command, metadata: metadata)
                 }
-            case .send(let prompt):
-                _ = try await nativeJournal.commitInput(
-                    text: prompt, deliveryMode: .queued, command: command,
-                    metadata: metadata)
-            case .steer(let text), .queueFollowUp(let text):
-                _ = try await nativeJournal.commitInput(
-                    text: text, deliveryMode: .queued, command: command,
-                    metadata: metadata)
-            case .cancel(let scope):
-                metadata["cancellation_scope"] = .string(scope.rawValue)
-                _ = try await nativeJournal.commitCommand(
-                    label: intent.command.label, deliveryMode: .queued,
-                    command: command, metadata: metadata)
-            case .endRun:
-                _ = try await nativeJournal.commitCommand(
-                    label: intent.command.label, deliveryMode: .queued,
-                    command: command, metadata: metadata)
             }
+            try await commitLegacyProjection(intent)
         } catch let error as SessionCommandJournalError {
             throw error
         } catch let error as RunJournalBundleError {
@@ -268,6 +365,9 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
             throw error
         }
 
+    }
+
+    private func commitLegacyProjection(_ intent: SessionCommandIntent) async throws {
         // Native acceptance is already durable. If this projection append fails, the command
         // remains visibly accepted-but-undelivered in Work and the controller refuses dispatch.
         do {

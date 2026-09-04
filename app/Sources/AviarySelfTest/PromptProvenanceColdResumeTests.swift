@@ -185,7 +185,7 @@ func test_promptProvenanceColdResumeUsesRetainedBodiesAfterSourceFilesChange() a
         to: fixture.project.appending(path: "CLAUDE.md"), atomically: true, encoding: .utf8)
 
     let result = try resumePromptCold(fixture)
-    let replayed = try XCTUnwrap(result.systemPromptAssembly)
+    let replayed = result.systemPromptAssembly
     XCTAssertEqual(replayed.flattenedText, fixture.assembly.flattenedText)
     XCTAssertEqual(replayed.flattenedByteCount, fixture.assembly.flattenedByteCount)
     XCTAssertEqual(replayed.flattenedDigest, fixture.assembly.flattenedDigest)
@@ -390,12 +390,16 @@ func test_promptProvenanceColdResumeRefusesForgedMissingAndMismatchedObservation
     } catch is NativeColdResumeError { }
 }
 
-func test_promptProvenanceColdResumeLeavesLegacyAssemblyNil() async throws {
+func test_promptProvenanceColdResumeRefusesLegacySourceLessManifest() async throws {
     let fixture = try await makePromptColdResumeFixture(includeSources: false)
     defer { try? FileManager.default.removeItem(at: fixture.home.root) }
     try? FileManager.default.removeItem(at: fixture.project.appending(path: "AGENTS.md"))
     try "new file".write(
         to: fixture.project.appending(path: "CLAUDE.md"), atomically: true, encoding: .utf8)
-    let result = try resumePromptCold(fixture)
-    XCTAssertNil(result.systemPromptAssembly)
+    do {
+        _ = try resumePromptCold(fixture)
+        XCTFail("source-less native cold resume must refuse before runtime effect")
+    } catch NativeColdResumeError.noCompleteContextManifest {
+        XCTAssertTrue(true)
+    }
 }

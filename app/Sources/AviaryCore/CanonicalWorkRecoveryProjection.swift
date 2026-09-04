@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 /// A presentation state explicitly reported by an in-process Work observer. A filesystem row,
@@ -1012,7 +1011,7 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
     }
 
     fileprivate static func digest(_ value: String) -> String {
-        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+        AviarySHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func groupingKey(

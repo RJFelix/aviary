@@ -159,7 +159,7 @@ final class InHouseDriver {
             hasExited = true
             return
         }
-        guard await installNativeJournalIfAppropriate(legacyWriter: writer) else {
+        guard await installNativeJournal(legacyWriter: writer) else {
             try? await writer.closeChecked()
             hasExited = true
             return
@@ -538,17 +538,15 @@ final class InHouseDriver {
             "Could not " + operation + ": " + String(describing: reason) + ".")
     }
 
-    /// Install Timeline v2 before Start is admitted. A legacy-only resumed conversation stays
-    /// legacy-only for this attempt: creating a native pair at its tail would make a cold reader
-    /// see a deceptively complete history. Once a pair exists, one-sided or corrupt state is a
-    /// launch error rather than an invitation to manufacture the missing half.
-    private func installNativeJournalIfAppropriate(legacyWriter: SessionWriter) async -> Bool {
+    /// Install the canonical Session/Work authority before Start is admitted. Fresh launches
+    /// create the pair; exact cold resume requires a complete native history and fails closed if
+    /// that history is missing, one-sided, or corrupt.
+    private func installNativeJournal(legacyWriter: SessionWriter) async -> Bool {
         do {
-            guard let bridge = try await NativeSessionCommandJournal.openForLaunch(
+            let bridge = try await NativeSessionCommandJournal.openForLaunch(
                 home: home, identity: identity, legacyProjection: legacyWriter,
                 actorID: actorID, modelID: model.qualifiedID,
-                resumingLegacySession: resume != nil)
-            else { return true }
+                modelContextMode: resume == nil ? .launchFresh : .exactColdResume)
             guard await commandController.installJournalBeforeAdmission(bridge) else {
                 _ = try? await bridge.nativeJournal.finishRun(
                     outcome: .failed, detail: "command journal authority was already admitted")

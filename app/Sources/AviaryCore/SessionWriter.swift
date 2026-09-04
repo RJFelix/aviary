@@ -171,6 +171,37 @@ public actor SessionWriter {
         }
     }
 
+    /// Reopen an existing projection without appending a run boundary.
+    ///
+    /// This is reserved for the narrow crash window where the canonical Work journal already
+    /// contains the exact trailing `run.started` marker (or a prior process has written this
+    /// Run's flat boundary) but the Start command was never accepted. The caller must prove that
+    /// boundary from the native journal before choosing this initializer; it is not a general
+    /// transcript-resume API.
+    public init(
+        home: AgentHome,
+        reopeningWithoutRunBoundary sessionID: String,
+        identity requestedIdentity: SessionWorkIdentity,
+        failurePlan: FailurePlan = .none
+    ) throws {
+        let identity = Self.resumeIdentity(
+            home: home, sessionID: sessionID, requested: requestedIdentity)
+        self.identity = identity
+        self.sessionID = identity.sessionID
+        self.fileURL = home.sessionFile(id: identity.sessionID)
+        guard identity == requestedIdentity,
+              FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw ResumeFailure.noSuchSession(sessionID)
+        }
+        handle = try FileHandle(forWritingTo: fileURL)
+        try handle.seekToEnd()
+        self.failurePlan = failurePlan
+        try Self.quarantinePartialTail(of: fileURL, handle: handle)
+        let tail = Self.tailEntry(of: fileURL)
+        lastEntryID = tail.id
+        entryCount = tail.count
+    }
+
     /// The id of the last entry in an existing session, and how many entries it holds.
     ///
     /// Reads the whole file, which is the honest cost of resuming: the largest transcript in
@@ -216,7 +247,7 @@ public actor SessionWriter {
         try FileManager.default.createDirectory(
             at: home.sessionsDir, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: fileURL.path) {
-            FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+            _ = FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         }
         handle = try FileHandle(forWritingTo: fileURL)
         try handle.seekToEnd()

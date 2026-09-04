@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import AviaryCore
 
@@ -114,6 +115,40 @@ func test_systemPromptAssemblyReportsContextStatesAndCharacterTruncation() throw
     let disabled = try SystemPromptAssembly.build(cwd: cwd.path, includeContextFiles: false)
     XCTAssertEqual(disabled.sources.suffix(2).map(\.status), [.disabled, .disabled])
     XCTAssertEqual(disabled.text, legacySystemPrompt(cwd: cwd.path, includeContextFiles: false))
+}
+
+func test_systemPromptAssemblyRejectsSymlinkedAndOversizedContextFiles() throws {
+    let cwd = try promptAssemblyTempDirectory()
+    defer { try? FileManager.default.removeItem(at: cwd) }
+
+    let target = cwd.appending(path: "real-context.md")
+    try "do not follow this link".write(to: target, atomically: true, encoding: .utf8)
+    try FileManager.default.createSymbolicLink(
+        at: cwd.appending(path: "AGENTS.md"), withDestinationURL: target)
+    let linked = try SystemPromptAssembly.build(cwd: cwd.path)
+    let linkedSource = try XCTUnwrap(linked.sources.first { $0.label == "AGENTS.md" })
+    XCTAssertEqual(linkedSource.status, .unreadable)
+    XCTAssertNil(linkedSource.fullBody)
+    XCTAssertEqual(linkedSource.deliveredByteCount, 0)
+
+    try FileManager.default.removeItem(at: cwd.appending(path: "AGENTS.md"))
+    XCTAssertEqual(
+        Darwin.mkfifo(cwd.appending(path: "AGENTS.md").path, mode_t(0o600)), 0)
+    let fifo = try SystemPromptAssembly.build(cwd: cwd.path)
+    let fifoSource = try XCTUnwrap(fifo.sources.first { $0.label == "AGENTS.md" })
+    XCTAssertEqual(fifoSource.status, .unreadable)
+    XCTAssertNil(fifoSource.fullBody)
+    XCTAssertEqual(fifoSource.deliveredByteCount, 0)
+
+    try FileManager.default.removeItem(at: cwd.appending(path: "AGENTS.md"))
+    let oversized = String(repeating: "x", count: 12_000 * 4 + 5)
+    try oversized.write(
+        to: cwd.appending(path: "AGENTS.md"), atomically: true, encoding: .utf8)
+    let bounded = try SystemPromptAssembly.build(cwd: cwd.path)
+    let oversizedSource = try XCTUnwrap(bounded.sources.first { $0.label == "AGENTS.md" })
+    XCTAssertEqual(oversizedSource.status, .unreadable)
+    XCTAssertNil(oversizedSource.fullBody)
+    XCTAssertEqual(oversizedSource.deliveredByteCount, 0)
 }
 
 func test_systemPromptAssemblyUsesDistinctStableIdentityAndContentDigests() throws {

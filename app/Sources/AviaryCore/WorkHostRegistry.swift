@@ -72,27 +72,26 @@ public struct WorkHostLaunchMetadata: Codable, Hashable, Sendable {
 
     public let providerID: String?
     public let modelID: String?
-    public let workingDirectoryPolicy: WorkHostWorkingDirectoryPolicy
+    /// Opaque host-minted workspace identity. A descriptor may carry this identity, but never
+    /// the host-local path it resolves to.
+    public let workspaceID: WorkHostWorkspaceID?
     public let runtimeHostKind: String?
     public let actorKind: String?
-    public let resume: Bool
     public let metadataWasTruncated: Bool
 
     public init(
         providerID: String? = nil,
         modelID: String? = nil,
-        workingDirectoryPolicy: WorkHostWorkingDirectoryPolicy = .unspecified,
+        workspaceID: WorkHostWorkspaceID? = nil,
         runtimeHostKind: String? = nil,
-        actorKind: String? = nil,
-        resume: Bool = false
+        actorKind: String? = nil
     ) {
         self.init(
             providerID: providerID,
             modelID: modelID,
-            workingDirectoryPolicy: workingDirectoryPolicy,
+            workspaceID: workspaceID,
             runtimeHostKind: runtimeHostKind,
             actorKind: actorKind,
-            resume: resume,
             metadataWasTruncated: false,
             maximumBytes: Self.defaultMaximumBytes)
     }
@@ -100,10 +99,9 @@ public struct WorkHostLaunchMetadata: Codable, Hashable, Sendable {
     private init(
         providerID: String?,
         modelID: String?,
-        workingDirectoryPolicy: WorkHostWorkingDirectoryPolicy,
+        workspaceID: WorkHostWorkspaceID?,
         runtimeHostKind: String?,
         actorKind: String?,
-        resume: Bool,
         metadataWasTruncated: Bool,
         maximumBytes: Int
     ) {
@@ -113,10 +111,9 @@ public struct WorkHostLaunchMetadata: Codable, Hashable, Sendable {
         let actor = Self.bound(actorKind, maximumBytes: maximumBytes)
         self.providerID = provider.value
         self.modelID = model.value
-        self.workingDirectoryPolicy = workingDirectoryPolicy
+        self.workspaceID = workspaceID
         self.runtimeHostKind = runtime.value
         self.actorKind = actor.value
-        self.resume = resume
         self.metadataWasTruncated = metadataWasTruncated
             || provider.wasTruncated
             || model.wasTruncated
@@ -125,8 +122,8 @@ public struct WorkHostLaunchMetadata: Codable, Hashable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case providerID, modelID, workingDirectoryPolicy, runtimeHostKind, actorKind
-        case resume, metadataWasTruncated
+        case providerID, modelID, workspaceID, runtimeHostKind, actorKind
+        case metadataWasTruncated
     }
 
     public init(from decoder: Decoder) throws {
@@ -136,11 +133,10 @@ public struct WorkHostLaunchMetadata: Codable, Hashable, Sendable {
         self.init(
             providerID: try values.decodeIfPresent(String.self, forKey: .providerID),
             modelID: try values.decodeIfPresent(String.self, forKey: .modelID),
-            workingDirectoryPolicy: try values.decodeIfPresent(
-                WorkHostWorkingDirectoryPolicy.self, forKey: .workingDirectoryPolicy) ?? .unspecified,
+            workspaceID: try values.decodeIfPresent(
+                WorkHostWorkspaceID.self, forKey: .workspaceID),
             runtimeHostKind: try values.decodeIfPresent(String.self, forKey: .runtimeHostKind),
             actorKind: try values.decodeIfPresent(String.self, forKey: .actorKind),
-            resume: try values.decodeIfPresent(Bool.self, forKey: .resume) ?? false,
             metadataWasTruncated: encodedWasTruncated,
             maximumBytes: Self.defaultMaximumBytes)
     }
@@ -149,10 +145,9 @@ public struct WorkHostLaunchMetadata: Codable, Hashable, Sendable {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encodeIfPresent(providerID, forKey: .providerID)
         try values.encodeIfPresent(modelID, forKey: .modelID)
-        try values.encode(workingDirectoryPolicy, forKey: .workingDirectoryPolicy)
+        try values.encodeIfPresent(workspaceID, forKey: .workspaceID)
         try values.encodeIfPresent(runtimeHostKind, forKey: .runtimeHostKind)
         try values.encodeIfPresent(actorKind, forKey: .actorKind)
-        try values.encode(resume, forKey: .resume)
         try values.encode(metadataWasTruncated, forKey: .metadataWasTruncated)
     }
 
@@ -161,10 +156,9 @@ public struct WorkHostLaunchMetadata: Codable, Hashable, Sendable {
         return WorkHostLaunchMetadata(
             providerID: providerID,
             modelID: modelID,
-            workingDirectoryPolicy: workingDirectoryPolicy,
+            workspaceID: workspaceID,
             runtimeHostKind: runtimeHostKind,
             actorKind: actorKind,
-            resume: resume,
             metadataWasTruncated: metadataWasTruncated,
             maximumBytes: maximumBytes)
     }
@@ -339,6 +333,26 @@ public struct WorkHostRegistryLiveEntry: Sendable {
     public let registeredAt: Date
 }
 
+/// A fenced slot reservation used when opening a Hosted Work can suspend.  The reservation is
+/// counted against live/total bounds and prevents another registry mutation from occupying the
+/// Work while the service materializes the actor.  It is deliberately opaque to callers: only
+/// the registry that minted it can commit or cancel the token.
+public struct WorkHostRegistryRegistrationReservation: Hashable, Sendable {
+    public let work: WorkRef
+    public let launchMetadata: WorkHostLaunchMetadata
+    fileprivate let token: String
+
+    fileprivate init(
+        work: WorkRef,
+        launchMetadata: WorkHostLaunchMetadata,
+        token: String
+    ) {
+        self.work = work
+        self.launchMetadata = launchMetadata
+        self.token = token
+    }
+}
+
 public enum WorkHostRegistryEntryKind: String, Codable, Hashable, Sendable {
     case liveRegistered = "live_registered"
     case historical
@@ -425,6 +439,7 @@ public actor WorkHostRegistry {
     private let initializationError: WorkHostRegistryError?
     private var live: [WorkRef: WorkHostRegistryLiveEntry] = [:]
     private var canonical: [WorkRef: WorkHostRegistryCanonicalFact] = [:]
+    private var registrationReservations: [WorkRef: WorkHostRegistryRegistrationReservation] = [:]
     /// A replacement holds the logical Work slot while its new Run actor is being opened. This
     /// prevents a concurrent release from converting the old ended actor to history underneath
     /// the replacement's identity checks.
@@ -434,8 +449,8 @@ public actor WorkHostRegistry {
     /// Defaults are generated once here and remain stable for the registry's lifetime.
     public init(
         host: WorkHostRef,
-        instanceID: String = "instance-" + UUID().uuidString.lowercased(),
-        startIdentity: String = "start-" + UUID().uuidString.lowercased(),
+        instanceID: String = "instance-" + AviarySecureRandom.uuidString(),
+        startIdentity: String = "start-" + AviarySecureRandom.uuidString(),
         bounds: WorkHostRegistryBounds = .default
     ) {
         self.host = host
@@ -479,6 +494,9 @@ public actor WorkHostRegistry {
             throw WorkHostRegistryError.hostMismatch(
                 expected: host, actual: WorkHostRef(work.workHostID))
         }
+        guard registrationReservations[work] == nil else {
+            throw WorkHostRegistryError.registrationConflict(work)
+        }
         guard live[work] == nil else {
             throw WorkHostRegistryError.duplicateRegistration(work)
         }
@@ -502,6 +520,78 @@ public actor WorkHostRegistry {
         return entry
     }
 
+    /// Reserve a live registry slot before opening a Hosted actor.  Hosted construction writes
+    /// durable run evidence and may fail or suspend; keeping this reservation in the actor makes
+    /// capacity and Work identity checks atomic across that await.
+    public func reserveRegistration(
+        for work: WorkRef,
+        launchMetadata: WorkHostLaunchMetadata = .init()
+    ) throws -> WorkHostRegistryRegistrationReservation {
+        try ensureConfigured()
+        try validateWork(work)
+        guard work.workHostID == host.workHostID else {
+            throw WorkHostRegistryError.hostMismatch(
+                expected: host, actual: WorkHostRef(work.workHostID))
+        }
+        guard live[work] == nil, canonical[work] == nil,
+              registrationReservations[work] == nil else {
+            throw WorkHostRegistryError.registrationConflict(work)
+        }
+        guard live.count + registrationReservations.count < bounds.maxLiveEntries else {
+            throw WorkHostRegistryError.liveCapacityExceeded
+        }
+        guard live.count + canonical.count + registrationReservations.count < bounds.maxEntries else {
+            throw WorkHostRegistryError.capacityExceeded
+        }
+        let reservation = WorkHostRegistryRegistrationReservation(
+            work: work,
+            launchMetadata: launchMetadata.bounded(to: bounds.maxMetadataBytes),
+            token: AviarySecureRandom.uuidString())
+        registrationReservations[work] = reservation
+        return reservation
+    }
+
+    /// Commit an actor into an exact preflight reservation.  Once the token is valid, no
+    /// capacity/conflict check can fail because the slot was counted when it was reserved.
+    @discardableResult
+    public func commitRegistration(
+        _ reservation: WorkHostRegistryRegistrationReservation,
+        hostedWork: HostedInHouseWork
+    ) throws -> WorkHostRegistryLiveEntry {
+        try ensureConfigured()
+        guard let current = registrationReservations[reservation.work],
+              current == reservation else {
+            throw WorkHostRegistryError.registrationConflict(reservation.work)
+        }
+        guard hostedWork.identity.work == reservation.work else {
+            throw WorkHostRegistryError.divergentRegistration(
+                expected: reservation.work, actual: hostedWork.identity.work)
+        }
+        guard reservation.work.workHostID == host.workHostID,
+              live[reservation.work] == nil,
+              canonical[reservation.work] == nil else {
+            throw WorkHostRegistryError.registrationConflict(reservation.work)
+        }
+        registrationReservations.removeValue(forKey: reservation.work)
+        let entry = WorkHostRegistryLiveEntry(
+            work: reservation.work,
+            hostedWork: hostedWork,
+            hostInstance: hostInstance,
+            launchMetadata: reservation.launchMetadata,
+            registeredAt: Date())
+        live[reservation.work] = entry
+        return entry
+    }
+
+    /// Cancel an exact reservation after Hosted construction failed or was rejected.  A stale or
+    /// foreign token is intentionally a no-op so cleanup cannot mutate another admission.
+    public func cancelRegistration(
+        _ reservation: WorkHostRegistryRegistrationReservation
+    ) {
+        guard registrationReservations[reservation.work] == reservation else { return }
+        registrationReservations.removeValue(forKey: reservation.work)
+    }
+
     /// Import one canonical non-live fact after a catalog/recovery reader has validated its
     /// durable source. This is intentionally module-internal: a public assertion DTO must not be
     /// enough for an external caller to manufacture recovery truth or host liveness.
@@ -511,6 +601,9 @@ public actor WorkHostRegistry {
         guard fact.work.workHostID == host.workHostID else {
             throw WorkHostRegistryError.hostMismatch(
                 expected: host, actual: WorkHostRef(fact.work.workHostID))
+        }
+        guard registrationReservations[fact.work] == nil else {
+            throw WorkHostRegistryError.registrationConflict(fact.work)
         }
         guard validSourceID(fact.sourceID) else {
             throw WorkHostRegistryError.invalidIdentity("canonical source identity")
@@ -698,9 +791,9 @@ public actor WorkHostRegistry {
             throw WorkHostRegistryError.invalidReplacement(
                 work, reason: "replacement Run identity must be new")
         }
-        guard configuration.resume else {
+        guard configuration.projectionMode == .reopenHistorical else {
             throw WorkHostRegistryError.invalidReplacement(
-                work, reason: "replacement must resume the existing Session projection")
+                work, reason: "replacement must reopen the existing Session projection")
         }
 
         let replacement = try await HostedInHouseWork.open(configuration: configuration)

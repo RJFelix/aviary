@@ -194,12 +194,14 @@ public actor Agent {
     private var selfDelegate: SelfDelegate?
     /// Tasks the agent asked to be told about and stopped waiting for.
     private var dispatchedCount = 0
+#if !os(Linux)
     /// MCP servers whose tools this run may call, keyed by the namespaced tool name the model
     /// sees. Namespaced because two servers may both offer `search`, and a bare name would
     /// make that collision silent.
     private var mcpTools: [String: (client: MCPClient, tool: MCPClient.Tool)] = [:]
     /// Images the cell asked to look at, waiting for the end of the tool call that queued them.
     private var pendingImages: [(image: AttachedImage, note: String?)] = []
+#endif
     /// Where `remember` writes and `recall` reads. Absent means the run has no memory, which
     /// is a legitimate configuration rather than an error.
     private var memory: MemoryStore?
@@ -366,10 +368,12 @@ public actor Agent {
     /// rather than the next session.
     private var peerCount = 0
 
+#if !os(Linux)
     /// Offer this run a set of MCP tools.
     public func addMCPTools(_ tools: [MCPClient.Tool], from client: MCPClient) {
         for tool in tools { mcpTools[tool.qualifiedName] = (client, tool) }
     }
+#endif
 
     /// Answer the next turn with a different model.
     ///
@@ -603,6 +607,7 @@ public actor Agent {
                 return .object(["error": .string(error.localizedDescription)])
             }
 
+#if !os(Linux)
         case "attach_image":
             guard config.model.supportsImages else {
                 return .object(["error": .string(
@@ -634,6 +639,7 @@ public actor Agent {
                     permit, state: .failed, retrySafety: .safe, failureKind: .task)
                 return .object(["error": .string(error.localizedDescription)])
             }
+#endif
 
         case "spawn":
             guard await requireJournal("child start") else {
@@ -954,14 +960,20 @@ public actor Agent {
 
     /// The tools this run actually offers, given its depth and whether spawning is wired up.
     private var activeTools: [ChatTool] {
+        #if os(Linux)
+        let supportsImages = false
+        #else
+        let supportsImages = config.model.supportsImages
+        #endif
         var tools = Self.tools(
             cwd: config.cwd,
             canSpawn: spawnDelegate != nil && config.depth < config.maxDepth,
             spawnBudget: max(0, config.maxDepth - config.depth),
             hasMemory: memory != nil,
-            supportsImages: config.model.supportsImages,
+            supportsImages: supportsImages,
             peerCount: peerCount,
             hasWeb: WebSearch.configuredKey() != nil)
+#if !os(Linux)
         // MCP tools are declared individually rather than behind one dispatcher, because a
         // model picks a tool by reading its schema and a single `call_mcp(name, args)` hides
         // every schema behind a string.
@@ -973,6 +985,7 @@ public actor Agent {
                     : entry.tool.description,
                 parameters: entry.tool.schema))
         }
+#endif
         return tools
     }
 
@@ -1639,6 +1652,7 @@ public actor Agent {
         return !pendingFollowUps.isEmpty || !pendingSteering.isEmpty
     }
 
+#if !os(Linux)
     /// Move anything `attach_image` queued into the conversation.
     ///
     /// A user message rather than part of the tool result, because that is the one shape all
@@ -1670,6 +1684,11 @@ public actor Agent {
         }
         return true
     }
+#else
+    /// Linux daemon builds do not compile the Apple image bridge, so image attachment is not a
+    /// capability in their advertised tool set.
+    private func drainPendingImages() async -> Bool { true }
+#endif
 
     // MARK: Compaction
 
@@ -1928,6 +1947,7 @@ public actor Agent {
         guard await requireJournal("tool \(call.name)") else {
             return (journalFailureDetail ?? "The session journal is unavailable; stop this run.", true)
         }
+#if !os(Linux)
         if call.name != "python" {
             if let entry = mcpTools[call.name] {
                 let permit = await beginNativeAction(
@@ -1984,6 +2004,11 @@ public actor Agent {
             let available = (["python"] + mcpTools.keys.sorted()).joined(separator: ", ")
             return ("No tool named \(call.name). Available: \(available).", true)
         }
+#else
+        if call.name != "python" {
+            return ("No tool named \(call.name). Available: python.", true)
+        }
+#endif
         guard var code = call.arguments["code"]?.stringValue, !code.isEmpty else {
             return ("The `python` tool needs a non-empty `code` argument.", true)
         }
@@ -2104,7 +2129,7 @@ public actor Agent {
         try? FileManager.default.createDirectory(
             at: wireLogURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: wireLogURL.path) {
-            FileManager.default.createFile(atPath: wireLogURL.path, contents: nil)
+            _ = FileManager.default.createFile(atPath: wireLogURL.path, contents: nil)
         }
         // Best-effort, and silent on failure: diagnostics must never take down a run, and a
         // full disk should not produce one error per model call.

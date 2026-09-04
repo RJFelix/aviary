@@ -14,6 +14,7 @@ CONFIG="${1:-release}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="$ROOT/build/Aviary.app"
 BIN_NAME="Aviary"
+DAEMON_NAME="aviaryd"
 BUNDLE_ID="works.duckbill.aviary"
 VERSION="0.1.0"
 MODULE_CACHE="$ROOT/app/.build/module-cache"
@@ -28,11 +29,26 @@ cd "$ROOT/app"
 swift build -c "$CONFIG" --product "$BIN_NAME"
 BIN_PATH="$(swift build -c "$CONFIG" --show-bin-path)/$BIN_NAME"
 [ -x "$BIN_PATH" ] || { echo "no binary at $BIN_PATH"; exit 1; }
+swift build -c "$CONFIG" --product "$DAEMON_NAME"
+DAEMON_PATH="$(swift build -c "$CONFIG" --show-bin-path)/$DAEMON_NAME"
+[ -x "$DAEMON_PATH" ] || { echo "no daemon binary at $DAEMON_PATH"; exit 1; }
 
 echo "==> Assembling $APP_DIR"
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Helpers" "$APP_DIR/Contents/Resources"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/$BIN_NAME"
+cp "$DAEMON_PATH" "$APP_DIR/Contents/Helpers/$DAEMON_NAME"
+
+# The helper is a real Work Host process, not a thin launcher back into the checkout. Ship the
+# Python runtime hosts it owns so Work can continue when the GUI is closed and when the app bundle
+# is moved away from the source tree. Copy the two audited entry points explicitly: build caches or
+# other local runtime directory contents must never become accidental bundle resources.
+mkdir -p "$APP_DIR/Contents/Resources/runtime-hosts/python3"
+mkdir -p "$APP_DIR/Contents/Resources/runtime-hosts/python3-shared"
+install -m 0644 "$ROOT/runtime-hosts/python3/host.py" \
+    "$APP_DIR/Contents/Resources/runtime-hosts/python3/host.py"
+install -m 0644 "$ROOT/runtime-hosts/python3-shared/host.py" \
+    "$APP_DIR/Contents/Resources/runtime-hosts/python3-shared/host.py"
 
 BUILD_STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 BUILD_COMMIT="$(git -C "$(dirname "$0")/.." rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -118,12 +134,20 @@ sign_with_deadline() {
 
 if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_ID"; then
     echo "==> Signing as '$SIGN_ID'"
+    # Nested code must be signed before the outer app. Signing the app first leaves the helper
+    # outside its sealed resource graph and makes Gatekeeper reject the bundle on launch.
+    sign_with_deadline 60 codesign --force --sign "$SIGN_ID" \
+        --identifier "$BUNDLE_ID.daemon" "$APP_DIR/Contents/Helpers/$DAEMON_NAME" \
+        || echo "    (daemon signing failed; the app still runs locally)"
     sign_with_deadline 60 codesign --force --sign "$SIGN_ID" \
         --identifier "$BUNDLE_ID" "$APP_DIR" \
         || echo "    (signing failed; the app still runs, but permission grants will not persist)"
 else
     echo "==> Signing (ad-hoc — permission prompts will return after every build)"
     echo "    Run scripts/make-signing-cert.sh once to stop that."
+    sign_with_deadline 60 codesign --force --sign - \
+        --identifier "$BUNDLE_ID.daemon" "$APP_DIR/Contents/Helpers/$DAEMON_NAME" \
+        || echo "    (daemon ad-hoc signing failed; the app still runs locally)"
     sign_with_deadline 60 codesign --force --sign - --identifier "$BUNDLE_ID" "$APP_DIR" \
         || echo "    (codesign failed; the app will still run locally)"
 fi

@@ -1,6 +1,9 @@
-import CryptoKit
-import Darwin
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 private enum WorkHostControlLimits {
     static let maxIdentityCharacters = 256
@@ -8,9 +11,11 @@ private enum WorkHostControlLimits {
     static let maxCapabilities = 64
     static let maxCapabilityCharacters = 128
     static let maxDigestCharacters = 80
-    static let maxTargetJournalBytes = 64 * 1024 * 1024
-    static let maxControlJournalBytes = 64 * 1024 * 1024
     static let maxDurabilitySealBytes = 16 * 1024
+    /// Temporary supported state envelope until the persistent projection store lands. This is a
+    /// record-count bound, not a journal byte ceiling; it keeps reducer copy-on-write costs
+    /// explicit rather than silently accepting an unbounded projection.
+    static let maxSupportedControlRecords = 1_000_000
 }
 
 /// Control-plane event names that are intentionally kept here until the general Timeline event
@@ -77,7 +82,94 @@ private func controlLengthPrefixedKey(_ client: ClientRef, commandID: String) ->
 }
 
 private func controlSHA256(_ data: Data) -> String {
-    "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    "sha256:" + AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+/// A small streaming SHA-256 implementation used only for the control journal seal.  The
+/// platform digest helper intentionally exposes a one-shot API; keeping this state here means an
+/// append extends the prior seal without retaining or hashing the complete history again.
+private struct ControlSHA256State: Sendable {
+    private var state: [UInt32] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ]
+    private var pending: [UInt8] = []
+    private var byteCount: UInt64 = 0
+
+    mutating func update(_ data: Data) {
+        byteCount += UInt64(data.count)
+        pending.append(contentsOf: data)
+        while pending.count >= 64 {
+            let block = Array(pending.prefix(64))
+            pending.removeFirst(64)
+            compress(block)
+        }
+    }
+
+    func hexDigest() -> String {
+        var copy = self
+        let bitCount = copy.byteCount &* 8
+        copy.pending.append(0x80)
+        while copy.pending.count % 64 != 56 { copy.pending.append(0) }
+        copy.pending.append(contentsOf: withUnsafeBytes(of: bitCount.bigEndian, Array.init))
+        while !copy.pending.isEmpty {
+            let block = Array(copy.pending.prefix(64))
+            copy.pending.removeFirst(64)
+            copy.compress(block)
+        }
+        return copy.state.map { String(format: "%08x", $0) }.joined()
+    }
+
+    private mutating func compress(_ block: [UInt8]) {
+        let constants: [UInt32] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b,
+            0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
+            0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7,
+            0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+            0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152,
+            0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+            0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
+            0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
+            0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f,
+            0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        ]
+        var words = [UInt32](repeating: 0, count: 64)
+        for index in 0..<16 {
+            let base = index * 4
+            words[index] = UInt32(block[base]) << 24 | UInt32(block[base + 1]) << 16
+                | UInt32(block[base + 2]) << 8 | UInt32(block[base + 3])
+        }
+        for index in 16..<64 {
+            let value = words[index - 15]
+            let s0 = value.rotateRight(7) ^ value.rotateRight(18) ^ (value >> 3)
+            let prior = words[index - 2]
+            let s1 = prior.rotateRight(17) ^ prior.rotateRight(19) ^ (prior >> 10)
+            words[index] = words[index - 16] &+ s0 &+ words[index - 7] &+ s1
+        }
+        var a = state[0], b = state[1], c = state[2], d = state[3]
+        var e = state[4], f = state[5], g = state[6], h = state[7]
+        for index in 0..<64 {
+            let s1 = e.rotateRight(6) ^ e.rotateRight(11) ^ e.rotateRight(25)
+            let choose = (e & f) ^ ((~e) & g)
+            let first = h &+ s1 &+ choose &+ constants[index] &+ words[index]
+            let s0 = a.rotateRight(2) ^ a.rotateRight(13) ^ a.rotateRight(22)
+            let majority = (a & b) ^ (a & c) ^ (b & c)
+            let second = s0 &+ majority
+            h = g; g = f; f = e; e = d &+ first
+            d = c; c = b; b = a; a = first &+ second
+        }
+        state[0] &+= a; state[1] &+= b; state[2] &+= c; state[3] &+= d
+        state[4] &+= e; state[5] &+= f; state[6] &+= g; state[7] &+= h
+    }
+}
+
+private extension UInt32 {
+    func rotateRight(_ amount: UInt32) -> UInt32 {
+        (self >> amount) | (self << (32 - amount))
+    }
 }
 
 private struct WorkHostControlDurabilitySeal: Codable, Hashable, Sendable {
@@ -88,7 +180,40 @@ private struct WorkHostControlDurabilitySeal: Codable, Hashable, Sendable {
     let sha256: String
 }
 
-private struct WorkHostControlMutationIdentity: Codable {
+/// Read-path observations for proving that a live control journal extends from its cache. These
+/// counters are diagnostics only and never participate in journal identity or admission. Normal
+/// mutation CPU is not claimed to be O(delta): one reducer preflight can trigger Swift
+/// copy-on-write across the bounded control-state envelope above.
+public struct WorkHostControlJournalReadMetrics: Codable, Hashable, Sendable {
+    public let fullReads: Int
+    public let cacheHits: Int
+    public let incrementalReads: Int
+    public let invalidations: Int
+    public let bytesScanned: Int
+    public let recordsApplied: Int
+    public let targetVerificationBytesScanned: Int
+    public let targetVerificationChunks: Int
+    public let targetVerificationPeakChunkBytes: Int
+
+    public init(
+        fullReads: Int = 0, cacheHits: Int = 0, incrementalReads: Int = 0,
+        invalidations: Int = 0, bytesScanned: Int = 0, recordsApplied: Int = 0,
+        targetVerificationBytesScanned: Int = 0, targetVerificationChunks: Int = 0,
+        targetVerificationPeakChunkBytes: Int = 0
+    ) {
+        self.fullReads = fullReads
+        self.cacheHits = cacheHits
+        self.incrementalReads = incrementalReads
+        self.invalidations = invalidations
+        self.bytesScanned = bytesScanned
+        self.recordsApplied = recordsApplied
+        self.targetVerificationBytesScanned = targetVerificationBytesScanned
+        self.targetVerificationChunks = targetVerificationChunks
+        self.targetVerificationPeakChunkBytes = targetVerificationPeakChunkBytes
+    }
+}
+
+struct WorkHostControlMutationIdentity: Codable, Hashable, Sendable {
     let type: String
     let work: WorkRef
     let workJournal: JournalRef
@@ -98,9 +223,21 @@ private struct WorkHostControlMutationIdentity: Codable {
     let sessionJournal: JournalRef?
     let sessionAttachment: SessionAttachmentRef?
     let capabilities: [String]?
+    /// The caller's requested capability envelope is distinct from the host's granted set. It is
+    /// retained in the digest so two requests which reduce to the same grant cannot alias one
+    /// another under a client/Work/command identity.
+    let requestedCapabilities: [String]?
     let targetJournal: JournalRef?
     let targetCursor: JournalCursor?
     let causalControlCursor: JournalCursor
+}
+
+/// A previously committed control mutation. This is an internal reconciliation seam: callers
+/// still have to validate the request envelope before turning the record into a response, while
+/// the journal remains the only authority for the resulting cursor/event identity.
+struct WorkHostControlPriorMutation: Sendable {
+    let event: TimelineEvent
+    let commit: TimelineJournalCommit
 }
 
 // MARK: - Durable creation transaction
@@ -1153,6 +1290,30 @@ public actor WorkHostControlJournal {
     private let home: AgentHome?
     private let creationIdentityMinter: @Sendable () -> WorkHostControlMintedIdentity
     private var controlFailure: String?
+    private struct ControlFileFingerprint: Equatable, Sendable {
+        let device: UInt64
+        let inode: UInt64
+        let mode: UInt32
+        let byteCount: Int
+        let modificationSeconds: Int64
+        let modificationNanoseconds: Int64
+        let changeSeconds: Int64
+        let changeNanoseconds: Int64
+        let lastByte: UInt8?
+    }
+    private var cachedReadFingerprint: ControlFileFingerprint?
+    private var cachedReadResult: TimelineJournalReadResult?
+    /// Record segments are append-only. Keeping them separate avoids an O(history) array copy
+    /// when one new control event is committed; `read()` flattens only on explicit caller demand.
+    private var cachedRecordSegments: [[TimelineJournalRecord]] = []
+    private var cachedSnapshot: WorkHostControlSnapshot?
+    /// These values are the actor's sealed-prefix state. They are published as one unit only
+    /// after the Timeline append and the atomic seal publication have both succeeded.
+    private var cachedCursor: JournalCursor?
+    private var cachedCommandIndex: [String: [TimelineJournalRecord]] = [:]
+    private var cachedSealedByteCount = 0
+    private var cachedDigestState: ControlSHA256State?
+    private var readMetrics = WorkHostControlJournalReadMetrics()
     private var mutationInFlight = false
     private var mutationWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -1275,18 +1436,194 @@ public actor WorkHostControlJournal {
     }
 
     public func read() throws -> TimelineJournalReadResult {
-        let data = try Self.readBoundedData(
-            at: fileURL, maximum: WorkHostControlLimits.maxControlJournalBytes)
+        try ensureControlCache()
+        if cachedReadResult == nil {
+            cachedReadResult = TimelineJournalReadResult(
+                records: cachedRecordSegments.flatMap { $0 })
+        }
+        guard let cachedReadResult else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal has an incomplete tail")
+        }
+        return cachedReadResult
+    }
+
+    /// Bring the actor-owned sealed-prefix cache current without materializing its record list.
+    /// Normal mutations use this path; the public read API is the only operation that asks for a
+    /// flat history value.
+    private func ensureControlCache() throws {
+        // A failed append or seal is deliberately a read-only view of the last known sealed
+        // prefix. The writer may have a complete line in page cache, or the seal rename may have
+        // become visible without its directory fsync; neither is a successful mutation.
+        if controlFailure != nil, cachedSnapshot != nil { return }
+        let fingerprint = try controlFileFingerprint()
+        if let cachedReadFingerprint, cachedReadFingerprint == fingerprint,
+           cachedSnapshot != nil {
+            try Self.validateCachedSeal(
+                at: fileURL, journal: journal, byteCount: cachedSealedByteCount,
+                cursor: cachedCursor ?? JournalCursor(journal: journal, sequence: 0),
+                digest: cachedDigestState?.hexDigest()
+                    ?? String(controlSHA256(Data()).dropFirst("sha256:".count)))
+            addReadMetrics(cacheHits: 1)
+            return
+        }
+
+        // During the small await in writer.append(), the complete append is intentionally not
+        // visible yet. Keep serving the old projection until its seal can be published. A public
+        // read is otherwise an external mutation observation and must fail closed.
+        if mutationInFlight, cachedSnapshot != nil { return }
+        let data = try Self.readFileData(at: fileURL)
         let committedData = try Self.committedPrefixData(
             for: fileURL, journal: journal, data: data)
-        return TimelineJournalReader.read(
+        guard committedData.count == data.count else {
+            invalidateCache()
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal has an unsealed external suffix")
+        }
+        let result = TimelineJournalReader.read(
             committedData, journal: journal, actor: readerActor, hostRecordedAt: Date())
+        guard result.quarantinedSuffix == nil, result.truncatedTail == nil else {
+            invalidateCache()
+            return
+        }
+        guard result.records.count <= WorkHostControlLimits.maxSupportedControlRecords else {
+            invalidateCache()
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control projection exceeds its supported record envelope")
+        }
+        let after = try controlFileFingerprint()
+        guard fingerprint == after else {
+            invalidateCache()
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal changed during read")
+        }
+        let snapshot = WorkHostControlReducer.reduce(
+            result.records.map(\.event), initial: WorkHostControlSnapshot(journal: journal))
+        var digestState = ControlSHA256State()
+        digestState.update(committedData)
+        let cursor = currentCursor(of: snapshot)
+        var commandIndex: [String: [TimelineJournalRecord]] = [:]
+        for record in result.records {
+            if let key = Self.commandIndexKey(for: record.event) {
+                commandIndex[key, default: []].append(record)
+            }
+        }
+        cachedReadFingerprint = after
+        cachedReadResult = result
+        cachedRecordSegments = [result.records]
+        cachedSnapshot = snapshot
+        cachedCursor = cursor
+        cachedCommandIndex = commandIndex
+        cachedSealedByteCount = committedData.count
+        cachedDigestState = digestState
+        addReadMetrics(fullReads: 1, bytesScanned: committedData.count,
+                       recordsApplied: result.records.count)
+        return
     }
 
     public func snapshot() throws -> WorkHostControlSnapshot {
-        let result = try read()
-        let initial = WorkHostControlSnapshot(journal: journal)
-        return WorkHostControlReducer.reduce(result.records.map(\.event), initial: initial)
+        try ensureControlCache()
+        if let cachedSnapshot { return cachedSnapshot }
+        return WorkHostControlSnapshot(journal: journal)
+    }
+
+    public func journalReadMetrics() -> WorkHostControlJournalReadMetrics { readMetrics }
+
+    /// Find one client-qualified command without applying any current attachment, source-journal,
+    /// or causal-cursor policy. JournalBackedWorkService uses this before those mutable checks so
+    /// an exact retry can reconstruct a durable response after the original response was lost.
+    /// The caller must still compare the complete request envelope and mutation digest.
+    func priorCommand(
+        work: WorkRef, client: ClientRef, commandID: String
+    ) async throws -> WorkHostControlPriorMutation? {
+        await acquireMutationGate()
+        defer { releaseMutationGate() }
+        guard controlBoundedIdentity(work.workHostID),
+              controlBoundedIdentity(work.workID),
+              work.workHostID == workHost.workHostID,
+              controlBoundedIdentity(client.clientID),
+              controlBoundedIdentity(commandID) else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "control command lookup identities exceed the bounded contract")
+        }
+        try ensureControlCache()
+        guard let current = cachedSnapshot else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal cache was not published")
+        }
+        guard current.structuralIntegrityValid,
+              current.semanticProjectionValid,
+              current.unknownEvents.isEmpty else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal is not completely projectable")
+        }
+        let key = Self.commandIndexKey(work: work, client: client, commandID: commandID)
+        let matches = cachedCommandIndex[key] ?? []
+        guard matches.count <= 1 else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "client-qualified control command has duplicate durable records")
+        }
+        guard let record = matches.first else { return nil }
+        if case .failed(let reason) = await writer.health {
+            throw TimelineJournalWriter.WriterError.unavailable(reason)
+        }
+        return WorkHostControlPriorMutation(
+            event: record.event,
+            commit: TimelineJournalCommit(
+                eventRef: EventRef(journal: journal, eventID: record.event.eventID),
+                cursor: JournalCursor(
+                    journal: journal, eventID: record.event.eventID,
+                    sequence: record.event.sequence)))
+    }
+
+    /// Find an exact mutation identity without appending. Unlike `commitMutation`, this method is
+    /// intentionally only a lookup; a nil result leaves the caller free to perform source and
+    /// attachment validation before invoking the normal mutating API.
+    func priorMutation(
+        _ identity: WorkHostControlMutationIdentity, command: CommandRef
+    ) async throws -> WorkHostControlPriorMutation? {
+        await acquireMutationGate()
+        defer { releaseMutationGate() }
+        if let controlFailure {
+            throw TimelineJournalWriter.WriterError.unavailable(controlFailure)
+        }
+        try validateMutationCommand(command, identity: identity)
+        let digest = try mutationDigest(identity)
+        try ensureControlCache()
+        guard let current = cachedSnapshot else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal cache was not published")
+        }
+        guard current.structuralIntegrityValid,
+              current.semanticProjectionValid,
+              current.unknownEvents.isEmpty else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal is not completely projectable")
+        }
+        let key = Self.commandIndexKey(
+            work: identity.work, client: identity.client, commandID: command.commandID)
+        let matches = cachedCommandIndex[key] ?? []
+        guard matches.count <= 1 else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "client-qualified control command has duplicate durable records")
+        }
+        guard let record = matches.first else { return nil }
+        guard record.event.command == command,
+              record.event.type == identity.type,
+              record.event.idempotencyKey == digest else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "client-qualified control command conflicts with a prior request")
+        }
+        if case .failed(let reason) = await writer.health {
+            throw TimelineJournalWriter.WriterError.unavailable(reason)
+        }
+        return WorkHostControlPriorMutation(
+            event: record.event,
+            commit: TimelineJournalCommit(
+                eventRef: EventRef(journal: journal, eventID: record.event.eventID),
+                cursor: JournalCursor(
+                    journal: journal, eventID: record.event.eventID,
+                    sequence: record.event.sequence)))
     }
 
     public func closeChecked() async throws {
@@ -1322,6 +1659,7 @@ public actor WorkHostControlJournal {
         attachment: ClientAttachmentRef,
         client: ClientRef,
         capabilities: Set<String>,
+        requestedCapabilities: Set<String>,
         session: SessionRef? = nil,
         sessionJournal: JournalRef? = nil,
         sessionAttachment: SessionAttachmentRef? = nil,
@@ -1336,7 +1674,9 @@ public actor WorkHostControlJournal {
             type: TimelineEventType.clientAttached, work: work, workJournal: workJournal,
             attachment: attachment, client: client, session: session,
             sessionJournal: sessionJournal, sessionAttachment: sessionAttachment,
-            capabilities: capabilities.sorted(), targetJournal: nil, targetCursor: nil,
+            capabilities: capabilities.sorted(),
+            requestedCapabilities: requestedCapabilities.sorted(),
+            targetJournal: nil, targetCursor: nil,
             causalControlCursor: causalControlCursor), command: command)
     }
 
@@ -1359,7 +1699,8 @@ public actor WorkHostControlJournal {
             type: TimelineEventType.clientDetached, work: work, workJournal: workJournal,
             attachment: attachment, client: client, session: session,
             sessionJournal: sessionJournal, sessionAttachment: sessionAttachment,
-            capabilities: nil, targetJournal: nil, targetCursor: nil,
+            capabilities: nil, requestedCapabilities: nil,
+            targetJournal: nil, targetCursor: nil,
             causalControlCursor: causalControlCursor), command: command)
     }
 
@@ -1370,6 +1711,7 @@ public actor WorkHostControlJournal {
         attachment: ClientAttachmentRef,
         client: ClientRef,
         capabilities: Set<String>,
+        requestedCapabilities: Set<String>,
         session: SessionRef? = nil,
         sessionJournal: JournalRef? = nil,
         sessionAttachment: SessionAttachmentRef? = nil,
@@ -1384,7 +1726,9 @@ public actor WorkHostControlJournal {
             type: TimelineEventType.clientCapabilityChanged, work: work,
             workJournal: workJournal, attachment: attachment, client: client, session: session,
             sessionJournal: sessionJournal, sessionAttachment: sessionAttachment,
-            capabilities: capabilities.sorted(), targetJournal: nil, targetCursor: nil,
+            capabilities: capabilities.sorted(),
+            requestedCapabilities: requestedCapabilities.sorted(),
+            targetJournal: nil, targetCursor: nil,
             causalControlCursor: causalControlCursor), command: command)
     }
 
@@ -1415,7 +1759,8 @@ public actor WorkHostControlJournal {
             type: TimelineEventType.clientReadAcknowledged, work: work,
             workJournal: workJournal, attachment: attachment, client: client, session: session,
             sessionJournal: sessionJournal, sessionAttachment: sessionAttachment,
-            capabilities: nil, targetJournal: targetJournal, targetCursor: cursor,
+            capabilities: nil, requestedCapabilities: nil,
+            targetJournal: targetJournal, targetCursor: cursor,
             causalControlCursor: causalControlCursor), command: command)
     }
 
@@ -1786,8 +2131,7 @@ public actor WorkHostControlJournal {
         }
         let data: Data
         do {
-            data = try Self.readBoundedData(
-                at: sourceURL, maximum: WorkHostControlLimits.maxTargetJournalBytes)
+            data = try Self.readFileData(at: sourceURL)
         } catch {
             return .unreadable
         }
@@ -1989,25 +2333,14 @@ public actor WorkHostControlJournal {
         snapshot: WorkHostControlSnapshot,
         cursor: JournalCursor
     ) {
-        let read = try self.read()
-        guard read.quarantinedSuffix == nil, read.truncatedTail == nil else {
-            throw TimelineJournalWriter.WriterError.invalidJournal(
-                reason: "Work Host control journal has an incomplete tail")
-        }
-        let snapshot = WorkHostControlReducer.reduce(
-            read.records.map(\.event), initial: WorkHostControlSnapshot(journal: journal))
+        let snapshot = try self.snapshot()
         guard snapshot.structuralIntegrityValid,
               snapshot.semanticProjectionValid,
               snapshot.unknownEvents.isEmpty else {
             throw TimelineJournalWriter.WriterError.invalidJournal(
                 reason: "Work Host control journal is not completely projectable")
         }
-        let cursor: JournalCursor
-        if let event = read.records.last?.event {
-            cursor = JournalCursor(journal: journal, eventID: event.eventID, sequence: event.sequence)
-        } else {
-            cursor = JournalCursor(journal: journal, eventID: nil, sequence: 0)
-        }
+        let cursor = currentCursor(of: snapshot)
         return (snapshot, cursor)
     }
 
@@ -2094,21 +2427,6 @@ public actor WorkHostControlJournal {
             throw TimelineJournalWriter.WriterError.invalidDraft(
                 reason: "creation mutation is not valid for the current control projection")
         }
-        let currentData = try Self.readBoundedData(
-            at: fileURL, maximum: WorkHostControlLimits.maxControlJournalBytes)
-        let committedData = try Self.committedPrefixData(
-            for: fileURL, journal: journal, data: currentData)
-        guard committedData.count == currentData.count else {
-            throw TimelineJournalWriter.WriterError.invalidJournal(
-                reason: "Work Host control journal has an unsealed suffix")
-        }
-        var upperBoundEventBytes = try JSONEncoder().encode(preflightEvent)
-        upperBoundEventBytes.append(0x0A)
-        guard currentData.count <= WorkHostControlLimits.maxControlJournalBytes
-                - upperBoundEventBytes.count - 4096 else {
-            throw TimelineJournalWriter.WriterError.invalidDraft(
-                reason: "Work Host control journal has reached its byte bound")
-        }
         var boundedDraft = draft
         // Keep the request digest as the event's idempotency identity. This is metadata only and
         // does not duplicate any raw request body in the control journal.
@@ -2124,12 +2442,15 @@ public actor WorkHostControlJournal {
             clientTimestamp: draft.clientTimestamp, payloadVersion: draft.payloadVersion,
             type: draft.type, declaredDomains: draft.declaredDomains, links: draft.links,
             payload: draft.payload)
-        let commit = try await writer.append(boundedDraft)
+        let commit: TimelineJournalCommit
         do {
-            let data = try Self.readBoundedData(
-                at: fileURL, maximum: WorkHostControlLimits.maxControlJournalBytes)
-            try Self.persistDurabilitySeal(
-                for: fileURL, journal: journal, cursor: commit.cursor, data: data)
+            commit = try await writer.append(boundedDraft)
+        } catch {
+            if case .failed(let reason) = await writer.health { controlFailure = reason }
+            throw error
+        }
+        do {
+            try appendToCacheAndSeal(commit: commit, current: current)
             return commit
         } catch {
             let reason = "Work Host control durability seal failed: \(error.localizedDescription)"
@@ -2141,6 +2462,86 @@ public actor WorkHostControlJournal {
     private func currentCursor(of snapshot: WorkHostControlSnapshot) -> JournalCursor {
         JournalCursor(
             journal: journal, eventID: snapshot.lastEventID, sequence: snapshot.lastSequence)
+    }
+
+    private static func commandIndexKey(
+        work: WorkRef, client: ClientRef, commandID: String
+    ) -> String {
+        "work:\(work.workHostID.utf8.count):\(work.workHostID)/\(work.workID.utf8.count):\(work.workID)/"
+            + controlLengthPrefixedKey(client, commandID: commandID)
+    }
+
+    private static func commandIndexKey(for event: TimelineEvent) -> String? {
+        guard let work = event.work, let command = event.command,
+              let client = command.client else { return nil }
+        return commandIndexKey(work: work, client: client, commandID: command.commandID)
+    }
+
+    /// Parse exactly the bytes appended after the actor's sealed cache, extend the reducer and
+    /// command index, then publish one new seal. Nothing from the candidate becomes visible until
+    /// the seal's fsync, rename, and containing-directory fsync have all succeeded.
+    private func appendToCacheAndSeal(
+        commit: TimelineJournalCommit, current: WorkHostControlSnapshot
+    ) throws {
+        guard let priorDigest = cachedDigestState,
+              cachedCursor == currentCursor(of: current),
+              cachedSealedByteCount >= 0,
+              current.lastSequence < WorkHostControlLimits.maxSupportedControlRecords else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host append cache is not at the current sealed cursor")
+        }
+        let before = try controlFileFingerprint()
+        guard before.byteCount >= cachedSealedByteCount else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal moved backwards during append")
+        }
+        let appended = try Self.readDataRange(
+            at: fileURL, offset: cachedSealedByteCount, expectedByteCount: before.byteCount,
+            maximum: nil)
+        let parsed = TimelineJournalReader.read(
+            appended, journal: journal, actor: readerActor, hostRecordedAt: Date(),
+            initialByteOffset: cachedSealedByteCount,
+            initialSequence: current.lastSequence + 1,
+            initialPreviousEventID: current.lastEventID)
+        guard parsed.quarantinedSuffix == nil, parsed.truncatedTail == nil,
+              parsed.records.count == 1,
+              let record = parsed.records.first,
+              record.event.eventID == commit.eventRef.eventID,
+              record.event.sequence == commit.cursor.sequence else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host append did not produce one canonical event")
+        }
+        var nextSnapshot = current
+        var reducer = WorkHostControlReducer(snapshot: current)
+        reducer.apply(record.event)
+        nextSnapshot = reducer.snapshot
+        guard nextSnapshot.structuralIntegrityValid,
+              nextSnapshot.semanticProjectionValid,
+              nextSnapshot.quarantinedEvents.count == current.quarantinedEvents.count else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host append is not valid for the cached projection")
+        }
+        var nextDigest = priorDigest
+        nextDigest.update(appended)
+        try Self.persistDurabilitySeal(
+            for: fileURL, journal: journal, cursor: commit.cursor,
+            byteCount: before.byteCount, digest: nextDigest.hexDigest())
+        let after = try controlFileFingerprint()
+        guard after.byteCount == before.byteCount else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal changed while publishing its seal")
+        }
+        cachedReadFingerprint = after
+        cachedReadResult = nil
+        cachedRecordSegments.append(parsed.records)
+        cachedSnapshot = nextSnapshot
+        cachedCursor = commit.cursor
+        if let key = Self.commandIndexKey(for: record.event) {
+            cachedCommandIndex[key, default: []].append(record)
+        }
+        cachedSealedByteCount = before.byteCount
+        cachedDigestState = nextDigest
+        addReadMetrics(incrementalReads: 1, bytesScanned: appended.count, recordsApplied: 1)
     }
 
     /// Commit a control-plane mutation with one client-qualified idempotency identity.
@@ -2159,13 +2560,11 @@ public actor WorkHostControlJournal {
         }
         try validateMutationCommand(command, identity: identity)
         let digest = try mutationDigest(identity)
-        let read = try self.read()
-        guard read.quarantinedSuffix == nil, read.truncatedTail == nil else {
+        try ensureControlCache()
+        guard let current = cachedSnapshot else {
             throw TimelineJournalWriter.WriterError.invalidJournal(
-                reason: "Work Host control journal has an incomplete tail")
+                reason: "Work Host control journal cache was not published")
         }
-        let current = WorkHostControlReducer.reduce(
-            read.records.map(\.event), initial: WorkHostControlSnapshot(journal: journal))
         guard current.structuralIntegrityValid,
               current.semanticProjectionValid,
               current.unknownEvents.isEmpty else {
@@ -2173,11 +2572,9 @@ public actor WorkHostControlJournal {
                 reason: "Work Host control journal is not completely projectable")
         }
 
-        let prior = read.records.filter {
-            $0.event.work == identity.work
-                && $0.event.command?.client == identity.client
-                && $0.event.command?.commandID == command.commandID
-        }
+        let key = Self.commandIndexKey(
+            work: identity.work, client: identity.client, commandID: command.commandID)
+        let prior = cachedCommandIndex[key] ?? []
         if let record = prior.first {
             guard prior.count == 1,
                   record.event.command == command,
@@ -2208,13 +2605,7 @@ public actor WorkHostControlJournal {
             try verifyTargetCursor(journal: targetJournal, cursor: targetCursor)
         }
 
-        let actualCursor: JournalCursor
-        if let last = read.records.last?.event {
-            actualCursor = JournalCursor(
-                journal: journal, eventID: last.eventID, sequence: last.sequence)
-        } else {
-            actualCursor = JournalCursor(journal: journal, eventID: nil, sequence: 0)
-        }
+        let actualCursor = cachedCursor ?? currentCursor(of: current)
         guard identity.causalControlCursor == actualCursor else {
             throw TimelineJournalWriter.WriterError.invalidDraft(
                 reason: "control mutation causal cursor is stale")
@@ -2225,7 +2616,8 @@ public actor WorkHostControlJournal {
             sessionJournal: identity.sessionJournal,
             targetJournal: identity.targetJournal,
             cursor: identity.targetCursor,
-            capabilities: identity.capabilities.map(Set.init))
+            capabilities: identity.capabilities.map(Set.init),
+            requestedCapabilities: identity.requestedCapabilities.map(Set.init))
         let draft = TimelineEventDraft(
             idempotencyKey: digest, command: command, session: identity.session,
             work: identity.work, workHost: workHost, client: identity.client,
@@ -2257,30 +2649,18 @@ public actor WorkHostControlJournal {
             throw TimelineJournalWriter.WriterError.invalidDraft(
                 reason: "control mutation is not valid for the current attachment state")
         }
-        let currentData = try Self.readBoundedData(
-            at: fileURL, maximum: WorkHostControlLimits.maxControlJournalBytes)
-        let committedData = try Self.committedPrefixData(
-            for: fileURL, journal: journal, data: currentData)
-        guard committedData.count == currentData.count else {
-            throw TimelineJournalWriter.WriterError.invalidJournal(
-                reason: "Work Host control journal has an unsealed suffix")
-        }
-        var upperBoundEventBytes = try JSONEncoder().encode(preflightEvent)
-        upperBoundEventBytes.append(0x0A)
         // The preflight ID is longer than production UUIDs; the small fixed margin also covers
         // representation differences in an injected clock. Refuse before append so the first
         // byte beyond the bounded journal can never be written by this owner.
-        guard currentData.count <= WorkHostControlLimits.maxControlJournalBytes
-                - upperBoundEventBytes.count - 4096 else {
-            throw TimelineJournalWriter.WriterError.invalidDraft(
-                reason: "Work Host control journal has reached its byte bound")
-        }
-        let commit = try await writer.append(draft)
+        let commit: TimelineJournalCommit
         do {
-            let data = try Self.readBoundedData(
-                at: fileURL, maximum: WorkHostControlLimits.maxControlJournalBytes)
-            try Self.persistDurabilitySeal(
-                for: fileURL, journal: journal, cursor: commit.cursor, data: data)
+            commit = try await writer.append(draft)
+        } catch {
+            if case .failed(let reason) = await writer.health { controlFailure = reason }
+            throw error
+        }
+        do {
+            try appendToCacheAndSeal(commit: commit, current: current)
             return commit
         } catch {
             let reason = "Work Host control durability seal failed: \(error.localizedDescription)"
@@ -2307,6 +2687,43 @@ public actor WorkHostControlJournal {
             // newly arriving call from overtaking the resumed mutation at this actor boundary.
             mutationWaiters.removeFirst().resume()
         }
+    }
+
+    private func addReadMetrics(
+        fullReads: Int = 0, cacheHits: Int = 0, incrementalReads: Int = 0,
+        invalidations: Int = 0, bytesScanned: Int = 0, recordsApplied: Int = 0,
+        targetVerificationBytesScanned: Int = 0, targetVerificationChunks: Int = 0,
+        targetVerificationPeakChunkBytes: Int = 0
+    ) {
+        func add(_ value: Int, _ delta: Int) -> Int {
+            let (result, overflow) = value.addingReportingOverflow(delta)
+            return overflow ? Int.max : result
+        }
+        readMetrics = WorkHostControlJournalReadMetrics(
+            fullReads: add(readMetrics.fullReads, fullReads),
+            cacheHits: add(readMetrics.cacheHits, cacheHits),
+            incrementalReads: add(readMetrics.incrementalReads, incrementalReads),
+            invalidations: add(readMetrics.invalidations, invalidations),
+            bytesScanned: add(readMetrics.bytesScanned, bytesScanned),
+            recordsApplied: add(readMetrics.recordsApplied, recordsApplied),
+            targetVerificationBytesScanned: add(
+                readMetrics.targetVerificationBytesScanned, targetVerificationBytesScanned),
+            targetVerificationChunks: add(
+                readMetrics.targetVerificationChunks, targetVerificationChunks),
+            targetVerificationPeakChunkBytes: max(
+                readMetrics.targetVerificationPeakChunkBytes, targetVerificationPeakChunkBytes))
+    }
+
+    private func invalidateCache() {
+        cachedReadFingerprint = nil
+        cachedReadResult = nil
+        cachedRecordSegments.removeAll()
+        cachedSnapshot = nil
+        cachedCursor = nil
+        cachedCommandIndex.removeAll()
+        cachedSealedByteCount = 0
+        cachedDigestState = nil
+        addReadMetrics(invalidations: 1)
     }
 
     private func validateMutationCommand(
@@ -2338,6 +2755,9 @@ public actor WorkHostControlJournal {
             throw TimelineJournalWriter.WriterError.invalidDraft(
                 reason: "control command must carry bounded identities and the exact control cursor")
         }
+        if let requestedCapabilities = identity.requestedCapabilities {
+            try validateCapabilities(Set(requestedCapabilities))
+        }
     }
 
     private func validateCapabilities(_ capabilities: Set<String>) throws {
@@ -2351,11 +2771,11 @@ public actor WorkHostControlJournal {
         }
     }
 
-    private func mutationDigest(_ identity: WorkHostControlMutationIdentity) throws -> String {
+    func mutationDigest(_ identity: WorkHostControlMutationIdentity) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(identity)
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Resolve and read the target journal inside the Work Host. The remote caller supplies only
@@ -2380,82 +2800,131 @@ public actor WorkHostControlJournal {
                 reason: "control journals cannot acknowledge themselves as a read target")
         }
 
-        let descriptor = targetURL.path.withCString {
-            Darwin.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        let scan = try Self.scanTargetThroughCursor(
+            at: targetURL, journal: targetJournal, cursor: cursor, actor: readerActor)
+        addReadMetrics(
+            targetVerificationBytesScanned: scan.bytesScanned,
+            targetVerificationChunks: scan.chunks,
+            targetVerificationPeakChunkBytes: scan.peakChunkBytes)
+    }
+
+    /// Verify only the canonical prefix named by an acknowledgement cursor. Bytes after that
+    /// cursor are intentionally neither read nor interpreted: a client may acknowledge an early
+    /// page while a producer is still appending (or has an unusable tail). The Work/Session source
+    /// service validates global event-ID uniqueness when it admits and serves a source journal;
+    /// this acknowledgement proof retains no prefix-sized ID set and proves the exact local
+    /// chain/sequence/previous-link/cursor instead. The open descriptor's identity is compared
+    /// with the path before and after scanning to fence replacement races.
+    private struct TargetCursorScanStats {
+        let bytesScanned: Int
+        let chunks: Int
+        let peakChunkBytes: Int
+    }
+
+    private static func scanTargetThroughCursor(
+        at url: URL, journal: JournalRef, cursor: JournalCursor, actor: TimelineActor
+    ) throws -> TargetCursorScanStats {
+        let descriptor = url.path.withCString {
+            open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
         }
         guard descriptor >= 0 else {
             throw TimelineJournalWriter.WriterError.invalidDraft(
                 reason: "read acknowledgement target is unavailable")
         }
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        defer { try? handle.close() }
-        var fileStatus = stat()
-        guard Darwin.fstat(descriptor, &fileStatus) == 0,
-              (fileStatus.st_mode & S_IFMT) == S_IFREG,
-              fileStatus.st_uid == geteuid(),
-              fileStatus.st_size >= 0,
-              fileStatus.st_size <= WorkHostControlLimits.maxTargetJournalBytes else {
+        defer { _ = AviaryPOSIX.close(descriptor) }
+        var before = stat()
+        var beforePath = stat()
+        let beforePathResult = url.path.withCString { lstat($0, &beforePath) }
+        guard fstat(descriptor, &before) == 0,
+              beforePathResult == 0,
+              (before.st_mode & S_IFMT) == S_IFREG,
+              before.st_uid == geteuid(), before.st_size >= 0,
+              before.st_size <= off_t(Int.max),
+              before.st_dev == beforePath.st_dev, before.st_ino == beforePath.st_ino else {
             throw TimelineJournalWriter.WriterError.invalidDraft(
                 reason: "read acknowledgement target is not a bounded owner-readable file")
         }
-        var data = Data()
-        while data.count <= WorkHostControlLimits.maxTargetJournalBytes {
-            let remaining = WorkHostControlLimits.maxTargetJournalBytes + 1 - data.count
-            guard let chunk = try handle.read(upToCount: min(1024 * 1024, remaining)),
-                  !chunk.isEmpty else { break }
-            data.append(chunk)
-        }
-        guard data.count <= WorkHostControlLimits.maxTargetJournalBytes else {
-            throw TimelineJournalWriter.WriterError.invalidDraft(
-                reason: "read acknowledgement target exceeds the byte bound")
-        }
-        let read = TimelineJournalReader.read(
-            data, journal: targetJournal, actor: readerActor,
-            hostRecordedAt: Date(timeIntervalSince1970: 0))
-        try validateTargetRead(read, journal: targetJournal, cursor: cursor)
-    }
 
-    private func validateTargetRead(
-        _ read: TimelineJournalReadResult,
-        journal targetJournal: JournalRef,
-        cursor: JournalCursor
-    ) throws {
-        guard cursor.journal == targetJournal,
-              read.quarantinedSuffix == nil,
-              read.truncatedTail == nil else {
-            throw TimelineJournalWriter.WriterError.invalidDraft(
-                reason: "read acknowledgement requires a complete canonical target read")
-        }
-        var previousEventID: String?
-        var eventIDs = Set<String>()
-        for (offset, record) in read.records.enumerated() {
-            let event = record.event
-            guard event.journal == targetJournal,
-                  event.sequence == offset + 1,
-                  event.previousEventID == previousEventID,
-                  event.provenance == .native,
-                  event.schemaVersion == TimelineEvent.currentSchemaVersion,
-                  !event.eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  eventIDs.insert(event.eventID).inserted else {
-                throw TimelineJournalWriter.WriterError.invalidDraft(
-                    reason: "read acknowledgement target is not one canonical append chain")
+        // The empty-prefix cursor is a valid acknowledgement even when later bytes already
+        // exist. No bytes after the requested cursor are needed to prove it.
+        var bytesScanned = 0
+        var chunks = 0
+        var peakChunkBytes = 0
+        if cursor.sequence > 0 {
+            var parser = TimelineJournalReaderState(
+                journal: journal, actor: actor, hostRecordedAt: Date(timeIntervalSince1970: 0))
+            var sequence = 1
+            var previousEventID: String?
+            var found = false
+            let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+            while !found {
+                let chunk = try handle.read(upToCount: 256 * 1024) ?? Data()
+                if chunk.isEmpty {
+                    let final = parser.append(Data(), final: true)
+                    guard final.quarantinedSuffix == nil, final.truncatedTail == nil else {
+                        throw TimelineJournalWriter.WriterError.invalidDraft(
+                            reason: "read acknowledgement target has malformed bytes before cursor")
+                    }
+                    break
+                }
+                bytesScanned += chunk.count
+                chunks += 1
+                peakChunkBytes = max(peakChunkBytes, chunk.count)
+                let parsed = parser.append(chunk, final: false)
+                for record in parsed.records {
+                    let event = record.event
+                    guard event.journal == journal,
+                          event.sequence == sequence,
+                          event.previousEventID == previousEventID,
+                          event.provenance == .native,
+                          event.schemaVersion == TimelineEvent.currentSchemaVersion,
+                          event.payloadVersion <= 1,
+                          !event.eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw TimelineJournalWriter.WriterError.invalidDraft(
+                            reason: "read acknowledgement target is not one canonical append chain")
+                    }
+                    if sequence == cursor.sequence {
+                        guard event.eventID == cursor.eventID else {
+                            throw TimelineJournalWriter.WriterError.invalidDraft(
+                                reason: "read acknowledgement cursor is absent from the target journal")
+                        }
+                        found = true
+                        break
+                    }
+                    previousEventID = event.eventID
+                    sequence += 1
+                }
+                // A malformed suffix in the same bounded chunk is irrelevant only if the exact
+                // target was already emitted from the chunk. Otherwise it is before the cursor.
+                if !found, parsed.quarantinedSuffix != nil {
+                    throw TimelineJournalWriter.WriterError.invalidDraft(
+                        reason: "read acknowledgement target has malformed bytes before cursor")
+                }
             }
-            previousEventID = event.eventID
-        }
-        if cursor.sequence == 0 {
-            guard cursor.eventID == nil, read.records.isEmpty else {
-                throw TimelineJournalWriter.WriterError.invalidDraft(
-                    reason: "empty read acknowledgement does not match the target journal")
-            }
-        } else {
-            guard cursor.sequence > 0,
-                  read.records.contains(where: {
-                      $0.event.sequence == cursor.sequence && $0.event.eventID == cursor.eventID
-                  }) else {
+            guard found else {
                 throw TimelineJournalWriter.WriterError.invalidDraft(
                     reason: "read acknowledgement cursor is absent from the target journal")
             }
+        } else {
+            guard cursor.eventID == nil else {
+                throw TimelineJournalWriter.WriterError.invalidDraft(
+                    reason: "read acknowledgement baseline cursor carries an event identity")
+            }
         }
+
+        var after = stat()
+        var afterPath = stat()
+        let afterPathResult = url.path.withCString { lstat($0, &afterPath) }
+        guard fstat(descriptor, &after) == 0,
+              afterPathResult == 0,
+              after.st_dev == afterPath.st_dev, after.st_ino == afterPath.st_ino,
+              after.st_dev == before.st_dev, after.st_ino == before.st_ino,
+              after.st_size == before.st_size else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "read acknowledgement target changed during verification")
+        }
+        return TargetCursorScanStats(
+            bytesScanned: bytesScanned, chunks: chunks, peakChunkBytes: peakChunkBytes)
     }
 
     private func validateWorkTarget(work: WorkRef, journal: JournalRef) throws {
@@ -2522,7 +2991,8 @@ public actor WorkHostControlJournal {
         sessionJournal: JournalRef? = nil,
         targetJournal: JournalRef? = nil,
         cursor: JournalCursor? = nil,
-        capabilities: Set<String>? = nil
+        capabilities: Set<String>? = nil,
+        requestedCapabilities: Set<String>? = nil
     ) -> JSONValue {
         var object: [String: JSONValue] = ["work_journal": encodeControlValue(workJournal)]
         if let sessionJournal { object["session_journal"] = encodeControlValue(sessionJournal) }
@@ -2530,6 +3000,10 @@ public actor WorkHostControlJournal {
         if let cursor { object["cursor"] = encodeControlValue(cursor) }
         if let capabilities {
             object["capabilities"] = .array(capabilities.sorted().map { .string($0) })
+        }
+        if let requestedCapabilities {
+            object["requested_capabilities"] = .array(
+                requestedCapabilities.sorted().map { .string($0) })
         }
         return .object(object)
     }
@@ -2553,11 +3027,7 @@ public actor WorkHostControlJournal {
         journal: JournalRef,
         data: Data
     ) throws -> Data {
-        guard data.count <= WorkHostControlLimits.maxControlJournalBytes else {
-            throw TimelineJournalWriter.WriterError.invalidJournal(
-                reason: "Work Host control journal exceeds its byte bound")
-        }
-        let sealData = try readBoundedData(
+        let sealData = try readFileData(
             at: durabilitySealURL(for: journalURL),
             maximum: WorkHostControlLimits.maxDurabilitySealBytes)
         let seal: WorkHostControlDurabilitySeal
@@ -2587,6 +3057,20 @@ public actor WorkHostControlJournal {
         journalURL.appendingPathExtension("commit")
     }
 
+    private static func validateCachedSeal(
+        at journalURL: URL, journal: JournalRef, byteCount: Int,
+        cursor: JournalCursor, digest: String
+    ) throws {
+        let sealData = try readFileData(
+            at: durabilitySealURL(for: journalURL), maximum: WorkHostControlLimits.maxDurabilitySealBytes)
+        guard let seal = try? JSONDecoder().decode(WorkHostControlDurabilitySeal.self, from: sealData),
+              seal.schemaVersion == 1, seal.journal == journal,
+              seal.cursor == cursor, seal.byteCount == byteCount, seal.sha256 == digest else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control durability seal changed outside the owner")
+        }
+    }
+
     private static func persistDurabilitySeal(
         for journalURL: URL,
         journal: JournalRef,
@@ -2598,9 +3082,34 @@ public actor WorkHostControlJournal {
             throw TimelineJournalWriter.WriterError.invalidJournal(
                 reason: "Work Host control commit does not match its journal tip")
         }
+        var digestState = ControlSHA256State()
+        digestState.update(data)
+        try persistDurabilitySeal(
+            for: journalURL, journal: journal, cursor: cursor,
+            byteCount: data.count, digest: digestState.hexDigest())
+    }
+
+    private static func persistDurabilitySeal(
+        for journalURL: URL,
+        journal: JournalRef,
+        cursor: JournalCursor,
+        byteCount: Int,
+        digest: String
+    ) throws {
+        guard byteCount >= 0,
+              digest.count == 64,
+              digest.unicodeScalars.allSatisfy({
+                  switch $0.value {
+                  case 48...57, 65...70, 97...102: return true
+                  default: return false
+                  }
+              }) else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control durability seal digest is malformed")
+        }
         let seal = WorkHostControlDurabilitySeal(
             schemaVersion: 1, journal: journal, cursor: cursor,
-            byteCount: data.count, sha256: sha256(data))
+            byteCount: byteCount, sha256: digest)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         var bytes = try encoder.encode(seal)
@@ -2617,7 +3126,7 @@ public actor WorkHostControlJournal {
             path: ".control-commit-\(UUID().uuidString.lowercased()).tmp",
             directoryHint: .notDirectory)
         let descriptor = temporaryURL.path.withCString {
-            Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                         S_IRUSR | S_IWUSR)
         }
         guard descriptor >= 0 else {
@@ -2625,14 +3134,14 @@ public actor WorkHostControlJournal {
                 "could not create Work Host control durability seal")
         }
         defer {
-            Darwin.close(descriptor)
-            _ = temporaryURL.path.withCString { Darwin.unlink($0) }
+            _ = AviaryPOSIX.close(descriptor)
+            _ = temporaryURL.path.withCString { unlink($0) }
         }
         try bytes.withUnsafeBytes { rawBuffer in
             guard let base = rawBuffer.baseAddress else { return }
             var written = 0
             while written < bytes.count {
-                let result = Darwin.write(
+                let result = write(
                     descriptor, base.advanced(by: written), bytes.count - written)
                 if result < 0, errno == EINTR { continue }
                 guard result > 0 else {
@@ -2642,26 +3151,26 @@ public actor WorkHostControlJournal {
                 written += result
             }
         }
-        guard Darwin.fsync(descriptor) == 0 else {
+        guard fsync(descriptor) == 0 else {
             throw TimelineJournalWriter.WriterError.unavailable(
                 "could not synchronize Work Host control durability seal")
         }
         let renamed = temporaryURL.path.withCString { source in
-            sealURL.path.withCString { destination in Darwin.rename(source, destination) }
+            sealURL.path.withCString { destination in rename(source, destination) }
         }
         guard renamed == 0 else {
             throw TimelineJournalWriter.WriterError.unavailable(
                 "could not publish Work Host control durability seal")
         }
         let directoryDescriptor = directory.path.withCString {
-            Darwin.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+            open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         }
         guard directoryDescriptor >= 0 else {
             throw TimelineJournalWriter.WriterError.unavailable(
                 "could not open Work Host control directory for synchronization")
         }
-        defer { Darwin.close(directoryDescriptor) }
-        guard Darwin.fsync(directoryDescriptor) == 0 else {
+        defer { _ = AviaryPOSIX.close(directoryDescriptor) }
+        guard fsync(directoryDescriptor) == 0 else {
             throw TimelineJournalWriter.WriterError.unavailable(
                 "could not synchronize Work Host control directory")
         }
@@ -2715,7 +3224,7 @@ public actor WorkHostControlJournal {
         } catch {
             let sealURL = durabilitySealURL(for: journalURL)
             var sealStatus = stat()
-            let sealResult = sealURL.path.withCString { Darwin.lstat($0, &sealStatus) }
+            let sealResult = sealURL.path.withCString { lstat($0, &sealStatus) }
             guard data.isEmpty, sealResult != 0, errno == ENOENT else { throw error }
             let zero = JournalCursor(journal: journal, eventID: nil, sequence: 0)
             try persistDurabilitySeal(
@@ -2724,30 +3233,31 @@ public actor WorkHostControlJournal {
         }
     }
 
-    private static func readBoundedData(at url: URL, maximum: Int) throws -> Data {
+    private static func readFileData(at url: URL, maximum: Int? = nil) throws -> Data {
         let descriptor = url.path.withCString {
-            Darwin.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
         }
         guard descriptor >= 0 else {
             throw TimelineJournalWriter.WriterError.invalidJournal(
-                reason: "required Work Host control durability data is unavailable")
+                reason: "required Work Host journal data is unavailable")
         }
-        defer { Darwin.close(descriptor) }
+        defer { _ = AviaryPOSIX.close(descriptor) }
         var status = stat()
-        guard Darwin.fstat(descriptor, &status) == 0,
+        guard fstat(descriptor, &status) == 0,
               (status.st_mode & S_IFMT) == S_IFREG,
               status.st_uid == geteuid(),
               status.st_size >= 0,
-              status.st_size <= off_t(maximum) else {
+              maximum.map({ status.st_size <= off_t($0) }) ?? true,
+              status.st_size <= off_t(Int.max) else {
             throw TimelineJournalWriter.WriterError.invalidJournal(
-                reason: "Work Host control durability data is not one bounded owner file")
+                reason: "Work Host journal data is not one owner-readable file")
         }
         var data = Data()
-        while data.count <= maximum {
-            var buffer = [UInt8](
-                repeating: 0, count: min(1024 * 1024, maximum + 1 - data.count))
+        let expectedByteCount = Int(status.st_size)
+        while data.count < expectedByteCount {
+            var buffer = [UInt8](repeating: 0, count: min(1024 * 1024, expectedByteCount - data.count))
             let count = buffer.withUnsafeMutableBytes { rawBuffer in
-                Darwin.read(descriptor, rawBuffer.baseAddress, rawBuffer.count)
+                AviaryPOSIX.read(descriptor, rawBuffer.baseAddress, rawBuffer.count)
             }
             if count < 0, errno == EINTR { continue }
             guard count >= 0 else {
@@ -2757,15 +3267,137 @@ public actor WorkHostControlJournal {
             if count == 0 { break }
             data.append(contentsOf: buffer.prefix(count))
         }
-        guard data.count <= maximum else {
+        guard data.count == expectedByteCount,
+              maximum.map({ data.count <= $0 }) ?? true else {
             throw TimelineJournalWriter.WriterError.invalidJournal(
-                reason: "Work Host control durability data exceeds its byte bound")
+                reason: "Work Host journal data could not be read to EOF")
+        }
+        return data
+    }
+
+    /// Read only a newly appended range. The descriptor and path are fenced on both sides so a
+    /// replacement or concurrent rewrite cannot be mistaken for the owner's append.
+    private static func readDataRange(
+        at url: URL, offset: Int, expectedByteCount: Int, maximum: Int?
+    ) throws -> Data {
+        guard offset >= 0, expectedByteCount >= offset else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control append range is invalid")
+        }
+        let descriptor = url.path.withCString {
+            open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal is unavailable while extending its cache")
+        }
+        defer { _ = AviaryPOSIX.close(descriptor) }
+        var before = stat()
+        var path = stat()
+        let pathResult = url.path.withCString { lstat($0, &path) }
+        guard fstat(descriptor, &before) == 0,
+              pathResult == 0,
+              (before.st_mode & S_IFMT) == S_IFREG,
+              before.st_dev == path.st_dev, before.st_ino == path.st_ino,
+              before.st_size == off_t(expectedByteCount), before.st_size >= 0,
+              maximum.map({ expectedByteCount - offset <= $0 }) ?? true else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal changed while extending its cache")
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        try handle.seek(toOffset: UInt64(offset))
+        var data = Data()
+        while data.count < expectedByteCount - offset {
+            let requested = min(1024 * 1024, expectedByteCount - offset - data.count)
+            guard let chunk = try handle.read(upToCount: requested), !chunk.isEmpty else {
+                throw TimelineJournalWriter.WriterError.invalidJournal(
+                    reason: "Work Host control append range was truncated")
+            }
+            data.append(chunk)
+        }
+        var after = stat()
+        var afterPath = stat()
+        let afterPathResult = url.path.withCString { lstat($0, &afterPath) }
+        guard fstat(descriptor, &after) == 0,
+              afterPathResult == 0,
+              after.st_dev == afterPath.st_dev, after.st_ino == afterPath.st_ino,
+              after.st_size == off_t(expectedByteCount) else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal changed while extending its cache")
         }
         return data
     }
 
     private static func sha256(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func controlFileFingerprint() throws -> ControlFileFingerprint {
+        let descriptor = fileURL.standardizedFileURL.path.withCString {
+            AviaryPOSIX.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "required Work Host control journal is unavailable")
+        }
+        defer { _ = AviaryPOSIX.close(descriptor) }
+        var descriptorStatus = stat()
+        guard fstat(descriptor, &descriptorStatus) == 0,
+              (descriptorStatus.st_mode & S_IFMT) == S_IFREG,
+              descriptorStatus.st_size >= 0,
+              descriptorStatus.st_size <= off_t(Int.max) else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal is not one owner file")
+        }
+        var pathStatus = stat()
+        let pathResult = fileURL.standardizedFileURL.path.withCString {
+            lstat($0, &pathStatus)
+        }
+        guard pathResult == 0,
+              (pathStatus.st_mode & S_IFMT) == S_IFREG,
+              descriptorStatus.st_dev == pathStatus.st_dev,
+              descriptorStatus.st_ino == pathStatus.st_ino else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal path changed during read")
+        }
+        let byteCount = Int(descriptorStatus.st_size)
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        let lastByte: UInt8?
+        if byteCount == 0 {
+            lastByte = nil
+        } else {
+            try handle.seek(toOffset: UInt64(byteCount - 1))
+            let data = try handle.read(upToCount: 1) ?? Data()
+            guard data.count == 1 else {
+                throw TimelineJournalWriter.WriterError.invalidJournal(
+                    reason: "Work Host control journal could not be fingerprinted")
+            }
+            lastByte = data[data.startIndex]
+            try handle.seek(toOffset: 0)
+        }
+        #if canImport(Darwin)
+        let modificationSeconds = Int64(descriptorStatus.st_mtimespec.tv_sec)
+        let modificationNanoseconds = Int64(descriptorStatus.st_mtimespec.tv_nsec)
+        let changeSeconds = Int64(descriptorStatus.st_ctimespec.tv_sec)
+        let changeNanoseconds = Int64(descriptorStatus.st_ctimespec.tv_nsec)
+        #elseif canImport(Glibc)
+        let modificationSeconds = Int64(descriptorStatus.st_mtim.tv_sec)
+        let modificationNanoseconds = Int64(descriptorStatus.st_mtim.tv_nsec)
+        let changeSeconds = Int64(descriptorStatus.st_ctim.tv_sec)
+        let changeNanoseconds = Int64(descriptorStatus.st_ctim.tv_nsec)
+        #else
+        let modificationSeconds: Int64 = 0
+        let modificationNanoseconds: Int64 = 0
+        let changeSeconds: Int64 = 0
+        let changeNanoseconds: Int64 = 0
+        #endif
+        return ControlFileFingerprint(
+            device: UInt64(descriptorStatus.st_dev), inode: UInt64(descriptorStatus.st_ino),
+            mode: UInt32(descriptorStatus.st_mode), byteCount: byteCount,
+            modificationSeconds: modificationSeconds,
+            modificationNanoseconds: modificationNanoseconds,
+            changeSeconds: changeSeconds, changeNanoseconds: changeNanoseconds,
+            lastByte: lastByte)
     }
 
 }

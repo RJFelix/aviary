@@ -12,6 +12,15 @@ enum Harness {
     nonisolated(unsafe) static var currentCase = ""
     nonisolated(unsafe) static var assertions = 0
 
+    /// Keep the synchronous lock operations outside async call sites. Swift 6.3 diagnoses
+    /// direct `NSLock.lock()`/`unlock()` calls from an async function even though this tiny
+    /// runner never suspends while the lock is held.
+    private static func withStateLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+
     static func run(_ cases: [(String, () async throws -> Void)]) async {
         let filter = ProcessInfo.processInfo.environment["AVIARY_SELFTEST_FILTER"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -29,28 +38,21 @@ enum Harness {
         }
         let started = Date()
         for (name, body) in selected {
-            lock.lock()
-            currentCase = name
-            let before = failures.count
-            lock.unlock()
+            let before = withStateLock {
+                currentCase = name
+                return failures.count
+            }
             do {
                 try await body()
             } catch {
-                lock.lock()
-                failures.append("\(name): threw \(error)")
-                lock.unlock()
+                withStateLock { failures.append("\(name): threw \(error)") }
             }
-            lock.lock()
-            let mark = failures.count == before ? "✓" : "✗"
-            lock.unlock()
+            let mark = withStateLock { failures.count == before ? "✓" : "✗" }
             print("  \(mark) \(name)")
         }
         let elapsed = String(format: "%.2fs", Date().timeIntervalSince(started))
         print("")
-        lock.lock()
-        let finalFailures = failures
-        let finalAssertions = assertions
-        lock.unlock()
+        let (finalFailures, finalAssertions) = withStateLock { (failures, assertions) }
         if finalFailures.isEmpty {
             print("\(selected.count) cases, \(finalAssertions) assertions, all passed in \(elapsed)")
             exit(0)
@@ -61,16 +63,14 @@ enum Harness {
     }
 
     static func check(_ condition: Bool, _ message: String, line: Int) {
-        lock.lock()
-        defer { lock.unlock() }
-        assertions += 1
-        if !condition { failures.append("\(currentCase):\(line) — \(message)") }
+        withStateLock {
+            assertions += 1
+            if !condition { failures.append("\(currentCase):\(line) — \(message)") }
+        }
     }
 
     static func countAssertion() {
-        lock.lock()
-        assertions += 1
-        lock.unlock()
+        withStateLock { assertions += 1 }
     }
 }
 

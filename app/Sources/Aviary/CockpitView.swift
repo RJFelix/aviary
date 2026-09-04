@@ -151,7 +151,7 @@ private struct RunRailCard: View {
                     Text(run.isStreaming ? "working" : "ready")
                         .foregroundStyle(run.isStreaming ? Design.success : .secondary)
                     Spacer()
-                    Text(Fmt.duration(run.elapsed))
+                    Text(run.elapsedLabel)
                 }
                 .font(Design.numeric(9.5))
             }
@@ -202,9 +202,10 @@ private struct NewRunRailCard: View {
 
 // MARK: - Rows
 
-// `LiveSessionRow` lived here: a row describing a session the harness daemon was holding,
-// with a lease, a worker and an attached-client count. Aviary runs its agents in-process, so
-// a live run is simply one of `runs` — `RunRailCard` above is the whole of it now.
+// `LiveSessionRow` lived here: a row describing a session a daemon was holding, with a lease,
+// a worker and an attached-client count. Service-backed Work now supplies that durable state;
+// a live run is an attachment in `runs`, and the canonical Sessions surface remains the source
+// for Work that is not currently attached to this GUI.
 
 struct SessionRow: View {
     var session: SessionSummary

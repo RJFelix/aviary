@@ -3,13 +3,18 @@ import AviaryCore
 import Combine
 import SwiftUI
 
-/// Start runs, watch them stream, steer them mid-flight.
+/// Attach to Work, watch it stream, and steer it mid-flight.
 ///
-/// The views on this screen are attachments to Work retained by the app process. Detaching a
-/// view is not a stop request, and closing the last window leaves the menu-bar process running.
+/// The views on this screen are GUI attachments to Work. Detaching a view is not a stop request;
+/// a service-backed Work remains owned by its Work Host when the window or GUI disappears.
 struct LiveView: View {
     @Environment(AppModel.self) private var model
     @State private var showLauncher = false
+
+    private static let launcherDescription =
+        "In-house runs are durable Work on the local Work Host. Aviary is only an attached "
+        + "client: closing a window or quitting the GUI disconnects it without ending Work. "
+        + "End is always an explicit command. Claude Code keeps its existing process path."
 
     var body: some View {
         Group {
@@ -93,12 +98,7 @@ struct LiveView: View {
             VStack(alignment: .leading, spacing: 14) {
                 Card("Start a run", symbol: "play.circle.fill") {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text(
-                            "Aviary starts the selected engine directly, with your login "
-                                + "shell's environment so credentials resolve as they do in a "
-                                + "terminal. Closing the window leaves Work running in the menu "
-                                + "bar; quitting Aviary still ends in-process Work."
-                        )
+                        Text(Self.launcherDescription)
                             .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -116,8 +116,9 @@ struct LiveView: View {
                     Card("Detached Work", symbol: "rectangle.on.rectangle.slash") {
                         VStack(alignment: .leading, spacing: 8) {
                             Text(
-                                "These runs are still held by this Aviary process. Reattaching "
-                                    + "does not resume or restart them."
+                                "These are GUI attachments detached from their Work. Reattaching "
+                                    + "does not resume or restart Work, and disconnecting the GUI "
+                                    + "does not end it."
                             )
                             .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
@@ -140,6 +141,55 @@ struct LiveView: View {
                 // harness daemon is holding, and the in-house engine holds its runs itself
                 // (they are right here on this screen). Retired rather than deleted; see
                 // docs/architecture.md, "Retired daemon surfaces".
+                if !model.localServiceCatalogWorks.isEmpty {
+                    Card("Available Work", symbol: "rectangle.stack") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(
+                                "These Work records are owned by the Work Host. Attach or inspect "
+                                    + "is explicit; it does not start, resume, or terminate Work."
+                            )
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            ForEach(model.localServiceCatalogWorks, id: \.work) { descriptor in
+                                let hasOwnAttachment = descriptor.attachments.contains {
+                                    $0.client == model.localWorkServiceClient
+                                }
+                                let canAttach = descriptor.attachments.contains {
+                                    $0.session != nil
+                                        && $0.sessionJournal != nil
+                                        && $0.sessionAttachment != nil
+                                }
+                                HStack(spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(descriptor.work.workID)
+                                            .font(Design.mono(11))
+                                        Text(
+                                            "\(model.workspaceLabel(for: descriptor)) · "
+                                                + "\(descriptor.execution.rawValue)"
+                                        )
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Button(hasOwnAttachment ? "Inspect" : "Attach") {
+                                        model.attachServiceWork(descriptor)
+                                    }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .disabled(!canAttach)
+                                        .help(
+                                            canAttach
+                                                ? (hasOwnAttachment
+                                                    ? "Inspect this terminal Work without starting it"
+                                                    : "Attach this Work without starting it")
+                                                : "No canonical Session attachment is available")
+                                }
+                            }
+                        }
+                    }
+                }
+
             }
             .padding(Design.gutter)
         }
@@ -206,13 +256,16 @@ struct RunPane: View {
             titleVisibility: .visible
         ) {
             Button("End run", role: .destructive) {
-                Task { await run.stop() }
+                Task { await run.end() }
             }
             Button("Keep running", role: .cancel) {}
         } message: {
             Text(
-                "This stops the agent and destroys its current Python runtime. "
-                    + "The transcript remains available.")
+                run.isServiceBacked
+                    ? "This sends an explicit End command to the Work Host. The GUI can detach "
+                        + "without ending it, and the transcript remains available."
+                    : "This stops the agent and destroys its current Python runtime. "
+                        + "The transcript remains available.")
         }
     }
 
@@ -261,7 +314,7 @@ struct RunPane: View {
                 if run.usage.cost.total > 0 {
                     Chip(text: Fmt.cost(run.usage.cost.total), tint: Design.accent)
                 }
-                Chip(text: Fmt.duration(run.elapsed), symbol: "clock", tint: .secondary)
+                Chip(text: run.elapsedLabel, symbol: "clock", tint: .secondary)
                 Spacer()
                 if let share = run.contextShare, let tokens = run.contextTokens {
                     HStack(spacing: 5) {
@@ -357,7 +410,10 @@ struct RunPane: View {
                 .tint(Design.danger)
                 .accessibilityValue(run.isEnding ? "In progress" : "Available")
                 .disabled(run.isEnding)
-                .help("Stop the agent and destroy this run's Python runtime")
+                .help(
+                    run.isServiceBacked
+                        ? "Send an explicit End command to the Work Host"
+                        : "Stop the agent and destroy this run's Python runtime")
             }
 
             RunOptionsMenu(
@@ -689,7 +745,7 @@ struct LauncherFormBody: View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    Card("Working directory", symbol: "folder") {
+                    Card("Workspace", symbol: "folder") {
                         VStack(alignment: .leading, spacing: 7) {
                             HStack(spacing: 7) {
                                 TextField("", text: $cwd)
@@ -719,13 +775,21 @@ struct LauncherFormBody: View {
                                 }
                             }
                             Text(
-                                "The agent's AGENTS.md and CLAUDE.md discovery walks up from "
-                                + "here, so this choice changes its instructions, not just its "
-                                    + "file paths."
+                                "This local folder is registered by the co-located Work Host. "
+                                + "The GUI keeps the path here; Create and Start carry only "
+                                    + "the host-minted opaque workspace ID. AGENTS.md and "
+                                    + "CLAUDE.md discovery still starts from this choice."
                             )
                                 .font(.system(size: 10))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
+
+                            if model.engineChoice == .inHouse {
+                                WorkHostStatusRow(
+                                    handshake: model.localWorkServiceHandshake,
+                                    catalog: model.localWorkspaceCatalog,
+                                    error: model.localWorkServiceError)
+                            }
                         }
                     }
 
@@ -979,12 +1043,12 @@ struct LauncherFormBody: View {
     private var engineExplanation: String {
         switch model.engineChoice {
         case .inHouse:
-            return "Aviary's own agent loop, provider client and Python runtime host. No "
-                + "other process and no Node. Skills are ranked against your prompt rather "
-                + "than all sent, and the transcript is written in the same format so every "
-                + "other screen still reads it. Follow-ups continue in the same interpreter, "
-                + "so variables persist between prompts. Steering, payload recording and "
-                + "resuming a session all work."
+            return "Aviary's durable Work Host owns the agent loop, provider client and Python "
+                + "runtime. This GUI is an attached client: Work and its canonical transcript "
+                + "survive a closed window or quit, and another GUI can reattach later. The "
+                + "selected local folder is registered as a host workspace; only its opaque "
+                + "ID crosses the service boundary. Steering, queued follow-ups, payload "
+                + "recording and explicit End are available when the Work advertises them."
         case .claudeCode:
             return "Claude Code drives, and Aviary's kernel is the only tool it gets — its "
                 + "loop, its history, its stopping decision; your interpreter, your skills, "
@@ -1036,6 +1100,45 @@ struct LauncherFormBody: View {
         panel.allowsMultipleSelection = false
         panel.directoryURL = URL(fileURLWithPath: cwd.isEmpty ? model.defaultCwd : cwd)
         if panel.runModal() == .OK, let url = panel.url { cwd = url.path }
+    }
+}
+
+/// A deliberately path-free status projection for the co-located Work Host. The directory
+/// picker above is an administrator control; once the host has registered it, the GUI displays
+/// only the host identity, catalog revision, and opaque workspace labels/IDs.
+struct WorkHostStatusRow: View {
+    let handshake: WorkServiceHandshakeResponse?
+    let catalog: WorkHostWorkspaceCatalog
+    let error: String?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Circle()
+                .fill(error == nil && handshake != nil ? Design.success : Design.warning)
+                .frame(width: 6, height: 6)
+                .padding(.top, 4)
+            VStack(alignment: .leading, spacing: 2) {
+                if let handshake {
+                    Text(
+                        "Work Host \(handshake.host.workHostID) · catalog \(catalog.revision) · "
+                            + "\(catalog.entries.count) workspace"
+                            + (catalog.entries.count == 1 ? "" : "s")
+                    )
+                        .font(Design.mono(10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    if !catalog.isComplete {
+                        Text("Workspace catalog is incomplete; new Work is withheld.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Design.warning)
+                    }
+                } else {
+                    Text(error ?? "Connecting to the local Work Host…")
+                        .font(.system(size: 10))
+                        .foregroundStyle(error == nil ? .secondary : Design.warning)
+                }
+            }
+        }
     }
 }
 
@@ -1103,9 +1206,13 @@ struct RunInspector: View {
             VStack(alignment: .leading, spacing: 12) {
                 Card("Run", symbol: "info.circle") {
                     VStack(alignment: .leading, spacing: 5) {
-                        DetailRow(label: "Started", value: Fmt.timestamp(run.startedAt))
-                        DetailRow(label: "Elapsed", value: Fmt.duration(run.elapsed))
-                        DetailRow(label: "Working dir", value: run.config.cwd, mono: true)
+                        DetailRow(label: "Started", value: run.startedLabel)
+                        DetailRow(label: "Elapsed", value: run.elapsedLabel)
+                        if run.isServiceBacked {
+                            DetailRow(label: "Workspace", value: run.projectName, mono: true)
+                        } else {
+                            DetailRow(label: "Working dir", value: run.config.cwd, mono: true)
+                        }
                         if let id = run.sessionID {
                             DetailRow(label: "Session id", value: id, mono: true)
                         }
@@ -1131,6 +1238,10 @@ struct RunInspector: View {
 
                 if let driver = run.claudeCode {
                     ClaudeCodeRunCard(driver: driver)
+                }
+
+                if run.isServiceBacked {
+                    ServiceWorkCard(run: run)
                 }
 
                 Card("Tokens", symbol: "number") {
@@ -1279,6 +1390,176 @@ struct RunInspector: View {
             Chip(text: label, tint: tint)
             Text(text).font(.system(size: 10.5)).lineLimit(3)
             Spacer()
+        }
+    }
+}
+
+/// The service-backed inspector is intentionally made from canonical Work/Session projections,
+/// not transport logs or GUI timestamps. It gives a person enough evidence to understand what
+/// the agent is doing while retaining the bounded-display and recovery caveats beside it.
+private struct ServiceWorkCard: View {
+    let run: LiveRun
+
+    private var projection: WorkServiceAttachedWorkProjection? { run.serviceProjection }
+
+    var body: some View {
+        if let projection {
+            Card("Work Host", symbol: "server.rack") {
+                VStack(alignment: .leading, spacing: 7) {
+                    DetailRow(label: "Host", value: projection.descriptor.work.workHostID, mono: true)
+                    DetailRow(label: "Work", value: projection.descriptor.work.workID, mono: true)
+                    DetailRow(label: "Workspace", value: run.serviceWorkspaceLabel ?? "—")
+                    DetailRow(label: "Connection", value: connectionLabel)
+                    DetailRow(label: "Execution", value: run.serviceExecutionLabel ?? "unknown")
+                    if let currentRun = projection.descriptor.currentRun {
+                        DetailRow(label: "Current run", value: currentRun.runID, mono: true)
+                    }
+
+                    if let pending = projection.pendingCommand {
+                        Divider().opacity(0.5)
+                        Label(
+                            "\(pending.kind.rawValue) is \(pending.state.rawValue); refresh and "
+                                + "reconcile explicitly before retrying.",
+                            systemImage: "exclamationmark.triangle"
+                        )
+                            .font(.system(size: 10))
+                            .foregroundStyle(Design.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 6) {
+                            Button("Refresh") {
+                                Task { await run.refreshService() }
+                            }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            Button("Retry exact command") {
+                                Task { _ = await run.retryServiceCommand() }
+                            }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(
+                                    run.hasExited || run.isEnding
+                                        || pending.state == .awaitingCanonicalEvidence)
+                            if pending.state == .stale {
+                                Button("Abandon stale") {
+                                    Task { _ = await run.abandonStaleServiceCommand() }
+                                }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                    .tint(Design.warning)
+                                    .disabled(run.hasExited || run.isEnding)
+                            }
+                        }
+                    }
+
+                    if !projection.projectionOmissions.isEmpty {
+                        Divider().opacity(0.5)
+                        Label(
+                            "Display is bounded: \(projection.projectionOmissions.count) "
+                                + "omission record\(projection.projectionOmissions.count == 1 ? "" : "s"). "
+                                + "Full canonical records remain addressable through the Work Host; "
+                                + "this does not disable healthy commands.",
+                            systemImage: "ellipsis.circle"
+                        )
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if projection.needsRecovery || projection.requiresRefresh {
+                        Label(
+                            projection.requiresRefresh
+                                ? "Canonical state is catching up; commands wait for refresh."
+                                : "Recovery is required before this Work can accept commands.",
+                            systemImage: "arrow.triangle.2.circlepath"
+                        )
+                            .font(.system(size: 10))
+                            .foregroundStyle(Design.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if !run.serviceActivities.isEmpty {
+                        Divider().opacity(0.5)
+                        Text("RECENT ACTIONS")
+                            .font(Design.sectionTitle)
+                            .foregroundStyle(.secondary)
+                        ForEach(
+                            Array(run.serviceActivities.suffix(8)),
+                            id: \.action.actionID
+                        ) { action in
+                            ServiceActionRow(action: action)
+                        }
+                    } else {
+                        Text("No canonical actions recorded yet.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+        }
+    }
+
+    private var connectionLabel: String {
+        guard let projection else { return "unknown" }
+        switch projection.connectivity {
+        case .connected: return "connected"
+        case .connecting: return "connecting"
+        case .reconnecting: return "reconnecting"
+        case .discovering: return "discovering"
+        case .unavailable: return "unavailable"
+        case .incompatible: return "incompatible"
+        case .disconnected: return "disconnected"
+        }
+    }
+}
+
+private struct ServiceActionRow: View {
+    let action: WorkActionSnapshot
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Circle()
+                .fill(tint)
+                .frame(width: 6, height: 6)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    Text(action.kind.rawValue)
+                        .font(Design.mono(10))
+                    Text(action.state.rawValue.replacingOccurrences(of: "_", with: " "))
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(tint)
+                }
+                if let intent = action.intent, !intent.isEmpty {
+                    Text(intent)
+                        .font(.system(size: 10))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if let target = action.target, !target.isEmpty {
+                    Text(target)
+                        .font(Design.mono(9.5))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundStyle(.secondary)
+                }
+                if let failure = action.failureKind {
+                    Text(
+                        "failure: \(failure.rawValue)"
+                            + (action.retrySafety.map { " · retry \($0.rawValue)" } ?? "")
+                    )
+                        .font(.system(size: 9))
+                        .foregroundStyle(Design.warning)
+                }
+            }
+            Spacer(minLength: 2)
+        }
+    }
+
+    private var tint: Color {
+        switch action.state {
+        case .succeeded: return Design.success
+        case .failed, .indeterminateEffect: return Design.danger
+        case .canceled, .cancelRequested: return Design.warning
+        case .running, .queued: return Design.accent
+        case .proposed, .unknown: return .secondary
         }
     }
 }

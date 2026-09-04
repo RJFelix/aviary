@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 @testable import AviaryCore
 
 private func localCatalogHome() throws -> AgentHome {
@@ -57,7 +56,7 @@ private func localCatalogWriteControl(
     let last = read.records.last?.event
     let cursor = JournalCursor(
         journal: journal, eventID: last?.eventID, sequence: last?.sequence ?? 0)
-    let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    let digest = AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     let seal = LocalCatalogControlDurabilitySeal(
         schemaVersion: 1, journal: journal, cursor: cursor,
         byteCount: data.count, sha256: digest)

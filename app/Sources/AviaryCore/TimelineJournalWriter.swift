@@ -1,5 +1,9 @@
 import Foundation
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// The caller-supplied part of a Timeline v2 event.
 ///
@@ -332,8 +336,8 @@ public actor TimelineJournalWriter {
     public var lastEventID: String? { previousEventID }
     public var synchronizeCallCount: Int { synchronizeCount }
     var descriptorsCloseOnExec: Bool {
-        let dataFlags = Darwin.fcntl(handle.fileDescriptor, F_GETFD)
-        let lockFlags = Darwin.fcntl(lockHandle.fileDescriptor, F_GETFD)
+        let dataFlags = fcntl(handle.fileDescriptor, F_GETFD)
+        let lockFlags = fcntl(lockHandle.fileDescriptor, F_GETFD)
         return dataFlags >= 0 && lockFlags >= 0
             && (dataFlags & FD_CLOEXEC) != 0 && (lockFlags & FD_CLOEXEC) != 0
     }
@@ -538,13 +542,13 @@ public actor TimelineJournalWriter {
     /// canonical journal. Checking on both sides of fsync makes that race explicit and latches the
     /// writer instead of silently forking the path-visible prefix.
     private func verifyDataPathIdentity() throws {
-        var descriptorStatus = Darwin.stat()
-        guard Darwin.fstat(handle.fileDescriptor, &descriptorStatus) == 0 else {
+        var descriptorStatus = stat()
+        guard fstat(handle.fileDescriptor, &descriptorStatus) == 0 else {
             throw WriterError.unavailable(
                 "could not inspect open journal descriptor: \(String(cString: strerror(errno)))")
         }
-        var pathStatus = Darwin.stat()
-        let result = fileURL.path.withCString { Darwin.lstat($0, &pathStatus) }
+        var pathStatus = stat()
+        let result = fileURL.path.withCString { lstat($0, &pathStatus) }
         guard result == 0,
               descriptorStatus.st_dev == pathStatus.st_dev,
               descriptorStatus.st_ino == pathStatus.st_ino
@@ -595,8 +599,9 @@ public actor TimelineJournalWriter {
         }
 
         let fd = url.path.withCString {
-            Darwin.open($0, O_RDWR | O_CREAT | O_EXLOCK | O_NONBLOCK | O_CLOEXEC,
-                        S_IRUSR | S_IWUSR)
+            AviaryPOSIX.openExclusiveLock(
+                $0, flags: O_RDWR | O_CREAT | O_NONBLOCK | O_CLOEXEC,
+                mode: mode_t(S_IRUSR | S_IWUSR))
         }
         guard fd >= 0 else { throw openError(dataURL, operation: "lock") }
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
@@ -625,8 +630,9 @@ public actor TimelineJournalWriter {
         }
 
         let fd = url.path.withCString {
-            Darwin.open($0, O_RDWR | O_CREAT | O_EXCL | O_EXLOCK | O_NONBLOCK | O_CLOEXEC,
-                        S_IRUSR | S_IWUSR)
+            AviaryPOSIX.openExclusiveLock(
+                $0, flags: O_RDWR | O_CREAT | O_EXCL | O_NONBLOCK | O_CLOEXEC,
+                mode: mode_t(S_IRUSR | S_IWUSR))
         }
         guard fd >= 0 else { throw openError(url, operation: "create") }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
@@ -648,7 +654,8 @@ public actor TimelineJournalWriter {
             throw WriterError.missing(path: url.path)
         }
         let fd = url.path.withCString {
-            Darwin.open($0, O_RDWR | O_EXLOCK | O_NONBLOCK | O_CLOEXEC)
+            AviaryPOSIX.openExclusiveLock(
+                $0, flags: O_RDWR | O_NONBLOCK | O_CLOEXEC, mode: mode_t(0o600))
         }
         guard fd >= 0 else { throw openError(url, operation: "open") }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
@@ -666,15 +673,15 @@ public actor TimelineJournalWriter {
                         reason: "recovery prefix is outside the readable journal")
                 }
                 if committedByteCount < bytes.count {
-                    var descriptorStatus = Darwin.stat()
-                    var pathStatus = Darwin.stat()
-                    let pathResult = url.path.withCString { Darwin.lstat($0, &pathStatus) }
-                    guard Darwin.fstat(handle.fileDescriptor, &descriptorStatus) == 0,
+                    var descriptorStatus = stat()
+                    var pathStatus = stat()
+                    let pathResult = url.path.withCString { lstat($0, &pathStatus) }
+                    guard fstat(handle.fileDescriptor, &descriptorStatus) == 0,
                           pathResult == 0,
                           (descriptorStatus.st_mode & S_IFMT) == S_IFREG,
                           descriptorStatus.st_dev == pathStatus.st_dev,
                           descriptorStatus.st_ino == pathStatus.st_ino,
-                          Darwin.ftruncate(
+                          ftruncate(
                               handle.fileDescriptor, off_t(committedByteCount)) == 0 else {
                         throw WriterError.invalidJournal(
                             reason: "uncommitted journal suffix could not be discarded safely")

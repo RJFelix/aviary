@@ -1,6 +1,9 @@
-import Darwin
-import CryptoKit
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 @testable import AviaryCore
 
 private let transportHost = WorkHostRef("transport-host")
@@ -22,7 +25,7 @@ private struct RejectingTransportPrincipalBinding: WorkServiceTransportPrincipal
 
 private func transportBody() -> (reference: TimelineBodyReference, data: Data) {
     let data = Data("transport-artifact-body".utf8)
-    let digest = "sha256:" + SHA256.hash(data: data).map {
+    let digest = "sha256:" + AviarySHA256.hash(data: data).map {
         String(format: "%02x", $0)
     }.joined()
     return (
@@ -44,9 +47,12 @@ private func transportAuthorizer() -> WorkServiceCapabilityPolicy {
 }
 
 private func transportSocketPath() -> String {
-    FileManager.default.temporaryDirectory
-        .appendingPathComponent("aw-\(UUID().uuidString.prefix(8)).sock")
-        .path
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("aw-\(UUID().uuidString.lowercased())", isDirectory: true)
+    try! FileManager.default.createDirectory(
+        at: root, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: NSNumber(value: Int16(0o700))])
+    return root.appendingPathComponent("service.sock").path
 }
 
 private func transportEnvelopePayload<T: Encodable>(_ value: T) throws -> JSONValue {
@@ -72,8 +78,7 @@ private func transportFixture(
     let body = transportBody()
     try await service.register(.init(
         work: transportWork, journal: transportJournal, cursor: cursor,
-        configuration: .init(
-            modelID: "transport-model", initialPrompt: "transport retained prompt"),
+        configuration: .init(modelID: "transport-model"),
         artifacts: [WorkServiceArtifactDescriptor(
             artifactID: "artifact-1", work: transportWork, label: "transport artifact",
             mediaType: "text/plain", byteCount: body.data.count,
@@ -93,7 +98,10 @@ private func stopTransport(
     _ clients: [WorkServiceUnixSocketClient]
 ) async {
     for client in clients { await client.close() }
+    let root = URL(fileURLWithPath: (await server.endpoint).path)
+        .deletingLastPathComponent()
     await server.stop()
+    try? FileManager.default.removeItem(at: root)
 }
 
 func test_workServiceTransportHandshakeAndReadProjection() async throws {
@@ -114,24 +122,21 @@ func test_workServiceTransportHandshakeAndReadProjection() async throws {
         XCTAssertEqual(page.works.first?.work, transportWork)
         XCTAssertEqual(page.works.first?.journal, transportJournal)
         XCTAssertEqual(page.works.first?.configuration.modelID, "transport-model")
-        XCTAssertNil(page.works.first?.configuration.initialPrompt)
         let described = try await fixture.clientA.describeWork(.init(
             work: transportWork, journal: transportJournal, client: transportClientA))
         XCTAssertEqual(described, page.works.first)
         let created = try await fixture.clientA.createWork(.init(
             client: transportClientA, commandID: "transport-create",
             causalControlCursor: handshake.controlCursor,
-            configuration: .init(
-                modelID: "created-model", initialPrompt: "created retained prompt")))
+            configuration: .init(modelID: "created-model")))
         XCTAssertEqual(created.work.configuration.modelID, "created-model")
-        XCTAssertNil(created.work.configuration.initialPrompt)
         XCTAssertTrue(created.attachment.readAcknowledgements.isEmpty)
         do {
             _ = try await fixture.clientA.createWork(.init(
                 client: transportClientA, commandID: "transport-create",
                 causalControlCursor: handshake.controlCursor,
                 configuration: .init(
-                    modelID: "created-model", initialPrompt: "changed retained prompt")))
+                    modelID: "changed-model")))
             XCTFail("transport redaction must preserve exact host-side retry comparison")
         } catch WorkServiceTransportError.remote(let code, _) {
             XCTAssertEqual(code, .invalidRequest)
@@ -139,6 +144,49 @@ func test_workServiceTransportHandshakeAndReadProjection() async throws {
         await stopTransport(fixture.server, [fixture.clientA])
     } catch {
         await stopTransport(fixture.server, [fixture.clientA])
+        throw error
+    }
+}
+
+func test_workServiceTransportRefreshesHandshakeCursorOnTheSameSocket() async throws {
+    let path = transportSocketPath()
+    let fixture = try await transportFixture(path: path)
+    let wrongHostClient = WorkServiceUnixSocketClient(
+        endpoint: WorkServiceTransportEndpoint(path: path), client: transportClientB,
+        expectedHost: WorkHostRef("different-host"))
+    do {
+        let initial = try await fixture.clientA.connect()
+        XCTAssertEqual(initial.controlCursor.sequence, 0)
+        let session = SessionRef("transport-handshake-session")
+        let sessionJournal = JournalRef.session(
+            session, authority: TimelineAuthorityRef(transportHost.workHostID))
+        let attached = try await fixture.clientA.attach(.init(
+            work: transportWork, journal: transportJournal, client: transportClientA,
+            session: session, sessionJournal: sessionJournal,
+            sessionAttachment: SessionAttachmentRef("transport-handshake-attachment"),
+            commandID: "transport-handshake-attach", causalControlCursor: initial.controlCursor,
+            requestedCapabilities: [.observe, .control]))
+        XCTAssertEqual(attached.state, .accepted)
+        let refreshed = try await fixture.clientA.handshake(.init(client: transportClientA))
+        XCTAssertEqual(refreshed.controlCursor, attached.resultingControlCursor)
+        XCTAssertEqual((await fixture.clientA.negotiatedHandshake)?.controlCursor,
+                       attached.resultingControlCursor)
+
+        do {
+            _ = try await fixture.clientA.handshake(.init(client: transportClientB))
+            XCTFail("a connected socket must reject a different client identity")
+        } catch WorkServiceTransportError.remote(let code, _) {
+            XCTAssertEqual(code, .identityMismatch)
+        }
+        do {
+            _ = try await wrongHostClient.connect()
+            XCTFail("a client with a different expected host must reject the handshake")
+        } catch WorkServiceTransportError.remote(let code, _) {
+            XCTAssertEqual(code, .identityMismatch)
+        }
+        await stopTransport(fixture.server, [fixture.clientA, wrongHostClient])
+    } catch {
+        await stopTransport(fixture.server, [fixture.clientA, wrongHostClient])
         throw error
     }
 }
@@ -252,7 +300,8 @@ func test_workServiceTransportSupportsIndependentClientsAndOrderedMutations() as
         XCTAssertEqual(started.state, .accepted)
         XCTAssertEqual(started.outcome, .started)
         XCTAssertEqual(started.causalWorkCursor, cursorB)
-        XCTAssertEqual(started.resultingWorkCursor?.sequence, cursorB.sequence + 1)
+        // Start records the Run boundary before its command admission receipt.
+        XCTAssertEqual(started.resultingWorkCursor?.sequence, cursorB.sequence + 2)
 
         // A second client can observe the same Work after the first client's mutation; no
         // connection-level host sequence or global client lock is needed for this join.
@@ -261,8 +310,19 @@ func test_workServiceTransportSupportsIndependentClientsAndOrderedMutations() as
             attachment: attachmentB.attachment, client: transportClientB,
             target: .work(journal: transportJournal),
             afterCursor: cursorB, limit: 8))
-        XCTAssertTrue(observed.events.contains { $0.command?.commandID == "start-a" })
+        let canonicalStartID = WorkServiceCommandLedgerIdentity.commandID(
+            client: transportClientA, commandID: "start-a")
+        XCTAssertTrue(observed.events.contains { $0.command?.commandID == canonicalStartID })
         XCTAssertEqual(observed.work.currentRun, RunRef("run-1"))
+        let firstObservedEvent = try XCTUnwrap(observed.events.first)
+        let exactEventBytes = try WorkServiceEventPageSizing.encodedByteCount(
+            of: firstObservedEvent)
+        let exactBoundary = try await clientB.eventsAfterCursor(.init(
+            work: transportWork, journal: transportJournal,
+            attachment: attachmentB.attachment, client: transportClientB,
+            target: .work(journal: transportJournal),
+            afterCursor: cursorB, limit: 1, maxBytes: exactEventBytes))
+        XCTAssertEqual(exactBoundary.events, [firstObservedEvent])
         do {
             _ = try await clientB.eventsAfterCursor(.init(
                 work: transportWork, journal: transportJournal,
@@ -291,7 +351,7 @@ func test_workServiceTransportSupportsIndependentClientsAndOrderedMutations() as
             attachment: attachmentB.attachment, client: transportClientB,
             target: .work(journal: transportJournal),
             afterCursor: cursorB, limit: 8))
-        XCTAssertTrue(events.events.contains { $0.command?.commandID == "start-a" })
+        XCTAssertTrue(events.events.contains { $0.command?.commandID == canonicalStartID })
         let detached = try await clientB.detach(.init(
             work: transportWork, journal: transportJournal,
             attachment: attachmentB.attachment, client: transportClientB,
@@ -448,11 +508,70 @@ func test_workServiceTransportCodecBoundsAndRoundTripsEnvelopes() throws {
     XCTAssertEqual(try WorkServiceTransportCodec.decodeResponse(responseFrame.dropLast()), response)
 }
 
+func test_workServiceTransportRejectsRawWorkspacePathAlongsideOpaqueID() async throws {
+    let path = transportSocketPath()
+    let fixture = try await transportFixture(path: path)
+    do {
+        let raw = try RawWorkServiceTransportClient(path: path)
+        let handshake = WorkServiceHandshakeRequest(client: transportClientA)
+        try raw.send(WorkServiceTransportRequestEnvelope(
+            id: "path-handshake", operation: .handshake, client: transportClientA,
+            payload: try transportEnvelopePayload(handshake)))
+        let accepted = try raw.receive()
+        XCTAssertTrue(accepted.ok)
+        let handshakeData = try JSONEncoder().encode(try XCTUnwrap(accepted.data))
+        let handshakeResponse = try JSONDecoder().decode(
+            WorkServiceHandshakeResponse.self, from: handshakeData)
+        let request = WorkServiceCreateWorkRequest(
+            client: transportClientA, commandID: "raw-path-create",
+            causalControlCursor: handshakeResponse.controlCursor,
+            configuration: .init(workspaceID: try WorkHostWorkspaceID(
+                "workspace-00000000-0000-0000-0000-000000000021")))
+        guard case .object(var requestObject) = try transportEnvelopePayload(request),
+              case .object(var configuration) = requestObject["configuration"] else {
+            XCTFail("create request did not encode as an object")
+            raw.close()
+            await stopTransport(fixture.server, [])
+            return
+        }
+        configuration["path"] = .string("/private/host-secret/workspace")
+        requestObject["configuration"] = .object(configuration)
+        try raw.send(WorkServiceTransportRequestEnvelope(
+            id: "raw-path-request", operation: .createWork, client: transportClientA,
+            payload: .object(requestObject)))
+        let rejected = try raw.receive()
+        XCTAssertFalse(rejected.ok)
+        XCTAssertEqual(rejected.error?.code, .invalidFrame)
+        raw.close()
+        await stopTransport(fixture.server, [])
+    } catch {
+        await stopTransport(fixture.server, [])
+        throw error
+    }
+}
+
+func test_workServiceTransportRejectsPathShapedWorkspaceLabels() throws {
+    let labels = ["/private/host-secret/workspace", "file:///tmp/workspace", "~/workspace", "../workspace"]
+    for label in labels {
+        let wire = Data("""
+        {"workspaceID":"workspace-00000000-0000-0000-0000-000000000021","label":"\(label)","isDefault":false,"availability":"available","capabilities":[]}
+        """.utf8)
+        do {
+            _ = try JSONDecoder().decode(WorkHostWorkspaceDescriptor.self, from: wire)
+            XCTFail("transport accepted a path-shaped workspace label: \(label)")
+        } catch let error as WorkHostWorkspaceRegistryError {
+            XCTAssertEqual(error, .invalidLabel)
+        } catch {
+            XCTFail("unexpected workspace label error: \(error)")
+        }
+    }
+}
+
 private final class RawWorkServiceTransportClient: @unchecked Sendable {
     private let descriptor: Int32
 
     init(path: String) throws {
-        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        let descriptor = AviaryPOSIX.streamSocket()
         guard descriptor >= 0 else { throw UnwrapFailure(description: "raw socket failed") }
         do {
             var address = sockaddr_un()
@@ -467,12 +586,12 @@ private final class RawWorkServiceTransportClient: @unchecked Sendable {
             }
             let result = withUnsafePointer(to: &address) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
                 }
             }
             guard result == 0 else { throw UnwrapFailure(description: "raw connect failed") }
         } catch {
-            Darwin.close(descriptor)
+            _ = AviaryPOSIX.close(descriptor)
             throw error
         }
         self.descriptor = descriptor
@@ -488,7 +607,7 @@ private final class RawWorkServiceTransportClient: @unchecked Sendable {
             guard let base = rawBytes.bindMemory(to: UInt8.self).baseAddress else { return }
             var offset = 0
             while offset < rawBytes.count {
-                let written = Darwin.write(
+                let written = AviaryPOSIX.write(
                     descriptor, base.advanced(by: offset), rawBytes.count - offset)
                 guard written > 0 else { throw UnwrapFailure(description: "raw write failed") }
                 offset += written
@@ -500,7 +619,9 @@ private final class RawWorkServiceTransportClient: @unchecked Sendable {
         var line = Data()
         while true {
             var byte: UInt8 = 0
-            let count = Darwin.read(descriptor, &byte, 1)
+            let count = withUnsafeMutableBytes(of: &byte) { rawBytes in
+                AviaryPOSIX.read(descriptor, rawBytes.baseAddress, rawBytes.count)
+            }
             guard count == 1 else { throw UnwrapFailure(description: "raw socket closed") }
             if byte == UInt8(ascii: "\n") { break }
             line.append(byte)
@@ -511,7 +632,7 @@ private final class RawWorkServiceTransportClient: @unchecked Sendable {
         return try WorkServiceTransportCodec.decodeResponse(line)
     }
 
-    func close() { Darwin.close(descriptor) }
+    func close() { _ = AviaryPOSIX.close(descriptor) }
 }
 
 private final class DelayedWorkService: WorkServiceClient, @unchecked Sendable {
@@ -1149,6 +1270,400 @@ func test_workServiceTransportRejectsFalsePageProgressAndBodyEOFClaims() async t
     }
 }
 
+func test_workServiceTransportBindsMutationReceiptShapesAndIdentities() async throws {
+    let path = transportSocketPath()
+    let fixture = try await transportFixture(path: path)
+    let expectedInstance = WorkHostInstanceRef(
+        host: transportHost, instanceID: "transport-instance", startIdentity: "transport-start")
+    do {
+        let handshake = try await fixture.clientA.connect()
+        let createRequest = WorkServiceCreateWorkRequest(
+            client: transportClientA, commandID: "adversarial-create",
+            causalControlCursor: handshake.controlCursor)
+        let created = try await fixture.clientA.createWork(createRequest)
+        let createEnvelope = WorkServiceTransportRequestEnvelope(
+            id: "adversarial-create", operation: .createWork, client: transportClientA,
+            payload: try transportEnvelopePayload(createRequest))
+
+        let forgedCreateAuthorization = WorkServiceAuthorizationOutcome(
+            requested: [.observe], granted: [.observe], denied: [])
+        let forgedCreate = WorkServiceCreateWorkResponse(
+            work: created.work, authorization: forgedCreateAuthorization,
+            session: created.session, sessionJournal: created.sessionJournal,
+            sessionAttachment: created.sessionAttachment, attachment: created.attachment,
+            workCursor: created.workCursor, sessionCursor: created.sessionCursor,
+            controlCursor: created.controlCursor, receipt: created.receipt)
+        let forgedCreateEnvelope = WorkServiceTransportResponseEnvelope(
+            id: createEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedCreate), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedCreateEnvelope, request: createEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted create authorization different from its receipt")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        // Every authorization copy can agree with each other and still lie about what was
+        // requested. The transport must validate the capability partition against the request,
+        // not only compare response fields with one another.
+        let forgedCreateAttachment = WorkServiceClientAttachment(
+            attachment: created.attachment.attachment, client: created.attachment.client,
+            session: created.attachment.session, sessionJournal: created.attachment.sessionJournal,
+            sessionAttachment: created.attachment.sessionAttachment,
+            authorization: forgedCreateAuthorization)
+        let forgedCreateWork = WorkServiceWorkDescriptor(
+            work: created.work.work, journal: created.work.journal,
+            recordedDisposition: created.work.recordedDisposition,
+            execution: created.work.execution, currentRun: created.work.currentRun,
+            configuration: created.work.configuration,
+            hostObservation: created.work.hostObservation,
+            attachments: [forgedCreateAttachment], artifacts: created.work.artifacts,
+            omissions: created.work.omissions)
+        let forgedCreateAllCopiesReceipt = WorkServiceControlReceipt(
+            operation: .createWork, work: forgedCreateWork.work,
+            commandID: createRequest.commandID, state: .accepted,
+            host: created.receipt.host, causalControlCursor: createRequest.causalControlCursor,
+            resultingControlCursor: created.controlCursor,
+            authorization: forgedCreateAuthorization, outcome: .created)
+        let forgedCreateAllCopies = WorkServiceCreateWorkResponse(
+            work: forgedCreateWork, authorization: forgedCreateAuthorization,
+            session: created.session, sessionJournal: created.sessionJournal,
+            sessionAttachment: created.sessionAttachment, attachment: forgedCreateAttachment,
+            workCursor: created.workCursor, sessionCursor: created.sessionCursor,
+            controlCursor: created.controlCursor, receipt: forgedCreateAllCopiesReceipt)
+        let forgedCreateAllCopiesEnvelope = WorkServiceTransportResponseEnvelope(
+            id: createEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedCreateAllCopies), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedCreateAllCopiesEnvelope, request: createEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted create authorization whose copies lied about requested capabilities")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        let forgedCreateReceipt = WorkServiceControlReceipt(
+            operation: .createWork, work: created.work.work, commandID: createRequest.commandID,
+            state: .accepted, host: created.receipt.host,
+            causalControlCursor: createRequest.causalControlCursor,
+            resultingControlCursor: created.controlCursor,
+            authorization: created.receipt.authorization)
+        let forgedCreateOutcome = WorkServiceCreateWorkResponse(
+            work: created.work, authorization: created.authorization,
+            session: created.session, sessionJournal: created.sessionJournal,
+            sessionAttachment: created.sessionAttachment, attachment: created.attachment,
+            workCursor: created.workCursor, sessionCursor: created.sessionCursor,
+            controlCursor: created.controlCursor, receipt: forgedCreateReceipt)
+        let forgedCreateOutcomeEnvelope = WorkServiceTransportResponseEnvelope(
+            id: createEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedCreateOutcome), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedCreateOutcomeEnvelope, request: createEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted a create receipt without its required outcome")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        let attachRequest = WorkServiceAttachRequest(
+            work: created.work.work, journal: created.work.journal, client: transportClientA,
+            session: created.session, sessionJournal: created.sessionJournal,
+            sessionAttachment: created.sessionAttachment, commandID: "adversarial-attach",
+            causalControlCursor: created.controlCursor, requestedCapabilities: [.observe, .control])
+        let attached = try await fixture.clientA.attach(attachRequest)
+        let attachEnvelope = WorkServiceTransportRequestEnvelope(
+            id: "adversarial-attach", operation: .attach, client: transportClientA,
+            payload: try transportEnvelopePayload(attachRequest))
+        let attachedClientAttachment = try XCTUnwrap(attached.attachment)
+
+        let forgedAttachAuthorization = WorkServiceAuthorizationOutcome(
+            requested: [.observe], granted: [.observe], denied: [])
+        let forgedAttachAttachment = WorkServiceClientAttachment(
+            attachment: attachedClientAttachment.attachment, client: attachedClientAttachment.client,
+            session: attachedClientAttachment.session,
+            sessionJournal: attachedClientAttachment.sessionJournal,
+            sessionAttachment: attachedClientAttachment.sessionAttachment,
+            authorization: forgedAttachAuthorization)
+        let forgedAttachWork = WorkServiceWorkDescriptor(
+            work: attached.work.work, journal: attached.work.journal,
+            recordedDisposition: attached.work.recordedDisposition,
+            execution: attached.work.execution, currentRun: attached.work.currentRun,
+            configuration: attached.work.configuration,
+            hostObservation: attached.work.hostObservation,
+            attachments: attached.work.attachments.map {
+                $0.attachment == attachedClientAttachment.attachment
+                    ? forgedAttachAttachment : $0
+            }, artifacts: attached.work.artifacts, omissions: attached.work.omissions)
+        let forgedAttachAllCopiesReceipt = WorkServiceControlReceipt(
+            operation: .attach, work: attached.work.work, commandID: attached.commandID,
+            state: .accepted, host: attached.host,
+            causalControlCursor: attached.causalControlCursor,
+            resultingControlCursor: attached.resultingControlCursor,
+            authorization: forgedAttachAuthorization, outcome: .attached)
+        let forgedAttachAllCopies = WorkServiceAttachResponse(
+            work: forgedAttachWork, attachment: forgedAttachAttachment,
+            authorization: forgedAttachAuthorization, commandID: attached.commandID,
+            state: .accepted, host: attached.host,
+            causalControlCursor: attached.causalControlCursor,
+            resultingControlCursor: attached.resultingControlCursor,
+            receipt: forgedAttachAllCopiesReceipt)
+        let forgedAttachAllCopiesEnvelope = WorkServiceTransportResponseEnvelope(
+            id: attachEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedAttachAllCopies), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedAttachAllCopiesEnvelope, request: attachEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted attach authorization whose copies lied about requested capabilities")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        let foreignControlJournal = JournalRef.workHost(WorkHostRef("foreign-control-host"))
+        let swappedResultingCursor = JournalCursor(
+            journal: foreignControlJournal, eventID: "foreign-control-event", sequence: 1)
+        let swappedCursorReceipt = WorkServiceControlReceipt(
+            operation: .attach, work: attached.work.work, commandID: attached.commandID,
+            state: .accepted, host: attached.host,
+            causalControlCursor: attached.causalControlCursor,
+            resultingControlCursor: swappedResultingCursor,
+            authorization: attached.authorization, outcome: .attached)
+        let swappedCursorResponse = WorkServiceAttachResponse(
+            work: attached.work, attachment: attached.attachment,
+            authorization: attached.authorization, commandID: attached.commandID,
+            state: .accepted, host: attached.host,
+            causalControlCursor: attached.causalControlCursor,
+            resultingControlCursor: swappedResultingCursor,
+            receipt: swappedCursorReceipt)
+        let swappedCursorEnvelope = WorkServiceTransportResponseEnvelope(
+            id: attachEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(swappedCursorResponse), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                swappedCursorEnvelope, request: attachEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted a resulting cursor from a foreign control journal")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        let backwardCursor = attachRequest.causalControlCursor
+        let backwardCursorReceipt = WorkServiceControlReceipt(
+            operation: .attach, work: attached.work.work, commandID: attached.commandID,
+            state: .accepted, host: attached.host,
+            causalControlCursor: attached.causalControlCursor,
+            resultingControlCursor: backwardCursor,
+            authorization: attached.authorization, outcome: .attached)
+        let backwardCursorResponse = WorkServiceAttachResponse(
+            work: attached.work, attachment: attached.attachment,
+            authorization: attached.authorization, commandID: attached.commandID,
+            state: .accepted, host: attached.host,
+            causalControlCursor: attached.causalControlCursor,
+            resultingControlCursor: backwardCursor,
+            receipt: backwardCursorReceipt)
+        let backwardCursorEnvelope = WorkServiceTransportResponseEnvelope(
+            id: attachEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(backwardCursorResponse), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                backwardCursorEnvelope, request: attachEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted an accepted attach without forward cursor progress")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        let swappedSession = SessionRef("swapped-session")
+        let swappedSessionJournal = JournalRef.session(
+            swappedSession, authority: TimelineAuthorityRef(transportHost.workHostID))
+        let swappedAttachment = WorkServiceClientAttachment(
+            attachment: attachedClientAttachment.attachment, client: transportClientA,
+            session: swappedSession, sessionJournal: swappedSessionJournal,
+            sessionAttachment: SessionAttachmentRef("swapped-session-attachment"),
+            authorization: attachedClientAttachment.authorization)
+        let forgedAttach = WorkServiceAttachResponse(
+            work: attached.work, attachment: swappedAttachment,
+            authorization: attached.authorization, commandID: attached.commandID,
+            state: attached.state, host: attached.host,
+            causalControlCursor: attached.causalControlCursor,
+            resultingControlCursor: attached.resultingControlCursor,
+            receipt: attached.receipt)
+        let forgedAttachEnvelope = WorkServiceTransportResponseEnvelope(
+            id: attachEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedAttach), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedAttachEnvelope, request: attachEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted an attachment with a swapped Session tuple")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        let missingAttachOutcomeReceipt = WorkServiceControlReceipt(
+            operation: .attach, work: attached.work.work, commandID: attached.commandID,
+            state: .accepted, host: attached.host,
+            causalControlCursor: attached.causalControlCursor,
+            resultingControlCursor: attached.resultingControlCursor,
+            authorization: attached.authorization)
+        let forgedAttachOutcome = WorkServiceAttachResponse(
+            work: attached.work, attachment: attached.attachment,
+            authorization: attached.authorization, commandID: attached.commandID,
+            state: .accepted, host: attached.host,
+            causalControlCursor: attached.causalControlCursor,
+            resultingControlCursor: attached.resultingControlCursor,
+            receipt: missingAttachOutcomeReceipt)
+        let forgedAttachOutcomeEnvelope = WorkServiceTransportResponseEnvelope(
+            id: attachEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedAttachOutcome), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedAttachOutcomeEnvelope, request: attachEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted an attach receipt without its required outcome")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        let inconsistentReceipt = WorkServiceControlReceipt(
+            operation: .attach, work: attached.work.work, commandID: attached.commandID,
+            state: .rejected, host: attached.host,
+            causalControlCursor: attached.causalControlCursor,
+            resultingControlCursor: attached.resultingControlCursor,
+            authorization: attached.authorization, rejection: .invalidState)
+        let forgedAttachState = WorkServiceAttachResponse(
+            work: attached.work, attachment: attached.attachment,
+            authorization: attached.authorization, commandID: attached.commandID,
+            state: .accepted, host: attached.host,
+            causalControlCursor: attached.causalControlCursor,
+            resultingControlCursor: attached.resultingControlCursor,
+            receipt: inconsistentReceipt)
+        let forgedAttachStateEnvelope = WorkServiceTransportResponseEnvelope(
+            id: attachEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedAttachState), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedAttachStateEnvelope, request: attachEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted inconsistent attachment state and receipt")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        let updateRequest = WorkServiceUpdateCapabilitiesRequest(
+            work: attached.work.work, journal: attached.work.journal,
+            attachment: attachedClientAttachment.attachment, client: transportClientA,
+            requestedCapabilities: [.observe], commandID: "adversarial-capabilities",
+            causalControlCursor: attached.resultingControlCursor)
+        let forgedUpdateAuthorization = WorkServiceAuthorizationOutcome(
+            requested: [], granted: [], denied: [])
+        let forgedUpdateAttachment = WorkServiceClientAttachment(
+            attachment: attachedClientAttachment.attachment, client: transportClientA,
+            session: attachedClientAttachment.session,
+            sessionJournal: attachedClientAttachment.sessionJournal,
+            sessionAttachment: attachedClientAttachment.sessionAttachment,
+            authorization: forgedUpdateAuthorization)
+        let forgedUpdateReceipt = WorkServiceControlReceipt(
+            operation: .updateCapabilities, work: updateRequest.work,
+            commandID: updateRequest.commandID, state: .accepted, host: attached.host,
+            causalControlCursor: updateRequest.causalControlCursor,
+            resultingControlCursor: attached.resultingControlCursor,
+            authorization: forgedUpdateAuthorization, outcome: .capabilitiesUpdated)
+        let forgedUpdate = WorkServiceUpdateCapabilitiesResponse(
+            work: updateRequest.work, attachment: forgedUpdateAttachment,
+            authorization: forgedUpdateAuthorization, commandID: updateRequest.commandID,
+            state: .accepted, host: attached.host,
+            causalControlCursor: updateRequest.causalControlCursor,
+            resultingControlCursor: attached.resultingControlCursor,
+            receipt: forgedUpdateReceipt)
+        let updateEnvelope = WorkServiceTransportRequestEnvelope(
+            id: "adversarial-capabilities", operation: .updateCapabilities,
+            client: transportClientA, payload: try transportEnvelopePayload(updateRequest))
+        let forgedUpdateEnvelope = WorkServiceTransportResponseEnvelope(
+            id: updateEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedUpdate), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedUpdateEnvelope, request: updateEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted update authorization whose copies lied about requested capabilities")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        let commandRequest = WorkServiceCommandRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: attachedClientAttachment.attachment, commandID: "adversarial-start",
+            client: transportClientA, causalWorkCursor: created.workCursor, kind: .start)
+        let commandReceipt = try await fixture.clientA.command(commandRequest)
+        let commandEnvelope = WorkServiceTransportRequestEnvelope(
+            id: "adversarial-start", operation: .command, client: transportClientA,
+            payload: try transportEnvelopePayload(commandRequest))
+        let forgedCommand = WorkServiceCommandReceipt(
+            work: commandReceipt.work, commandID: commandReceipt.commandID,
+            state: commandReceipt.state, host: commandReceipt.host,
+            hostSequence: commandReceipt.hostSequence,
+            causalWorkCursor: commandReceipt.causalWorkCursor,
+            resultingWorkCursor: commandReceipt.resultingWorkCursor,
+            authorization: commandReceipt.authorization, outcome: .completed)
+        let forgedCommandEnvelope = WorkServiceTransportResponseEnvelope(
+            id: commandEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedCommand), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedCommandEnvelope, request: commandEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted a command outcome for another command kind")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+        let forgedCommandCursor = WorkServiceCommandReceipt(
+            work: commandReceipt.work, commandID: commandReceipt.commandID,
+            state: commandReceipt.state, host: commandReceipt.host,
+            hostSequence: commandReceipt.hostSequence,
+            causalWorkCursor: JournalCursor(journal: created.work.journal, sequence: 0),
+            resultingWorkCursor: commandReceipt.resultingWorkCursor,
+            authorization: commandReceipt.authorization, outcome: commandReceipt.outcome)
+        let forgedCommandCursorEnvelope = WorkServiceTransportResponseEnvelope(
+            id: commandEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedCommandCursor), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedCommandCursorEnvelope, request: commandEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted a command receipt with a swapped causal cursor")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+        let forgedCommandID = WorkServiceCommandReceipt(
+            work: commandReceipt.work, commandID: "swapped-command",
+            state: commandReceipt.state, host: commandReceipt.host,
+            hostSequence: commandReceipt.hostSequence,
+            causalWorkCursor: commandReceipt.causalWorkCursor,
+            resultingWorkCursor: commandReceipt.resultingWorkCursor,
+            authorization: commandReceipt.authorization, outcome: commandReceipt.outcome)
+        let forgedCommandIDEnvelope = WorkServiceTransportResponseEnvelope(
+            id: commandEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedCommandID), hostInstance: expectedInstance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedCommandIDEnvelope, request: commandEnvelope,
+                expectedHostInstance: expectedInstance)
+            XCTFail("transport accepted a receipt for a swapped command")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+        await stopTransport(fixture.server, [fixture.clientA])
+    } catch {
+        await stopTransport(fixture.server, [fixture.clientA])
+        throw error
+    }
+}
+
 func test_workServiceTransportRejectsDuplicateAndOversizedFramesExplicitly() async throws {
     let path = transportSocketPath()
     let fixture = try await transportFixture(path: path)
@@ -1193,6 +1708,9 @@ let casesWorkServiceTransport: [Case] = [
     ("phase3 Work service transport: handshake and read projection", {
         try await test_workServiceTransportHandshakeAndReadProjection()
     }),
+    ("phase3 Work service transport: same-socket handshake refreshes control cursor", {
+        try await test_workServiceTransportRefreshesHandshakeCursorOnTheSameSocket()
+    }),
     ("phase3 Work service transport: independent clients and ordered mutations", {
         try await test_workServiceTransportSupportsIndependentClientsAndOrderedMutations()
     }),
@@ -1207,6 +1725,12 @@ let casesWorkServiceTransport: [Case] = [
     }),
     ("phase3 Work service transport: codec bounds and envelope round trips", {
         try test_workServiceTransportCodecBoundsAndRoundTripsEnvelopes()
+    }),
+    ("phase3 Work service transport: raw workspace paths are rejected", {
+        try await test_workServiceTransportRejectsRawWorkspacePathAlongsideOpaqueID()
+    }),
+    ("phase3 Work service transport: path-shaped workspace labels are rejected", {
+        try test_workServiceTransportRejectsPathShapedWorkspaceLabels()
     }),
     ("phase3 Work service transport: duplicate and oversized frames are explicit", {
         try await test_workServiceTransportRejectsDuplicateAndOversizedFramesExplicitly()
@@ -1240,5 +1764,8 @@ let casesWorkServiceTransport: [Case] = [
     }),
     ("phase3 Work service transport: response progress and body EOF are exact", {
         try await test_workServiceTransportRejectsFalsePageProgressAndBodyEOFClaims()
+    }),
+    ("phase3 Work service transport: mutation receipts bind state and identities", {
+        try await test_workServiceTransportBindsMutationReceiptShapesAndIdentities()
     }),
 ]

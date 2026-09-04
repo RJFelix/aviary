@@ -55,7 +55,9 @@ struct RootView: View {
     private var subtitle: String {
         switch model.section {
         case .cockpit:
-            return model.engine.map { "\($0.kind.label) · \($0.version ?? "unknown version")" } ?? "No engine"
+            return model.engineChoice == .inHouse
+                ? "In-house · durable Work Host"
+                : "Claude Code · driven sessions"
         case .sessions:
             let archived = model.sessions.filter(\.isArchived).count
             let current = model.sessions.count - archived
@@ -80,7 +82,7 @@ struct RootView: View {
                 .filter { legacyIDs.contains($0.key) }
                 .flatMap(\.value).flatMap(\.flattened).count
             return "\(works.count) Work · \(children) children · \(attention) attention"
-                + (legacyChildren == 0 ? "" : " · \(legacyChildren) legacy children")
+                + (legacyChildren == 0 ? "" : " · \(legacyChildren) historical children")
         case .models:
             return "\(model.runtimeModels.count) reachable · \(model.modelsConfig.providers.count) configured providers"
         case .usage:

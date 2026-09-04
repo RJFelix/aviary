@@ -1,0 +1,2510 @@
+import Foundation
+
+// MARK: - Attached Work controller
+
+/// The durable identities a GUI must already possess before it can observe one Work.
+///
+/// The `created` form is intentionally made from the complete host response: Work, Session,
+/// and both attachment identities are host minted. The `existing` form requires the caller to
+/// provide the exact client attachment it received from the host. Neither form permits a caller
+/// to guess a Session from a Work id or to derive a new attachment locally.
+public enum WorkServiceAttachedWorkSeed: Sendable, Hashable {
+    case created(WorkServiceCreateWorkResponse)
+    case existing(work: WorkServiceWorkDescriptor, attachment: WorkServiceClientAttachment)
+
+    public var work: WorkServiceWorkDescriptor {
+        switch self {
+        case .created(let response): return response.work
+        case .existing(let work, _): return work
+        }
+    }
+
+    public var attachment: WorkServiceClientAttachment {
+        switch self {
+        case .created(let response): return response.attachment
+        case .existing(_, let attachment): return attachment
+        }
+    }
+
+    public var client: ClientRef { attachment.client }
+
+    public var session: SessionRef? { attachment.session }
+    public var sessionJournal: JournalRef? { attachment.sessionJournal }
+    public var sessionAttachment: SessionAttachmentRef? { attachment.sessionAttachment }
+}
+
+/// A connection can be healthy while its canonical read is incomplete. Keeping those facts in
+/// separate fields prevents a GUI from treating “socket connected” as “state recovered.”
+public enum WorkServiceAttachedWorkConnectivity: Equatable, Hashable, Sendable {
+    case disconnected
+    case discovering
+    case connecting(WorkHostRef)
+    case connected(WorkHostInstanceRef?)
+    case reconnecting(WorkHostRef?)
+    case unavailable(WorkHostRef?)
+    case incompatible(WorkHostRef?)
+}
+
+public enum WorkServiceAttachedWorkPendingState: String, Codable, Hashable, Sendable {
+    case stale
+    case indeterminate
+    /// The Work Host returned a correlated acceptance receipt, but the controller has not yet
+    /// reduced the exact canonical command event named by that receipt. This is a read-only
+    /// catch-up obligation: retrying the command would risk duplicating an already-owned effect.
+    case awaitingCanonicalEvidence = "awaiting_canonical_evidence"
+}
+
+/// The only command record retained after a stale cursor or transport uncertainty. The request
+/// itself remains private to the local client store; the projection exposes only the exact
+/// identity, digest, and cursor needed for UI reconciliation without echoing command text.
+public struct WorkServiceAttachedWorkPendingCommand: Codable, Hashable, Sendable {
+    public let state: WorkServiceAttachedWorkPendingState
+    public let kind: WorkServiceCommandKind
+    public let commandID: String
+    public let client: ClientRef
+    public let attachment: ClientAttachmentRef
+    public let sessionAttachment: SessionAttachmentRef?
+    public let causalWorkCursor: JournalCursor
+    public let expectedResultingWorkCursor: JournalCursor?
+    public let expectedHostSequence: Int?
+    public let valueDigest: String?
+
+    public init(state: WorkServiceAttachedWorkPendingState,
+                kind: WorkServiceCommandKind, commandID: String, client: ClientRef,
+                attachment: ClientAttachmentRef,
+                sessionAttachment: SessionAttachmentRef?,
+                causalWorkCursor: JournalCursor,
+                expectedResultingWorkCursor: JournalCursor? = nil,
+                expectedHostSequence: Int? = nil,
+                valueDigest: String?) {
+        self.state = state
+        self.kind = kind
+        self.commandID = commandID
+        self.client = client
+        self.attachment = attachment
+        self.sessionAttachment = sessionAttachment
+        self.causalWorkCursor = causalWorkCursor
+        self.expectedResultingWorkCursor = expectedResultingWorkCursor
+        self.expectedHostSequence = expectedHostSequence
+        self.valueDigest = valueDigest
+    }
+}
+
+/// The immutable/read-only view consumed by a GUI. A source marked incomplete or a snapshot
+/// carrying unknown/corrupt projection state is still visible as evidence, but `isCanonical` is
+/// false and command admission will refuse to act on it.
+public struct WorkServiceAttachedWorkProjection: Sendable, Hashable {
+    public let descriptor: WorkServiceWorkDescriptor
+    public let attachment: WorkServiceClientAttachment
+    public let capabilities: Set<WorkServiceCapability>
+    public let workSnapshot: WorkSnapshot
+    public let sessionSnapshot: SessionSnapshot
+    public let visibleMessages: [SessionMessageSnapshot]
+    /// Bounded, deterministic activity projection. The reducer retains the full validated action
+    /// map for incremental continuation; this array is the GUI-facing view and never exposes raw
+    /// event pages or an unbounded activity list.
+    public let activities: [WorkActionSnapshot]
+    /// Explicit local projection omissions. A non-empty list makes `projectionComplete` false;
+    /// source canonicality remains independent because omitted UI rows are still in the validated
+    /// reducer/journal projection.
+    public let projectionOmissions: [WorkServiceOmission]
+    public let projectionComplete: Bool
+    public let workCursor: JournalCursor
+    public let sessionCursor: JournalCursor
+    public let workSourceCompleteness: WorkServiceSourceCompleteness
+    public let sessionSourceCompleteness: WorkServiceSourceCompleteness
+    public let workOmissions: [WorkServiceOmission]
+    public let sessionOmissions: [WorkServiceOmission]
+    public let workUnknownEvents: [UnknownTimelineEvent]
+    public let sessionUnknownEvents: [UnknownTimelineEvent]
+    public let workCorruptionReasons: [String]
+    public let sessionCorruptionReasons: [String]
+    /// Bounded controller-level validation/read failures. These are deliberately generic and do
+    /// not echo remote error descriptions, paths, credentials, or command bodies.
+    public let readDiagnostics: [String]
+    public let connectivity: WorkServiceAttachedWorkConnectivity
+    public let pendingCommand: WorkServiceAttachedWorkPendingCommand?
+    public let lastReceipt: WorkServiceCommandReceipt?
+    /// A correlated command receipt names canonical Work state this projection has not reduced
+    /// yet. This is ordinary catch-up, not a recovery failure, but mutation must wait for refresh.
+    public let requiresRefresh: Bool
+    public let isCanonical: Bool
+    public let needsRecovery: Bool
+
+    public init(
+        descriptor: WorkServiceWorkDescriptor,
+        attachment: WorkServiceClientAttachment,
+        capabilities: Set<WorkServiceCapability>,
+        workSnapshot: WorkSnapshot,
+        sessionSnapshot: SessionSnapshot,
+        workCursor: JournalCursor,
+        sessionCursor: JournalCursor,
+        workSourceCompleteness: WorkServiceSourceCompleteness,
+        sessionSourceCompleteness: WorkServiceSourceCompleteness,
+        workOmissions: [WorkServiceOmission] = [],
+        sessionOmissions: [WorkServiceOmission] = [],
+        readDiagnostics: [String] = [],
+        connectivity: WorkServiceAttachedWorkConnectivity = .disconnected,
+        pendingCommand: WorkServiceAttachedWorkPendingCommand? = nil,
+        lastReceipt: WorkServiceCommandReceipt? = nil,
+        requiresRefresh: Bool = false
+    ) {
+        self.descriptor = descriptor
+        self.attachment = attachment
+        self.capabilities = capabilities
+        self.workSnapshot = workSnapshot
+        self.sessionSnapshot = sessionSnapshot
+        let orderedActivities = workSnapshot.actions.values.sorted { lhs, rhs in
+            let lhsSequence = lhs.intentEvent?.sequence ?? lhs.startedEvent?.sequence
+                ?? lhs.outcomeEvent?.sequence ?? Int.max
+            let rhsSequence = rhs.intentEvent?.sequence ?? rhs.startedEvent?.sequence
+                ?? rhs.outcomeEvent?.sequence ?? Int.max
+            if lhsSequence != rhsSequence { return lhsSequence < rhsSequence }
+            return lhs.action.actionID < rhs.action.actionID
+        }
+        let activityLimit = Self.maxActivities
+        let messageLimit = Self.maxMessages
+        self.activities = Array(orderedActivities.suffix(activityLimit))
+        var retainedMessages: [SessionMessageSnapshot] = []
+        var retainedMessageBytes = 0
+        for message in sessionSnapshot.messages.reversed() {
+            let messageBytes = message.text.utf8.count
+            guard retainedMessages.count < messageLimit,
+                  messageBytes <= Self.maxMessageBytes - retainedMessageBytes else {
+                break
+            }
+            retainedMessages.insert(message, at: 0)
+            retainedMessageBytes += messageBytes
+        }
+        self.visibleMessages = retainedMessages
+        var localOmissions: [WorkServiceOmission] = []
+        if orderedActivities.count > activityLimit {
+            localOmissions.append(WorkServiceOmission(
+                category: "activities", count: orderedActivities.count - activityLimit,
+                diagnostic: "activity projection is bounded; retained activities are addressable through the canonical journal"))
+        }
+        let truncatedActivities = orderedActivities.filter(\.metadataWasTruncated).count
+        if truncatedActivities > 0 {
+            localOmissions.append(WorkServiceOmission(
+                category: "activity_metadata", count: truncatedActivities,
+                diagnostic: "activity metadata exceeded the UTF-8 projection bound"))
+        }
+        let totalMessageBytes = sessionSnapshot.messages.reduce(into: 0) { total, message in
+            let remaining = Int.max - total
+            total += min(remaining, message.text.utf8.count)
+        }
+        if sessionSnapshot.messages.count > retainedMessages.count {
+            let omittedBytes = max(0, totalMessageBytes - retainedMessageBytes)
+            localOmissions.append(WorkServiceOmission(
+                category: "messages", count: sessionSnapshot.messages.count - retainedMessages.count,
+                diagnostic: "message projection is bounded; omitted \(omittedBytes) UTF-8 bytes remain addressable through the canonical journal"))
+        }
+        self.projectionOmissions = Array(localOmissions.prefix(Self.maxOmissions))
+        self.projectionComplete = localOmissions.isEmpty
+        self.workCursor = workCursor
+        self.sessionCursor = sessionCursor
+        self.workSourceCompleteness = workSourceCompleteness
+        self.sessionSourceCompleteness = sessionSourceCompleteness
+        self.workOmissions = Array(workOmissions.prefix(Self.maxOmissions))
+        self.sessionOmissions = Array(sessionOmissions.prefix(Self.maxOmissions))
+        self.workUnknownEvents = Array(workSnapshot.unknownEvents.prefix(Self.maxUnknownEvents))
+        self.sessionUnknownEvents = Array(sessionSnapshot.unknownEvents.prefix(Self.maxUnknownEvents))
+        self.workCorruptionReasons = Array(workSnapshot.corruptionReasons.prefix(Self.maxDiagnostics))
+        self.sessionCorruptionReasons = Array(sessionSnapshot.corruptionReasons.prefix(Self.maxDiagnostics))
+        self.readDiagnostics = Array(readDiagnostics.prefix(Self.maxDiagnostics))
+        self.connectivity = connectivity
+        self.pendingCommand = pendingCommand
+        self.lastReceipt = lastReceipt
+        self.requiresRefresh = requiresRefresh
+        let healthySnapshots = workSnapshot.structuralIntegrityValid
+            && workSnapshot.semanticProjectionValid
+            && sessionSnapshot.structuralIntegrityValid
+            && sessionSnapshot.semanticProjectionValid
+            && workSnapshot.lifecycle != .unknown
+            && sessionSnapshot.lifecycle != .unknown
+            && workSnapshot.quarantinedEvents.isEmpty
+            && sessionSnapshot.quarantinedEvents.isEmpty
+        self.isCanonical = workSourceCompleteness == .complete
+            && sessionSourceCompleteness == .complete
+            && !requiresRefresh
+            && healthySnapshots
+        self.needsRecovery = descriptor.execution == .recoveryRequired
+            || descriptor.execution == .unknown
+            || workSourceCompleteness != .complete
+            || sessionSourceCompleteness != .complete
+            || !healthySnapshots
+    }
+
+    private static let maxMessages = 512
+    private static let maxMessageBytes = 256 * 1024
+    private static let maxActivities = 256
+    private static let maxOmissions = 32
+    private static let maxUnknownEvents = 128
+    private static let maxDiagnostics = 32
+}
+
+public enum WorkServiceAttachedWorkControllerError: Error, Equatable, Sendable {
+    case invalidSeed
+    case invalidOptions
+    case hostMismatch
+    case notConnected
+    case malformedResponse
+    case sourceIncomplete
+    case pendingCommandExists
+    case noPendingCommand
+    case commandNotAdmissible
+    case capabilityDenied(WorkServiceCapability)
+    case terminalWork
+    case recoveryRequired
+    case staleCursor
+    case transportFailure
+}
+
+/// One GUI-side object for one Work and its durably bound Session.
+///
+/// The controller owns no Work process, host filesystem path, runtime host, or agent. Its local
+/// durable state is limited to pending command/ack identities and reducer checkpoints needed to
+/// survive GUI death. It can therefore be recreated by another GUI/device and disconnected
+/// without changing Work lifecycle.
+public actor WorkServiceAttachedWorkController {
+    public typealias Connect = @Sendable () async throws -> WorkServiceHandshakeResponse
+    public typealias Connectivity = @Sendable () async -> WorkServiceAttachedWorkConnectivity
+
+    private struct ReadResult: Sendable {
+        let cursor: JournalCursor
+        let events: [TimelineEvent]
+        let descriptor: WorkServiceWorkDescriptor
+        let sourceCompleteness: WorkServiceSourceCompleteness
+        let omissions: [WorkServiceOmission]
+        let basePrefixDigest: String?
+        let prefixDigest: String?
+    }
+
+    private enum StagedSnapshot: Sendable {
+        case work(WorkSnapshot)
+        case session(SessionSnapshot)
+    }
+
+    /// Pages beyond the per-refresh budget are retained as a controller-owned continuation.
+    /// The committed reducer/cursors never move until both targets have a complete, validated
+    /// prefix.  Only the incrementally reduced snapshot is retained; raw event history is never
+    /// accumulated in memory or in the durable checkpoint.
+    private struct StagedRead: Sendable {
+        let cursor: JournalCursor
+        let snapshot: StagedSnapshot
+        let descriptor: WorkServiceWorkDescriptor
+        let omissions: [WorkServiceOmission]
+        let prefixDigest: String?
+    }
+
+    private struct ReadAcknowledgementKey: Hashable, Sendable {
+        let targetJournal: JournalRef
+        let cursor: JournalCursor
+    }
+
+    /// An acknowledgement that crossed the transport boundary but whose response was not
+    /// correlated.  A later descriptor read can prove it committed; until then it is never
+    /// replayed automatically.  This protects a lost response from becoming a duplicate control
+    /// mutation after reconnect/restart.
+    private struct PendingReadAcknowledgement: Sendable {
+        let request: WorkServiceAcknowledgeReadRequest
+        var stale: Bool
+
+        var key: ReadAcknowledgementKey {
+            ReadAcknowledgementKey(targetJournal: request.target.journal, cursor: request.cursor)
+        }
+    }
+
+    private enum ReadKind: Sendable, Equatable {
+        case work
+        case session
+    }
+
+    private struct PendingInternal: Sendable {
+        let request: WorkServiceCommandRequest
+        var state: WorkServiceAttachedWorkPendingState
+        var expectedResultingWorkCursor: JournalCursor?
+        var expectedHostSequence: Int?
+
+        var projection: WorkServiceAttachedWorkPendingCommand {
+            WorkServiceAttachedWorkPendingCommand(
+                state: state, kind: request.kind, commandID: request.command.commandID,
+                client: request.command.client!, attachment: request.attachment,
+                sessionAttachment: request.command.sessionAttachment,
+                causalWorkCursor: request.causalWorkCursor,
+                expectedResultingWorkCursor: expectedResultingWorkCursor,
+                expectedHostSequence: expectedHostSequence,
+                valueDigest: WorkServiceAttachedWorkController.valueDigest(request.value))
+        }
+    }
+
+    public let client: ClientRef
+    public let work: WorkRef
+
+    private let service: any WorkServiceClient
+    private let connectIfNeeded: Connect?
+    private let connectivityProvider: Connectivity?
+    private let pageLimit: Int
+    private let pageBytes: Int
+    private let journal: JournalRef
+    private let session: SessionRef
+    private let sessionJournal: JournalRef
+    private let sessionAttachment: SessionAttachmentRef
+    private let intentStore: WorkServiceAttachedWorkIntentStore
+    private let checkpointStore: any WorkServiceAttachedWorkCheckpointStoring
+
+    private var descriptorStorage: WorkServiceWorkDescriptor
+    private var attachmentStorage: WorkServiceClientAttachment
+    private var workSnapshotStorage = WorkSnapshot()
+    private var sessionSnapshotStorage = SessionSnapshot()
+    private var workCursorStorage: JournalCursor
+    private var sessionCursorStorage: JournalCursor
+    private var workCompletenessStorage: WorkServiceSourceCompleteness = .unknown
+    private var sessionCompletenessStorage: WorkServiceSourceCompleteness = .unknown
+    private var workOmissionsStorage: [WorkServiceOmission] = []
+    private var sessionOmissionsStorage: [WorkServiceOmission] = []
+    private var readDiagnosticsStorage: [String] = []
+    private var connectivityStorage: WorkServiceAttachedWorkConnectivity = .disconnected
+    private var pendingStorage: PendingInternal?
+    /// The Work Host control cursor is independent from both read cursors. It is advanced only
+    /// from a validated handshake or acknowledgement receipt, then chained into the next
+    /// acknowledgement request.
+    private var controlCursorStorage: JournalCursor?
+    private var workPrefixDigestStorage: String?
+    private var sessionPrefixDigestStorage: String?
+    private var stagedWorkReadStorage: StagedRead?
+    private var stagedSessionReadStorage: StagedRead?
+    private var pendingReadAcknowledgementsStorage: [ReadAcknowledgementKey: PendingReadAcknowledgement] = [:]
+    /// A restored reducer checkpoint is kept out of all public projection fields until the host
+    /// has returned matching base-prefix digests for both journals.  Once the first validated
+    /// read starts, its reduced state moves into the in-memory staging slots below.
+    private var restoredCheckpointStorage: WorkServiceAttachedWorkCheckpointStore.Record?
+    private var lastCheckpointRecordStorage: WorkServiceAttachedWorkCheckpointStore.Record?
+    private var checkpointPersistenceAvailableStorage = true
+    /// A disk checkpoint is useful only as a reducer starting point.  Until the first host read
+    /// proves both exact base-prefix digests, its bytes remain diagnostic cache content and are
+    /// forced noncanonical even when the serialized reducer is internally consistent.
+    private var checkpointAwaitingHostValidationStorage = false
+    private var lastReceiptStorage: WorkServiceCommandReceipt?
+    private var requiredWorkCursorStorage: JournalCursor?
+    private var requiresRefreshStorage = false
+    private var refreshInProgress = false
+
+    /// Construct from any transport implementation. For a ``WorkServiceClientSession``, use the
+    /// convenience initializer below so refresh can explicitly establish/re-establish its socket.
+    public init(
+        service: any WorkServiceClient,
+        seed: WorkServiceAttachedWorkSeed,
+        intentStore: WorkServiceAttachedWorkIntentStore,
+        pageLimit: Int = WorkServiceBounds.maxEventsPerPage,
+        pageBytes: Int = WorkServiceBounds.maxEventPageBytes,
+        connect: Connect? = nil,
+        connectivity: Connectivity? = nil,
+        checkpointStore: (any WorkServiceAttachedWorkCheckpointStoring)? = nil
+    ) throws {
+        try Self.validateSeed(seed)
+        guard pageLimit > 0, pageLimit <= WorkServiceBounds.maxEventsPerPage,
+              pageBytes > 0, pageBytes <= WorkServiceBounds.maxEventPageBytes else {
+            throw WorkServiceAttachedWorkControllerError.invalidOptions
+        }
+        let descriptor = seed.work
+        let attachment = seed.attachment
+        guard let session = attachment.session,
+              let sessionJournal = attachment.sessionJournal,
+              let sessionAttachment = attachment.sessionAttachment else {
+            throw WorkServiceAttachedWorkControllerError.invalidSeed
+        }
+        let restored: PendingInternal?
+        do {
+            restored = try intentStore.load().map {
+                try Self.validateRestoredPending(
+                    $0, descriptor: descriptor, attachment: attachment,
+                    sessionAttachment: sessionAttachment)
+                return PendingInternal(
+                    request: $0.request, state: $0.state,
+                    expectedResultingWorkCursor: $0.expectedResultingWorkCursor,
+                    expectedHostSequence: $0.expectedHostSequence)
+            }
+        } catch let error as WorkServiceAttachedWorkControllerError {
+            throw error
+        } catch {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        let resolvedCheckpointStore = try checkpointStore ?? WorkServiceAttachedWorkCheckpointStore(
+            url: intentStore.url.deletingPathExtension().appendingPathExtension("checkpoint.json"))
+        let persistedCheckpoint: WorkServiceAttachedWorkCheckpointStore.Record?
+        let checkpointReadFailed: Bool
+        do {
+            persistedCheckpoint = try resolvedCheckpointStore.load()
+            checkpointReadFailed = false
+        } catch {
+            persistedCheckpoint = nil
+            checkpointReadFailed = true
+        }
+        let usableCheckpoint: WorkServiceAttachedWorkCheckpointStore.Record?
+        if let persistedCheckpoint,
+           Self.validCheckpoint(
+               persistedCheckpoint, descriptor: descriptor, attachment: attachment,
+               session: session, sessionJournal: sessionJournal,
+               sessionAttachment: sessionAttachment) {
+            usableCheckpoint = persistedCheckpoint
+        } else {
+            usableCheckpoint = nil
+        }
+        // Pending acknowledgement requests may be retained by a compact checkpoint even when it
+        // deliberately omits reducer snapshots.  They are safe to restore because the request
+        // identity is validated below; the missing reducer state merely forces a source replay.
+        let checkpointWithValidMetadata = persistedCheckpoint.flatMap {
+            Self.validCheckpointMetadata(
+                $0, descriptor: descriptor, attachment: attachment,
+                session: session, sessionJournal: sessionJournal,
+                sessionAttachment: sessionAttachment) ? $0 : nil
+        }
+        var restoredPendingReadAcknowledgements: [ReadAcknowledgementKey: PendingReadAcknowledgement] = [:]
+        if let checkpoint = checkpointWithValidMetadata {
+            for pending in checkpoint.pendingAcknowledgements {
+                let key = ReadAcknowledgementKey(
+                    targetJournal: pending.request.target.journal,
+                    cursor: pending.request.cursor)
+                guard restoredPendingReadAcknowledgements[key] == nil else {
+                    // Treat duplicate keys as a corrupt cache. The durable source remains
+                    // authoritative and the controller will safely reread from its seed.
+                    restoredPendingReadAcknowledgements.removeAll()
+                    break
+                }
+                restoredPendingReadAcknowledgements[key] = PendingReadAcknowledgement(
+                    request: pending.request, stale: pending.stale)
+            }
+        }
+        let initialControlCursor = checkpointWithValidMetadata?.controlCursor ?? {
+            switch seed {
+            case .created(let response): return response.controlCursor
+            case .existing: return nil
+            }
+        }()
+        self.service = service
+        self.client = attachment.client
+        self.work = descriptor.work
+        self.connectIfNeeded = connect
+        self.connectivityProvider = connectivity
+        self.pageLimit = pageLimit
+        self.pageBytes = pageBytes
+        self.journal = descriptor.journal
+        self.session = session
+        self.sessionJournal = sessionJournal
+        self.sessionAttachment = sessionAttachment
+        self.intentStore = intentStore
+        self.checkpointStore = resolvedCheckpointStore
+        // Never expose restored reducer bytes through the initial projection.  The seed is the
+        // caller-provided identity envelope, while reducer state starts at the safe baseline until
+        // a fresh host read proves each checkpoint cursor/prefix pair.
+        self.descriptorStorage = descriptor
+        self.attachmentStorage = attachment
+        self.workCursorStorage = JournalCursor(journal: descriptor.journal, sequence: 0)
+        self.sessionCursorStorage = JournalCursor(journal: sessionJournal, sequence: 0)
+        self.workSnapshotStorage = WorkSnapshot()
+        self.workSnapshotStorage.journal = descriptor.journal
+        self.workSnapshotStorage.work = descriptor.work
+        self.workSnapshotStorage.workHost = WorkHostRef(descriptor.work.workHostID)
+        self.sessionSnapshotStorage = SessionSnapshot()
+        self.sessionSnapshotStorage.journal = sessionJournal
+        self.sessionSnapshotStorage.session = session
+        self.pendingStorage = restored
+        self.controlCursorStorage = initialControlCursor
+        self.workPrefixDigestStorage = nil
+        self.sessionPrefixDigestStorage = nil
+        self.restoredCheckpointStorage = usableCheckpoint
+        self.lastCheckpointRecordStorage = checkpointWithValidMetadata
+        self.checkpointPersistenceAvailableStorage = true
+        self.checkpointAwaitingHostValidationStorage = usableCheckpoint != nil
+        self.pendingReadAcknowledgementsStorage = restoredPendingReadAcknowledgements
+        if let restored,
+           restored.state == .awaitingCanonicalEvidence,
+           let expected = restored.expectedResultingWorkCursor {
+            self.requiredWorkCursorStorage = expected
+            self.requiresRefreshStorage = true
+        }
+        if checkpointReadFailed || (persistedCheckpoint != nil && checkpointWithValidMetadata == nil) {
+            self.readDiagnosticsStorage = [
+                "The local reducer checkpoint was unavailable; journal history will be revalidated from its seed cursor."
+            ]
+        }
+    }
+
+    /// Convenience constructor for the normal GUI path. The client id comes from the exact
+    /// attachment rather than from a separately supplied or guessed identity.
+    public init(
+        session: WorkServiceClientSession,
+        seed: WorkServiceAttachedWorkSeed,
+        intentStore: WorkServiceAttachedWorkIntentStore,
+        pageLimit: Int = WorkServiceBounds.maxEventsPerPage,
+        pageBytes: Int = WorkServiceBounds.maxEventPageBytes
+    ) throws {
+        try self.init(
+            service: session, seed: seed, intentStore: intentStore,
+            pageLimit: pageLimit, pageBytes: pageBytes,
+            connect: { try await session.refreshHandshake() },
+            connectivity: { Self.map(await session.state) })
+    }
+
+    /// Return the current immutable projection. Reads are actor-isolated and safe to hand to a
+    /// SwiftUI task without exposing mutable reducer state.
+    public func projection() -> WorkServiceAttachedWorkProjection {
+        WorkServiceAttachedWorkProjection(
+            descriptor: descriptorStorage, attachment: attachmentStorage,
+            capabilities: attachmentStorage.authorization.granted,
+            workSnapshot: workSnapshotStorage, sessionSnapshot: sessionSnapshotStorage,
+            workCursor: workCursorStorage, sessionCursor: sessionCursorStorage,
+            workSourceCompleteness: checkpointAwaitingHostValidationStorage ? .unknown
+                : workCompletenessStorage,
+            sessionSourceCompleteness: checkpointAwaitingHostValidationStorage ? .unknown
+                : sessionCompletenessStorage,
+            workOmissions: workOmissionsStorage, sessionOmissions: sessionOmissionsStorage,
+            readDiagnostics: readDiagnosticsStorage,
+            connectivity: connectivityStorage,
+            pendingCommand: pendingStorage?.projection, lastReceipt: lastReceiptStorage,
+            requiresRefresh: requiresRefreshStorage)
+    }
+
+    /// Read and atomically publish the newest complete pair of Work and Session projections.
+    /// A source error leaves the prior pair/cursors untouched and marks its source incomplete.
+    @discardableResult
+    public func refresh() async throws -> WorkServiceAttachedWorkProjection {
+        guard !refreshInProgress else { return projection() }
+        refreshInProgress = true
+        defer { refreshInProgress = false }
+
+        do {
+            let handshake = try await establishConnectionIfNeeded()
+            if let handshake {
+                guard Self.validHandshake(
+                    handshake, expectedHost: WorkHostRef(work.workHostID)) else {
+                    throw WorkServiceAttachedWorkControllerError.hostMismatch
+                }
+                controlCursorStorage = handshake.controlCursor
+                connectivityStorage = .connected(handshake.hostInstance)
+            } else {
+                connectivityStorage = .connected(descriptorStorage.hostObservation?.instance)
+                // Existing seeds do not carry a control cursor. A direct loopback service can
+                // still provide one through handshake; failure here is nonfatal because reads
+                // remain useful even when this transport does not expose control-plane state.
+                if controlCursorStorage == nil {
+                    await discoverControlCursor()
+                }
+            }
+
+            let service = self.service
+            // A restored record is an internal reducer seed only.  It is never read through
+            // `projection()`; the first successful pair of host reads must prove its exact base
+            // prefix digests before this state can be published.
+            let restoredCheckpoint = self.restoredCheckpointStorage
+            let restoredWorkStage = restoredCheckpoint.flatMap { checkpoint -> StagedRead? in
+                guard let cursor = checkpoint.stagedWorkCursor,
+                      let snapshot = checkpoint.stagedWorkSnapshot else { return nil }
+                return StagedRead(
+                    cursor: cursor, snapshot: .work(snapshot), descriptor: checkpoint.descriptor,
+                    omissions: checkpoint.stagedWorkOmissions,
+                    prefixDigest: checkpoint.stagedWorkPrefixDigest)
+            }
+            let restoredSessionStage = restoredCheckpoint.flatMap { checkpoint -> StagedRead? in
+                guard let cursor = checkpoint.stagedSessionCursor,
+                      let snapshot = checkpoint.stagedSessionSnapshot else { return nil }
+                return StagedRead(
+                    cursor: cursor, snapshot: .session(snapshot), descriptor: checkpoint.descriptor,
+                    omissions: checkpoint.stagedSessionOmissions,
+                    prefixDigest: checkpoint.stagedSessionPrefixDigest)
+            }
+            let descriptor = restoredCheckpoint?.descriptor ?? self.descriptorStorage
+            let attachment = restoredCheckpoint?.attachmentProjection ?? self.attachmentStorage
+            let client = self.client
+            let committedWorkCursor = restoredCheckpoint?.committedWorkCursor
+                ?? self.workCursorStorage
+            let committedSessionCursor = restoredCheckpoint?.committedSessionCursor
+                ?? self.sessionCursorStorage
+            let activeWorkStage = self.stagedWorkReadStorage ?? restoredWorkStage
+            let activeSessionStage = self.stagedSessionReadStorage ?? restoredSessionStage
+            let workCursor = activeWorkStage?.cursor ?? committedWorkCursor
+            let sessionCursor = activeSessionStage?.cursor ?? committedSessionCursor
+            let workPrefixDigest = activeWorkStage?.prefixDigest
+                ?? restoredCheckpoint?.committedWorkPrefixDigest
+                ?? self.workPrefixDigestStorage
+            let sessionPrefixDigest = activeSessionStage?.prefixDigest
+                ?? restoredCheckpoint?.committedSessionPrefixDigest
+                ?? self.sessionPrefixDigestStorage
+            let workSnapshot = Self.stagedWorkSnapshot(activeWorkStage)
+                ?? restoredCheckpoint?.committedWorkSnapshot
+                ?? self.workSnapshotStorage
+            let sessionSnapshot = Self.stagedSessionSnapshot(activeSessionStage)
+                ?? restoredCheckpoint?.committedSessionSnapshot
+                ?? self.sessionSnapshotStorage
+            let pageLimit = self.pageLimit
+            let pageBytes = self.pageBytes
+            // A live handshake is the transport-generation fence.  Host instance identity is
+            // deliberately not persisted as part of a reducer checkpoint: a normal daemon
+            // restart may mint a new instance while preserving the same journal prefixes.  A
+            // direct loopback without a handshake still verifies the stable Work Host identity
+            // in `validDescriptor`, but does not impose an obsolete instance from the seed.
+            let expectedHostInstance = handshake?.hostInstance
+            let journal = self.journal
+            let session = self.session
+            let sessionJournal = self.sessionJournal
+            let sessionAttachment = self.sessionAttachment
+
+            async let workRead = Self.readJournal(
+                kind: .work, service: service, descriptor: descriptor, attachment: attachment,
+                client: client, journal: journal, session: session,
+                sessionJournal: sessionJournal, sessionAttachment: sessionAttachment,
+                after: workCursor, pageLimit: pageLimit, pageBytes: pageBytes,
+                expectedHostInstance: expectedHostInstance,
+                expectedBasePrefixDigest: workPrefixDigest)
+            async let sessionRead = Self.readJournal(
+                kind: .session, service: service, descriptor: descriptor, attachment: attachment,
+                client: client, journal: journal, session: session,
+                sessionJournal: sessionJournal, sessionAttachment: sessionAttachment,
+                after: sessionCursor, pageLimit: pageLimit, pageBytes: pageBytes,
+                expectedHostInstance: expectedHostInstance,
+                expectedBasePrefixDigest: sessionPrefixDigest)
+            let (workDelta, sessionDelta) = try await (workRead, sessionRead)
+            // Both reads returned a validated base (possibly with a page-budget continuation), so
+            // the restored disk record is no longer needed as a seed.  Keep the newly reduced
+            // continuation private until the paired projection commits below.
+            if restoredCheckpoint != nil {
+                restoredCheckpointStorage = nil
+            }
+            let reducedWork = try Self.reduceRead(
+                workDelta, initial: workSnapshot, kind: .work, expectedCursor: workCursor)
+            let reducedSession = try Self.reduceRead(
+                sessionDelta, initial: sessionSnapshot, kind: .session,
+                expectedCursor: sessionCursor)
+            let newWork = workDelta
+            let newSession = sessionDelta
+            let stagedWork = StagedRead(
+                cursor: newWork.cursor, snapshot: .work(reducedWork),
+                descriptor: newWork.descriptor, omissions: newWork.omissions,
+                prefixDigest: newWork.prefixDigest)
+            let stagedSession = StagedRead(
+                cursor: newSession.cursor, snapshot: .session(reducedSession),
+                descriptor: newSession.descriptor, omissions: newSession.omissions,
+                prefixDigest: newSession.prefixDigest)
+
+            // A page-budget stop is a valid, validated continuation, not a permanent source
+            // failure. Retain each prefix and leave the last committed pair untouched. The next
+            // refresh starts at these exact cursors and can eventually publish both together.
+            if newWork.sourceCompleteness != .complete
+                || newSession.sourceCompleteness != .complete {
+                stagedWorkReadStorage = stagedWork
+                stagedSessionReadStorage = stagedSession
+                workCompletenessStorage = .incomplete
+                sessionCompletenessStorage = .incomplete
+                workOmissionsStorage = newWork.omissions
+                sessionOmissionsStorage = newSession.omissions
+                appendReadDiagnostic(
+                    "Work service catch-up is bounded; the next refresh will continue from the retained journal cursors.")
+                _ = persistCheckpointIfPossible()
+                return projection()
+            }
+
+            guard reducedWork.structuralIntegrityValid,
+                  reducedWork.semanticProjectionValid,
+                  reducedWork.quarantinedEvents.isEmpty,
+                  reducedSession.structuralIntegrityValid,
+                  reducedSession.semanticProjectionValid,
+                  reducedSession.quarantinedEvents.isEmpty else {
+                throw WorkServiceAttachedWorkControllerError.malformedResponse
+            }
+            // Keep a complete, validated candidate durable until both read acknowledgements and
+            // the paired projection commit finish. A crash at either point can then resume from
+            // reducer truth rather than using a bare host acknowledgement as a skip marker.
+            let candidateChanged = stagedWorkReadStorage != nil
+                || stagedSessionReadStorage != nil
+                || newWork.cursor != committedWorkCursor
+                || newSession.cursor != committedSessionCursor
+                || reducedWork != self.workSnapshotStorage
+                || reducedSession != self.sessionSnapshotStorage
+                || !Self.descriptorsEquivalent(newWork.descriptor, descriptor)
+            stagedWorkReadStorage = stagedWork
+            stagedSessionReadStorage = stagedSession
+            // A failed cache write is noncanonical and must not hide a valid remote projection,
+            // but it also must not strand read acknowledgement forever. Retry the same exact
+            // record on a later refresh once the local filesystem is healthy again; this remains
+            // byte-identical no-op suppression when the prior save succeeded.
+            if candidateChanged || !checkpointPersistenceAvailableStorage {
+                _ = persistCheckpointIfPossible()
+            }
+            var refreshedAttachment = try Self.attachmentProjection(
+                in: newWork.descriptor, expected: attachment)
+            try Self.validateReadAcknowledgements(
+                in: refreshedAttachment, workJournal: journal, session: session,
+                sessionJournal: sessionJournal)
+            try Self.validateAcknowledgementCursors(
+                in: refreshedAttachment, workCursor: newWork.cursor,
+                sessionCursor: newSession.cursor)
+            try Self.validateReducedBinding(
+                work: reducedWork, sessionSnapshot: reducedSession, descriptor: newWork.descriptor,
+                attachment: refreshedAttachment, journal: journal, sessionJournal: sessionJournal,
+                session: session, sessionAttachment: sessionAttachment)
+            if let required = requiredWorkCursorStorage {
+                guard Self.cursor(newWork.cursor, reaches: required) else {
+                    throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+                }
+            }
+            try reconcilePendingCommand(in: reducedWork, through: newWork.cursor)
+
+            // Ack only after both reads and both reducers have validated. Acknowledgements are
+            // control-journal mutations, so they never stand in for a half-published pair.
+            refreshedAttachment = await acknowledgeAdvancedReads(
+                attachment: refreshedAttachment, workCursor: newWork.cursor,
+                sessionCursor: newSession.cursor)
+
+            // The event pages are now validated and the two reducers agree on the exact bound
+            // relationship. Publish both together; no journal can expose a half-updated pair.
+            descriptorStorage = Self.descriptorByUpdatingAttachment(
+                newWork.descriptor, attachment: refreshedAttachment)
+            attachmentStorage = refreshedAttachment
+            workSnapshotStorage = reducedWork
+            sessionSnapshotStorage = reducedSession
+            workCursorStorage = newWork.cursor
+            sessionCursorStorage = newSession.cursor
+            workPrefixDigestStorage = newWork.prefixDigest
+            sessionPrefixDigestStorage = newSession.prefixDigest
+            workCompletenessStorage = newWork.sourceCompleteness
+            sessionCompletenessStorage = newSession.sourceCompleteness
+            if !reducedWork.unknownEvents.isEmpty {
+                workCompletenessStorage = .incomplete
+            }
+            if !reducedSession.unknownEvents.isEmpty {
+                sessionCompletenessStorage = .incomplete
+            }
+            workOmissionsStorage = newWork.omissions
+            sessionOmissionsStorage = newSession.omissions
+            stagedWorkReadStorage = nil
+            stagedSessionReadStorage = nil
+            checkpointAwaitingHostValidationStorage = false
+            requiredWorkCursorStorage = nil
+            requiresRefreshStorage = false
+            _ = persistCheckpointIfPossible()
+            return projection()
+        } catch let error as WorkServiceAttachedWorkControllerError {
+            if restoredCheckpointStorage != nil {
+                // A checkpoint that cannot be reconciled against the host's exact prefix is only
+                // a failed cache hint.  Drop that hint so the next refresh safely replays from
+                // the baseline instead of retrying a mismatched cursor forever.
+                restoredCheckpointStorage = nil
+                stagedWorkReadStorage = nil
+                stagedSessionReadStorage = nil
+            }
+            markReadFailure(error)
+            throw error
+        } catch {
+            if restoredCheckpointStorage != nil {
+                restoredCheckpointStorage = nil
+                stagedWorkReadStorage = nil
+                stagedSessionReadStorage = nil
+            }
+            markReadFailure(.transportFailure)
+            throw WorkServiceAttachedWorkControllerError.transportFailure
+        }
+    }
+
+    /// Construct and admit Start using the latest canonical Work cursor and exact Session
+    /// attachment. The returned receipt is the durable Work-service boundary; a successful
+    /// command does not fabricate a local event or advance a cursor before refresh observes it.
+    public func start(_ prompt: String, commandID: String = UUID().uuidString.lowercased()) async throws
+        -> WorkServiceCommandReceipt {
+        try await issue(kind: .start, commandID: commandID, value: prompt)
+    }
+
+    public func send(_ prompt: String, commandID: String = UUID().uuidString.lowercased()) async throws
+        -> WorkServiceCommandReceipt {
+        try await issue(kind: .send, commandID: commandID, value: prompt)
+    }
+
+    public func steer(_ text: String, commandID: String = UUID().uuidString.lowercased()) async throws
+        -> WorkServiceCommandReceipt {
+        try await issue(kind: .steer, commandID: commandID, value: text)
+    }
+
+    public func queue(_ text: String, commandID: String = UUID().uuidString.lowercased()) async throws
+        -> WorkServiceCommandReceipt {
+        try await issue(kind: .queue, commandID: commandID, value: text)
+    }
+
+    public func cancel(
+        scope: SessionCancellationScope = .agentLoop,
+        commandID: String = UUID().uuidString.lowercased()
+    ) async throws
+        -> WorkServiceCommandReceipt {
+        try await issue(kind: .cancel, commandID: commandID, value: scope.rawValue)
+    }
+
+    public func end(commandID: String = UUID().uuidString.lowercased()) async throws
+        -> WorkServiceCommandReceipt {
+        try await issue(kind: .end, commandID: commandID, value: nil)
+    }
+
+    /// Explicitly retry exactly the one retained request. No refresh or transport reconnect
+    /// calls this method implicitly, and the original cursor/value/command id are unchanged.
+    public func retryPendingCommand() async throws -> WorkServiceCommandReceipt {
+        guard let pending = pendingStorage else {
+            throw WorkServiceAttachedWorkControllerError.noPendingCommand
+        }
+        guard pending.state != .awaitingCanonicalEvidence else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        return try await submit(pending.request, retainingState: pending.state)
+    }
+
+    /// Reconciliation is intentionally read-only. Callers can inspect the pending record and
+    /// refresh canonical pages; dispatch requires an explicit `retryPendingCommand()` call.
+    public func pendingCommand() -> WorkServiceAttachedWorkPendingCommand? {
+        pendingStorage?.projection
+    }
+
+    /// Discard a command only after the host proved its causal cursor stale. The caller must
+    /// refresh first and supply a new command id for any reissue. An indeterminate command may
+    /// have taken effect and therefore cannot be abandoned or rebased through this API.
+    public func abandonStaleCommand() throws {
+        guard let pending = pendingStorage else {
+            throw WorkServiceAttachedWorkControllerError.noPendingCommand
+        }
+        guard pending.state == .stale else {
+            throw WorkServiceAttachedWorkControllerError.commandNotAdmissible
+        }
+        try intentStore.clear(expecting: pending.request)
+        pendingStorage = nil
+    }
+
+    private func issue(
+        kind: WorkServiceCommandKind, commandID: String, value: String?
+    ) async throws -> WorkServiceCommandReceipt {
+        guard pendingStorage == nil else {
+            throw WorkServiceAttachedWorkControllerError.pendingCommandExists
+        }
+        guard (value?.utf8.count ?? 0) <= WorkServiceBounds.maxCommandValueCharacters else {
+            throw WorkServiceAttachedWorkControllerError.commandNotAdmissible
+        }
+        try validateCommandAdmission(kind: kind, commandID: commandID)
+        let command = CommandRef(
+            commandID: commandID, client: client, sessionAttachment: sessionAttachment,
+            causalCursor: workCursorStorage)
+        let request = WorkServiceCommandRequest(
+            work: work, journal: journal, attachment: attachmentStorage.attachment,
+            commandID: commandID, client: client, sessionAttachment: sessionAttachment,
+            causalWorkCursor: workCursorStorage, kind: kind, value: value)
+        // Ensure the request's exact command envelope is the one we intended. This also keeps a
+        // future protocol revision from silently dropping the Session attachment.
+        guard request.command == command else {
+            throw WorkServiceAttachedWorkControllerError.commandNotAdmissible
+        }
+        return try await submit(request, retainingState: nil)
+    }
+
+    private func submit(
+        _ request: WorkServiceCommandRequest,
+        retainingState requestedState: WorkServiceAttachedWorkPendingState?
+    ) async throws -> WorkServiceCommandReceipt {
+        let state = requestedState ?? .indeterminate
+        if pendingStorage == nil {
+            do {
+                try intentStore.retain(request, state: state)
+            } catch let error as WorkServiceAttachedWorkControllerError {
+                throw error
+            } catch {
+                throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+            }
+            pendingStorage = PendingInternal(
+                request: request, state: state,
+                expectedResultingWorkCursor: nil, expectedHostSequence: nil)
+        } else if pendingStorage?.request != request {
+            throw WorkServiceAttachedWorkControllerError.pendingCommandExists
+        }
+        do {
+            let receipt = try await service.command(request)
+            guard receipt.work == work,
+                  receipt.commandID == request.command.commandID,
+                  receipt.host.host == WorkHostRef(work.workHostID),
+                  receipt.causalWorkCursor == request.causalWorkCursor,
+                  Self.validCursor(receipt.causalWorkCursor, journal: journal),
+                  (receipt.resultingWorkCursor.map {
+                      Self.validCursor($0, journal: journal)
+                  } ?? true) else {
+                pendingStorage?.state = .indeterminate
+                throw WorkServiceAttachedWorkControllerError.transportFailure
+            }
+            switch receipt.state {
+            case .accepted, .duplicate:
+                guard Self.validAcceptedReceipt(receipt, for: request, journal: journal) else {
+                    pendingStorage?.state = .indeterminate
+                    throw WorkServiceAttachedWorkControllerError.transportFailure
+                }
+            case .rejected:
+                guard receipt.rejection != nil,
+                      receipt.outcome == nil,
+                      receipt.hostSequence == nil,
+                      receipt.terminalProof == nil else {
+                    pendingStorage?.state = .indeterminate
+                    throw WorkServiceAttachedWorkControllerError.transportFailure
+                }
+            }
+            if receipt.state == .rejected && receipt.rejection == .staleCursor {
+                pendingStorage?.state = .stale
+                pendingStorage?.expectedResultingWorkCursor = nil
+                pendingStorage?.expectedHostSequence = nil
+                try intentStore.retain(request, state: .stale)
+                markKnownBehind(receipt.resultingWorkCursor)
+            } else if receipt.state == .rejected {
+                // A durable rejection is a final command outcome, not an indeterminate effect.
+                try intentStore.clear(expecting: request)
+                pendingStorage = nil
+            } else {
+                let resultingCursor = receipt.resultingWorkCursor!
+                let hostSequence = receipt.hostSequence!
+                // The receipt proves host admission, not that the exact canonical event has
+                // reached this controller. Persist the evidence obligation before returning so
+                // a GUI crash cannot turn a success response into an untracked mutation.
+                try intentStore.retain(
+                    request, state: .awaitingCanonicalEvidence,
+                    expectedResultingWorkCursor: resultingCursor,
+                    expectedHostSequence: hostSequence)
+                pendingStorage?.state = .awaitingCanonicalEvidence
+                pendingStorage?.expectedResultingWorkCursor = resultingCursor
+                pendingStorage?.expectedHostSequence = hostSequence
+                markKnownBehind(resultingCursor)
+            }
+            lastReceiptStorage = receipt
+            return receipt
+        } catch let error as WorkServiceAttachedWorkControllerError {
+            let pendingState: WorkServiceAttachedWorkPendingState = error == .staleCursor
+                ? .stale : .indeterminate
+            pendingStorage?.state = pendingState
+            pendingStorage?.expectedResultingWorkCursor = nil
+            pendingStorage?.expectedHostSequence = nil
+            try? intentStore.retain(request, state: pendingState)
+            connectivityStorage = await currentConnectivity(after: error)
+            throw error
+        } catch WorkServiceProtocolError.staleCursor {
+            do {
+                try intentStore.retain(request, state: .stale)
+                pendingStorage?.state = .stale
+                pendingStorage?.expectedResultingWorkCursor = nil
+                pendingStorage?.expectedHostSequence = nil
+            } catch {
+                pendingStorage?.state = .indeterminate
+                throw WorkServiceAttachedWorkControllerError.transportFailure
+            }
+            markKnownBehind(nil)
+            connectivityStorage = await currentConnectivity(after: .staleCursor)
+            throw WorkServiceAttachedWorkControllerError.staleCursor
+        } catch WorkServiceTransportError.remote(let code, _) where code == .staleCursor {
+            do {
+                try intentStore.retain(request, state: .stale)
+                pendingStorage?.state = .stale
+                pendingStorage?.expectedResultingWorkCursor = nil
+                pendingStorage?.expectedHostSequence = nil
+            } catch {
+                pendingStorage?.state = .indeterminate
+                throw WorkServiceAttachedWorkControllerError.transportFailure
+            }
+            markKnownBehind(nil)
+            connectivityStorage = await currentConnectivity(after: .staleCursor)
+            throw WorkServiceAttachedWorkControllerError.staleCursor
+        } catch {
+            pendingStorage?.state = .indeterminate
+            pendingStorage?.expectedResultingWorkCursor = nil
+            pendingStorage?.expectedHostSequence = nil
+            connectivityStorage = await currentConnectivity(after: .transportFailure)
+            throw WorkServiceAttachedWorkControllerError.transportFailure
+        }
+    }
+
+    private static func validAcceptedReceipt(
+        _ receipt: WorkServiceCommandReceipt,
+        for request: WorkServiceCommandRequest,
+        journal: JournalRef
+    ) -> Bool {
+        guard let resulting = receipt.resultingWorkCursor,
+              let hostSequence = receipt.hostSequence,
+              hostSequence > 0,
+              validCursor(resulting, journal: journal),
+              resulting.sequence > request.causalWorkCursor.sequence,
+              resulting.eventID?.isEmpty == false,
+              receipt.rejection == nil else { return false }
+        let validOutcome: Bool = switch request.kind {
+        case .start:
+            receipt.outcome == .started || receipt.outcome == .startRecoveryRequired
+        case .send: receipt.outcome == .inputAccepted
+        case .steer: receipt.outcome == .steeringAccepted
+        case .queue: receipt.outcome == .queued
+        case .cancel: receipt.outcome == .cancellationRequested
+        case .end: receipt.outcome == .endRequested
+        case .hold: receipt.outcome == .holdRequested
+        case .destroy: receipt.outcome == .destroyed
+        case .complete: receipt.outcome == .completed
+        }
+        guard validOutcome else { return false }
+        if request.kind == .complete || request.kind == .destroy {
+            return receipt.terminalProof != nil
+        }
+        return receipt.terminalProof == nil
+    }
+
+    private func reconcilePendingCommand(
+        in snapshot: WorkSnapshot, through cursor: JournalCursor
+    ) throws {
+        guard let pending = pendingStorage else { return }
+        guard pending.state != .stale else { return }
+        let canonicalID = WorkServiceCommandLedgerIdentity.commandID(
+            client: client, commandID: pending.request.command.commandID)
+        guard let recorded = snapshot.commands[canonicalID] else {
+            if pending.state == .awaitingCanonicalEvidence,
+               let expected = pending.expectedResultingWorkCursor,
+               Self.cursor(cursor, reaches: expected) {
+                throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+            }
+            return
+        }
+        let expectedCommand = WorkServiceCommandLedgerIdentity.command(
+            from: pending.request.command, client: client)
+        guard recorded.command == expectedCommand else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        if pending.state == .awaitingCanonicalEvidence {
+            guard let expectedCursor = pending.expectedResultingWorkCursor,
+                  let expectedHostSequence = pending.expectedHostSequence,
+                  Self.cursor(cursor, reaches: expectedCursor),
+                  recorded.acceptanceEventRef == EventRef(
+                      journal: expectedCursor.journal, eventID: expectedCursor.eventID!),
+                  recorded.acceptanceHostSequence == expectedHostSequence,
+                  recorded.state != .rejected else {
+                throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+            }
+        }
+        // An exact canonical acceptance/delivery/rejection resolves both an indeterminate send
+        // and an acknowledged receipt. Clear disk first; if that fails, leave the in-memory
+        // obligation intact and fail the projection rather than claiming recovery.
+        try intentStore.clear(expecting: pending.request)
+        pendingStorage = nil
+    }
+
+    private func validateCommandAdmission(
+        kind: WorkServiceCommandKind, commandID: String
+    ) throws {
+        guard Self.validIdentity(commandID) else {
+            throw WorkServiceAttachedWorkControllerError.commandNotAdmissible
+        }
+        guard attachmentStorage.authorization.allows(.control) else {
+            throw WorkServiceAttachedWorkControllerError.capabilityDenied(.control)
+        }
+        let capability: WorkServiceCapability
+        switch kind {
+        case .start: capability = .start
+        case .send: capability = .send
+        case .steer: capability = .steer
+        case .queue: capability = .queue
+        case .cancel: capability = .cancel
+        case .end: capability = .end
+        case .hold: capability = .hold
+        case .destroy: capability = .destroy
+        case .complete: capability = .complete
+        }
+        guard attachmentStorage.authorization.allows(capability) else {
+            throw WorkServiceAttachedWorkControllerError.capabilityDenied(capability)
+        }
+        guard workCompletenessStorage == .complete,
+              sessionCompletenessStorage == .complete,
+              !requiresRefreshStorage,
+              workSnapshotStorage.structuralIntegrityValid,
+              workSnapshotStorage.semanticProjectionValid,
+              sessionSnapshotStorage.structuralIntegrityValid,
+              sessionSnapshotStorage.semanticProjectionValid,
+              workSnapshotStorage.quarantinedEvents.isEmpty,
+              sessionSnapshotStorage.quarantinedEvents.isEmpty else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        guard descriptorStorage.recordedDisposition == .reusable else {
+            throw WorkServiceAttachedWorkControllerError.terminalWork
+        }
+        switch workSnapshotStorage.lifecycle {
+        case .completed, .destroyed:
+            throw WorkServiceAttachedWorkControllerError.terminalWork
+        case .unknown:
+            throw WorkServiceAttachedWorkControllerError.recoveryRequired
+        case .active:
+            break
+        }
+        guard descriptorStorage.execution != .recoveryRequired,
+              descriptorStorage.execution != .unknown,
+              let reducedExecution = Self.serviceExecution(workSnapshotStorage.execution),
+              descriptorStorage.execution == reducedExecution,
+              workSnapshotStorage.unknownEvents.isEmpty,
+              sessionSnapshotStorage.unknownEvents.isEmpty,
+              sessionSnapshotStorage.lifecycle == .active else {
+            throw WorkServiceAttachedWorkControllerError.recoveryRequired
+        }
+        switch (kind, reducedExecution) {
+        // An idle Work with no current Run is the only valid Start boundary. Once a Run has
+        // settled between turns, the reducer may report .idle while activeRun remains
+        // present; that is still the same live conversation and must accept Send/End.
+        case (.start, .idle) where descriptorStorage.currentRun == nil: break
+        case (.send, .running): break
+        case (.send, .idle) where descriptorStorage.currentRun != nil: break
+        case (.steer, .running), (.queue, .running): break
+        case (.cancel, .running), (.cancel, .held), (.end, .running),
+             (.end, .held), (.end, .canceling),
+             (.end, .idle) where descriptorStorage.currentRun != nil: break
+        default: throw WorkServiceAttachedWorkControllerError.commandNotAdmissible
+        }
+    }
+
+    private func markKnownBehind(_ resultingCursor: JournalCursor?) {
+        requiresRefreshStorage = true
+        guard let resultingCursor,
+              Self.validCursor(resultingCursor, journal: journal) else { return }
+        if let requiredWorkCursorStorage,
+           Self.cursor(requiredWorkCursorStorage, reaches: resultingCursor) {
+            return
+        }
+        requiredWorkCursorStorage = resultingCursor
+    }
+
+    private func establishConnectionIfNeeded() async throws -> WorkServiceHandshakeResponse? {
+        guard let connectIfNeeded else { return nil }
+        do {
+            return try await connectIfNeeded()
+        } catch WorkServiceClientSessionError.notConnected {
+            throw WorkServiceAttachedWorkControllerError.notConnected
+        } catch WorkServiceClientSessionError.unavailable {
+            throw WorkServiceAttachedWorkControllerError.transportFailure
+        } catch WorkServiceClientSessionError.incompatibleProtocol {
+            throw WorkServiceAttachedWorkControllerError.hostMismatch
+        } catch WorkServiceClientSessionError.hostInstanceMismatch {
+            throw WorkServiceAttachedWorkControllerError.hostMismatch
+        } catch {
+            throw WorkServiceAttachedWorkControllerError.transportFailure
+        }
+    }
+
+    private func currentConnectivity(
+        after error: WorkServiceAttachedWorkControllerError
+    ) async -> WorkServiceAttachedWorkConnectivity {
+        if let provider = connectivityProvider { return await provider() }
+        switch error {
+        case .hostMismatch: return .incompatible(WorkHostRef(work.workHostID))
+        case .notConnected, .transportFailure: return .unavailable(WorkHostRef(work.workHostID))
+        default: return connectivityStorage
+        }
+    }
+
+    private func markReadFailure(_ error: WorkServiceAttachedWorkControllerError) {
+        switch error {
+        case .hostMismatch: connectivityStorage = .incompatible(WorkHostRef(work.workHostID))
+        case .notConnected, .transportFailure: connectivityStorage = .unavailable(WorkHostRef(work.workHostID))
+        default: break
+        }
+        // Keep canonical snapshots/cursors exactly as they were. The source state is the only
+        // mutable truth changed by this failed transaction.
+        workCompletenessStorage = .incomplete
+        sessionCompletenessStorage = .incomplete
+        let diagnostic: String
+        switch error {
+        case .malformedResponse: diagnostic = "Work service returned a malformed journal read."
+        case .sourceIncomplete: diagnostic = "Work service journal read was incomplete."
+        case .hostMismatch: diagnostic = "Work service host identity did not match the attachment."
+        case .notConnected, .transportFailure: diagnostic = "Work service journal read was unavailable."
+        default: diagnostic = "Work service journal read failed."
+        }
+        if !readDiagnosticsStorage.contains(diagnostic) {
+            readDiagnosticsStorage = Array((readDiagnosticsStorage + [diagnostic]).suffix(
+                WorkServiceAttachedWorkControllerBounds.maxDiagnostics))
+        }
+    }
+
+    // MARK: - Read validation
+
+    private static func readJournal(
+        kind: ReadKind,
+        service: any WorkServiceClient,
+        descriptor: WorkServiceWorkDescriptor,
+        attachment: WorkServiceClientAttachment,
+        client: ClientRef,
+        journal: JournalRef,
+        session: SessionRef,
+        sessionJournal: JournalRef,
+        sessionAttachment: SessionAttachmentRef,
+        after: JournalCursor,
+        pageLimit: Int,
+        pageBytes: Int,
+        expectedHostInstance: WorkHostInstanceRef?,
+        expectedBasePrefixDigest: String?
+    ) async throws -> ReadResult {
+        let target: WorkServiceReadTarget
+        let targetJournal: JournalRef
+        switch kind {
+        case .work:
+            target = .work(journal: journal)
+            targetJournal = journal
+        case .session:
+            target = .session(session: session, journal: sessionJournal)
+            targetJournal = sessionJournal
+        }
+        let first: WorkServiceSnapshot
+        do {
+            first = try await service.snapshot(WorkServiceSnapshotRequest(
+                work: descriptor.work, journal: descriptor.journal,
+                attachment: attachment.attachment, client: client, target: target,
+                afterCursor: after, limit: pageLimit, maxBytes: pageBytes))
+        } catch {
+            throw mapReadError(error)
+        }
+        guard first.target == target,
+              validDescriptor(
+                  first.work, expected: descriptor.work, expectedJournal: journal,
+                  expectedHostInstance: expectedHostInstance) else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        guard Self.validPrefixDigest(first.basePrefixDigest),
+              Self.validPrefixDigest(first.prefixDigest),
+              expectedBasePrefixDigest == nil || first.basePrefixDigest == expectedBasePrefixDigest else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        if first.work.hostObservation?.sourceCompleteness == .incomplete
+            || first.work.hostObservation?.sourceCompleteness == .unknown {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        var cursor = try validateSnapshot(
+            first, target: target, targetJournal: targetJournal, expectedWork: descriptor.work,
+            expectedSession: session, expectedSessionAttachment: sessionAttachment,
+            after: after, pageLimit: pageLimit, pageBytes: pageBytes)
+        var events = first.events
+        var prefixDigest = first.prefixDigest
+        var omissions: [WorkServiceOmission] = []
+        let hasMoreInSnapshot = hasPagingOmission(first.omissions)
+        if !hasMoreInSnapshot {
+            if kind == .work,
+               let advertised = first.work.hostObservation?.servedCursor,
+               advertised != cursor {
+                throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+            }
+        }
+        var needsPage = hasMoreInSnapshot
+        var pageCount = 0
+        var seenCursors: Set<JournalCursor> = [cursor]
+        while needsPage {
+            guard pageCount < WorkServiceAttachedWorkControllerBounds.maxPages else {
+                // The prefix and its exact continuation cursor are valid. Returning it as an
+                // incomplete result lets the controller retain a resumable checkpoint instead of
+                // re-reading from zero or latching permanently into sourceIncomplete.
+                omissions.append(WorkServiceOmission(
+                    category: "controller_page_budget", count: 1,
+                    diagnostic: "per-refresh page budget reached; continue from this cursor"))
+                omissions.append(contentsOf: first.omissions.filter { !hasPagingOmission([$0]) })
+                return ReadResult(
+                    cursor: cursor, events: events, descriptor: first.work,
+                    sourceCompleteness: .incomplete, omissions: boundedOmissions(omissions),
+                    basePrefixDigest: first.basePrefixDigest, prefixDigest: prefixDigest)
+            }
+            pageCount += 1
+            let page: WorkServiceEventPage
+            do {
+                page = try await service.eventsAfterCursor(WorkServiceEventsRequest(
+                    work: descriptor.work, journal: descriptor.journal,
+                    attachment: attachment.attachment, client: client, target: target,
+                    afterCursor: cursor, limit: pageLimit, maxBytes: pageBytes))
+            } catch {
+                throw mapReadError(error)
+            }
+            guard page.target == target else {
+                throw WorkServiceAttachedWorkControllerError.malformedResponse
+            }
+            guard Self.validPrefixDigest(page.basePrefixDigest),
+                  Self.validPrefixDigest(page.prefixDigest),
+                  page.basePrefixDigest == prefixDigest else {
+                throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+            }
+            let pageCursor = try validateEventPage(
+                page, target: target, targetJournal: targetJournal, expectedWork: descriptor.work,
+                expectedSession: session, expectedSessionAttachment: sessionAttachment,
+                after: cursor, pageLimit: pageLimit, pageBytes: pageBytes)
+            guard pageCursor != cursor, seenCursors.insert(pageCursor).inserted else {
+                throw WorkServiceAttachedWorkControllerError.malformedResponse
+            }
+            events.append(contentsOf: page.events)
+            prefixDigest = page.prefixDigest
+            // Event-count/byte omissions are resolved by the bounded continuation loop. Keep
+            // any other omission category as explicit bounded evidence instead of dropping it
+            // merely because it arrived on a later page.
+            omissions.append(contentsOf: page.omissions.filter { !hasPagingOmission([$0]) })
+            cursor = pageCursor
+            if let next = page.nextCursor {
+                guard next == pageCursor else {
+                    throw WorkServiceAttachedWorkControllerError.malformedResponse
+                }
+                needsPage = true
+            } else if hasPagingOmission(page.omissions) {
+                // A server that admits more data but does not provide a progressing cursor has
+                // exposed an incomplete source. Do not reduce or publish this candidate.
+                throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+            } else {
+                needsPage = false
+            }
+        }
+        // Event/page omissions are consumed by the bounded loop above. Non-event omissions
+        // (typically artifact metadata) remain visible but do not make the Work/Session journal
+        // itself incomplete.
+        omissions.append(contentsOf: first.omissions.filter { !hasPagingOmission([$0]) })
+        return ReadResult(
+            cursor: cursor, events: events, descriptor: first.work,
+            sourceCompleteness: .complete, omissions: boundedOmissions(omissions),
+            basePrefixDigest: first.basePrefixDigest, prefixDigest: prefixDigest)
+    }
+
+    private static func stagedWorkSnapshot(_ staged: StagedRead?) -> WorkSnapshot? {
+        guard let staged, case .work(let snapshot) = staged.snapshot else { return nil }
+        return snapshot
+    }
+
+    private static func stagedSessionSnapshot(_ staged: StagedRead?) -> SessionSnapshot? {
+        guard let staged, case .session(let snapshot) = staged.snapshot else { return nil }
+        return snapshot
+    }
+
+    private static func reduceRead(
+        _ delta: ReadResult,
+        initial: WorkSnapshot,
+        kind: ReadKind,
+        expectedCursor: JournalCursor
+    ) throws -> WorkSnapshot {
+        guard kind == .work,
+              delta.cursor.journal == expectedCursor.journal,
+              validCursor(delta.cursor, journal: expectedCursor.journal) else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        let reduced = WorkReducer.reduce(delta.events, initial: initial)
+        guard reduced.journal == expectedCursor.journal,
+              reduced.lastSequence == delta.cursor.sequence,
+              reduced.lastEventID == delta.cursor.eventID,
+              reduced.structuralIntegrityValid,
+              reduced.semanticProjectionValid,
+              reduced.quarantinedEvents.isEmpty else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        return reduced
+    }
+
+    private static func reduceRead(
+        _ delta: ReadResult,
+        initial: SessionSnapshot,
+        kind: ReadKind,
+        expectedCursor: JournalCursor
+    ) throws -> SessionSnapshot {
+        guard kind == .session,
+              delta.cursor.journal == expectedCursor.journal,
+              validCursor(delta.cursor, journal: expectedCursor.journal) else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        let reduced = SessionReducer.reduce(delta.events, initial: initial)
+        guard reduced.journal == expectedCursor.journal,
+              reduced.lastSequence == delta.cursor.sequence,
+              reduced.lastEventID == delta.cursor.eventID,
+              reduced.structuralIntegrityValid,
+              reduced.semanticProjectionValid,
+              reduced.quarantinedEvents.isEmpty else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        return reduced
+    }
+
+    /// A direct service fixture may not be wrapped by WorkServiceClientSession. Probe its control
+    /// plane opportunistically so an existing seed can still acknowledge reads; a transport that
+    /// intentionally omits handshake support remains read-only.
+    private func discoverControlCursor() async {
+        let request = WorkServiceHandshakeRequest(client: client)
+        do {
+            let handshake = try await service.handshake(request)
+            guard Self.validHandshake(
+                handshake, expectedHost: WorkHostRef(work.workHostID)) else { return }
+            controlCursorStorage = handshake.controlCursor
+            if case .disconnected = connectivityStorage {
+                connectivityStorage = .connected(handshake.hostInstance)
+            }
+        } catch {
+            // Reads are still useful for a deliberately minimal loopback test double. Mutation
+            // admission below will simply record that the control cursor was unavailable.
+        }
+    }
+
+    private func appendReadDiagnostic(_ diagnostic: String) {
+        guard !readDiagnosticsStorage.contains(diagnostic) else { return }
+        readDiagnosticsStorage = Array(
+            (readDiagnosticsStorage + [diagnostic]).suffix(
+                WorkServiceAttachedWorkControllerBounds.maxDiagnostics))
+    }
+
+    private func acknowledgeAdvancedReads(
+        attachment: WorkServiceClientAttachment,
+        workCursor: JournalCursor,
+        sessionCursor: JournalCursor
+    ) async -> WorkServiceClientAttachment {
+        let workTarget = WorkServiceReadTarget.work(journal: journal)
+        let sessionTarget = WorkServiceReadTarget.session(
+            session: session, journal: sessionJournal)
+        var projected = attachment
+        for (target, cursor) in [(workTarget, workCursor), (sessionTarget, sessionCursor)] {
+            if let pending = pendingReadAcknowledgementsStorage.values.first(where: {
+                $0.request.target == target
+            }) {
+                if let durable = Self.acknowledgedCursor(for: target, in: projected),
+                   Self.cursor(durable, reaches: pending.request.cursor) {
+                    pendingReadAcknowledgementsStorage.removeValue(forKey: pending.key)
+                    _ = persistCheckpointIfPossible(attachmentOverride: projected)
+                } else if Self.cursor(cursor, reaches: pending.request.cursor) {
+                    // Descriptor reconciliation has completed for this refresh.  Replay the
+                    // exact retained request within this refresh before asking for a newer cursor.
+                    // The command ID, target, cursor, and causal control cursor are unchanged, so
+                    // the host's idempotency record decides whether this is an admission or a
+                    // duplicate. A later refresh gets a fresh bounded attempt; no lifetime retry
+                    // counter can strand an otherwise valid idempotent request.
+                    await acknowledge(
+                        target: target, cursor: pending.request.cursor, attachment: &projected)
+                    if pendingReadAcknowledgementsStorage.values.contains(where: {
+                        $0.request.target == target
+                    }) {
+                        continue
+                    }
+                } else {
+                    appendReadDiagnostic(
+                        "A pending read acknowledgement is ahead of the validated journal prefix.")
+                    continue
+                }
+            }
+            guard let durable = Self.acknowledgedCursor(for: target, in: projected) else {
+                await acknowledge(target: target, cursor: cursor, attachment: &projected)
+                continue
+            }
+            guard Self.cursor(cursor, reaches: durable) else {
+                // An acknowledgement ahead of the fully read candidate means this controller
+                // cannot prove the missing history. Do not send a second mutation; the next
+                // refresh will re-read from its committed/checkpoint cursor.
+                appendReadDiagnostic(
+                    "Work service returned a read acknowledgement ahead of the validated journal prefix.")
+                continue
+            }
+            if cursor != durable {
+                await acknowledge(target: target, cursor: cursor, attachment: &projected)
+            }
+        }
+        return projected
+    }
+
+    private func acknowledge(
+        target: WorkServiceReadTarget,
+        cursor: JournalCursor,
+        attachment: inout WorkServiceClientAttachment
+    ) async {
+        guard cursor.journal == target.journal,
+              Self.validCursor(cursor, journal: target.journal) else {
+            appendReadDiagnostic("Work service returned an invalid read cursor.")
+            return
+        }
+        let key = ReadAcknowledgementKey(targetJournal: target.journal, cursor: cursor)
+        var retainedRequest: WorkServiceAcknowledgeReadRequest?
+        if let pending = pendingReadAcknowledgementsStorage[key] {
+            if let durable = Self.acknowledgedCursor(for: target, in: attachment),
+               Self.cursor(durable, reaches: cursor) {
+                pendingReadAcknowledgementsStorage.removeValue(forKey: key)
+            } else if !pending.stale {
+                // The bound is per refresh (`attempts` below), not a durable lifetime counter.
+                // A response can be lost repeatedly before admission; every later descriptor
+                // reconciliation may safely retry this same idempotent request until the host
+                // proves admission or returns a correlated no-effect rejection.
+                retainedRequest = pending.request
+            } else {
+                // A stale response is proof of no effect. It is safe to mint a fresh causal
+                // request for the same target/cursor on the next attempt.
+                pendingReadAcknowledgementsStorage.removeValue(forKey: key)
+            }
+        }
+        guard attachment.authorization.allows(.observe) else {
+            appendReadDiagnostic(
+                "The attached client cannot durably acknowledge its read cursor.")
+            return
+        }
+        guard checkpointPersistenceAvailableStorage else {
+            appendReadDiagnostic(
+                "Read acknowledgement is withheld until the local reducer checkpoint is durable.")
+            return
+        }
+        var control: JournalCursor
+        if let retainedRequest {
+            // An exact replay must not be rewritten to the current handshake cursor.  If that
+            // causal cursor is stale, the structured stale response below supplies the one safe
+            // successor cursor for a fresh attempt of the same logical acknowledgement.
+            control = retainedRequest.causalControlCursor
+        } else {
+            guard let initialControl = await currentControlCursor() else {
+                appendReadDiagnostic(
+                    "The Work Host control cursor was unavailable; read acknowledgement is pending.")
+                return
+            }
+            control = initialControl
+        }
+        var attempts = 0
+        while attempts < 2 {
+            attempts += 1
+            let request: WorkServiceAcknowledgeReadRequest
+            if let retainedRequest, attempts == 1 {
+                request = retainedRequest
+            } else {
+                let commandID = Self.acknowledgementCommandID(
+                    work: work, attachment: attachment.attachment, target: target,
+                    cursor: cursor, causalControlCursor: control)
+                request = WorkServiceAcknowledgeReadRequest(
+                    work: work, journal: journal, attachment: attachment.attachment,
+                    client: client, target: target, cursor: cursor,
+                    commandID: commandID, causalControlCursor: control)
+                pendingReadAcknowledgementsStorage[key] = PendingReadAcknowledgement(
+                    request: request, stale: false)
+                guard persistCheckpointIfPossible(attachmentOverride: attachment) else { return }
+            }
+            do {
+                let response = try await service.acknowledgeRead(request)
+                guard Self.validAcknowledgementResponse(
+                    response, request: request, expectedHost: WorkHostRef(work.workHostID)) else {
+                    appendReadDiagnostic(
+                        "The Work Host returned an uncorrelated read acknowledgement.")
+                    return
+                }
+                controlCursorStorage = response.resultingControlCursor
+                switch response.state {
+                case .accepted, .duplicate:
+                    pendingReadAcknowledgementsStorage.removeValue(forKey: key)
+                    attachment = Self.attachmentByAcknowledging(
+                        target: target, cursor: cursor, attachment: attachment)
+                    _ = persistCheckpointIfPossible(attachmentOverride: attachment)
+                    return
+                case .rejected:
+                    if response.rejection == .staleCursor, attempts < 2 {
+                        // This rejection proves no read-ack mutation occurred. Chain the exact
+                        // resulting control cursor into one bounded retry; never do this for an
+                        // ambiguous transport result.
+                        pendingReadAcknowledgementsStorage[key] = PendingReadAcknowledgement(
+                            request: request, stale: true)
+                        guard persistCheckpointIfPossible(attachmentOverride: attachment) else {
+                            return
+                        }
+                        guard Self.validControlCursor(
+                            response.resultingControlCursor,
+                            expectedHost: WorkHostRef(work.workHostID)) else { return }
+                        control = response.resultingControlCursor
+                        controlCursorStorage = response.resultingControlCursor
+                        continue
+                    }
+                    pendingReadAcknowledgementsStorage.removeValue(forKey: key)
+                    appendReadDiagnostic(
+                        response.rejection == .staleCursor
+                            ? "Read acknowledgement remained stale after a bounded control-cursor retry."
+                            : "The Work Host rejected a read acknowledgement.")
+                    return
+                }
+            } catch {
+                // The request remains retained in memory for descriptor reconciliation, but is
+                // deliberately not replayed from this refresh (or a reconnect).
+                appendReadDiagnostic(
+                    "A read acknowledgement response was unavailable; waiting for descriptor reconciliation.")
+                return
+            }
+        }
+    }
+
+    private func currentControlCursor() async -> JournalCursor? {
+        if let control = controlCursorStorage,
+           Self.validControlCursor(control, expectedHost: WorkHostRef(work.workHostID)) {
+            return control
+        }
+        await discoverControlCursor()
+        guard let control = controlCursorStorage,
+              Self.validControlCursor(control, expectedHost: WorkHostRef(work.workHostID)) else {
+            return nil
+        }
+        return control
+    }
+
+    /// Persist the exact committed reducer pair plus any uncommitted continuation. This is a
+    /// local cache: a write failure is diagnostic only and never changes the remote source's
+    /// availability or the validated projection that the GUI may display.
+    private func persistCheckpoint(
+        attachmentOverride: WorkServiceClientAttachment? = nil
+    ) throws {
+        let stagedWork = stagedWorkReadStorage
+        let stagedSession = stagedSessionReadStorage
+        let descriptor = stagedWork?.descriptor ?? stagedSession?.descriptor ?? descriptorStorage
+        let pending = pendingReadAcknowledgementsStorage.values
+            .sorted { lhs, rhs in
+                let left = lhs.request.target.journal.journalID + "|" + String(lhs.request.cursor.sequence)
+                let right = rhs.request.target.journal.journalID + "|" + String(rhs.request.cursor.sequence)
+                return left < right
+            }
+            .map {
+                WorkServiceAttachedWorkCheckpointStore.PendingAcknowledgement(
+                    request: $0.request, stale: $0.stale)
+            }
+        let candidate = WorkServiceAttachedWorkCheckpointStore.Record(
+            client: client, work: work, journal: journal, session: session,
+            sessionJournal: sessionJournal, sessionAttachment: sessionAttachment,
+            attachment: attachmentStorage.attachment,
+            hostInstance: descriptor.hostObservation?.instance,
+            descriptor: descriptor,
+            attachmentProjection: attachmentOverride ?? attachmentStorage,
+            controlCursor: controlCursorStorage,
+            committedWorkCursor: workCursorStorage,
+            committedWorkPrefixDigest: workPrefixDigestStorage,
+            committedWorkSnapshot: workSnapshotStorage,
+            committedSessionCursor: sessionCursorStorage,
+            committedSessionPrefixDigest: sessionPrefixDigestStorage,
+            committedSessionSnapshot: sessionSnapshotStorage,
+            stagedWorkCursor: stagedWork?.cursor,
+            stagedWorkPrefixDigest: stagedWork?.prefixDigest,
+            stagedWorkSnapshot: Self.stagedWorkSnapshot(stagedWork),
+            stagedWorkOmissions: stagedWork?.omissions ?? [],
+            stagedSessionCursor: stagedSession?.cursor,
+            stagedSessionPrefixDigest: stagedSession?.prefixDigest,
+            stagedSessionSnapshot: Self.stagedSessionSnapshot(stagedSession),
+            stagedSessionOmissions: stagedSession?.omissions ?? [],
+            pendingAcknowledgements: pending)
+        let record = WorkServiceAttachedWorkCheckpointStore.boundedRecord(candidate)
+        guard record != lastCheckpointRecordStorage else {
+            checkpointPersistenceAvailableStorage = true
+            return
+        }
+        try checkpointStore.save(record)
+        lastCheckpointRecordStorage = record
+        checkpointPersistenceAvailableStorage = true
+    }
+
+    private func persistCheckpointIfPossible(
+        attachmentOverride: WorkServiceClientAttachment? = nil
+    ) -> Bool {
+        do {
+            try persistCheckpoint(attachmentOverride: attachmentOverride)
+            return true
+        } catch {
+            checkpointPersistenceAvailableStorage = false
+            appendReadDiagnostic(
+                "Local reducer checkpoint could not be persisted; reads remain visible and will be revalidated after restart.")
+            return false
+        }
+    }
+
+    private static func validCheckpoint(
+        _ record: WorkServiceAttachedWorkCheckpointStore.Record,
+        descriptor: WorkServiceWorkDescriptor,
+        attachment: WorkServiceClientAttachment,
+        session: SessionRef,
+        sessionJournal: JournalRef,
+        sessionAttachment: SessionAttachmentRef
+    ) -> Bool {
+        guard validCheckpointMetadata(
+            record, descriptor: descriptor, attachment: attachment, session: session,
+            sessionJournal: sessionJournal, sessionAttachment: sessionAttachment),
+              let committedWorkSnapshot = record.committedWorkSnapshot,
+              let committedSessionSnapshot = record.committedSessionSnapshot,
+              validCommittedWork(committedWorkSnapshot, cursor: record.committedWorkCursor,
+                                 work: descriptor.work, journal: descriptor.journal),
+              validCommittedSession(committedSessionSnapshot,
+                                    cursor: record.committedSessionCursor,
+                                    session: session, journal: sessionJournal) else {
+            return false
+        }
+        let validStagedWork: Bool
+        if let cursor = record.stagedWorkCursor, let snapshot = record.stagedWorkSnapshot {
+            validStagedWork = validCommittedWork(
+                snapshot, cursor: cursor, work: descriptor.work, journal: descriptor.journal)
+                && cursor.sequence >= record.committedWorkCursor.sequence
+                && checkpointDigestUsable(cursor, digest: record.stagedWorkPrefixDigest)
+        } else {
+            validStagedWork = record.stagedWorkCursor == nil && record.stagedWorkSnapshot == nil
+                && record.stagedWorkPrefixDigest == nil
+        }
+        let validStagedSession: Bool
+        if let cursor = record.stagedSessionCursor, let snapshot = record.stagedSessionSnapshot {
+            validStagedSession = validCommittedSession(
+                snapshot, cursor: cursor, session: session, journal: sessionJournal)
+                && cursor.sequence >= record.committedSessionCursor.sequence
+                && checkpointDigestUsable(cursor, digest: record.stagedSessionPrefixDigest)
+        } else {
+            validStagedSession = record.stagedSessionCursor == nil
+                && record.stagedSessionSnapshot == nil
+                && record.stagedSessionPrefixDigest == nil
+        }
+        guard validStagedWork, validStagedSession,
+              checkpointDigestUsable(
+                  record.committedWorkCursor, digest: record.committedWorkPrefixDigest),
+              checkpointDigestUsable(
+                  record.committedSessionCursor, digest: record.committedSessionPrefixDigest) else {
+            return false
+        }
+        let acknowledgedWorkCursor = record.stagedWorkCursor ?? record.committedWorkCursor
+        let acknowledgedSessionCursor = record.stagedSessionCursor ?? record.committedSessionCursor
+        for acknowledgement in record.attachmentProjection.readAcknowledgements {
+            switch acknowledgement.target {
+            case .work:
+                guard cursor(acknowledgedWorkCursor, reaches: acknowledgement.cursor) else {
+                    return false
+                }
+            case .session:
+                guard cursor(acknowledgedSessionCursor, reaches: acknowledgement.cursor) else {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    /// Validate only the identity/cursor/proof envelope.  A compact checkpoint intentionally has
+    /// no reducer snapshots and therefore cannot resume history, but its pending idempotent
+    /// acknowledgement requests are still safe to restore after this metadata check.
+    private static func validCheckpointMetadata(
+        _ record: WorkServiceAttachedWorkCheckpointStore.Record,
+        descriptor: WorkServiceWorkDescriptor,
+        attachment: WorkServiceClientAttachment,
+        session: SessionRef,
+        sessionJournal: JournalRef,
+        sessionAttachment: SessionAttachmentRef
+    ) -> Bool {
+        guard record.client == attachment.client,
+              record.work == descriptor.work,
+              record.journal == descriptor.journal,
+              record.session == session,
+              record.sessionJournal == sessionJournal,
+              record.sessionAttachment == sessionAttachment,
+              record.attachment == attachment.attachment,
+              record.descriptor.work == descriptor.work,
+              record.descriptor.journal == descriptor.journal,
+              record.descriptor.work.workHostID == descriptor.work.workHostID,
+              record.attachmentProjection.attachment == attachment.attachment,
+              record.attachmentProjection.client == attachment.client,
+              record.attachmentProjection.session == session,
+              record.attachmentProjection.sessionJournal == sessionJournal,
+              record.attachmentProjection.sessionAttachment == sessionAttachment,
+              record.committedWorkCursor.journal == descriptor.journal,
+              record.committedSessionCursor.journal == sessionJournal,
+              validPrefixDigest(record.committedWorkPrefixDigest),
+              validPrefixDigest(record.committedSessionPrefixDigest),
+              checkpointDigestUsable(
+                  record.committedWorkCursor, digest: record.committedWorkPrefixDigest),
+              checkpointDigestUsable(
+                  record.committedSessionCursor, digest: record.committedSessionPrefixDigest),
+              validControlCheckpointCursor(record.controlCursor, host: descriptor.work.workHostID) else {
+            return false
+        }
+        if let stagedCursor = record.stagedWorkCursor {
+            guard stagedCursor.journal == descriptor.journal,
+                  stagedCursor.sequence >= record.committedWorkCursor.sequence,
+                  checkpointDigestUsable(stagedCursor, digest: record.stagedWorkPrefixDigest) else {
+                return false
+            }
+        } else {
+            guard record.stagedWorkSnapshot == nil, record.stagedWorkPrefixDigest == nil else {
+                return false
+            }
+        }
+        if let stagedCursor = record.stagedSessionCursor {
+            guard stagedCursor.journal == sessionJournal,
+                  stagedCursor.sequence >= record.committedSessionCursor.sequence,
+                  checkpointDigestUsable(stagedCursor, digest: record.stagedSessionPrefixDigest) else {
+                return false
+            }
+        } else {
+            guard record.stagedSessionSnapshot == nil, record.stagedSessionPrefixDigest == nil else {
+                return false
+            }
+        }
+        guard (record.stagedWorkCursor == nil) == (record.stagedWorkSnapshot == nil),
+              (record.stagedSessionCursor == nil) == (record.stagedSessionSnapshot == nil),
+              (try? validateReadAcknowledgements(
+                  in: record.attachmentProjection, workJournal: descriptor.journal,
+                  session: session, sessionJournal: sessionJournal)) != nil else {
+            return false
+        }
+        var pendingKeys = Set<ReadAcknowledgementKey>()
+        for pending in record.pendingAcknowledgements {
+            let key = ReadAcknowledgementKey(
+                targetJournal: pending.request.target.journal, cursor: pending.request.cursor)
+            guard pendingKeys.insert(key).inserted,
+                  pending.request.work == descriptor.work,
+                  pending.request.journal == descriptor.journal,
+                  pending.request.attachment == attachment.attachment,
+                  pending.request.client == attachment.client,
+                  pending.request.target.journal == key.targetJournal,
+                  validCursor(pending.request.cursor, journal: key.targetJournal),
+                  validControlCheckpointCursor(
+                      pending.request.causalControlCursor, host: descriptor.work.workHostID) else {
+                return false
+            }
+            switch pending.request.target {
+            case .work(let targetJournal):
+                guard targetJournal == descriptor.journal else { return false }
+            case .session(let targetSession, let targetJournal):
+                guard targetSession == session, targetJournal == sessionJournal else { return false }
+            }
+        }
+        return true
+    }
+
+    private static func validCommittedWork(
+        _ snapshot: WorkSnapshot,
+        cursor: JournalCursor,
+        work: WorkRef,
+        journal: JournalRef
+    ) -> Bool {
+        snapshot.journal == journal
+            && snapshot.work == work
+            && snapshot.workHost == WorkHostRef(work.workHostID)
+            && snapshot.lastSequence == cursor.sequence
+            && snapshot.lastEventID == cursor.eventID
+            && cursor.journal == journal
+            && validCursor(cursor, journal: journal)
+            && snapshot.structuralIntegrityValid
+            && snapshot.semanticProjectionValid
+            && snapshot.quarantinedEvents.isEmpty
+            && snapshot.unknownEvents.isEmpty
+    }
+
+    private static func validCommittedSession(
+        _ snapshot: SessionSnapshot,
+        cursor: JournalCursor,
+        session: SessionRef,
+        journal: JournalRef
+    ) -> Bool {
+        snapshot.journal == journal
+            && snapshot.session == session
+            && snapshot.lastSequence == cursor.sequence
+            && snapshot.lastEventID == cursor.eventID
+            && cursor.journal == journal
+            && validCursor(cursor, journal: journal)
+            && snapshot.structuralIntegrityValid
+            && snapshot.semanticProjectionValid
+            && snapshot.quarantinedEvents.isEmpty
+            && snapshot.unknownEvents.isEmpty
+    }
+
+    private static func checkpointDigestUsable(
+        _ cursor: JournalCursor, digest: String?
+    ) -> Bool {
+        cursor.sequence == 0 ? validPrefixDigest(digest) : digest != nil && validPrefixDigest(digest)
+    }
+
+    private static func validControlCheckpointCursor(
+        _ cursor: JournalCursor?, host: String
+    ) -> Bool {
+        guard let cursor else { return true }
+        return validControlCursor(cursor, expectedHost: WorkHostRef(host))
+    }
+
+    private static func validateReadAcknowledgements(
+        in attachment: WorkServiceClientAttachment,
+        workJournal: JournalRef,
+        session: SessionRef,
+        sessionJournal: JournalRef
+    ) throws {
+        guard attachment.readAcknowledgements.count <= WorkServiceBounds.maxReadAcknowledgementsPerAttachment else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        var targets = Set<WorkServiceReadTarget>()
+        for acknowledgement in attachment.readAcknowledgements {
+            guard targets.insert(acknowledgement.target).inserted,
+                  acknowledgement.cursor.journal == acknowledgement.target.journal,
+                  validCursor(acknowledgement.cursor, journal: acknowledgement.target.journal) else {
+                throw WorkServiceAttachedWorkControllerError.malformedResponse
+            }
+            switch acknowledgement.target {
+            case .work(let journal):
+                guard journal == workJournal else {
+                    throw WorkServiceAttachedWorkControllerError.malformedResponse
+                }
+            case .session(let acknowledgedSession, let journal):
+                guard acknowledgedSession == session, journal == sessionJournal else {
+                    throw WorkServiceAttachedWorkControllerError.malformedResponse
+                }
+            }
+        }
+    }
+
+    private static func validateAcknowledgementCursors(
+        in attachment: WorkServiceClientAttachment,
+        workCursor: JournalCursor,
+        sessionCursor: JournalCursor
+    ) throws {
+        for acknowledgement in attachment.readAcknowledgements {
+            let available: JournalCursor
+            switch acknowledgement.target {
+            case .work:
+                available = workCursor
+            case .session:
+                available = sessionCursor
+            }
+            guard cursor(available, reaches: acknowledgement.cursor) else {
+                // A host acknowledgement is not a license to skip unseen journal history. If
+                // it claims a future cursor, reject this candidate and preserve the last paired
+                // projection until a complete read can prove the same prefix.
+                throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+            }
+        }
+    }
+
+    private static func acknowledgedCursor(
+        for target: WorkServiceReadTarget,
+        in attachment: WorkServiceClientAttachment
+    ) -> JournalCursor? {
+        attachment.readAcknowledgements.first(where: { $0.target == target })?.cursor
+    }
+
+    private static func validControlCursor(
+        _ cursor: JournalCursor,
+        expectedHost: WorkHostRef
+    ) -> Bool {
+        guard cursor.journal.owner == .workHost(expectedHost),
+              cursor.journal.kind == .workHost,
+              cursor.journal.authority.authorityID == expectedHost.workHostID else {
+            return false
+        }
+        return validCursor(cursor, journal: cursor.journal)
+    }
+
+    private static func validPrefixDigest(_ digest: String?) -> Bool {
+        guard let digest else { return true }
+        let hex = digest.dropFirst("sha256:".count)
+        return digest.hasPrefix("sha256:") && hex.count == 64
+            && hex.allSatisfy { $0.isHexDigit }
+    }
+
+    private static func validAcknowledgementResponse(
+        _ response: WorkServiceAcknowledgeReadResponse,
+        request: WorkServiceAcknowledgeReadRequest,
+        expectedHost: WorkHostRef
+    ) -> Bool {
+        guard response.work == request.work,
+              response.target == request.target,
+              response.cursor == request.cursor,
+              response.commandID == request.commandID,
+              response.causalControlCursor == request.causalControlCursor,
+              response.host.host == expectedHost,
+              response.receipt.operation == .acknowledgeRead,
+              response.receipt.work == request.work,
+              response.receipt.commandID == request.commandID,
+              response.receipt.state == response.state,
+              response.receipt.host == response.host,
+              response.receipt.causalControlCursor == request.causalControlCursor,
+              response.receipt.resultingControlCursor == response.resultingControlCursor,
+              response.receipt.rejection == response.rejection,
+              validControlCursor(response.resultingControlCursor, expectedHost: expectedHost) else {
+            return false
+        }
+        switch response.state {
+        case .accepted, .duplicate:
+            return response.rejection == nil
+                && response.receipt.outcome == .readAcknowledged
+        case .rejected:
+            return response.rejection != nil && response.receipt.outcome == nil
+        }
+    }
+
+    private static func acknowledgementCommandID(
+        work: WorkRef,
+        attachment: ClientAttachmentRef,
+        target: WorkServiceReadTarget,
+        cursor: JournalCursor,
+        causalControlCursor: JournalCursor
+    ) -> String {
+        let targetMaterial: String = switch target {
+        case .work(let targetJournal):
+            "work|\(targetJournal.journalID)|\(targetJournal.authority.authorityID)"
+        case .session(let targetSession, let targetJournal):
+            "session|\(targetSession.sessionID)|\(targetJournal.journalID)|\(targetJournal.authority.authorityID)"
+        }
+        let material = [
+            work.workHostID, work.workID, attachment.attachmentID, targetMaterial,
+            cursor.journal.journalID, String(cursor.sequence), cursor.eventID ?? "",
+            causalControlCursor.journal.journalID, String(causalControlCursor.sequence),
+            causalControlCursor.eventID ?? "",
+        ].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+        let digest = AviarySHA256.hash(data: Data(material.utf8))
+        return "read-ack-v1-" + digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func attachmentByAcknowledging(
+        target: WorkServiceReadTarget,
+        cursor: JournalCursor,
+        attachment: WorkServiceClientAttachment
+    ) -> WorkServiceClientAttachment {
+        var acknowledgements = attachment.readAcknowledgements.filter { $0.target != target }
+        acknowledgements.append(WorkServiceReadAcknowledgement(target: target, cursor: cursor))
+        acknowledgements.sort { lhs, rhs in
+            let left = String(describing: lhs.target)
+            let right = String(describing: rhs.target)
+            if left != right { return left < right }
+            return lhs.cursor.sequence < rhs.cursor.sequence
+        }
+        return WorkServiceClientAttachment(
+            attachment: attachment.attachment, client: attachment.client,
+            session: attachment.session, sessionJournal: attachment.sessionJournal,
+            sessionAttachment: attachment.sessionAttachment,
+            authorization: attachment.authorization,
+            readAcknowledgements: acknowledgements)
+    }
+
+    private static func validateSnapshot(
+        _ snapshot: WorkServiceSnapshot,
+        target: WorkServiceReadTarget,
+        targetJournal: JournalRef,
+        expectedWork: WorkRef,
+        expectedSession: SessionRef,
+        expectedSessionAttachment: SessionAttachmentRef,
+        after: JournalCursor,
+        pageLimit: Int,
+        pageBytes: Int
+    ) throws -> JournalCursor {
+        guard snapshot.target == target else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        let cursor = try validateEvents(
+            snapshot.events, target: target, targetJournal: targetJournal,
+            expectedWork: expectedWork, expectedSession: expectedSession,
+            expectedSessionAttachment: expectedSessionAttachment,
+            after: after, pageLimit: pageLimit, pageBytes: pageBytes)
+        guard let served = snapshot.servedCursor,
+              served.journal == targetJournal,
+              served == cursor else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        return cursor
+    }
+
+    private static func validateEventPage(
+        _ page: WorkServiceEventPage,
+        target: WorkServiceReadTarget,
+        targetJournal: JournalRef,
+        expectedWork: WorkRef,
+        expectedSession: SessionRef,
+        expectedSessionAttachment: SessionAttachmentRef,
+        after: JournalCursor,
+        pageLimit: Int,
+        pageBytes: Int
+    ) throws -> JournalCursor {
+        guard page.target == target else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        let cursor = try validateEvents(
+            page.events, target: target, targetJournal: targetJournal,
+            expectedWork: expectedWork, expectedSession: expectedSession,
+            expectedSessionAttachment: expectedSessionAttachment,
+            after: after, pageLimit: pageLimit, pageBytes: pageBytes)
+        guard let served = page.servedCursor,
+              served.journal == targetJournal, served == cursor else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        if page.events.isEmpty {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        return cursor
+    }
+
+    private static func validateEvents(
+        _ events: [TimelineEvent],
+        target: WorkServiceReadTarget,
+        targetJournal: JournalRef,
+        expectedWork: WorkRef,
+        expectedSession: SessionRef,
+        expectedSessionAttachment: SessionAttachmentRef,
+        after: JournalCursor,
+        pageLimit: Int,
+        pageBytes: Int
+    ) throws -> JournalCursor {
+        guard events.count <= pageLimit,
+              events.count <= WorkServiceBounds.maxEventsPerPage,
+              let encodedByteCount = try? WorkServiceEventPageSizing.encodedByteCount(of: events),
+              encodedByteCount <= pageBytes else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        var sequence = after.sequence
+        var previous = after.eventID
+        var ids = Set<String>()
+        for event in events {
+            guard event.journal == targetJournal,
+                  event.sequence > sequence,
+                  event.sequence == sequence + 1,
+                  event.sequence < Int.max,
+                  validIdentity(event.eventID), ids.insert(event.eventID).inserted,
+                  event.previousEventID == previous else {
+                throw WorkServiceAttachedWorkControllerError.malformedResponse
+            }
+            switch target {
+        case .work:
+                // A Work-journal envelope must identify the Work and its authoritative host. A
+                // missing identity is not a wildcard: accepting it would let a future/foreign
+                // event mutate the seeded reducer without proving ownership.
+                guard event.work == expectedWork,
+                      event.workHost == WorkHostRef(expectedWork.workHostID) else {
+                    throw WorkServiceAttachedWorkControllerError.malformedResponse
+                }
+            case .session:
+                // A Session may record observations of multiple Works. Its Session identity and
+                // journal are authoritative here; the final binding check decides whether the
+                // requested Work/Session attachment is present and valid.
+                guard event.session == expectedSession else {
+                    throw WorkServiceAttachedWorkControllerError.malformedResponse
+                }
+                if event.sessionAttachment == expectedSessionAttachment {
+                    guard event.work == nil || event.work == expectedWork
+                        || event.type == TimelineEventType.sessionCreated else {
+                        throw WorkServiceAttachedWorkControllerError.malformedResponse
+                    }
+                }
+            }
+            previous = event.eventID
+            sequence = event.sequence
+        }
+        return JournalCursor(journal: targetJournal, eventID: previous, sequence: sequence)
+    }
+
+    private static func validateReducedBinding(
+        work: WorkSnapshot,
+        sessionSnapshot: SessionSnapshot,
+        descriptor: WorkServiceWorkDescriptor,
+        attachment: WorkServiceClientAttachment,
+        journal: JournalRef,
+        sessionJournal: JournalRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef
+    ) throws {
+        let workAttachmentIsCanonical = work.sessionAttachments[sessionAttachment.attachmentID].map {
+            $0.session == session
+                && $0.attachment == sessionAttachment
+                && $0.isAttached
+        } ?? false
+        // The protocol's reference service records the Session attachment in the Session
+        // journal and returns the host-issued tuple in the Work descriptor; native Work journals
+        // may additionally carry a mirrored `session.attached` event. Accept either canonical
+        // representation, but never synthesize a Session or accept a descriptor-less tuple.
+        let workAttachmentIsDescribed = descriptor.attachments.contains {
+            $0.attachment == attachment.attachment
+                && $0.client == attachment.client
+                && $0.session == session
+                && $0.sessionJournal == sessionJournal
+                && $0.sessionAttachment == sessionAttachment
+        }
+        guard descriptor.work == work.work,
+              descriptor.journal == journal,
+              journal.owner == .work(descriptor.work),
+              journal.authority.authorityID == descriptor.work.workHostID,
+              work.journal == journal,
+              work.work == descriptor.work,
+              work.workHost == WorkHostRef(descriptor.work.workHostID),
+              work.lifecycle != .unknown,
+              sessionSnapshot.journal == sessionJournal,
+              sessionSnapshot.session == session,
+              sessionSnapshot.lifecycle != .unknown,
+              workAttachmentIsCanonical || workAttachmentIsDescribed,
+              let sessionAttachmentState = sessionSnapshot.attachments[sessionAttachment.attachmentID],
+              sessionAttachmentState.work == descriptor.work,
+              sessionAttachmentState.attachment == sessionAttachment,
+              sessionAttachmentState.isAttached,
+              attachment.session == session,
+              attachment.sessionJournal == sessionJournal,
+              attachment.sessionAttachment == sessionAttachment else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        guard sessionJournal.owner == .session(session) else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+    }
+
+    private static func attachmentProjection(
+        in descriptor: WorkServiceWorkDescriptor,
+        expected: WorkServiceClientAttachment
+    ) throws -> WorkServiceClientAttachment {
+        guard let listed = descriptor.attachments.first(where: {
+            $0.attachment == expected.attachment
+        }) else {
+            // Attachment lists are bounded and may legitimately omit an otherwise valid client
+            // attachment. The exact seed remains authoritative until a host lists a conflicting
+            // tuple for this attachment id.
+            return expected
+        }
+        guard listed.client == expected.client,
+              listed.session == expected.session,
+              listed.sessionJournal == expected.sessionJournal,
+              listed.sessionAttachment == expected.sessionAttachment else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        return normalizedAttachment(listed)
+    }
+
+    private static func descriptorByUpdatingAttachment(
+        _ descriptor: WorkServiceWorkDescriptor,
+        attachment: WorkServiceClientAttachment
+    ) -> WorkServiceWorkDescriptor {
+        WorkServiceWorkDescriptor(
+            work: descriptor.work, journal: descriptor.journal,
+            recordedDisposition: descriptor.recordedDisposition, execution: descriptor.execution,
+            currentRun: descriptor.currentRun, configuration: descriptor.configuration,
+            hostObservation: descriptor.hostObservation,
+            attachments: descriptor.attachments.map {
+                $0.attachment == attachment.attachment
+                    ? normalizedAttachment(attachment) : normalizedAttachment($0)
+            }, artifacts: descriptor.artifacts, omissions: descriptor.omissions)
+    }
+
+    private static func normalizedAttachment(
+        _ attachment: WorkServiceClientAttachment
+    ) -> WorkServiceClientAttachment {
+        WorkServiceClientAttachment(
+            attachment: attachment.attachment, client: attachment.client,
+            session: attachment.session, sessionJournal: attachment.sessionJournal,
+            sessionAttachment: attachment.sessionAttachment,
+            authorization: attachment.authorization,
+            readAcknowledgements: attachment.readAcknowledgements.sorted {
+                let left = ($0.target.journal.stableKey, $0.cursor.sequence,
+                            $0.cursor.eventID ?? "")
+                let right = ($1.target.journal.stableKey, $1.cursor.sequence,
+                             $1.cursor.eventID ?? "")
+                return left < right
+            })
+    }
+
+    private static func descriptorsEquivalent(
+        _ lhs: WorkServiceWorkDescriptor,
+        _ rhs: WorkServiceWorkDescriptor
+    ) -> Bool {
+        func normalized(_ descriptor: WorkServiceWorkDescriptor)
+            -> WorkServiceWorkDescriptor {
+            WorkServiceWorkDescriptor(
+                work: descriptor.work, journal: descriptor.journal,
+                recordedDisposition: descriptor.recordedDisposition,
+                execution: descriptor.execution, currentRun: descriptor.currentRun,
+                configuration: descriptor.configuration,
+                hostObservation: descriptor.hostObservation,
+                attachments: descriptor.attachments.map(normalizedAttachment).sorted {
+                    $0.attachment.attachmentID < $1.attachment.attachmentID
+                }, artifacts: descriptor.artifacts, omissions: descriptor.omissions)
+        }
+        return normalized(lhs) == normalized(rhs)
+    }
+
+    private static func validateRestoredPending(
+        _ record: WorkServiceAttachedWorkIntentStore.Record,
+        descriptor: WorkServiceWorkDescriptor,
+        attachment: WorkServiceClientAttachment,
+        sessionAttachment: SessionAttachmentRef
+    ) throws {
+        let request = record.request
+        guard request.work == descriptor.work,
+              request.journal == descriptor.journal,
+              request.attachment == attachment.attachment,
+              request.command.client == attachment.client,
+              request.command.sessionAttachment == sessionAttachment,
+              request.command.causalCursor == request.causalWorkCursor,
+              validCursor(request.causalWorkCursor, journal: descriptor.journal),
+              validIdentity(request.command.commandID),
+              !request.valueWasTruncated,
+              (request.value?.utf8.count ?? 0) <= WorkServiceBounds.maxCommandValueCharacters else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+    }
+
+    private static func cursor(_ candidate: JournalCursor, reaches required: JournalCursor) -> Bool {
+        guard candidate.journal == required.journal,
+              candidate.sequence >= required.sequence else { return false }
+        return candidate.sequence > required.sequence || candidate.eventID == required.eventID
+    }
+
+    private static func validateSeed(_ seed: WorkServiceAttachedWorkSeed) throws {
+        let descriptor = seed.work
+        let attachment = seed.attachment
+        guard validIdentity(descriptor.work.workHostID), validIdentity(descriptor.work.workID),
+              validIdentity(descriptor.journal.journalID),
+              descriptor.journal.owner == .work(descriptor.work),
+              descriptor.journal.authority.authorityID == descriptor.work.workHostID,
+              validIdentity(descriptor.journal.authority.authorityID),
+              descriptor.journal.kind == .work,
+              validIdentity(attachment.client.clientID),
+              validIdentity(attachment.attachment.attachmentID),
+              let session = attachment.session,
+              let sessionJournal = attachment.sessionJournal,
+              let sessionAttachment = attachment.sessionAttachment,
+              validIdentity(session.sessionID),
+              validIdentity(sessionJournal.journalID),
+              validIdentity(sessionAttachment.attachmentID),
+              sessionJournal.owner == .session(session),
+              sessionJournal.authority.authorityID == descriptor.work.workHostID,
+              validIdentity(sessionJournal.authority.authorityID),
+              sessionJournal.kind == .session else {
+            throw WorkServiceAttachedWorkControllerError.invalidSeed
+        }
+        if let observation = descriptor.hostObservation {
+            guard observation.instance.host == WorkHostRef(descriptor.work.workHostID) else {
+                throw WorkServiceAttachedWorkControllerError.invalidSeed
+            }
+        }
+        switch seed {
+        case .created(let response):
+            let controlJournal = JournalRef.workHost(WorkHostRef(descriptor.work.workHostID))
+            let listedAttachment = descriptor.attachments.first {
+                $0.attachment == attachment.attachment
+            }
+            guard response.work == descriptor,
+                  response.session == session,
+                  response.sessionJournal == sessionJournal,
+                  response.sessionAttachment == sessionAttachment,
+                  response.attachment == attachment,
+                  response.authorization == attachment.authorization,
+                  response.workCursor.journal == descriptor.journal,
+                  response.sessionCursor.journal == sessionJournal,
+                  validCursor(response.workCursor, journal: descriptor.journal),
+                  validCursor(response.sessionCursor, journal: sessionJournal),
+                  response.controlCursor.journal == controlJournal,
+                  validCursor(response.controlCursor, journal: controlJournal),
+                  response.receipt.operation == .createWork,
+                  response.receipt.work == descriptor.work,
+                  validIdentity(response.receipt.commandID),
+                  response.receipt.state == .accepted,
+                  response.receipt.host.host == WorkHostRef(descriptor.work.workHostID),
+                  validIdentity(response.receipt.host.instanceID),
+                  validIdentity(response.receipt.host.startIdentity),
+                  response.receipt.causalControlCursor.journal == controlJournal,
+                  response.receipt.causalControlCursor.sequence
+                      <= response.controlCursor.sequence,
+                  response.receipt.resultingControlCursor == response.controlCursor,
+                  validCursor(response.receipt.causalControlCursor, journal: controlJournal),
+                  response.receipt.authorization == response.authorization,
+                  response.receipt.outcome == .created,
+                  response.receipt.rejection == nil,
+                  listedAttachment?.client == attachment.client,
+                  listedAttachment?.session == attachment.session,
+                  listedAttachment?.sessionJournal == attachment.sessionJournal,
+                  listedAttachment?.sessionAttachment == attachment.sessionAttachment else {
+                throw WorkServiceAttachedWorkControllerError.invalidSeed
+            }
+        case .existing(let existingDescriptor, let existingAttachment):
+            guard existingDescriptor == descriptor,
+                  existingAttachment == attachment else {
+                throw WorkServiceAttachedWorkControllerError.invalidSeed
+            }
+            if let listed = descriptor.attachments.first(where: {
+                $0.attachment == attachment.attachment
+            }) {
+                guard listed.client == attachment.client,
+                      listed.session == attachment.session,
+                      listed.sessionJournal == attachment.sessionJournal,
+                      listed.sessionAttachment == attachment.sessionAttachment else {
+                    throw WorkServiceAttachedWorkControllerError.invalidSeed
+                }
+            }
+        }
+    }
+
+    private static func validDescriptor(
+        _ descriptor: WorkServiceWorkDescriptor,
+        expected: WorkRef,
+        expectedJournal: JournalRef,
+        expectedHostInstance: WorkHostInstanceRef? = nil
+    ) -> Bool {
+        guard descriptor.work == expected,
+              descriptor.journal == expectedJournal,
+              descriptor.journal.owner == .work(expected),
+              descriptor.journal.authority.authorityID == expected.workHostID else {
+            return false
+        }
+        guard let expectedHostInstance else {
+            return descriptor.hostObservation.map {
+                $0.instance.host == WorkHostRef(expected.workHostID)
+            } ?? true
+        }
+        guard let observation = descriptor.hostObservation else { return false }
+        return observation.instance == expectedHostInstance
+    }
+
+    private static func validCursor(_ cursor: JournalCursor, journal: JournalRef) -> Bool {
+        cursor.journal == journal && cursor.sequence >= 0 && cursor.sequence < Int.max
+            && (cursor.sequence == 0 ? cursor.eventID == nil : cursor.eventID.map(validIdentity) != nil)
+    }
+
+    private static func validHandshake(
+        _ handshake: WorkServiceHandshakeResponse,
+        expectedHost: WorkHostRef
+    ) -> Bool {
+        let controlJournal = JournalRef.workHost(expectedHost)
+        return handshake.accepted
+            && validIdentity(expectedHost.workHostID)
+            && handshake.host == expectedHost
+            && handshake.hostInstance.host == expectedHost
+            && validIdentity(handshake.hostInstance.instanceID)
+            && validIdentity(handshake.hostInstance.startIdentity)
+            && (handshake.negotiatedVersion.map {
+                handshake.supportedRange.contains($0)
+            } ?? true)
+            && handshake.controlJournal == controlJournal
+            && validCursor(handshake.controlCursor, journal: controlJournal)
+    }
+
+    private static func serviceExecution(_ execution: WorkExecution)
+        -> WorkServiceExecutionState? {
+        switch execution {
+        case .idle: return .idle
+        case .running: return .running
+        case .canceling: return .canceling
+        case .held: return .held
+        case .unknown, .preparing, .failed: return nil
+        }
+    }
+
+    private static func validIdentity(_ value: String) -> Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && value.utf8.count <= WorkServiceBounds.maxIdentityCharacters
+    }
+
+    private static func hasPagingOmission(_ omissions: [WorkServiceOmission]) -> Bool {
+        omissions.contains { $0.category == "events" || $0.category == "event_bytes" }
+    }
+
+    private static func boundedOmissions(_ omissions: [WorkServiceOmission]) -> [WorkServiceOmission] {
+        guard omissions.count > WorkServiceAttachedWorkControllerBounds.maxOmissions else {
+            return omissions
+        }
+        let retained = WorkServiceAttachedWorkControllerBounds.maxOmissions - 1
+        return Array(omissions.prefix(retained)) + [WorkServiceOmission(
+            category: "controller_omissions", count: omissions.count - retained,
+            diagnostic: "additional read omissions were bounded")]
+    }
+
+    private static func mapReadError(_ error: Error) -> WorkServiceAttachedWorkControllerError {
+        if let error = error as? WorkServiceAttachedWorkControllerError { return error }
+        if case WorkServiceProtocolError.sourceIncomplete = error { return .sourceIncomplete }
+        return .transportFailure
+    }
+
+    private static func valueDigest(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let digest = AviarySHA256.hash(data: Data(value.utf8))
+        return "sha256:" + digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func map(_ state: WorkServiceClientSessionState)
+        -> WorkServiceAttachedWorkConnectivity {
+        switch state {
+        case .disconnected: return .disconnected
+        case .discovering: return .discovering
+        case .connecting(let host): return .connecting(host)
+        case .connected(let instance): return .connected(instance)
+        case .reconnecting(let host): return .reconnecting(host)
+        case .unavailable(let host): return .unavailable(host)
+        case .incompatible(let host): return .incompatible(host)
+        }
+    }
+}
+
+private enum WorkServiceAttachedWorkControllerBounds {
+    static let maxPages = 256
+    static let maxOmissions = 32
+    static let maxDiagnostics = 32
+}

@@ -227,12 +227,14 @@ func test_workHostControlJournalPersistsAcrossReopenAndSurvivesTerminalWork() as
     let attachCommit = try await journal.attachClient(
         work: controlTestWork, workJournal: controlTestWorkJournal,
         attachment: controlTestAttachment, client: controlTestClient,
-        capabilities: ["observe", "control"], command: attachCommand,
+        capabilities: ["observe", "control"], requestedCapabilities: ["observe", "control"],
+        command: attachCommand,
         causalControlCursor: emptyControlCursor)
     let duplicateAttach = try await journal.attachClient(
         work: controlTestWork, workJournal: controlTestWorkJournal,
         attachment: controlTestAttachment, client: controlTestClient,
-        capabilities: ["observe", "control"], command: attachCommand,
+        capabilities: ["observe", "control"], requestedCapabilities: ["observe", "control"],
+        command: attachCommand,
         causalControlCursor: emptyControlCursor)
     XCTAssertEqual(duplicateAttach, attachCommit)
     XCTAssertEqual(await journal.nextSequenceNumber, 2)
@@ -296,13 +298,15 @@ func test_workHostControlJournalRejectsStaleConflictingAndUnprovenMutations() as
     let attachCommit = try await journal.attachClient(
         work: controlTestWork, workJournal: controlTestWorkJournal,
         attachment: controlTestAttachment, client: controlTestClient,
-        capabilities: ["observe"], command: command, causalControlCursor: empty)
+        capabilities: ["observe"], requestedCapabilities: ["observe"],
+        command: command, causalControlCursor: empty)
 
     do {
         _ = try await journal.attachClient(
             work: controlTestWork, workJournal: controlTestWorkJournal,
             attachment: controlTestAttachment, client: controlTestClient,
-            capabilities: ["control"], command: command, causalControlCursor: empty)
+            capabilities: ["control"], requestedCapabilities: ["control"],
+            command: command, causalControlCursor: empty)
         XCTFail("changed request reused a client-qualified command identity")
     } catch {}
 
@@ -311,7 +315,7 @@ func test_workHostControlJournalRejectsStaleConflictingAndUnprovenMutations() as
         _ = try await journal.attachClient(
             work: controlTestWork, workJournal: controlTestWorkJournal,
             attachment: otherAttachment, client: controlTestClient,
-            capabilities: ["observe"],
+            capabilities: ["observe"], requestedCapabilities: ["observe"],
             command: CommandRef(
                 commandID: "stale-attach", client: controlTestClient, causalCursor: empty),
             causalControlCursor: empty)
@@ -351,7 +355,7 @@ func test_workHostControlJournalRejectsStaleConflictingAndUnprovenMutations() as
         _ = try await journal.attachClient(
             work: controlTestWork, workJournal: controlTestWorkJournal,
             attachment: ClientAttachmentRef("bounded-attachment"), client: controlTestClient,
-            capabilities: ["observe"],
+            capabilities: ["observe"], requestedCapabilities: ["observe"],
             command: CommandRef(
                 commandID: oneGraphemeOversizedID, client: controlTestClient,
                 causalCursor: attachCommit.cursor),
@@ -377,6 +381,7 @@ func test_workHostControlJournalSerializesConcurrentCausalMutations() async thro
                 work: controlTestWork, workJournal: controlTestWorkJournal,
                 attachment: ClientAttachmentRef("concurrent-attachment-1"),
                 client: controlTestClient, capabilities: ["observe"],
+                requestedCapabilities: ["observe"],
                 command: CommandRef(
                     commandID: "concurrent-attach-1", client: controlTestClient,
                     causalCursor: empty),
@@ -390,6 +395,7 @@ func test_workHostControlJournalSerializesConcurrentCausalMutations() async thro
                 work: controlTestWork, workJournal: controlTestWorkJournal,
                 attachment: ClientAttachmentRef("concurrent-attachment-2"),
                 client: controlTestClient, capabilities: ["observe"],
+                requestedCapabilities: ["observe"],
                 command: CommandRef(
                     commandID: "concurrent-attach-2", client: controlTestClient,
                     causalCursor: empty),
@@ -429,7 +435,8 @@ func test_workHostControlJournalDoesNotPromoteUnsynchronizedRetry() async throws
         _ = try await journal.attachClient(
             work: controlTestWork, workJournal: controlTestWorkJournal,
             attachment: controlTestAttachment, client: controlTestClient,
-            capabilities: ["observe"], command: command, causalControlCursor: empty)
+            capabilities: ["observe"], requestedCapabilities: ["observe"],
+            command: command, causalControlCursor: empty)
         XCTFail("injected pre-sync failure was accepted")
     } catch {}
     if case .failed = await journal.health {} else {
@@ -447,7 +454,8 @@ func test_workHostControlJournalDoesNotPromoteUnsynchronizedRetry() async throws
         _ = try await journal.attachClient(
             work: controlTestWork, workJournal: controlTestWorkJournal,
             attachment: controlTestAttachment, client: controlTestClient,
-            capabilities: ["observe"], command: command, causalControlCursor: empty)
+            capabilities: ["observe"], requestedCapabilities: ["observe"],
+            command: command, causalControlCursor: empty)
         XCTFail("exact retry promoted an unsynchronized readable line")
     } catch {}
     XCTAssertEqual(await journal.nextSequenceNumber, 1)
@@ -460,7 +468,8 @@ func test_workHostControlJournalDoesNotPromoteUnsynchronizedRetry() async throws
     let committedRetry = try await recovered.attachClient(
         work: controlTestWork, workJournal: controlTestWorkJournal,
         attachment: controlTestAttachment, client: controlTestClient,
-        capabilities: ["observe"], command: command, causalControlCursor: empty)
+        capabilities: ["observe"], requestedCapabilities: ["observe"],
+        command: command, causalControlCursor: empty)
     XCTAssertEqual(committedRetry.cursor.sequence, 1)
     XCTAssertEqual(committedRetry.eventRef.eventID, "recovered-control-event")
     XCTAssertEqual(try await recovered.read().records.count, 1)
@@ -489,6 +498,142 @@ func test_workHostControlJournalRecoversEmptySealCrashWindow() async throws {
     try await recovered.closeChecked()
 }
 
+func test_workHostControlJournalCacheTracksLocalAppends() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "aviary-control-cache-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let home = AgentHome(root: root)
+    let first = try WorkHostControlJournal.createFresh(
+        home: home, workHost: controlTestHost, actor: controlTestActor)
+    let empty = JournalCursor(journal: first.journal, eventID: nil, sequence: 0)
+
+    XCTAssertTrue(try await first.snapshot().clientAttachments.isEmpty,
+                  "the empty projection is deliberately cached before the first mutation")
+    _ = try await first.attachClient(
+        work: controlTestWork, workJournal: controlTestWorkJournal,
+        attachment: controlTestAttachment, client: controlTestClient,
+        capabilities: ["observe"], requestedCapabilities: ["observe"],
+        command: CommandRef(
+            commandID: "cache-first", client: controlTestClient, causalCursor: empty),
+        causalControlCursor: empty)
+    XCTAssertEqual(try await first.snapshot().clientAttachments.count, 1,
+                   "a local append must invalidate the pre-append reducer cache")
+    try await first.closeChecked()
+}
+
+func test_workHostControlJournalExtendsCacheByAppendBytes() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "aviary-control-incremental-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let journal = try WorkHostControlJournal.createFresh(
+        home: AgentHome(root: root), workHost: controlTestHost, actor: controlTestActor)
+    let empty = JournalCursor(journal: journal.journal, eventID: nil, sequence: 0)
+    let attached = try await journal.attachClient(
+        work: controlTestWork, workJournal: controlTestWorkJournal,
+        attachment: controlTestAttachment, client: controlTestClient,
+        capabilities: ["observe"], requestedCapabilities: ["observe"],
+        command: CommandRef(
+            commandID: "incremental-attach", client: controlTestClient,
+            causalCursor: empty), causalControlCursor: empty)
+    let afterAttach = await journal.journalReadMetrics()
+    XCTAssertEqual(afterAttach.fullReads, 1)
+    XCTAssertEqual(afterAttach.incrementalReads, 1)
+
+    _ = try await journal.updateClientCapabilities(
+        work: controlTestWork, workJournal: controlTestWorkJournal,
+        attachment: controlTestAttachment, client: controlTestClient,
+        capabilities: ["observe", "control"], requestedCapabilities: ["observe", "control"],
+        command: CommandRef(
+            commandID: "incremental-capability", client: controlTestClient,
+            causalCursor: attached.cursor), causalControlCursor: attached.cursor)
+    let afterSecond = await journal.journalReadMetrics()
+    XCTAssertEqual(afterSecond.fullReads, afterAttach.fullReads,
+                   "a normal mutation must not reparse the control history")
+    XCTAssertEqual(afterSecond.incrementalReads, afterAttach.incrementalReads + 1)
+    XCTAssertTrue(afterSecond.bytesScanned > 0)
+    XCTAssertEqual(afterSecond.recordsApplied, 2)
+    try await journal.closeChecked()
+}
+
+func test_workHostControlJournalTargetScanKeepsBoundedStateForLargeJournal() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "aviary-control-target-scale-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let home = AgentHome(root: root)
+    let journal = try WorkHostControlJournal.createFresh(
+        home: home, workHost: controlTestHost, actor: controlTestActor)
+    let empty = JournalCursor(journal: journal.journal, eventID: nil, sequence: 0)
+    let attached = try await journal.attachClient(
+        work: controlTestWork, workJournal: controlTestWorkJournal,
+        attachment: controlTestAttachment, client: controlTestClient,
+        capabilities: ["observe"], requestedCapabilities: ["observe"],
+        command: CommandRef(
+            commandID: "target-scale-attach", client: controlTestClient,
+            causalCursor: empty), causalControlCursor: empty)
+
+    let targetURL = home.timelineV2WorkJournalURL(controlTestWork)
+    try FileManager.default.createDirectory(
+        at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let eventCount = 100_001
+    var targetData = Data()
+    targetData.reserveCapacity(eventCount * 480)
+    var previous: String?
+    for sequence in 1...eventCount {
+        let eventID = "target-scale-\(sequence)"
+        let event = TimelineEvent(
+            eventID: eventID, journal: controlTestWorkJournal, sequence: sequence,
+            previousEventID: previous, work: controlTestWork, workHost: controlTestHost,
+            actor: controlTestActor, hostRecordedAt: Date(timeIntervalSince1970: 1),
+            type: TimelineEventType.workCreated, declaredDomains: [.work])
+        targetData.append(try JSONEncoder().encode(event))
+        targetData.append(0x0A)
+        previous = eventID
+    }
+    try targetData.write(to: targetURL, options: .atomic)
+    let targetJournal = controlTestWorkJournal
+    func targetCursor(_ sequence: Int) -> JournalCursor {
+        JournalCursor(
+            journal: targetJournal, eventID: "target-scale-\(sequence)", sequence: sequence)
+    }
+
+    let early = try await journal.acknowledgeRead(
+        work: controlTestWork, workJournal: controlTestWorkJournal,
+        attachment: controlTestAttachment, client: controlTestClient,
+        targetJournal: targetJournal, cursor: targetCursor(1),
+        command: CommandRef(
+            commandID: "target-scale-early", client: controlTestClient,
+            causalCursor: attached.cursor), causalControlCursor: attached.cursor)
+    let afterEarly = await journal.journalReadMetrics()
+    XCTAssertTrue(afterEarly.targetVerificationBytesScanned < targetData.count)
+    XCTAssertTrue(afterEarly.targetVerificationPeakChunkBytes <= 256 * 1024)
+    XCTAssertEqual(afterEarly.targetVerificationChunks, 1)
+
+    let middle = try await journal.acknowledgeRead(
+        work: controlTestWork, workJournal: controlTestWorkJournal,
+        attachment: controlTestAttachment, client: controlTestClient,
+        targetJournal: targetJournal, cursor: targetCursor(50_000),
+        command: CommandRef(
+            commandID: "target-scale-middle", client: controlTestClient,
+            causalCursor: early.cursor), causalControlCursor: early.cursor)
+    let afterMiddle = await journal.journalReadMetrics()
+    XCTAssertTrue(afterMiddle.targetVerificationChunks > afterEarly.targetVerificationChunks)
+    let tip = try await journal.acknowledgeRead(
+        work: controlTestWork, workJournal: controlTestWorkJournal,
+        attachment: controlTestAttachment, client: controlTestClient,
+        targetJournal: targetJournal, cursor: targetCursor(eventCount),
+        command: CommandRef(
+            commandID: "target-scale-tip", client: controlTestClient,
+            causalCursor: middle.cursor), causalControlCursor: middle.cursor)
+    XCTAssertEqual(tip.cursor.sequence, 4)
+    let metrics = await journal.journalReadMetrics()
+    XCTAssertTrue(metrics.targetVerificationChunks > afterMiddle.targetVerificationChunks)
+    XCTAssertTrue(metrics.targetVerificationPeakChunkBytes <= 256 * 1024)
+    try await journal.closeChecked()
+}
+
 let casesWorkHostControlJournal: [Case] = [
     ("phase3 Work Host control: owner authority and coding are explicit", {
         try test_workHostControlJournalIdentityIsHostBoundAndCodable()
@@ -513,5 +658,14 @@ let casesWorkHostControlJournal: [Case] = [
     }),
     ("phase3 Work Host control: empty seal crash window recovers", {
         try await test_workHostControlJournalRecoversEmptySealCrashWindow()
+    }),
+    ("phase3 Work Host control: cache follows local appends", {
+        try await test_workHostControlJournalCacheTracksLocalAppends()
+    }),
+    ("phase3 Work Host control: appends extend the actor cache", {
+        try await test_workHostControlJournalExtendsCacheByAppendBytes()
+    }),
+    ("phase3 Work Host control: large target scans retain bounded state", {
+        try await test_workHostControlJournalTargetScanKeepsBoundedStateForLargeJournal()
     }),
 ]

@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 /// OpenAI Codex (ChatGPT) OAuth, and the credential store it shares with the harness.
@@ -243,7 +242,7 @@ public enum CodexAuth {
         var bytes = [UInt8](repeating: 0, count: 32)
         _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
         let verifier = base64URLEncode(Data(bytes))
-        let digest = SHA256.hash(data: Data(verifier.utf8))
+        let digest = AviarySHA256.hash(data: Data(verifier.utf8))
         return (verifier, base64URLEncode(Data(digest)))
     }
 

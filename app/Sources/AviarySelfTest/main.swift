@@ -1,5 +1,4 @@
 import CoreGraphics
-import CryptoKit
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -712,7 +711,12 @@ func makeHost(_ variant: HostVariant) throws -> RuntimeHost? {
         print("      skipped: \(script.lastPathComponent) missing for \(variant.rawValue)")
         return nil
     }
-    return RuntimeHost(executable: "/usr/bin/env", arguments: ["python3", script.path])
+    // SelfTest is an ephemeral owner: opt into the parent-lifetime PID lease so a killed or sleeping
+    // test process cannot leave today's runtime host adoptable with no durable Work owner. Real
+    // app/daemon launches use the default false and deliberately survive client disconnects.
+    return RuntimeHost(
+        executable: "/usr/bin/env", arguments: ["python3", script.path],
+        parentLifetimeLease: true)
 }
 
 /// Collects streamed output events from a host. Locked because the events arrive on the
@@ -2863,7 +2867,7 @@ let cases4: [Case] = [
         }
         // Recomputing over the verifier *string* must reproduce the challenge.
         let expected = CodexAuth.base64URLEncode(
-            Data(SHA256.hash(data: Data(verifier.utf8))))
+            Data(AviarySHA256.hash(data: Data(verifier.utf8))))
         XCTAssertEqual(challenge, expected)
         let (other, _) = CodexAuth.generatePKCE()
         XCTAssertNotEqual(verifier, other, "fresh randomness each time")
@@ -5994,6 +5998,108 @@ let casesRepoRoot: [Case] = [
         XCTAssertNotEqual(found?.path, fake.path,
                           "a vendored harness alone must no longer identify a checkout")
     }),
+
+    ("repoRoot: a bundled helper finds shipped runtime hosts without claiming a checkout", {
+        let fake = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-bundle-root-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: fake) }
+        let app = fake.appending(path: "Aviary.app", directoryHint: .isDirectory)
+        let helpers = app.appending(path: "Contents/Helpers", directoryHint: .isDirectory)
+        let resources = app.appending(path: "Contents/Resources", directoryHint: .isDirectory)
+        let runtime = resources.appending(
+            path: "runtime-hosts/python3", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: helpers, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+        try "# shipped runtime\n".write(
+            to: runtime.appending(path: "host.py"), atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(EngineLocator.runtimeRoot(startingAt: helpers)?.path, resources.path)
+        XCTAssertNotEqual(EngineLocator.repoRoot(startingAt: app)?.path, resources.path,
+                          "runtime resources are not a source checkout")
+    }),
+
+    ("runtimeRoot: executable origin is fenced to its own payload or checkout", {
+        let fake = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-runtime-origin-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: fake) }
+        let app = fake.appending(path: "Aviary.app", directoryHint: .isDirectory)
+        let helper = app.appending(path: "Contents/Helpers/aviaryd", directoryHint: .notDirectory)
+        let resources = app.appending(path: "Contents/Resources", directoryHint: .isDirectory)
+        let runtime = resources.appending(path: "runtime-hosts/python3", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: helper.deletingLastPathComponent(), withIntermediateDirectories: true)
+        guard FileManager.default.createFile(
+            atPath: helper.path, contents: Data("helper".utf8),
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o755))]) else {
+            throw NSError(domain: "AviarySelfTest", code: 1)
+        }
+        guard FileManager.default.createFile(
+            atPath: runtime.appending(path: "host.py").path,
+            contents: Data("# bundled\n".utf8),
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o644))]) else {
+            throw NSError(domain: "AviarySelfTest", code: 2)
+        }
+        XCTAssertEqual(EngineLocator.runtimeRoot(forExecutable: helper)?.path, resources.path)
+
+        // A damaged/missing bundled payload must fail closed rather than searching a checkout.
+        try FileManager.default.removeItem(at: runtime.appending(path: "host.py"))
+        XCTAssertNil(EngineLocator.runtimeRoot(forExecutable: helper))
+
+        // A symlinked runtime directory is not an app-owned payload even if its target has a
+        // valid host.py.
+        try FileManager.default.removeItem(at: runtime)
+        let external = fake.appending(path: "external-runtime/python3", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        guard FileManager.default.createFile(
+            atPath: external.appending(path: "host.py").path,
+            contents: Data("# external\n".utf8),
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o644))]) else {
+            throw NSError(domain: "AviarySelfTest", code: 3)
+        }
+        try FileManager.default.createSymbolicLink(
+            at: runtime, withDestinationURL: external)
+        XCTAssertNil(EngineLocator.runtimeRoot(forExecutable: helper))
+
+        // SwiftPM products may resolve only an enclosing checkout with its own package/runtime
+        // markers; an unrelated `.build` directory remains unresolvable.
+        let checkout = fake.appending(path: "checkout", directoryHint: .isDirectory)
+        let checkoutRuntime = checkout.appending(path: "runtime-hosts/python3", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: checkoutRuntime, withIntermediateDirectories: true)
+        guard FileManager.default.createFile(
+            atPath: checkoutRuntime.appending(path: "host.py").path,
+            contents: Data("# source\n".utf8),
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o644))]) else {
+            throw NSError(domain: "AviarySelfTest", code: 4)
+        }
+        try FileManager.default.createDirectory(
+            at: checkout.appending(path: "app", directoryHint: .isDirectory),
+            withIntermediateDirectories: true)
+        guard FileManager.default.createFile(
+            atPath: checkout.appending(path: "app/Package.swift").path,
+            contents: Data("// package\n".utf8),
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o644))]) else {
+            throw NSError(domain: "AviarySelfTest", code: 5)
+        }
+        let product = checkout.appending(path: ".build/debug/aviaryd", directoryHint: .notDirectory)
+        try FileManager.default.createDirectory(
+            at: product.deletingLastPathComponent(), withIntermediateDirectories: true)
+        guard FileManager.default.createFile(
+            atPath: product.path, contents: Data("product".utf8),
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o755))]) else {
+            throw NSError(domain: "AviarySelfTest", code: 6)
+        }
+        XCTAssertEqual(EngineLocator.runtimeRoot(forExecutable: product)?.path, checkout.path)
+        let orphan = fake.appending(path: "orphan/.build/debug/aviaryd", directoryHint: .notDirectory)
+        try FileManager.default.createDirectory(
+            at: orphan.deletingLastPathComponent(), withIntermediateDirectories: true)
+        guard FileManager.default.createFile(
+            atPath: orphan.path, contents: Data("orphan".utf8),
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o755))]) else {
+            throw NSError(domain: "AviarySelfTest", code: 7)
+        }
+        XCTAssertNil(EngineLocator.runtimeRoot(forExecutable: orphan))
+    }),
 ]
 
 let casesBuildStamp: [Case] = [
@@ -6285,6 +6391,15 @@ let casesPhase1Timeline: [Case] = [
     ("phase1: live and cold timeline prefixes reduce identically", {
         try test_timelineReducersLiveAndColdPrefixEquivalence()
     }),
+    ("phase1: Session messages append without rebuilding unselected history", {
+        try test_sessionReducerAppendsUnselectedMessagesAndRebuildsOnlyAtTipSelection()
+    }),
+    ("phase1: Session message projection cost is linear", {
+        try test_sessionReducerMessageAppendScaleUsesNoHistoryRescan()
+    }),
+    ("phase1: producer message and tip projection stays linear", {
+        try test_sessionReducerProducerMessageTipSequenceStaysLinear()
+    }),
     ("phase1: attachment and Run identities cannot be reused", {
         try test_timelineReducersRejectAttachmentAndRunIdentityReuse()
     }),
@@ -6308,6 +6423,9 @@ let casesPhase1Timeline: [Case] = [
     }),
     ("phase1: action, context, terminality, and semantic tips are validated", {
         try test_timelineValidatesActionLifecycleContextAndSemanticTip()
+    }),
+    ("phase1: canonical message and action metadata survive incremental reduction", {
+        try test_timelineProjectsCanonicalMessageAndActionMetadataAcrossIncrementalPages()
     }),
     ("phase1: concurrent command receipts preserve host order and retry identity", {
         try test_timelineProjectsCommandReceiptsAndRejectsHostReordering()
@@ -6609,6 +6727,9 @@ let casesPromptProvenance: [Case] = [
     ("phase1 prompt provenance: source status and Unicode truncation are explicit", {
         try test_systemPromptAssemblyReportsContextStatesAndCharacterTruncation()
     }),
+    ("phase1 prompt provenance: context files are bounded and no-follow", {
+        try test_systemPromptAssemblyRejectsSymlinkedAndOversizedContextFiles()
+    }),
     ("phase1 prompt provenance: source identity is stable and distinct from content", {
         try test_systemPromptAssemblyUsesDistinctStableIdentityAndContentDigests()
     }),
@@ -6657,8 +6778,8 @@ let casesPromptProvenance: [Case] = [
     ("phase1 prompt provenance: cold resume requires exact source observation", {
         try await test_promptProvenanceColdResumeRefusesForgedMissingAndMismatchedObservation()
     }),
-    ("phase1 prompt provenance: legacy cold resume remains opaque", {
-        try await test_promptProvenanceColdResumeLeavesLegacyAssemblyNil()
+    ("phase1 prompt provenance: source-less cold resume refuses", {
+        try await test_promptProvenanceColdResumeRefusesLegacySourceLessManifest()
     }),
 ]
 
@@ -6683,6 +6804,15 @@ let casesNativeColdResume: [Case] = [
     }),
     ("phase1 native resume: pre-Start seed wins over legacy and sends prompt once", {
         try await test_nativeLaunchCapturesPreStartSeedAndRunnerNeverFallsBackToLegacy()
+    }),
+    ("phase1 native resume: same-text source mismatch refuses before effects", {
+        try await test_nativeColdResumeRefusesSameTextDifferentSourceAssembly()
+    }),
+    ("phase1 native resume: different prompt bytes refuse before effects", {
+        try await test_nativeColdResumeRefusesDifferentPromptBytes()
+    }),
+    ("phase1 native resume: source-less assembly refuses before effects", {
+        try await test_nativeColdResumeRefusesSourceLessEmptyAssembly()
     }),
     ("phase1 native resume: corrupt seed refuses before commands or runtime effects", {
         try await test_nativeLaunchRefusesUnavailableSeedBeforeCommandOrRuntimeEffect()
@@ -6780,7 +6910,7 @@ let casesWorkService: [Case] = [
     ("phase3 Work service: handshake is versioned and host identity is opaque", {
         try await test_workServiceHandshakeIsVersionedAndHostIdentityIsOpaque()
     }),
-    ("phase3 Work service: many-to-many attachments and ordered commands", {
+    ("phase3 Work service: many-to-many attachments and reattach epochs", {
         try await test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities()
     }),
     ("phase3 Work service: run finish, End, and completion stay distinct", {
@@ -6809,6 +6939,9 @@ let casesWorkService: [Case] = [
     }),
     ("phase3 Work service: creation carries bounded host policy", {
         try await test_workServiceCreateCarriesBoundedHostPolicyAndFreshIdentity()
+    }),
+    ("phase3 Work service: Create requires an advertised available workspace ID", {
+        try await test_workServiceCreateRequiresAnAdvertisedAvailableWorkspaceID()
     }),
     ("phase3 Work service: create idempotency identity is typed", {
         try await test_workServiceCreateIdempotencyKeyIsTypedAndInjective()
@@ -6909,6 +7042,9 @@ let casesRunJournalBundle: [Case] = [
     ("phase1 bundle: every action kind receives a post-start permit", {
         try await test_runJournalBundleAllActionKindsPermitOnlyAfterDurableStart()
     }),
+    ("phase1 bundle: action lifecycle carries the active Turn", {
+        try await test_runJournalBundleActionLifecycleCarriesActiveTurn()
+    }),
     ("phase1 bundle: reopen retains single-use action identities", {
         try await test_runJournalBundleReopenRetainsSingleUseActionIdentities()
     }),
@@ -6969,7 +7105,7 @@ let casesRunJournalBundle: [Case] = [
 ]
 
 await Harness.run(
-    cases0 + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
+    cases0 + casesShell + cases1 + cases2 + cases3 + cases4 + cases5 + cases6 + casesBuiltins
         + casesLibraryUsage + casesArtifact + casesAttachImage + casesMCPVersions
         + casesModelSwitch + casesMirrorChurn + casesBuildStamp
         + casesRepoRoot + casesAgentHome
@@ -6981,9 +7117,20 @@ await Harness.run(
         + casesLocalTimelineCatalog + casesCanonicalWorkRecoveryProjection
         + casesWorkService + casesWorkHostControlJournal + casesWorkHostControlCreation
         + casesWorkHostRegistry
-        + casesHostedInHouseWork + casesWorkServiceTransport
+        + casesHostedInHouseWork + casesInHouseWorkFactory
+        + casesInHouseModelResolver + casesLocalWorkHostLaunchResolver
+        + casesWorkServiceTransport + casesJournalBackedWorkService
+        + casesWorkLaunchManifest + casesWorkHostDaemonEndpoint + casesWorkHostDaemonProcess
+        + casesWorkServiceHostLocator + casesWorkServiceClientSession
+        + casesWorkServiceCatalog
+        + casesLocalWorkServiceBootstrap
+        + casesLocalAviaryDaemonLauncher
+        + casesServiceBackedIntentStores
+        + casesWorkServiceAttachedWorkController
+        + casesWorkHostWorkspaceRegistry
         + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal
         + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel
         + casesNativeIndeterminateEffects + casesChildLifecycle
-        + casesCommandDeliveryOutcome + casesRuntimeHostAdoption)
+        + casesCommandDeliveryOutcome + casesRuntimeHostParentLifetime
+        + casesRuntimeHostAdoption)

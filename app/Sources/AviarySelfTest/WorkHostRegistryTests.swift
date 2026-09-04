@@ -265,7 +265,8 @@ func test_workHostRegistryOwnsFullWorkRefsAndStableInstanceIdentity() async thro
     let metadata = WorkHostLaunchMetadata(
         providerID: "registry-provider",
         modelID: "registry-model",
-        workingDirectoryPolicy: .project,
+        workspaceID: try WorkHostWorkspaceID(
+            "workspace-00000000-0000-0000-0000-000000000001"),
         runtimeHostKind: "reference",
         actorKind: "registry-test-work")
     _ = try await registry.register(first, launchMetadata: metadata)
@@ -280,7 +281,7 @@ func test_workHostRegistryOwnsFullWorkRefsAndStableInstanceIdentity() async thro
         XCTFail("expected a live registration")
         return
     }
-    XCTAssertEqual(firstEntry.launchMetadata.workingDirectoryPolicy, .project)
+    XCTAssertEqual(firstEntry.launchMetadata.workspaceID, metadata.workspaceID)
     XCTAssertNil(firstEntry.launchMetadata.providerID.flatMap { $0.contains("/private") ? $0 : nil })
     XCTAssertFalse(
         String(describing: firstEntry.launchMetadata)
@@ -513,7 +514,7 @@ func test_workHostRegistryRequiresCanonicalProofAndSerializesReleaseRace() async
         actorKind: "registry-test-replacement",
         systemPrompt: "Registry replacement agent.",
         maxIterations: 1,
-        resume: true)
+        projectionMode: .reopenHistorical)
     let replacementEntry = try await registry.replace(
         work.identity.work, configuration: replacementConfiguration)
     let activeWork = replacementEntry.hostedWork
@@ -616,7 +617,8 @@ func test_workHostRegistryBoundsMetadataIdentityCapacityAndPaging() async throws
     let metadata = WorkHostLaunchMetadata(
         providerID: "ééé",
         modelID: "model-long",
-        workingDirectoryPolicy: .workspace,
+        workspaceID: try WorkHostWorkspaceID(
+            "workspace-00000000-0000-0000-0000-000000000002"),
         runtimeHostKind: "reference",
         actorKind: "registry")
     let first = WorkRef(workHostID: host.workHostID, workID: "first")

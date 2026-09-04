@@ -103,7 +103,7 @@ func test_canonicalSessionCatalogPreservesAttachedWorkIdentityAndTruth() throws 
     work.modelID = "work-model"
     work.childStates["child-work"] = "running"
     work.actions["action-1"] = WorkActionSnapshot(
-        action: ActionRef("action-1"), state: .running)
+        action: ActionRef("action-1"), state: .running, kind: .runtime)
 
     var unrelated = WorkSnapshot()
     unrelated.journal = JournalRef.work(

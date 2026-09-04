@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 /// A bounded, read-only index of the native Timeline v2 journals in one AgentHome.
 ///
@@ -46,7 +45,7 @@ public enum LocalTimelineCatalog {
         public init(kind: String, message: String) {
             self.kind = kind
             self.message = String(message.prefix(Self.maxMessageCharacters))
-            let digest = SHA256.hash(data: Data("\(kind)\0\(self.message)".utf8))
+            let digest = AviarySHA256.hash(data: Data("\(kind)\0\(self.message)".utf8))
             self.id = "diagnostic-" + digest.map { String(format: "%02x", $0) }.joined()
         }
     }
@@ -1088,7 +1087,7 @@ public enum LocalTimelineCatalog {
     }
 
     private static func digest(_ value: String) -> String {
-        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+        AviarySHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func unique(_ values: [String]) -> [String] {

@@ -64,7 +64,8 @@ func test_nativeCommandBridgeRecordsAcceptanceAndExactDeliveryOnce() async throw
     let controller = SessionCommandController(identity: identity, journal: bridge)
 
     let start = await controller.admitAndCommit(
-        .start(prompt: "hello"), actorID: "gui", commandID: "bridge-start")
+        .start(prompt: "hello"), actorID: "gui", commandID: "bridge-start",
+        causalCursor: await bundle.latestWorkCursor)
     guard case .accepted(let admitted) = start else {
         XCTFail("the native command bridge should accept Start")
         return
@@ -79,7 +80,8 @@ func test_nativeCommandBridgeRecordsAcceptanceAndExactDeliveryOnce() async throw
     XCTAssertTrue(await controller.acknowledgeTurnFinished(commandID: admitted.commandID))
 
     let ending = await controller.admitAndCommit(
-        .endRun, actorID: "gui", commandID: "bridge-end")
+        .endRun, actorID: "gui", commandID: "bridge-end",
+        causalCursor: await bundle.latestWorkCursor)
     guard case .accepted(let end) = ending else {
         XCTFail("the native command bridge should accept End")
         return
@@ -123,7 +125,8 @@ func test_nativeCommandBridgeLeavesAcceptedUndeliveredEvidenceWhenLegacyProjecti
     await writer.injectFailure(.beforeWrite)
 
     let start = await controller.admitAndCommitReceipt(
-        .start(prompt: "must not dispatch"), actorID: "gui", commandID: "failed-start")
+        .start(prompt: "must not dispatch"), actorID: "gui", commandID: "failed-start",
+        causalCursor: await bundle.latestWorkCursor)
     guard case .accepted = start.admission else {
         XCTFail("native acceptance must not be rewritten as rejection when projection fails")
         return
@@ -180,7 +183,8 @@ func test_nativeCommandBridgeInspectsWorkAfterCanonicalSessionFailure() async th
     await bundle.injectWriterFailure(.beforeWrite, in: .session)
     let result = await controller.admitAndCommitReceipt(
         .start(prompt: "canonical session failure"), actorID: "gui",
-        commandID: "canonical-session-failure")
+        commandID: "canonical-session-failure",
+        causalCursor: await bundle.latestWorkCursor)
     guard case .accepted = result.admission else {
         XCTFail("a durable Work acceptance must not be relabeled as rejection")
         return
@@ -221,6 +225,17 @@ func test_nativeCommandBridgePreservesCallerCursorAndRefusesStaleCommand() async
         identity: identity, nativeJournal: bundle, legacyProjection: writer)
     let controller = SessionCommandController(identity: identity, journal: bridge)
     let initialCursor = await bundle.latestWorkCursor
+
+    let missing = await controller.admitAndCommitReceipt(
+        .start(prompt: "missing-cursor"), actorID: "gui",
+        commandID: "cursor-missing")
+    guard case .rejected(_, let missingReason) = missing.admission,
+          case .causalConflict(let missingExpected, let missingReceived) = missingReason else {
+        XCTFail("a native command without an observed Work cursor must be refused")
+        return
+    }
+    XCTAssertEqual(missingExpected, initialCursor)
+    XCTAssertNil(missingReceived)
 
     let start = await controller.admitAndCommitReceipt(
         .start(prompt: "cursor-preserved"), actorID: "gui",
@@ -386,7 +401,9 @@ func test_nativeExecutionAgentProviderPythonAndConversationReduceFromDisk() asyn
 
     _ = try await bundle.commitInput(
         text: "what is six times seven?", deliveryMode: .delivered,
-        command: CommandRef(commandID: "native-e2e-start", client: ClientRef("integration-client")))
+        command: CommandRef(
+            commandID: "native-e2e-start", client: ClientRef("integration-client"),
+            causalCursor: await bundle.latestWorkCursor))
     _ = try await host.start()
     let hostSession = try await host.createSession(id: identity.workID, cwd: "/tmp")
     let agent = Agent(

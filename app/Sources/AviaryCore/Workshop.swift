@@ -333,7 +333,7 @@ public enum WorkshopLog {
         data.append(UInt8(ascii: "\n"))
 
         if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
+            _ = FileManager.default.createFile(atPath: url.path, contents: nil)
         }
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }

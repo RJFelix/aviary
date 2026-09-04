@@ -678,6 +678,7 @@ public extension CanonicalSessionCatalogSummary {
     }
 }
 
+#if !os(Linux)
 public extension SessionCatalog {
     /// Canonical snapshot adapter. The existing `scan()` and `summarize(fileURL:)` remain the
     /// legacy JSONL compatibility path until each catalog consumer is migrated explicitly.
@@ -693,3 +694,4 @@ public extension SessionCatalog {
             sessionRead: sessionRead, workReads: workReads)
     }
 }
+#endif

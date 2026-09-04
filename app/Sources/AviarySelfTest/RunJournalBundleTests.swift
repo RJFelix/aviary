@@ -72,6 +72,20 @@ private func terminalCommand(
         sessionAttachment: bundle.sessionAttachment, causalCursor: cursor)
 }
 
+private func exactCommand(
+    _ bundle: RunJournalBundle,
+    id: String,
+    client: ClientRef = ClientRef("bundle-test-client"),
+    sessionAttachment: SessionAttachmentRef? = nil
+) async throws -> CommandRef {
+    guard let cursor = await bundle.latestWorkCursor else {
+        throw RunJournalBundleError.invalidOperation("test bundle has no Work cursor")
+    }
+    return CommandRef(
+        commandID: id, client: client, sessionAttachment: sessionAttachment,
+        causalCursor: cursor)
+}
+
 private let terminalDetailRoundTripMatrix: [String?] = [
     nil,
     "",
@@ -204,7 +218,7 @@ func test_runJournalBundleFinishedTurnPublishesExactReadyForReviewWhileRunRemain
 
     _ = try await bundle.commitInput(
         text: "do the work", deliveryMode: .delivered,
-        command: CommandRef(commandID: "notification-command"))
+        command: try await exactCommand(bundle, id: "notification-command"))
     let turn = TurnRef("notification-turn")
     _ = try await bundle.startTurn(turn)
     _ = try await bundle.commitAssistantMessage("finished result")
@@ -306,16 +320,17 @@ func test_runJournalBundleInputAndAssistantTipsRemainOneVisibleChain() async thr
     defer { try? FileManager.default.removeItem(at: home.root) }
     let bundle = try await makeBundle(home: home)
     let client = ClientRef("bundle-client")
-    let command1 = CommandRef(commandID: "command-1", client: client)
     do {
         _ = try await bundle.startTurn(TurnRef(""))
         XCTFail("empty TurnRef must be rejected before bytes")
     } catch { }
     _ = try await bundle.startTurn(TurnRef("turn-1"))
+    let command1 = try await exactCommand(bundle, id: "command-1", client: client)
     do {
         _ = try await bundle.commitInput(
             text: "foreign", deliveryMode: .queued,
-            command: CommandRef(commandID: "foreign", sessionAttachment: SessionAttachmentRef("other")))
+            command: try await exactCommand(
+                bundle, id: "foreign", sessionAttachment: SessionAttachmentRef("other")))
         XCTFail("foreign attachment must be rejected before writing")
     } catch { }
     let first = try await bundle.commitInput(text: "first", deliveryMode: .delivered, command: command1)
@@ -356,7 +371,22 @@ func test_runJournalBundleQueuedDeliveryUsesOriginalReceiptAndNoSecondInput() as
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
     let bundle = try await makeBundle(home: home)
-    let command = CommandRef(commandID: "queued-command", client: ClientRef("queued-client"))
+    let prefix = await bundle.status.durablePrefix
+    do {
+        _ = try await bundle.commitInput(
+            text: "ambiguous", deliveryMode: .queued,
+            command: CommandRef(commandID: "missing-causal-cursor"))
+        XCTFail("canonical command admission must require the caller-observed Work cursor")
+    } catch let error as RunJournalBundleError {
+        guard case .invalidOperation(let reason) = error,
+              reason.contains("current pre-receipt Work cursor") else {
+            XCTFail("unexpected missing-cursor error: \(error)")
+            return
+        }
+    }
+    XCTAssertEqual(await bundle.status.durablePrefix, prefix)
+    let command = try await exactCommand(
+        bundle, id: "queued-command", client: ClientRef("queued-client"))
     let queued = try await bundle.commitInput(text: "queued", deliveryMode: .queued, command: command)
     XCTAssertEqual(queued.count, 3)
     let beforeDelivery = try bundleEvents(
@@ -389,7 +419,7 @@ func test_runJournalBundleNonConversationalCommandDoesNotCreateAUserMessage() as
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
     let bundle = try await makeBundle(home: home)
-    let command = CommandRef(commandID: "end-command", client: ClientRef("gui"))
+    let command = try await exactCommand(bundle, id: "end-command", client: ClientRef("gui"))
     let accepted = try await bundle.commitCommand(
         label: "end_run", deliveryMode: .queued, command: command,
         metadata: ["scope": .string("run")])
@@ -445,6 +475,43 @@ func test_runJournalBundleAllActionKindsPermitOnlyAfterDurableStart() async thro
     try await bundle.closeChecked()
 }
 
+func test_runJournalBundleActionLifecycleCarriesActiveTurn() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let bundle = try await makeBundle(home: home)
+    let turn = TurnRef("action-turn")
+    _ = try await bundle.startTurn(turn)
+
+    let permit = try await bundle.beginAction(
+        action: ActionRef("turn-bound-action"), kind: .mcp,
+        intent: "invoke turn-bound action", target: "target", scope: "turn",
+        metadata: ["purpose": .string("producer coverage")])
+    _ = try await bundle.finishAction(
+        permit, state: .failed, retrySafety: .unknown, failureKind: .timeout)
+
+    let events = try bundleEvents(
+        home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
+    let lifecycle = events.filter { event in
+        event.action == permit.action
+            && [TimelineEventType.actionIntent, TimelineEventType.actionStarted,
+                TimelineEventType.actionOutcome].contains(event.type)
+    }
+    XCTAssertEqual(lifecycle.map(\.type), [
+        TimelineEventType.actionIntent, TimelineEventType.actionStarted,
+        TimelineEventType.actionOutcome
+    ])
+    XCTAssertEqual(lifecycle.map(\.turn), [turn, turn, turn])
+    XCTAssertEqual(lifecycle.map(\.run), [bundle.run, bundle.run, bundle.run])
+    XCTAssertEqual(lifecycle.map(\.action), [permit.action, permit.action, permit.action])
+    XCTAssertEqual(lifecycle[0].payload["kind"]?.stringValue, ActionKind.mcp.rawValue)
+    XCTAssertEqual(lifecycle[0].payload["intent"]?.stringValue, "invoke turn-bound action")
+    XCTAssertEqual(lifecycle[2].payload["failure_kind"]?.stringValue,
+                   ActionFailureKind.timeout.rawValue)
+    XCTAssertEqual(lifecycle[2].payload["retry_safety"]?.stringValue,
+                   ActionRetrySafety.unknown.rawValue)
+    try await bundle.closeChecked()
+}
+
 func test_runJournalBundleReopenRetainsSingleUseActionIdentities() async throws {
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
@@ -470,6 +537,7 @@ func test_runJournalBundleSemanticGateSerializesConcurrentMutations() async thro
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
     let bundle = try await makeBundle(home: home)
+    let concurrentCommand = try await exactCommand(bundle, id: "concurrent-command")
 
     let inputResults = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
         for _ in 0..<2 {
@@ -477,7 +545,7 @@ func test_runJournalBundleSemanticGateSerializesConcurrentMutations() async thro
                 do {
                     _ = try await bundle.commitInput(
                         text: "same", deliveryMode: .queued,
-                        command: CommandRef(commandID: "concurrent-command"))
+                        command: concurrentCommand)
                     return true
                 } catch { return false }
             }
@@ -539,7 +607,7 @@ func test_runJournalBundleQueuedCommandMustTerminalizeBeforeFinishedRunReopen() 
     let bundle = try await makeBundle(home: home, runID: "queued-run")
     _ = try await bundle.commitInput(
         text: "deliver later", deliveryMode: .queued,
-        command: CommandRef(commandID: "deliver-later"))
+        command: try await exactCommand(bundle, id: "deliver-later"))
     do {
         _ = try await bundle.finishRun()
         XCTFail("a Run must not finish while an accepted command has no delivery outcome")
@@ -673,7 +741,7 @@ func test_runJournalBundlePartialPrefixesLatchAndRefusePermits() async throws {
     do {
         _ = try await first.commitInput(
             text: "lost", deliveryMode: .delivered,
-            command: CommandRef(commandID: "first-failure"))
+            command: try await exactCommand(first, id: "first-failure"))
         XCTFail("first journal failure must throw")
     } catch { }
     let firstStatus = await bundleStatus(first)
@@ -697,7 +765,7 @@ func test_runJournalBundlePartialPrefixesLatchAndRefusePermits() async throws {
     do {
         _ = try await second.commitInput(
             text: "work prefix", deliveryMode: .delivered,
-            command: CommandRef(commandID: "second-failure"))
+            command: try await exactCommand(second, id: "second-failure"))
         XCTFail("second journal failure must throw")
     } catch { }
     let secondStatus = await bundleStatus(second)
@@ -880,7 +948,8 @@ func test_runJournalBundleReopenContinuesFromSemanticTipNotPhysicalTail() async 
     defer { try? FileManager.default.removeItem(at: home.root) }
     let bundle = try await makeBundle(home: home)
     _ = try await bundle.commitInput(
-        text: "root", deliveryMode: .delivered, command: CommandRef(commandID: "root-command"))
+        text: "root", deliveryMode: .delivered,
+        command: try await exactCommand(bundle, id: "root-command"))
     _ = try await bundle.commitAssistantMessage("selected answer")
     _ = try await bundle.finishRun()
     try await bundle.closeChecked()
@@ -943,7 +1012,7 @@ func test_runJournalBundleProducesCanonicalAttentionTransitions() async throws {
     let bundle = try await makeBundle(home: home)
     _ = try await bundle.commitInput(
         text: "work on this", deliveryMode: .delivered,
-        command: CommandRef(commandID: "attention-input"))
+        command: try await exactCommand(bundle, id: "attention-input"))
     let during: SessionSnapshot = SessionReducer.reduce(
         try bundleEvents(home, bundle.sessionJournal, home.timelineV2SessionJournalURL(bundle.session)))
     XCTAssertEqual(during.attention, SessionAttention.none)

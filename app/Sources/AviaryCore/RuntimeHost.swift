@@ -1,5 +1,9 @@
-import Darwin
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 private enum UnixSocketFailure: Error {
     case invalidPath
@@ -26,20 +30,14 @@ private final class UnixSocketConnection: @unchecked Sendable {
             throw UnixSocketFailure.invalidPath
         }
 
-        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        let descriptor = AviaryPOSIX.streamSocket()
         guard descriptor >= 0 else { throw UnixSocketFailure.system(errno) }
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         do {
             // A peer can disappear while a write is in flight. Prevent SIGPIPE from taking the
             // entire GUI down; the write must surface as a typed transport failure instead.
-            var noSigPipe: Int32 = 1
-            let noSigPipeResult = withUnsafePointer(to: &noSigPipe) {
-                Darwin.setsockopt(
-                    descriptor, SOL_SOCKET, SO_NOSIGPIPE, $0,
-                    socklen_t(MemoryLayout<Int32>.size))
-            }
-            guard noSigPipeResult == 0 else {
+            guard AviaryPOSIX.setNoSigPipe(descriptor) == 0 else {
                 throw UnixSocketFailure.system(errno)
             }
             var bytes = pathData
@@ -55,7 +53,7 @@ private final class UnixSocketConnection: @unchecked Sendable {
             }
             let result = withUnsafePointer(to: &address) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
                 }
             }
             guard result == 0 else {
@@ -65,15 +63,15 @@ private final class UnixSocketConnection: @unchecked Sendable {
             // callback is only scheduled when data/EOF is available, while writes below can use
             // poll to impose their own deadline instead of relying on FileHandle's opaque retry
             // loop (which can ignore SO_SNDTIMEO for a large payload).
-            let flags = Darwin.fcntl(descriptor, F_GETFL)
+            let flags = fcntl(descriptor, F_GETFL)
             guard flags >= 0,
-                  Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0
+                  fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0
             else {
                 throw UnixSocketFailure.system(errno)
             }
         } catch {
             // This is the sole close path for a descriptor that failed before FileHandle owns it.
-            Darwin.close(descriptor)
+            _ = AviaryPOSIX.close(descriptor)
             throw error
         }
         handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
@@ -92,9 +90,9 @@ private final class UnixSocketConnection: @unchecked Sendable {
                 guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return }
                 var offset = 0
                 while offset < rawBuffer.count {
-                    let sent = Darwin.send(
+                    let sent = send(
                         handle.fileDescriptor, base.advanced(by: offset), rawBuffer.count - offset,
-                        Int32(MSG_DONTWAIT))
+                        AviaryPOSIX.sendFlags)
                     if sent > 0 {
                         offset += sent
                         continue
@@ -107,7 +105,7 @@ private final class UnixSocketConnection: @unchecked Sendable {
                             fd: handle.fileDescriptor, events: Int16(POLLOUT), revents: 0)
                         let remainingMilliseconds = Int32(
                             min(100, max(1, (deadline - now) / 1_000_000)))
-                        let ready = Darwin.poll(&descriptor, 1, remainingMilliseconds)
+                        let ready = poll(&descriptor, 1, remainingMilliseconds)
                         if ready == 0 { continue }
                         if ready < 0 {
                             if errno == EINTR { continue }
@@ -379,6 +377,7 @@ public actor RuntimeHost {
 
     private let executable: String?
     private let arguments: [String]
+    private let parentLifetimeLeaseEnabled: Bool
     private var expectedIdentity: HostIdentity?
     private let expectedProtocolVersion: Int
     private var process: Process?
@@ -437,9 +436,12 @@ public actor RuntimeHost {
     /// Number of admitted callback effects that have not yet been observed as complete.
     public var activeCallbackCount: Int { callbackTasks.count }
 
-    public init(executable: String, arguments: [String]) {
+    public init(
+        executable: String, arguments: [String], parentLifetimeLease: Bool = false
+    ) {
         self.executable = executable
         self.arguments = arguments
+        self.parentLifetimeLeaseEnabled = parentLifetimeLease
         self.expectedIdentity = nil
         self.expectedProtocolVersion = Self.protocolVersion
         self.endpointStorage = nil
@@ -451,6 +453,7 @@ public actor RuntimeHost {
     public init(endpoint: SocketEndpoint, expectedIdentity: HostIdentity) {
         self.executable = nil
         self.arguments = []
+        self.parentLifetimeLeaseEnabled = false
         self.expectedIdentity = expectedIdentity
         self.expectedProtocolVersion = Self.protocolVersion
         self.endpointStorage = endpoint
@@ -472,6 +475,7 @@ public actor RuntimeHost {
     ) {
         self.executable = nil
         self.arguments = []
+        self.parentLifetimeLeaseEnabled = false
         self.expectedIdentity = expectedIdentity
         self.expectedProtocolVersion = expectedProtocolVersion
         self.endpointStorage = endpoint
@@ -480,11 +484,14 @@ public actor RuntimeHost {
 
     /// The bundled CPython host, if this checkout has it.
     public static func bundledPython(
-        repoRoot: URL, python: String = "/usr/bin/env", variant: String = "python3"
+        repoRoot: URL, python: String = "/usr/bin/env", variant: String = "python3",
+        parentLifetimeLease: Bool = false
     ) -> RuntimeHost? {
         let script = repoRoot.appending(path: "runtime-hosts/\(variant)/host.py")
         guard FileManager.default.fileExists(atPath: script.path) else { return nil }
-        return RuntimeHost(executable: python, arguments: ["python3", script.path])
+        return RuntimeHost(
+            executable: python, arguments: ["python3", script.path],
+            parentLifetimeLease: parentLifetimeLease)
     }
 
     // MARK: Lifecycle
@@ -526,7 +533,13 @@ public actor RuntimeHost {
         processGeneration &+= 1
         let generation = processGeneration
         p.executableURL = URL(fileURLWithPath: executable!)
-        p.arguments = arguments + ["--socket", path.path, "--host-id", hostID]
+        var launchArguments = arguments + ["--socket", path.path, "--host-id", hostID]
+        if parentLifetimeLeaseEnabled {
+            launchArguments += [
+                "--parent-lifetime-pid", String(ProcessInfo.processInfo.processIdentifier),
+            ]
+        }
+        p.arguments = launchArguments
         var env = ProcessEnvironment.shared.snapshot
         // Keep this for Python's own background work; the transport is a socket, not stdio.
         env["PYTHONUNBUFFERED"] = "1"
@@ -1235,22 +1248,22 @@ public actor RuntimeHost {
         // The final component must be an actual directory owned by this user. Opening with
         // O_NOFOLLOW also closes the lstat -> chmod race for a swapped final path.
         let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW
-        let descriptor = Darwin.open(directory.path, flags)
+        let descriptor = open(directory.path, flags)
         guard descriptor >= 0 else {
             throw HostError.invalidEndpoint("socket directory is not a real directory")
         }
-        defer { Darwin.close(descriptor) }
+        defer { close(descriptor) }
 
         var info = stat()
-        guard Darwin.fstat(descriptor, &info) == 0,
+        guard fstat(descriptor, &info) == 0,
               (info.st_mode & S_IFMT) == S_IFDIR,
-              info.st_uid == Darwin.getuid()
+              info.st_uid == getuid()
         else {
             throw HostError.invalidEndpoint("socket directory is not owned by this user")
         }
         let mode = info.st_mode & 0o777
         if mode != 0o700 {
-            guard Darwin.fchmod(descriptor, mode_t(0o700)) == 0 else {
+            guard fchmod(descriptor, mode_t(0o700)) == 0 else {
                 throw HostError.invalidEndpoint("cannot secure socket directory")
             }
         }

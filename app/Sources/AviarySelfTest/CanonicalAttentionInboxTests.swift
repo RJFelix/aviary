@@ -139,7 +139,7 @@ private func attentionSummary(
         if let indeterminateActionID {
             work.actions[indeterminateActionID] = WorkActionSnapshot(
                 action: ActionRef(indeterminateActionID), state: .indeterminateEffect,
-                failureKind: .indeterminateEffect, retrySafety: .unknown)
+                failureKind: .indeterminateEffect, retrySafety: .unknown, kind: .runtime)
         }
         work.unknownEvents = (0..<workUnknownEventCount).map { index in
             let event = TimelineEvent(

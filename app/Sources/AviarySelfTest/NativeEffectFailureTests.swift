@@ -187,7 +187,9 @@ func test_nativeProviderDoesNotRunWhenIntentCannotBeCommitted() async throws {
     defer { try? FileManager.default.removeItem(at: home.root) }
     _ = try await bundle.commitInput(
         text: "do not call", deliveryMode: .delivered,
-        command: CommandRef(commandID: "permit-denied-input", client: ClientRef("test")))
+        command: CommandRef(
+            commandID: "permit-denied-input", client: ClientRef("test"),
+            causalCursor: await bundle.latestWorkCursor))
     let agent = Agent(
         provider: OpenAICompletionsProvider(
             id: "fake", baseURL: server.baseURL, apiKey: "test-key"),
@@ -220,7 +222,9 @@ func test_nativeOutcomeFailureStopsAfterOneEffectAndRequiresRecovery() async thr
     defer { try? FileManager.default.removeItem(at: home.root) }
     _ = try await bundle.commitInput(
         text: "one call", deliveryMode: .delivered,
-        command: CommandRef(commandID: "outcome-failure-input", client: ClientRef("test")))
+        command: CommandRef(
+            commandID: "outcome-failure-input", client: ClientRef("test"),
+            causalCursor: await bundle.latestWorkCursor))
     let provider = OutcomeJournalFailingProvider(bundle: bundle)
     let agent = Agent(
         provider: provider, host: host, writer: writer, hostSession: hostSession,

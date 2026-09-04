@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 /// The delivery crossing recorded by ``RunJournalBundle.commitInput``.
@@ -270,6 +269,10 @@ public actor RunJournalBundle {
     private var permits: [String: EffectPermit]
     private var activeTurn: TurnRef?
     private var activeRun: RunRef?
+    /// The exact Work prefix that preceded this bundle's `run.started` marker. A service can
+    /// admit a Run after observing the idle Work cursor, so the first Start command may retain
+    /// this historical cursor even though the marker is now the current Work tip.
+    private var runStartPredecessorCursor: JournalCursor?
     /// Work remains reusable after every `run.finished`; this only changes after the explicit
     /// Work terminal transition has been durably paired with the Session cursor.
     private var workLifecycle: WorkLifecycle
@@ -299,6 +302,7 @@ public actor RunJournalBundle {
         commands: [String: WorkCommandSnapshot] = [:],
         commandAcceptedRefs: [String: EventRef] = [:], permits: [String: EffectPermit] = [:],
         activeTurn: TurnRef? = nil, activeRun: RunRef? = nil,
+        runStartPredecessorCursor: JournalCursor? = nil,
         workLifecycle: WorkLifecycle = .active,
         lastMessage: EventRef? = nil,
         authoredAttention: SessionAttention = .none,
@@ -327,6 +331,7 @@ public actor RunJournalBundle {
         self.permits = permits
         self.activeTurn = activeTurn
         self.activeRun = activeRun
+        self.runStartPredecessorCursor = runStartPredecessorCursor
         self.workLifecycle = workLifecycle
         self.lastMessage = lastMessage
         self.authoredAttention = authoredAttention
@@ -365,6 +370,19 @@ public actor RunJournalBundle {
         let actor = TimelineActor(actorID: actorID, kind: actorKind)
         let sessionURL = home.timelineV2SessionJournalURL(binding.session)
         let workURL = home.timelineV2WorkJournalURL(binding.work)
+
+        // `freshAt` intentionally refuses to overwrite an existing path. A process can still
+        // die after either writer opens or after any of the four genesis appends, so an
+        // unregistered reservation must be continued under both exact journal locks rather than
+        // being left permanently wedged. The continuation accepts only the deterministic global
+        // prefix emitted below; foreign/extended/corrupt evidence remains fail-closed.
+        if FileManager.default.fileExists(atPath: sessionURL.path)
+                || FileManager.default.fileExists(atPath: workURL.path) {
+            return try await continueIdleWork(
+                home: home, binding: binding, actor: actor,
+                configuration: configuration, sessionURL: sessionURL, workURL: workURL,
+                failurePlan: failurePlan, eventIDProvider: eventIDProvider, now: now)
+        }
 
         let sessionWriter: TimelineJournalWriter
         do {
@@ -511,6 +529,506 @@ public actor RunJournalBundle {
             commits: commits)
     }
 
+    private static func continueIdleWork(
+        home: AgentHome,
+        binding: WorkBinding,
+        actor: TimelineActor,
+        configuration: Configuration,
+        sessionURL: URL,
+        workURL: URL,
+        failurePlan: (session: TimelineJournalWriter.FailurePlan,
+                      work: TimelineJournalWriter.FailurePlan),
+        eventIDProvider: @escaping @Sendable () -> String,
+        now: @escaping @Sendable () -> Date
+    ) async throws -> IdleWorkCreation {
+        let sessionExists = FileManager.default.fileExists(atPath: sessionURL.path)
+        let workExists = FileManager.default.fileExists(atPath: workURL.path)
+        guard sessionExists || workExists else {
+            throw RunJournalBundleError.invalidOperation(
+                "idle Work continuation requires a durable journal prefix")
+        }
+        // The writer opens Session before Work and performs the first Session append before the
+        // first Work append. A Work-only file is therefore impossible for this reservation. A
+        // Session-only empty file is the one valid one-sided open window; an eventful Session
+        // without its Work counterpart is foreign/deleted state and fails closed below.
+        guard sessionExists else {
+            throw RunJournalBundleError.invalidGenesis(
+                journal: configuration.workJournal,
+                reason: "idle genesis has a Work journal without its Session counterpart")
+        }
+
+        @Sendable func exactEnvelope(
+            _ event: TimelineEvent, sequence: Int, hostSequence: Int,
+            domains: Set<TimelineDomain>
+        ) -> Bool {
+            event.sequence == sequence
+                && event.hostSequence == hostSequence
+                && event.actor == actor
+                && event.schemaVersion == TimelineEvent.currentSchemaVersion
+                && event.payloadVersion == 1
+                && event.idempotencyKey == nil
+                && event.command == nil
+                && event.parentActivityID == nil
+                && event.conversationParent == nil
+                && event.client == nil
+                && event.clientAttachment == nil
+                && event.turn == nil
+                && event.action == nil
+                && event.handle == nil
+                && event.clientTimestamp == nil
+                && event.links.isEmpty
+                && event.declaredDomains == domains
+        }
+
+        // This validator runs inside TimelineJournalWriter's recovery callback, before any
+        // unterminated suffix is truncated. It admits only an exact prefix emitted by this
+        // reservation; the cross-journal causal/order checks remain below after both writers
+        // have been opened.
+        @Sendable func validateProducerPrefix(_ data: Data, journal: JournalRef) throws -> Int {
+            let read = TimelineJournalReader.read(
+                data, journal: journal, actor: actor,
+                hostRecordedAt: Date(timeIntervalSince1970: 0))
+            guard read.quarantinedSuffix == nil else {
+                throw TimelineJournalWriter.WriterError.invalidJournal(
+                    reason: "idle genesis contains a corrupt interior suffix")
+            }
+            let events = read.records.map(\.event)
+            guard events.count <= 2 else {
+                throw TimelineJournalWriter.WriterError.invalidJournal(
+                    reason: "idle genesis prefix contains extra events")
+            }
+            for (index, event) in events.enumerated() {
+                let expectedPrevious = index == 0 ? nil : events[index - 1].eventID
+                guard event.previousEventID == expectedPrevious else {
+                    throw TimelineJournalWriter.WriterError.invalidJournal(
+                        reason: "idle genesis producer chain is not exact")
+                }
+                if journal == configuration.sessionJournal {
+                    if index == 0 {
+                        guard exactEnvelope(event, sequence: 1, hostSequence: 1,
+                                            domains: [.session]),
+                              event.type == TimelineEventType.sessionCreated,
+                              event.session == binding.session,
+                              event.work == nil,
+                              event.workHost == nil,
+                              event.run == nil,
+                              event.causedByEventID == nil,
+                              event.payload == .object([:]) else {
+                            throw TimelineJournalWriter.WriterError.invalidJournal(
+                                reason: "Session creation prefix does not match reservation")
+                        }
+                    } else {
+                        guard exactEnvelope(event, sequence: 2, hostSequence: 3,
+                                            domains: [.session, .work]),
+                              event.type == TimelineEventType.sessionAttached,
+                              event.session == binding.session,
+                              event.work == binding.work,
+                              event.workHost == nil,
+                              event.sessionAttachment == binding.sessionAttachment,
+                              event.run == nil,
+                              event.causedByEventID == nil,
+                              event.payload == .object(["capabilities": .array([])]) else {
+                            throw TimelineJournalWriter.WriterError.invalidJournal(
+                                reason: "Session attachment prefix does not match reservation")
+                        }
+                    }
+                } else if journal == configuration.workJournal {
+                    if index == 0 {
+                        guard exactEnvelope(event, sequence: 1, hostSequence: 2,
+                                            domains: [.work]),
+                              event.type == TimelineEventType.workCreated,
+                              event.work == binding.work,
+                              event.workHost == binding.workHost,
+                              event.session == nil,
+                              event.sessionAttachment == nil,
+                              event.run == nil,
+                              event.causedByEventID == nil,
+                              event.payload == .object([:]) else {
+                            throw TimelineJournalWriter.WriterError.invalidJournal(
+                                reason: "Work creation prefix does not match reservation")
+                        }
+                    } else {
+                        // The cross-journal predecessor is checked after both files are read;
+                        // this local validator still enforces all producer-owned fields.
+                        guard exactEnvelope(event, sequence: 2, hostSequence: 4,
+                                            domains: [.work, .session]),
+                              event.type == TimelineEventType.sessionAttached,
+                              event.session == binding.session,
+                              event.work == binding.work,
+                              event.workHost == binding.workHost,
+                              event.sessionAttachment == binding.sessionAttachment,
+                              event.run == nil,
+                              event.payload == .object(["capabilities": .array([])]) else {
+                            throw TimelineJournalWriter.WriterError.invalidJournal(
+                                reason: "Work attachment prefix does not match reservation")
+                        }
+                    }
+                } else {
+                    throw TimelineJournalWriter.WriterError.invalidJournal(
+                        reason: "idle genesis journal is not one of the reservation journals")
+                }
+            }
+            return read.truncatedTail?.byteStart ?? data.count
+        }
+
+        // Do not create the missing Work file until the existing one-sided prefix has been
+        // proved to be the exact empty Session-open window. In particular, Session event 1 plus
+        // no Work file is an impossible crash state for createIdleWork; creating Work first and
+        // discovering that fact later would turn a rejected reservation into an accepted retry.
+        if !workExists {
+            let handle = try FileHandle(forReadingFrom: sessionURL)
+            defer { try? handle.close() }
+            let maximumGenesisBytes = 256 * 1024
+            let data = try handle.read(upToCount: maximumGenesisBytes + 1) ?? Data()
+            guard data.count <= maximumGenesisBytes else {
+                throw RunJournalBundleError.invalidJournal(
+                    journal: configuration.sessionJournal,
+                    reason: "idle genesis journal exceeds bounded prefix size")
+            }
+            let committedByteCount = try validateProducerPrefix(
+                data, journal: configuration.sessionJournal)
+            guard committedByteCount == data.count, data.isEmpty else {
+                throw RunJournalBundleError.invalidGenesis(
+                    journal: configuration.sessionJournal,
+                    reason: "eventful Session journal has no Work counterpart")
+            }
+        }
+
+        let sessionWriter: TimelineJournalWriter
+        do {
+            if sessionExists {
+                sessionWriter = try TimelineJournalWriter(
+                    reopening: sessionURL, journal: configuration.sessionJournal,
+                    actor: actor, home: home,
+                    recoveryCommittedByteCount: { data in
+                        try validateProducerPrefix(data, journal: configuration.sessionJournal)
+                    },
+                    failurePlan: failurePlan.session,
+                    eventIDProvider: eventIDProvider, now: now)
+            } else {
+                sessionWriter = try TimelineJournalWriter(
+                    freshAt: sessionURL, journal: configuration.sessionJournal,
+                    actor: actor, home: home, failurePlan: failurePlan.session,
+                    eventIDProvider: eventIDProvider, now: now)
+            }
+        } catch let error as TimelineJournalWriter.WriterError {
+            throw mapWriterOpenError(error)
+        }
+
+        let workWriter: TimelineJournalWriter
+        do {
+            if workExists {
+                workWriter = try TimelineJournalWriter(
+                    reopening: workURL, journal: configuration.workJournal,
+                    actor: actor, home: home,
+                    recoveryCommittedByteCount: { data in
+                        try validateProducerPrefix(data, journal: configuration.workJournal)
+                    },
+                    failurePlan: failurePlan.work,
+                    eventIDProvider: eventIDProvider, now: now)
+            } else {
+                workWriter = try TimelineJournalWriter(
+                    freshAt: workURL, journal: configuration.workJournal,
+                    actor: actor, home: home, failurePlan: failurePlan.work,
+                    eventIDProvider: eventIDProvider, now: now)
+            }
+        } catch let error as TimelineJournalWriter.WriterError {
+            try? await sessionWriter.closeChecked()
+            throw mapWriterOpenError(error)
+        }
+
+        let readPrefix: (URL, JournalRef) throws -> [TimelineEvent] = { url, journal in
+            // Genesis has at most two tiny events per file. Read one bounded sentinel byte over
+            // the allowed envelope so a corrupt/hostile path cannot make recovery allocate an
+            // unbounded Data buffer before the producer-prefix validator runs.
+            let maximumGenesisBytes = 256 * 1024
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            let data = try handle.read(upToCount: maximumGenesisBytes + 1) ?? Data()
+            guard data.count <= maximumGenesisBytes else {
+                throw RunJournalBundleError.invalidJournal(
+                    journal: journal, reason: "idle genesis journal exceeds bounded prefix size")
+            }
+            let committedByteCount = try validateProducerPrefix(data, journal: journal)
+            guard committedByteCount == data.count else {
+                throw RunJournalBundleError.invalidJournal(
+                    journal: journal, reason: "idle genesis prefix remains truncated")
+            }
+            let read = TimelineJournalReader.read(
+                data, journal: journal, actor: actor,
+                hostRecordedAt: Date(timeIntervalSince1970: 0))
+            return read.records.map(\.event)
+        }
+
+        var continuationFailedJournal: JournalRef?
+        do {
+            let sessionEvents = try readPrefix(sessionURL, configuration.sessionJournal)
+            let workEvents = try readPrefix(workURL, configuration.workJournal)
+            guard sessionEvents.count <= 2, workEvents.count <= 2 else {
+                throw RunJournalBundleError.invalidGenesis(
+                    journal: configuration.workJournal,
+                    reason: "idle genesis prefix contains extra events")
+            }
+            guard sessionEvents.allSatisfy({ $0.provenance == .native }),
+                  workEvents.allSatisfy({ $0.provenance == .native }) else {
+                throw RunJournalBundleError.invalidGenesis(
+                    journal: configuration.workJournal,
+                    reason: "idle genesis prefix contains a legacy event")
+            }
+            if let created = sessionEvents.first {
+                guard exactEnvelope(created, sequence: 1, hostSequence: 1,
+                                    domains: [.session]),
+                      created.type == TimelineEventType.sessionCreated,
+                      created.session == binding.session,
+                      created.work == nil,
+                      created.workHost == nil,
+                      created.run == nil,
+                      created.causedByEventID == nil,
+                      created.payload == .object([:]),
+                      created.previousEventID == nil else {
+                    throw RunJournalBundleError.invalidGenesis(
+                        journal: configuration.sessionJournal,
+                        reason: "Session prefix does not begin with this reservation's creation")
+                }
+            }
+            if let attached = sessionEvents.dropFirst().first {
+                guard sessionEvents.count == 2,
+                      exactEnvelope(attached, sequence: 2, hostSequence: 3,
+                                    domains: [.session, .work]),
+                      attached.type == TimelineEventType.sessionAttached,
+                      attached.session == binding.session,
+                      attached.work == binding.work,
+                      attached.workHost == nil,
+                      attached.sessionAttachment == binding.sessionAttachment,
+                      attached.run == nil,
+                      attached.causedByEventID == nil,
+                      attached.payload == .object(["capabilities": .array([])]) else {
+                    throw RunJournalBundleError.invalidGenesis(
+                        journal: configuration.sessionJournal,
+                        reason: "Session attachment prefix does not match reservation")
+                }
+            }
+            if let created = workEvents.first {
+                guard exactEnvelope(created, sequence: 1, hostSequence: 2,
+                                    domains: [.work]),
+                      created.type == TimelineEventType.workCreated,
+                      created.work == binding.work,
+                      created.workHost == binding.workHost,
+                      created.session == nil,
+                      created.sessionAttachment == nil,
+                      created.run == nil,
+                      created.causedByEventID == nil,
+                      created.payload == .object([:]),
+                      created.previousEventID == nil else {
+                    throw RunJournalBundleError.invalidGenesis(
+                        journal: configuration.workJournal,
+                        reason: "Work prefix does not begin with this reservation's creation")
+                }
+            }
+            if let attached = workEvents.dropFirst().first {
+                guard workEvents.count == 2,
+                      exactEnvelope(attached, sequence: 2, hostSequence: 4,
+                                    domains: [.work, .session]),
+                      attached.type == TimelineEventType.sessionAttached,
+                      attached.session == binding.session,
+                      attached.work == binding.work,
+                      attached.workHost == binding.workHost,
+                      attached.sessionAttachment == binding.sessionAttachment,
+                      attached.run == nil,
+                      let sessionAttach = sessionEvents.dropFirst().first,
+                      attached.causedByEventID == EventRef(
+                          journal: configuration.sessionJournal,
+                          eventID: sessionAttach.eventID),
+                      attached.payload == .object(["capabilities": .array([])]) else {
+                    throw RunJournalBundleError.invalidGenesis(
+                        journal: configuration.workJournal,
+                        reason: "Work attachment prefix does not match Session attachment")
+                }
+            }
+            // Only the global append prefixes emitted by createIdleWork are admitted. This
+            // rejects an impossible work-only prefix and any pair whose order skipped a suffix.
+            guard sessionEvents.count >= workEvents.count,
+                  sessionEvents.count <= workEvents.count + 1,
+                  !(workEvents.count == 0 && sessionEvents.count == 2) else {
+                throw RunJournalBundleError.invalidGenesis(
+                    journal: configuration.workJournal,
+                    reason: "journal files are not one exact idle genesis prefix")
+            }
+            guard workExists || sessionEvents.isEmpty else {
+                throw RunJournalBundleError.invalidGenesis(
+                    journal: configuration.sessionJournal,
+                    reason: "eventful Session journal has no Work counterpart")
+            }
+
+            var sessionCursor = sessionEvents.last.map {
+                JournalCursor(journal: configuration.sessionJournal,
+                              eventID: $0.eventID, sequence: $0.sequence)
+            }
+            var workCursor = workEvents.last.map {
+                JournalCursor(journal: configuration.workJournal,
+                              eventID: $0.eventID, sequence: $0.sequence)
+            }
+            var hostOrder = max(
+                sessionEvents.compactMap(\.hostSequence).max() ?? 0,
+                workEvents.compactMap(\.hostSequence).max() ?? 0)
+            var sessionEventCount = sessionEvents.count
+            var workEventCount = workEvents.count
+            var commits: [TimelineJournalCommit] = []
+            if sessionEvents.isEmpty {
+                hostOrder += 1
+                continuationFailedJournal = configuration.sessionJournal
+                let created = try await sessionWriter.append(TimelineEventDraft(
+                    hostSequence: hostOrder, session: binding.session,
+                    type: TimelineEventType.sessionCreated,
+                    declaredDomains: [.session]))
+                sessionCursor = created.cursor
+                sessionEventCount += 1
+                commits.append(created)
+            }
+            if workEvents.isEmpty {
+                hostOrder += 1
+                continuationFailedJournal = configuration.workJournal
+                let created = try await workWriter.append(TimelineEventDraft(
+                    hostSequence: hostOrder, work: binding.work,
+                    workHost: binding.workHost, type: TimelineEventType.workCreated,
+                    declaredDomains: [.work]))
+                workCursor = created.cursor
+                workEventCount += 1
+                commits.append(created)
+            }
+            var sessionAttachEventID = sessionEvents.dropFirst().first?.eventID
+            if sessionAttachEventID == nil {
+                hostOrder += 1
+                continuationFailedJournal = configuration.sessionJournal
+                let attached = try await sessionWriter.append(TimelineEventDraft(
+                    hostSequence: hostOrder, session: binding.session, work: binding.work,
+                    sessionAttachment: binding.sessionAttachment,
+                    type: TimelineEventType.sessionAttached,
+                    declaredDomains: [.session, .work],
+                    payload: .object(["capabilities": .array([])])))
+                sessionCursor = attached.cursor
+                sessionEventCount += 1
+                sessionAttachEventID = attached.eventRef.eventID
+                commits.append(attached)
+            }
+            if workEvents.count < 2 {
+                guard let sessionAttachEventID else {
+                    throw RunJournalBundleError.invalidGenesis(
+                        journal: configuration.sessionJournal,
+                        reason: "Work attachment has no Session attachment predecessor")
+                }
+                hostOrder += 1
+                continuationFailedJournal = configuration.workJournal
+                let attached = try await workWriter.append(TimelineEventDraft(
+                    hostSequence: hostOrder,
+                    causedByEventID: EventRef(
+                        journal: configuration.sessionJournal,
+                        eventID: sessionAttachEventID),
+                    session: binding.session, work: binding.work,
+                    workHost: binding.workHost,
+                    sessionAttachment: binding.sessionAttachment,
+                    type: TimelineEventType.sessionAttached,
+                    declaredDomains: [.work, .session],
+                    payload: .object(["capabilities": .array([])])))
+                workCursor = attached.cursor
+                workEventCount += 1
+                commits.append(attached)
+            }
+
+            do {
+                continuationFailedJournal = configuration.sessionJournal
+                try await sessionWriter.closeChecked()
+                continuationFailedJournal = configuration.workJournal
+                try await workWriter.closeChecked()
+                continuationFailedJournal = nil
+            } catch {
+                throw RunJournalBundleError.closeFailed(
+                    RunJournalBundlePrefix(
+                        sessionCursor: sessionCursor, workCursor: workCursor,
+                        sessionEventCount: sessionEventCount, workEventCount: workEventCount,
+                        hostOrder: hostOrder, failedJournal: continuationFailedJournal,
+                        failureReason: error.localizedDescription),
+                    reason: error.localizedDescription)
+            }
+            guard let sessionCursor, let workCursor else {
+                throw RunJournalBundleError.initializationFailed(
+                    RunJournalBundlePrefix(
+                        sessionCursor: sessionCursor, workCursor: workCursor,
+                        sessionEventCount: 0, workEventCount: 0, hostOrder: hostOrder,
+                        failedJournal: configuration.workJournal,
+                        failureReason: "idle genesis continuation has no cursors"),
+                    reason: "idle genesis continuation has no cursors")
+            }
+            let finalSessionEvents = try readPrefix(sessionURL, configuration.sessionJournal)
+            let finalWorkEvents = try readPrefix(workURL, configuration.workJournal)
+            var commitsWithHostSequence: [(Int, TimelineJournalCommit)] = []
+            commitsWithHostSequence.reserveCapacity(
+                finalSessionEvents.count + finalWorkEvents.count)
+            for event in finalSessionEvents {
+                guard let hostSequence = event.hostSequence else {
+                    throw RunJournalBundleError.invalidGenesis(
+                        journal: configuration.sessionJournal,
+                        reason: "idle genesis event has no host sequence")
+                }
+                commitsWithHostSequence.append((hostSequence, TimelineJournalCommit(
+                    eventRef: EventRef(journal: configuration.sessionJournal,
+                                       eventID: event.eventID),
+                    cursor: JournalCursor(journal: configuration.sessionJournal,
+                                          eventID: event.eventID, sequence: event.sequence))))
+            }
+            for event in finalWorkEvents {
+                guard let hostSequence = event.hostSequence else {
+                    throw RunJournalBundleError.invalidGenesis(
+                        journal: configuration.workJournal,
+                        reason: "idle genesis event has no host sequence")
+                }
+                commitsWithHostSequence.append((hostSequence, TimelineJournalCommit(
+                    eventRef: EventRef(journal: configuration.workJournal,
+                                       eventID: event.eventID),
+                    cursor: JournalCursor(journal: configuration.workJournal,
+                                          eventID: event.eventID, sequence: event.sequence))))
+            }
+            commitsWithHostSequence.sort { $0.0 < $1.0 }
+            guard commitsWithHostSequence.map(\.0) == Array(1...4) else {
+                throw RunJournalBundleError.invalidGenesis(
+                    journal: configuration.workJournal,
+                    reason: "idle genesis host sequence is not exactly 1 through 4")
+            }
+            let allCommits = commitsWithHostSequence.map(\.1)
+            return IdleWorkCreation(
+                binding: binding, sessionCursor: sessionCursor, workCursor: workCursor,
+                commits: allCommits)
+        } catch {
+            try? await sessionWriter.closeChecked()
+            try? await workWriter.closeChecked()
+            if let bundleError = error as? RunJournalBundleError {
+                throw bundleError
+            }
+            let sessionEvents = try? readPrefix(sessionURL, configuration.sessionJournal)
+            let workEvents = try? readPrefix(workURL, configuration.workJournal)
+            let sessionCursor = sessionEvents?.last.map {
+                JournalCursor(journal: configuration.sessionJournal,
+                              eventID: $0.eventID, sequence: $0.sequence)
+            }
+            let workCursor = workEvents?.last.map {
+                JournalCursor(journal: configuration.workJournal,
+                              eventID: $0.eventID, sequence: $0.sequence)
+            }
+            let sessionCount = sessionEvents?.count ?? 0
+            let workCount = workEvents?.count ?? 0
+            let hostOrder = max(
+                sessionEvents?.compactMap(\.hostSequence).max() ?? 0,
+                workEvents?.compactMap(\.hostSequence).max() ?? 0)
+            throw RunJournalBundleError.initializationFailed(
+                RunJournalBundlePrefix(
+                    sessionCursor: sessionCursor, workCursor: workCursor,
+                    sessionEventCount: sessionCount, workEventCount: workCount,
+                    hostOrder: hostOrder, failedJournal: continuationFailedJournal,
+                    failureReason: error.localizedDescription),
+                reason: error.localizedDescription)
+        }
+    }
+
     /// Open the one native journal pair owned by an existing launch identity.
     ///
     /// Fresh and resumed execution deliberately share this entry point. If neither journal
@@ -624,6 +1142,25 @@ public actor RunJournalBundle {
             throw RunJournalBundleError.invalidConfiguration(
                 "the execution actor identity is empty")
         }
+        let configuration = try makeConfiguration(
+            session: workBinding.session, work: workBinding.work,
+            workHost: workBinding.workHost,
+            sessionAuthority: TimelineAuthorityRef(workBinding.workHost.workHostID),
+            sessionAttachment: workBinding.sessionAttachment, run: binding.run)
+        let actor = TimelineActor(actorID: actorID, kind: actorKind)
+        let workEvents = try readNativeJournal(
+            at: home.timelineV2WorkJournalURL(workBinding.work),
+            journal: configuration.workJournal, actor: actor)
+        let workState = WorkReducer.reduce(workEvents)
+        // If the host died after the marker but before the first Start command, the marker is a
+        // recoverable reservation only while it is the exact Work tail and no runtime effect has
+        // been recorded. Reopen that exact Run without manufacturing a second run.started event.
+        let recoverStartedRun = workState.activeRun == binding.run
+            && workState.activeTurn == nil
+            && workState.activeActionIDs.isEmpty
+            && workEvents.count >= 2
+            && workEvents.last?.type == TimelineEventType.runStarted
+            && workEvents.last?.run == binding.run
         return try await reopen(
             home: home,
             session: workBinding.session,
@@ -632,11 +1169,12 @@ public actor RunJournalBundle {
             sessionAuthority: TimelineAuthorityRef(workBinding.workHost.workHostID),
             sessionAttachment: workBinding.sessionAttachment,
             run: binding.run,
-            actor: TimelineActor(actorID: actorID, kind: actorKind),
+            actor: actor,
             modelID: modelID,
             failurePlan: failurePlan,
             eventIDProvider: eventIDProvider,
-            now: now)
+            now: now,
+            recoverStartedRun: recoverStartedRun)
     }
 
     /// Open and lock both journals before writing the first semantic event.
@@ -724,12 +1262,14 @@ public actor RunJournalBundle {
         failurePlan: (session: TimelineJournalWriter.FailurePlan,
                       work: TimelineJournalWriter.FailurePlan) = (.none, .none),
         eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        recoverStartedRun: Bool = false
     ) async throws -> RunJournalBundle {
         try await openExisting(
             home: home, session: session, work: work, workHost: workHost,
             sessionAuthority: sessionAuthority, sessionAttachment: sessionAttachment, run: run,
             actor: actor, modelID: modelID, startsRun: true,
+            recoverStartedRun: recoverStartedRun,
             failurePlan: failurePlan, eventIDProvider: eventIDProvider, now: now)
     }
 
@@ -821,6 +1361,7 @@ public actor RunJournalBundle {
         actor: TimelineActor,
         modelID: String?,
         startsRun: Bool,
+        recoverStartedRun: Bool = false,
         failurePlan: (session: TimelineJournalWriter.FailurePlan,
                       work: TimelineJournalWriter.FailurePlan),
         eventIDProvider: @escaping @Sendable () -> String,
@@ -888,19 +1429,32 @@ public actor RunJournalBundle {
             guard unfinished.isEmpty else {
                 throw RunJournalBundleError.unfinishedActions(unfinished)
             }
-            guard workState.activeRun == nil, workState.activeTurn == nil else {
-                throw RunJournalBundleError.invalidOperation(
-                    "the previous Run is still active; finish it before cold resume")
+            if recoverStartedRun {
+                guard startsRun,
+                      workState.activeRun == run,
+                      workState.activeTurn == nil,
+                      workState.activeActionIDs.isEmpty,
+                      workEvents.count >= 2,
+                      workEvents.last?.type == TimelineEventType.runStarted,
+                      workEvents.last?.run == run else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "only an untouched trailing run.started marker can be recovered")
+                }
+            } else {
+                guard workState.activeRun == nil, workState.activeTurn == nil else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "the previous Run is still active; finish it before cold resume")
+                }
             }
             guard workState.lifecycle == .active else {
                 throw RunJournalBundleError.workTerminal(workState.lifecycle)
             }
-            if startsRun {
+            if startsRun && !recoverStartedRun {
                 guard !workEvents.contains(where: { $0.run?.runID == run.runID }) else {
                     throw RunJournalBundleError.invalidOperation(
                         "the replacement Run identity already appears in the Work journal")
                 }
-            } else {
+            } else if !recoverStartedRun {
                 let startedRuns = workEvents.compactMap { event -> RunRef? in
                     guard event.type == TimelineEventType.runStarted else { return nil }
                     return event.run
@@ -923,6 +1477,19 @@ public actor RunJournalBundle {
 
             let sessionCursor = cursor(for: sessionEvents.last, journal: configuration.sessionJournal)
             let workCursor = cursor(for: workEvents.last, journal: configuration.workJournal)
+            let runStartPredecessorCursor: JournalCursor? = {
+                // Both a fresh service Start and an exact restart retry cross the same marker
+                // boundary. Preserve the cursor observed immediately before that marker so the
+                // first Start command can bridge its caller's pre-open cursor. A terminal reopen
+                // never admits a Run and therefore has no such bridge.
+                guard (startsRun || recoverStartedRun) else { return nil }
+                let predecessor = recoverStartedRun
+                    ? workEvents.dropLast().last : workEvents.last
+                guard let predecessor else {
+                    return nil
+                }
+                return cursor(for: predecessor, journal: configuration.workJournal)
+            }()
             let hostOrder = max(
                 sessionEvents.compactMap(\.hostSequence).max() ?? 0,
                 workEvents.compactMap(\.hostSequence).max() ?? 0)
@@ -944,7 +1511,9 @@ public actor RunJournalBundle {
                     refs[command.commandID] = EventRef(
                         journal: configuration.workJournal, eventID: event.eventID)
                 },
-                activeTurn: workState.activeTurn, activeRun: startsRun ? run : nil,
+                activeTurn: workState.activeTurn,
+                activeRun: (startsRun || recoverStartedRun) ? run : nil,
+                runStartPredecessorCursor: runStartPredecessorCursor,
                 workLifecycle: workState.lifecycle,
                 lastMessage: sessionState.semanticTip ?? sessionState.messageHistory.last.map {
                     EventRef(journal: configuration.sessionJournal, eventID: $0.eventID)
@@ -952,7 +1521,7 @@ public actor RunJournalBundle {
                 authoredAttention: sessionState.attention,
                 contextDeliveredBytesByRun:
                     sessionState.contextCumulativeDeliveredBytesByRun ?? [:])
-            if startsRun {
+            if startsRun && !recoverStartedRun {
                 do {
                     try await bundle.appendRunStarted(modelID: modelID ?? workState.modelID)
                     return bundle
@@ -986,6 +1555,33 @@ public actor RunJournalBundle {
 
     public var latestSessionCursor: JournalCursor? { sessionCursor }
     public var latestWorkCursor: JournalCursor? { workCursor }
+
+    /// Whether this bundle still contains only the exact newly-started Run marker and therefore
+    /// may be closed without terminalizing the reservation. This is intentionally narrow: once a
+    /// command, turn, action, or recovery event is durable, callers must not erase that evidence.
+    public var isUntouchedStartedRun: Bool {
+        guard activeRun == run, let predecessor = runStartPredecessorCursor,
+              activeTurn == nil, activeActionIDs.isEmpty else { return false }
+        // `commands` is Work-wide history, so it is expected to contain commands from an
+        // earlier finished Run during End -> Start recovery.  Prove the stronger property from
+        // the locked canonical tail instead: the exact marker follows the saved predecessor and
+        // no command/turn/action/effect/recovery event exists after it.
+        guard let events = try? Self.readNativeJournal(
+            at: workWriter.fileURL, journal: workJournal, actor: actor),
+              let marker = events.last,
+              marker.type == TimelineEventType.runStarted,
+              marker.run == run,
+              let prior = events.dropLast().last,
+              JournalCursor(
+                  journal: workJournal, eventID: prior.eventID,
+                  sequence: prior.sequence) == predecessor,
+              JournalCursor(
+                  journal: workJournal, eventID: marker.eventID,
+                  sequence: marker.sequence) == workCursor else {
+            return false
+        }
+        return true
+    }
     public var latestHostOrder: Int { hostOrder }
     /// The durable Work lifecycle as understood by this open bundle. `run.finished` deliberately
     /// leaves this `active`; only `completeWork` or `destroyWork` changes it.
@@ -1038,14 +1634,78 @@ public actor RunJournalBundle {
         }
     }
 
+    /// Record the first Start whose caller observed the idle Work prefix immediately before
+    /// this bundle appended `run.started`.
+    ///
+    /// Opening a Run advances the Work journal before the client can submit its Start command.
+    /// This deliberately narrow seam preserves that client's exact causal cursor while still
+    /// appending the acceptance receipt after `run.started`. It returns nil for every cursor that
+    /// is not the exact canonical immediate predecessor, allowing the caller to use the normal
+    /// stale-cursor rejection path. No other command, turn, or action may have appeared after the
+    /// marker because the canonical Work tail must still be `run.started` for this Run.
+    public func commitInitialStartIfEligible(
+        prompt: String,
+        deliveryMode: RunInputDeliveryMode,
+        command: CommandRef,
+        metadata: [String: JSONValue] = [:]
+    ) async throws -> [TimelineJournalCommit]? {
+        try await withSemanticGate {
+            guard let causal = command.causalCursor,
+                  let predecessor = self.runStartPredecessorCursor,
+                  self.activeRun == self.run,
+                  self.activeTurn == nil,
+                  self.activeActionIDs.isEmpty,
+                  causal == predecessor,
+                  let current = self.workCursor,
+                  current != predecessor else {
+                return nil
+            }
+
+            // Re-read the canonical prefix at the semantic boundary. In addition to proving the
+            // saved predecessor was not fabricated, this closes the gap where another writer
+            // appended an intervening command/turn/action after `run.started`.
+            let workEvents = try Self.readNativeJournal(
+                at: self.workWriter.fileURL, journal: self.workJournal, actor: self.actor)
+            let (nextSequence, sequenceOverflow) = predecessor.sequence.addingReportingOverflow(1)
+            guard let runStarted = workEvents.last,
+                  runStarted.type == TimelineEventType.runStarted,
+                  runStarted.run == self.run,
+                  let predecessorEvent = workEvents.dropLast().last,
+                  JournalCursor(
+                      journal: self.workJournal,
+                      eventID: predecessorEvent.eventID,
+                      sequence: predecessorEvent.sequence) == predecessor,
+                  JournalCursor(
+                      journal: self.workJournal,
+                      eventID: runStarted.eventID,
+                      sequence: runStarted.sequence) == current,
+                  !sequenceOverflow,
+                  runStarted.previousEventID == predecessor.eventID,
+                  runStarted.sequence == nextSequence else {
+                return nil
+            }
+
+            if prompt.isEmpty {
+                return try await self.commitCommandLocked(
+                    label: "start", deliveryMode: deliveryMode, command: command,
+                    metadata: metadata, initialStartPredecessor: predecessor)
+            }
+            return try await self.commitInputLocked(
+                text: prompt, deliveryMode: deliveryMode, command: command,
+                metadata: metadata, initialStartPredecessor: predecessor)
+        }
+    }
+
     private func commitInputLocked(
         text: String,
         deliveryMode: RunInputDeliveryMode,
         command: CommandRef,
-        metadata: [String: JSONValue]
+        metadata: [String: JSONValue],
+        initialStartPredecessor: JournalCursor? = nil
     ) async throws -> [TimelineJournalCommit] {
         let accepted = try await acceptCommandLocked(
-            command, deliveryMode: deliveryMode, payload: metadata)
+            command, deliveryMode: deliveryMode, payload: metadata,
+            initialStartPredecessor: initialStartPredecessor)
         let normalized = accepted.command
         var commits = accepted.commits
         let receipt = commits.last!
@@ -1061,7 +1721,7 @@ public actor RunJournalBundle {
             causedByEventID: receipt.eventRef,
             conversationParent: lastMessage,
             session: session, work: work, client: command.client,
-            sessionAttachment: sessionAttachment,
+            sessionAttachment: sessionAttachment, run: activeRun, turn: activeTurn,
             type: TimelineEventType.inputAccepted,
             declaredDomains: [.session, .work], payload: .object(inputPayload)))
         commits.append(input)
@@ -1121,9 +1781,27 @@ public actor RunJournalBundle {
             }
             var payload = metadata
             payload["command_kind"] = .string(label)
-            return try await self.acceptCommandLocked(
-                command, deliveryMode: deliveryMode, payload: payload).commits
+            return try await self.commitCommandLocked(
+                label: label, deliveryMode: deliveryMode, command: command,
+                metadata: payload)
         }
+    }
+
+    private func commitCommandLocked(
+        label: String,
+        deliveryMode: RunInputDeliveryMode,
+        command: CommandRef,
+        metadata: [String: JSONValue],
+        initialStartPredecessor: JournalCursor? = nil
+    ) async throws -> [TimelineJournalCommit] {
+        guard !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RunJournalBundleError.invalidOperation("command label is empty")
+        }
+        var payload = metadata
+        payload["command_kind"] = .string(label)
+        return try await acceptCommandLocked(
+            command, deliveryMode: deliveryMode, payload: payload,
+            initialStartPredecessor: initialStartPredecessor).commits
     }
 
     /// Durably refuse a command whose caller observed a real but stale Work cursor. Rejection
@@ -1201,7 +1879,8 @@ public actor RunJournalBundle {
     private func acceptCommandLocked(
         _ command: CommandRef,
         deliveryMode: RunInputDeliveryMode,
-        payload extraPayload: [String: JSONValue]
+        payload extraPayload: [String: JSONValue],
+        initialStartPredecessor: JournalCursor? = nil
     ) async throws -> (command: CommandRef, commits: [TimelineJournalCommit]) {
         try ensureUsable()
         try ensureRunActive()
@@ -1214,13 +1893,25 @@ public actor RunJournalBundle {
         guard command.sessionAttachment == nil || command.sessionAttachment == sessionAttachment else {
             throw RunJournalBundleError.invalidOperation("command belongs to another Session attachment")
         }
-        guard let causal = command.causalCursor ?? workCursor,
-              causal.journal == workJournal,
-              causal.sequence == workCursor?.sequence,
-              causal.eventID == workCursor?.eventID
-        else {
-            throw RunJournalBundleError.invalidOperation(
-                "command must carry the current pre-receipt Work cursor")
+        let causal: JournalCursor
+        if let initialStartPredecessor {
+            guard command.causalCursor == initialStartPredecessor,
+                  self.activeRun == self.run,
+                  let current = self.workCursor,
+                  current != initialStartPredecessor else {
+                throw RunJournalBundleError.invalidOperation(
+                    "initial Start command does not carry its canonical pre-run Work cursor")
+            }
+            causal = initialStartPredecessor
+        } else {
+            guard let current = command.causalCursor,
+                  current.journal == workJournal,
+                  current.sequence == workCursor?.sequence,
+                  current.eventID == workCursor?.eventID else {
+                throw RunJournalBundleError.invalidOperation(
+                    "command must carry the current pre-receipt Work cursor")
+            }
+            causal = current
         }
         let normalized = CommandRef(
             commandID: command.commandID, client: command.client,
@@ -1233,7 +1924,7 @@ public actor RunJournalBundle {
             command: normalized,
             causedByEventID: causal.eventID.map { EventRef(journal: workJournal, eventID: $0) },
             session: nil, work: work, workHost: workHost,
-            client: command.client, sessionAttachment: sessionAttachment,
+            client: command.client, sessionAttachment: sessionAttachment, run: self.activeRun,
             type: TimelineEventType.commandAccepted,
             declaredDomains: [.work], payload: .object(payload)))
         commands[normalized.commandID] = WorkCommandSnapshot(
@@ -1289,6 +1980,7 @@ public actor RunJournalBundle {
             command: existing.command, causedByEventID: acceptance,
             work: work, workHost: workHost,
             client: existing.command.client, sessionAttachment: sessionAttachment,
+            run: self.activeRun,
             type: TimelineEventType.commandDelivered,
             declaredDomains: [.work], payload: .object([
                 "delivery_mode": .string(RunInputDeliveryMode.delivered.rawValue)
@@ -1576,13 +2268,13 @@ public actor RunJournalBundle {
         let intentCommit = try await appendWork(TimelineEventDraft(
             hostSequence: nextHostOrder(), causedByEventID: causedBy,
             work: work, workHost: workHost,
-            run: activeRun, action: action, type: TimelineEventType.actionIntent,
+            run: activeRun, turn: activeTurn, action: action, type: TimelineEventType.actionIntent,
             declaredDomains: [.work, .externalEffects], links: links, payload: .object(payload)))
         let startedCommit = try await appendWork(TimelineEventDraft(
             hostSequence: nextHostOrder(), causedByEventID: intentCommit.eventRef,
             parentActivityID: intentCommit.eventRef,
             work: work, workHost: workHost,
-            run: activeRun, action: action,
+            run: activeRun, turn: activeTurn, action: action,
             type: TimelineEventType.actionStarted,
             declaredDomains: [.work, .externalEffects], payload: .object([
                 "state": .string(ActionExecutionState.running.rawValue),
@@ -1636,7 +2328,7 @@ public actor RunJournalBundle {
             hostSequence: nextHostOrder(), causedByEventID: permit.startedCommit.eventRef,
             parentActivityID: permit.startedCommit.eventRef,
             work: work, workHost: workHost,
-            run: activeRun, action: permit.action,
+            run: activeRun, turn: activeTurn, action: permit.action,
             type: TimelineEventType.actionOutcome,
             declaredDomains: [.work, .externalEffects], payload: .object(outcomePayload)))
         activeActionIDs.remove(permit.action.actionID)
@@ -1724,7 +2416,7 @@ public actor RunJournalBundle {
         }
         let message = try await appendSession(TimelineEventDraft(
             hostSequence: nextHostOrder(), conversationParent: lastMessage,
-            session: session, run: activeRun,
+            session: session, run: activeRun, turn: activeTurn,
             type: TimelineEventType.messageCommitted, declaredDomains: [.session],
             payload: .object([
                 "role": .string("assistant"), "text": .string(text),
@@ -1974,7 +2666,7 @@ public actor RunJournalBundle {
     }
 
     private static func promptDigest(_ data: Data) -> String {
-        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        "sha256:" + AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     /// End the current run only after all actions and turns are terminal. Cursor advancement is a
@@ -2647,10 +3339,12 @@ public actor RunJournalBundle {
     private func appendRunStarted(modelID: String?) async throws {
         var payload: [String: JSONValue] = [:]
         if let modelID { payload["model_id"] = .string(modelID) }
+        let predecessor = workCursor
         _ = try await appendWork(TimelineEventDraft(
             hostSequence: nextHostOrder(), work: work, workHost: workHost,
             run: run, type: TimelineEventType.runStarted, declaredDomains: [.work],
             payload: .object(payload)))
+        runStartPredecessorCursor = predecessor
         activeRun = run
     }
 

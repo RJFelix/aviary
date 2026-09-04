@@ -1,5 +1,9 @@
-import CryptoKit
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// The kind of material that contributed to a system prompt.
 ///
@@ -143,7 +147,7 @@ public struct PromptSource: Sendable, Hashable, Equatable, Encodable {
     public var deliveredByteOffset: Int { renderedByteOffset }
 
     private static func digest(_ data: Data) -> String {
-        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        "sha256:" + AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -184,6 +188,12 @@ public struct PromptSource: Sendable, Hashable, Equatable, Encodable {
 /// provenance, and inspection.
 public struct SystemPromptAssembly: Sendable, Hashable, Equatable, Encodable {
     public static let schemaVersion = 1
+
+    /// The prompt contract limits each context file to 12,000 characters. Four bytes per UTF-8
+    /// scalar plus a small boundary allowance lets us preserve that contract while bounding the
+    /// read. A file beyond this byte bound is reported as unreadable rather than retaining a
+    /// partial body whose digest would falsely claim to describe the source.
+    private static let maximumContextFileBytes = 12_000 * 4 + 4
 
     /// The exact text to use as the system message. It is intentionally not encoded by default.
     public let text: String
@@ -291,30 +301,35 @@ public struct SystemPromptAssembly: Sendable, Hashable, Equatable, Encodable {
             }
 
             let url = URL(fileURLWithPath: cwd).appending(path: name)
-            guard FileManager.default.fileExists(atPath: url.path) else {
+            switch readContextFile(url, maximumBytes: Self.maximumContextFileBytes) {
+            case .missing:
                 sourceBodies.append((sourceID, .contextFile, name, identity,
                                      .missing, nil, "", "", 0))
                 continue
-            }
-            guard let data = try? Data(contentsOf: url),
-                  let fileText = String(data: data, encoding: .utf8)
-            else {
+            case .unreadable, .oversized:
                 sourceBodies.append((sourceID, .contextFile, name, identity,
                                      .unreadable, nil, "", "", 0))
                 continue
-            }
-            guard !fileText.isEmpty else {
+            case .body(let data):
+                guard let fileText = String(data: data, encoding: .utf8) else {
+                    sourceBodies.append((sourceID, .contextFile, name, identity,
+                                         .unreadable, nil, "", "", 0))
+                    continue
+                }
+                guard !fileText.isEmpty else {
+                    sourceBodies.append((sourceID, .contextFile, name, identity,
+                                         .present, "", "", "", 0))
+                    continue
+                }
+                let status: PromptSourceStatus = fileText.count > 12_000 ? .truncated : .present
+                let content = status == .truncated ? String(fileText.prefix(12_000)) : fileText
+                let truncationMarker = status == .truncated ? "\n…(truncated)" : ""
+                let framing = "\n\n## \(name) (from \(cwd))\n\n"
+                let rendered = framing + content + truncationMarker
                 sourceBodies.append((sourceID, .contextFile, name, identity,
-                                     .present, "", "", "", 0))
-                continue
+                                     status, fileText, content, rendered,
+                                     Data(framing.utf8).count))
             }
-            let status: PromptSourceStatus = fileText.count > 12_000 ? .truncated : .present
-            let content = status == .truncated ? String(fileText.prefix(12_000)) : fileText
-            let truncationMarker = status == .truncated ? "\n…(truncated)" : ""
-            let framing = "\n\n## \(name) (from \(cwd))\n\n"
-            let rendered = framing + content + truncationMarker
-            sourceBodies.append((sourceID, .contextFile, name, identity,
-                                 status, fileText, content, rendered, Data(framing.utf8).count))
         }
 
         var offset = 0
@@ -332,11 +347,65 @@ public struct SystemPromptAssembly: Sendable, Hashable, Equatable, Encodable {
     }
 
     private static func digest(_ data: Data) -> String {
-        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        "sha256:" + AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func pathDigest(_ path: String) -> String {
-        SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
+        AviarySHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private enum ContextFileRead {
+        case missing
+        case unreadable
+        case oversized
+        case body(Data)
+    }
+
+    /// Read one context file through a no-follow descriptor and a byte bound. The descriptor is
+    /// opened before metadata and bytes are inspected, so a final-path symlink is rejected and
+    /// ordinary small regular files retain their exact bytes. A file that grows past the bound
+    /// during the read is rejected as oversized instead of being mistaken for a complete body.
+    private static func readContextFile(_ url: URL, maximumBytes: Int) -> ContextFileRead {
+        let descriptor = url.path.withCString {
+            // O_NONBLOCK is immaterial for regular files but prevents a FIFO/device supplied at
+            // the context path from blocking the agent before fstat can reject it.
+            open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else {
+            return errno == ENOENT ? .missing : .unreadable
+        }
+        defer { close(descriptor) }
+
+        var information = stat()
+        guard fstat(descriptor, &information) == 0,
+              (information.st_mode & S_IFMT) == S_IFREG,
+              information.st_size >= 0 else {
+            return .unreadable
+        }
+        let initialSize = information.st_size
+        if initialSize > off_t(maximumBytes) { return .oversized }
+
+        var result = Data()
+        result.reserveCapacity(min(maximumBytes, Int(initialSize)))
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        while true {
+            let count = read(descriptor, &buffer, buffer.count)
+            if count > 0 {
+                guard result.count <= maximumBytes - count else { return .oversized }
+                result.append(buffer, count: count)
+                continue
+            }
+            if count == 0 {
+                // A concurrent truncate/append must not turn a partial body into an apparently
+                // complete source. The open descriptor keeps the inode stable, so size is the
+                // useful bounded consistency check here.
+                guard fstat(descriptor, &information) == 0,
+                      information.st_size == initialSize else { return .unreadable }
+                return .body(result)
+            }
+            if errno == EINTR { continue }
+            return .unreadable
+        }
     }
 
     private enum CodingKeys: String, CodingKey {

@@ -1,0 +1,4577 @@
+import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+// MARK: - Host-private launch material
+
+/// The durable Work service cannot reconstruct an execution from the control journal's digests
+/// alone. A host-private manifest resolver therefore supplies the material which is deliberately
+/// absent from transport and control records (for example a provider/runtime and the retained
+/// prompt). `durableRecord` is the verified record returned by ``WorkLaunchManifestStore``;
+/// closures are only the injected runtime/provider resolver and never an in-memory reconstruction
+/// database.
+public struct JournalBackedWorkLaunchManifest: Sendable {
+    public let identity: WorkLaunchManifestIdentity?
+    public let template: WorkLaunchWorkTemplateRecord?
+    public let bodyDigest: String
+    public let configurationDigest: String
+    public let launchMetadata: WorkHostLaunchMetadata
+    public let hostedConfiguration: (@Sendable (WorkRunBinding) -> HostedInHouseWorkConfiguration?)?
+    public let hostedConfigurationAsync:
+        (@Sendable (WorkRunBinding, WorkLaunchExecutionPolicy) async throws
+            -> HostedInHouseWorkConfiguration?)?
+    public let durableRecord: WorkLaunchManifestRecord?
+    public let retainedRecord: WorkLaunchDraftRetentionRecord?
+    /// Digest of the identity-independent durable draft. This is distinct from the final
+    /// identity-bound manifest digest and is what a retry uses to reload the exact draft.
+    public let retainedDraftDigest: String?
+    /// The exact bounded caller configuration, when attested by the adapter. The durable store
+    /// always populates this from the retained draft; lightweight injected seams may leave it nil.
+    public let requestedConfiguration: WorkServiceWorkConfiguration?
+    public let requestedCapabilities: Set<WorkServiceCapability>?
+
+    public init(
+        bodyDigest: String,
+        configurationDigest: String,
+        launchMetadata: WorkHostLaunchMetadata = .init(),
+        hostedConfiguration: (@Sendable (WorkRunBinding) -> HostedInHouseWorkConfiguration?)? = nil,
+        identity: WorkLaunchManifestIdentity? = nil,
+        template: WorkLaunchWorkTemplateRecord? = nil,
+        hostedConfigurationAsync:
+            (@Sendable (WorkRunBinding, WorkLaunchExecutionPolicy) async throws
+                -> HostedInHouseWorkConfiguration?)? = nil,
+        durableRecord: WorkLaunchManifestRecord? = nil,
+        retainedDraftDigest: String? = nil,
+        retainedRecord: WorkLaunchDraftRetentionRecord? = nil,
+        requestedConfiguration: WorkServiceWorkConfiguration? = nil,
+        requestedCapabilities: Set<WorkServiceCapability>? = nil
+    ) {
+        self.identity = identity
+        self.template = template
+        self.bodyDigest = bodyDigest
+        self.configurationDigest = configurationDigest
+        self.launchMetadata = launchMetadata
+        self.hostedConfiguration = hostedConfiguration
+        self.hostedConfigurationAsync = hostedConfigurationAsync
+        self.durableRecord = durableRecord
+        self.retainedDraftDigest = retainedDraftDigest
+        self.retainedRecord = retainedRecord
+        self.requestedConfiguration = requestedConfiguration
+        self.requestedCapabilities = requestedCapabilities
+    }
+
+    fileprivate func withTemplate(
+        _ template: WorkLaunchWorkTemplateRecord
+    ) -> JournalBackedWorkLaunchManifest {
+        JournalBackedWorkLaunchManifest(
+            bodyDigest: bodyDigest, configurationDigest: configurationDigest,
+            launchMetadata: launchMetadata, hostedConfiguration: hostedConfiguration,
+            identity: nil, template: template,
+            hostedConfigurationAsync: hostedConfigurationAsync,
+            durableRecord: nil, retainedDraftDigest: retainedDraftDigest,
+            retainedRecord: retainedRecord,
+            requestedConfiguration: requestedConfiguration
+                ?? template.template.draft.configuration,
+            requestedCapabilities: requestedCapabilities
+                ?? template.template.draft.requestedCapabilities)
+    }
+
+    fileprivate func withDurableRecord(
+        _ record: WorkLaunchManifestRecord
+    ) -> JournalBackedWorkLaunchManifest {
+        JournalBackedWorkLaunchManifest(
+            bodyDigest: record.manifest.initialInputBodyDigest ?? record.manifestDigest,
+            configurationDigest: record.manifestDigest,
+            launchMetadata: WorkHostLaunchMetadata(
+                providerID: record.manifest.runtime.providerID,
+                modelID: record.manifest.runtime.modelID,
+                workspaceID: template?.template.draft.configuration.workspaceID
+                    ?? retainedRecord?.draft.draft.configuration.workspaceID,
+                runtimeHostKind: record.manifest.runtime.runtimeVariant),
+            hostedConfiguration: hostedConfiguration,
+            identity: record.manifest.identity,
+            template: template,
+            hostedConfigurationAsync: hostedConfigurationAsync,
+            durableRecord: record,
+            retainedDraftDigest: retainedDraftDigest,
+            retainedRecord: retainedRecord,
+            requestedConfiguration: requestedConfiguration
+                ?? template?.template.draft.configuration,
+            requestedCapabilities: requestedCapabilities
+                ?? template?.template.draft.requestedCapabilities)
+    }
+}
+
+/// Host-private manifest seam.  `retain` is called before the control reservation, making the
+/// manifest itself the first durable/recoverable admission fact.  `resolve` is called only during
+/// a fresh recovery read; no previously returned manifest is cached as proof.
+public protocol JournalBackedWorkServiceLaunchManifestStore: Sendable {
+    func retain(
+        _ request: WorkServiceCreateWorkRequest
+    ) async throws -> JournalBackedWorkLaunchManifest
+
+    /// Recover a control reservation whose response was lost before the Run-free template was
+    /// published. Implementations must use only the reservation's durable retention proof; they
+    /// must not invoke an ambient/default resolver for this path.
+    func recoverReservation(
+        _ reservation: WorkHostControlCreationReservation
+    ) async throws -> JournalBackedWorkLaunchManifest?
+
+    /// Publish the Run-free Work template after control reservation. This is the Create commit;
+    /// no Run or execution actor exists yet.
+    func bindTemplate(
+        _ manifest: JournalBackedWorkLaunchManifest,
+        binding: WorkBinding
+    ) async throws -> JournalBackedWorkLaunchManifest
+
+    /// Publish one exact Run-bound manifest for a client-qualified Start admission.
+    func bindStart(
+        _ manifest: JournalBackedWorkLaunchManifest,
+        binding: WorkBinding,
+        run: RunRef,
+        intent: WorkLaunchStartIntent,
+        body: Data,
+        policy: WorkLaunchExecutionPolicy,
+        /// Exact predecessor assembly selected by native cold-resume preflight. When present it
+        /// is the only permitted assembly input; the ambient resolver is for launch-fresh only.
+        selectedPromptAssembly: WorkLaunchPromptAssembly?
+    ) async throws -> JournalBackedWorkLaunchManifest
+
+    /// Durably choose the one Run which may assemble a Start prompt. Only the CAS winner may
+    /// consult ambient files, skills, or memory; a reserved retry must use its retained assembly.
+    func reserveStart(
+        _ template: WorkLaunchWorkTemplateRecord,
+        run: RunRef,
+        intent: WorkLaunchStartIntent,
+        expectedPrevious: WorkLaunchManifestGeneration?,
+        initialInputBodyReference: TimelineBodyReference
+    ) async throws -> WorkLaunchStartAdmission
+
+    func prepareStart(
+        _ reservation: WorkLaunchStartReservation,
+        promptAssembly: WorkLaunchPromptAssembly
+    ) async throws -> WorkLaunchStartReservation
+
+    /// Read the exact binding-wide Start reservation without selecting a Run. A reservation
+    /// which already contains an assembly is eligible for exact recovery; one without it is a
+    /// crash-during-assembly fact and must remain recovery-required.
+    func resolveStartReservation(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        intent: WorkLaunchStartIntent
+    ) async throws -> WorkLaunchStartReservation?
+
+    /// Load the exact durable assembly from a predecessor Run for native cold replay. A nil
+    /// result is not permission to consult ambient prompt sources.
+    func resolvePromptAssemblyRecord(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        run: RunRef
+    ) async throws -> WorkLaunchPromptAssembly?
+
+    func resolve(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef
+    ) async throws -> JournalBackedWorkLaunchManifest?
+
+    /// Resolve an exact prior Start admission. A nil result is never permission to mint another
+    /// Run for a retry; the caller must report recovery-required instead.
+    func resolveStart(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        intent: WorkLaunchStartIntent
+    ) async throws -> JournalBackedWorkLaunchManifest?
+
+    /// Read the exact Work-level Run selection without treating it as execution liveness. This
+    /// lets recovery distinguish a Run-bound admission which died before `run.started` from the
+    /// ordinary post-End selection of a completed historical Run.
+    func currentSelection(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef
+    ) async throws -> WorkLaunchManifestRecord?
+
+    /// The pending pointer is a binding-wide admission fence. Its presence without a current
+    /// selection is a crash window, not permission to treat an idle Work as reconstructable.
+    func hasPendingStart(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef
+    ) async throws -> Bool
+
+    /// Whether an exact pending Run is still fenced by the selection observed when it was
+    /// published. Historical pending records must be returned for duplicate projection but may
+    /// never rewind a newer current-by-binding selection.
+    func mayRepairPendingStart(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        intent: WorkLaunchStartIntent,
+        currentSelection: WorkLaunchBindingSelection?
+    ) async throws -> Bool
+
+    /// Prove that the host can materialize an executable configuration from the durable Run-free
+    /// template. A nonnil resolver closure alone is not reconstruction proof after restart.
+    func canReconstruct(
+        _ manifest: JournalBackedWorkLaunchManifest
+    ) async throws -> Bool
+}
+
+public extension JournalBackedWorkServiceLaunchManifestStore {
+    func recoverReservation(
+        _ reservation: WorkHostControlCreationReservation
+    ) async throws -> JournalBackedWorkLaunchManifest? {
+        _ = reservation
+        return nil
+    }
+
+    func mayRepairPendingStart(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        intent: WorkLaunchStartIntent,
+        currentSelection: WorkLaunchBindingSelection?
+    ) async throws -> Bool {
+        // Test/injected stores which do not expose durable pending fences remain conservative:
+        // their pending result is treated as repairable only when it is not already superseded.
+        _ = (work, session, sessionAttachment, intent, currentSelection)
+        return true
+    }
+
+    func resolveStartReservation(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        intent: WorkLaunchStartIntent
+    ) async throws -> WorkLaunchStartReservation? {
+        _ = (work, session, sessionAttachment, intent)
+        return nil
+    }
+
+    func resolvePromptAssemblyRecord(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        run: RunRef
+    ) async throws -> WorkLaunchPromptAssembly? {
+        _ = (work, session, sessionAttachment, run)
+        return nil
+    }
+}
+
+/// Bridge the service seam to the durable ``WorkLaunchManifestStore``. The draft and runtime
+/// resolvers are injected because Core must not know how a host obtains provider credentials,
+/// model instances, or workspace access. The durable store owns retention, binding, generation,
+/// and exact-identity verification. Recovery always uses the store's Work-template pointer; the
+/// service never substitutes a closure or an in-memory index for that durable lookup.
+public struct DurableJournalBackedWorkLaunchManifestStore:
+    JournalBackedWorkServiceLaunchManifestStore, Sendable {
+    public typealias DraftResolver =
+        @Sendable (WorkServiceCreateWorkRequest) async throws -> WorkLaunchManifestDraft
+    public typealias HostedConfigurationResolver =
+        @Sendable (WorkLaunchManifest, WorkRunBinding, WorkLaunchExecutionPolicy) async throws
+            -> HostedInHouseWorkConfiguration?
+    public typealias PromptAssemblyResolver =
+        @Sendable (WorkLaunchManifestDraft, Data, WorkLaunchStartIntent) async throws
+            -> SystemPromptAssembly
+    public typealias ReconstructabilityProbe =
+        @Sendable (WorkLaunchWorkTemplateRecord) async throws -> Bool
+
+    public let store: WorkLaunchManifestStore
+    private let draftResolver: DraftResolver
+    private let hostedResolver: HostedConfigurationResolver?
+    private let promptAssemblyResolver: PromptAssemblyResolver?
+    private let reconstructabilityProbe: ReconstructabilityProbe?
+    private let bodyAuthority: JournalRef
+
+    public init(
+        store: WorkLaunchManifestStore,
+        bodyAuthority: JournalRef,
+        draftResolver: @escaping DraftResolver,
+        hostedResolver: HostedConfigurationResolver? = nil,
+        promptAssemblyResolver: PromptAssemblyResolver? = nil,
+        reconstructabilityProbe: ReconstructabilityProbe? = nil
+    ) {
+        self.store = store
+        self.bodyAuthority = bodyAuthority
+        self.draftResolver = draftResolver
+        self.hostedResolver = hostedResolver
+        self.promptAssemblyResolver = promptAssemblyResolver
+        self.reconstructabilityProbe = reconstructabilityProbe
+    }
+
+    public func retain(
+        _ request: WorkServiceCreateWorkRequest
+    ) async throws -> JournalBackedWorkLaunchManifest {
+        // The Create key is caller-computable. Recovering it before invoking the resolver closes
+        // the crash window after durable retention but before the control reservation: a changed
+        // provider default must not select a second draft or rerun provider/workspace effects.
+        let requestKey = WorkLaunchCreateKey(
+            client: request.client,
+            requestDigest: try WorkLaunchCreateKey.requestDigest(
+                configuration: request.configuration,
+                requestedCapabilities: request.requestedCapabilities),
+            commandID: request.commandID,
+            causalControlCursor: request.causalControlCursor)
+        if let retained = try store.loadRetainedDraft(for: requestKey) {
+            return retainedManifest(retained)
+        }
+        let draft = try await draftResolver(request)
+        guard draft.configuration == request.configuration,
+              draft.requestedCapabilities == request.requestedCapabilities else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "resolved launch draft does not preserve the requested Create identity")
+        }
+        // Create retains only identity-independent launch configuration. Start owns its exact
+        // input body and retains it under the chosen Run identity before manifest publication.
+        // The request key is client/command/cursor-qualified and its digest is independent of the
+        // resolved runtime and provenance timestamp. This makes duplicate Create calls return
+        // the same retained draft after a process restart, even when ambient defaults changed.
+        let retained = try store.retain(draft, for: requestKey)
+        return retainedManifest(retained)
+    }
+
+    private func retainedManifest(
+        _ retained: WorkLaunchDraftRetentionRecord
+    ) -> JournalBackedWorkLaunchManifest {
+        let draft = retained.draft.draft
+        return JournalBackedWorkLaunchManifest(
+            bodyDigest: retained.digest,
+            configurationDigest: retained.digest,
+            launchMetadata: WorkHostLaunchMetadata(
+                providerID: draft.runtime.providerID,
+                modelID: draft.runtime.modelID,
+                workspaceID: draft.configuration.workspaceID,
+                runtimeHostKind: draft.runtime.runtimeVariant),
+            hostedConfigurationAsync: {
+                guard let resolver = hostedResolver else { return nil }
+                return { @Sendable [store, resolver] binding, policy in
+                    let identity = WorkLaunchManifestIdentity(
+                        work: binding.workBinding.work, session: binding.workBinding.session,
+                        sessionAttachment: binding.workBinding.sessionAttachment, run: binding.run)
+                    guard let record = try store.read(identity) else {
+                        throw WorkServiceProtocolError.sourceIncomplete
+                    }
+                    return try await resolver(record.manifest, binding, policy)
+                }
+            }(), retainedDraftDigest: retained.digest,
+            retainedRecord: retained,
+            requestedConfiguration: draft.configuration,
+            requestedCapabilities: draft.requestedCapabilities)
+    }
+
+    public func recoverReservation(
+        _ reservation: WorkHostControlCreationReservation
+    ) async throws -> JournalBackedWorkLaunchManifest? {
+        let retained = try store.loadRetainedDraft(
+            client: reservation.client,
+            commandID: reservation.command.commandID,
+            causalControlCursor: reservation.causalControlCursor,
+            draftDigest: reservation.configurationDigest)
+        guard let retained, retained.digest == reservation.configurationDigest else {
+            return nil
+        }
+        let draft = retained.draft.draft
+        return JournalBackedWorkLaunchManifest(
+            bodyDigest: retained.digest,
+            configurationDigest: retained.digest,
+            launchMetadata: WorkHostLaunchMetadata(
+                providerID: draft.runtime.providerID,
+                modelID: draft.runtime.modelID,
+                workspaceID: draft.configuration.workspaceID,
+                runtimeHostKind: draft.runtime.runtimeVariant),
+            hostedConfigurationAsync: {
+                guard let resolver = hostedResolver else { return nil }
+                return { @Sendable [store, resolver] binding, policy in
+                    let identity = WorkLaunchManifestIdentity(
+                        work: binding.workBinding.work, session: binding.workBinding.session,
+                        sessionAttachment: binding.workBinding.sessionAttachment, run: binding.run)
+                    guard let record = try store.read(identity) else {
+                        throw WorkServiceProtocolError.sourceIncomplete
+                    }
+                    return try await resolver(record.manifest, binding, policy)
+                }
+            }(),
+            retainedDraftDigest: retained.digest,
+            retainedRecord: retained,
+            requestedConfiguration: draft.configuration,
+            requestedCapabilities: draft.requestedCapabilities)
+    }
+
+    public func bindTemplate(
+        _ manifest: JournalBackedWorkLaunchManifest,
+        binding: WorkBinding
+    ) async throws -> JournalBackedWorkLaunchManifest {
+        if let template = manifest.template {
+            guard template.binding == binding else { throw WorkServiceProtocolError.journalMismatch }
+            return manifest.withTemplate(template)
+        }
+        guard let retained = manifest.retainedRecord else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let template = try store.publishTemplate(retained, binding: binding)
+        return manifest.withTemplate(template)
+    }
+
+    public func reserveStart(
+        _ template: WorkLaunchWorkTemplateRecord,
+        run: RunRef,
+        intent: WorkLaunchStartIntent,
+        expectedPrevious: WorkLaunchManifestGeneration?,
+        initialInputBodyReference: TimelineBodyReference
+    ) async throws -> WorkLaunchStartAdmission {
+        guard template.binding.work.workHostID == (try? store.home.requirePersistedWorkHostID()) else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return try store.reserveStart(
+            template, run: run, startIntent: intent,
+            expectedPrevious: expectedPrevious,
+            initialInputBodyReference: initialInputBodyReference)
+    }
+
+    public func prepareStart(
+        _ reservation: WorkLaunchStartReservation,
+        promptAssembly: WorkLaunchPromptAssembly
+    ) async throws -> WorkLaunchStartReservation {
+        try store.prepareStart(reservation, promptAssembly: promptAssembly)
+    }
+
+    public func resolveStartReservation(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        intent: WorkLaunchStartIntent
+    ) async throws -> WorkLaunchStartReservation? {
+        let binding = WorkBinding(
+            session: session, work: work, workHost: WorkHostRef(work.workHostID),
+            sessionAttachment: sessionAttachment)
+        guard let reservation = try store.readStartReservation(for: binding) else {
+            return nil
+        }
+        return reservation.intent == intent ? reservation : nil
+    }
+
+    public func resolvePromptAssemblyRecord(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        run: RunRef
+    ) async throws -> WorkLaunchPromptAssembly? {
+        let identity = WorkLaunchManifestIdentity(
+            work: work, session: session, sessionAttachment: sessionAttachment, run: run)
+        return try store.read(identity)?.manifest.promptAssembly
+    }
+
+    public func bindStart(
+        _ manifest: JournalBackedWorkLaunchManifest,
+        binding: WorkBinding,
+        run: RunRef,
+        intent: WorkLaunchStartIntent,
+        body: Data,
+        policy: WorkLaunchExecutionPolicy,
+        selectedPromptAssembly: WorkLaunchPromptAssembly? = nil
+    ) async throws -> JournalBackedWorkLaunchManifest {
+        guard let template = manifest.template,
+              template.binding == binding else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        // Retain and verify the exact per-Run input before publication. Create's template may
+        // contain a default, but a replacement Start is allowed to carry different bytes.
+        let reference: TimelineBodyReference
+        do {
+            reference = try ContextBodyStore(home: store.home).retain(body, authority: bodyAuthority)
+        } catch {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        guard reference.digest == intent.bodyDigest else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "Start input does not match its durable Start identity")
+        }
+        // The binding pointer is the durable Work-level Start reservation. A first Start may
+        // never replace an in-flight pointer: exact retries join the same record, while a
+        // different client-qualified Start fails closed. Replacement is reserved exclusively
+        // for End -> Start and remains a compare-and-swap under the store lock.
+        let currentSelection = try store.readCurrentSelection(for: template.binding)
+        let replacingEndedRun = policy.projection == .reopenHistorical
+
+        // A process can die after the exact Run pointer is published but before the Work-level
+        // selection pointer. Recover that one pending intent before considering a fresh Run. The
+        // caller's in-process gate and the durable Start intent are the two halves of this CAS;
+        // no scan result is accepted for a different intent or silently made current.
+        if let pending = try store.readPendingStart(for: template.binding, intent: intent) {
+            let mayRepair = try store.mayRepairPendingStart(
+                for: template.binding, intent: intent, currentSelection: currentSelection)
+            if mayRepair {
+                let repaired = try store.repairCurrentSelection(
+                    pending, expectedPrevious: currentSelection?.selectionGeneration)
+                guard repaired.manifest.identity.run == pending.manifest.identity.run,
+                      repaired.manifest.startIntent == intent else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                return manifest.withDurableRecord(repaired)
+            }
+            // The pending record is an old, exact Start whose Work selection has since moved to
+            // another Run. Return it only for duplicate projection; never regress the binding
+            // pointer merely because a historical pending marker survived cleanup.
+            return manifest.withDurableRecord(pending)
+        }
+        let current = currentSelection?.record
+        if let current, !replacingEndedRun {
+            guard current.manifest.startIntent == intent else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            return manifest.withDurableRecord(current)
+        }
+        let expectedPrevious = currentSelection?.selectionGeneration
+
+        // The exact Start bytes are retained before the durable winner CAS and are the only body
+        // input supplied to prompt assembly. A reservation without an assembly is a crash/recovery
+        // fact, not permission to read ambient files again.
+        let exactBody: Data
+        do {
+            exactBody = try ContextBodyStore(home: store.home).read(reference)
+        } catch {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let admission = try store.reserveStart(
+            template, run: run, startIntent: intent, expectedPrevious: expectedPrevious,
+            initialInputBodyReference: reference)
+        let prepared: WorkLaunchStartReservation
+        switch admission {
+        case .existing(let existing):
+            return manifest.withDurableRecord(existing)
+        case .reserved(let reservation):
+            guard let assembly = reservation.promptAssembly else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            prepared = reservation
+            _ = assembly
+        case .winner(let reservation):
+            let retainedAssembly: WorkLaunchPromptAssembly
+            if let selectedPromptAssembly {
+                // Exact cold resume selected this assembly from the predecessor's durable
+                // crossing. It is already retained and must be carried byte-for-byte; stamping
+                // a fresh provenance timestamp would make the new Run attest a different
+                // assembly even when its provider bytes and source refs are identical.
+                retainedAssembly = selectedPromptAssembly
+            } else {
+                guard let promptAssemblyResolver else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                let assembly: SystemPromptAssembly
+                do {
+                    assembly = try await promptAssemblyResolver(
+                        template.template.draft, exactBody, intent)
+                } catch {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                let promptProvenance = WorkLaunchManifestProvenance(source: "start.prompt.v1")
+                do {
+                    retainedAssembly = try store.retainPromptAssembly(
+                        assembly, authority: .workHost(try store.home.requirePersistedWorkHost()),
+                        provenance: promptProvenance)
+                } catch {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+            }
+            prepared = try store.prepareStart(
+                reservation, promptAssembly: retainedAssembly)
+        }
+        guard let promptAssembly = prepared.promptAssembly else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let record = try store.start(
+            template,
+            run: prepared.run, startIntent: prepared.intent,
+            expectedPrevious: prepared.expectedPrevious,
+            initialInputBodyReference: prepared.initialInputBodyReference,
+            promptAssembly: promptAssembly,
+            resumePolicy: policy.resumePolicy)
+        return manifest.withDurableRecord(record)
+    }
+
+    public func resolve(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef
+    ) async throws -> JournalBackedWorkLaunchManifest? {
+        guard let template = try store.readTemplate(for: work),
+              template.binding.work == work,
+              template.binding.session == session,
+              template.binding.sessionAttachment == sessionAttachment else { return nil }
+        // The template's retention key is the durable Create proof.  Resolve must load and
+        // verify that keyed retention after restart; a template payload alone is not enough to
+        // reconstruct executable launch material.
+        let draftDigest = try template.template.draft.contentDigest()
+        guard let retained = try store.loadRetainedDraft(for: template.template.retentionKey),
+              retained.digest == draftDigest else {
+            return nil
+        }
+        return JournalBackedWorkLaunchManifest(
+            bodyDigest: draftDigest,
+            configurationDigest: draftDigest,
+            launchMetadata: WorkHostLaunchMetadata(
+                providerID: template.template.draft.runtime.providerID,
+                modelID: template.template.draft.runtime.modelID,
+                workspaceID: template.template.draft.configuration.workspaceID,
+                runtimeHostKind: template.template.draft.runtime.runtimeVariant),
+            template: template,
+            hostedConfigurationAsync: {
+                guard let resolver = hostedResolver else { return nil }
+                return { @Sendable [resolver, store] binding, policy in
+                    let identity = WorkLaunchManifestIdentity(
+                        work: binding.workBinding.work, session: binding.workBinding.session,
+                        sessionAttachment: binding.workBinding.sessionAttachment, run: binding.run)
+                    guard let record = try store.read(identity) else {
+                        throw WorkServiceProtocolError.sourceIncomplete
+                    }
+                    return try await resolver(record.manifest, binding, policy)
+                }
+            }(), retainedDraftDigest: draftDigest,
+            retainedRecord: retained,
+            requestedConfiguration: template.template.draft.configuration,
+            requestedCapabilities: template.template.draft.requestedCapabilities)
+    }
+
+    public func resolveStart(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        intent: WorkLaunchStartIntent
+    ) async throws -> JournalBackedWorkLaunchManifest? {
+        guard let base = try await resolve(
+            work: work, session: session, sessionAttachment: sessionAttachment) else {
+            return nil
+        }
+        let binding = WorkBinding(
+            session: session, work: work, workHost: WorkHostRef(work.workHostID),
+            sessionAttachment: sessionAttachment)
+        let current = try store.readCurrentSelection(for: binding)
+        if let record = current?.record,
+           record.manifest.startIntent == intent,
+           record.manifest.identity.work == work,
+           record.manifest.identity.session == session,
+           record.manifest.identity.sessionAttachment == sessionAttachment {
+            return base.withDurableRecord(record)
+        }
+        // Historical duplicates use the intent index, never the Work-level current pointer. This
+        // preserves Run 1's canonical receipt after a later Run 2 replacement without moving
+        // current-by-binding backwards.
+        if let historical = try store.readStart(for: binding, intent: intent) {
+            return base.withDurableRecord(historical)
+        }
+        // A crash can leave an exact Run-bound payload and identity pointer published while the
+        // Work-level selection still names the prior Run. Return the exact pending record as a
+        // recovery candidate, but do not repair here: this method is also used by a duplicate
+        // Start receipt after later Runs exist. ``bindStart`` performs the strict repair only on
+        // the no-command, admission path while its per-Work gate is held.
+        let pending = try store.readPendingStart(for: binding, intent: intent)
+        guard let pending else { return nil }
+        guard pending.manifest.startIntent == intent,
+              pending.manifest.identity.work == work,
+              pending.manifest.identity.session == session,
+              pending.manifest.identity.sessionAttachment == sessionAttachment else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return base.withDurableRecord(pending)
+    }
+
+    public func currentSelection(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef
+    ) async throws -> WorkLaunchManifestRecord? {
+        let binding = WorkBinding(
+            session: session, work: work, workHost: WorkHostRef(work.workHostID),
+            sessionAttachment: sessionAttachment)
+        return try store.readCurrentSelection(for: binding)?.record
+    }
+
+    public func hasPendingStart(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef
+    ) async throws -> Bool {
+        let binding = WorkBinding(
+            session: session, work: work, workHost: WorkHostRef(work.workHostID),
+            sessionAttachment: sessionAttachment)
+        return try store.hasPendingStart(for: binding)
+    }
+
+    public func mayRepairPendingStart(
+        work: WorkRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        intent: WorkLaunchStartIntent,
+        currentSelection: WorkLaunchBindingSelection?
+    ) async throws -> Bool {
+        let binding = WorkBinding(
+            session: session, work: work, workHost: WorkHostRef(work.workHostID),
+            sessionAttachment: sessionAttachment)
+        return try store.mayRepairPendingStart(
+            for: binding, intent: intent, currentSelection: currentSelection)
+    }
+
+    public func canReconstruct(
+        _ manifest: JournalBackedWorkLaunchManifest
+    ) async throws -> Bool {
+        guard hostedResolver != nil, promptAssemblyResolver != nil,
+              let template = manifest.template,
+              let reconstructabilityProbe else { return false }
+        // The probe is deliberately Run-free: invoking the normal resolver would require
+        // selecting a Run and would turn a recovery read into an execution admission.
+        return try await reconstructabilityProbe(template)
+    }
+}
+
+public enum JournalBackedWorkRecoveryDisposition: String, Codable, Hashable, Sendable {
+    case idleReconstructable = "idle_reconstructable"
+    /// A durable active Run exists, but this service instance has no fresh liveness proof.  It is
+    /// intentionally not projected as running.
+    case liveUnproven = "live_unproven"
+    case recoveryRequired = "recovery_required"
+    case historical
+    case corrupt
+    case unavailable
+}
+
+public struct JournalBackedWorkRecoveryEntry: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let journal: JournalRef?
+    public let disposition: JournalBackedWorkRecoveryDisposition
+    public let workCursor: JournalCursor?
+    public let sessionCursor: JournalCursor?
+    public let sourcePresence: WorkHostControlCreationSourcePresence
+    public let failure: WorkHostControlCreationSourceVerificationFailure?
+    public let hostInstance: WorkHostInstanceRef?
+    public let diagnostic: String?
+
+    public init(
+        work: WorkRef,
+        journal: JournalRef?,
+        disposition: JournalBackedWorkRecoveryDisposition,
+        workCursor: JournalCursor? = nil,
+        sessionCursor: JournalCursor? = nil,
+        sourcePresence: WorkHostControlCreationSourcePresence = .notObserved,
+        failure: WorkHostControlCreationSourceVerificationFailure? = nil,
+        hostInstance: WorkHostInstanceRef? = nil,
+        diagnostic: String? = nil
+    ) {
+        self.work = work
+        self.journal = journal
+        self.disposition = disposition
+        self.workCursor = workCursor
+        self.sessionCursor = sessionCursor
+        self.sourcePresence = sourcePresence
+        self.failure = failure
+        self.hostInstance = hostInstance
+        self.diagnostic = diagnostic.map { String($0.prefix(WorkServiceBounds.maxDiagnosticCharacters)) }
+    }
+}
+
+/// A workspace catalog is host-local I/O, not Work-service state.  Keep the potentially blocking
+/// provider outside the service actor and share one in-flight probe between callers.  A timeout
+/// only releases the caller: an underlying synchronous filesystem/network call cannot be safely
+/// cancelled, so its single task remains fenced until it returns.  That is intentional -- a hung
+/// provider can make handshakes fail closed, but cannot grow one unbounded task per request.
+private actor BoundedWorkspaceCatalogProbe {
+    enum ReadResult: Sendable {
+        case success(WorkHostWorkspaceCatalog)
+        case unavailable
+        case timedOut
+        case cancelled
+    }
+
+    private enum ProbeResult: Sendable {
+        case success(WorkHostWorkspaceCatalog)
+        case unavailable
+    }
+
+    private struct ActiveProbe {
+        let id: UUID
+        let task: Task<ProbeResult, Never>
+    }
+
+    private struct Waiter {
+        let probeID: UUID
+        let continuation: CheckedContinuation<ReadResult, Never>
+        let timeoutTask: Task<Void, Never>
+    }
+
+    private let provider: WorkHostWorkspaceCatalogProvider
+    private let timeoutNanoseconds: UInt64
+    private let maximumWaiters: Int
+    private var activeProbe: ActiveProbe?
+    private var waiters: [UUID: Waiter] = [:]
+
+    init(
+        provider: @escaping WorkHostWorkspaceCatalogProvider,
+        timeoutNanoseconds: UInt64,
+        maximumWaiters: Int = 16
+    ) {
+        self.provider = provider
+        // Keep a caller-provided test timeout useful while preventing an accidental zero timeout
+        // or an effectively unbounded service handshake in production.
+        self.timeoutNanoseconds = min(max(timeoutNanoseconds, 1), 30_000_000_000)
+        self.maximumWaiters = max(1, maximumWaiters)
+    }
+
+    func read() async -> ReadResult {
+        if Task.isCancelled { return .cancelled }
+        let waiterID = UUID()
+        let probeID = beginProbeIfNeeded()
+        guard waiters.count < maximumWaiters else { return .unavailable }
+
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                install(
+                    waiterID: waiterID,
+                    probeID: probeID,
+                    continuation: continuation)
+            }
+        }, onCancel: {
+            Task { await self.cancel(waiterID: waiterID) }
+        })
+    }
+
+    private func beginProbeIfNeeded() -> UUID {
+        if let activeProbe { return activeProbe.id }
+        let id = UUID()
+        let provider = self.provider
+        let task = Task.detached(priority: .utility) { () -> ProbeResult in
+            do {
+                return .success(try await provider())
+            } catch {
+                return .unavailable
+            }
+        }
+        activeProbe = ActiveProbe(id: id, task: task)
+        Task { [weak self] in
+            let result = await task.value
+            await self?.complete(probeID: id, result: result)
+        }
+        return id
+    }
+
+    private func install(
+        waiterID: UUID,
+        probeID: UUID,
+        continuation: CheckedContinuation<ReadResult, Never>
+    ) {
+        guard activeProbe?.id == probeID else {
+            continuation.resume(returning: .unavailable)
+            return
+        }
+        if Task.isCancelled {
+            continuation.resume(returning: .cancelled)
+            return
+        }
+        let timeoutNanoseconds = self.timeoutNanoseconds
+        let timeoutTask = Task.detached(priority: .utility) { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await self?.timeout(waiterID: waiterID, probeID: probeID)
+        }
+        waiters[waiterID] = Waiter(
+            probeID: probeID, continuation: continuation, timeoutTask: timeoutTask)
+    }
+
+    private func complete(probeID: UUID, result: ProbeResult) {
+        guard activeProbe?.id == probeID else { return }
+        activeProbe = nil
+        let matching = waiters.filter { $0.value.probeID == probeID }
+        for (waiterID, waiter) in matching {
+            waiters.removeValue(forKey: waiterID)
+            waiter.timeoutTask.cancel()
+            switch result {
+            case .success(let catalog): waiter.continuation.resume(returning: .success(catalog))
+            case .unavailable: waiter.continuation.resume(returning: .unavailable)
+            }
+        }
+    }
+
+    private func timeout(waiterID: UUID, probeID: UUID) {
+        guard let waiter = waiters[waiterID], waiter.probeID == probeID else { return }
+        waiters.removeValue(forKey: waiterID)
+        waiter.continuation.resume(returning: .timedOut)
+    }
+
+    private func cancel(waiterID: UUID) {
+        guard let waiter = waiters.removeValue(forKey: waiterID) else { return }
+        waiter.timeoutTask.cancel()
+        waiter.continuation.resume(returning: .cancelled)
+    }
+}
+
+// MARK: - Journal-backed composition
+
+/// Read-path counters exposed for diagnostics and production tests. `bytesScanned` counts bytes
+/// handed to the incremental JSONL reader, not metadata probes or bytes served from the cache.
+/// These counters are observations only; they never participate in canonical identity or
+/// readiness decisions.
+public struct JournalBackedWorkServiceReadMetrics: Codable, Hashable, Sendable {
+    public let readCalls: Int
+    public let cacheHits: Int
+    public let rebuilds: Int
+    public let incrementalReads: Int
+    public let invalidations: Int
+    public let bytesScanned: Int
+    public let recordsApplied: Int
+
+    public init(
+        readCalls: Int = 0,
+        cacheHits: Int = 0,
+        rebuilds: Int = 0,
+        incrementalReads: Int = 0,
+        invalidations: Int = 0,
+        bytesScanned: Int = 0,
+        recordsApplied: Int = 0
+    ) {
+        self.readCalls = readCalls
+        self.cacheHits = cacheHits
+        self.rebuilds = rebuilds
+        self.incrementalReads = incrementalReads
+        self.invalidations = invalidations
+        self.bytesScanned = bytesScanned
+        self.recordsApplied = recordsApplied
+    }
+}
+
+/// Resolves the immutable canonical admission evidence used by public command receipts.
+/// A Hosted actor saying it admitted work is not enough: the exact client-qualified command
+/// envelope must be present in the reduced Work journal, with an addressable event and host
+/// sequence. This intentionally has no fallback to the current Work tip.
+enum JournalBackedWorkServiceCommandEvidence {
+    struct Result: Equatable, Sendable {
+        let cursor: JournalCursor
+        let hostSequence: Int
+    }
+
+    static func resolve(
+        snapshot: WorkSnapshot,
+        journal: JournalRef,
+        request: WorkServiceCommandRequest,
+        client: ClientRef
+    ) throws -> Result {
+        let expected = WorkServiceCommandLedgerIdentity.command(
+            from: request.command, client: client)
+        guard snapshot.journal == journal,
+              journal == request.journal,
+              snapshot.structuralIntegrityValid,
+              snapshot.semanticProjectionValid,
+              snapshot.quarantinedEvents.isEmpty,
+              let recorded = snapshot.commands[expected.commandID],
+              recorded.command == expected,
+              let acceptance = recorded.acceptanceEventRef,
+              acceptance.journal == journal,
+              let sequence = snapshot.eventSequences[acceptance.eventID],
+              sequence > request.causalWorkCursor.sequence,
+              recorded.acceptanceHostSequence > 0 else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return Result(
+            cursor: JournalCursor(
+                journal: journal, eventID: acceptance.eventID, sequence: sequence),
+            hostSequence: recorded.acceptanceHostSequence)
+    }
+}
+
+/// The bounded production composition of WorkServiceProtocol.
+///
+/// The control journal owns client relationships and control cursors.  RunJournalBundle owns
+/// Session/Work source truth, while WorkHostRegistry owns the live HostedInHouseWork actor.  No
+/// client reference is used as actor ownership, so detaching the final GUI leaves Work alive.
+public actor JournalBackedWorkService: WorkServiceClient {
+    public typealias LaunchManifestStore = JournalBackedWorkServiceLaunchManifestStore
+
+    public let home: AgentHome
+    public let host: WorkHostRef
+    public let hostInstance: WorkHostInstanceRef
+    public let controlJournal: WorkHostControlJournal
+    public let registry: WorkHostRegistry
+
+    private let actor: TimelineActor
+    private let authorizer: any WorkServiceAuthorizer
+    private let manifestStore: (any JournalBackedWorkServiceLaunchManifestStore)?
+    /// Read the host-owned workspace registry at each handshake. Keeping a provider rather than
+    /// a catalog snapshot means a GUI that reconnects observes durable registry mutations made by
+    /// another local admin process, while launch resolution still revalidates the selected ID.
+    private let workspaceCatalogProbe: BoundedWorkspaceCatalogProbe
+    private let bounds: WorkHostRegistryBounds
+    private var loaded = false
+    private var manifests: [WorkRef: JournalBackedWorkLaunchManifest] = [:]
+
+    // MARK: Incremental canonical source cache
+
+    /// The cache is actor-owned and keyed by both the typed journal authority and the exact
+    /// expected path. A path by itself is not an identity, and a JournalRef by itself cannot
+    /// distinguish two host-private files accidentally supplied for one logical journal.
+    private struct JournalCacheKey: Hashable, Sendable {
+        let journal: JournalRef
+        let path: String
+    }
+
+    private struct JournalFileIdentity: Hashable, Sendable {
+        let device: UInt64
+        let inode: UInt64
+        let mode: UInt32
+    }
+
+    private struct JournalFileFingerprint: Equatable, Sendable {
+        let identity: JournalFileIdentity
+        let byteCount: Int
+        let modificationSeconds: Int64
+        let modificationNanoseconds: Int64
+        let changeSeconds: Int64
+        let changeNanoseconds: Int64
+        let lastByte: UInt8?
+        /// Hash of bounded prefix/suffix evidence. It is not a complete file digest; it prevents
+        /// the common same-inode rewrite+append case from reusing a stale reducer prefix.
+        let prefixEvidence: String
+    }
+
+    /// A sparse, byte-addressable checkpoint used when a journal is larger than the resident
+    /// decoded-event cache.  It deliberately keeps only identity and offsets; the event envelope
+    /// is reread from the already-authorized journal when a bounded page needs it.
+    private struct JournalRecordIndex: Sendable {
+        let eventID: String
+        let sequence: Int
+        let byteStart: Int
+        let byteEnd: Int
+        let previousEventID: String?
+        /// Digest immediately before this record. Keeping both sides of each sparse anchor lets a
+        /// page prove a checkpoint at an arbitrary cursor while rereading only the bounded anchor
+        /// suffix, rather than retaining one digest per historical event.
+        let prefixDigestBefore: String
+        let prefixDigest: String
+    }
+
+    private struct JournalReadCacheEntry: Sendable {
+        let fingerprint: JournalFileFingerprint
+        let result: TimelineJournalReadResult
+        let workSnapshot: WorkSnapshot?
+        let sessionSnapshot: SessionSnapshot?
+        let sequenceToIndex: [Int: Int]
+        let sparseIndex: [JournalRecordIndex]
+        let recordCount: Int
+        let lastRecord: TimelineJournalRecord?
+        let penultimateRecord: TimelineJournalRecord?
+        let terminalLineDigest: String?
+        let prefixSeed: String
+        let prefixDigest: String
+        let nextSequence: Int
+        let previousEventID: String?
+        let isFullyResident: Bool
+        let latestRunStarted: RunRef?
+        let latestRunFinished: RunRef?
+        let runStartedIDs: Set<String>
+        let runFinishedIDs: Set<String>
+        let runFinishedExists: Bool
+        let artifactDescriptors: [WorkServiceArtifactDescriptor]
+        let bodyReferences: Set<TimelineBodyReference>
+        let bodyReferenceCount: Int
+        let bodyReferencesComplete: Bool
+    }
+
+    private enum JournalReadLimits {
+        static let chunkBytes = 256 * 1024
+        /// Cache admission is bounded independently of journal availability.  Sources larger than
+        /// this retain reducer state plus a sparse offset index and continue to be readable via
+        /// bounded page scans; the value is never used as a source-size validity limit.
+        static let maximumResidentBytes = 256 * 1024 * 1024
+        static let maximumResidentRecords = 1_000_000
+        static let sparseStride = 256
+        static let maximumSparseEntries = 4_000_000
+        static let maximumCachedArtifacts = WorkServiceBounds.maxArtifactsPerWork
+        static let maximumCachedBodyReferences = 65_536
+    }
+
+    private var journalCache: [JournalCacheKey: JournalReadCacheEntry] = [:]
+    private var readMetrics = JournalBackedWorkServiceReadMetrics()
+    /// A durable reservation prevents two processes from minting Runs, while this in-process
+    /// task map prevents an actor re-entrant duplicate from observing the winner's pre-assembly
+    /// reservation and incorrectly reporting ``sourceIncomplete``.  The key is the complete
+    /// client-qualified Start intent; conflicting intents never join this task.
+    private struct StartAdmissionKey: Hashable, Sendable {
+        let work: WorkRef
+        let intent: WorkLaunchStartIntent
+    }
+    private struct StartActorAdmission: Sendable {
+        let entry: WorkHostRegistryLiveEntry
+        let ownsTask: Bool
+    }
+    private var startsInProgress: [StartAdmissionKey: Task<WorkHostRegistryLiveEntry, Error>] = [:]
+
+    public init(
+        home: AgentHome,
+        workHost: WorkHostRef? = nil,
+        instanceID: String = "instance-" + UUID().uuidString.lowercased(),
+        startIdentity: String = "start-" + UUID().uuidString.lowercased(),
+        actor: TimelineActor = TimelineActor(actorID: "work-service", kind: "work-service"),
+        authorizer: any WorkServiceAuthorizer,
+        manifestStore: (any JournalBackedWorkServiceLaunchManifestStore)? = nil,
+        bounds: WorkHostRegistryBounds = .default,
+        workspaceCatalogProvider: @escaping WorkHostWorkspaceCatalogProvider = { .empty },
+        workspaceCatalogTimeoutNanoseconds: UInt64 = 500_000_000,
+        creationIdentityMinter: @escaping @Sendable () -> WorkHostControlMintedIdentity = {
+            WorkHostControlMintedIdentity(
+                workID: "work-" + UUID().uuidString.lowercased(),
+                sessionID: "session-" + UUID().uuidString.lowercased(),
+                sessionAttachmentID: "session-attachment-" + UUID().uuidString.lowercased())
+        }
+    ) throws {
+        let persistedHost = try home.requirePersistedWorkHost()
+        if let workHost, workHost != persistedHost {
+            throw WorkServiceProtocolError.hostUnavailable(workHost)
+        }
+        self.home = home
+        self.host = persistedHost
+        self.actor = actor
+        self.authorizer = authorizer
+        self.manifestStore = manifestStore
+        self.workspaceCatalogProbe = BoundedWorkspaceCatalogProbe(
+            provider: workspaceCatalogProvider,
+            timeoutNanoseconds: workspaceCatalogTimeoutNanoseconds)
+        self.bounds = bounds
+        let instance = WorkHostInstanceRef(
+            host: persistedHost, instanceID: instanceID, startIdentity: startIdentity)
+        self.hostInstance = instance
+        self.registry = WorkHostRegistry(hostInstance: instance, bounds: bounds)
+        let controlURL = home.timelineV2WorkHostControlJournalURL(persistedHost)
+        if FileManager.default.fileExists(atPath: controlURL.path) {
+            self.controlJournal = try WorkHostControlJournal.reopenExisting(
+                home: home, workHost: persistedHost, actor: actor,
+                creationIdentityMinter: creationIdentityMinter)
+        } else {
+            self.controlJournal = try WorkHostControlJournal.createFresh(
+                home: home, workHost: persistedHost, actor: actor,
+                creationIdentityMinter: creationIdentityMinter)
+        }
+    }
+
+    /// Return source-reader instrumentation without exposing cache contents or filesystem paths.
+    /// A caller may use the delta between two samples to verify that a steady-state poll consumed
+    /// only an append suffix rather than rereading the complete journal.
+    public func journalReadMetrics() -> JournalBackedWorkServiceReadMetrics {
+        readMetrics
+    }
+
+    public func handshake(_ request: WorkServiceHandshakeRequest) async throws
+        -> WorkServiceHandshakeResponse {
+        try validateClient(request.client)
+        let catalog: WorkHostWorkspaceCatalog
+        switch await workspaceCatalogProbe.read() {
+        case .success(let freshCatalog):
+            catalog = freshCatalog
+        case .unavailable, .timedOut, .cancelled:
+            // This is deliberately performed before both accepted and rejected responses. A
+            // malformed/inaccessible registry must never be hidden by a stale or empty snapshot.
+            let cursor = try await currentControlCursor()
+            return WorkServiceHandshakeResponse(
+                accepted: false, negotiatedVersion: nil,
+                supportedRange: WorkServiceProtocol.minimumSupportedVersion
+                    ... WorkServiceProtocol.maximumSupportedVersion,
+                host: host, hostInstance: hostInstance,
+                controlJournal: cursor.journal, controlCursor: cursor,
+                capabilities: [], workspaceCatalog: .empty,
+                diagnostic: "workspace catalog unavailable")
+        }
+        guard request.protocolVersion >= WorkServiceProtocol.minimumSupportedVersion,
+              request.protocolVersion <= WorkServiceProtocol.maximumSupportedVersion else {
+            return WorkServiceHandshakeResponse(
+                accepted: false, negotiatedVersion: nil,
+                supportedRange: WorkServiceProtocol.minimumSupportedVersion ...
+                    WorkServiceProtocol.maximumSupportedVersion,
+                host: host, hostInstance: hostInstance,
+                controlJournal: try await currentControlCursor().journal,
+                controlCursor: try await currentControlCursor(),
+                capabilities: [], workspaceCatalog: catalog,
+                diagnostic: "unsupported Work service protocol version")
+        }
+        let cursor = try await currentControlCursor()
+        return WorkServiceHandshakeResponse(
+            accepted: true, negotiatedVersion: WorkServiceProtocol.currentVersion,
+            supportedRange: WorkServiceProtocol.minimumSupportedVersion ...
+                WorkServiceProtocol.maximumSupportedVersion,
+            host: host, hostInstance: hostInstance,
+            controlJournal: cursor.journal, controlCursor: cursor,
+            capabilities: Set(WorkServiceCapability.allCases), workspaceCatalog: catalog)
+    }
+
+    public func listWorks(_ request: WorkServiceListRequest) async throws -> WorkServiceWorkPage {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        let listAuthorization = authorizer.authorization(
+            for: request.client, requested: [.observe])
+        guard listAuthorization.allows(.observe) else {
+            throw WorkServiceProtocolError.capabilityDenied(.observe)
+        }
+        guard request.pageSize > 0, request.pageSize <= WorkServiceBounds.maxPageSize else {
+            throw WorkServiceProtocolError.invalidRequest("page size is outside the protocol bound")
+        }
+        let all = try await allWorkRefs()
+        let offset = try parsePageToken(request.pageToken, total: all.count)
+        let selected = Array(all.dropFirst(offset).prefix(request.pageSize))
+        var descriptors: [WorkServiceWorkDescriptor] = []
+        var unavailableDescriptorCount = 0
+        for work in selected {
+            do {
+                descriptors.append(try await descriptor(for: work, client: request.client))
+            } catch {
+                // One corrupt or unavailable Work must not make a bounded inventory page
+                // unprogressable. The sorted source page is still consumed, while the typed
+                // omission records that this row was deliberately not projected. Do not expose
+                // arbitrary source errors in the transport diagnostic.
+                unavailableDescriptorCount += 1
+            }
+        }
+        let nextOffset = offset + selected.count
+        let omissions: [WorkServiceOmission] = unavailableDescriptorCount == 0 ? [] : [
+            WorkServiceOmission(
+                category: "work_descriptors", count: unavailableDescriptorCount,
+                diagnostic: "one or more Work descriptors were unavailable")
+        ]
+        return WorkServiceWorkPage(
+            works: descriptors,
+            nextPageToken: nextOffset < all.count ? String(nextOffset) : nil,
+            omissions: omissions)
+    }
+
+    public func describeWork(_ request: WorkServiceDescribeRequest) async throws -> WorkServiceWorkDescriptor {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        _ = try await requireCanonical(work: request.work, journal: request.journal)
+        guard try await clientHasObserve(work: request.work, client: request.client) else {
+            throw WorkServiceProtocolError.capabilityDenied(.observe)
+        }
+        return try await descriptor(for: request.work, client: request.client)
+    }
+
+    public func createWork(_ request: WorkServiceCreateWorkRequest) async throws
+        -> WorkServiceCreateWorkResponse {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        guard validConfigurationBounds(request.configuration) else {
+            throw WorkServiceProtocolError.invalidRequest("configuration exceeds protocol bounds")
+        }
+        let auth = authorizer.authorization(
+            for: request.client, requested: request.requestedCapabilities)
+        guard auth.allows(.observe), auth.allows(.control) else {
+            throw WorkServiceProtocolError.capabilityDenied(
+                auth.denied.contains(.observe) ? .observe : .control)
+        }
+        guard let manifestStore else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        // Inspect the durable control key before asking a resolver for launch material. A lost
+        // Create response must replay the already-bound template, even if defaults, provider
+        // routing, or workspace preferences changed while the process was down.
+        let controlBeforeRetain = try await controlSnapshot()
+        let priorCreation = controlBeforeRetain.creation(
+            client: request.client, commandID: request.commandID)
+        let retainedManifest: JournalBackedWorkLaunchManifest?
+        let reservation: WorkHostControlCreationReservation
+        let priorManifest: JournalBackedWorkLaunchManifest?
+        if let priorCreation {
+            guard !priorCreation.isConflicted else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            reservation = priorCreation.reservation
+            guard reservation.causalControlCursor == request.causalControlCursor else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "Create retry does not match its durable causal control cursor")
+            }
+            let priorBinding = WorkBinding(
+                session: reservation.session,
+                work: reservation.work,
+                workHost: host,
+                sessionAttachment: reservation.sessionAttachment)
+            let resolved = try await manifestStore.resolve(
+                work: reservation.work,
+                session: reservation.session,
+                sessionAttachment: reservation.sessionAttachment)
+            if let resolved {
+                if let requested = resolved.requestedConfiguration {
+                    guard requested == request.configuration else {
+                        throw WorkServiceProtocolError.invalidRequest(
+                            "Create retry does not match its durable requested configuration")
+                    }
+                }
+                if let capabilities = resolved.requestedCapabilities {
+                    guard capabilities == request.requestedCapabilities else {
+                        throw WorkServiceProtocolError.invalidRequest(
+                            "Create retry does not match its durable capabilities")
+                    }
+                }
+                guard let template = resolved.template,
+                      template.binding == priorBinding,
+                      resolved.identity == nil,
+                      resolved.bodyDigest == reservation.bodyDigest,
+                      resolved.configurationDigest == reservation.configurationDigest else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                retainedManifest = nil
+                priorManifest = resolved
+            } else {
+                // A crash after reservation but before template publication can still recover the
+                // exact retained draft by the full client/command/cursor/digest proof. It must
+                // never rerun the resolver, since ambient defaults may have changed.
+                guard priorCreation.registration == nil,
+                      let recovered = try await manifestStore.recoverReservation(reservation),
+                      recovered.template == nil,
+                      recovered.retainedRecord != nil,
+                      recovered.bodyDigest == reservation.bodyDigest,
+                      recovered.configurationDigest == reservation.configurationDigest else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                if let requested = recovered.requestedConfiguration {
+                    guard requested == request.configuration else {
+                        throw WorkServiceProtocolError.invalidRequest(
+                            "Create retry does not match its durable requested configuration")
+                    }
+                }
+                if let capabilities = recovered.requestedCapabilities {
+                    guard capabilities == request.requestedCapabilities else {
+                        throw WorkServiceProtocolError.invalidRequest(
+                            "Create retry does not match its durable capabilities")
+                    }
+                }
+                retainedManifest = recovered
+                priorManifest = nil
+            }
+        } else {
+            // Manifest retention is intentionally before reservation: a control digest without
+            // host-private launch material is not a reusable creation proof after restart.
+            let retained = try await manifestStore.retain(request)
+            try validateManifest(retained)
+            let creationRequest = WorkHostControlCreationRequest(
+                client: request.client, commandID: request.commandID,
+                bodyDigest: retained.bodyDigest,
+                configurationDigest: retained.configurationDigest,
+                causalControlCursor: request.causalControlCursor)
+            retainedManifest = retained
+            reservation = try await controlJournal.reserveCreation(creationRequest)
+            priorManifest = nil
+        }
+        let binding = WorkBinding(
+            session: reservation.session,
+            work: reservation.work,
+            workHost: host,
+            sessionAttachment: reservation.sessionAttachment)
+        // A response retry after registration must resolve the exact identity-bound record. It
+        // may not mint a new Run or republish a different manifest merely because the first
+        // response was lost. A reservation with no registration is the only crash window where a
+        // fresh same-command bind is allowed to repair the incomplete transaction.
+        let controlBeforeBind = try await controlSnapshot()
+        let priorRegistration = controlBeforeBind.creation(
+            client: request.client, commandID: request.commandID)?.registration
+        let manifest: JournalBackedWorkLaunchManifest
+        if let priorManifest {
+            manifest = priorManifest
+        } else {
+            guard priorRegistration == nil else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            guard let retainedManifest else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            // Create publishes only the Run-free template. A Run is an execution generation and
+            // is minted by Start, never by a retry of this control operation.
+            manifest = try await manifestStore.bindTemplate(
+                retainedManifest, binding: binding)
+        }
+        try validateManifest(manifest)
+        guard let template = manifest.template,
+              template.binding == binding,
+              manifest.identity == nil,
+              manifest.bodyDigest == reservation.bodyDigest,
+              manifest.configurationDigest == reservation.configurationDigest else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "Create requires an exact Run-free launch template")
+        }
+        manifests[reservation.work] = manifest
+        let registration = try await ensureRegistered(
+            reservation: reservation, binding: binding)
+        // Create admits an idle Work only. Opening HostedInHouseWork here would append a
+        // `run.started` marker before the client has issued Start, making the response depend on
+        // whether a provider resolver happened to be available and falsely projecting running.
+        // The registry is populated by Start, after an execution generation is explicitly
+        // admitted. This also leaves a lost Create response replayable from the idle pair.
+        // A fresh verified projection is required immediately before returning a creation
+        // response. This closes the journal-write/registration/response crash window.
+        let projection = await controlJournal.verifiedCreationProjection(
+            client: request.client, commandID: request.commandID)
+        guard projection.verification.isVerified,
+              projection.projection?.state == .registered,
+              projection.projection?.responseIsReconstructable == true,
+              let verifiedRegistration = projection.projection?.registration,
+              verifiedRegistration == registration else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let attachment = try await attachForCreate(
+            request: request, reservation: reservation,
+            registration: verifiedRegistration, authorization: auth)
+        let controlCursor = try await currentControlCursor()
+        let source = try await canonicalSource(
+            work: reservation.work, journal: verifiedRegistration.workJournal,
+            registration: verifiedRegistration)
+        let descriptor = try await descriptor(for: reservation.work, client: request.client)
+        return WorkServiceCreateWorkResponse(
+            work: descriptor, authorization: auth,
+            session: reservation.session, sessionJournal: verifiedRegistration.sessionJournal,
+            sessionAttachment: reservation.sessionAttachment,
+            attachment: attachment,
+            workCursor: source.workCursor, sessionCursor: source.sessionCursor,
+            controlCursor: controlCursor,
+            receipt: WorkServiceControlReceipt(
+                operation: .createWork, work: reservation.work,
+                commandID: request.commandID, state: .accepted,
+                host: hostInstance, causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor, authorization: auth,
+                outcome: .created))
+    }
+
+    public func attach(_ request: WorkServiceAttachRequest) async throws -> WorkServiceAttachResponse {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        // Reconcile the durable command before reading source journals or checking the current
+        // control cursor. A response can be lost after the control append, and a later mutation
+        // (or an unavailable source) must not turn an exact retry into a stale/error result.
+        if let prior = try await controlJournal.priorCommand(
+            work: request.work, client: request.client, commandID: request.commandID) {
+            guard prior.event.type == TimelineEventType.clientAttached,
+                  prior.event.work == request.work,
+                  prior.event.journal == controlJournal.journal,
+                  prior.event.client == request.client,
+                  prior.event.clientAttachment != nil,
+                  prior.event.command?.commandID == request.commandID,
+                  prior.event.command?.causalCursor == request.causalControlCursor,
+                  let workJournal: JournalRef = decodeControlPayload(
+                      prior.event.payload["work_journal"]),
+                  workJournal == request.journal,
+                  let capabilities: [String] = decodeControlPayload(
+                      prior.event.payload["capabilities"]),
+                  let requestedCapabilities: [String] = decodeControlPayload(
+                      prior.event.payload["requested_capabilities"]),
+                  let command = prior.event.command,
+                  let attachmentRef = prior.event.clientAttachment else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "client-qualified attach command conflicts with a prior request")
+            }
+            let sessionJournal: JournalRef? = decodeControlPayload(
+                prior.event.payload["session_journal"])
+            let identity = WorkHostControlMutationIdentity(
+                type: TimelineEventType.clientAttached, work: request.work,
+                workJournal: workJournal, attachment: attachmentRef, client: request.client,
+                session: prior.event.session, sessionJournal: sessionJournal,
+                sessionAttachment: prior.event.sessionAttachment,
+                capabilities: capabilities.sorted(),
+                requestedCapabilities: requestedCapabilities.sorted(),
+                targetJournal: nil, targetCursor: nil,
+                causalControlCursor: request.causalControlCursor)
+            guard let exact = try await controlJournal.priorMutation(identity, command: command),
+                  exact.event.eventID == prior.event.eventID else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "client-qualified attach command conflicts with a prior request")
+            }
+            let suppliedSessionTuple = request.session != nil
+                || request.sessionJournal != nil || request.sessionAttachment != nil
+            if suppliedSessionTuple {
+                guard request.session == prior.event.session,
+                      request.sessionJournal == sessionJournal,
+                      request.sessionAttachment == prior.event.sessionAttachment else {
+                    throw WorkServiceProtocolError.invalidRequest(
+                        "client-qualified attach command conflicts with a prior request")
+                }
+            }
+            guard requestedCapabilities == request.requestedCapabilities
+                .map(\.rawValue).sorted() else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "client-qualified attach command conflicts with a prior request")
+            }
+            let control = try await controlSnapshot()
+            guard let record = control.clientAttachments.values.first(where: {
+                $0.attachedEvent == EventRef(journal: prior.event.journal,
+                                             eventID: prior.event.eventID)
+                    && $0.workJournal == request.journal
+            }) else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let requested = Set(requestedCapabilities.compactMap(WorkServiceCapability.init(rawValue:)))
+            let duplicateAuthorization = WorkServiceAuthorizationOutcome(
+                requested: requested,
+                granted: Set(record.capabilities.compactMap(WorkServiceCapability.init(rawValue:))),
+                denied: requested.subtracting(
+                    Set(record.capabilities.compactMap(WorkServiceCapability.init(rawValue:)))))
+            let attachment = try clientAttachment(
+                record, control: control, authorizationOverride: duplicateAuthorization)
+            let descriptor = try await descriptor(for: request.work, client: request.client)
+            let resulting = prior.commit.cursor
+            return WorkServiceAttachResponse(
+                work: descriptor, attachment: attachment,
+                authorization: attachment.authorization, commandID: request.commandID,
+                state: .duplicate, host: hostInstance,
+                causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: resulting,
+                receipt: controlReceipt(
+                    .attach, work: request.work, commandID: request.commandID,
+                    state: .duplicate, causal: request.causalControlCursor,
+                    resulting: resulting, authorization: duplicateAuthorization,
+                    outcome: .attached))
+        }
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        let auth = authorizer.authorization(
+            for: request.client, requested: request.requestedCapabilities)
+        guard auth.allows(.observe) else {
+            throw WorkServiceProtocolError.capabilityDenied(.observe)
+        }
+        let cursor = try await currentControlCursor()
+        guard request.causalControlCursor == cursor else {
+            throw WorkServiceProtocolError.staleCursor(expected: request.causalControlCursor, actual: cursor)
+        }
+        let sessionTuple = try normalizedSessionTuple(
+            request.session, request.sessionJournal, request.sessionAttachment, source: source)
+        let attachmentRef = try await mintClientAttachment()
+        let command = CommandRef(
+            commandID: request.commandID, client: request.client,
+            // The normalized tuple is the authority for this attachment's Session identity.
+            // Keep the command envelope tied to it rather than the source's shorthand field.
+            sessionAttachment: sessionTuple.attachment, causalCursor: request.causalControlCursor)
+        _ = try await controlJournal.attachClient(
+            work: request.work, workJournal: request.journal, attachment: attachmentRef,
+            client: request.client, capabilities: Set(auth.granted.map(\.rawValue)),
+            requestedCapabilities: Set(request.requestedCapabilities.map(\.rawValue)),
+            session: sessionTuple.session, sessionJournal: sessionTuple.journal,
+            sessionAttachment: sessionTuple.attachment, command: command,
+            causalControlCursor: request.causalControlCursor)
+        let resulting = try await currentControlCursor()
+        let descriptor = try await descriptor(for: request.work, client: request.client)
+        let updatedControl = try await controlSnapshot()
+        guard let record = updatedControl.clientAttachments[attachmentRef.attachmentID] else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let attachment = try clientAttachment(record, control: updatedControl)
+        return WorkServiceAttachResponse(
+            work: descriptor, attachment: attachment, authorization: auth,
+            commandID: request.commandID, state: .accepted, host: hostInstance,
+            causalControlCursor: request.causalControlCursor, resultingControlCursor: resulting,
+            receipt: controlReceipt(.attach, work: request.work, commandID: request.commandID,
+                                    state: .accepted, causal: request.causalControlCursor,
+                                    resulting: resulting, authorization: auth,
+                                    outcome: .attached))
+    }
+
+    public func detach(_ request: WorkServiceDetachRequest) async throws -> WorkServiceDetachResponse {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        if let prior = try await controlJournal.priorCommand(
+            work: request.work, client: request.client, commandID: request.commandID) {
+            guard prior.event.type == TimelineEventType.clientDetached,
+                  prior.event.work == request.work,
+                  prior.event.journal == controlJournal.journal,
+                  prior.event.client == request.client,
+                  prior.event.clientAttachment == request.attachment,
+                  prior.event.command?.commandID == request.commandID,
+                  prior.event.command?.causalCursor == request.causalControlCursor,
+                  let workJournal: JournalRef = decodeControlPayload(
+                      prior.event.payload["work_journal"]),
+                  workJournal == request.journal,
+                  let command = prior.event.command else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "client-qualified detach command conflicts with a prior request")
+            }
+            let sessionJournal: JournalRef? = decodeControlPayload(
+                prior.event.payload["session_journal"])
+            let identity = WorkHostControlMutationIdentity(
+                type: TimelineEventType.clientDetached, work: request.work,
+                workJournal: workJournal, attachment: request.attachment,
+                client: request.client, session: prior.event.session,
+                sessionJournal: sessionJournal,
+                sessionAttachment: prior.event.sessionAttachment,
+                capabilities: nil, requestedCapabilities: nil,
+                targetJournal: nil, targetCursor: nil,
+                causalControlCursor: request.causalControlCursor)
+            guard let exact = try await controlJournal.priorMutation(identity, command: command),
+                  exact.event.eventID == prior.event.eventID else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "client-qualified detach command conflicts with a prior request")
+            }
+            let control = try await controlSnapshot()
+            guard let current = control.clientAttachments[request.attachment.attachmentID],
+                  current.client == request.client, current.work == request.work,
+                  current.workJournal == request.journal else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let resulting = prior.commit.cursor
+            let authorization = authorization(current)
+            let receipt = controlReceipt(
+                .detach, work: request.work, commandID: request.commandID,
+                state: .duplicate, causal: request.causalControlCursor,
+                resulting: resulting, authorization: authorization, outcome: .detached)
+            return WorkServiceDetachResponse(
+                work: request.work, commandID: request.commandID, state: .duplicate,
+                host: hostInstance, causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: resulting, receipt: receipt)
+        }
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        let control = try await controlSnapshot()
+        guard let current = control.clientAttachments[request.attachment.attachmentID],
+              current.client == request.client, current.work == request.work,
+              current.workJournal == request.journal, current.isAttached else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
+        guard current.capabilities.contains(WorkServiceCapability.control.rawValue) else {
+            throw WorkServiceProtocolError.capabilityDenied(.control)
+        }
+        try validateSessionTuple(
+            current.session, current.sessionJournal, current.sessionAttachment,
+            expectedSession: source.session, expectedJournal: source.sessionJournal,
+            expectedAttachment: source.sessionAttachment)
+        let cursor = try await currentControlCursor()
+        guard request.causalControlCursor == cursor else {
+            throw WorkServiceProtocolError.staleCursor(expected: request.causalControlCursor, actual: cursor)
+        }
+        let command = CommandRef(
+            commandID: request.commandID, client: request.client,
+            sessionAttachment: current.sessionAttachment,
+            causalCursor: request.causalControlCursor)
+        _ = try await controlJournal.explicitlyDetachClient(
+            work: request.work, workJournal: request.journal, attachment: request.attachment,
+            client: request.client, session: current.session, sessionJournal: current.sessionJournal,
+            sessionAttachment: current.sessionAttachment, command: command,
+            causalControlCursor: request.causalControlCursor)
+        let resulting = try await currentControlCursor()
+        let receipt = controlReceipt(.detach, work: request.work, commandID: request.commandID,
+                                    state: .accepted, causal: request.causalControlCursor,
+                                    resulting: resulting, authorization: authorization(current),
+                                    outcome: .detached)
+        return WorkServiceDetachResponse(
+            work: request.work, commandID: request.commandID, state: .accepted,
+            host: hostInstance, causalControlCursor: request.causalControlCursor,
+            resultingControlCursor: resulting, receipt: receipt)
+    }
+
+    public func updateCapabilities(_ request: WorkServiceUpdateCapabilitiesRequest) async throws
+        -> WorkServiceUpdateCapabilitiesResponse {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        if let prior = try await controlJournal.priorCommand(
+            work: request.work, client: request.client, commandID: request.commandID) {
+            guard prior.event.type == TimelineEventType.clientCapabilityChanged,
+                  prior.event.work == request.work,
+                  prior.event.journal == controlJournal.journal,
+                  prior.event.client == request.client,
+                  prior.event.clientAttachment == request.attachment,
+                  prior.event.command?.commandID == request.commandID,
+                  prior.event.command?.causalCursor == request.causalControlCursor,
+                  let workJournal: JournalRef = decodeControlPayload(
+                      prior.event.payload["work_journal"]),
+                  workJournal == request.journal,
+                  let capabilities: [String] = decodeControlPayload(
+                      prior.event.payload["capabilities"]),
+                  let requestedCapabilities: [String] = decodeControlPayload(
+                      prior.event.payload["requested_capabilities"]),
+                  let command = prior.event.command else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "client-qualified capability command conflicts with a prior request")
+            }
+            let sessionJournal: JournalRef? = decodeControlPayload(
+                prior.event.payload["session_journal"])
+            let identity = WorkHostControlMutationIdentity(
+                type: TimelineEventType.clientCapabilityChanged, work: request.work,
+                workJournal: workJournal, attachment: request.attachment,
+                client: request.client, session: prior.event.session,
+                sessionJournal: sessionJournal,
+                sessionAttachment: prior.event.sessionAttachment,
+                capabilities: capabilities.sorted(),
+                requestedCapabilities: requestedCapabilities.sorted(),
+                targetJournal: nil, targetCursor: nil,
+                causalControlCursor: request.causalControlCursor)
+            guard let exact = try await controlJournal.priorMutation(identity, command: command),
+                  exact.event.eventID == prior.event.eventID else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "client-qualified capability command conflicts with a prior request")
+            }
+            guard requestedCapabilities == request.requestedCapabilities
+                .map(\.rawValue).sorted() else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "client-qualified capability command conflicts with a prior request")
+            }
+            let control = try await controlSnapshot()
+            guard let current = control.clientAttachments[request.attachment.attachmentID],
+                  current.client == request.client, current.work == request.work,
+                  current.workJournal == request.journal else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            var durable = current
+            durable.capabilities = Set(capabilities)
+            let attachment = try clientAttachment(durable, control: control)
+            let authorization = WorkServiceAuthorizationOutcome(
+                requested: request.requestedCapabilities,
+                granted: attachment.authorization.granted,
+                denied: request.requestedCapabilities.subtracting(
+                    attachment.authorization.granted))
+            let resulting = prior.commit.cursor
+            return WorkServiceUpdateCapabilitiesResponse(
+                work: request.work, attachment: attachment, authorization: authorization,
+                commandID: request.commandID, state: .duplicate, host: hostInstance,
+                causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: resulting,
+                receipt: controlReceipt(
+                    .updateCapabilities, work: request.work, commandID: request.commandID,
+                    state: .duplicate, causal: request.causalControlCursor,
+                    resulting: resulting, authorization: authorization,
+                    outcome: .capabilitiesUpdated))
+        }
+        _ = try await requireCanonical(work: request.work, journal: request.journal)
+        let auth = authorizer.authorization(
+            for: request.client, requested: request.requestedCapabilities)
+        guard auth.allows(.observe) else { throw WorkServiceProtocolError.capabilityDenied(.observe) }
+        let control = try await controlSnapshot()
+        guard let current = control.clientAttachments[request.attachment.attachmentID],
+              current.client == request.client, current.work == request.work,
+              current.workJournal == request.journal, current.isAttached else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
+        guard current.capabilities.contains(WorkServiceCapability.control.rawValue) else {
+            throw WorkServiceProtocolError.capabilityDenied(.control)
+        }
+        let cursor = try await currentControlCursor()
+        guard request.causalControlCursor == cursor else {
+            throw WorkServiceProtocolError.staleCursor(expected: request.causalControlCursor, actual: cursor)
+        }
+        let command = CommandRef(commandID: request.commandID, client: request.client,
+                                 sessionAttachment: current.sessionAttachment,
+                                 causalCursor: request.causalControlCursor)
+        _ = try await controlJournal.updateClientCapabilities(
+            work: request.work, workJournal: request.journal, attachment: request.attachment,
+            client: request.client, capabilities: Set(auth.granted.map(\.rawValue)),
+            requestedCapabilities: Set(request.requestedCapabilities.map(\.rawValue)),
+            session: current.session, sessionJournal: current.sessionJournal,
+            sessionAttachment: current.sessionAttachment, command: command,
+            causalControlCursor: request.causalControlCursor)
+        let resulting = try await currentControlCursor()
+        let snapshot = try await controlSnapshot()
+        guard let updated = snapshot.clientAttachments[request.attachment.attachmentID] else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let attachment = try clientAttachment(updated, control: snapshot)
+        return WorkServiceUpdateCapabilitiesResponse(
+            work: request.work, attachment: attachment, authorization: auth,
+            commandID: request.commandID, state: .accepted, host: hostInstance,
+            causalControlCursor: request.causalControlCursor, resultingControlCursor: resulting,
+            receipt: controlReceipt(.updateCapabilities, work: request.work,
+                                    commandID: request.commandID, state: .accepted,
+                                    causal: request.causalControlCursor, resulting: resulting,
+                                    authorization: auth, outcome: .capabilitiesUpdated))
+    }
+
+    public func acknowledgeRead(_ request: WorkServiceAcknowledgeReadRequest) async throws
+        -> WorkServiceAcknowledgeReadResponse {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        if let prior = try await controlJournal.priorCommand(
+            work: request.work, client: request.client, commandID: request.commandID) {
+            guard prior.event.type == TimelineEventType.clientReadAcknowledged,
+                  prior.event.work == request.work,
+                  prior.event.journal == controlJournal.journal,
+                  prior.event.client == request.client,
+                  prior.event.clientAttachment == request.attachment,
+                  prior.event.command?.commandID == request.commandID,
+                  prior.event.command?.causalCursor == request.causalControlCursor,
+                  let workJournal: JournalRef = decodeControlPayload(
+                      prior.event.payload["work_journal"]),
+                  workJournal == request.journal,
+                  let targetJournal: JournalRef = decodeControlPayload(
+                      prior.event.payload["target_journal"]),
+                  targetJournal == request.target.journal,
+                  let targetCursor: JournalCursor = decodeControlPayload(
+                      prior.event.payload["cursor"]),
+                  targetCursor == request.cursor,
+                  let command = prior.event.command else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "client-qualified read acknowledgement conflicts with a prior request")
+            }
+            let sessionJournal: JournalRef? = decodeControlPayload(
+                prior.event.payload["session_journal"])
+            let identity = WorkHostControlMutationIdentity(
+                type: TimelineEventType.clientReadAcknowledged, work: request.work,
+                workJournal: workJournal, attachment: request.attachment,
+                client: request.client, session: prior.event.session,
+                sessionJournal: sessionJournal,
+                sessionAttachment: prior.event.sessionAttachment,
+                capabilities: nil, requestedCapabilities: nil,
+                targetJournal: targetJournal, targetCursor: targetCursor,
+                causalControlCursor: request.causalControlCursor)
+            guard let exact = try await controlJournal.priorMutation(identity, command: command),
+                  exact.event.eventID == prior.event.eventID else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "client-qualified read acknowledgement conflicts with a prior request")
+            }
+            let control = try await controlSnapshot()
+            guard let current = control.clientAttachments[request.attachment.attachmentID],
+                  current.client == request.client, current.work == request.work,
+                  current.workJournal == request.journal else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let authorization = authorization(current)
+            let resulting = prior.commit.cursor
+            return WorkServiceAcknowledgeReadResponse(
+                work: request.work, target: request.target, cursor: request.cursor,
+                commandID: request.commandID, state: .duplicate, host: hostInstance,
+                causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: resulting, authorization: authorization,
+                receipt: controlReceipt(
+                    .acknowledgeRead, work: request.work, commandID: request.commandID,
+                    state: .duplicate, causal: request.causalControlCursor,
+                    resulting: resulting, authorization: authorization,
+                    outcome: .readAcknowledged))
+        }
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        guard request.cursor.journal == request.target.journal else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
+        let control = try await controlSnapshot()
+        guard let current = control.clientAttachments[request.attachment.attachmentID],
+              current.client == request.client, current.work == request.work,
+              current.workJournal == request.journal, current.isAttached else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
+        guard current.capabilities.contains(WorkServiceCapability.observe.rawValue) else {
+            throw WorkServiceProtocolError.capabilityDenied(.observe)
+        }
+        try validateTarget(request.target, source: source)
+        let actualTargetCursor = request.target.session == nil ? source.workCursor : source.sessionCursor
+        guard request.cursor.sequence <= actualTargetCursor.sequence else {
+            throw WorkServiceProtocolError.staleCursor(expected: request.cursor, actual: actualTargetCursor)
+        }
+        let cursor = try await currentControlCursor()
+        guard request.causalControlCursor == cursor else {
+            throw WorkServiceProtocolError.staleCursor(expected: request.causalControlCursor, actual: cursor)
+        }
+        let command = CommandRef(commandID: request.commandID, client: request.client,
+                                 sessionAttachment: current.sessionAttachment,
+                                 causalCursor: request.causalControlCursor)
+        _ = try await controlJournal.acknowledgeRead(
+            work: request.work, workJournal: request.journal, attachment: request.attachment,
+            client: request.client, targetJournal: request.target.journal, cursor: request.cursor,
+            session: current.session, sessionJournal: current.sessionJournal,
+            sessionAttachment: current.sessionAttachment, command: command,
+            causalControlCursor: request.causalControlCursor)
+        let resulting = try await currentControlCursor()
+        return WorkServiceAcknowledgeReadResponse(
+            work: request.work, target: request.target, cursor: request.cursor,
+            commandID: request.commandID, state: .accepted, host: hostInstance,
+            causalControlCursor: request.causalControlCursor, resultingControlCursor: resulting,
+            authorization: authorization(current),
+            receipt: controlReceipt(.acknowledgeRead, work: request.work,
+                                    commandID: request.commandID, state: .accepted,
+                                    causal: request.causalControlCursor, resulting: resulting,
+                                    authorization: authorization(current), outcome: .readAcknowledged))
+    }
+
+    public func snapshot(_ request: WorkServiceSnapshotRequest) async throws -> WorkServiceSnapshot {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        try await requireAttached(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            client: request.client, capability: .observe)
+        let records = try records(for: request.target, source: source)
+        let page = try await page(
+            entry: records, journal: request.target.journal,
+            expectedURL: expectedURL(for: request.target, source: source),
+            after: request.afterCursor, target: request.target,
+            limit: request.limit, maxBytes: request.maxBytes)
+        return WorkServiceSnapshot(
+            work: try await descriptor(for: request.work, client: request.client),
+            events: page.events, target: request.target,
+            servedCursor: page.servedCursor, basePrefixDigest: page.basePrefixDigest,
+            prefixDigest: page.prefixDigest, omissions: page.omissions)
+    }
+
+    public func eventsAfterCursor(_ request: WorkServiceEventsRequest) async throws
+        -> WorkServiceEventPage {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        try await requireAttached(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            client: request.client, capability: .observe)
+        let records = try records(for: request.target, source: source)
+        let page = try await page(
+            entry: records, journal: request.target.journal,
+            expectedURL: expectedURL(for: request.target, source: source),
+            after: request.afterCursor, target: request.target,
+            limit: request.limit, maxBytes: request.maxBytes)
+        return WorkServiceEventPage(
+            events: page.events, target: request.target, servedCursor: page.servedCursor,
+            nextCursor: page.nextCursor, basePrefixDigest: page.basePrefixDigest,
+            prefixDigest: page.prefixDigest, omissions: page.omissions)
+    }
+
+    public func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws
+        -> WorkServiceArtifactDescriptor {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        try await requireAttached(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            client: request.client, capability: .inspectArtifacts)
+        guard let artifact = artifacts(in: source).first(where: { $0.artifactID == request.artifactID }) else {
+            throw WorkServiceProtocolError.artifactNotFound
+        }
+        return artifact
+    }
+
+    public func fetchBody(_ request: WorkServiceBodyRequest) async throws -> WorkServiceBodyResponse {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        let attachment = try await requireAttached(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            client: request.client, capability: .observe)
+        guard request.offset >= 0, request.limit > 0 else {
+            throw WorkServiceProtocolError.invalidRequest("body offset and limit must be positive")
+        }
+        guard request.reference.authority == request.journal
+                || request.reference.authority == source.sessionJournal else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
+        if artifacts(in: source).contains(where: { $0.bodyReference == request.reference })
+                && !attachment.authorization.allows(.inspectArtifacts) {
+            throw WorkServiceProtocolError.capabilityDenied(.inspectArtifacts)
+        }
+        guard try sourceContainsBodyReference(source, request.reference) else {
+            return WorkServiceBodyResponse(reference: request.reference, status: .unavailable,
+                                           offset: request.offset,
+                                           diagnostic: "body reference is not present in canonical journals")
+        }
+        let store = ContextBodyStore(home: home)
+        guard let body = try? store.read(request.reference) else {
+            return WorkServiceBodyResponse(reference: request.reference, status: .unavailable,
+                                           offset: request.offset, diagnostic: "body is not retained")
+        }
+        guard request.offset <= body.count else {
+            throw WorkServiceProtocolError.invalidRequest("body offset is beyond retained body")
+        }
+        let length = min(request.limit, WorkServiceBounds.maxBodyChunkBytes)
+        let end = request.offset + min(length, body.count - request.offset)
+        return WorkServiceBodyResponse(
+            reference: request.reference, status: .retained, offset: request.offset,
+            data: body.subdata(in: request.offset..<end), nextOffset: end < body.count ? end : nil)
+    }
+
+    public func command(_ request: WorkServiceCommandRequest) async throws
+        -> WorkServiceCommandReceipt {
+        try await ensureLoaded()
+        try validateClient(request.command.client)
+        guard let client = request.command.client,
+              request.command.causalCursor == request.causalWorkCursor else {
+            throw WorkServiceProtocolError.invalidRequest("command causal cursor is inconsistent")
+        }
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        let attachment = try await requireAttached(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            client: client, capability: capability(for: request.kind))
+        guard request.command.sessionAttachment == attachment.sessionAttachment else {
+            throw WorkServiceProtocolError.invalidRequest("command Session attachment does not match client attachment")
+        }
+        guard !request.valueWasTruncated,
+              (request.value?.utf8.count ?? 0) <= WorkServiceBounds.maxCommandValueCharacters else {
+            throw WorkServiceProtocolError.invalidRequest("command value exceeds protocol bounds")
+        }
+        if request.kind == .start {
+            // Start's value is part of the client-qualified launch identity. Resolve the durable
+            // Work template before any actor admission so a retry or a racing caller cannot bind
+            // the same Run reservation to different prompt bytes.
+            guard let store = manifestStore,
+                  try await store.resolve(
+                      work: request.work, session: source.session,
+                      sessionAttachment: source.sessionAttachment) != nil else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            // The per-Run body is retained at Start admission. The Run-free template is only
+            // configuration/reconstruction material and must not constrain a replacement's
+            // exact input bytes.
+        }
+        let commandLedgerID = qualifiedCommandID(clientID: client.clientID,
+                                                  commandID: request.command.commandID)
+        let priorCommand = source.workState.commands[commandLedgerID]
+        let liveActor: WorkHostRegistryLiveEntry?
+        if let lookup = await registry.lookup(request.work), case .live(let entry) = lookup {
+            liveActor = entry
+        } else {
+            liveActor = nil
+        }
+        let exactLiveActor = if let liveActor {
+            await exactLiveHostedActor(liveActor, source: source)
+        } else {
+            false
+        }
+        // An explicit End leaves the terminal Hosted actor in the registry until the replacement
+        // Start swaps it for the next Run. Its ended/closed snapshot is not a liveness proof, but
+        // it is a valid reusable boundary when the canonical Work has no active Run. Other
+        // disconnected, failed, or identity-mismatched actors remain recovery-required.
+        let endedLiveActor: Bool
+        if let liveActor {
+            let snapshot = await liveActor.hostedWork.snapshot()
+            endedLiveActor = snapshot.identity.work == source.registration.reservation.work
+                && snapshot.identity.sessionID == source.session.sessionID
+                && snapshot.sessionAttachment == source.sessionAttachment
+                && snapshot.lifecycle == .ended
+                && snapshot.journalHealth == .closed
+        } else {
+            endedLiveActor = false
+        }
+        // These are observations of a durable execution/recovery boundary, not ordinary
+        // command-state rejections. Do not let terminal commands or a send through an absent
+        // actor turn them back into an idle/reusable Work. The one exception is the exact Start
+        // admission retry which may repair a minted Run through the native marker bridge.
+        let exactStartRecoveryRetry: Bool
+        if request.kind == .start {
+            exactStartRecoveryRetry = try await isExactStartRecoveryRetry(
+                request, source: source, client: client)
+        } else {
+            exactStartRecoveryRetry = false
+        }
+        // The first Start may be suspended while the prompt resolver reads bounded ambient
+        // inputs. A same-intent request must join that exact in-process task before the durable
+        // reservation is classified as an unfinished crash; a different intent remains fenced.
+        let inFlightStartAdmission: Bool = if request.kind == .start {
+            startsInProgress[startAdmissionKey(
+                work: request.work, client: client,
+                commandID: request.command.commandID,
+                causalWorkCursor: request.causalWorkCursor,
+                prompt: request.value ?? "")] != nil
+        } else {
+            false
+        }
+        let unstartedStartReservation = try await hasUnstartedStartReservation(source)
+        let registryRequiresRecovery: Bool = if let lookup = await registry.lookup(request.work) {
+            switch lookup {
+            case .recovering, .unavailable: true
+            case .live, .historical: false
+            }
+        } else {
+            false
+        }
+        let executionRequiresRecovery = source.workState.execution == .failed
+            || source.workState.execution == .unknown
+            || (unstartedStartReservation && !inFlightStartAdmission)
+            || (source.workState.activeRun != nil && !exactLiveActor)
+            || (source.workState.activeRun == nil
+                && source.workState.execution != .idle && !exactLiveActor)
+            // A registry `.live` label is only an ownership lookup. If its Hosted snapshot is
+            // disconnected, failed, stale, or otherwise mismatched, even an idle reducer state
+            // must remain non-actionable until an exact recovery path proves a healthy actor.
+            || (liveActor != nil && !exactLiveActor
+                && !(request.kind == .start && source.workState.activeRun == nil
+                    && endedLiveActor))
+            || registryRequiresRecovery
+        // A Start retry needs the durable, client-qualified admission record. The Work command
+        // projection intentionally does not retain enough request body material to prove that a
+        // caller with the same textual id supplied the same launch. If the exact Start record is
+        // present, its acceptance is already canonical and a lost response can be replayed without
+        // reopening an ended actor or minting a second Run.
+        if request.kind == .start, priorCommand != nil {
+            guard let priorCursor = priorCommand?.command.causalCursor,
+                  request.causalWorkCursor == priorCursor else {
+                throw WorkServiceProtocolError.staleCursor(
+                    expected: priorCommand?.command.causalCursor ?? source.workCursor,
+                    actual: request.causalWorkCursor)
+            }
+            guard let priorManifest = try await resolveStartManifest(
+                work: request.work, source: source, client: client,
+                commandID: request.command.commandID, prompt: request.value ?? ""),
+                  let priorRecord = priorManifest.durableRecord,
+                  startBodyMatches(
+                    request.value ?? "", record: priorRecord) else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            // A Work may already have a newer Run actor after End -> Start. Only an actor whose
+            // complete identity matches this historical Start is a liveness proof for its
+            // duplicate receipt; a different current Run must remain explicitly unproven.
+            let samePriorIdentity = liveActor.map {
+                $0.hostedWork.identity.work == priorRecord.manifest.identity.work
+                    && $0.hostedWork.identity.sessionID == priorRecord.manifest.identity.session.sessionID
+                    && $0.hostedWork.identity.runID == priorRecord.manifest.identity.run.runID
+                    && $0.hostedWork.sessionAttachment == priorRecord.manifest.identity.sessionAttachment
+            } ?? false
+            // Identity alone is not a liveness proof. The exact snapshot gate also checks the
+            // runtime connection, journal health, lifecycle, and active Run tuple; a retained
+            // actor with the right IDs but a failed/disconnected writer remains recovery-required.
+            let hasLiveActorForPrior = samePriorIdentity && exactLiveActor
+            let latest = try await canonicalSource(
+                work: request.work, journal: request.journal,
+                registration: source.registration)
+            let priorState = priorCommand!.state
+            let recoveryRequired = source.workState.activeRun == priorRecord.manifest.identity.run
+                && !hasLiveActorForPrior
+            let deliveryDiagnostic: String?
+            let duplicateOutcome: WorkServiceCommandOutcome?
+            let duplicateRejection: WorkServiceCommandRejection?
+            let duplicateRecoveryState: CommandDeliveryState?
+            switch priorState {
+            case .accepted:
+                duplicateOutcome = recoveryRequired ? .startRecoveryRequired : .started
+                duplicateRejection = nil
+                duplicateRecoveryState = recoveryRequired ? .accepted : nil
+                deliveryDiagnostic = recoveryRequired
+                    ? "Start was accepted before host loss; delivery is unproven and no redispatch was attempted"
+                    : "Start was already durably admitted"
+            case .delivered:
+                duplicateOutcome = recoveryRequired ? .startRecoveryRequired : .started
+                duplicateRejection = nil
+                duplicateRecoveryState = recoveryRequired ? .delivered : nil
+                deliveryDiagnostic = recoveryRequired
+                    ? "Start was accepted and delivered before host loss; execution recovery is required and no redispatch was attempted"
+                    : "Start was already durably admitted and delivered"
+            case .rejected:
+                duplicateOutcome = nil
+                duplicateRejection = .invalidState
+                duplicateRecoveryState = nil
+                deliveryDiagnostic = "Start was durably rejected"
+            case .notDelivered:
+                duplicateOutcome = .startRecoveryRequired
+                duplicateRejection = nil
+                duplicateRecoveryState = .notDelivered
+                deliveryDiagnostic = "Start was accepted but durably marked not delivered; recovery is required and no redispatch was attempted"
+            case .indeterminate:
+                duplicateOutcome = .startRecoveryRequired
+                duplicateRejection = nil
+                duplicateRecoveryState = .indeterminate
+                deliveryDiagnostic = "Start delivery is indeterminate; recovery is required and no redispatch was attempted"
+            }
+            let exactEvidence = try JournalBackedWorkServiceCommandEvidence.resolve(
+                snapshot: latest.workState, journal: latest.workJournal,
+                request: request, client: client)
+            let receiptState: WorkServiceCommandReceiptState = priorState == .rejected
+                ? .rejected : .duplicate
+            return WorkServiceCommandReceipt(
+                work: request.work, commandID: request.command.commandID,
+                state: receiptState, host: hostInstance,
+                // Public rejection receipts do not claim an accepted execution ordering.
+                // The rejection event remains addressable through `resultingWorkCursor`.
+                hostSequence: receiptState == .rejected ? nil : exactEvidence.hostSequence,
+                hostProvenance: hasLiveActorForPrior ? .current : .unknown,
+                causalWorkCursor: priorCommand?.command.causalCursor ?? request.causalWorkCursor,
+                resultingWorkCursor: exactEvidence.cursor,
+                authorization: attachment.authorization, outcome: duplicateOutcome,
+                rejection: duplicateRejection, recoveryState: duplicateRecoveryState,
+                diagnostic: deliveryDiagnostic)
+        }
+        // A duplicate Start can return its already-canonical recovery receipt without acting on
+        // the host. All new commands, including terminal commands, remain fail-closed while the
+        // durable execution boundary is unproven; only an exact non-duplicate Start retry may
+        // repair a pre-run marker through the native bridge below.
+        guard !executionRequiresRecovery || exactStartRecoveryRetry || inFlightStartAdmission else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        // A retry may carry the original (now stale) cursor. Only the exact live actor can
+        // compare the complete command value and reconcile the response; after restart, a Work
+        // command projection deliberately lacks enough body material to invent that proof.
+        if priorCommand != nil && liveActor == nil
+                && request.kind != .complete && request.kind != .destroy {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let initialStartRecoveryCursor = request.kind == .start
+            ? startPredecessorCursor(source) : nil
+        guard request.causalWorkCursor == source.workCursor || priorCommand != nil
+                || request.kind == .complete || request.kind == .destroy
+                || request.causalWorkCursor == initialStartRecoveryCursor else {
+            throw WorkServiceProtocolError.staleCursor(
+                expected: request.causalWorkCursor, actual: source.workCursor)
+        }
+        switch request.kind {
+        case .hold:
+            throw WorkServiceProtocolError.invalidRequest("hold is not supported by HostedInHouseWork")
+        case .complete, .destroy:
+            return try await terminalCommand(request, source: source, attachment: attachment,
+                                             client: client)
+        case .start, .send, .steer, .queue, .cancel, .end:
+            break
+        }
+        let live: WorkHostRegistryLiveEntry
+        var ownsStartAdmission = false
+        var startAdmissionKeyToRelease: StartAdmissionKey?
+        defer {
+            if ownsStartAdmission, let key = startAdmissionKeyToRelease {
+                startsInProgress.removeValue(forKey: key)
+            }
+        }
+        var commandSource = source
+        if request.kind == .start {
+            let admission = try await admitStartActor(
+                work: request.work, source: source, client: client,
+                commandID: request.command.commandID,
+                causalWorkCursor: request.causalWorkCursor,
+                prompt: request.value ?? "")
+            live = admission.entry
+            ownsStartAdmission = admission.ownsTask
+            if ownsStartAdmission {
+                startAdmissionKeyToRelease = startAdmissionKey(
+                    work: request.work, client: client,
+                    commandID: request.command.commandID,
+                    causalWorkCursor: request.causalWorkCursor,
+                    prompt: request.value ?? "")
+            }
+            commandSource = try await canonicalSource(
+                work: request.work, journal: request.journal,
+                registration: source.registration)
+        } else if let lookup = await registry.lookup(request.work), case .live(let entry) = lookup {
+            live = entry
+        } else {
+            throw WorkServiceProtocolError.hostUnavailable(host)
+        }
+        let sessionCommand: SessionCommand
+        switch request.kind {
+        case .start: sessionCommand = .start(prompt: request.value ?? "")
+        case .send: sessionCommand = .send(prompt: request.value ?? "")
+        case .steer: sessionCommand = .steer(text: request.value ?? "")
+        case .queue: sessionCommand = .queueFollowUp(text: request.value ?? "")
+        case .cancel:
+            guard let value = request.value,
+                  let scope = SessionCancellationScope(rawValue: value) else {
+                throw WorkServiceProtocolError.invalidRequest("cancel requires a valid scope")
+            }
+            sessionCommand = .cancel(scope: scope)
+        case .end: sessionCommand = .endRun
+        case .hold, .destroy, .complete: fatalError("terminal/hold handled above")
+        }
+        let hosted = HostedInHouseWorkCommand(
+            work: request.work, session: SessionRef(commandSource.session.sessionID),
+            sessionAttachment: commandSource.sessionAttachment, client: client,
+            commandID: request.command.commandID,
+            // The caller's cursor is the command's canonical causal identity. The execution
+            // opener must provide a journal-level bridge for the preceding `run.started` marker;
+            // substituting the post-open cursor here would produce a split-brain receipt and
+            // canonical CommandRef. Until that bridge is available, the native journal fails
+            // closed rather than silently rewriting this identity.
+            causalCursor: request.causalWorkCursor,
+            command: sessionCommand)
+        do {
+            let result = try await live.hostedWork.submit(hosted)
+            // A same-intent caller which joined the in-process admission task is a duplicate
+            // even though Hosted's idempotent command ledger returns the original accepted
+            // receipt. Preserve one accepted opener and one duplicate reconciliation at the
+            // public service boundary; later retries use the durable prior-command branch.
+            let state: WorkServiceCommandReceiptState = if result.receipt.wasAdmitted {
+                request.kind == .start && !ownsStartAdmission ? .duplicate : .accepted
+            } else {
+                .rejected
+            }
+            let outcome = result.receipt.wasAdmitted ? commandOutcome(request.kind) : nil
+            let latest = try await canonicalSource(
+                work: request.work, journal: request.journal,
+                registration: source.registration)
+            let exactEvidence: JournalBackedWorkServiceCommandEvidence.Result?
+            if result.receipt.wasAdmitted {
+                exactEvidence = try JournalBackedWorkServiceCommandEvidence.resolve(
+                    snapshot: latest.workState, journal: latest.workJournal,
+                    request: request, client: client)
+            } else {
+                exactEvidence = nil
+            }
+            return WorkServiceCommandReceipt(
+                work: request.work, commandID: request.command.commandID, state: state,
+                host: hostInstance, hostSequence: exactEvidence?.hostSequence,
+                causalWorkCursor: request.causalWorkCursor,
+                // The public receipt identifies command acceptance, not whichever asynchronous
+                // Agent delivery happened to append before this read. Joined Start callers and
+                // later duplicate retries must therefore expose the same immutable cursor.
+                resultingWorkCursor: exactEvidence?.cursor ?? latest.workCursor,
+                authorization: attachment.authorization, outcome: outcome,
+                rejection: state == .rejected ? .invalidState : nil,
+                diagnostic: result.receipt.delivery.detail)
+        } catch let error as HostedInHouseWorkError {
+            throw WorkServiceProtocolError.invalidRequest(error.localizedDescription)
+        }
+    }
+
+    public func completeWork(_ request: WorkServiceCompleteWorkRequest) async throws
+        -> WorkServiceCommandReceipt {
+        let command = WorkServiceCommandRequest(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            commandID: request.command.commandID, client: request.command.client ?? ClientRef(""),
+            sessionAttachment: request.command.sessionAttachment,
+            causalWorkCursor: request.causalWorkCursor, kind: .complete)
+        return try await self.command(command)
+    }
+
+    /// Re-read all control creations and source journals. This method intentionally returns
+    /// recovery categories instead of upgrading a durable active Run to `running`.
+    public func scanRecovery() async throws -> [JournalBackedWorkRecoveryEntry] {
+        try await ensureLoaded()
+        let control = try await controlSnapshot()
+        var result: [JournalBackedWorkRecoveryEntry] = []
+        for creation in control.creations.values.sorted(by: {
+            $0.reservation.work.workID < $1.reservation.work.workID
+        }) {
+            let reservation = creation.reservation
+            let verified = await controlJournal.verifiedCreationProjection(
+                client: reservation.client, commandID: reservation.command.commandID)
+            guard verified.verification.isVerified,
+                  let registration = verified.projection?.registration else {
+                let disposition: JournalBackedWorkRecoveryDisposition =
+                    creation.registration == nil ? .unavailable : .corrupt
+                result.append(JournalBackedWorkRecoveryEntry(
+                    work: reservation.work, journal: creation.registration?.workJournal,
+                    disposition: disposition, sourcePresence: verified.verification.sourcePresence,
+                    failure: verified.verification.failure,
+                    hostInstance: hostInstance,
+                    diagnostic: "creation source verification did not produce a reconstructable pair"))
+                continue
+            }
+            do {
+                let source = try await canonicalSource(
+                    work: reservation.work, journal: registration.workJournal,
+                    registration: registration)
+                // Recovery classification is a fresh observation. The in-memory manifest cache
+                // is useful for routing only; it is never enough to call an idle Work
+                // reconstructable after a store loss, deletion, or tamper event.
+                let manifestResolves: Bool
+                let hostedConfigurationResolves: Bool
+                if let store = manifestStore {
+                    let resolved = try? await store.resolve(
+                        work: reservation.work, session: reservation.session,
+                        sessionAttachment: reservation.sessionAttachment)
+                    manifestResolves = resolved != nil
+                    hostedConfigurationResolves = if let resolved {
+                        (try? await store.canReconstruct(resolved)) == true
+                    } else {
+                        false
+                    }
+                } else {
+                    manifestResolves = false
+                    hostedConfigurationResolves = false
+                }
+                let lookup = await registry.lookup(reservation.work)
+                let hasUnstartedStartReservation = try await self.hasUnstartedStartReservation(source)
+                let disposition: JournalBackedWorkRecoveryDisposition
+                let host: WorkHostInstanceRef?
+                switch source.workState.lifecycle {
+                case .completed, .destroyed:
+                    disposition = .historical
+                    host = nil
+                case .active:
+                    if source.workState.execution == .unknown
+                            || !source.workState.unknownEvents.isEmpty
+                            || !source.workState.unknownDomains.isEmpty {
+                        disposition = .corrupt
+                    } else if source.workState.execution == .failed {
+                        disposition = .recoveryRequired
+                    } else if source.workState.activeRun != nil {
+                        // A durable run marker is evidence of unfinished recovery, never a
+                        // runtime liveness claim. An actor retained by this process is still
+                        // classified separately as live-unproven; after restart there is no such
+                        // registration and the same canonical state is recovery-required.
+                        disposition = lookup?.isLiveRegistration == true
+                            ? .liveUnproven : .recoveryRequired
+                    } else if hasUnstartedStartReservation {
+                        // A Run-bound selection or pending mutex without a canonical marker is
+                        // an unfinished Start admission. It must never be projected as idle or
+                        // reconstructed by a different command.
+                        disposition = .recoveryRequired
+                    } else if manifestResolves && hostedConfigurationResolves
+                                && lookup?.isLiveRegistration == true {
+                        disposition = .idleReconstructable
+                    } else {
+                        disposition = manifestResolves && hostedConfigurationResolves
+                            ? .idleReconstructable : .recoveryRequired
+                    }
+                    host = lookup.flatMap { if case .live(let entry) = $0 { return entry.hostInstance }; return nil }
+                case .unknown:
+                    disposition = .corrupt
+                    host = nil
+                }
+                result.append(JournalBackedWorkRecoveryEntry(
+                    work: reservation.work, journal: registration.workJournal,
+                    disposition: disposition, workCursor: source.workCursor,
+                    sessionCursor: source.sessionCursor, sourcePresence: .verified,
+                    hostInstance: host, diagnostic: nil))
+            } catch {
+                result.append(JournalBackedWorkRecoveryEntry(
+                    work: reservation.work, journal: registration.workJournal,
+                    disposition: .corrupt, sourcePresence: .verified,
+                    hostInstance: hostInstance, diagnostic: "canonical source read failed"))
+            }
+        }
+        return result
+    }
+
+    // MARK: Internals
+
+    private struct CanonicalSource: Sendable {
+        let registration: WorkHostControlWorkRegistration
+        let workJournal: JournalRef
+        let sessionJournal: JournalRef
+        let workCache: JournalReadCacheEntry
+        let sessionCache: JournalReadCacheEntry
+        let workRead: TimelineJournalReadResult
+        let sessionRead: TimelineJournalReadResult
+        let workState: WorkSnapshot
+        let sessionState: SessionSnapshot
+        let workSequenceToIndex: [Int: Int]
+        let sessionSequenceToIndex: [Int: Int]
+        let workCursor: JournalCursor
+        let sessionCursor: JournalCursor
+        var session: SessionRef { registration.reservation.session }
+        var sessionAttachment: SessionAttachmentRef { registration.reservation.sessionAttachment }
+    }
+
+    /// Admit a Hosted actor only as part of an explicit Start. Create deliberately leaves the
+    /// Work pair idle, so this is the sole service path that appends a `run.started` marker. An
+    /// ended actor is replaced under the registry's same Work/Session/attachment fence; it is
+    /// never submitted a command after its lifecycle has closed.
+    private func admitStartActor(
+        work: WorkRef,
+        source: CanonicalSource,
+        client: ClientRef,
+        commandID: String,
+        causalWorkCursor: JournalCursor,
+        prompt: String
+    ) async throws -> StartActorAdmission {
+        let key = startAdmissionKey(
+            work: work, client: client, commandID: commandID,
+            causalWorkCursor: causalWorkCursor, prompt: prompt)
+        let intent = key.intent
+        if let existing = startsInProgress[key] {
+            // Await the exact opener task. Once it returns the caller continues through the
+            // Hosted command ledger, whose command-ID idempotency makes the duplicate receipt
+            // converge without a second provider Run or prompt assembly.
+            return StartActorAdmission(entry: try await existing.value, ownsTask: false)
+        }
+        let task = Task { [self] in
+            try await performStartActor(
+                work: work, source: source, client: client, commandID: commandID,
+                prompt: prompt, intent: intent)
+        }
+        startsInProgress[key] = task
+        do {
+            let result = try await task.value
+            return StartActorAdmission(entry: result, ownsTask: true)
+        } catch {
+            startsInProgress.removeValue(forKey: key)
+            throw error
+        }
+    }
+
+    private func performStartActor(
+        work: WorkRef,
+        source: CanonicalSource,
+        client: ClientRef,
+        commandID: String,
+        prompt: String,
+        intent: WorkLaunchStartIntent
+    ) async throws -> WorkHostRegistryLiveEntry {
+        guard source.workState.lifecycle == .active else {
+            throw WorkServiceProtocolError.invalidRequest("Start requires an active Work")
+        }
+
+        var endedEntry: WorkHostRegistryLiveEntry?
+        if let lookup = await registry.lookup(work) {
+            switch lookup {
+            case .live(let entry):
+                let snapshot = await entry.hostedWork.snapshot()
+                switch snapshot.lifecycle {
+                case .ended where snapshot.journalHealth == .closed:
+                    endedEntry = entry
+                case .prepared, .preparing, .idle, .running, .canceling, .ending:
+                    guard source.workState.activeRun == nil else {
+                        throw WorkServiceProtocolError.sourceIncomplete
+                    }
+                    return entry
+                case .ended, .failed:
+                    throw WorkServiceProtocolError.hostUnavailable(host)
+                }
+            case .historical, .recovering, .unavailable:
+                throw WorkServiceProtocolError.hostUnavailable(host)
+            }
+        }
+
+        guard let store = manifestStore else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        // Always re-read the Work-level template. A cached closure or descriptor is not restart
+        // proof and can otherwise let two concurrent Start calls race on stale launch material.
+        let base: JournalBackedWorkLaunchManifest
+        if let resolved = try await store.resolve(
+            work: work, session: source.session, sessionAttachment: source.sessionAttachment) {
+            manifests[work] = resolved
+            base = resolved
+        } else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        // The first Start caller observes the idle Work tip. During the narrow opener window the
+        // canonical tip advances to run.started; the exact predecessor remains the causal
+        // identity retained by the durable Start intent and by RunJournalBundle's bridge.
+        let recoveryCursor = startPredecessorCursor(source)
+        let intentCursor = recoveryCursor ?? source.workCursor
+
+        guard intent.causalWorkCursor == intentCursor,
+              intent.bodyDigest == digest(Data(prompt.utf8)) else {
+            throw WorkServiceProtocolError.invalidRequest("Start intent changed during admission")
+        }
+        let hasFinishedRun = source.workCache.runFinishedExists
+        let replacingEndedRun = endedEntry != nil || hasFinishedRun
+        let workBinding = WorkBinding(
+            session: source.session, work: work, workHost: host,
+            sessionAttachment: source.sessionAttachment)
+        let prior = try await store.resolveStart(
+            work: work, session: source.session,
+            sessionAttachment: source.sessionAttachment, intent: intent)
+        var recoveringStartedRun = false
+        if let priorRun = prior?.identity?.run, source.workState.activeRun == priorRun {
+            guard recoveryCursor != nil else { throw WorkServiceProtocolError.sourceIncomplete }
+            recoveringStartedRun = true
+        }
+        let predecessorRun = source.workCache.latestRunFinished
+        let launchPolicy: WorkLaunchExecutionPolicy
+        var selectedPromptAssembly: WorkLaunchPromptAssembly?
+        if recoveringStartedRun, let prior,
+           let priorPolicy = prior.durableRecord?.manifest.resumePolicy {
+            // Exact admission retries reuse the policy already persisted for that Run. The
+            // current Work marker is not a new historical replacement and must not reclassify a
+            // fresh first Start as cold merely because its flat boundary exists.
+            launchPolicy = WorkLaunchExecutionPolicy(
+                projection: .fresh,
+                modelContext: priorPolicy.mode == .coldResume
+                    ? .exactColdResume : .launchFresh,
+                sourceSession: priorPolicy.sourceSession,
+                sourceRun: priorPolicy.sourceRun)
+        } else if replacingEndedRun {
+            guard let predecessorRun else { throw WorkServiceProtocolError.sourceIncomplete }
+            let priorContext: NativeColdResumeResult?
+            do {
+                priorContext = try NativeSessionCommandJournal.preflightPriorContext(
+                    home: home, binding: workBinding)
+            } catch NativeColdResumeError.noCompleteContextManifest {
+                // This is the ordinary empty/no-crossing predecessor. Historical projection
+                // reopening remains required, but the provider receives a fresh context.
+                priorContext = nil
+            } catch {
+                // A recorded crossing with incomplete/corrupt retained state is not equivalent
+                // to "no context". Refuse before bindStart publishes the replacement Run.
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            if let priorContext {
+                // The native bridge will replay this exact predecessor assembly. A source-less
+                // predecessor cannot claim exact cold parity, and current ambient inputs are not
+                // a valid substitute for the recorded crossing.
+                let materializedAssembly = priorContext.systemPromptAssembly
+                guard let durableAssembly = try await store.resolvePromptAssemblyRecord(
+                          work: work, session: source.session,
+                          sessionAttachment: source.sessionAttachment, run: predecessorRun),
+                      let recordedAssembly = try? durableAssembly.materialize(
+                          using: ContextBodyStore(home: home)),
+                      recordedAssembly == materializedAssembly else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                selectedPromptAssembly = durableAssembly
+            }
+            launchPolicy = WorkLaunchExecutionPolicy(
+                projection: .reopenHistorical,
+                modelContext: priorContext == nil ? .launchFresh : .exactColdResume,
+                sourceSession: priorContext == nil ? nil : source.session,
+                sourceRun: priorContext == nil ? nil : predecessorRun)
+        } else {
+            launchPolicy = WorkLaunchExecutionPolicy(
+                projection: .fresh, modelContext: .launchFresh)
+        }
+        let manifest: JournalBackedWorkLaunchManifest
+        if let prior {
+            // If the opener crashed before run.started, the exact durable pointer can safely be
+            // continued with the same Run. Once run.started exists, however, a missing live actor
+            // is recovery-required; this service must not claim liveness from a journal marker.
+            guard let priorRun = prior.identity?.run else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            if source.workState.activeRun == priorRun {
+                guard recoveryCursor != nil else { throw WorkServiceProtocolError.sourceIncomplete }
+                recoveringStartedRun = true
+            }
+            guard source.workState.activeRun == nil || recoveringStartedRun else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            // Re-submit the exact durable Run through bindStart. For a pending pointer this
+            // repairs the Work-level selection; for an already-current record it is an idempotent
+            // read. It never mints a second Run for this Start identity.
+            manifest = try await store.bindStart(
+                prior,
+                binding: workBinding,
+                run: priorRun,
+                intent: intent,
+                body: Data(prompt.utf8),
+                policy: launchPolicy,
+                selectedPromptAssembly: nil)
+        } else {
+            // Every successful Start gets one fresh Run generation. A retry of an already
+            // admitted Start returned above from its exact durable pointer; it never reaches
+            // this minting path.
+            // A durable active Run is an unresolved admission, not an indication that this
+            // Work is available for another replacement. Only the exact Start intent branch
+            // above may recover that trailing marker; a different command must not supersede it.
+            guard source.workState.activeRun == nil else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let run = RunRef("run-" + UUID().uuidString.lowercased())
+            let binding = WorkRunBinding(
+                workBinding: WorkBinding(
+                    session: source.session, work: work, workHost: host,
+                    sessionAttachment: source.sessionAttachment), run: run)
+            // A replacement has a new Run identity but the exact same logical Work binding. The
+            // manifest store publishes this generation and its Work-level current-start pointer
+            // before any journal opener runs. Its compare-and-swap is the durable half of the
+            // in-process `startsInProgress` gate.
+            manifest = try await store.bindStart(
+                base, binding: binding.workBinding, run: run, intent: intent,
+                body: Data(prompt.utf8),
+                policy: launchPolicy,
+                selectedPromptAssembly: selectedPromptAssembly)
+        }
+        try validateManifest(manifest)
+        manifests[work] = manifest
+        guard let run = manifest.identity?.run else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let binding = WorkRunBinding(
+            workBinding: WorkBinding(
+                session: source.session, work: work, workHost: host,
+                sessionAttachment: source.sessionAttachment), run: run)
+        try validateStartManifest(
+            manifest, intent: intent, body: Data(prompt.utf8), binding: binding)
+        let configuration = try await hostedConfiguration(
+            manifest, binding: binding, policy: launchPolicy)
+        guard let configuration,
+              attestHostedConfiguration(
+                  configuration, manifest: manifest, binding: binding,
+                  policy: launchPolicy) else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        if endedEntry != nil {
+            // Registry replacement opens exactly one new actor under its same Work/Session/
+            // attachment fence. Do not open a second actor here.
+            return try await registry.replace(
+                work, configuration: configuration,
+                launchMetadata: manifest.launchMetadata)
+        }
+        // Reserve the registry slot before Hosted construction. Opening writes the durable
+        // run.started marker and acquires native/flat writer locks; a post-open capacity failure
+        // would otherwise strand an indexed, unaccepted Run and poison its exact retry. The
+        // actor-isolated reservation counts against both caps and fences this Work until commit.
+        let reservation = try await registry.reserveRegistration(
+            for: work, launchMetadata: manifest.launchMetadata)
+        do {
+            let hosted = try await HostedInHouseWork.open(configuration: configuration)
+            do {
+                return try await registry.commitRegistration(reservation, hostedWork: hosted)
+            } catch {
+                // commit can fail only for an invalid token/identity or an unexpected future
+                // registry mutation. Release the unadopted actor before dropping it; the exact
+                // reservation is cancelled regardless of the failure path.
+                await closeUnadoptedActor(hosted)
+                await registry.cancelRegistration(reservation)
+                throw error
+            }
+        } catch {
+            await registry.cancelRegistration(reservation)
+            throw error
+        }
+    }
+
+    private func closeUnadoptedActor(_ hosted: HostedInHouseWork) async {
+        let snapshot = await hosted.snapshot()
+        guard snapshot.lifecycle != .ended,
+              let causalCursor = snapshot.latestWorkCursor else { return }
+        let cleanup = HostedInHouseWorkCommand(
+            work: snapshot.identity.work,
+            session: SessionRef(snapshot.identity.sessionID),
+            sessionAttachment: snapshot.sessionAttachment,
+            client: ClientRef("work-host-registry-cleanup"),
+            commandID: "registry-cleanup-" + UUID().uuidString.lowercased(),
+            causalCursor: causalCursor,
+            command: .endRun)
+        _ = try? await hosted.submit(cleanup)
+    }
+
+    private func hostedConfiguration(
+        _ manifest: JournalBackedWorkLaunchManifest,
+        binding: WorkRunBinding,
+        policy: WorkLaunchExecutionPolicy
+    ) async throws -> HostedInHouseWorkConfiguration? {
+        if let resolver = manifest.hostedConfigurationAsync {
+            return try await resolver(binding, policy)
+        }
+        return manifest.hostedConfiguration?(binding)
+    }
+
+    /// The provider resolver is an effectful boundary and may run after a daemon restart.  A
+    /// nonnil result is not enough: every executable fact which survived in the host-private
+    /// manifest must still match the materialized configuration before it can open writers or
+    /// start a provider.  In particular, a changed workspace/model/system context is drift, not
+    /// a best-effort reconstruction.
+    private func attestHostedConfiguration(
+        _ configuration: HostedInHouseWorkConfiguration,
+        manifest: JournalBackedWorkLaunchManifest,
+        binding: WorkRunBinding,
+        policy: WorkLaunchExecutionPolicy
+    ) -> Bool {
+        guard configuration.home == home,
+              configuration.workRunBinding == binding,
+              configuration.projectionMode == policy.projection,
+              configuration.modelContextMode == policy.modelContext,
+              manifest.durableRecord?.manifest.resumePolicy == policy.resumePolicy,
+              let draft = manifest.template?.template.draft else {
+            return false
+        }
+        guard configuration.cwd == draft.workspace.locator,
+              configuration.model.providerID == draft.runtime.providerID,
+              configuration.model.id == draft.runtime.modelID,
+              configuration.recordPayloads == draft.recordingPolicy.recordPayloads,
+              configuration.reasoningEffort == draft.reasoningPolicy.level,
+              // These fields have no corresponding executable knobs in Hosted yet.  Accept only
+              // their explicit defaults until a typed field is added; silently dropping a
+              // persisted budget/goal/hook/context policy would make restart reconstruction
+              // claim a different run than the one the client created.
+              draft.contextPolicy == WorkLaunchContextPolicy(),
+              draft.recordingPolicy.wireLogLocator == nil,
+              draft.reasoningPolicy.enabled == false,
+              draft.reasoningPolicy.tokenBudget == nil,
+              draft.budgetPolicy.maximumTokens == nil,
+              draft.budgetPolicy.maximumWallClockSeconds == nil,
+              draft.goal == WorkLaunchGoalConfiguration(),
+              draft.hooks.isEmpty,
+              draft.peerScheduler == WorkLaunchPeerSchedulerConfiguration(),
+              configuration.maxIterations == (draft.budgetPolicy.maximumTurns ?? 40),
+              configuration.maxDepth == (draft.budgetPolicy.maximumDepth ?? 3),
+              configuration.childMaxIterations ==
+                  (draft.budgetPolicy.childMaximumTurns ?? 20),
+              configuration.hookPaths.isEmpty else {
+            return false
+        }
+        guard let assembly = manifest.durableRecord?.manifest.promptAssembly,
+              let configuredAssembly = configuration.systemPromptAssembly,
+              let retainedAssembly = try? assembly.materialize(
+                  using: ContextBodyStore(home: home)),
+              configuredAssembly == retainedAssembly,
+              configuredAssembly.flattenedDigest == assembly.flattenedDigest,
+              digest(Data(configuration.systemPrompt.utf8)) == assembly.flattenedDigest else {
+            // A final native launch without the retained assembly is source-less and must fail
+            // closed. The Run-free template is intentionally not a fallback prompt source.
+            return false
+        }
+        return true
+    }
+
+    private func resolveStartManifest(
+        work: WorkRef,
+        source: CanonicalSource,
+        client: ClientRef,
+        commandID: String,
+        prompt: String
+    ) async throws -> JournalBackedWorkLaunchManifest? {
+        guard let store = manifestStore else { return nil }
+        let key = qualifiedCommandID(clientID: client.clientID, commandID: commandID)
+        guard let prior = source.workState.commands[key],
+              prior.command.client == client,
+              prior.command.commandID == key,
+              let causalCursor = prior.command.causalCursor else {
+            return nil
+        }
+        guard try await store.resolve(
+            work: work, session: source.session, sessionAttachment: source.sessionAttachment)
+                != nil else { return nil }
+        let intent = WorkLaunchStartIntent(
+            client: client, commandID: commandID, causalWorkCursor: causalCursor,
+            bodyDigest: digest(Data(prompt.utf8)))
+        if let current = try await store.resolveStart(
+            work: work, session: source.session,
+            sessionAttachment: source.sessionAttachment, intent: intent) {
+            return current
+        }
+        return nil
+    }
+
+    /// A registry `.live` case is only an ownership record. It becomes a command/liveness proof
+    /// after the actor snapshot still matches the canonical Work/Session/attachment/Run tuple
+    /// and reports healthy connected writers. A stale or disconnected actor must not authorize a
+    /// command merely because the registry retains a reference to it.
+    private func exactLiveHostedActor(
+        _ entry: WorkHostRegistryLiveEntry,
+        source: CanonicalSource
+    ) async -> Bool {
+        let snapshot = await entry.hostedWork.snapshot()
+        guard snapshot.identity.work == source.registration.reservation.work,
+              snapshot.identity.sessionID == source.session.sessionID,
+              snapshot.sessionAttachment == source.sessionAttachment,
+              snapshot.runtimeState == .connected,
+              snapshot.journalHealth == .healthy,
+              snapshot.lifecycle != .failed else { return false }
+        guard let activeRun = source.workState.activeRun else {
+            // During the narrow Start opener window the actor is prepared before the marker is
+            // visible to the Work reducer. It is safe to use only for Start; callers with a
+            // durable idle source are handled by the command recovery guard above.
+            return snapshot.lifecycle == .prepared || snapshot.lifecycle == .idle
+        }
+        return snapshot.identity.runID == activeRun.runID
+    }
+
+    /// Prove the only restart repair permitted for a Run-bound Start admission. The durable
+    /// selection, caller identity, causal Work cursor, and retained prompt bytes must all match;
+    /// a same-text command with a different cursor/identity remains a new unproven admission.
+    private func isExactStartRecoveryRetry(
+        _ request: WorkServiceCommandRequest,
+        source: CanonicalSource,
+        client: ClientRef
+    ) async throws -> Bool {
+        guard request.kind == .start, let store = manifestStore else { return false }
+        let intent = WorkLaunchStartIntent(
+            client: client, commandID: request.command.commandID,
+            causalWorkCursor: request.causalWorkCursor,
+            bodyDigest: digest(Data((request.value ?? "").utf8)))
+        let selection = try await store.currentSelection(
+            work: source.registration.reservation.work,
+            session: source.registration.reservation.session,
+            sessionAttachment: source.registration.reservation.sessionAttachment)
+        if let record = selection {
+            guard record.manifest.identity.work == request.work,
+                  record.manifest.identity.session == source.session,
+                  record.manifest.identity.sessionAttachment == source.sessionAttachment,
+                  record.manifest.startIntent == intent,
+                  startBodyMatches(request.value ?? "", record: record) else { return false }
+            let run = record.manifest.identity.run
+
+            if source.workState.activeRun == nil {
+                // The pre-marker crash window: the selection is durable, but no canonical marker
+                // has yet been appended. The opener may mint no new Run; it must continue this
+                // one.
+                return !source.workCache.runStartedIDs.contains(run.runID)
+            }
+
+            // If the marker is already canonical, only its untouched immediate predecessor
+            // remains eligible for the bridge. Any later event makes recovery indeterminate and
+            // therefore rejects even an otherwise matching retry.
+            guard source.workState.activeRun == run,
+                  let predecessor = startPredecessorCursor(source),
+                  predecessor == request.causalWorkCursor else { return false }
+            return true
+        }
+
+        // A crash after prompt assembly has been retained but before the final Run manifest was
+        // published leaves only the binding reservation. It is safe to continue exactly that
+        // reservation when its persisted assembly is present; a reservation without assembly
+        // remains recovery-required and must never call the ambient resolver again.
+        guard let reservation = try await store.resolveStartReservation(
+            work: source.registration.reservation.work,
+            session: source.registration.reservation.session,
+            sessionAttachment: source.registration.reservation.sessionAttachment,
+            intent: intent), reservation.promptAssembly != nil else {
+            return false
+        }
+        return true
+    }
+
+    /// Return the Work cursor immediately before an untouched trailing `run.started` marker.
+    /// This is the only cursor a one-call Start retry may use after the opener has crossed the
+    /// marker boundary; any later canonical event makes the reservation recovery-required.
+    private func startPredecessorCursor(_ source: CanonicalSource) -> JournalCursor? {
+        guard source.workState.activeRun != nil,
+              source.workCache.recordCount >= 2,
+              let marker = source.workCache.lastRecord,
+              marker.event.type == TimelineEventType.runStarted,
+              marker.event.run == source.workState.activeRun,
+              let predecessor = source.workCache.penultimateRecord else {
+            return nil
+        }
+        return JournalCursor(
+            journal: source.workJournal,
+            eventID: predecessor.event.eventID,
+            sequence: predecessor.event.sequence)
+    }
+
+    private func startAdmissionKey(
+        work: WorkRef,
+        client: ClientRef,
+        commandID: String,
+        causalWorkCursor: JournalCursor,
+        prompt: String
+    ) -> StartAdmissionKey {
+        StartAdmissionKey(
+            work: work,
+            intent: WorkLaunchStartIntent(
+                client: client, commandID: commandID,
+                causalWorkCursor: causalWorkCursor,
+                bodyDigest: digest(Data(prompt.utf8))))
+    }
+
+    /// A Run-bound manifest can be durable before the native opener appends `run.started`.
+    /// That state is neither idle nor live: the selected Run is an unfinished admission and
+    /// must be repaired only by the exact client-qualified Start retry. A completed prior Run
+    /// remains the normal current selection after End, so its historical marker/terminal event
+    /// explicitly excludes it from this classification.
+    private func hasUnstartedStartReservation(_ source: CanonicalSource) async throws -> Bool {
+        guard let store = manifestStore else { return false }
+        let selection = try await store.currentSelection(
+            work: source.registration.reservation.work,
+            session: source.registration.reservation.session,
+            sessionAttachment: source.registration.reservation.sessionAttachment)
+        if let selection {
+            let run = selection.manifest.identity.run
+            let hasStarted = source.workCache.runStartedIDs.contains(run.runID)
+            let hasFinished = source.workCache.runFinishedIDs.contains(run.runID)
+            if !hasStarted && !hasFinished { return true }
+        }
+        return try await store.hasPendingStart(
+            work: source.registration.reservation.work,
+            session: source.registration.reservation.session,
+            sessionAttachment: source.registration.reservation.sessionAttachment)
+    }
+
+    private func ensureLoaded() async throws {
+        guard !loaded else { return }
+        let control = try await controlSnapshot()
+        guard control.structuralIntegrityValid, control.semanticProjectionValid,
+              control.quarantinedEvents.isEmpty else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        for creation in control.creations.values {
+            let reservation = creation.reservation
+            let verified = await controlJournal.verifiedCreationProjection(
+                client: reservation.client, commandID: reservation.command.commandID)
+            guard verified.verification.isVerified,
+                  let registration = verified.projection?.registration else {
+                if let registration = creation.registration {
+                    try? await registerCanonical(
+                        work: reservation.work, registration: registration,
+                        disposition: .unavailable, sourceID: "creation-" + reservation.command.commandID)
+                }
+                continue
+            }
+            var resolvedManifest: JournalBackedWorkLaunchManifest?
+            if let store = manifestStore {
+                let manifest = try? await store.resolve(
+                    work: reservation.work, session: reservation.session,
+                    sessionAttachment: reservation.sessionAttachment)
+                if let manifest {
+                    resolvedManifest = manifest
+                    manifests[reservation.work] = manifest
+                }
+            }
+            do {
+                let source = try await canonicalSource(
+                    work: reservation.work, journal: registration.workJournal,
+                    registration: registration)
+                let disposition: WorkHostRegistryCanonicalDisposition =
+                    source.workState.lifecycle == .completed || source.workState.lifecycle == .destroyed
+                        ? .historical : .recovering
+                // An idle pair plus matching host-private launch material can be opened by a
+                // later Create/Start path. Leave the logical slot unclaimed so a restart can
+                // reconstruct the service-owned actor without trying to replace a canonical fact.
+                let hasUntouchedStartReservation = source.workState.lifecycle == .active
+                    && source.workState.activeRun != nil
+                    && source.workState.activeTurn == nil
+                    && source.workState.activeActionIDs.isEmpty
+                    && source.workCache.recordCount >= 2
+                    && source.workCache.lastRecord?.event.type == TimelineEventType.runStarted
+                    && source.workCache.lastRecord?.event.run == source.workState.activeRun
+                let hasHostedConfiguration: Bool
+                if let store = manifestStore, let resolvedManifest {
+                    hasHostedConfiguration = (try? await store.canReconstruct(resolvedManifest)) == true
+                } else {
+                    hasHostedConfiguration = false
+                }
+                let hasUnstartedStartReservation = try await self.hasUnstartedStartReservation(source)
+                let canReconstructIdle = source.workState.lifecycle == .active
+                    && source.workState.execution == .idle
+                    && source.workState.activeRun == nil
+                    && !hasUnstartedStartReservation
+                    && resolvedManifest != nil && hasHostedConfiguration
+                let canRecoverStartedReservation = hasUntouchedStartReservation
+                    && resolvedManifest != nil && hasHostedConfiguration
+                if await registry.lookup(reservation.work) == nil
+                        && !canReconstructIdle && !canRecoverStartedReservation
+                        // A Run-bound Start selection with no run.started marker is an
+                        // unfinished admission, but it must remain addressable by the exact
+                        // client-qualified retry. Registering `.recovering` here would make
+                        // admitStartActor reject that retry before it can resolve the durable
+                        // intent. scanRecovery/descriptor projection carries the recovery truth;
+                        // the absent registry slot is an intentional admission seam.
+                        && !hasUnstartedStartReservation {
+                    try await registerCanonical(
+                        work: reservation.work, registration: registration,
+                        disposition: disposition, sourceID: "creation-" + reservation.command.commandID)
+                }
+            } catch {
+                if await registry.lookup(reservation.work) == nil {
+                    try? await registerCanonical(
+                        work: reservation.work, registration: registration,
+                        disposition: .unavailable, sourceID: "creation-" + reservation.command.commandID)
+                }
+            }
+        }
+        loaded = true
+    }
+
+    private func ensureRegistered(
+        reservation: WorkHostControlCreationReservation,
+        binding: WorkBinding
+    ) async throws -> WorkHostControlWorkRegistration {
+        let current = try await controlSnapshot()
+        if let prior = current.creation(client: reservation.client,
+                                        commandID: reservation.command.commandID)?.registration {
+            return prior
+        }
+        // Creation owns the deterministic idle genesis pair. `createIdleWork` continues an
+        // exact unregistered prefix (including a one-sided writer-open window) under both locks;
+        // it rejects any registered/extended/foreign evidence instead of overwriting it.
+        let idle = try await RunJournalBundle.createIdleWork(
+            home: home, binding: binding, actorID: actor.actorID, actorKind: actor.kind)
+        let source = (workCursor: idle.workCursor, sessionCursor: idle.sessionCursor)
+        let registration = try await controlJournal.registerWork(
+            WorkHostControlWorkRegistrationRequest(
+                reservation: reservation, workJournal: binding.workJournal,
+                sessionJournal: binding.sessionJournal, workGenesisCursor: source.workCursor,
+                sessionGenesisCursor: source.sessionCursor,
+                causalControlCursor: try await currentControlCursor()))
+        return registration
+    }
+
+    private func readGenesisSource(binding: WorkBinding) async throws -> (workCursor: JournalCursor, sessionCursor: JournalCursor) {
+        let work = try readJournal(binding.workJournal, expectedURL: home.timelineV2WorkJournalURL(binding.work))
+        let session = try readJournal(binding.sessionJournal, expectedURL: home.timelineV2SessionJournalURL(binding.session))
+        let workEvents = work.result.records.map(\.event)
+        let sessionEvents = session.result.records.map(\.event)
+        guard let workState = work.workSnapshot,
+              let sessionState = session.sessionSnapshot else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let workAttachments = Set(workEvents.compactMap { event -> SessionAttachmentRef? in
+            guard event.type == TimelineEventType.sessionAttached,
+                  event.session == binding.session, event.work == binding.work else { return nil }
+            return event.sessionAttachment
+        })
+        let sessionAttachments = Set(sessionEvents.compactMap { event -> SessionAttachmentRef? in
+            guard event.type == TimelineEventType.sessionAttached,
+                  event.session == binding.session, event.work == binding.work else { return nil }
+            return event.sessionAttachment
+        })
+        // Registration may reconcile only the exact two-event idle pair created by
+        // `createIdleWork`. A partially started or otherwise extended source is a recovery case,
+        // never a fresh Create registration.
+        guard work.result.records.count == 2, session.result.records.count == 2,
+              workEvents.first?.type == TimelineEventType.workCreated,
+              sessionEvents.first?.type == TimelineEventType.sessionCreated,
+              workAttachments == Set([binding.sessionAttachment]),
+              sessionAttachments == workAttachments,
+              workState.structuralIntegrityValid, workState.semanticProjectionValid,
+              workState.lifecycle == .active, workState.activeRun == nil,
+              sessionState.structuralIntegrityValid, sessionState.semanticProjectionValid,
+              let workLast = work.result.records.last?.event,
+              let sessionLast = session.result.records.last?.event else { throw WorkServiceProtocolError.sourceIncomplete }
+        return (
+            JournalCursor(journal: binding.workJournal, eventID: workLast.eventID, sequence: workLast.sequence),
+            JournalCursor(journal: binding.sessionJournal, eventID: sessionLast.eventID, sequence: sessionLast.sequence))
+    }
+
+    private func attachForCreate(
+        request: WorkServiceCreateWorkRequest,
+        reservation: WorkHostControlCreationReservation,
+        registration: WorkHostControlWorkRegistration,
+        authorization: WorkServiceAuthorizationOutcome
+    ) async throws -> WorkServiceClientAttachment {
+        let control = try await controlSnapshot()
+        let attachmentCommandID = createAttachmentCommandID(
+            client: request.client, commandID: request.commandID)
+        let prior = try await priorAttachment(
+            control: control, work: reservation.work, journal: registration.workJournal,
+            client: request.client, commandID: attachmentCommandID)
+        if let prior {
+            return try clientAttachment(prior, control: control)
+        }
+        let attachment = try await mintClientAttachment()
+        let cursor = try await currentControlCursor()
+        let command = CommandRef(commandID: attachmentCommandID, client: request.client,
+                                 sessionAttachment: reservation.sessionAttachment,
+                                 causalCursor: cursor)
+        _ = try await controlJournal.attachClient(
+            work: reservation.work, workJournal: registration.workJournal,
+            attachment: attachment, client: request.client,
+            capabilities: Set(authorization.granted.map(\.rawValue)),
+            requestedCapabilities: Set(authorization.requested.map(\.rawValue)),
+            session: reservation.session, sessionJournal: registration.sessionJournal,
+            sessionAttachment: reservation.sessionAttachment, command: command,
+            causalControlCursor: cursor)
+        let updated = try await controlSnapshot()
+        guard let record = updated.clientAttachments[attachment.attachmentID] else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return try clientAttachment(record, control: updated)
+    }
+
+    private func registerCanonical(
+        work: WorkRef,
+        registration: WorkHostControlWorkRegistration,
+        disposition: WorkHostRegistryCanonicalDisposition,
+        sourceID: String
+    ) async throws {
+        try await registry.registerCanonical(WorkHostRegistryCanonicalFact(
+            work: work, disposition: disposition, sourceID: sourceID,
+            hostInstance: disposition == .recovering ? hostInstance : nil,
+            launchMetadata: nil))
+    }
+
+    private func canonicalSource(
+        work: WorkRef, journal: JournalRef,
+        registration: WorkHostControlWorkRegistration
+    ) async throws -> CanonicalSource {
+        guard journal == registration.workJournal,
+              registration.reservation.work == work else { throw WorkServiceProtocolError.journalMismatch }
+        let workCache = try readJournal(journal, expectedURL: home.timelineV2WorkJournalURL(work))
+        let sessionCache = try readJournal(
+            registration.sessionJournal,
+            expectedURL: home.timelineV2SessionJournalURL(registration.reservation.session))
+        let workRead = workCache.result
+        let sessionRead = sessionCache.result
+        guard workRead.quarantinedSuffix == nil, workRead.truncatedTail == nil,
+              sessionRead.quarantinedSuffix == nil, sessionRead.truncatedTail == nil else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        guard let workState = workCache.workSnapshot,
+              let sessionState = sessionCache.sessionSnapshot else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        guard workState.structuralIntegrityValid, workState.semanticProjectionValid,
+              sessionState.structuralIntegrityValid, sessionState.semanticProjectionValid,
+              workState.work == work, workState.journal == journal,
+              sessionState.session == registration.reservation.session,
+              sessionState.journal == registration.sessionJournal else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        guard let workLast = workCache.lastRecord?.event,
+              let sessionLast = sessionCache.lastRecord?.event else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return CanonicalSource(
+            registration: registration, workJournal: journal,
+            sessionJournal: registration.sessionJournal, workCache: workCache,
+            sessionCache: sessionCache, workRead: workRead, sessionRead: sessionRead,
+            workState: workState, sessionState: sessionState,
+            workSequenceToIndex: workCache.sequenceToIndex,
+            sessionSequenceToIndex: sessionCache.sequenceToIndex,
+            workCursor: JournalCursor(journal: journal, eventID: workLast.eventID, sequence: workLast.sequence),
+            sessionCursor: JournalCursor(journal: registration.sessionJournal,
+                                         eventID: sessionLast.eventID, sequence: sessionLast.sequence))
+    }
+
+    private func requireCanonical(work: WorkRef, journal: JournalRef) async throws -> CanonicalSource {
+        let control = try await controlSnapshot()
+        guard let creation = control.creations.values.first(where: {
+            $0.reservation.work == work && $0.registration?.workJournal == journal
+        }), creation.registration != nil else {
+            throw WorkServiceProtocolError.workNotFound(work)
+        }
+        let verified = await controlJournal.verifiedCreationProjection(
+            client: creation.reservation.client, commandID: creation.reservation.command.commandID)
+        guard verified.verification.isVerified,
+              let verifiedRegistration = verified.projection?.registration else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return try await canonicalSource(work: work, journal: journal, registration: verifiedRegistration)
+    }
+
+    private func controlSnapshot() async throws -> WorkHostControlSnapshot { try await controlJournal.snapshot() }
+
+    private func currentControlCursor() async throws -> JournalCursor {
+        let snapshot = try await controlSnapshot()
+        guard let journal = snapshot.journal else { throw WorkServiceProtocolError.sourceIncomplete }
+        return JournalCursor(journal: journal, eventID: snapshot.lastEventID, sequence: snapshot.lastSequence)
+    }
+
+    private func allWorkRefs() async throws -> [WorkRef] {
+        let control = try await controlSnapshot()
+        return control.creations.values.map(\.reservation.work).sorted {
+            $0.workID < $1.workID
+        }
+    }
+
+    private func descriptor(for work: WorkRef, client: ClientRef) async throws -> WorkServiceWorkDescriptor {
+        let source = try await requireCanonical(
+            work: work, journal: JournalRef.work(work))
+        let lookup = await registry.lookup(work)
+        let recorded: WorkServiceRecordedDisposition
+        switch source.workState.lifecycle {
+        case .completed: recorded = .completed
+        case .destroyed: recorded = .destroyed
+        case .active: recorded = .reusable
+        case .unknown: throw WorkServiceProtocolError.sourceIncomplete
+        }
+        // Unknown reducer facts are observable, but they are not a reason to guess a usable
+        // execution state. The same is true of a durable active Run: a journal marker identifies
+        // the Run, not a live actor capable of accepting commands.
+        var execution: WorkServiceExecutionState
+        if source.workState.execution == .unknown
+                || !source.workState.unknownEvents.isEmpty
+                || !source.workState.unknownDomains.isEmpty {
+            execution = .unknown
+        } else if source.workState.execution == .failed {
+            execution = .recoveryRequired
+        } else if source.workState.activeRun != nil {
+            execution = .recoveryRequired
+        } else {
+            switch source.workState.execution {
+            case .idle: execution = .idle
+            case .running, .preparing, .canceling, .held:
+                // A non-running durable projection with no active Run is still not actionable
+                // unless a live actor below proves the exact binding. This covers reducer states
+                // whose active Run evidence was lost or could not be projected.
+                execution = .recoveryRequired
+            case .failed: execution = .recoveryRequired
+            case .unknown: execution = .unknown
+            }
+        }
+        var observation: WorkServiceHostObservation?
+        if let lookup {
+            switch lookup {
+            case .live(let entry):
+                let hosted = await entry.hostedWork.snapshot()
+                let exactBinding = hosted.identity.work == source.registration.reservation.work
+                    && hosted.identity.sessionID == source.session.sessionID
+                    && hosted.sessionAttachment == source.sessionAttachment
+                let exactRun = source.workState.activeRun.map {
+                    hosted.identity.runID == $0.runID
+                } ?? [.prepared, .idle, .ended].contains(hosted.lifecycle)
+                let liveProof = exactBinding && exactRun
+                    && hosted.runtimeState == .connected
+                    && hosted.journalHealth == .healthy
+                    && hosted.lifecycle != .failed
+                let exactIdleActor = exactBinding && source.workState.activeRun == nil
+                    && hosted.journalHealth == .healthy
+                    && [.prepared, .idle].contains(hosted.lifecycle)
+                let exactEndedActor = exactBinding && source.workState.activeRun == nil
+                    && hosted.lifecycle == .ended && hosted.journalHealth == .closed
+                if liveProof || exactIdleActor || exactEndedActor {
+                    if exactEndedActor {
+                        execution = .idle
+                    } else {
+                        switch hosted.lifecycle {
+                    case .prepared, .idle: execution = .idle
+                    case .preparing, .running: execution = .running
+                    case .canceling: execution = .canceling
+                    case .ending: execution = .ending
+                    case .ended, .failed: execution = .recoveryRequired
+                        }
+                    }
+                } else if source.workState.execution != .unknown {
+                    execution = .recoveryRequired
+                }
+                observation = WorkServiceHostObservation(
+                    instance: entry.hostInstance,
+                    reachability: hosted.runtimeState == .connected
+                        && hosted.journalHealth == .healthy ? .observedReachable : .recovering,
+                    currentRun: source.workState.activeRun,
+                    servedCursor: source.workCursor,
+                    sourceCompleteness: .complete)
+            case .recovering(let fact):
+                // A recovering entry is never a positive liveness observation. In particular, a
+                // durable run.started record does not turn this descriptor into `running` or
+                // leave an otherwise idle projection actionable.
+                if execution != .unknown { execution = .recoveryRequired }
+                observation = WorkServiceHostObservation(
+                    instance: fact.hostInstance ?? hostInstance, reachability: .recovering,
+                    currentRun: source.workState.activeRun, servedCursor: source.workCursor,
+                    sourceCompleteness: .complete)
+            case .historical:
+                // Historical is a durable terminal/retired registry fact, not liveness. An idle
+                // Work with no current Run remains idle; an active or failed projection remains
+                // recovery-required and can never be acted on through this descriptor.
+                if source.workState.activeRun != nil || execution == .recoveryRequired {
+                    execution = .recoveryRequired
+                }
+                observation = nil
+            case .unavailable:
+                if execution != .unknown { execution = .recoveryRequired }
+                observation = nil
+            }
+        }
+        // A durable pre-marker Start selection has no activeRun in the Work reducer yet, but it
+        // is still an unfinished admission. Only its exact Start retry may cross the opener.
+        let hasUnstartedReservation = try await hasUnstartedStartReservation(source)
+        if execution == .idle && hasUnstartedReservation {
+            execution = .recoveryRequired
+        }
+        let control = try await controlSnapshot()
+        let attachments = try control.clientAttachments.values
+            .filter {
+                $0.work == work && $0.workJournal == source.workJournal && $0.isAttached
+            }
+            .sorted { $0.attachment.attachmentID < $1.attachment.attachmentID }
+            .prefix(WorkServiceBounds.maxAttachmentsPerWork)
+            .map { try clientAttachment($0, control: control) }
+        let omitted = control.clientAttachments.values.filter {
+            $0.work == work && $0.workJournal == source.workJournal && $0.isAttached
+        }.count - attachments.count
+        guard let config = manifests[work]?.requestedConfiguration
+            ?? manifests[work]?.template?.template.draft.configuration else {
+            // A durable template without its exact request configuration is not a truthful
+            // descriptor after restart.  Do not substitute the resolved runtime route here.
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return WorkServiceWorkDescriptor(
+            work: work, journal: source.workJournal, recordedDisposition: recorded,
+            execution: execution, currentRun: source.workState.activeRun,
+            configuration: WorkServiceWorkConfiguration(
+                providerID: config.providerID, modelID: config.modelID,
+                thinkingLevel: config.thinkingLevel, contextPolicy: config.contextPolicy,
+                workspaceID: config.workspaceID,
+                includeContextFiles: config.includeContextFiles,
+                recordPayloads: config.recordPayloads, resumePolicy: config.resumePolicy),
+            hostObservation: observation,
+            attachments: Array(attachments), artifacts: artifacts(in: source),
+            omissions: omitted > 0 ? [WorkServiceOmission(category: "attachments", count: omitted)] : [])
+    }
+
+    private func clientAttachment(
+        _ value: WorkHostClientAttachmentSnapshot,
+        control: WorkHostControlSnapshot,
+        authorizationOverride: WorkServiceAuthorizationOutcome? = nil
+    ) throws -> WorkServiceClientAttachment {
+        let granted = Set(value.capabilities.compactMap(WorkServiceCapability.init(rawValue:)))
+        let auth = WorkServiceAuthorizationOutcome(requested: granted, granted: granted, denied: [])
+        let acknowledgements = control.readAcknowledgements.values.filter {
+            $0.client == value.client && $0.attachment == value.attachment && $0.work == value.work
+        }.sorted { $0.targetJournal.stableKey < $1.targetJournal.stableKey }
+            .prefix(WorkServiceBounds.maxReadAcknowledgementsPerAttachment)
+            .map { ack -> WorkServiceReadAcknowledgement in
+                let target: WorkServiceReadTarget
+                if case .session(let session) = ack.targetJournal.owner {
+                    target = .session(session: session, journal: ack.targetJournal)
+                } else {
+                    target = .work(journal: ack.targetJournal)
+                }
+                return WorkServiceReadAcknowledgement(target: target, cursor: ack.cursor)
+            }
+        return WorkServiceClientAttachment(
+            attachment: value.attachment, client: value.client, session: value.session,
+            sessionJournal: value.sessionJournal, sessionAttachment: value.sessionAttachment,
+            authorization: authorizationOverride ?? auth,
+            readAcknowledgements: Array(acknowledgements))
+    }
+
+    private func decodeControlPayload<T: Decodable>(_ value: JSONValue?) -> T? {
+        guard let value, let data = try? JSONEncoder().encode(value) else { return nil }
+        return try? JSONDecoder().decode(T.self, from: data)
+    }
+
+    private func priorAttachment(
+        control: WorkHostControlSnapshot,
+        work: WorkRef,
+        journal: JournalRef,
+        client: ClientRef,
+        commandID: String
+    ) async throws -> WorkHostClientAttachmentSnapshot? {
+        let read = try await controlJournal.read()
+        guard let attachedRef = read.records.map(\.event).first(where: { event in
+            event.type == TimelineEventType.clientAttached && event.work == work
+                && event.journal == control.journal && event.client == client
+                && event.command?.commandID == commandID
+        }).map({ EventRef(journal: $0.journal, eventID: $0.eventID) }) else {
+            return nil
+        }
+        return control.clientAttachments.values.first {
+            $0.attachedEvent == attachedRef && $0.workJournal == journal
+        }
+    }
+
+    private func authorization(_ value: WorkHostClientAttachmentSnapshot) -> WorkServiceAuthorizationOutcome {
+        let granted = Set(value.capabilities.compactMap(WorkServiceCapability.init(rawValue:)))
+        return WorkServiceAuthorizationOutcome(requested: granted, granted: granted, denied: [])
+    }
+
+    private func clientHasObserve(work: WorkRef, client: ClientRef) async throws -> Bool {
+        let control = try await controlSnapshot()
+        return control.clientAttachments.values.contains {
+            $0.work == work && $0.client == client && $0.isAttached
+                && $0.capabilities.contains(WorkServiceCapability.observe.rawValue)
+        }
+    }
+
+    @discardableResult
+    private func requireAttached(
+        work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
+        client: ClientRef, capability: WorkServiceCapability
+    ) async throws -> WorkServiceClientAttachment {
+        let control = try await controlSnapshot()
+        guard let value = control.clientAttachments[attachment.attachmentID],
+              value.work == work, value.workJournal == journal, value.client == client,
+              value.isAttached else { throw WorkServiceProtocolError.attachmentNotFound }
+        let result = try clientAttachment(value, control: control)
+        guard result.authorization.allows(capability) else {
+            throw WorkServiceProtocolError.capabilityDenied(capability)
+        }
+        return result
+    }
+
+    private func validateTarget(_ target: WorkServiceReadTarget, source: CanonicalSource) throws {
+        switch target {
+        case .work(let journal):
+            guard journal == source.workJournal else { throw WorkServiceProtocolError.journalMismatch }
+        case .session(let session, let journal):
+            guard session == source.session, journal == source.sessionJournal else {
+                throw WorkServiceProtocolError.journalMismatch
+            }
+        }
+    }
+
+    private func records(
+        for target: WorkServiceReadTarget, source: CanonicalSource
+    ) throws -> JournalReadCacheEntry {
+        try validateTarget(target, source: source)
+        return target.session == nil ? source.workCache : source.sessionCache
+    }
+
+    private func expectedURL(
+        for target: WorkServiceReadTarget, source: CanonicalSource
+    ) -> URL {
+        if target.session == nil {
+            return home.timelineV2WorkJournalURL(source.registration.reservation.work)
+        }
+        return home.timelineV2SessionJournalURL(source.registration.reservation.session)
+    }
+
+    private struct Page {
+        let events: [TimelineEvent]
+        let servedCursor: JournalCursor?
+        let nextCursor: JournalCursor?
+        let basePrefixDigest: String?
+        let prefixDigest: String?
+        let omissions: [WorkServiceOmission]
+    }
+
+    private func page(
+        entry: JournalReadCacheEntry, journal: JournalRef, expectedURL: URL,
+        after: JournalCursor?, target: WorkServiceReadTarget,
+        limit: Int, maxBytes: Int
+    ) async throws -> Page {
+        guard limit > 0, limit <= WorkServiceBounds.maxEventsPerPage,
+              maxBytes > 0, maxBytes <= WorkServiceBounds.maxEventPageBytes else {
+            throw WorkServiceProtocolError.invalidRequest("event page bounds are invalid")
+        }
+        guard after?.journal == nil || after?.journal == journal else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
+        guard entry.isFullyResident else {
+            return try streamPage(
+                entry: entry, journal: journal, expectedURL: expectedURL,
+                after: after, target: target, limit: limit, maxBytes: maxBytes)
+        }
+        return try residentPage(
+            entry: entry, records: entry.result.records, sequenceToIndex: entry.sequenceToIndex,
+            recordCount: entry.recordCount, after: after, target: target,
+            limit: limit, maxBytes: maxBytes)
+    }
+
+    private func residentPage(
+        entry: JournalReadCacheEntry, records: [TimelineJournalRecord],
+        sequenceToIndex: [Int: Int], recordCount: Int,
+        after: JournalCursor?, target: WorkServiceReadTarget,
+        limit: Int, maxBytes: Int
+    ) throws -> Page {
+        let journal = target.journal
+        let start: Int
+        if let after {
+            // Sequence zero with no event is the canonical empty-prefix cursor. It is useful for
+            // a first page and is not itself a journal record; every other cursor must identify
+            // an exact event, including its event ID, so a fabricated cursor cannot skip data.
+            if after.sequence == 0 && after.eventID == nil {
+                start = 0
+            } else {
+                guard let index = sequenceToIndex[after.sequence],
+                      index < records.count,
+                      records[index].event.sequence == after.sequence,
+                      records[index].event.eventID == after.eventID else {
+                    throw WorkServiceProtocolError.staleCursor(
+                        expected: after, actual: cursor(records, journal: journal))
+                }
+                start = index + 1
+            }
+        } else { start = 0 }
+        var selected: [TimelineEvent] = []
+        var bytes = 0
+        var stoppedForBytes = false
+        for record in records.dropFirst(start).prefix(limit) {
+            // The page protocol counts standalone event envelopes. Durable JSONL byte ranges also
+            // include record delimiters and therefore cannot be used as the wire-facing bound.
+            let size = try WorkServiceEventPageSizing.encodedByteCount(of: record.event)
+            guard size <= maxBytes else {
+                throw WorkServiceProtocolError.eventPageCannotProgress(requiredBytes: size, maximumBytes: maxBytes)
+            }
+            guard bytes + size <= maxBytes else {
+                stoppedForBytes = true
+                break
+            }
+            selected.append(record.event); bytes += size
+        }
+        let served = selected.last.map { JournalCursor(journal: journal, eventID: $0.eventID, sequence: $0.sequence) }
+            ?? after
+        let index = selected.last.flatMap { sequenceToIndex[$0.sequence] }
+        let hasMore = index.map { $0 + 1 < recordCount } ?? false
+        let next = hasMore ? served : nil
+        let remaining = recordCount - (start + selected.count)
+        var omissions: [WorkServiceOmission] = []
+        if remaining > 0 {
+            // These are deliberately source-level facts, not an estimate of what the client has
+            // already read.  The continuation cursor is the last event actually delivered, so a
+            // controller can prove that every omitted event will be requested on the next page.
+            let category = stoppedForBytes ? "event_bytes" : "events"
+            let diagnostic = stoppedForBytes
+                ? "event page byte bound reached; continue from served cursor"
+                : "event page count bound reached; continue from served cursor"
+            omissions.append(WorkServiceOmission(
+                category: category, count: remaining, diagnostic: diagnostic))
+        }
+        let basePrefixDigest = try prefixDigest(
+            for: after, entry: entry, records: records, sequenceToIndex: sequenceToIndex,
+            journal: journal)
+        var servedPrefixDigest = basePrefixDigest
+        for event in selected {
+            servedPrefixDigest = try advancePrefixDigest(
+                servedPrefixDigest ?? entry.prefixSeed, event: event)
+        }
+        return Page(
+            events: selected, servedCursor: served, nextCursor: next,
+            basePrefixDigest: basePrefixDigest, prefixDigest: servedPrefixDigest,
+            omissions: omissions)
+    }
+
+    /// Read a bounded page from a nonresident source. The canonical full-file scan already
+    /// validated the append chain and populated the reducer cache; this second pass only decodes
+    /// the suffix needed by the requested page and re-fences the open file before publishing it.
+    private func streamPage(
+        entry: JournalReadCacheEntry, journal: JournalRef, expectedURL: URL,
+        after: JournalCursor?, target: WorkServiceReadTarget,
+        limit: Int, maxBytes: Int
+    ) throws -> Page {
+        let path = expectedURL.standardizedFileURL.path
+        let descriptor = path.withCString {
+            AviaryPOSIX.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else { throw WorkServiceProtocolError.sourceIncomplete }
+        defer { _ = AviaryPOSIX.close(descriptor) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        let before = try journalFileFingerprint(descriptor: descriptor, path: expectedURL, handle: handle)
+        guard before == entry.fingerprint else { throw WorkServiceProtocolError.sourceIncomplete }
+
+        let afterSequence = after?.sequence ?? 0
+        guard afterSequence >= 0, afterSequence <= entry.recordCount else {
+            throw WorkServiceProtocolError.staleCursor(
+                expected: after ?? JournalCursor(journal: journal, sequence: afterSequence),
+                actual: JournalCursor(journal: journal, sequence: entry.recordCount))
+        }
+        if afterSequence == 0, after?.eventID != nil {
+            throw WorkServiceProtocolError.staleCursor(
+                expected: after ?? JournalCursor(journal: journal, sequence: 0),
+                actual: JournalCursor(journal: journal, sequence: entry.recordCount))
+        }
+        let anchor: JournalRecordIndex?
+        if afterSequence == 0 {
+            anchor = nil
+        } else {
+            anchor = sparseAnchor(for: afterSequence, in: entry.sparseIndex)
+            guard anchor != nil else { throw WorkServiceProtocolError.sourceIncomplete }
+        }
+        let startOffset = anchor?.byteStart ?? 0
+        let initialSequence = anchor?.sequence ?? 1
+        let initialPreviousEventID = anchor?.previousEventID
+        var parser = TimelineJournalReaderState(
+            journal: journal, actor: actor, hostRecordedAt: Date(),
+            initialByteOffset: startOffset, initialSequence: initialSequence,
+            initialPreviousEventID: initialPreviousEventID)
+        var offset = startOffset
+        var validatedAfter = afterSequence == 0
+        var selected: [TimelineEvent] = []
+        var bytes = 0
+        var stoppedForBytes = false
+        var prefix = anchor?.prefixDigestBefore ?? entry.prefixSeed
+        var basePrefixDigest: String? = afterSequence == 0 ? entry.prefixSeed : nil
+        var servedPrefixDigest: String?
+        while offset < entry.fingerprint.byteCount {
+            let requested = min(JournalReadLimits.chunkBytes, entry.fingerprint.byteCount - offset)
+            try handle.seek(toOffset: UInt64(offset))
+            guard let chunk = try handle.read(upToCount: requested), chunk.count == requested else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let final = offset + requested == entry.fingerprint.byteCount
+            let parsed = parser.append(chunk, final: final)
+            guard parsed.quarantinedSuffix == nil,
+                  parsed.truncatedTail == nil || !final else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            for record in parsed.records {
+                let digestBefore = prefix
+                prefix = try advancePrefixDigest(digestBefore, event: record.event)
+                if !validatedAfter {
+                    if record.event.sequence == afterSequence {
+                        guard let after, record.event.eventID == after.eventID else {
+                            throw WorkServiceProtocolError.staleCursor(
+                                expected: JournalCursor(
+                                    journal: journal, eventID: after?.eventID,
+                                    sequence: afterSequence),
+                                actual: JournalCursor(
+                                    journal: journal, eventID: record.event.eventID,
+                                    sequence: record.event.sequence))
+                        }
+                        validatedAfter = true
+                        basePrefixDigest = prefix
+                    }
+                    continue
+                }
+                guard selected.count < limit else { break }
+                let size = try WorkServiceEventPageSizing.encodedByteCount(of: record.event)
+                guard size <= maxBytes else {
+                    throw WorkServiceProtocolError.eventPageCannotProgress(
+                        requiredBytes: size, maximumBytes: maxBytes)
+                }
+                guard bytes + size <= maxBytes else {
+                    stoppedForBytes = true
+                    break
+                }
+                selected.append(record.event)
+                bytes += size
+                servedPrefixDigest = prefix
+            }
+            if (validatedAfter && (selected.count >= limit || stoppedForBytes)) { break }
+            offset += requested
+        }
+        guard validatedAfter else {
+            throw WorkServiceProtocolError.staleCursor(
+                expected: after ?? JournalCursor(journal: journal, sequence: afterSequence),
+                actual: JournalCursor(journal: journal, sequence: entry.recordCount))
+        }
+        let served = selected.last.map {
+            JournalCursor(journal: journal, eventID: $0.eventID, sequence: $0.sequence)
+        } ?? after
+        if servedPrefixDigest == nil {
+            servedPrefixDigest = basePrefixDigest
+        }
+        let deliveredThrough = selected.last?.sequence ?? afterSequence
+        let remaining = max(0, entry.recordCount - deliveredThrough)
+        let hasMore = remaining > 0
+        var omissions: [WorkServiceOmission] = []
+        if hasMore {
+            omissions.append(WorkServiceOmission(
+                category: stoppedForBytes ? "event_bytes" : "events",
+                count: remaining,
+                diagnostic: stoppedForBytes
+                    ? "event page byte bound reached; continue from served cursor"
+                    : "event page count bound reached; continue from served cursor"))
+        }
+        let afterFingerprint = try journalFileFingerprint(
+            descriptor: descriptor, path: expectedURL, handle: handle)
+        guard before == afterFingerprint else { throw WorkServiceProtocolError.sourceIncomplete }
+        return Page(
+            events: selected, servedCursor: served, nextCursor: hasMore ? served : nil,
+            basePrefixDigest: basePrefixDigest, prefixDigest: servedPrefixDigest,
+            omissions: omissions)
+    }
+
+    private func sparseAnchor(
+        for sequence: Int, in entries: [JournalRecordIndex]
+    ) -> JournalRecordIndex? {
+        var low = 0
+        var high = entries.count
+        var result: JournalRecordIndex?
+        while low < high {
+            let middle = low + (high - low) / 2
+            if entries[middle].sequence <= sequence {
+                result = entries[middle]
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        return result
+    }
+
+    /// Read one canonical source through an actor-owned incremental cache. The open descriptor is
+    /// itself the identity fence: `O_NOFOLLOW` rejects a replaced final path, and fstat/lstat
+    /// comparisons before and after the scan reject a rename or inode swap while bytes are read.
+    /// A candidate cache is published only after the complete append chain reaches EOF without a
+    /// malformed or unterminated suffix.
+    private func readJournal(
+        _ journal: JournalRef, expectedURL: URL, stabilizationAttempt: Int = 0
+    ) throws -> JournalReadCacheEntry {
+        let path = expectedURL.standardizedFileURL.path
+        guard !path.utf8.contains(0) else { throw WorkServiceProtocolError.sourceIncomplete }
+        let key = JournalCacheKey(journal: journal, path: path)
+        let previous = journalCache[key]
+        incrementReadMetrics(readCalls: 1)
+
+        let descriptor = path.withCString {
+            AviaryPOSIX.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            incrementReadMetrics(invalidations: 1)
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        defer { _ = AviaryPOSIX.close(descriptor) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+
+        var observedBefore: JournalFileFingerprint?
+        do {
+            let before = try journalFileFingerprint(
+                descriptor: descriptor, path: expectedURL, handle: handle)
+            observedBefore = before
+            if let previous, previous.fingerprint == before {
+                // Even a cache hit gets a second identity check. It performs no history read, but
+                // a concurrent path replacement must not turn the old entry into current truth.
+                let after = try journalFileFingerprint(
+                    descriptor: descriptor, path: expectedURL, handle: handle)
+                guard before == after else {
+                    journalCache.removeValue(forKey: key)
+                    incrementReadMetrics(invalidations: 1)
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                incrementReadMetrics(cacheHits: 1)
+                return previous
+            }
+
+            // Remove the old entry before mutating any shared arrays/dictionaries. This avoids a
+            // copy-on-write full-history clone on the append path and makes failure semantics
+            // explicit: the old value can never be served after the source changed.
+            journalCache.removeValue(forKey: key)
+            let appendBase: JournalReadCacheEntry?
+            if let previous,
+               previous.fingerprint.identity == before.identity,
+               before.byteCount > previous.fingerprint.byteCount,
+               try prefixTailMatches(
+                   previous, descriptor: descriptor, handle: handle) {
+                appendBase = previous
+            } else {
+                appendBase = nil
+            }
+            let startByteCount = appendBase?.fingerprint.byteCount ?? 0
+            let scan = try scanJournal(
+                journal: journal, handle: handle, targetByteCount: before.byteCount,
+                startByteCount: startByteCount, previous: appendBase)
+            let after = try journalFileFingerprint(
+                descriptor: descriptor, path: expectedURL, handle: handle)
+            guard before == after else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let entry = JournalReadCacheEntry(
+                fingerprint: after, result: scan.result,
+                workSnapshot: scan.workSnapshot, sessionSnapshot: scan.sessionSnapshot,
+                sequenceToIndex: scan.sequenceToIndex,
+                sparseIndex: scan.sparseIndex, recordCount: scan.recordCount,
+                lastRecord: scan.lastRecord, penultimateRecord: scan.penultimateRecord,
+                terminalLineDigest: scan.terminalLineDigest,
+                prefixSeed: scan.prefixSeed, prefixDigest: scan.prefixDigest,
+                nextSequence: scan.nextSequence, previousEventID: scan.previousEventID,
+                isFullyResident: scan.isFullyResident,
+                latestRunStarted: scan.latestRunStarted,
+                latestRunFinished: scan.latestRunFinished,
+                runStartedIDs: scan.runStartedIDs, runFinishedIDs: scan.runFinishedIDs,
+                runFinishedExists: scan.runFinishedExists,
+                artifactDescriptors: scan.artifactDescriptors,
+                bodyReferences: scan.bodyReferences,
+                bodyReferenceCount: scan.bodyReferenceCount,
+                bodyReferencesComplete: scan.bodyReferencesComplete)
+            journalCache[key] = entry
+            incrementReadMetrics(
+                rebuilds: appendBase == nil ? 1 : 0,
+                incrementalReads: appendBase == nil ? 0 : 1)
+            return entry
+        } catch {
+            // A Hosted actor may append a complete line while this reader is scanning. The open
+            // descriptor proves that the path identity is unchanged, and a strictly larger byte
+            // count is the one safe transient case: retry the bounded read against the new tip.
+            // Stable malformed content, truncation, and inode replacement remain fail-closed.
+            if stabilizationAttempt < 3,
+               let before = observedBefore,
+               let after = try? journalFileFingerprint(
+                   descriptor: descriptor, path: expectedURL, handle: handle),
+               before.identity == after.identity,
+               after.byteCount > before.byteCount {
+                journalCache.removeValue(forKey: key)
+                return try readJournal(
+                    journal, expectedURL: expectedURL,
+                    stabilizationAttempt: stabilizationAttempt + 1)
+            }
+            // No stale success is allowed after an invalidation, even when the prior cache was a
+            // fully valid prefix. The caller receives sourceIncomplete and must retry after a new
+            // stable append-chain read.
+            journalCache.removeValue(forKey: key)
+            incrementReadMetrics(invalidations: 1)
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+    }
+
+    private struct JournalScanResult {
+        let result: TimelineJournalReadResult
+        let workSnapshot: WorkSnapshot?
+        let sessionSnapshot: SessionSnapshot?
+        let sequenceToIndex: [Int: Int]
+        let sparseIndex: [JournalRecordIndex]
+        let recordCount: Int
+        let lastRecord: TimelineJournalRecord?
+        let penultimateRecord: TimelineJournalRecord?
+        let terminalLineDigest: String?
+        let prefixSeed: String
+        let prefixDigest: String
+        let nextSequence: Int
+        let previousEventID: String?
+        let isFullyResident: Bool
+        let latestRunStarted: RunRef?
+        let latestRunFinished: RunRef?
+        let runStartedIDs: Set<String>
+        let runFinishedIDs: Set<String>
+        let runFinishedExists: Bool
+        let artifactDescriptors: [WorkServiceArtifactDescriptor]
+        let bodyReferences: Set<TimelineBodyReference>
+        let bodyReferenceCount: Int
+        let bodyReferencesComplete: Bool
+    }
+
+    private func scanJournal(
+        journal: JournalRef,
+        handle: FileHandle,
+        targetByteCount: Int,
+        startByteCount: Int,
+        previous: JournalReadCacheEntry?
+    ) throws -> JournalScanResult {
+        guard targetByteCount >= 0,
+              startByteCount >= 0, startByteCount <= targetByteCount else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+
+        let priorEventID = previous?.previousEventID
+        var parser = TimelineJournalReaderState(
+            journal: journal, actor: actor, hostRecordedAt: Date(),
+            initialByteOffset: startByteCount,
+            initialSequence: previous?.nextSequence ?? 1,
+            initialPreviousEventID: priorEventID)
+
+        // A resident cache is a latency optimization, not a prerequisite for canonical
+        // availability.  Once a source exceeds the resident budget we retain only a sparse byte
+        // index and the bounded reducer projection.  Pages then reread just the requested range.
+        var isFullyResident = targetByteCount <= JournalReadLimits.maximumResidentBytes
+            && previous?.isFullyResident != false
+        var records = isFullyResident ? (previous?.result.records ?? []) : []
+        var sequenceToIndex = isFullyResident ? (previous?.sequenceToIndex ?? [:]) : [:]
+        var sparseIndex = previous?.sparseIndex ?? []
+        var recordCount = previous?.recordCount ?? 0
+        var lastRecord = previous?.lastRecord
+        var penultimateRecord = previous?.penultimateRecord
+        var terminalLineDigest = previous?.terminalLineDigest
+        let seedDigest = previous?.prefixSeed ?? prefixSeed(for: journal)
+        var currentPrefixDigest = previous?.prefixDigest ?? seedDigest
+        var workReducer: WorkReducer?
+        var sessionReducer: SessionReducer?
+        switch journal.owner {
+        case .work:
+            workReducer = WorkReducer(snapshot: previous?.workSnapshot ?? WorkSnapshot())
+            sessionReducer = nil
+        case .session:
+            workReducer = nil
+            sessionReducer = SessionReducer(snapshot: previous?.sessionSnapshot ?? SessionSnapshot())
+        case .workHost:
+            workReducer = nil
+            sessionReducer = nil
+        }
+        var latestRunStarted = previous?.latestRunStarted
+        var latestRunFinished = previous?.latestRunFinished
+        var runStartedIDs = previous?.runStartedIDs ?? []
+        var runFinishedIDs = previous?.runFinishedIDs ?? []
+        var runFinishedExists = previous?.runFinishedExists ?? false
+        var artifactDescriptors = previous?.artifactDescriptors ?? []
+        var cachedBodyReferences = previous?.bodyReferences ?? []
+        var bodyReferenceCount = previous?.bodyReferenceCount ?? 0
+        var bodyReferencesComplete = previous?.bodyReferencesComplete ?? true
+        var offset = startByteCount
+
+        while offset < targetByteCount {
+            let requested = min(JournalReadLimits.chunkBytes, targetByteCount - offset)
+            try handle.seek(toOffset: UInt64(offset))
+            guard let chunk = try handle.read(upToCount: requested),
+                  chunk.count == requested else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            incrementReadMetrics(bytesScanned: chunk.count)
+            let parsed = parser.append(
+                chunk, final: offset + requested == targetByteCount)
+            guard parsed.quarantinedSuffix == nil,
+                  parsed.truncatedTail == nil || offset + requested < targetByteCount else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            for record in parsed.records {
+                recordCount += 1
+                let compact = TimelineJournalRecord(
+                    event: record.event, rawLineBytes: Data(), byteStart: record.byteStart,
+                    byteEnd: record.byteEnd, legacyRawID: record.legacyRawID)
+                let priorRecord = lastRecord
+                penultimateRecord = lastRecord
+                lastRecord = compact
+                terminalLineDigest = digest(record.rawLineBytes)
+                let prefixDigestBefore = currentPrefixDigest
+                currentPrefixDigest = try advancePrefixDigest(
+                    prefixDigestBefore, event: record.event)
+                if record.event.type == TimelineEventType.runStarted,
+                   let run = record.event.run {
+                    latestRunStarted = run
+                    runStartedIDs.insert(run.runID)
+                }
+                if record.event.type == TimelineEventType.runFinished {
+                    runFinishedExists = true
+                    if let run = record.event.run {
+                        latestRunFinished = run
+                        runFinishedIDs.insert(run.runID)
+                    }
+                }
+                let references = collectBodyReferences(in: record.event.payload)
+                if !references.isEmpty {
+                    bodyReferenceCount += references.count
+                    if bodyReferencesComplete {
+                        for reference in references {
+                            if cachedBodyReferences.count < JournalReadLimits.maximumCachedBodyReferences {
+                                cachedBodyReferences.insert(reference)
+                            } else {
+                                bodyReferencesComplete = false
+                                break
+                            }
+                        }
+                    }
+                }
+                if case .work(let artifactWork) = journal.owner,
+                   artifactDescriptors.count < JournalReadLimits.maximumCachedArtifacts,
+                   let artifact = artifactDescriptor(from: record.event, work: artifactWork) {
+                    artifactDescriptors.append(artifact)
+                }
+
+                // Keep a bounded sparse index even for nonresident sources. The first record and
+                // every stride boundary are enough to locate any later page with a bounded suffix
+                // scan, while avoiding one dictionary entry per historical event.
+                if sparseIndex.count < JournalReadLimits.maximumSparseEntries,
+                   recordCount == 1 || (recordCount - 1) % JournalReadLimits.sparseStride == 0 {
+                    sparseIndex.append(JournalRecordIndex(
+                        eventID: record.event.eventID, sequence: record.event.sequence,
+                        byteStart: record.byteStart, byteEnd: record.byteEnd,
+                        previousEventID: priorRecord?.event.eventID,
+                        prefixDigestBefore: prefixDigestBefore,
+                        prefixDigest: currentPrefixDigest))
+                }
+
+                if isFullyResident {
+                    if recordCount <= JournalReadLimits.maximumResidentRecords {
+                        sequenceToIndex[record.event.sequence] = records.count
+                        records.append(compact)
+                    } else {
+                        // The source remains valid. Drop the resident envelopes and continue the
+                        // same validated reduction with sparse offsets.
+                        isFullyResident = false
+                        records.removeAll(keepingCapacity: false)
+                        sequenceToIndex.removeAll(keepingCapacity: false)
+                    }
+                }
+                workReducer?.apply(record.event)
+                sessionReducer?.apply(record.event)
+                incrementReadMetrics(recordsApplied: 1)
+            }
+            offset += requested
+        }
+
+        let nextSequence: Int
+        let previousEventID: String?
+        if let last = lastRecord?.event {
+            let (next, overflow) = last.sequence.addingReportingOverflow(1)
+            guard !overflow else { throw WorkServiceProtocolError.sourceIncomplete }
+            nextSequence = next
+            previousEventID = last.eventID
+        } else {
+            nextSequence = 1
+            previousEventID = nil
+        }
+        return JournalScanResult(
+            result: TimelineJournalReadResult(records: isFullyResident ? records : []),
+            workSnapshot: workReducer?.snapshot,
+            sessionSnapshot: sessionReducer?.snapshot,
+            sequenceToIndex: sequenceToIndex, sparseIndex: sparseIndex,
+            recordCount: recordCount, lastRecord: lastRecord,
+            penultimateRecord: penultimateRecord,
+            terminalLineDigest: terminalLineDigest, prefixSeed: seedDigest,
+            prefixDigest: currentPrefixDigest, nextSequence: nextSequence,
+            previousEventID: previousEventID, isFullyResident: isFullyResident,
+            latestRunStarted: latestRunStarted, latestRunFinished: latestRunFinished,
+            runStartedIDs: runStartedIDs, runFinishedIDs: runFinishedIDs,
+            runFinishedExists: runFinishedExists,
+            artifactDescriptors: artifactDescriptors, bodyReferences: cachedBodyReferences,
+            bodyReferenceCount: bodyReferenceCount,
+            bodyReferencesComplete: bodyReferencesComplete)
+    }
+
+    private func incrementReadMetrics(
+        readCalls: Int = 0,
+        cacheHits: Int = 0,
+        rebuilds: Int = 0,
+        incrementalReads: Int = 0,
+        invalidations: Int = 0,
+        bytesScanned: Int = 0,
+        recordsApplied: Int = 0
+    ) {
+        func add(_ value: Int, _ delta: Int) -> Int {
+            guard delta > 0 else { return value }
+            let (result, overflow) = value.addingReportingOverflow(delta)
+            return overflow ? Int.max : result
+        }
+        readMetrics = JournalBackedWorkServiceReadMetrics(
+            readCalls: add(readMetrics.readCalls, readCalls),
+            cacheHits: add(readMetrics.cacheHits, cacheHits),
+            rebuilds: add(readMetrics.rebuilds, rebuilds),
+            incrementalReads: add(readMetrics.incrementalReads, incrementalReads),
+            invalidations: add(readMetrics.invalidations, invalidations),
+            bytesScanned: add(readMetrics.bytesScanned, bytesScanned),
+            recordsApplied: add(readMetrics.recordsApplied, recordsApplied))
+    }
+
+    /// The empty-prefix token is scoped to the logical journal, so a cursor from one journal can
+    /// never be mistaken for an empty prefix in another journal.  Prefix tokens are a hash-chain
+    /// over the decoded event's canonical JSON line, not a whole-history digest: each scan advances
+    /// the token once and sparse anchors make later validation bounded.
+    private func prefixSeed(for journal: JournalRef) -> String {
+        digest(Data("aviary-prefix-v1\u{0}seed\u{0}\(journal.stableKey)".utf8))
+    }
+
+    private func canonicalEventLine(_ event: TimelineEvent) throws -> Data {
+        let encoder = JSONEncoder()
+        // Prefix tokens cross requests and process lifetimes. Dictionary iteration order must not
+        // make the same canonical event produce a different checkpoint digest on a later read.
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(event) + Data([UInt8(ascii: "\n")])
+    }
+
+    private func advancePrefixDigest(_ prefix: String, event: TimelineEvent) throws -> String {
+        let lineDigest = digest(try canonicalEventLine(event))
+        var material = Data("aviary-prefix-v1\u{0}".utf8)
+        material.append(Data(prefix.utf8))
+        material.append(0)
+        material.append(Data(lineDigest.utf8))
+        return digest(material)
+    }
+
+    private func prefixDigest(
+        for cursorValue: JournalCursor?, entry: JournalReadCacheEntry,
+        records: [TimelineJournalRecord], sequenceToIndex: [Int: Int], journal: JournalRef
+    ) throws -> String? {
+        guard let cursor = cursorValue else { return entry.prefixSeed }
+        guard cursor.journal == journal, cursor.sequence >= 0,
+              cursor.sequence <= entry.recordCount else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
+        guard cursor.sequence > 0 else {
+            guard cursor.eventID == nil else {
+                throw WorkServiceProtocolError.staleCursor(
+                    expected: cursor,
+                    actual: JournalCursor(journal: journal, sequence: entry.recordCount))
+            }
+            return entry.prefixSeed
+        }
+        guard let targetIndex = sequenceToIndex[cursor.sequence],
+              targetIndex >= 0, targetIndex < records.count,
+              records[targetIndex].event.sequence == cursor.sequence,
+              records[targetIndex].event.eventID == cursor.eventID else {
+            throw WorkServiceProtocolError.staleCursor(
+                expected: cursor,
+                actual: self.cursor(records, journal: journal))
+        }
+        guard let anchor = sparseAnchor(for: cursor.sequence, in: entry.sparseIndex),
+              let anchorIndex = sequenceToIndex[anchor.sequence],
+              anchorIndex >= 0, anchorIndex <= targetIndex,
+              records[anchorIndex].event.sequence == anchor.sequence,
+              records[anchorIndex].event.eventID == anchor.eventID else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        var result = try advancePrefixDigest(
+            anchor.prefixDigestBefore, event: records[anchorIndex].event)
+        guard result == anchor.prefixDigest else { throw WorkServiceProtocolError.sourceIncomplete }
+        if anchorIndex < targetIndex {
+            for index in (anchorIndex + 1)...targetIndex {
+                result = try advancePrefixDigest(result, event: records[index].event)
+            }
+        }
+        // This is an internal cache invariant. A mismatch means the cache's prefix proof no longer
+        // describes the events being served, so fail closed rather than returning a token that a
+        // controller could use to skip an unproven reducer state.
+        return result
+    }
+
+    private func prefixTailMatches(
+        _ previous: JournalReadCacheEntry,
+        descriptor: Int32,
+        handle: FileHandle
+    ) throws -> Bool {
+        let fingerprint = previous.fingerprint
+        guard fingerprint.byteCount > 0 else { return true }
+        guard let expected = fingerprint.lastByte else { return false }
+        guard let actual = try byte(
+            at: fingerprint.byteCount - 1, descriptor: descriptor, handle: handle) else {
+            return false
+        }
+        guard actual == expected else { return false }
+        guard let terminal = previous.lastRecord,
+              let expectedTerminalDigest = previous.terminalLineDigest else {
+            return false
+        }
+        let terminalLength = terminal.byteEnd - terminal.byteStart
+        guard terminalLength > 0,
+              let terminalData = try readRange(
+                  at: terminal.byteStart, length: terminalLength, handle: handle),
+              digest(terminalData) == expectedTerminalDigest else {
+            return false
+        }
+        // A small prefix sample catches in-place rewrites which leave the former terminal line
+        // unchanged.  Complete-prefix proof is supplied by the owner writer's append lock; this
+        // evidence makes accidental same-inode replacement fail closed in ordinary cases without
+        // re-reading the entire history on every append.
+        return try prefixEvidence(for: handle, byteCount: fingerprint.byteCount)
+            == fingerprint.prefixEvidence
+    }
+
+    private func readRange(at offset: Int, length: Int, handle: FileHandle) throws -> Data? {
+        let (_, overflow) = offset.addingReportingOverflow(length)
+        guard offset >= 0, length >= 0, !overflow else {
+            return nil
+        }
+        try handle.seek(toOffset: UInt64(offset))
+        let data = try handle.read(upToCount: length) ?? Data()
+        try handle.seek(toOffset: 0)
+        return data.count == length ? data : nil
+    }
+
+    private func byte(
+        at offset: Int, descriptor: Int32, handle: FileHandle
+    ) throws -> UInt8? {
+        _ = descriptor
+        guard offset >= 0 else { return nil }
+        try handle.seek(toOffset: UInt64(offset))
+        let data = try handle.read(upToCount: 1) ?? Data()
+        try handle.seek(toOffset: 0)
+        guard data.count == 1 else { return nil }
+        return data[data.startIndex]
+    }
+
+    private func journalFileFingerprint(
+        descriptor: Int32, path: URL, handle: FileHandle
+    ) throws -> JournalFileFingerprint {
+        var descriptorStatus = stat()
+        guard fstat(descriptor, &descriptorStatus) == 0,
+              (descriptorStatus.st_mode & S_IFMT) == S_IFREG,
+              descriptorStatus.st_size >= 0,
+              descriptorStatus.st_size <= off_t(Int.max) else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        var pathStatus = stat()
+        let pathResult = path.standardizedFileURL.path.withCString {
+            lstat($0, &pathStatus)
+        }
+        guard pathResult == 0,
+              (pathStatus.st_mode & S_IFMT) == S_IFREG,
+              descriptorStatus.st_dev == pathStatus.st_dev,
+              descriptorStatus.st_ino == pathStatus.st_ino else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let byteCount = Int(descriptorStatus.st_size)
+        let lastByte = try byte(at: byteCount - 1, descriptor: descriptor, handle: handle)
+        let evidence = try prefixEvidence(for: handle, byteCount: byteCount)
+        let times = journalFileTimes(descriptorStatus)
+        return JournalFileFingerprint(
+            identity: JournalFileIdentity(
+                device: UInt64(descriptorStatus.st_dev),
+                inode: UInt64(descriptorStatus.st_ino),
+                mode: UInt32(descriptorStatus.st_mode)),
+            byteCount: byteCount,
+            modificationSeconds: times.modificationSeconds,
+            modificationNanoseconds: times.modificationNanoseconds,
+            changeSeconds: times.changeSeconds,
+            changeNanoseconds: times.changeNanoseconds,
+            lastByte: lastByte, prefixEvidence: evidence)
+    }
+
+    private func journalFileTimes(_ status: stat) -> (
+        modificationSeconds: Int64,
+        modificationNanoseconds: Int64,
+        changeSeconds: Int64,
+        changeNanoseconds: Int64
+    ) {
+        #if canImport(Darwin)
+        return (
+            Int64(status.st_mtimespec.tv_sec), Int64(status.st_mtimespec.tv_nsec),
+            Int64(status.st_ctimespec.tv_sec), Int64(status.st_ctimespec.tv_nsec))
+        #elseif canImport(Glibc)
+        return (
+            Int64(status.st_mtim.tv_sec), Int64(status.st_mtim.tv_nsec),
+            Int64(status.st_ctim.tv_sec), Int64(status.st_ctim.tv_nsec))
+        #else
+        return (0, 0, 0, 0)
+        #endif
+    }
+
+    private func prefixEvidence(for handle: FileHandle, byteCount: Int) throws -> String {
+        guard byteCount >= 0 else { throw WorkServiceProtocolError.sourceIncomplete }
+        let sample = min(4 * 1024, byteCount)
+        guard let first = try readRange(at: 0, length: sample, handle: handle) else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        guard byteCount > sample else { return digest(first) }
+        guard let last = try readRange(
+            at: byteCount - sample, length: sample, handle: handle) else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        var evidence = Data()
+        evidence.append(first)
+        evidence.append(last)
+        return digest(evidence)
+    }
+
+    private func artifacts(in source: CanonicalSource) -> [WorkServiceArtifactDescriptor] {
+        source.workCache.artifactDescriptors
+    }
+
+    private func artifactDescriptor(
+        from event: TimelineEvent, work: WorkRef
+    ) -> WorkServiceArtifactDescriptor? {
+        // Artifact payloads have intentionally remained an opaque producer contract. Expose only
+        // references that decode as the bounded service descriptor, and never synthesize one
+        // from a filename or local path.
+        guard event.type == TimelineEventType.artifact,
+              let object = event.payload.objectValue,
+              let id = object["artifact_id"]?.stringValue,
+              !id.isEmpty else { return nil }
+        let body: TimelineBodyReference? = object["body_reference"].flatMap { value in
+            guard let data = try? JSONEncoder().encode(value) else { return nil }
+            return try? JSONDecoder().decode(TimelineBodyReference.self, from: data)
+        }
+        return WorkServiceArtifactDescriptor(
+            artifactID: id, work: work, label: object["label"]?.stringValue ?? id,
+            mediaType: object["media_type"]?.stringValue,
+            byteCount: object["byte_count"]?.intValue,
+            digest: object["digest"]?.stringValue,
+            available: body != nil || object["available"]?.boolValue != false,
+            bodyReference: body)
+    }
+
+    private func collectBodyReferences(in value: JSONValue) -> Set<TimelineBodyReference> {
+        var result: Set<TimelineBodyReference> = []
+        func visit(_ value: JSONValue) {
+            if let data = try? JSONEncoder().encode(value),
+               let reference = try? JSONDecoder().decode(TimelineBodyReference.self, from: data) {
+                result.insert(reference)
+            }
+            switch value {
+            case .array(let values): values.forEach(visit)
+            case .object(let values): values.values.forEach(visit)
+            default: break
+            }
+        }
+        visit(value)
+        return result
+    }
+
+    private func sourceContainsBodyReference(
+        _ source: CanonicalSource, _ reference: TimelineBodyReference
+    ) throws -> Bool {
+        if source.workCache.bodyReferences.contains(reference)
+            || source.sessionCache.bodyReferences.contains(reference) {
+            return true
+        }
+        let candidates: [(JournalReadCacheEntry, JournalRef, URL)] = [
+            (source.workCache, source.workJournal,
+             home.timelineV2WorkJournalURL(source.registration.reservation.work)),
+            (source.sessionCache, source.sessionJournal,
+             home.timelineV2SessionJournalURL(source.registration.reservation.session))
+        ]
+        for (entry, journal, url) in candidates where !entry.bodyReferencesComplete {
+            if try streamContainsBodyReference(
+                entry: entry, journal: journal, expectedURL: url, reference: reference) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func streamContainsBodyReference(
+        entry: JournalReadCacheEntry, journal: JournalRef, expectedURL: URL,
+        reference: TimelineBodyReference
+    ) throws -> Bool {
+        let path = expectedURL.standardizedFileURL.path
+        let descriptor = path.withCString {
+            AviaryPOSIX.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else { throw WorkServiceProtocolError.sourceIncomplete }
+        defer { _ = AviaryPOSIX.close(descriptor) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        let before = try journalFileFingerprint(descriptor: descriptor, path: expectedURL, handle: handle)
+        guard before == entry.fingerprint else { throw WorkServiceProtocolError.sourceIncomplete }
+        var found = false
+        var parser = TimelineJournalReaderState(
+            journal: journal, actor: actor, hostRecordedAt: Date())
+        var offset = 0
+        while offset < before.byteCount {
+            let requested = min(JournalReadLimits.chunkBytes, before.byteCount - offset)
+            try handle.seek(toOffset: UInt64(offset))
+            guard let chunk = try handle.read(upToCount: requested), chunk.count == requested else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let final = offset + requested == before.byteCount
+            let parsed = parser.append(chunk, final: final)
+            guard parsed.quarantinedSuffix == nil,
+                  parsed.truncatedTail == nil || !final else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            if parsed.records.contains(where: {
+                collectBodyReferences(in: $0.event.payload).contains(reference)
+            }) {
+                found = true
+                break
+            }
+            offset += requested
+        }
+        let after = try journalFileFingerprint(descriptor: descriptor, path: expectedURL, handle: handle)
+        guard before == after else { throw WorkServiceProtocolError.sourceIncomplete }
+        return found
+    }
+
+    private func terminalCommand(
+        _ request: WorkServiceCommandRequest, source: CanonicalSource,
+        attachment: WorkServiceClientAttachment, client: ClientRef
+    ) async throws -> WorkServiceCommandReceipt {
+        let operation: WorkServiceTerminalOperation = request.kind == .complete ? .complete : .destroy
+        guard let sessionAttachment = attachment.sessionAttachment else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let command = WorkServiceCommandLedgerIdentity.command(
+            from: CommandRef(
+                commandID: request.command.commandID, client: client,
+                sessionAttachment: sessionAttachment,
+                causalCursor: request.causalWorkCursor),
+            client: client)
+        let identity = SessionWorkIdentity(
+            sessionID: source.session.sessionID, work: request.work,
+            runID: source.workCache.latestRunStarted?.runID ?? "unknown-run")
+        let terminal = WorkServiceTerminalCommitRequest(
+            operation: operation, work: request.work, journal: request.journal,
+            client: client, session: source.session, sessionJournal: source.sessionJournal,
+            sessionAttachment: sessionAttachment,
+            causalWorkCursor: request.causalWorkCursor, detail: request.value,
+            command: command)
+        let proof: WorkServiceTerminalCommitProof?
+        if let lookup = await registry.lookup(request.work), case .live(let entry) = lookup {
+            proof = try await entry.hostedWork.commit(terminal)
+            _ = try await registry.release(request.work, terminalProof: proof!)
+        } else {
+            proof = try RunJournalBundle.readTerminalCommit(
+                home: home, identity: identity,
+                sessionAttachment: sessionAttachment, command: command,
+                detail: request.value).flatMap { try WorkServiceTerminalCommitProof.makeProof(record: $0, request: terminal) }
+        }
+        guard let proof else { throw WorkServiceProtocolError.invalidRequest("Work must End before terminalization") }
+        return WorkServiceCommandReceipt(
+            work: request.work, commandID: request.command.commandID, state: .accepted,
+            host: hostInstance, hostSequence: proof.terminalEvent.hostSequence,
+            causalWorkCursor: request.causalWorkCursor, resultingWorkCursor: proof.resultingWorkCursor,
+            authorization: attachment.authorization,
+            outcome: operation == .complete ? .completed : .destroyed, terminalProof: proof)
+    }
+
+    private func mintClientAttachment() async throws -> ClientAttachmentRef {
+        for _ in 0..<32 {
+            let value = ClientAttachmentRef("client-attachment-" + UUID().uuidString.lowercased())
+            let control = try await controlSnapshot()
+            if control.clientAttachments[value.attachmentID] == nil { return value }
+        }
+        throw WorkServiceProtocolError.sourceIncomplete
+    }
+
+    private func validateManifest(_ manifest: JournalBackedWorkLaunchManifest) throws {
+        guard validDigest(manifest.bodyDigest), validDigest(manifest.configurationDigest) else {
+            throw WorkServiceProtocolError.invalidRequest("launch manifest digests are invalid")
+        }
+    }
+
+    /// A Start may execute only from the exact identity-bound durable record returned by the
+    /// launch store. A template/digest or an in-memory closure is not enough: the retained body,
+    /// client-qualified intent, Work/Session/attachment tuple, and selected Run must all be
+    /// present and byte-verifiable before Hosted construction can append a marker.
+    private func validateStartManifest(
+        _ manifest: JournalBackedWorkLaunchManifest,
+        intent: WorkLaunchStartIntent,
+        body: Data,
+        binding: WorkRunBinding
+    ) throws {
+        guard let record = manifest.durableRecord else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let durable = record.manifest
+        guard durable.identity.work == binding.workBinding.work,
+              durable.identity.session == binding.workBinding.session,
+              durable.identity.sessionAttachment == binding.workBinding.sessionAttachment,
+              durable.identity.run == binding.run,
+              durable.startIntent == intent,
+              durable.promptAssembly != nil,
+              let reference = durable.initialInputBodyReference,
+              reference.digest == intent.bodyDigest,
+              (try? ContextBodyStore(home: home).read(reference)) == body else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        try validateManifest(manifest)
+    }
+
+    private func digest(_ data: Data) -> String {
+        "sha256:" + AviarySHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func startBodyMatches(
+        _ prompt: String,
+        record: WorkLaunchManifestRecord
+    ) -> Bool {
+        let bytes = Data(prompt.utf8)
+        guard record.manifest.startIntent.bodyDigest == digest(bytes) else { return false }
+        guard let reference = record.manifest.initialInputBodyReference else {
+            // A Start record without its exact retained input body is not replayable.  Digest-only
+            // protocol seams cannot prove the bytes after restart, so they fail closed.
+            return false
+        }
+        return (try? ContextBodyStore(home: home).read(reference)) == bytes
+    }
+
+    private func validConfigurationBounds(_ configuration: WorkServiceWorkConfiguration) -> Bool {
+        !configuration.wasTruncated
+            && [configuration.providerID, configuration.modelID, configuration.thinkingLevel,
+                configuration.contextPolicy,
+                configuration.resumePolicy]
+                .allSatisfy { ($0?.utf8.count ?? 0) <= WorkServiceBounds.maxCommandValueCharacters }
+    }
+
+    private func capability(for kind: WorkServiceCommandKind) -> WorkServiceCapability {
+        switch kind {
+        case .start: return .start
+        case .send: return .send
+        case .steer: return .steer
+        case .queue: return .queue
+        case .hold: return .hold
+        case .cancel: return .cancel
+        case .end: return .end
+        case .destroy: return .destroy
+        case .complete: return .complete
+        }
+    }
+
+    private func qualifiedCommandID(clientID: String, commandID: String) -> String {
+        WorkServiceCommandLedgerIdentity.commandID(
+            client: ClientRef(clientID), commandID: commandID)
+    }
+
+    private func createAttachmentCommandID(client: ClientRef, commandID: String) -> String {
+        let material = Data("create-attachment-v1\u{0}\(client.clientID)\u{0}\(commandID)".utf8)
+        let digest = AviarySHA256.hash(data: material)
+            .map { String(format: "%02x", $0) }.joined()
+        return "create-attachment-v1.\(digest)"
+    }
+
+    private func validateClient(_ client: ClientRef?) throws {
+        guard let client, !client.clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              client.clientID.utf8.count <= WorkServiceBounds.maxIdentityCharacters else {
+            throw WorkServiceProtocolError.invalidRequest("client identity is not bounded")
+        }
+    }
+
+    private func validateSessionTuple(
+        _ session: SessionRef?, _ sessionJournal: JournalRef?, _ attachment: SessionAttachmentRef?,
+        expectedSession: SessionRef, expectedJournal: JournalRef,
+        expectedAttachment: SessionAttachmentRef
+    ) throws {
+        guard session == expectedSession, sessionJournal == expectedJournal,
+              attachment == expectedAttachment else { throw WorkServiceProtocolError.journalMismatch }
+    }
+
+    private func normalizedSessionTuple(
+        _ session: SessionRef?, _ journal: JournalRef?, _ attachment: SessionAttachmentRef?,
+        source: CanonicalSource
+    ) throws -> (session: SessionRef, journal: JournalRef, attachment: SessionAttachmentRef) {
+        if session == nil && journal == nil && attachment == nil {
+            return (source.session, source.sessionJournal, source.sessionAttachment)
+        }
+        try validateSessionTuple(
+            session, journal, attachment, expectedSession: source.session,
+            expectedJournal: source.sessionJournal, expectedAttachment: source.sessionAttachment)
+        return (source.session, source.sessionJournal, source.sessionAttachment)
+    }
+
+    private func parsePageToken(_ token: String?, total: Int) throws -> Int {
+        guard let token else { return 0 }
+        guard let value = Int(token), value >= 0, value <= total else {
+            throw WorkServiceProtocolError.invalidRequest("invalid page token")
+        }
+        return value
+    }
+
+    private func cursor(_ records: [TimelineJournalRecord], journal: JournalRef) -> JournalCursor {
+        records.last.map { JournalCursor(journal: journal, eventID: $0.event.eventID, sequence: $0.event.sequence) }
+            ?? JournalCursor(journal: journal, sequence: 0)
+    }
+
+    private func controlReceipt(
+        _ operation: WorkServiceControlOperation, work: WorkRef, commandID: String,
+        state: WorkServiceCommandReceiptState, causal: JournalCursor,
+        resulting: JournalCursor, authorization: WorkServiceAuthorizationOutcome,
+        outcome: WorkServiceControlOutcome? = nil
+    ) -> WorkServiceControlReceipt {
+        WorkServiceControlReceipt(
+            operation: operation, work: work, commandID: commandID, state: state,
+            host: hostInstance, causalControlCursor: causal,
+            resultingControlCursor: resulting, authorization: authorization, outcome: outcome)
+    }
+
+    private func commandOutcome(_ kind: WorkServiceCommandKind) -> WorkServiceCommandOutcome? {
+        switch kind {
+        case .start: return .started
+        case .send: return .inputAccepted
+        case .steer: return .steeringAccepted
+        case .queue: return .queued
+        case .cancel: return .cancellationRequested
+        case .end: return .endRequested
+        case .hold: return .holdRequested
+        case .destroy: return .destroyed
+        case .complete: return .completed
+        }
+    }
+
+    private func validDigest(_ value: String) -> Bool {
+        let parts = value.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        return parts.count == 2 && parts[0].lowercased() == "sha256"
+            && parts[1].count == 64 && parts[1].allSatisfy { $0.isHexDigit }
+    }
+
+    private func containsBodyReference(_ value: JSONValue, _ reference: TimelineBodyReference) -> Bool {
+        if let data = try? JSONEncoder().encode(value),
+           let decoded = try? JSONDecoder().decode(TimelineBodyReference.self, from: data), decoded == reference {
+            return true
+        }
+        switch value {
+        case .array(let values): return values.contains { containsBodyReference($0, reference) }
+        case .object(let values): return values.values.contains { containsBodyReference($0, reference) }
+        default: return false
+        }
+    }
+}

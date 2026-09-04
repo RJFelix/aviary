@@ -74,7 +74,7 @@ public struct SubAgentRecorder: Sendable {
         data.append(UInt8(ascii: "\n"))
 
         if !FileManager.default.fileExists(atPath: ledgerURL.path) {
-            FileManager.default.createFile(atPath: ledgerURL.path, contents: nil)
+            _ = FileManager.default.createFile(atPath: ledgerURL.path, contents: nil)
         }
         let handle = try FileHandle(forWritingTo: ledgerURL)
         defer { try? handle.close() }

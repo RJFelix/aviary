@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 @testable import AviaryCore
 
 private let recoveryProjectionActor = TimelineActor(actorID: "recovery-projection-test", kind: "test")
@@ -57,7 +56,7 @@ private func recoveryProjectionWriteControl(
     let last = read.records.last?.event
     let cursor = JournalCursor(
         journal: journal, eventID: last?.eventID, sequence: last?.sequence ?? 0)
-    let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    let digest = AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     let seal = RecoveryProjectionControlDurabilitySeal(
         schemaVersion: 1, journal: journal, cursor: cursor,
         byteCount: data.count, sha256: digest)
@@ -721,13 +720,16 @@ func test_canonicalWorkRecoveryProjectionRequiresReciprocalWorkSessionAttachment
         type: TimelineEventType.actionIntent, work: work,
         workHost: WorkHostRef(work.workHostID), action: action,
         declaredDomains: [.work, .externalEffects],
-        payload: .object(["state": .string("proposed"), "action_kind": .string("tool")])))
+        payload: .object([
+            "state": .string("proposed"), "kind": .string("mcp"),
+            "intent": .string("tool invocation")
+        ])))
     workData.append(try recoveryProjectionEvent(
         id: "rw4", journal: workJournal, sequence: 4, previous: "rw3",
         type: TimelineEventType.actionStarted, work: work,
         workHost: WorkHostRef(work.workHostID), action: action,
         declaredDomains: [.work, .externalEffects],
-        payload: .object(["state": .string("running"), "action_kind": .string("tool")])))
+        payload: .object(["state": .string("running"), "kind": .string("mcp")])))
     workData.append(try recoveryProjectionEvent(
         id: "rw5", journal: workJournal, sequence: 5, previous: "rw4",
         type: TimelineEventType.actionOutcome, work: work,

@@ -1,4 +1,5 @@
 import AviaryCore
+import CryptoKit
 import Observation
 import SwiftUI
 import UserNotifications
@@ -224,11 +225,40 @@ final class AppModel {
     // MARK: Runs
 
     var runs: [LiveRun] = []
-    /// Work retained by this process after its chat view is detached.
-    ///
-    /// This is an in-process bridge toward the Work Host split, not a durability claim: an app
-    /// process exit still ends these runs until the out-of-process host exists.
+    /// Work retained by this process after its chat view is detached. Service-backed rows are
+    /// durable host attachments; process-owned rows remain only the Claude Code path.
     var detachedRuns: [LiveRun] = []
+
+    /// The GUI's durable client identity and local Work Host connection.  The bootstrapper is
+    /// only a client transport: it may launch a helper to make a local host reachable, but it
+    /// never owns Work, Session, Run, or the helper process lifetime.
+    private(set) var localWorkService: LocalWorkServiceBootstrap?
+    private(set) var localWorkServiceClient: ClientRef?
+    var localWorkServiceHandshake: WorkServiceHandshakeResponse?
+    var localWorkspaceCatalog: WorkHostWorkspaceCatalog = .empty
+    /// Work rows offered by the last complete authoritative catalog read that this client does
+    /// not already attach to. The launcher uses this for an explicit Attach action; rows are
+    /// never reconstructed from a partially read or quarantined page.
+    private(set) var localServiceCatalogWorks: [WorkServiceWorkDescriptor] = []
+    var localWorkServiceError: String?
+    private var localWorkServiceBootstrapInFlight = false
+    private var serviceRefreshInFlight = false
+    /// Cursor for the bounded central service poll. Stable ordering plus rotation prevents
+    /// Work rows after the first page of attached runs from being starved forever.
+    private var servicePollOffset = 0
+    private var serviceCreateInFlight = false
+    /// Exact Attach requests retained across an ambiguous response.  The request's causal
+    /// control cursor and host instance are part of the logical attach epoch; a later retry uses
+    /// this same envelope only while the descriptor has not already proven the attachment.
+    private struct PendingServiceAttach {
+        let request: WorkServiceAttachRequest
+        let hostInstance: WorkHostInstanceRef
+    }
+    private var pendingServiceAttaches: [WorkRef: PendingServiceAttach] = [:]
+    /// Local presentation state only.  Closing a completed service row must not cause the next
+    /// catalog poll to recreate it; a relaunch starts with an empty set and can inspect terminal
+    /// Work again from the canonical Sessions/catalog surface.
+    private var hiddenServiceWorkIDs: Set<WorkRef> = []
 
     var workRuns: [LiveRun] { runs + detachedRuns }
 
@@ -248,9 +278,14 @@ final class AppModel {
             await workShutdownTask.value
             return
         }
-        let work = workRuns
+        let processOwnedWork = workRuns.filter { !$0.isServiceBacked }
         let task = Task { @MainActor in
-            for run in work { await run.stop() }
+            // Claude Code and the old in-process path still have an explicit process-owned
+            // teardown.  A Work-service run is different: disconnecting this GUI must not
+            // synthesize End or make the Work Host depend on this process.
+            for run in processOwnedWork { await run.stop() }
+            for run in workRuns where run.isServiceBacked { await run.disconnect() }
+            await self.disconnectLocalWorkService()
         }
         workShutdownTask = task
         await task.value
@@ -402,7 +437,7 @@ final class AppModel {
     ///
     /// Not a display mode — a *startup* mode. The full `bootstrap` costs about seven and a half
     /// seconds before anything is on screen, and almost none of it is work a UI edit needs:
-    /// capturing the login shell's environment (`zsh -ilc`), scanning every transcript on disk,
+    /// capturing the login shell's environment, scanning every transcript on disk,
     /// discovering engines, probing the daemon, resolving every provider's key expression (one
     /// of which shells out), starting Python hosts to read their capabilities, and asking
     /// `claude auth status`. A preview skips all of it and opens in well under a second, which
@@ -472,7 +507,662 @@ final class AppModel {
         restoreAfterReload()
 
         await refreshAll()
+        await bootstrapLocalWorkService()
         startPolling()
+    }
+
+    /// Establish the local client connection used by Aviary-owned in-house runs.  The durable
+    /// ClientRef is read before constructing any controller and is shared across GUI relaunches;
+    /// it is never regenerated merely because a window or process disappeared.
+    func bootstrapLocalWorkService() async {
+        guard !isPreview, localWorkService == nil, !localWorkServiceBootstrapInFlight else {
+            return
+        }
+        localWorkServiceBootstrapInFlight = true
+        defer { localWorkServiceBootstrapInFlight = false }
+        do {
+            let workHost = try home.requirePersistedWorkHost()
+            let identityStore = try WorkServiceClientIdentityStore(
+                url: home.root.appending(
+                    path: "work-service-client-id", directoryHint: .notDirectory))
+            let client = try identityStore.loadOrCreate()
+            let locator = LocalWorkServiceHostLocator(home: home, workHost: workHost)
+            let launcher = try LocalAviaryDaemonLauncher(agentHome: home).asLauncher()
+            let bootstrap = try LocalWorkServiceBootstrap(
+                locator: locator, client: client, launcher: launcher)
+            localWorkService = bootstrap
+            localWorkServiceClient = client
+            let initialSession = try await bootstrap.connect()
+            localWorkServiceHandshake = await initialSession.negotiatedHandshake
+            localWorkspaceCatalog = localWorkServiceHandshake?.workspaceCatalog ?? .empty
+            localWorkServiceError = nil
+            // A fresh probe is not enough for mutation admission: it may be a different daemon
+            // instance from the cached shared socket. Reconcile only after the shared session has
+            // been refreshed and fenced to the same host instance.
+            let (session, freshHandshake) = try await reconnectLocalWorkService()
+            localWorkServiceHandshake = freshHandshake
+            localWorkspaceCatalog = freshHandshake.workspaceCatalog
+            guard await reconcilePendingCreateIntents(session: session, client: client) else {
+                return
+            }
+            await restoreServiceWork(
+                session: session, client: client, handshake: freshHandshake)
+        } catch {
+            // The GUI remains usable for Claude Code and historical sessions if the local
+            // helper is unavailable.  Keep this error bounded and do not expose launcher paths.
+            localWorkServiceError = Self.serviceErrorMessage(error)
+        }
+    }
+
+    /// Read the host catalog and recreate every attachment belonging to this durable client.
+    /// This is observation/reconstruction only: the presence of an attachment is not an excuse
+    /// to issue another Attach command, and terminal Work remains inspectable.
+    private func restoreServiceWork(
+        session: WorkServiceClientSession, client: ClientRef,
+        handshake suppliedHandshake: WorkServiceHandshakeResponse? = nil
+    ) async {
+        let handshake: WorkServiceHandshakeResponse?
+        if let suppliedHandshake {
+            handshake = suppliedHandshake
+        } else {
+            handshake = await session.negotiatedHandshake
+        }
+        guard let handshake else {
+            localServiceCatalogWorks = []
+            localWorkServiceError = "The Work Host did not provide a handshake for reconstruction."
+            return
+        }
+        let catalog = await WorkServiceCatalog().refresh([
+            WorkServiceCatalogHost(host: handshake.host, session: session)
+        ])
+        let rowLocalQuarantineOnly = catalog.hosts.count == 1
+            && catalog.hosts[0].sourceCompleteness != .complete
+            && !catalog.hosts[0].quarantined.isEmpty
+            && catalog.hosts[0].diagnostics.isEmpty
+        guard catalog.hosts.count == 1,
+              let host = catalog.hosts.first,
+              connectionIsUsable(host.connectionState),
+              host.omissions.isEmpty,
+              host.negotiatedInstance == handshake.hostInstance,
+              host.sourceCompleteness == .complete || rowLocalQuarantineOnly else {
+            localServiceCatalogWorks = []
+            localWorkServiceError = "The Work Host catalog is incomplete; attached Work was withheld until a complete read."
+            return
+        }
+        // A malformed/duplicate descriptor is quarantined as a row by WorkServiceCatalog. It
+        // must not poison unrelated healthy Works from the same complete page, but any page or
+        // source omission still withholds reconstruction because the missing row could be this
+        // GUI's attachment. Keep the quarantine visible without consuming the bad row.
+        if !host.quarantined.isEmpty {
+            localWorkServiceError =
+                "Some Work rows were quarantined by the host catalog; healthy rows remain available for inspection."
+        } else {
+            localWorkServiceError = nil
+        }
+        localServiceCatalogWorks = catalog.works.filter { descriptor in
+            guard !hiddenServiceWorkIDs.contains(descriptor.work) else { return false }
+            let hasOwnAttachment = descriptor.attachments.contains { $0.client == client }
+            let alreadyRepresented = workRuns.contains {
+                $0.serviceProjection?.descriptor.work == descriptor.work
+            }
+            // Reusable Work with this client's attachment is reconstructed into LiveRun below.
+            // Terminal Work stays in the explicit catalog even when it retains that attachment,
+            // so a relaunch can reopen it for inspection instead of silently losing history.
+            return !alreadyRepresented
+                && (!hasOwnAttachment || descriptor.recordedDisposition != .reusable)
+        }
+        for descriptor in catalog.works {
+            guard !hiddenServiceWorkIDs.contains(descriptor.work) else { continue }
+            // Terminal Work remains available from Sessions/catalog and through the explicit
+            // Attach action below, but relaunch should not flood Live with completed history.
+            guard descriptor.recordedDisposition == .reusable else { continue }
+            let attachments = descriptor.attachments.filter { $0.client == client }
+            for attachment in attachments {
+                await adoptServiceAttachment(
+                    descriptor: descriptor, attachment: attachment,
+                    session: session, client: client)
+            }
+        }
+        // A Start seed may outlive both its GUI and its Run. Terminal Work is not auto-opened
+        // into Live, but its exact command evidence can still settle the local marker so a later
+        // relaunch never retries an already-ended Start or leaves a stale bootstrap obligation.
+        for descriptor in catalog.works {
+            guard !hiddenServiceWorkIDs.contains(descriptor.work),
+                  descriptor.recordedDisposition != .reusable,
+                  let attachment = descriptor.attachments.first(where: { $0.client == client }) else {
+                continue
+            }
+            await reconcileTerminalStartIntent(
+                descriptor: descriptor, attachment: attachment,
+                session: session, client: client)
+        }
+    }
+
+    private func connectionIsUsable(_ state: WorkServiceClientSessionState) -> Bool {
+        if case .connected = state { return true }
+        return false
+    }
+
+    private func reconcileTerminalStartIntent(
+        descriptor: WorkServiceWorkDescriptor,
+        attachment: WorkServiceClientAttachment,
+        session: WorkServiceClientSession,
+        client: ClientRef
+    ) async {
+        do {
+            let store = try ServiceBackedStartIntentStore(
+                home: home, client: client, work: descriptor.work)
+            guard let intent = try store.load() else { return }
+            guard attachment.session == intent.session,
+                  attachment.sessionJournal == intent.sessionJournal,
+                  attachment.sessionAttachment == intent.sessionAttachment else {
+                localWorkServiceError =
+                    "A terminal Work has a retained Start from a different Session attachment; explicit review is required."
+                return
+            }
+            let intentStore = try WorkServiceAttachedWorkIntentStore(
+                home: home, client: client, work: descriptor.work)
+            let controller = try WorkServiceAttachedWorkController(
+                session: session, seed: .existing(work: descriptor, attachment: attachment),
+                intentStore: intentStore)
+            let projection: WorkServiceAttachedWorkProjection
+            do {
+                projection = try await controller.refresh()
+            } catch {
+                projection = await controller.projection()
+            }
+            guard Self.hasCanonicalStartEvidence(intent, projection: projection) else { return }
+            try store.clear(intent)
+        } catch {
+            // A malformed marker or incomplete terminal read remains visible as a local
+            // recovery diagnostic. It is never silently converted into a fresh Start.
+            localWorkServiceError =
+                "A terminal Work's retained Start could not be reconciled safely."
+        }
+    }
+
+    private func adoptServiceAttachment(
+        descriptor: WorkServiceWorkDescriptor,
+        attachment: WorkServiceClientAttachment,
+        session: WorkServiceClientSession,
+        client: ClientRef
+    ) async {
+        guard attachment.session != nil,
+              attachment.sessionJournal != nil,
+              attachment.sessionAttachment != nil else {
+            localWorkServiceError = "A Work attachment without a Session identity was withheld."
+            return
+        }
+        guard !workRuns.contains(where: { $0.serviceProjection?.descriptor.work == descriptor.work })
+        else { return }
+        do {
+            let intentStore = try WorkServiceAttachedWorkIntentStore(
+                home: home, client: client, work: descriptor.work)
+            let startIntentStore = try ServiceBackedStartIntentStore(
+                home: home, client: client, work: descriptor.work)
+            let initialStart = try startIntentStore.load()
+            let controller = try WorkServiceAttachedWorkController(
+                session: session,
+                seed: .existing(work: descriptor, attachment: attachment),
+                intentStore: intentStore)
+            let projection: WorkServiceAttachedWorkProjection
+            do {
+                projection = try await controller.refresh()
+            } catch {
+                // Keep the row visible with the controller's bounded evidence.  A read failure
+                // is a recovery/unavailable state, never a reason to drop completed history.
+                projection = await controller.projection()
+            }
+            var unresolvedInitialStart = initialStart
+            if let initialStart, Self.hasCanonicalStartEvidence(
+                initialStart, projection: projection) {
+                // A prior Start may have crossed the host boundary after the GUI lost its
+                // response. The exact canonical command envelope resolves the bootstrap marker;
+                // never issue a second Start merely because the local cleanup was interrupted.
+                do {
+                    try startIntentStore.clear(initialStart)
+                    unresolvedInitialStart = nil
+                } catch {
+                    localWorkServiceError =
+                        "The initial Start is already reflected by canonical Work, but its local intent could not be cleared."
+                    unresolvedInitialStart = nil
+                }
+            }
+            let bridge = ServiceBackedRunBridge(
+                controller: controller,
+                projection: projection,
+                workspaceLabel: workspaceLabel(for: descriptor),
+                modelLabel: [descriptor.configuration.providerID,
+                             descriptor.configuration.modelID]
+                    .compactMap { $0 }.joined(separator: "/"),
+                thinkingLevel: descriptor.configuration.thinkingLevel)
+            let run = LiveRun(
+                service: bridge, initialStart: unresolvedInitialStart,
+                initialStartStore: startIntentStore)
+            runs.append(run)
+            run.observeService()
+            // A Create may have been durably accepted just before the previous GUI disappeared.
+            // Re-drive that exact first prompt only after the attachment has been reconstructed;
+            // refreshService will retry later if this initial read was incomplete.
+            if let unresolvedInitialStart,
+               bridge.projection.isCanonical,
+               bridge.hasMatchingStartAttachment(for: unresolvedInitialStart),
+               await controller.pendingCommand() == nil {
+                await run.startService(
+                    prompt: unresolvedInitialStart.prompt, commandID: unresolvedInitialStart.commandID)
+            } else if unresolvedInitialStart != nil {
+                run.commandNotice = .warning(
+                    "The retained initial Start belongs to a different Session attachment; review and retry it explicitly.")
+            }
+        } catch {
+            localWorkServiceError = "A Work attachment could not be reconstructed safely."
+        }
+    }
+
+    func workspaceLabel(for descriptor: WorkServiceWorkDescriptor) -> String {
+        guard let workspaceID = descriptor.configuration.workspaceID,
+              let workspace = localWorkspaceCatalog.entries.first(where: {
+                  $0.workspaceID == workspaceID
+              }) else {
+            return "Work \(descriptor.work.workID)"
+        }
+        return workspace.label ?? "Workspace \(workspaceID.rawValue.prefix(12))"
+    }
+
+    private static func serviceErrorMessage(_ error: Error) -> String {
+        if let error = error as? LocalWorkServiceBootstrapError {
+            return error.errorDescription ?? "The local Work Host is unavailable."
+        }
+        if error is WorkServiceClientSessionError {
+            return "The local Work Host connection is unavailable."
+        }
+        return "The local Work Host could not be reached or reconstructed."
+    }
+
+    /// Reconcile Create intents retained before a GUI crash or lost response. Replaying the exact
+    /// request is the protocol's idempotent lookup; inventing a new command or rewriting its
+    /// causal cursor could mint a second Work. An unresolved intent blocks new Create admission
+    /// but does not affect inspection of already-listed Work.
+    private func reconcilePendingCreateIntents(
+        session: WorkServiceClientSession, client: ClientRef
+    ) async -> Bool {
+        do {
+            let store = try ServiceBackedCreateIntentStore(home: home, client: client)
+            let pending = try store.loadPending()
+            for retained in pending {
+                let request = retained.request
+                do {
+                    let response = try await session.createWork(request)
+                    guard response.receipt.state == .accepted
+                        || response.receipt.state == .duplicate else {
+                        // A structured rejection is definitive non-admission, so clear it rather
+                        // than replaying a known-dead intent forever. Transport errors below are
+                        // different: their effect may be indeterminate and must remain retained.
+                        do {
+                            try store.clear(request)
+                        } catch {
+                            localWorkServiceError =
+                                "A rejected Work creation intent could not be cleared safely; new Work is withheld."
+                            return false
+                        }
+                        localWorkServiceError =
+                            response.receipt.rejection == .staleCursor
+                                ? "A retained Work creation intent was stale and was cleared; retry Create to use the current Work Host cursor."
+                                : "A retained Work creation intent was rejected and cleared; retry Create when ready."
+                        continue
+                    }
+                    if let initialStart = retained.initialStart {
+                        try Self.retainStartIntent(
+                            initialStart, response: response, home: home, client: client)
+                    }
+                    try store.clear(request)
+                } catch {
+                    if Self.isProvenStaleCreateFailure(error) {
+                        do {
+                            try store.clear(request)
+                        } catch {
+                            localWorkServiceError =
+                                "A stale Work creation intent could not be cleared safely; new Work is withheld."
+                            return false
+                        }
+                        localWorkServiceError =
+                            "A retained Work creation intent was stale and was cleared; retry Create to use the current Work Host cursor."
+                        continue
+                    }
+                    localWorkServiceError =
+                        "A retained Work creation intent could not be reconciled; no new Work will be created until the Work Host is reachable."
+                    return false
+                }
+            }
+            return true
+        } catch {
+            localWorkServiceError =
+                "A retained Work creation intent could not be read safely; new Work is withheld."
+            return false
+        }
+    }
+
+    private static func isProvenStaleCreateFailure(_ error: Error) -> Bool {
+        guard let transport = error as? WorkServiceTransportError else { return false }
+        guard case .remote(let code, _) = transport else { return false }
+        return code == .staleCursor
+    }
+
+    private static func hasCanonicalStartEvidence(
+        _ initialStart: ServiceBackedStartIntent,
+        projection: WorkServiceAttachedWorkProjection
+    ) -> Bool {
+        initialStart.hasCanonicalEvidence(in: projection)
+    }
+
+    private static func isProvenStaleAttachFailure(_ error: Error) -> Bool {
+        if case WorkServiceProtocolError.staleCursor = error { return true }
+        guard let transport = error as? WorkServiceTransportError,
+              case .remote(let code, _) = transport else { return false }
+        return code == .staleCursor
+    }
+
+    private static func retainStartIntent(
+        _ seed: ServiceBackedCreateIntentStore.InitialStart,
+        response: WorkServiceCreateWorkResponse,
+        home: AgentHome,
+        client: ClientRef
+    ) throws {
+        let intent = try ServiceBackedStartIntent(
+            seed: seed, response: response, client: client)
+        let store = try ServiceBackedStartIntentStore(
+            home: home, client: client, work: response.work.work)
+        try store.retain(intent)
+    }
+
+    /// The shared client session intentionally caches its handshake, while a Work Host's control
+    /// cursor advances after every Create/Attach. Probe a fresh auxiliary session for current
+    /// catalog/cursor evidence without disconnecting the shared session used by controllers.
+    private func freshLocalWorkServiceHandshake(
+        client: ClientRef
+    ) async throws -> WorkServiceHandshakeResponse {
+        let workHost = try home.requirePersistedWorkHost()
+        let locator = LocalWorkServiceHostLocator(home: home, workHost: workHost)
+        let probe = try WorkServiceClientSession(locator: locator, client: client)
+        do {
+            let handshake = try await probe.connect()
+            await probe.disconnect()
+            return handshake
+        } catch {
+            await probe.disconnect()
+            throw error
+        }
+    }
+
+    /// Explicitly attach this GUI client to a Work discovered in the complete host catalog.
+    /// The catalog row is re-read immediately before the mutation. Attach identity is scoped to
+    /// the exact causal control cursor, Session tuple, and capability envelope, so a lost
+    /// response can be retried exactly while a real Detach followed by Attach creates a new
+    /// logical attachment epoch.
+    func attachServiceWork(_ descriptor: WorkServiceWorkDescriptor) {
+        guard let client = localWorkServiceClient, localWorkService != nil else {
+            localWorkServiceError = "The local Work Host is not connected."
+            return
+        }
+        Task { @MainActor [weak self] in
+            await self?.attachServiceWorkNow(descriptor, client: client)
+        }
+    }
+
+    private func attachServiceWorkNow(
+        _ requested: WorkServiceWorkDescriptor, client: ClientRef
+    ) async {
+        guard localWorkService != nil else { return }
+        do {
+            // Attach is a mutation too: fence the shared socket and fresh cursor to one exact
+            // Work Host instance before reading or dispatching against the catalog. A locator
+            // replacement must never let a fresh probe B authorize an Attach sent to live A.
+            let (session, handshake) = try await reconnectLocalWorkService()
+            guard handshake.host.workHostID == requested.work.workHostID,
+                  handshake.workspaceCatalog.isComplete,
+                  handshake.hostInstance.host == handshake.host else {
+                throw LocalWorkServiceBootstrapError.connectionFailed(.notConnected)
+            }
+            let catalog = await WorkServiceCatalog().refresh([
+                WorkServiceCatalogHost(host: handshake.host, session: session)
+            ])
+            let rowLocalQuarantineOnly = catalog.hosts.count == 1
+                && catalog.hosts[0].sourceCompleteness != .complete
+                && !catalog.hosts[0].quarantined.isEmpty
+                && catalog.hosts[0].diagnostics.isEmpty
+            guard let host = catalog.hosts.first,
+                  connectionIsUsable(host.connectionState),
+                  host.omissions.isEmpty,
+                  host.negotiatedInstance == handshake.hostInstance,
+                  host.sourceCompleteness == .complete || rowLocalQuarantineOnly,
+                  let descriptor = catalog.works.first(where: {
+                      $0.work == requested.work
+                  }) else {
+                localWorkServiceError =
+                    "The Work Host catalog changed or is incomplete; Attach was withheld."
+                return
+            }
+            if let existing = descriptor.attachments.first(where: { $0.client == client }) {
+                await adoptServiceAttachment(
+                    descriptor: descriptor, attachment: existing,
+                    session: session, client: client)
+                return
+            }
+            guard let canonical = descriptor.attachments.first(where: {
+                $0.session != nil && $0.sessionJournal != nil && $0.sessionAttachment != nil
+            }) else {
+                localWorkServiceError =
+                    "This Work has no canonical Session attachment available for inspection."
+                return
+            }
+            let requestedCapabilities: Set<WorkServiceCapability> = [
+                .observe, .control, .start, .send, .steer, .queue, .cancel, .end
+            ]
+            let pending = pendingServiceAttaches[descriptor.work]
+            let request: WorkServiceAttachRequest
+            if let pending,
+               pending.hostInstance == handshake.hostInstance,
+               pending.request.work == descriptor.work,
+               pending.request.journal == descriptor.journal,
+               pending.request.client == client,
+               pending.request.session == canonical.session,
+               pending.request.sessionJournal == canonical.sessionJournal,
+               pending.request.sessionAttachment == canonical.sessionAttachment,
+               pending.request.requestedCapabilities == requestedCapabilities,
+               pending.request.causalControlCursor.journal == handshake.controlJournal {
+                // This is the exact lost-response retry. Do not mint a new id from the newer
+                // handshake cursor: doing so could create a second client attachment.
+                request = pending.request
+            } else {
+                let commandMaterial = Self.attachCommandMaterial(
+                    client: client, work: descriptor.work,
+                    session: canonical.session!, sessionJournal: canonical.sessionJournal!,
+                    sessionAttachment: canonical.sessionAttachment!,
+                    capabilities: requestedCapabilities,
+                    controlJournal: handshake.controlJournal,
+                    causalControlCursor: handshake.controlCursor)
+                let digest = SHA256.hash(data: Data(commandMaterial.utf8))
+                    .map { String(format: "%02x", $0) }.joined()
+                request = WorkServiceAttachRequest(
+                    work: descriptor.work,
+                    journal: descriptor.journal,
+                    client: client,
+                    session: canonical.session,
+                    sessionJournal: canonical.sessionJournal,
+                    sessionAttachment: canonical.sessionAttachment,
+                    commandID: "attach-v2-\(digest.prefix(48))",
+                    causalControlCursor: handshake.controlCursor,
+                    requestedCapabilities: requestedCapabilities)
+            }
+            pendingServiceAttaches[descriptor.work] = PendingServiceAttach(
+                request: request, hostInstance: handshake.hostInstance)
+            let response: WorkServiceAttachResponse
+            do {
+                response = try await session.attach(request)
+            } catch {
+                if Self.isProvenStaleAttachFailure(error) {
+                    // A typed stale_cursor response proves this exact Attach was not admitted.
+                    // Do not preserve an exact request whose cursor can never become current;
+                    // clear it and obtain fresh host/catalog evidence before exposing Attach
+                    // again.
+                    pendingServiceAttaches.removeValue(forKey: descriptor.work)
+                    await refreshAfterStaleAttach(session)
+                    return
+                }
+                // Transport uncertainty retains the exact request. A subsequent catalog read
+                // can prove it committed; no fresh Attach is synthesized here.
+                throw error
+            }
+            guard (response.state == .accepted || response.state == .duplicate),
+                  let attachment = response.attachment else {
+                pendingServiceAttaches.removeValue(forKey: descriptor.work)
+                if response.rejection == .staleCursor {
+                    await refreshAfterStaleAttach(session)
+                    return
+                }
+                localWorkServiceError =
+                    "The Work Host rejected Attach: "
+                        + (response.diagnostic ?? "no attachment was admitted.")
+                return
+            }
+            pendingServiceAttaches.removeValue(forKey: descriptor.work)
+            await adoptServiceAttachment(
+                descriptor: response.work, attachment: attachment,
+                session: session, client: client)
+            localServiceCatalogWorks.removeAll { $0.work == descriptor.work }
+        } catch {
+            localWorkServiceError = Self.serviceErrorMessage(error)
+        }
+    }
+
+    private func refreshAfterStaleAttach(_ session: WorkServiceClientSession) async {
+        do {
+            let refreshed = try await session.refreshHandshake()
+            localWorkServiceHandshake = refreshed
+            localWorkspaceCatalog = refreshed.workspaceCatalog
+            await refreshServiceWork()
+            localWorkServiceError =
+                "The Work Host rejected Attach because its cursor was stale. The pending intent was cleared and the catalog was refreshed."
+        } catch {
+            localWorkServiceError =
+                "The Work Host rejected Attach because its cursor was stale. The pending intent was cleared; reconnect before trying again."
+        }
+    }
+
+    private static func attachCommandMaterial(
+        client: ClientRef,
+        work: WorkRef,
+        session: SessionRef,
+        sessionJournal: JournalRef,
+        sessionAttachment: SessionAttachmentRef,
+        capabilities: Set<WorkServiceCapability>,
+        controlJournal: JournalRef,
+        causalControlCursor: JournalCursor
+    ) -> String {
+        let capabilityMaterial = capabilities.map(\.rawValue).sorted().joined(separator: ",")
+        let fields = [
+            client.clientID, work.workHostID, work.workID,
+            session.sessionID, sessionJournal.journalID,
+            sessionJournal.authority.authorityID, sessionAttachment.attachmentID,
+            capabilityMaterial, controlJournal.journalID,
+            controlJournal.authority.authorityID, String(causalControlCursor.sequence),
+            causalControlCursor.eventID ?? "",
+        ]
+        return fields.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+    }
+
+    /// Refresh all attached service projections and discover attachments created by another
+    /// GUI.  The Work service list is intentionally authoritative for reconstruction; local
+    /// `runs` is only this process's current view.
+    func refreshServiceWork() async {
+        guard !serviceRefreshInFlight,
+              let bootstrap = localWorkService,
+              let client = localWorkServiceClient else { return }
+        serviceRefreshInFlight = true
+        defer { serviceRefreshInFlight = false }
+        do {
+            let session = try await bootstrap.connect()
+            // Polling is the single central observation owner. A fresh auxiliary connection is
+            // reserved for mutation admission (Create/Attach), not every timer tick; opening a
+            // second socket per poll would turn a bounded poll into connection churn. The shared
+            // session's handshake is already fenced by each successful response and is replaced
+            // by an explicit reconnect when its transport becomes unusable.
+            guard let handshake = await session.negotiatedHandshake else {
+                throw LocalWorkServiceBootstrapError.connectionFailed(.notConnected)
+            }
+            localWorkServiceHandshake = handshake
+            localWorkspaceCatalog = handshake.workspaceCatalog
+            // Detached service rows still own this GUI's durable attachment and must continue
+            // receiving canonical updates. Presentation detachment is not an observation opt-out.
+            let attachedServiceRuns = workRuns
+                .filter { $0.isServiceBacked && !$0.hasExited }
+                .sorted { lhs, rhs in lhs.id.uuidString < rhs.id.uuidString }
+            let selectedServiceRuns: [LiveRun]
+            if attachedServiceRuns.isEmpty {
+                servicePollOffset = 0
+                selectedServiceRuns = []
+            } else {
+                let offset = servicePollOffset % attachedServiceRuns.count
+                let budget = min(32, attachedServiceRuns.count)
+                selectedServiceRuns = (0..<budget).map { index in
+                    attachedServiceRuns[(offset + index) % attachedServiceRuns.count]
+                }
+                servicePollOffset = (offset + budget) % attachedServiceRuns.count
+            }
+            for run in selectedServiceRuns {
+                await run.refreshService()
+            }
+            await restoreServiceWork(
+                session: session, client: client, handshake: handshake)
+        } catch {
+            localWorkServiceError = Self.serviceErrorMessage(error)
+        }
+    }
+
+    /// Closing Aviary removes only this GUI's transport attachment.  It never sends End,
+    /// Complete, Destroy, or a process signal to service-backed Work.
+    func disconnectLocalWorkService() async {
+        for run in workRuns where run.isServiceBacked { await run.disconnect() }
+        await localWorkService?.disconnect()
+        localWorkServiceHandshake = nil
+        localWorkspaceCatalog = .empty
+        localServiceCatalogWorks = []
+    }
+
+    private func reconnectLocalWorkService() async throws
+        -> (session: WorkServiceClientSession, handshake: WorkServiceHandshakeResponse)
+    {
+        guard let bootstrap = localWorkService else {
+            throw LocalWorkServiceBootstrapError.discoveryFailed
+        }
+        let session = try await bootstrap.connect()
+        guard let client = localWorkServiceClient else {
+            throw LocalWorkServiceBootstrapError.discoveryFailed
+        }
+        let sharedHandshake: WorkServiceHandshakeResponse
+        do {
+            sharedHandshake = try await session.refreshHandshake()
+        } catch {
+            await session.disconnect()
+            throw error
+        }
+        let probeHandshake: WorkServiceHandshakeResponse
+        do {
+            probeHandshake = try await freshLocalWorkServiceHandshake(client: client)
+        } catch {
+            throw error
+        }
+        guard sharedHandshake.host == probeHandshake.host,
+              sharedHandshake.hostInstance == probeHandshake.hostInstance else {
+            // The locator may have moved from daemon A to daemon B while the shared socket was
+            // still alive. Never dispatch a mutation using B's cursor on A's connection; poison
+            // the cached session so the next attempt discovers the new instance.
+            await session.disconnect()
+            throw LocalWorkServiceBootstrapError.connectionFailed(.notConnected)
+        }
+        localWorkServiceHandshake = probeHandshake
+        localWorkspaceCatalog = probeHandshake.workspaceCatalog
+        return (session, probeHandshake)
     }
 
     func refreshAll() async {
@@ -984,11 +1674,23 @@ final class AppModel {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                let busy = !self.workRuns.isEmpty
-                try? await Task.sleep(nanoseconds: busy ? 3_000_000_000 : 12_000_000_000)
+                let liveRuns = self.workRuns.filter { !$0.hasExited }
+                let attachedServiceWork = self.runs.contains {
+                    $0.isServiceBacked && !$0.hasExited
+                }
+                let interval: UInt64
+                if attachedServiceWork {
+                    interval = 1_500_000_000
+                } else if !liveRuns.isEmpty {
+                    interval = 3_000_000_000
+                } else {
+                    interval = 12_000_000_000
+                }
+                try? await Task.sleep(nanoseconds: interval)
                 guard !Task.isCancelled else { return }
                 self.annotateLiveState()
                 self.tree = AgentTreeReader.read(home: self.home)
+                await self.refreshServiceWork()
                 // The canonical journals are the notification producer's source of truth. A
                 // live run can finish or enter review between catalog refreshes, so polling
                 // must consume the projection as well as repainting the in-memory tree.
@@ -1331,12 +2033,10 @@ final class AppModel {
 
 // MARK: Runs
 
-    /// Start an in-house run: Aviary's own loop, its own provider client, its own runtime
-    /// host. No harness process and no Node.
-    /// Runs Aviary is holding, for an agent asking who else is here.
-    ///
-    /// Exited runs are excluded: a message to something that has stopped would be accepted and
-    /// never read, which is worse than being refused.
+    /// Start an in-house run through the durable local Work service.  This method is a GUI
+    /// admission boundary only: it registers the selected local directory as a host-admin
+    /// operation, then sends its opaque workspace identity through Create/Start.  No Session,
+    /// Run, RuntimeHost, or Python object is created in this process.
     func peerRuns(excluding sessionID: String) -> [LiveRun] {
         workRuns.filter { !$0.hasExited && $0.sessionID != sessionID }
     }
@@ -1408,7 +2108,8 @@ final class AppModel {
     func startInHouseRun(
         cwd: String, providerID: String?, modelID: String?, prompt: String,
         thinkingLevel: String? = nil, noContextFiles: Bool = false,
-        recordPayloads: Bool = false, resume: String? = nil, title: String? = nil
+        recordPayloads: Bool = false, resume: String? = nil, title: String? = nil,
+        onCreated: (@MainActor (LiveRun) -> Void)? = nil
     ) {
         guard acceptsNewWork else {
             show(
@@ -1421,61 +2122,201 @@ final class AppModel {
                  isError: true)
             return
         }
-        if let resume, focusExistingWork(forSession: resume) { return }
-        if let resume, nativeActionIsBlocked(forSession: resume) {
+        if let resume {
+            if focusExistingWork(forSession: resume) {
+                if let run = workRuns.first(where: {
+                    $0.config.identity?.sessionID == resume || $0.sessionID == resume
+                }) {
+                    onCreated?(run)
+                }
+                return
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.refreshServiceWork()
+                if self.focusExistingWork(forSession: resume) {
+                    if let run = self.workRuns.first(where: {
+                        $0.config.identity?.sessionID == resume || $0.sessionID == resume
+                    }) {
+                        onCreated?(run)
+                    }
+                    self.show("Reattached the durable Work for this conversation.")
+                } else {
+                    self.show(
+                        "This session has no attached Work in the current host catalog; a new "
+                            + "in-house run was not created.", isError: true)
+                }
+            }
+            return
+        }
+        Task { @MainActor [weak self] in
+            await self?.startServiceInHouseRun(
+                cwd: cwd, providerID: providerID, modelID: modelID, prompt: prompt,
+                thinkingLevel: thinkingLevel, noContextFiles: noContextFiles,
+                recordPayloads: recordPayloads, title: title, onCreated: onCreated)
+        }
+    }
+
+    private func startServiceInHouseRun(
+        cwd: String, providerID: String?, modelID: String?, prompt: String,
+        thinkingLevel: String?, noContextFiles: Bool, recordPayloads: Bool, title: String?,
+        onCreated: (@MainActor (LiveRun) -> Void)?
+    ) async {
+        guard !noContextFiles else {
             show(
-                "That session has active or uncertain Work on a Work Host. Attach to it or wait "
-                    + "for a proven terminal state before starting another writer.",
-                isError: true)
+                "The local Work Host currently requires project context files. Disable “Skip "
+                    + "AGENTS.md / CLAUDE.md discovery” for this run.", isError: true)
             return
         }
         guard
             let (providerSpec, model) = AgentCLI.resolve(
-            [providerID, modelID].compactMap { $0 }.joined(separator: "/"),
-            in: modelsConfig) ?? AgentCLI.resolve(modelID, in: modelsConfig)
+                [providerID, modelID].compactMap { $0 }.joined(separator: "/"),
+                in: modelsConfig) ?? AgentCLI.resolve(modelID, in: modelsConfig)
         else {
             toast = Toast(message: "No configured provider serves that model.", isError: true)
             return
         }
-        var config = RunConfiguration(
-            cwd: cwd, provider: providerSpec.id, model: model.id,
-            thinkingLevel: thinkingLevel, resume: resume,
-            noContextFiles: noContextFiles,
-            recordPayloads: recordPayloads)
-        let identity = config.resolvedIdentity(home: home)
-        config.identity = identity
-        let writer: SessionWriter
-        do {
-            if let resume {
-                writer = try SessionWriter(
-                    home: home, resuming: resume, cwd: cwd, model: model, identity: identity)
-            } else {
-                writer = try SessionWriter(
-                    home: home, cwd: cwd, model: model, identity: identity)
-            }
-        } catch {
-            toast = Toast(
-                message: "Could not open the session journal: \(error.localizedDescription)",
-                isError: true)
+        if localWorkService == nil { await bootstrapLocalWorkService() }
+        guard localWorkService != nil,
+              let client = localWorkServiceClient else {
+            show(localWorkServiceError ?? "The local Work Host is unavailable.", isError: true)
             return
         }
-        let commandController = SessionCommandController(
-            identity: identity,
-            capabilities: Agent.inHouseCommandCapabilities,
-            writer: writer)
-        let run = LiveRun(
-            inHouse: InHouseDriver(
-                home: home, cwd: cwd, model: model, providerSpec: providerSpec,
-                recordPayloads: recordPayloads, resume: resume,
-                peerDelegate: PeerBridge(model: self), identity: identity,
-                commandController: commandController, reasoningEffort: thinkingLevel,
-                noContextFiles: noContextFiles, writer: writer),
-            cwd: cwd, modelLabel: model.qualifiedID, config: config)
-        if let title { run.title = title }
-        runs.append(run)
-        focusedRunID = run.id
-        section = .live
-        run.startInHouse(prompt: prompt)
+        do {
+            // This is the one path-bearing operation in the GUI service flow.  The returned
+            // descriptor is reduced immediately to its opaque host-minted workspace ID.
+            let registry = try WorkHostWorkspaceRegistry(home: home)
+            let workspace = try registry.registerLocalDirectory(
+                URL(fileURLWithPath: cwd, isDirectory: true),
+                label: URL(fileURLWithPath: cwd).lastPathComponent,
+                isDefault: true)
+            let (session, handshake) = try await reconnectLocalWorkService()
+            guard !serviceCreateInFlight else {
+                show("A Work creation is already in progress; wait for its durable result.", isError: true)
+                return
+            }
+            serviceCreateInFlight = true
+            defer { serviceCreateInFlight = false }
+            guard await reconcilePendingCreateIntents(session: session, client: client) else {
+                show(
+                    localWorkServiceError
+                        ?? "A prior Work creation is still awaiting reconciliation.",
+                    isError: true)
+                return
+            }
+            guard handshake.workspaceCatalog.isComplete,
+                  let advertised = handshake.workspaceCatalog.entries.first(where: {
+                      $0.workspaceID == workspace.workspaceID
+                  }), advertised.isAvailable,
+                  advertised.capabilities.contains(.resolve) else {
+                throw LocalWorkServiceBootstrapError.connectionFailed(.notConnected)
+            }
+            let requested: Set<WorkServiceCapability> = [
+                .observe, .control, .start, .send, .steer, .queue, .cancel, .end
+            ]
+            let configuration = WorkServiceWorkConfiguration(
+                providerID: providerSpec.id, modelID: model.id,
+                thinkingLevel: thinkingLevel, workspaceID: advertised.workspaceID,
+                includeContextFiles: true, recordPayloads: recordPayloads)
+            let createRequest = WorkServiceCreateWorkRequest(
+                client: client,
+                commandID: UUID().uuidString.lowercased(),
+                causalControlCursor: handshake.controlCursor,
+                configuration: configuration,
+                requestedCapabilities: requested)
+            let createIntentStore = try ServiceBackedCreateIntentStore(home: home, client: client)
+            // Persist the exact initial prompt and Start command identity in the same durable
+            // transaction record before Create crosses the host boundary. Until Start resolves,
+            // a relaunch must not present this newly-created idle Work as an ordinary composer.
+            let initialStart = try ServiceBackedCreateIntentStore.InitialStart(
+                commandID: "start-v2-" + UUID().uuidString.lowercased(), prompt: prompt)
+            try createIntentStore.retain(createRequest, initialStart: initialStart)
+            let response = try await session.createWork(createRequest)
+            guard response.receipt.state == .accepted
+                || response.receipt.state == .duplicate else {
+                // Every structured rejection is definitive non-admission. In particular,
+                // staleCursor proves this exact request never crossed the host's mutation
+                // boundary; retaining it as an indeterminate mutation would freeze every later
+                // Create forever. Clear the exact intent before allowing the user to retry.
+                do {
+                    try createIntentStore.clear(createRequest)
+                } catch {
+                    localWorkServiceError =
+                        "Create was rejected, but its durable intent could not be cleared; new Work is withheld until it is reconciled."
+                    return
+                }
+                let detail = response.receipt.diagnostic ?? "no durable Work was admitted."
+                show(
+                    response.receipt.rejection == .staleCursor
+                        ? "The Work Host rejected Create because its control cursor was stale. No Work was created; retry when ready."
+                        : "The Work Host rejected Create: \(detail)",
+                    isError: true)
+                return
+            }
+            do {
+                try Self.retainStartIntent(
+                    initialStart, response: response, home: home, client: client)
+                try createIntentStore.clear(createRequest)
+            } catch {
+                // Keeping the intent is safe: the next bootstrap replays the exact idempotent
+                // request and promotes the Start seed again. Surface the durability issue without
+                // discarding the attached Work or losing its initial prompt.
+                localWorkServiceError =
+                    "Work was created, but its GUI Start intent could not be durably resolved; the exact request will be reconciled on relaunch."
+            }
+            let startIntentStore = try ServiceBackedStartIntentStore(
+                home: home, client: client, work: response.work.work)
+            guard let retainedStart = try startIntentStore.load() else {
+                throw ServiceBackedStartIntentError.corrupt
+            }
+            let intentStore = try WorkServiceAttachedWorkIntentStore(
+                home: home, client: client, work: response.work.work)
+            let controller = try WorkServiceAttachedWorkController(
+                session: session, seed: .created(response), intentStore: intentStore)
+            let projection: WorkServiceAttachedWorkProjection
+            do {
+                projection = try await controller.refresh()
+            } catch {
+                projection = await controller.projection()
+            }
+            var unresolvedRetainedStart: ServiceBackedStartIntent? = retainedStart
+            if Self.hasCanonicalStartEvidence(retainedStart, projection: projection) {
+                do {
+                    try startIntentStore.clear(retainedStart)
+                    unresolvedRetainedStart = nil
+                } catch {
+                    localWorkServiceError =
+                        "The initial Start is already reflected by canonical Work, but its local intent could not be cleared."
+                    unresolvedRetainedStart = nil
+                }
+            }
+            let bridge = ServiceBackedRunBridge(
+                controller: controller, projection: projection,
+                workspaceLabel: workspace.label ?? advertised.workspaceID.rawValue,
+                modelLabel: model.qualifiedID, thinkingLevel: thinkingLevel)
+            let run = LiveRun(
+                service: bridge, cwd: cwd, title: title,
+                initialStart: unresolvedRetainedStart, initialStartStore: startIntentStore)
+            run.config = RunConfiguration(
+                cwd: cwd, provider: providerSpec.id, model: model.id,
+                thinkingLevel: thinkingLevel, noContextFiles: noContextFiles,
+                recordPayloads: recordPayloads)
+            runs.append(run)
+            focusedRunID = run.id
+            section = .live
+            onCreated?(run)
+            if let unresolvedRetainedStart,
+               bridge.hasMatchingStartAttachment(for: unresolvedRetainedStart) {
+                await run.startService(
+                    prompt: unresolvedRetainedStart.prompt,
+                    commandID: unresolvedRetainedStart.commandID)
+            } else if unresolvedRetainedStart != nil {
+                run.commandNotice = .warning(
+                    "The retained initial Start belongs to a different Session attachment; review and retry it explicitly.")
+            }
+        } catch {
+            show(Self.serviceErrorMessage(error), isError: true)
+        }
     }
 
     /// Start a Claude-Code-driven run: Claude Code's loop, Aviary's kernel as its only tool.
@@ -1591,6 +2432,9 @@ final class AppModel {
         guard run.hasExited else {
             detachRun(run)
             return
+        }
+        if run.isServiceBacked, let work = run.serviceProjection?.descriptor.work {
+            hiddenServiceWorkIDs.insert(work)
         }
         if run.config.recordPayloads {
             // The log is complete now; make it discoverable from the Sessions tab.
@@ -1744,6 +2588,7 @@ final class LiveRun: Identifiable {
     /// Capabilities are owned by the Work driver, not inferred by a GUI. This keeps every
     /// attached view truthful when a remote or driven Work has different command semantics.
     var commandCapabilities: SessionCommandCapabilities {
+        if let serviceBridge { return serviceBridge.commandCapabilities }
         if let inHouse { return inHouse.commandCapabilities }
         if let claudeCode { return claudeCode.commandCapabilities }
         return SessionCommandCapabilities()
@@ -1764,6 +2609,27 @@ final class LiveRun: Identifiable {
     /// Set when Claude Code is driving this run instead of Aviary.
     private(set) var claudeCode: ClaudeCodeDriver?
     var isClaudeCode: Bool { claudeCode != nil }
+
+    /// A service-backed run is an attachment to Work owned by a Work Host.  The bridge is
+    /// intentionally separate from both process-owned drivers so a GUI disconnect cannot
+    /// accidentally call a local stop path.
+    private(set) var serviceBridge: ServiceBackedRunBridge? = nil
+    var isServiceBacked: Bool { serviceBridge != nil }
+    var serviceProjection: WorkServiceAttachedWorkProjection? { serviceBridge?.projection }
+    var serviceActivities: [WorkActionSnapshot] { serviceBridge?.activities ?? [] }
+    var serviceExecutionLabel: String? { serviceBridge?.executionLabel }
+    var serviceWorkspaceLabel: String? { serviceBridge?.workspaceLabel }
+    var hasCanonicalStartTime: Bool {
+        !isServiceBacked
+    }
+
+    var elapsedLabel: String {
+        hasCanonicalStartTime ? Fmt.duration(elapsed) : "time unknown"
+    }
+
+    var startedLabel: String {
+        isServiceBacked ? "unknown" : Fmt.timestamp(startedAt)
+    }
 
     init(
         inHouse driver: InHouseDriver, cwd: String, modelLabel: String,
@@ -1798,6 +2664,42 @@ final class LiveRun: Identifiable {
         self.modelLabel = modelLabel
         self.thinkingLevel = runConfig.thinkingLevel
         self.title = "New run"
+    }
+
+    /// Rehydrate a GUI row from a durable Work-service attachment.  `cwd` is deliberately
+    /// optional and is used only for the co-located launcher; remote reconstruction passes an
+    /// empty value and displays the opaque workspace label instead.
+    init(
+        service bridge: ServiceBackedRunBridge,
+        cwd: String = "",
+        title: String? = nil,
+        initialStart: ServiceBackedStartIntent? = nil,
+        initialStartStore: ServiceBackedStartIntentStore? = nil
+    ) {
+        self.engine = EngineLocation(
+            kind: .fork, path: "aviaryd", version: "work-service",
+            note: "Durable Work Host service")
+        self.config = RunConfiguration(
+            cwd: cwd,
+            provider: bridge.projection.descriptor.configuration.providerID,
+            model: bridge.projection.descriptor.configuration.modelID,
+            thinkingLevel: bridge.thinkingLevel)
+        self.serviceBridge = bridge
+        self.modelLabel = bridge.modelLabel
+        self.thinkingLevel = bridge.thinkingLevel
+        self.sessionID = bridge.sessionID
+        self.initialPromptDelivered = bridge.hasCanonicalInputDelivery
+        // WorkSnapshot currently carries no canonical run.started timestamp.  Keep the local
+        // initialization value private; the service UI uses `startedLabel`/`elapsedLabel` and
+        // never presents it as host history.
+        self.title = title ?? bridge.workspaceLabel
+        self.commandState = bridge.commandState
+        self.isStreaming = bridge.isStreaming
+        self.hasExited = bridge.isTerminal
+        self.isEnding = bridge.isEnding
+        self.errorBanner = bridge.errorBanner
+        self.initialStart = initialStart
+        self.initialStartStore = initialStartStore
     }
 
     /// Publish a value only when it actually differs.
@@ -1872,7 +2774,168 @@ final class LiveRun: Identifiable {
         }
     }
 
+    /// Admit the first prompt through the Work service.  This is deliberately asynchronous and
+    /// does not create a local writer or runtime; the Work Host performs that preparation after
+    /// durable Create/Start admission.
+    @discardableResult
+    func startService(
+        prompt: String, commandID: String? = nil
+    ) async -> LiveRunCommandResult {
+        guard let serviceBridge else { return .rejected("not a Work-service run") }
+        let effectivePrompt = initialStart?.prompt ?? prompt
+        let effectiveCommandID = commandID ?? initialStart?.commandID
+        if !effectivePrompt.isEmpty, title == "New run" {
+            title = String(effectivePrompt.prefix(60))
+        }
+        do {
+            let receipt = try await serviceBridge.start(effectivePrompt, commandID: effectiveCommandID)
+            var retainedMarkerWarning: String?
+            if let initialStart {
+                if serviceBridge.hasCanonicalStartEvidence(for: initialStart) {
+                    do {
+                        guard let initialStartStore else {
+                            throw ServiceBackedStartIntentError.corrupt
+                        }
+                        try initialStartStore.clear(initialStart)
+                        self.initialStart = nil
+                    } catch {
+                        retainedMarkerWarning =
+                            "Canonical Start evidence is present, but its local recovery marker could not be cleared."
+                    }
+                } else {
+                    // A receipt is not the canonical command event. Keep the independent
+                    // Create-to-Start bootstrap marker until a complete Work read proves the
+                    // exact client-qualified command, including across GUI termination here.
+                    retainedMarkerWarning =
+                        "Start was accepted; its local recovery marker remains until the exact canonical command is observed."
+                }
+            }
+            syncServiceState()
+            if let retainedMarkerWarning {
+                commandNotice = .warning(retainedMarkerWarning)
+            } else {
+                commandNotice = .success(
+                    "Start accepted by the Work Host; canonical state is catching up.")
+            }
+            return .service(receipt)
+        } catch {
+            if let initialStart {
+                let pending = await serviceBridge.controller.pendingCommand()
+                let definitiveRejection = error is ServiceBackedRunBridgeError
+                    || pending?.state == .stale
+                if definitiveRejection {
+                    // A structured rejection or stale cursor proves this exact Start never
+                    // crossed the host boundary. Clear the GUI bootstrap obligation; the
+                    // controller still exposes a stale command as an explicit repair, never as
+                    // an automatic replay. Transport/source uncertainty keeps the marker.
+                    if let initialStartStore {
+                        do {
+                            try initialStartStore.clear(initialStart)
+                            self.initialStart = nil
+                        } catch {
+                            commandNotice = .warning(
+                                "Start was rejected, but its local recovery marker could not be cleared.")
+                        }
+                    } else {
+                        commandNotice = .warning(
+                            "Start was rejected, but its local recovery marker has no durable store.")
+                    }
+                }
+            }
+            syncServiceState()
+            commandNotice = .warning(serviceBridge.errorBanner ?? "Start was not accepted.")
+            return .rejected(serviceBridge.errorBanner ?? "Work service unavailable")
+        }
+    }
+
+    private func syncServiceState() {
+        guard let serviceBridge else { return }
+        publish(serviceBridge.transcriptItems, to: \.items)
+        publish(serviceBridge.isStreaming, to: \.isStreaming)
+        publish(serviceBridge.isTerminal, to: \.hasExited)
+        publish(serviceBridge.isEnding, to: \.isEnding)
+        publish(serviceBridge.commandState, to: \.commandState)
+        publish(serviceBridge.errorBanner, to: \.errorBanner)
+        publish(serviceBridge.modelLabel, to: \.modelLabel)
+        publish(serviceBridge.thinkingLevel, to: \.thinkingLevel)
+        // This is canonical Session evidence (input.accepted/message history), not a Start
+        // receipt. It remains true even when the visible transcript has bounded omissions.
+        publish(serviceBridge.hasCanonicalInputDelivery, to: \.initialPromptDelivered)
+    }
+
+    /// Begin observing an already-existing attachment without issuing Start or Attach.
+    func observeService() {
+        guard serviceBridge != nil else { return }
+        syncServiceState()
+    }
+
+    func refreshService() async {
+        guard let serviceBridge else { return }
+        _ = await serviceBridge.refresh()
+        syncServiceState()
+        var startResolvedByEvidence = false
+        if let initialStart,
+           serviceBridge.hasCanonicalStartEvidence(for: initialStart) {
+            startResolvedByEvidence = true
+            do {
+                guard let initialStartStore else {
+                    throw ServiceBackedStartIntentError.corrupt
+                }
+                try initialStartStore.clear(initialStart)
+                self.initialStart = nil
+            } catch {
+                // Keep the in-memory marker as a guard until the durable file can be removed.
+                commandNotice = .warning(
+                    "Canonical Start evidence is present, but the local recovery marker remains.")
+            }
+        }
+        // If the GUI had to wait through a transiently incomplete first read, retry the
+        // persisted Start only after the pair is canonical. A command that already crossed the
+        // boundary remains in the controller's durable pending record and is never auto-replayed.
+        if !startResolvedByEvidence, let initialStart,
+           serviceBridge.projection.isCanonical,
+           serviceBridge.hasMatchingStartAttachment(for: initialStart),
+           serviceBridge.commandState == .idle,
+           await serviceBridge.controller.pendingCommand() == nil {
+            _ = await startService(
+                prompt: initialStart.prompt, commandID: initialStart.commandID)
+        }
+    }
+
+    /// User-directed repair of a command whose durable outcome was not yet safely known.
+    func retryServiceCommand() async -> LiveRunCommandResult {
+        guard let serviceBridge else { return .rejected("not a Work-service run") }
+        do {
+            let receipt = try await serviceBridge.retryPendingCommand()
+            commandNotice = .success(
+                "The exact pending command was accepted; canonical state is catching up.")
+            syncServiceState()
+            return .service(receipt)
+        } catch {
+            syncServiceState()
+            let detail = serviceBridge.errorBanner ?? error.localizedDescription
+            commandNotice = .warning(detail)
+            return .rejected(detail)
+        }
+    }
+
+    /// Remove a stale command intent after the current canonical state has been reviewed.
+    func abandonStaleServiceCommand() async -> Bool {
+        guard let serviceBridge else { return false }
+        do {
+            try await serviceBridge.abandonStaleCommand()
+            syncServiceState()
+            return true
+        } catch {
+            syncServiceState()
+            commandNotice = .warning(serviceBridge.errorBanner ?? error.localizedDescription)
+            return false
+        }
+    }
+
     private var mirror: Task<Void, Never>?
+    private var initialStart: ServiceBackedStartIntent?
+    private var initialStartStore: ServiceBackedStartIntentStore?
     /// End, Quit, and Reload all join this same teardown. `isEnding` is presentation state,
     /// not proof that cleanup finished.
     private var stopTask: Task<Void, Never>?
@@ -1892,7 +2955,10 @@ final class LiveRun: Identifiable {
     }
 
     var projectName: String {
-        URL(fileURLWithPath: config.cwd).lastPathComponent
+        if let serviceWorkspaceLabel, !serviceWorkspaceLabel.isEmpty {
+            return serviceWorkspaceLabel
+        }
+        return URL(fileURLWithPath: config.cwd).lastPathComponent
     }
 
     var elapsed: TimeInterval { Date().timeIntervalSince(startedAt) }
@@ -1941,11 +3007,42 @@ final class LiveRun: Identifiable {
         return inputs.last
     }
 
-    func send(_ text: String) async -> SessionCommandReceipt {
+    func send(_ text: String) async -> LiveRunCommandResult {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
             commandNotice = .warning("Could not send: empty input.")
-            return localReceipt(rejection: .emptyInput)
+            return .rejected("empty input")
             }
+        if let serviceBridge {
+            do {
+                let receipt: WorkServiceCommandReceipt
+                if serviceBridge.isStreaming {
+                    guard serviceBridge.commandCapabilities.supportsSteering else {
+                        if serviceBridge.commandCapabilities.supportsQueuedFollowUps {
+                            commandNotice = .warning(
+                                "This Work is busy; use Queue follow-up for the next turn.")
+                        } else {
+                            commandNotice = .warning(
+                                "This Work is busy and does not advertise steering.")
+                        }
+                        return .rejected("steering unavailable")
+                    }
+                    receipt = try await serviceBridge.steer(text)
+                } else {
+                    receipt = try await serviceBridge.send(text)
+                }
+                if receipt.state == .accepted || receipt.state == .duplicate {
+                    if title == "New run" { title = String(text.prefix(60)) }
+                    commandNotice = .success(
+                        "Command accepted by the Work Host; canonical state is catching up.")
+                }
+                syncServiceState()
+                return .service(receipt)
+            } catch {
+                syncServiceState()
+                commandNotice = .warning(serviceBridge.errorBanner ?? "The Work Host did not accept that command.")
+                return .rejected(serviceBridge.errorBanner ?? "Work service unavailable")
+            }
+        }
         if let claudeCode {
             // No steering. Claude Code owns the turn boundary and will not take an injection
             // mid-turn, so a message sent now would either be lost or arrive as a second
@@ -1954,12 +3051,11 @@ final class LiveRun: Identifiable {
                 commandNotice = .warning(
                     "Claude Code is mid-turn, and it does not accept steering — the turn "
                         + "boundary is its own. Wait for it to finish.")
-                return localReceipt(
-                    rejection: .unsupportedCommand(command: "steer"))
+                return .rejected("steering unavailable")
             }
             let receipt = await claudeCode.send(text)
             if receipt.wasHandedOff, title == "New run" { title = String(text.prefix(60)) }
-            return receipt
+            return .session(receipt)
         }
         if let inHouse {
             if inHouse.isStreaming {
@@ -1968,14 +3064,14 @@ final class LiveRun: Identifiable {
                 // conversation is well-formed.
                 let receipt = await inHouse.steer(text)
                 queuedSteering = inHouse.pendingSteering
-                return receipt
+                return .session(receipt)
             }
             let receipt = await inHouse.send(text)
             if receipt.wasHandedOff, title == "New run" { title = String(text.prefix(60)) }
-            return receipt
+            return .session(receipt)
         }
         commandNotice = .warning("This run has no engine behind it.")
-        return localReceipt(rejection: .unsupportedCommand(command: "send"))
+        return .rejected("no engine")
     }
 
     /// Queue a message for after the current turn.
@@ -1983,28 +3079,57 @@ final class LiveRun: Identifiable {
     /// The harness had a server-side queue for this. Aviary's own engine steers instead —
     /// the message lands at the next turn boundary, which is the same guarantee without a
     /// second place for a message to sit unacknowledged.
-    func queueFollowUp(_ text: String) async -> SessionCommandReceipt {
+    func queueFollowUp(_ text: String) async -> LiveRunCommandResult {
+        if let serviceBridge {
+            guard serviceBridge.commandCapabilities.supportsQueuedFollowUps else {
+                commandNotice = .warning("This Work does not advertise queued follow-ups.")
+                return .rejected("queued follow-ups unavailable")
+            }
+            do {
+                let receipt = try await serviceBridge.queue(text)
+                commandNotice = .success(
+                    "Follow-up accepted by the Work Host; canonical state is catching up.")
+                syncServiceState()
+                return .service(receipt)
+            } catch {
+                syncServiceState()
+                commandNotice = .warning(serviceBridge.errorBanner ?? "The Work Host did not accept that follow-up.")
+                return .rejected(serviceBridge.errorBanner ?? "Work service unavailable")
+            }
+        }
         guard let inHouse else {
             commandNotice = .warning("Claude Code does not support queued follow-ups.")
-            return localReceipt(
-                rejection: .unsupportedCommand(command: "queue_follow_up"))
+            return .rejected("queued follow-ups unavailable")
         }
         let receipt = await inHouse.queueFollowUp(text)
         queuedFollowUps = inHouse.pendingFollowUps
-        return receipt
+        return .session(receipt)
     }
 
     /// Request only a scope the attached Work explicitly advertises.
-    func cancel(_ scope: SessionCancellationScope) async -> SessionCommandReceipt {
+    func cancel(_ scope: SessionCancellationScope) async -> LiveRunCommandResult {
         guard commandCapabilities.supports(scope) else {
             commandNotice = .warning(
                 "This engine does not support \(scope.rawValue) cancellation.")
-            return localReceipt(rejection: .unsupportedCancellation(scope: scope))
+            return .rejected("unsupported cancellation scope")
         }
-        if let inHouse { return await inHouse.cancel(scope: scope) }
-        if let claudeCode { return await claudeCode.cancel(scope: scope) }
+        if let inHouse { return .session(await inHouse.cancel(scope: scope)) }
+        if let claudeCode { return .session(await claudeCode.cancel(scope: scope)) }
+        if let serviceBridge {
+            do {
+                let receipt = try await serviceBridge.cancel(scope: scope)
+                commandNotice = .success(
+                    "Cancellation accepted by the Work Host; canonical state is catching up.")
+                syncServiceState()
+                return .service(receipt)
+            } catch {
+                syncServiceState()
+                commandNotice = .warning(serviceBridge.errorBanner ?? "The Work Host did not accept cancellation.")
+                return .rejected(serviceBridge.errorBanner ?? "Work service unavailable")
+            }
+        }
         commandNotice = .warning("This run has no engine behind it.")
-        return localReceipt(rejection: .unsupportedCommand(command: "cancel"))
+        return .rejected("no engine")
     }
 
     /// Compaction is automatic on Aviary's own engine — the agent summarises the middle of
@@ -2027,6 +3152,22 @@ final class LiveRun: Identifiable {
         text: String, displaySender: String, sourceID: String? = nil
     ) async -> Bool {
         let attributed = "[message from \(displaySender)]\n\n" + text
+        if let serviceBridge {
+            do {
+                let receipt: WorkServiceCommandReceipt
+                if serviceBridge.isStreaming {
+                    guard serviceBridge.commandCapabilities.supportsSteering else { return false }
+                    receipt = try await serviceBridge.steer(attributed)
+                } else {
+                    receipt = try await serviceBridge.send(attributed)
+                }
+                syncServiceState()
+                return receipt.state == .accepted || receipt.state == .duplicate
+            } catch {
+                syncServiceState()
+                return false
+            }
+        }
         if let inHouse {
             if inHouse.isStreaming {
                 let admission = await inHouse.steer(
@@ -2034,19 +3175,13 @@ final class LiveRun: Identifiable {
                 queuedSteering = inHouse.pendingSteering
                 return admission.wasHandedOff
             } else {
-            return
+                return
                     (await inHouse.send(
                         attributed, sourceID: sourceID ?? displaySender)).wasHandedOff
-        }
+            }
         }
         commandNotice = .warning("A message arrived but this run has no engine to take it.")
         return false
-    }
-
-    private func localReceipt(rejection: SessionCommandRejection) -> SessionCommandReceipt {
-        SessionCommandReceipt(
-            admission: .rejected(
-                commandID: "local-\(UUID().uuidString.lowercased())", reason: rejection))
     }
 
     /// Change the model this run answers with.
@@ -2112,6 +3247,32 @@ final class LiveRun: Identifiable {
         isEnding = false
     }
 
+    /// Explicit End for a service-backed Work.  Calling `stop()` remains reserved for the
+    /// process-owned Claude/in-house paths; application termination uses `disconnect()` below.
+    func end() async {
+        if let serviceBridge {
+            guard !hasExited else { return }
+            isEnding = true
+            do {
+                _ = try await serviceBridge.end()
+                commandNotice = .success(
+                    "End accepted by the Work Host; waiting for canonical terminal state.")
+            } catch {
+                commandNotice = .warning(serviceBridge.errorBanner ?? "The Work Host did not accept End.")
+            }
+            syncServiceState()
+            return
+        }
+        await stop()
+    }
+
+    /// Detach this GUI from the service connection without sending an End command.
+    func disconnect() async {
+        guard serviceBridge != nil else { return }
+        mirror?.cancel()
+        mirror = nil
+    }
+
     private func performStop() async {
         if let claudeCode {
             await claudeCode.stop()
@@ -2127,6 +3288,12 @@ final class LiveRun: Identifiable {
             hasExited = inHouse.hasExited
             commandState = await inHouse.commandState()
             errorBanner = inHouse.errorBanner
+            return
+        }
+        if serviceBridge != nil {
+            // Defensive only: callers should use `end()` for a service-backed run.  Never send
+            // a lifecycle command from this generic cleanup path.
+            await disconnect()
             return
         }
         hasExited = true

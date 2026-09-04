@@ -14,9 +14,8 @@ public actor AgentRunner {
         public var cwd: String
         public var model: ModelSpec
         public var systemPrompt: String
-        /// The producer-side decomposition of ``systemPrompt``. This remains optional so
-        /// legacy callers and native resumes whose durable prefix predates source observations
-        /// keep the opaque aggregate path.
+        /// The producer-side decomposition of ``systemPrompt``. Native cold resume requires this
+        /// source-aware value; it remains optional for fresh and non-native legacy runs.
         public var systemPromptAssembly: SystemPromptAssembly?
         /// The user-selected reasoning level for provider routes that support it.
         public var reasoningEffort: String?
@@ -127,8 +126,10 @@ public actor AgentRunner {
     /// why a child settled.
     private var cancellationRequested: Set<String> = []
 
+#if !os(Linux)
     /// Live MCP servers, held so they can be stopped with the run that started them.
     private var mcpClients: [MCPClient] = []
+#endif
     /// Once teardown starts, no callback may admit another background child while the actor is
     /// re-entered awaiting existing child tasks. This remains closed for the lifetime of the
     /// runner, which is also the lifetime of its host resources.
@@ -163,6 +164,7 @@ public actor AgentRunner {
             permit, state: state, retrySafety: retrySafety, failureKind: failureKind)
     }
 
+#if !os(Linux)
     struct MCPReport {
         var client: MCPClient?
         var tools: [MCPClient.Tool]
@@ -221,6 +223,7 @@ public actor AgentRunner {
         }
         return reports
     }
+#endif
 
     /// Stop the servers this run started.
     public func stopMCPServers() async {
@@ -229,6 +232,7 @@ public actor AgentRunner {
         // clients are being dismantled. End must not be published until every child has
         // observed cancellation and returned.
         await stopBackgroundChildren()
+#if !os(Linux)
         let clients = mcpClients
         mcpClients.removeAll()
         for client in clients {
@@ -242,6 +246,7 @@ public actor AgentRunner {
                     permit, state: .succeeded, retrySafety: .idempotent)
             }
         }
+#endif
     }
 
     public func run(prompt: String) async throws -> (writer: SessionWriter, agent: Agent) {
@@ -256,6 +261,11 @@ public actor AgentRunner {
     /// there and then waits for what you want to say next, which is not the same as sending an
     /// empty prompt — an empty user turn is a real turn, and some routes reject it.
     public func prepare() async throws -> (writer: SessionWriter, agent: Agent) {
+        // Validate the exact native cold-resume inputs before opening a writer or touching the
+        // runtime. The launch boundary's seed and the configuration assembly must describe the
+        // same pinned system bytes and the same producer decomposition; otherwise any runtime
+        // effect would be based on a prompt the durable Run does not attest.
+        try validateNativeColdResumeConfiguration()
         // Resolve once, before the runtime/provider boundary. Legacy headers supply the Work
         // identity when available; otherwise this home owns a durable host id and gets a
         // deterministic legacy Work id for the resumed session.
@@ -330,8 +340,8 @@ public actor AgentRunner {
                     replay.lastModel = seed.modelID
                     systemPrompt = retainedSystemPrompt
                     // NativeColdResume owns source-body reconstruction and validation at the
-                    // recovery boundary. A nil value is intentional for legacy native prefixes
-                    // whose effective system prompt is only an opaque retained message.
+                    // recovery boundary. Its source-aware assembly is authoritative for the
+                    // resumed system message; source-less native prefixes are not resumable.
                     systemPromptAssembly = seed.systemPromptAssembly
                     expectedResumeTools = seed.tools
                     nativeResumeNote =
@@ -440,6 +450,7 @@ public actor AgentRunner {
                 await agent.recordPayloads(to: WireLog.path(forRun: identity.runID))
         }
 
+#if !os(Linux)
         // MCP servers from settings.json. Started here rather than at app launch because a
         // server is a child process holding credentials, and the honest lifetime for that is
         // the run that asked for it.
@@ -449,6 +460,7 @@ public actor AgentRunner {
                 await agent.addMCPTools(report.tools, from: client)
             }
         }
+#endif
 
         // Route the runtime's callbacks to this agent. One host serves many sessions, so the
         // handler dispatches on the host-session id rather than assuming a single agent.
@@ -474,6 +486,32 @@ public actor AgentRunner {
                 await host.destroySessionQuietly(hostSessionForCleanup)
             }
             throw error
+        }
+    }
+
+    private func validateNativeColdResumeConfiguration() throws {
+        if settings.resume == nil, settings.nativeResumeSeed != nil {
+            throw RunJournalBundleError.invalidConfiguration(
+                "a fresh run cannot consume a native cold-resume seed")
+        }
+        guard settings.resume != nil, settings.nativeJournal != nil else { return }
+
+        guard let configuredAssembly = settings.systemPromptAssembly,
+              let seed = settings.nativeResumeSeed,
+              !configuredAssembly.sources.isEmpty,
+              !seed.systemPromptAssembly.sources.isEmpty,
+              seed.pinnedMessages.count == 1,
+              seed.pinnedMessages[0].role == .system,
+              seed.pinnedMessages[0].content.count == 1,
+              case .text(let pinnedSystemPrompt) = seed.pinnedMessages[0].content[0] else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "native cold resume requires source-aware configuration and replay assemblies")
+        }
+        guard configuredAssembly == seed.systemPromptAssembly,
+              Data(settings.systemPrompt.utf8) == Data(configuredAssembly.flattenedText.utf8),
+              Data(pinnedSystemPrompt.utf8) == Data(configuredAssembly.flattenedText.utf8) else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "native cold resume configuration and replay assemblies differ")
         }
     }
 

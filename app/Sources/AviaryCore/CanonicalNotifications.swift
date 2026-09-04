@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 /// The small set of transitions for which Aviary currently has enough canonical evidence to
 /// notify a person. This is deliberately narrower than the full attention vocabulary: a
@@ -91,7 +90,7 @@ public struct CanonicalNotificationCandidate: Codable, Hashable, Sendable, Ident
         let source = sourceEvent.map { "event:\($0.journal.stableKey):\($0.eventID)" }
             ?? "cursor:\(sourceCursor.journal.stableKey):\(sourceCursor.sequence):\(sourceCursor.eventID ?? "")"
         self.transitionFingerprint = "\(kind.rawValue)|\(source)|\(actionIdentity.stableKey)"
-        let digest = SHA256.hash(data: Data(self.transitionFingerprint.utf8))
+        let digest = AviarySHA256.hash(data: Data(self.transitionFingerprint.utf8))
             .map { String(format: "%02x", $0) }.joined()
         // Keep the OS request identifier fixed-size and free of user-controlled path/ID bytes.
         self.id = "notification:v2|\(kind.rawValue)|\(digest)"
@@ -169,7 +168,7 @@ public struct CanonicalNotificationRoute: Codable, Hashable, Sendable {
     /// route itself, while queue bookkeeping never retains an attacker-sized identity string.
     public var deduplicationKey: String {
         let value = encodedValue ?? "invalid"
-        return SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+        return AviarySHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     public var encodedValue: String? {
@@ -540,7 +539,7 @@ public struct CanonicalNotificationDelivery: Sendable {
     private static func fingerprint(_ value: String) -> String { "fingerprint:v1:" + digest(value) }
 
     private static func digest(_ value: String) -> String {
-        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+        AviarySHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private mutating func pruneState(retaining requested: Set<String> = []) {

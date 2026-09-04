@@ -239,8 +239,9 @@ struct HealthView: View {
                 }
                 Text("A macOS app inherits launchd's environment, not the one your shell "
                     + "builds — so an app-launched agent would see no asdf shims, no "
-                    + "~/.local/bin, and none of your exported credentials. Aviary snapshots "
-                    + "`zsh -ilc env` once at startup and hands that to every engine process, "
+                    + "~/.local/bin, and none of your exported credentials. Aviary loads your "
+                    + "login-shell configuration once at startup and hands the resulting "
+                    + "environment to every engine process, "
                     + "so it behaves as if you had launched it from a terminal.")
                     .font(.system(size: 10.5)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

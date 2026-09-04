@@ -1,8 +1,60 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0/1 foundations, Phase 3A adoptable kernels, and the Phase 3B service protocol/ownership checkpoint are implemented; journal-backed service composition, an out-of-process Work Host, and GUI cutover remain
-Date: 2026-08-31
+Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; the transactional projection/index and new-Session-to-existing-Work seam are next
+Date: 2026-09-04
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
+
+Phase 3C closure checkpoint (2026-09-04): accepted and duplicate service commands no longer
+become UI truth on the strength of a transport receipt. The client retains the exact command
+intent until a fresh canonical projection proves its client-qualified `CommandRef`, acceptance
+event/cursor, expected resulting Work cursor, and host sequence; indeterminate delivery likewise
+clears only on exact canonical evidence. Create and Start intent stores are private, bounded,
+no-follow, synchronizing, and compare-and-clear, so GUI or machine interruption cannot silently
+turn an uncertain mutation into a fresh command. The journal-backed service and in-memory
+conformance host now emit the canonical Run and command evidence required by that contract, while
+rejected duplicate Start remains a rejection rather than a fabricated duplicate success. Attach
+receipts carry the exact attachment outcome required by transport correlation. Shell execution now
+distinguishes timeout and cancellation and performs bounded TERM-to-KILL cleanup without opening
+an implicit interactive stdin channel.
+
+The integrated macOS suite passes 787 cases / 8,450 assertions. The 100,000-event Timeline
+benchmark reads and reduces 46,766,700 bytes in 5.774 seconds on the checkpoint machine. Release
+assembly signs the GUI and its nested `aviaryd`; all 9 canonical 1600×1000 screens render and were
+visually inspected. On a fresh Ubuntu 24.04 x86_64 snapshot with Swift 6.3.3, the selected headless
+suite passes 18 cases / 188 assertions, the real reconnect/provider process proof passes 1 case /
+53 assertions, and the normal daemon proof passes 1 case / 12 assertions. A freshly rebuilt macOS
+client then handshakes that Linux daemon through SSH stream-local forwarding with the expected
+Work Host identity. The remaining named convergence work is the disposable transactional
+projection/index, followed by the first-class new-Session-to-existing-Work protocol and GUI flow;
+native remote discovery and device authentication remain later product surfaces.
+
+Phase 3C implementation checkpoint (2026-09-03): the production path now composes the durable
+workspace registry, journal-backed Work service, launch manifests, execution factory, and
+out-of-process `aviaryd`. The macOS GUI creates, restores, observes, and controls Work only through
+the service boundary; GUI window close, application quit, and transport loss detach the client
+without issuing End. A fresh client can reconstruct the canonical Work and Session projections,
+reconcile retained command intent, and attach to the same ongoing Work. Reducer checkpoints above
+32 MiB intentionally retain identity, cursor, and pending-ack proof rather than an unbounded
+snapshot; after a client crash those cases safely replay from the canonical beginning instead of
+yet resuming the large catch-up incrementally. Create and Attach use a fresh host/control
+observation, while steady polling has one bounded owner. The GUI exposes explicit End, disconnect,
+retry, and abandon operations rather than conflating process lifetime, transport reachability, and
+durable Work state.
+
+The same headless product now builds and runs on Ubuntu x86_64. A real process proof starts Work,
+drops the first client, attaches a second client, observes retained provider output, ends the Run,
+and shuts the daemon down through its bounded admission/drain contract. A macOS protocol client
+also reaches the Linux daemon through SSH stream-local forwarding and verifies the expected Work
+Host identity. This is evidence that the local protocol boundary can cross devices; SSH currently
+provides the encrypted/authenticated transport, and Aviary does not yet claim a native remote-host
+discovery or device-authentication product surface.
+
+Paired client checkpoints, exact end-to-end read acknowledgements, detached-attachment
+reconciliation, and bounded Linux provider streaming are implemented. This remains an intermediate
+checkpoint until production readers stop rescanning and retaining whole journals and large catch-up
+is cold-resumable rather than safely replaying from zero. A disposable disk-backed projection/index
+layer over canonical JSONL is the next named Phase 3C convergence slice, not postponed scalability
+polish.
 
 Implementation checkpoint (2026-09-02): stable session/Work/run identity, serialized command
 admission, immutable admission plus delivery receipts, writer-confirmed input delivery, live
@@ -68,9 +120,9 @@ do not masquerade as successful delivery. Socket ownership, path length, framing
 connection generations, teardown, and same-Session command serialization have adversarial coverage.
 A transport-neutral `WorkService` executable contract now specifies exact causal cursors,
 many-to-many client/session attachments, per-client authorization, bounded and addressable reads,
-and service-supplied terminal commit proofs. This is substrate only: the production GUI still owns
-`AgentRunner`, no `aviaryd` owns real Work yet, and no GUI currently reconnects to a persisted Work
-Host descriptor.
+and service-supplied terminal commit proofs. At the Phase 3A checkpoint this was substrate only: the
+production GUI still owned `AgentRunner`, no `aviaryd` owned real Work, and no GUI reconnected to a
+persisted Work Host descriptor. Phase 3C below closes those three historical gaps.
 
 The Phase 3B ownership substrate now includes a service-owned `HostedInHouseWork` actor whose
 Agent/runner/runtime lifetime is independent of any observing client, plus a bounded Unix-socket
@@ -84,9 +136,9 @@ canonical target reads cannot be forged by a caller-supplied snapshot. A synchro
 records the exact durable prefix, so live and cold readers project previously sealed truth while
 reporting an unsealed suffix rather than inventing a successful mutation. Reopen acquires one
 continuous owner lock before inspecting or truncating that suffix, including the fresh-empty crash
-window. This still is substrate: the next slice must compose the registry, journal-backed service,
-execution factory, and `aviaryd`, then route the GUI through them before GUI loss actually leaves
-production Work running.
+window. At that checkpoint this was still substrate; Phase 3C now composes the registry,
+journal-backed service, execution factory, and `aviaryd`, and routes the GUI through them so GUI
+loss leaves production Work running.
 
 The Phase 3B service protocol/ownership checkpoint (2026-09-03) closes the remaining substrate
 contracts needed for that composition. Create is a two-stage, host-minted transaction: the control
@@ -103,10 +155,9 @@ than by an observer. The transport now carries complete canonical Timeline event
 page chains and bounded body progress, rejects undeclared retained-body sizes, fences every response
 to the negotiated host instance (including empty responses), and rechecks the backing service
 instance on every request. Agent Home persists and synchronizes one strict host-instance identity.
-`InMemoryWorkService` remains a conformance harness, not the production composition. The next slice
-must bind these pieces to real journals and execution factories inside `aviaryd`, then prove that a
-second client can attach after the first GUI process exits before changing the user-facing survival
-claim.
+`InMemoryWorkService` remains a conformance harness rather than the production composition. Phase
+3C subsequently bound these pieces to real journals and execution factories inside `aviaryd` and
+proved that a second client can attach after the first client process exits.
 
 A canonical catalog adapter now projects authority-qualified Session identities and attached Work
 at independently verified requested/observed cursors. Only attached, exactly aligned Work with
@@ -293,9 +344,12 @@ provenance inside the now-durable block-level prompt sources; independent native
 children; actual disk-full and permission fault reachability; and a measured
 peak-RSS budget. The semantic component measure is deliberately not claimed to be provider-specific
 HTTP wire size. The 100,000-event benchmark fixes an encoded-input and read/reduce baseline, but does
-not claim incremental rendering or bounded peak memory. The out-of-process Work Host,
-GUI-independent process survival, and remote multi-client ownership remain Phase 3 rather than being
-implied here.
+not claim incremental rendering or bounded peak memory. Phase 3 now has an out-of-process local Work
+Host, GUI-independent process survival, reconnecting clients, durable paired read checkpoints and
+acknowledgements, and a Linux/SSH transport proof. It still owes the disposable transactional
+projection store that makes host/client catch-up and cold resume bounded, the independent
+new-Session-to-existing-Work transaction, integrated multi-client fault matrix, and native remote
+discovery/authentication UX before the entire many-to-many architecture is complete.
 
 ## Outcome
 
@@ -912,6 +966,12 @@ Deliverables:
 - Keep journals canonical and host-side. The read protocol pages snapshots/events by durable cursor
   and fetches artifacts; it is not a lossy live-event bus. A same-host file reader may remain an
   optimization behind the same interface, never a GUI assumption.
+- Add a disposable transactional projection store on both Work Host and GUI sides. Canonical JSONL
+  remains the transferable authority; the store records exact journal identity, cursor, prefix
+  digest, bounded event pages, reducer heads, and pending acknowledgement intent, catches up a
+  missing suffix after restart, and can be deleted/rebuilt on corruption or schema change. No normal
+  read, projection, append, or acknowledgement may require a lifetime-sized journal array or a scan
+  from byte zero once the stored prefix is proven.
 - Give the logical protocol a small device-independent surface: list/describe Work, attach/detach,
   update this client's observe/control capability, snapshot/events-after-cursor, fetch artifact,
   start/send/steer/queue, hold, supported cancellation, and explicit end/destroy commands.
@@ -1229,8 +1289,9 @@ visible promise is wired to the wrong operation.
   is proven and usage data shows demand.
 - Do not unify all engines by erasing capability differences. Use one product vocabulary and expose
   engine-specific support truthfully.
-- Do not replace JSONL merely for fashion. Add an index/cache if scale requires it while retaining
-  an append-only transferable source record.
+- Do not replace canonical JSONL with the projection database. The now-required Phase 3C index/cache
+  is disposable derived state whose cursor and prefix digest are always proven against the
+  append-only transferable source record.
 - Do not put all action detail inline. Progressive disclosure and stable summaries are part of the
   reliability experience.
 - Do not treat worktrees as full isolation; databases, ports, credentials, networks, and vendor APIs

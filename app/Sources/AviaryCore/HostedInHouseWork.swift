@@ -352,7 +352,14 @@ public struct HostedInHouseWorkConfiguration: Sendable {
     public let recordPayloads: Bool
     public let goal: Goal?
     public let hookPaths: [String]
-    public let resume: Bool
+    /// The compatibility transcript operation is independent from effective model context.
+    public let projectionMode: WorkLaunchProjectionMode
+    /// Whether AgentRunner should reconstruct the exact native context before dispatch.
+    public let modelContextMode: WorkLaunchContextMode
+    /// Existing in-house callback capabilities. The Work Host owns these delegates; Hosted Work
+    /// must carry them into the AgentRunner just as the GUI driver does.
+    public let peerDelegate: Agent.PeerDelegate?
+    public let selfDelegate: Agent.SelfDelegate?
     /// Optional coordination hook run after the actor has reserved Start preparation but before
     /// durable command admission. It lets a service test or scheduler hold this narrow window
     /// without making the reservation invisible to a concurrent End command.
@@ -382,7 +389,10 @@ public struct HostedInHouseWorkConfiguration: Sendable {
         recordPayloads: Bool = false,
         goal: Goal? = nil,
         hookPaths: [String] = [],
-        resume: Bool = false,
+        projectionMode: WorkLaunchProjectionMode = .fresh,
+        modelContextMode: WorkLaunchContextMode = .launchFresh,
+        peerDelegate: Agent.PeerDelegate? = nil,
+        selfDelegate: Agent.SelfDelegate? = nil,
         startAdmissionGate: (@Sendable () async -> Void)? = nil,
         adoptionEvidenceSink:
             (@Sendable (HostedInHouseWorkAdoptionEvidence) async throws -> Void)? = nil
@@ -405,7 +415,10 @@ public struct HostedInHouseWorkConfiguration: Sendable {
         self.recordPayloads = recordPayloads
         self.goal = goal
         self.hookPaths = hookPaths
-        self.resume = resume
+        self.projectionMode = projectionMode
+        self.modelContextMode = modelContextMode
+        self.peerDelegate = peerDelegate
+        self.selfDelegate = selfDelegate
         self.startAdmissionGate = startAdmissionGate
         self.adoptionEvidenceSink = adoptionEvidenceSink
     }
@@ -521,7 +534,7 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
     private var subscriptions: [String: AsyncStream<HostedInHouseWorkEvent>.Continuation] = [:]
     private var subscriptionClients: [String: ClientRef] = [:]
 
-    private init(
+    init(
         configuration: HostedInHouseWorkConfiguration,
         bridge: NativeSessionCommandJournal,
         controller: SessionCommandController
@@ -541,108 +554,13 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
     /// reopen old bytes; a resume must have the native pair and the current Session presentation
     /// file required by the existing AgentRunner writer seam. This is the only launch path for
     /// this actor.
+    /// Open through the Core composition factory. Hosted remains the public lifecycle surface;
+    /// the factory is the only implementation path that admits its journals and runtime.
     public static func open(
         configuration: HostedInHouseWorkConfiguration
     ) async throws -> HostedInHouseWork {
-        let binding = configuration.workRunBinding
-        let identity = SessionWorkIdentity(
-            sessionID: binding.workBinding.session.sessionID,
-            work: binding.workBinding.work,
-            runID: binding.run.runID)
-        let home = configuration.home
-        let configurationIdentifiers = [
-            identity.sessionID,
-            identity.work.workHostID,
-            identity.work.workID,
-            identity.runID,
-            configuration.serviceActorID,
-        ]
-        guard configurationIdentifiers.allSatisfy({
-            let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !trimmed.isEmpty && $0.utf8.count <= HostedInHouseWorkLimits.maxIdentifierBytes
-        }) else {
-            throw HostedInHouseWorkError.invalidConfiguration(
-                "Work, Session, Run, and service actor identities must be nonempty and at most "
-                    + "\(HostedInHouseWorkLimits.maxIdentifierBytes) UTF-8 bytes")
-        }
-        let persistedHost = try home.requirePersistedWorkHost()
-        guard binding.workBinding.workHost == persistedHost,
-              binding.workBinding.work.workHostID == persistedHost.workHostID else {
-            throw HostedInHouseWorkError.invalidConfiguration(
-                "execution Work binding does not belong to this AgentHome's persisted authority")
-        }
-        guard binding.workBinding.sessionJournal.authority ==
-                TimelineAuthorityRef(persistedHost.workHostID) else {
-            throw HostedInHouseWorkError.invalidConfiguration(
-                "execution Session authority must be the persisted Work Host authority")
-        }
-        let sessionURL = home.timelineV2SessionJournalURL(SessionRef(identity.sessionID))
-        let workURL = home.timelineV2WorkJournalURL(identity.work)
-        let sessionExists = FileManager.default.fileExists(atPath: sessionURL.path)
-        let workExists = FileManager.default.fileExists(atPath: workURL.path)
-        let sessionProjectionExists = FileManager.default.fileExists(
-            atPath: home.sessionFile(id: identity.sessionID).path)
-
-        guard sessionExists && workExists else {
-            throw HostedInHouseWorkError.invalidConfiguration(
-                "Hosted Work requires a separately created canonical idle Session/Work pair")
-        }
-        if configuration.resume {
-            guard sessionProjectionExists else {
-                throw HostedInHouseWorkError.invalidConfiguration(
-                    "resume requires an existing Session projection")
-            }
-        } else {
-            guard !sessionProjectionExists else {
-                throw HostedInHouseWorkError.invalidConfiguration(
-                    "a fresh Hosted run cannot replace an existing Session projection")
-            }
-        }
-
-        let writer: SessionWriter
-        do {
-            if configuration.resume {
-                writer = try SessionWriter(
-                    home: home, resuming: identity.sessionID, cwd: configuration.cwd,
-                    model: configuration.model, identity: identity)
-            } else {
-                writer = try SessionWriter(
-                    home: home, cwd: configuration.cwd, model: configuration.model,
-                    identity: identity)
-            }
-        } catch {
-            // A fresh projection is disposable and did not exist at admission. If its header
-            // write fails, do not leave a misleading half-created flat session behind; the
-            // canonical idle pair remains the source of truth for a later retry.
-            if !configuration.resume && !sessionProjectionExists {
-                try? FileManager.default.removeItem(at: home.sessionFile(id: identity.sessionID))
-            }
-            throw HostedInHouseWorkError.invalidConfiguration(
-                "could not open Session projection: \(Self.bounded(error.localizedDescription))")
-        }
-
-        do {
-            let bridge = try await NativeSessionCommandJournal.openForRun(
-                home: home,
-                binding: binding,
-                legacyProjection: writer,
-                actorID: configuration.serviceActorID,
-                actorKind: configuration.actorKind,
-                modelID: configuration.model.qualifiedID,
-                resumingLegacySession: configuration.resume)
-            let controller = SessionCommandController(
-                identity: identity, capabilities: Agent.inHouseCommandCapabilities, journal: bridge)
-            return HostedInHouseWork(
-                configuration: configuration, bridge: bridge, controller: controller)
-        } catch {
-            await writer.close()
-            // Native admission is canonical. A failed open must not strand the new disposable
-            // projection as if a Hosted run had actually been adopted.
-            if !configuration.resume && !sessionProjectionExists {
-                try? FileManager.default.removeItem(at: home.sessionFile(id: identity.sessionID))
-            }
-            throw error
-        }
+        try await InHouseWorkFactory.open(
+            configuration: InHouseWorkFactory.Configuration(hostedConfiguration: configuration))
     }
 
     /// Subscribe one GUI/service client to bounded notifications. Ending this stream has no
@@ -1095,9 +1013,13 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
                     recordPayloads: configuration.recordPayloads,
                     goal: configuration.goal,
                     hookPaths: configuration.hookPaths,
-                    resume: configuration.resume ? identity.sessionID : nil,
-                    peerDelegate: nil,
-                    selfDelegate: nil,
+                    // The legacy AgentRunner switch is an adapter detail. The public launch
+                    // contract carries the truthful typed context mode, while the projection
+                    // mode remains independent (a historical projection may still launch fresh).
+                    resume: configuration.modelContextMode == .exactColdResume
+                        ? identity.sessionID : nil,
+                    peerDelegate: configuration.peerDelegate,
+                    selfDelegate: configuration.selfDelegate,
                     identity: identity,
                     reasoningEffort: configuration.reasoningEffort,
                     writer: bridge.legacyProjection,
@@ -1837,9 +1759,8 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
     }
 
     private func qualifiedCommandID(clientID: String, commandID: String) -> String {
-        let client = Data(clientID.utf8).base64EncodedString()
-        let command = Data(commandID.utf8).base64EncodedString()
-        return "hosted-command-v1.\(client).\(command)"
+        WorkServiceCommandLedgerIdentity.commandID(
+            client: ClientRef(clientID), commandID: commandID)
     }
 
     private static func adoptionCaveat(_ descriptor: RuntimeHost.AdoptionDescriptor) -> String {
