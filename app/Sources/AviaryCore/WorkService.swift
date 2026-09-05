@@ -6,9 +6,9 @@ import Foundation
 /// in-memory reference service; a Unix-domain socket and a remote transport can encode these
 /// values without changing their meaning.
 public enum WorkServiceProtocol {
-    public static let currentVersion = 1
-    public static let minimumSupportedVersion = 1
-    public static let maximumSupportedVersion = 1
+    public static let currentVersion = 2
+    public static let minimumSupportedVersion = 2
+    public static let maximumSupportedVersion = 2
 }
 
 /// A bounded surface is intentional: protocol values must be safe to render even when a remote
@@ -27,6 +27,7 @@ public enum WorkServiceBounds {
     public static let maxTerminalProofHandles = 128
     public static let maxArtifactsPerWork = 128
     public static let maxAttachmentsPerWork = 64
+    public static let maxSessionAttachmentsPerWork = 64
     /// One client attachment currently has at most a Work target and its bound Session target.
     /// Keep this independently bounded so descriptor reconstruction cannot grow without limit.
     public static let maxReadAcknowledgementsPerAttachment = 2
@@ -170,6 +171,7 @@ public enum WorkServiceReadTarget: Codable, Hashable, Sendable {
 
 public enum WorkServiceControlOperation: String, Codable, Hashable, Sendable {
     case createWork = "create_work"
+    case createSession = "create_session"
     case attach
     case detach
     case updateCapabilities = "update_capabilities"
@@ -178,6 +180,7 @@ public enum WorkServiceControlOperation: String, Codable, Hashable, Sendable {
 
 public enum WorkServiceControlOutcome: String, Codable, Hashable, Sendable {
     case created
+    case sessionCreated = "session_created"
     case attached
     case detached
     case capabilitiesUpdated = "capabilities_updated"
@@ -316,6 +319,8 @@ public enum WorkServiceCapability: String, Codable, CaseIterable, Hashable, Send
     case inspectArtifacts = "inspect_artifacts"
     /// The host can advertise and resolve opaque workspace identities.
     case workspaceCatalog = "workspace_catalog"
+    /// The client may ask the Work Host to mint and durably attach another Session to existing Work.
+    case createSession = "create_session"
 }
 
 /// Authorization is injected at the host boundary. A transport may authenticate a principal
@@ -403,6 +408,57 @@ public struct WorkServiceClientAttachment: Codable, Hashable, Sendable {
     }
 }
 
+/// The durable semantic relationship between an existing Work and one Session. This is separate
+/// from ``WorkServiceClientAttachment``: several GUI/device attachments may observe the same
+/// Session relationship, while the relationship itself remains owned by the Work/Session
+/// journals. A descriptor never grants authority; its cursors and publication describe exactly
+/// which journal evidence was recorded by the host.
+public enum WorkServiceSessionAttachmentPublication: String, Codable, Hashable, Sendable {
+    /// The Work journal contains the corresponding ``session.attached`` mirror.
+    case mirrored
+    /// Work is terminal and cannot be changed; the relationship is a read-only reference to the
+    /// already durable Session journal evidence.
+    case terminalReference = "terminal_reference"
+}
+
+public struct WorkServiceSessionAttachmentDescriptor: Codable, Hashable, Sendable {
+    public let session: SessionRef
+    public let sessionJournal: JournalRef
+    public let sessionAttachment: SessionAttachmentRef
+    public let publication: WorkServiceSessionAttachmentPublication
+    /// The exact Session cursor before the Session relationship events.
+    public let causalSessionCursor: JournalCursor
+    /// The exact Session cursor after ``session.attachment_cursor_advanced``.
+    public let sessionCursor: JournalCursor
+    /// The exact Work cursor observed before publication. For a terminal reference this equals
+    /// ``resultingWorkCursor`` because no Work event may be appended.
+    public let causalWorkCursor: JournalCursor
+    /// The exact Work cursor after the mirror, or the unchanged cursor for a terminal reference.
+    public let resultingWorkCursor: JournalCursor
+    public let capabilities: Set<WorkServiceCapability>
+    public let isAttached: Bool
+
+    public init(session: SessionRef, sessionJournal: JournalRef,
+                sessionAttachment: SessionAttachmentRef,
+                publication: WorkServiceSessionAttachmentPublication,
+                causalSessionCursor: JournalCursor, sessionCursor: JournalCursor,
+                causalWorkCursor: JournalCursor, resultingWorkCursor: JournalCursor,
+                capabilities: Set<WorkServiceCapability>, isAttached: Bool = true) {
+        self.session = session
+        self.sessionJournal = sessionJournal
+        self.sessionAttachment = sessionAttachment
+        self.publication = publication
+        self.causalSessionCursor = causalSessionCursor
+        self.sessionCursor = sessionCursor
+        self.causalWorkCursor = causalWorkCursor
+        self.resultingWorkCursor = resultingWorkCursor
+        self.capabilities = capabilities
+        self.isAttached = isAttached
+    }
+
+    public var resultingSessionCursor: JournalCursor { sessionCursor }
+}
+
 public struct WorkServiceWorkDescriptor: Codable, Hashable, Sendable {
     public let work: WorkRef
     public let journal: JournalRef
@@ -412,6 +468,7 @@ public struct WorkServiceWorkDescriptor: Codable, Hashable, Sendable {
     public let configuration: WorkServiceWorkConfiguration
     public let hostObservation: WorkServiceHostObservation?
     public let attachments: [WorkServiceClientAttachment]
+    public let sessionAttachments: [WorkServiceSessionAttachmentDescriptor]
     public let artifacts: [WorkServiceArtifactDescriptor]
     public let omissions: [WorkServiceOmission]
 
@@ -421,6 +478,7 @@ public struct WorkServiceWorkDescriptor: Codable, Hashable, Sendable {
                 configuration: WorkServiceWorkConfiguration = .init(),
                 hostObservation: WorkServiceHostObservation?,
                 attachments: [WorkServiceClientAttachment] = [],
+                sessionAttachments: [WorkServiceSessionAttachmentDescriptor] = [],
                 artifacts: [WorkServiceArtifactDescriptor] = [],
                 omissions: [WorkServiceOmission] = []) {
         self.work = work
@@ -431,6 +489,10 @@ public struct WorkServiceWorkDescriptor: Codable, Hashable, Sendable {
         self.configuration = configuration
         self.hostObservation = hostObservation
         self.attachments = attachments
+        // Semantic relationships are not a best-effort display list.  The InMemory service
+        // admits them under the protocol bound before minting anything; silently dropping a
+        // relationship here would make a successful response unverifiable.
+        self.sessionAttachments = sessionAttachments
         self.artifacts = artifacts
         self.omissions = omissions
     }
@@ -702,6 +764,99 @@ public struct WorkServiceCreateWorkResponse: Codable, Hashable, Sendable {
     public var resultingSessionCursor: JournalCursor { sessionCursor }
     public var resultingControlCursor: JournalCursor { controlCursor }
     public var clientAttachment: WorkServiceClientAttachment { attachment }
+}
+
+/// Requests that an already-authorized client have the Work Host mint a new Session and its
+/// client attachment. No Session, SessionAttachment, or ClientAttachment identity is accepted
+/// from the caller; all three are host-owned outputs.
+public struct WorkServiceCreateSessionRequest: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let journal: JournalRef
+    /// The existing Work/client attachment authorizing this operation.
+    public let attachment: ClientAttachmentRef
+    public let client: ClientRef
+    public let commandID: String
+    public let causalControlCursor: JournalCursor
+    public let causalWorkCursor: JournalCursor
+    /// Capabilities requested for the newly-created Session relationship/Client attachment.
+    public let requestedCapabilities: Set<WorkServiceCapability>
+
+    public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
+                client: ClientRef, commandID: String,
+                causalControlCursor: JournalCursor, causalWorkCursor: JournalCursor,
+                requestedCapabilities: Set<WorkServiceCapability> = [.observe]) {
+        self.work = work
+        self.journal = journal
+        self.attachment = attachment
+        self.client = client
+        self.commandID = commandID
+        self.causalControlCursor = causalControlCursor
+        self.causalWorkCursor = causalWorkCursor
+        self.requestedCapabilities = requestedCapabilities
+    }
+}
+
+public struct WorkServiceCreateSessionResponse: Codable, Hashable, Sendable {
+    public let work: WorkServiceWorkDescriptor
+    /// Nil on a structured rejection. Existing Work facts remain available in ``work``;
+    /// no newly-minted identity is placed in a rejected response.
+    public let session: SessionRef?
+    public let sessionJournal: JournalRef?
+    public let sessionAttachment: SessionAttachmentRef?
+    public let attachment: WorkServiceClientAttachment?
+    public let relationship: WorkServiceSessionAttachmentDescriptor?
+    public let workCursor: JournalCursor
+    public let sessionCursor: JournalCursor?
+    public let controlCursor: JournalCursor
+    public let authorization: WorkServiceAuthorizationOutcome
+    public let commandID: String
+    public let state: WorkServiceCommandReceiptState
+    public let host: WorkHostInstanceRef
+    public let causalControlCursor: JournalCursor
+    public let causalWorkCursor: JournalCursor
+    public let receipt: WorkServiceControlReceipt
+    public let rejection: WorkServiceCommandRejection?
+    public let diagnostic: String?
+
+    public init(work: WorkServiceWorkDescriptor,
+                session: SessionRef? = nil, sessionJournal: JournalRef? = nil,
+                sessionAttachment: SessionAttachmentRef? = nil,
+                attachment: WorkServiceClientAttachment? = nil,
+                relationship: WorkServiceSessionAttachmentDescriptor? = nil,
+                workCursor: JournalCursor,
+                sessionCursor: JournalCursor? = nil,
+                controlCursor: JournalCursor,
+                authorization: WorkServiceAuthorizationOutcome,
+                commandID: String, state: WorkServiceCommandReceiptState = .accepted,
+                host: WorkHostInstanceRef,
+                causalControlCursor: JournalCursor,
+                causalWorkCursor: JournalCursor,
+                receipt: WorkServiceControlReceipt,
+                rejection: WorkServiceCommandRejection? = nil,
+                diagnostic: String? = nil) {
+        self.work = work
+        self.session = session
+        self.sessionJournal = sessionJournal
+        self.sessionAttachment = sessionAttachment
+        self.attachment = attachment
+        self.relationship = relationship
+        self.workCursor = workCursor
+        self.sessionCursor = sessionCursor
+        self.controlCursor = controlCursor
+        self.authorization = authorization
+        self.commandID = commandID
+        self.state = state
+        self.host = host
+        self.causalControlCursor = causalControlCursor
+        self.causalWorkCursor = causalWorkCursor
+        self.receipt = receipt
+        self.rejection = rejection
+        self.diagnostic = WorkServiceText.bound(diagnostic)
+    }
+
+    public var resultingWorkCursor: JournalCursor { workCursor }
+    public var resultingSessionCursor: JournalCursor? { sessionCursor }
+    public var resultingControlCursor: JournalCursor { controlCursor }
 }
 
 public struct WorkServiceCompleteWorkRequest: Codable, Hashable, Sendable {
@@ -1566,6 +1721,8 @@ public protocol WorkServiceClient: Sendable {
     func listWorks(_ request: WorkServiceListRequest) async throws -> WorkServiceWorkPage
     func describeWork(_ request: WorkServiceDescribeRequest) async throws -> WorkServiceWorkDescriptor
     func createWork(_ request: WorkServiceCreateWorkRequest) async throws -> WorkServiceCreateWorkResponse
+    func createSession(_ request: WorkServiceCreateSessionRequest) async throws
+        -> WorkServiceCreateSessionResponse
     func completeWork(_ request: WorkServiceCompleteWorkRequest) async throws -> WorkServiceCommandReceipt
     func attach(_ request: WorkServiceAttachRequest) async throws -> WorkServiceAttachResponse
     func detach(_ request: WorkServiceDetachRequest) async throws -> WorkServiceDetachResponse
@@ -1674,6 +1831,11 @@ public actor InMemoryWorkService: WorkServiceClient {
         let response: WorkServiceCreateWorkResponse
     }
 
+    private struct StoredCreateSession: Sendable {
+        let request: WorkServiceCreateSessionRequest
+        let response: WorkServiceCreateSessionResponse
+    }
+
     private struct StoredAttach: Sendable {
         let request: WorkServiceAttachRequest
         let response: WorkServiceAttachResponse
@@ -1692,6 +1854,14 @@ public actor InMemoryWorkService: WorkServiceClient {
     private struct StoredReadAcknowledgement: Sendable {
         let request: WorkServiceAcknowledgeReadRequest
         let response: WorkServiceAcknowledgeReadResponse
+    }
+
+    private struct SessionRecord: Sendable {
+        let session: SessionRef
+        let journal: JournalRef
+        var cursor: JournalCursor
+        var events: [TimelineEvent]
+        var nextEventSequence: Int
     }
 
     private enum TerminalAttempt: Sendable {
@@ -1722,6 +1892,7 @@ public actor InMemoryWorkService: WorkServiceClient {
     private var reachable = true
     private var works: [WorkRef: WorkState] = [:]
     private var createCommands: [CreateCommandKey: StoredCreate] = [:]
+    private var createSessionCommands: [CreateCommandKey: StoredCreateSession] = [:]
     private var attachCommands: [AttachmentCommandKey: StoredAttach] = [:]
     private var detachCommands: [AttachmentCommandKey: StoredDetach] = [:]
     private var capabilityCommands: [AttachmentCommandKey: StoredCapabilities] = [:]
@@ -1740,6 +1911,11 @@ public actor InMemoryWorkService: WorkServiceClient {
         var disposition: WorkServiceRecordedDisposition
         var execution: WorkServiceExecutionState
         var currentRun: RunRef?
+        /// Session identity that admitted the active Run. This remains stable until the Run
+        /// finishes so run-level events never fall back to the Work's original Session when a
+        /// later Session starts the Run.
+        var currentRunSession: SessionRef?
+        var currentRunSessionAttachment: SessionAttachmentRef?
         var configuration: WorkServiceWorkConfiguration
         var cursor: JournalCursor?
         var session: SessionRef?
@@ -1753,6 +1929,11 @@ public actor InMemoryWorkService: WorkServiceClient {
         var attachments: [ClientAttachmentRef: ClientState]
         var events: [TimelineEvent]
         var sessionEvents: [TimelineEvent]
+        /// Session journals are independent of the Work journal. The primary Session fields
+        /// above remain as the original launch projection; this bounded map carries additional
+        /// Sessions created against the same Work.
+        var sessionRecords: [SessionRef: SessionRecord]
+        var sessionRelationships: [SessionAttachmentRef: WorkServiceSessionAttachmentDescriptor]
         var readAcknowledgements: [ReadAcknowledgementKey: JournalCursor]
         var nextEventSequence: Int
         var nextSessionEventSequence: Int
@@ -1836,7 +2017,15 @@ public actor InMemoryWorkService: WorkServiceClient {
         let sessionCursor: JournalCursor? = seed.session == nil
             ? nil
             : (seed.sessionCursor ?? JournalCursor(journal: seed.sessionJournal!, sequence: 0))
-        guard cursor.sequence == 0 || seed.sourceCompleteness != .complete else {
+        var sessionRecords: [SessionRef: SessionRecord] = [:]
+        if let session = seed.session, let sessionJournal = seed.sessionJournal,
+           let sessionCursor {
+            sessionRecords[session] = SessionRecord(
+                session: session, journal: sessionJournal, cursor: sessionCursor,
+                events: seed.sessionEvents, nextEventSequence: sessionCursor.sequence + 1)
+        }
+        guard cursor.sequence == 0 || !seed.events.isEmpty
+                || seed.sourceCompleteness != .complete else {
             throw WorkServiceProtocolError.invalidRequest(
                 "a complete nonzero seed requires retained event history")
         }
@@ -1884,6 +2073,32 @@ public actor InMemoryWorkService: WorkServiceClient {
                 || (seed.execution == .idle && seed.currentRun == nil) else {
             throw WorkServiceProtocolError.invalidRequest("invalid execution/run combination")
         }
+        let currentRunBinding: (session: SessionRef, attachment: SessionAttachmentRef)?
+        if let currentRun = seed.currentRun, seed.sourceCompleteness == .complete {
+            let starts = seed.events.filter {
+                $0.type == TimelineEventType.runStarted && $0.run == currentRun
+            }
+            guard starts.count == 1,
+                  let start = starts.first,
+                  start.work == seed.work,
+                  start.workHost == host,
+                  let session = start.session,
+                  let attachment = start.sessionAttachment,
+                  seed.events.contains(where: {
+                      $0.sequence < start.sequence
+                          && $0.type == TimelineEventType.sessionAttached
+                          && $0.session == session
+                          && $0.sessionAttachment == attachment
+                  }) else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "a complete active Run seed requires exact Session attachment provenance")
+            }
+            currentRunBinding = (session, attachment)
+        } else {
+            // An incomplete source cannot prove who started its active Run. It is deliberately
+            // non-mutable, so retain unknown provenance rather than borrowing the launch Session.
+            currentRunBinding = nil
+        }
         guard Set(seed.artifacts.map { $0.artifactID }).count == seed.artifacts.count else {
             throw WorkServiceProtocolError.invalidRequest("duplicate artifact identity")
         }
@@ -1908,13 +2123,17 @@ public actor InMemoryWorkService: WorkServiceClient {
         }
         works[seed.work] = WorkState(
             work: seed.work, journal: seed.journal, disposition: seed.disposition,
-            execution: seed.execution, currentRun: seed.currentRun, configuration: seed.configuration, cursor: cursor,
+            execution: seed.execution, currentRun: seed.currentRun,
+            currentRunSession: currentRunBinding?.session,
+            currentRunSessionAttachment: currentRunBinding?.attachment,
+            configuration: seed.configuration, cursor: cursor,
             session: seed.session, sessionJournal: seed.sessionJournal,
             sessionAttachment: seed.sessionAttachment, sessionCursor: sessionCursor,
             sourceCompleteness: seed.sourceCompleteness, artifacts: artifacts, bodies: seed.bodies,
             omissions: omissions,
             attachments: [:],
             events: seed.events, sessionEvents: seed.sessionEvents,
+            sessionRecords: sessionRecords, sessionRelationships: [:],
             readAcknowledgements: [:],
             nextEventSequence: cursor.sequence + 1,
             nextSessionEventSequence: (sessionCursor?.sequence ?? 0) + 1,
@@ -2027,13 +2246,19 @@ public actor InMemoryWorkService: WorkServiceClient {
         nextAttachmentOrdinal += 1
         var state = WorkState(
             work: work, journal: workJournal, disposition: .reusable, execution: .idle,
-            currentRun: nil, configuration: request.configuration,
+            currentRun: nil, currentRunSession: nil, currentRunSessionAttachment: nil,
+            configuration: request.configuration,
             cursor: JournalCursor(journal: workJournal, sequence: 0),
             session: session, sessionJournal: sessionJournal,
             sessionAttachment: sessionAttachment,
             sessionCursor: JournalCursor(journal: sessionJournal, sequence: 0),
             sourceCompleteness: .complete, artifacts: [], bodies: [:], omissions: [],
-            attachments: [:], events: [], sessionEvents: [], readAcknowledgements: [:],
+            attachments: [:], events: [], sessionEvents: [],
+            sessionRecords: [session: SessionRecord(
+                session: session, journal: sessionJournal,
+                cursor: JournalCursor(journal: sessionJournal, sequence: 0),
+                events: [], nextEventSequence: 1)], sessionRelationships: [:],
+            readAcknowledgements: [:],
             nextEventSequence: 1, nextSessionEventSequence: 1, nextRunOrdinal: 1,
             nextHostSequence: 1, commands: [:], terminalReservation: nil)
         let createCommand = CommandRef(
@@ -2042,13 +2267,43 @@ public actor InMemoryWorkService: WorkServiceClient {
             causalCursor: state.cursor)
         _ = appendEvent(kind: TimelineEventType.workCreated,
                         commandID: request.commandID, command: createCommand,
+                        session: session, sessionAttachment: sessionAttachment,
                         state: &state)
-        _ = appendSessionEvent(kind: TimelineEventType.sessionCreated,
-                                commandID: request.commandID, command: createCommand,
-                                state: &state)
-        _ = appendSessionEvent(kind: TimelineEventType.sessionAttached,
-                                commandID: request.commandID, command: createCommand,
-                                state: &state)
+        let sessionCreated = appendSessionRecordEvent(
+            kind: TimelineEventType.sessionCreated, session: session,
+            journal: sessionJournal, sessionAttachment: nil, work: nil,
+            client: nil, command: createCommand, causedBy: nil,
+            capabilities: [], state: &state)
+        let relationshipCapabilities = authorization.granted.subtracting([.createSession])
+        let sessionAttached = appendSessionRecordEvent(
+            kind: TimelineEventType.sessionAttached, session: session,
+            journal: sessionJournal, sessionAttachment: sessionAttachment,
+            work: work, client: request.client, command: createCommand,
+            causedBy: EventRef(journal: sessionJournal, eventID: sessionCreated.eventID!),
+            capabilities: relationshipCapabilities, state: &state)
+        let causalWorkCursor = state.cursor!
+        let mirroredWorkCursor = appendWorkSessionAttachmentEvent(
+            session: session, sessionAttachment: sessionAttachment,
+            client: request.client,
+            command: CommandRef(
+                commandID: request.commandID, client: request.client,
+                sessionAttachment: sessionAttachment, causalCursor: causalWorkCursor),
+            causedBy: EventRef(journal: sessionJournal, eventID: sessionAttached.eventID!),
+            capabilities: relationshipCapabilities, state: &state)
+        let sessionCursor = appendSessionRecordEvent(
+            kind: TimelineEventType.sessionAttachmentCursorAdvanced, session: session,
+            journal: sessionJournal, sessionAttachment: sessionAttachment,
+            work: work, client: request.client, command: createCommand,
+            causedBy: EventRef(journal: workJournal, eventID: mirroredWorkCursor.eventID!),
+            capabilities: relationshipCapabilities,
+            cursorForPayload: mirroredWorkCursor, state: &state)
+        state.sessionRelationships[sessionAttachment] = WorkServiceSessionAttachmentDescriptor(
+            session: session, sessionJournal: sessionJournal,
+            sessionAttachment: sessionAttachment, publication: .mirrored,
+            causalSessionCursor: JournalCursor(journal: sessionJournal, sequence: 0),
+            sessionCursor: sessionCursor, causalWorkCursor: causalWorkCursor,
+            resultingWorkCursor: mirroredWorkCursor,
+            capabilities: relationshipCapabilities)
         let workCursor = state.cursor!
         let attachment = WorkServiceClientAttachment(
             attachment: attachmentID, client: request.client, session: session,
@@ -2056,6 +2311,12 @@ public actor InMemoryWorkService: WorkServiceClient {
             authorization: authorization)
         state.attachments[attachmentID] = ClientState(attachment: attachment)
         works[work] = state
+        // Canonical Create is a three-fact control transaction: identity reservation, source
+        // registration, and the initial client attachment. The in-memory reference service
+        // advances the same span as the journal-backed implementation so transport correlation
+        // can distinguish a complete transaction from a skipped cursor.
+        _ = appendControlEvent()
+        _ = appendControlEvent()
         let resultingControlCursor = appendControlEvent()
         let receipt = WorkServiceControlReceipt(
             operation: .createWork, work: work, commandID: request.commandID,
@@ -2072,6 +2333,299 @@ public actor InMemoryWorkService: WorkServiceClient {
                 ?? JournalCursor(journal: sessionJournal, sequence: 0),
             controlCursor: resultingControlCursor, receipt: receipt)
         createCommands[createKey] = StoredCreate(request: request, response: response)
+        return response
+    }
+
+    public func createSession(
+        _ request: WorkServiceCreateSessionRequest
+    ) async throws -> WorkServiceCreateSessionResponse {
+        try requireReachable()
+        guard var state = works[request.work] else {
+            throw WorkServiceProtocolError.workNotFound(request.work)
+        }
+        guard request.journal == state.journal else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
+        guard validIdentity(request.client.clientID), validIdentity(request.commandID),
+              validCursor(request.causalControlCursor, journal: controlJournal),
+              validCursor(request.causalWorkCursor, journal: state.journal) else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "invalid create Session client, command, or cursor identity")
+        }
+        let key = CreateCommandKey(client: request.client, commandID: request.commandID)
+
+        // Reconcile an exact retry before looking at either causal cursor or the current
+        // attachment. A response can be lost after the host has durably minted all identities;
+        // replay must return those identities rather than accidentally becoming a stale reject.
+        if let prior = createSessionCommands[key] {
+            if prior.request == request {
+                let duplicateReceipt = duplicateControl(of: prior.response.receipt)
+                let replayState: WorkServiceCommandReceiptState =
+                    prior.response.state == .rejected ? .rejected : .duplicate
+                return WorkServiceCreateSessionResponse(
+                    work: prior.response.work, session: prior.response.session,
+                    sessionJournal: prior.response.sessionJournal,
+                    sessionAttachment: prior.response.sessionAttachment,
+                    attachment: prior.response.attachment,
+                    relationship: prior.response.relationship,
+                    workCursor: prior.response.workCursor,
+                    sessionCursor: prior.response.sessionCursor,
+                    controlCursor: prior.response.controlCursor,
+                    authorization: prior.response.authorization,
+                    commandID: prior.response.commandID, state: replayState,
+                    host: prior.response.host,
+                    causalControlCursor: prior.response.causalControlCursor,
+                    causalWorkCursor: prior.response.causalWorkCursor,
+                    receipt: duplicateReceipt, rejection: prior.response.rejection,
+                    diagnostic: prior.response.state == .rejected
+                        ? prior.response.diagnostic : "idempotent duplicate")
+            }
+            // This is a rejection of the current, conflicting request. Its authorization tuple
+            // must describe that request rather than replaying the differently-shaped prior
+            // request's capability set.
+            let authorization = WorkServiceAuthorizationOutcome(
+                requested: request.requestedCapabilities,
+                granted: [], denied: request.requestedCapabilities,
+                diagnostic: "command identity conflicts with a prior request")
+            let currentCursor = state.cursor
+                ?? JournalCursor(journal: state.journal, sequence: 0)
+            let receipt = controlReceipt(
+                operation: .createSession, work: state.work,
+                commandID: request.commandID, state: .rejected,
+                causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor,
+                authorization: authorization, rejection: .conflictingCommand,
+                diagnostic: "create Session command ID was already used with different contents")
+            return WorkServiceCreateSessionResponse(
+                work: descriptor(for: state.work, includeObservation: true)!,
+                workCursor: currentCursor, controlCursor: controlCursor,
+                authorization: authorization, commandID: request.commandID,
+                state: .rejected, host: hostInstance,
+                causalControlCursor: request.causalControlCursor,
+                causalWorkCursor: request.causalWorkCursor, receipt: receipt,
+                rejection: .conflictingCommand,
+                diagnostic: "create Session command ID was already used with different contents")
+        }
+
+        guard let authorizing = state.attachments[request.attachment],
+              authorizing.attachment.client == request.client else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
+        let terminal = state.disposition != .reusable
+        let semanticCapabilities: Set<WorkServiceCapability> = terminal
+            ? [.observe]
+            : Set(WorkServiceCapability.allCases).subtracting([.createSession])
+        let principalSessionAuthorization = authorization(
+            for: request.client, requested: request.requestedCapabilities)
+        let effectiveCapabilities = request.requestedCapabilities
+            .intersection(principalSessionAuthorization.granted)
+            .intersection(authorizing.attachment.authorization.granted)
+            .intersection(semanticCapabilities)
+        let effectiveAuthorization = WorkServiceAuthorizationOutcome(
+            requested: request.requestedCapabilities,
+            granted: effectiveCapabilities,
+            denied: request.requestedCapabilities.subtracting(effectiveCapabilities),
+            diagnostic: effectiveCapabilities == request.requestedCapabilities
+                ? nil : "capabilities were limited by the authorizing attachment or Work state")
+        let operationAuthorization = authorization(
+            for: request.client, requested: [.createSession])
+
+        func rejected(
+            _ rejection: WorkServiceCommandRejection,
+            _ diagnostic: String,
+            authorization: WorkServiceAuthorizationOutcome
+        ) -> WorkServiceCreateSessionResponse {
+            let currentWorkCursor = state.cursor
+                ?? JournalCursor(journal: state.journal, sequence: 0)
+            let receipt = controlReceipt(
+                operation: .createSession, work: state.work,
+                commandID: request.commandID, state: .rejected,
+                causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor,
+                authorization: authorization, rejection: rejection,
+                diagnostic: diagnostic)
+            let response = WorkServiceCreateSessionResponse(
+                work: descriptor(for: state.work, includeObservation: true)!,
+                workCursor: currentWorkCursor, controlCursor: controlCursor,
+                authorization: authorization, commandID: request.commandID,
+                state: .rejected, host: hostInstance,
+                causalControlCursor: request.causalControlCursor,
+                causalWorkCursor: request.causalWorkCursor, receipt: receipt,
+                rejection: rejection, diagnostic: diagnostic)
+            createSessionCommands[key] = StoredCreateSession(
+                request: request, response: response)
+            works[state.work] = state
+            return response
+        }
+        guard operationAuthorization.allows(.createSession),
+              authorizing.attachment.authorization.allows(.createSession) else {
+            return rejected(
+                .authorizationDenied,
+                "client attachment is not authorized to create a Session",
+                authorization: effectiveAuthorization)
+        }
+        guard state.sourceCompleteness == .complete else {
+            return rejected(
+                .sourceIncomplete,
+                "host source is not complete enough to create a Session",
+                authorization: effectiveAuthorization)
+        }
+        guard request.causalControlCursor == controlCursor else {
+            return rejected(
+                .staleCursor,
+                "create Session causal control cursor is not current",
+                authorization: effectiveAuthorization)
+        }
+        guard request.causalWorkCursor == state.cursor else {
+            return rejected(
+                .staleCursor,
+                "create Session causal Work cursor is not current",
+                authorization: effectiveAuthorization)
+        }
+        guard state.terminalReservation == nil else {
+            return rejected(
+                .terminalProofUnavailable,
+                "a terminal Work transaction is already in progress",
+                authorization: effectiveAuthorization)
+        }
+        guard state.attachments.count < WorkServiceBounds.maxAttachmentsPerWork else {
+            return rejected(
+                .invalidState,
+                "Work client attachment bound reached",
+                authorization: effectiveAuthorization)
+        }
+        if terminal {
+            guard request.requestedCapabilities.contains(.observe),
+                  effectiveCapabilities == [.observe] else {
+                return rejected(
+                    .authorizationDenied,
+                    "terminal Session references require an effective observe grant",
+                    authorization: effectiveAuthorization)
+            }
+        }
+
+        let terminalEvent: TimelineEvent?
+        if terminal {
+            guard let canonical = canonicalTerminalEvent(for: state) else {
+                return rejected(
+                    .invalidState,
+                    "terminal Work lacks an exact canonical terminal event at its advertised cursor",
+                    authorization: effectiveAuthorization)
+            }
+            terminalEvent = canonical
+        } else {
+            terminalEvent = nil
+        }
+
+        // The descriptor carries semantic relationships, so this is an admission bound rather
+        // than a presentation limit.  Include the original Session relationship when present;
+        // the next operation must fail before minting or writing if all slots are occupied.
+        let hasPrimaryRelationship = state.session != nil && state.sessionAttachment != nil
+            && !state.sessionRelationships.values.contains {
+                $0.sessionAttachment == state.sessionAttachment
+            }
+        let semanticRelationshipCount = state.sessionRelationships.count
+            + (hasPrimaryRelationship ? 1 : 0)
+        guard semanticRelationshipCount < WorkServiceBounds.maxSessionAttachmentsPerWork else {
+            return rejected(
+                .invalidState,
+                "Work Session attachment bound reached",
+                authorization: effectiveAuthorization)
+        }
+
+        // All new identities are host-minted only after every rejection condition above has
+        // passed. The generated values are bounded and monotonic within this host instance.
+        let session = SessionRef("session-\(nextSessionOrdinal)")
+        nextSessionOrdinal += 1
+        let sessionJournal = JournalRef.session(
+            session, authority: TimelineAuthorityRef(host.workHostID))
+        let sessionAttachment = SessionAttachmentRef(
+            "session-attachment-\(nextAttachmentOrdinal)")
+        let clientAttachment = ClientAttachmentRef("attachment-\(nextAttachmentOrdinal)")
+        nextAttachmentOrdinal += 1
+        let causalWorkCursor = state.cursor
+            ?? JournalCursor(journal: state.journal, sequence: 0)
+        let causalSessionCursor = JournalCursor(journal: sessionJournal, sequence: 0)
+        state.sessionRecords[session] = SessionRecord(
+            session: session, journal: sessionJournal,
+            cursor: causalSessionCursor, events: [], nextEventSequence: 1)
+
+        let sessionCommand = WorkServiceCommandLedgerIdentity.command(
+            from: CommandRef(
+                commandID: request.commandID, client: request.client,
+                sessionAttachment: sessionAttachment, causalCursor: causalWorkCursor),
+            client: request.client)
+        let sessionCreated = appendSessionRecordEvent(
+            kind: TimelineEventType.sessionCreated, session: session,
+            journal: sessionJournal, sessionAttachment: nil, work: nil,
+            client: nil, command: sessionCommand, causedBy: nil,
+            capabilities: [], state: &state)
+        let sessionAttached = appendSessionRecordEvent(
+            kind: TimelineEventType.sessionAttached, session: session,
+            journal: sessionJournal, sessionAttachment: sessionAttachment,
+            work: state.work, client: request.client, command: sessionCommand,
+            causedBy: EventRef(journal: sessionJournal, eventID: sessionCreated.eventID!),
+            capabilities: effectiveCapabilities, state: &state)
+        let resultingWorkCursor: JournalCursor
+        if terminal {
+            // Terminal Work is immutable. The Session reference is independently durable, but
+            // this operation may not append a Work event, advance its cursor, or alter bodies.
+            resultingWorkCursor = causalWorkCursor
+        } else {
+            resultingWorkCursor = appendWorkSessionAttachmentEvent(
+                session: session, sessionAttachment: sessionAttachment,
+                client: request.client, command: sessionCommand,
+                causedBy: EventRef(journal: sessionJournal, eventID: sessionAttached.eventID!),
+                capabilities: effectiveCapabilities, state: &state)
+        }
+        let workEvidence = terminal
+            ? terminalEvent.map { EventRef(journal: $0.journal, eventID: $0.eventID) }
+            : EventRef(journal: state.journal, eventID: resultingWorkCursor.eventID!)
+        let cursorAdvanced = appendSessionRecordEvent(
+            kind: TimelineEventType.sessionAttachmentCursorAdvanced, session: session,
+            journal: sessionJournal, sessionAttachment: sessionAttachment,
+            work: state.work, client: request.client, command: sessionCommand,
+            causedBy: workEvidence, capabilities: effectiveCapabilities,
+            cursorForPayload: resultingWorkCursor, state: &state)
+        let resultingSessionCursor = cursorAdvanced
+        let publication: WorkServiceSessionAttachmentPublication = terminal
+            ? .terminalReference : .mirrored
+        let relationship = WorkServiceSessionAttachmentDescriptor(
+            session: session, sessionJournal: sessionJournal,
+            sessionAttachment: sessionAttachment, publication: publication,
+            causalSessionCursor: causalSessionCursor,
+            sessionCursor: resultingSessionCursor,
+            causalWorkCursor: causalWorkCursor,
+            resultingWorkCursor: resultingWorkCursor,
+            capabilities: effectiveCapabilities)
+        state.sessionRelationships[sessionAttachment] = relationship
+        let attachment = WorkServiceClientAttachment(
+            attachment: clientAttachment, client: request.client, session: session,
+            sessionJournal: sessionJournal, sessionAttachment: sessionAttachment,
+            authorization: effectiveAuthorization)
+        state.attachments[clientAttachment] = ClientState(attachment: attachment)
+        works[state.work] = state
+        // Existing-Work Session creation has a durable reservation and a source-publication
+        // result. Model both control facts even in-memory so every implementation exposes the
+        // same exact cursor advance.
+        _ = appendControlEvent()
+        let resultingControlCursor = appendControlEvent()
+        let receipt = controlReceipt(
+            operation: .createSession, work: state.work, commandID: request.commandID,
+            state: .accepted, causalControlCursor: request.causalControlCursor,
+            resultingControlCursor: resultingControlCursor,
+            authorization: effectiveAuthorization, outcome: .sessionCreated)
+        let response = WorkServiceCreateSessionResponse(
+            work: descriptor(for: state.work, includeObservation: true)!,
+            session: session, sessionJournal: sessionJournal,
+            sessionAttachment: sessionAttachment, attachment: attachment,
+            relationship: relationship, workCursor: resultingWorkCursor,
+            sessionCursor: resultingSessionCursor, controlCursor: resultingControlCursor,
+            authorization: effectiveAuthorization, commandID: request.commandID,
+            state: .accepted, host: hostInstance,
+            causalControlCursor: request.causalControlCursor,
+            causalWorkCursor: request.causalWorkCursor, receipt: receipt)
+        createSessionCommands[key] = StoredCreateSession(request: request, response: response)
         return response
     }
 
@@ -2143,10 +2697,11 @@ public actor InMemoryWorkService: WorkServiceClient {
             throw WorkServiceProtocolError.invalidRequest(
                 "Session, Session journal, and attachment identity must be complete and bounded")
         }
-        if let existingSession = state.session {
-            guard request.session == existingSession,
-                  request.sessionJournal == state.sessionJournal,
-                  request.sessionAttachment == state.sessionAttachment else {
+        if let requestedAttachment = request.sessionAttachment {
+            guard let relationship = state.sessionRelationships[requestedAttachment],
+                  relationship.isAttached,
+                  relationship.session == request.session,
+                  relationship.sessionJournal == request.sessionJournal else {
                 throw WorkServiceProtocolError.invalidRequest(
                     "attach Session tuple does not match the Work's canonical Session relationship")
             }
@@ -2183,6 +2738,18 @@ public actor InMemoryWorkService: WorkServiceClient {
                 host: hostInstance, causalControlCursor: request.causalControlCursor,
                 resultingControlCursor: controlCursor,
                 rejection: .staleCursor, diagnostic: "attach causal cursor is not current")
+            attachCommands[key] = StoredAttach(request: request, response: response)
+            works[state.work] = state
+            return response
+        }
+        if state.attachments.count >= WorkServiceBounds.maxAttachmentsPerWork {
+            let response = WorkServiceAttachResponse(
+                work: descriptor(for: state.work, includeObservation: true)!, attachment: nil,
+                authorization: authorization, commandID: request.commandID, state: .rejected,
+                host: hostInstance, causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: controlCursor,
+                rejection: .invalidState,
+                diagnostic: "Work client attachment bound reached")
             attachCommands[key] = StoredAttach(request: request, response: response)
             works[state.work] = state
             return response
@@ -2621,7 +3188,11 @@ public actor InMemoryWorkService: WorkServiceClient {
                                       attachment: request.attachment, client: request.client,
                                       requiring: .observe)
         let bodyJournal = request.reference.authority
-        guard bodyJournal == state.journal || bodyJournal == state.sessionJournal else {
+        let requestingAttachment = state.attachments[request.attachment]?.attachment
+        let ownsRequestedSessionJournal = requestingAttachment?.sessionJournal == bodyJournal
+            && requestingAttachment?.session != nil
+            && requestingAttachment?.sessionAttachment != nil
+        guard bodyJournal == state.journal || ownsRequestedSessionJournal else {
             throw WorkServiceProtocolError.journalMismatch
         }
         guard validBodyReference(request.reference, journal: bodyJournal) else {
@@ -2678,6 +3249,10 @@ public actor InMemoryWorkService: WorkServiceClient {
         }
         guard let clientState = state.attachments[request.attachment], clientState.attachment.client == clientID else {
             throw WorkServiceProtocolError.attachmentNotFound
+        }
+        guard request.command.sessionAttachment == clientState.attachment.sessionAttachment else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "command Session attachment does not match the authorizing client attachment")
         }
         let key = CommandKey(work: request.work, client: clientID,
                              commandID: request.command.commandID)
@@ -2845,14 +3420,25 @@ public actor InMemoryWorkService: WorkServiceClient {
         state.nextHostSequence += 1
         let canonicalCommand = WorkServiceCommandLedgerIdentity.command(
             from: request.command, client: clientID)
+        let commandSession = clientState.attachment.session
+        let commandSessionAttachment = clientState.attachment.sessionAttachment
+        if request.kind == .start {
+            state.currentRunSession = commandSession
+            state.currentRunSessionAttachment = commandSessionAttachment
+        }
         if request.kind == .start {
             _ = appendEvent(
                 kind: TimelineEventType.runStarted, commandID: nil,
-                command: nil, body: nil, hostSequence: nil, state: &state)
+                command: nil, body: nil, hostSequence: nil,
+                session: commandSession,
+                sessionAttachment: commandSessionAttachment,
+                state: &state)
         }
         let eventCursor = appendEvent(
             kind: TimelineEventType.commandAccepted, commandID: canonicalCommand.commandID,
             command: canonicalCommand, body: request.value, hostSequence: hostSequence,
+            session: commandSession,
+            sessionAttachment: commandSessionAttachment,
             state: &state)
         let receipt = WorkServiceCommandReceipt(
             work: state.work, commandID: request.command.commandID, state: .accepted,
@@ -2880,9 +3466,15 @@ public actor InMemoryWorkService: WorkServiceClient {
         // The terminal Run identity belongs on the canonical event. Clear the live projection
         // only after appending it; otherwise a cold reducer sees `run.finished` with no Run and
         // correctly quarantines the Work.
-        _ = appendEvent(kind: TimelineEventType.runFinished, commandID: nil, state: &state)
+        _ = appendEvent(
+            kind: TimelineEventType.runFinished, commandID: nil,
+            session: state.currentRunSession,
+            sessionAttachment: state.currentRunSessionAttachment,
+            state: &state)
         state.execution = .idle
         state.currentRun = nil
+        state.currentRunSession = nil
+        state.currentRunSessionAttachment = nil
         works[work] = state
     }
 
@@ -2971,11 +3563,11 @@ public actor InMemoryWorkService: WorkServiceClient {
                 throw WorkServiceProtocolError.invalidRequest(
                     "Session read target is not attached to this Work/client attachment")
             }
-            let cursor = state.session == session && state.sessionJournal == journal
-                ? (state.sessionCursor ?? JournalCursor(journal: journal, sequence: 0))
+            let record = state.sessionRecords[session]
+            let cursor = record?.journal == journal
+                ? (record?.cursor ?? JournalCursor(journal: journal, sequence: 0))
                 : JournalCursor(journal: journal, sequence: 0)
-            let events = state.session == session && state.sessionJournal == journal
-                ? state.sessionEvents : []
+            let events = record?.journal == journal ? (record?.events ?? []) : []
             return (journal, cursor, events)
         }
     }
@@ -3132,12 +3724,74 @@ public actor InMemoryWorkService: WorkServiceClient {
         if state.artifacts.count > artifacts.count {
             omissions.append(WorkServiceOmission(category: "artifacts", count: state.artifacts.count - artifacts.count))
         }
+        let relationships = sessionAttachmentProjections(for: state)
         return WorkServiceWorkDescriptor(
             work: state.work, journal: state.journal, recordedDisposition: state.disposition,
             execution: state.execution, currentRun: state.currentRun,
             configuration: state.configuration.observableDescriptorConfiguration,
-            hostObservation: observation, attachments: clients, artifacts: artifacts,
+            hostObservation: observation, attachments: clients,
+            sessionAttachments: relationships, artifacts: artifacts,
             omissions: WorkServiceText.boundedOmissions(omissions))
+    }
+
+    private func sessionAttachmentProjections(
+        for state: WorkState
+    ) -> [WorkServiceSessionAttachmentDescriptor] {
+        // Only relationships backed by the exact reciprocal publication path are projected.
+        // Seed metadata without retained Work/Session evidence is deliberately not upgraded into
+        // a fabricated mirror; callers must create or register canonical relationship evidence.
+        return state.sessionRelationships.values.sorted {
+            if $0.session.sessionID != $1.session.sessionID {
+                return $0.session.sessionID < $1.session.sessionID
+            }
+            return $0.sessionAttachment.attachmentID < $1.sessionAttachment.attachmentID
+        }
+    }
+
+    /// Return the terminal event that exactly proves the immutable disposition. A terminal enum
+    /// alone is not enough: a seed with a claimed disposition but no canonical event must not
+    /// be exposed as a terminal reference to a newly-created Session.
+    private func canonicalTerminalEvent(for state: WorkState) -> TimelineEvent? {
+        let expectedType: String
+        switch state.disposition {
+        case .completed:
+            expectedType = TimelineEventType.workCompleted
+        case .destroyed:
+            expectedType = TimelineEventType.workDestroyed
+        case .reusable:
+            return nil
+        }
+        guard let cursor = state.cursor, cursor.sequence > 0,
+              let eventID = cursor.eventID,
+              state.events.count == cursor.sequence,
+              state.events.enumerated().allSatisfy({ index, event in
+                  let expectedSequence = index + 1
+                  let expectedPrevious = index == 0 ? nil : state.events[index - 1].eventID
+                  return event.journal == state.journal
+                      && event.sequence == expectedSequence
+                      && event.previousEventID == expectedPrevious
+              }),
+              let event = state.events.last,
+              event.eventID == eventID,
+              event.journal == state.journal,
+              event.sequence == cursor.sequence,
+              event.type == expectedType,
+              event.work == state.work,
+              event.workHost == host else {
+            return nil
+        }
+        let reduced = WorkReducer.reduce(state.events)
+        guard reduced.journal == state.journal,
+              reduced.work == state.work,
+              reduced.workHost == host,
+              reduced.lastEventID == eventID,
+              reduced.lastSequence == cursor.sequence,
+              reduced.causalOrderValid,
+              reduced.structuralIntegrityValid,
+              reduced.semanticProjectionValid,
+              reduced.lifecycle == (state.disposition == .completed ? .completed : .destroyed)
+        else { return nil }
+        return event
     }
 
     private func apply(_ kind: WorkServiceCommandKind, to state: inout WorkState,
@@ -3375,8 +4029,83 @@ public actor InMemoryWorkService: WorkServiceClient {
         }
     }
 
+    private func appendSessionRecordEvent(
+        kind: String, session: SessionRef, journal: JournalRef,
+        sessionAttachment: SessionAttachmentRef?, work: WorkRef?, client: ClientRef?,
+        command: CommandRef?, causedBy: EventRef?,
+        capabilities: Set<WorkServiceCapability>, cursorForPayload: JournalCursor? = nil,
+        state: inout WorkState
+    ) -> JournalCursor {
+        var record = state.sessionRecords[session] ?? SessionRecord(
+            session: session, journal: journal,
+            cursor: JournalCursor(journal: journal, sequence: 0),
+            events: [], nextEventSequence: 1)
+        let sequence = record.nextEventSequence
+        record.nextEventSequence += 1
+        let eventID = "service-session-event-\(session.sessionID)-\(sequence)"
+        let cursor = JournalCursor(journal: journal, eventID: eventID, sequence: sequence)
+        var payloadFields: [String: JSONValue] = [
+            "capabilities": .array(capabilities.sorted { $0.rawValue < $1.rawValue }
+                .map { .string($0.rawValue) })
+        ]
+        if let cursorForPayload,
+           let encoded = try? JSONEncoder().encode(cursorForPayload),
+           let value = JSONValue.parse(encoded) {
+            payloadFields["cursor"] = value
+        }
+        let payload = JSONValue.object(payloadFields)
+        let event = TimelineEvent(
+            eventID: eventID, journal: journal, sequence: sequence,
+            idempotencyKey: command?.commandID, command: command,
+            previousEventID: record.events.last?.eventID, causedByEventID: causedBy,
+            session: session, work: work, workHost: work.map { WorkHostRef($0.workHostID) },
+            client: client, sessionAttachment: sessionAttachment,
+            actor: TimelineActor(actorID: hostInstance.instanceID, kind: "work-service"),
+            hostRecordedAt: Date(), type: WorkServiceText.bound(kind) ?? "unknown",
+            payload: payload)
+        record.cursor = cursor
+        record.events.append(event)
+        state.sessionRecords[session] = record
+        if state.session == session {
+            state.sessionCursor = cursor
+            state.sessionEvents = record.events
+            state.nextSessionEventSequence = record.nextEventSequence
+        }
+        return cursor
+    }
+
+    private func appendWorkSessionAttachmentEvent(
+        session: SessionRef, sessionAttachment: SessionAttachmentRef,
+        client: ClientRef, command: CommandRef, causedBy: EventRef,
+        capabilities: Set<WorkServiceCapability>, state: inout WorkState
+    ) -> JournalCursor {
+        let sequence = state.nextEventSequence
+        state.nextEventSequence += 1
+        let eventID = "service-event-\(sequence)"
+        let cursor = JournalCursor(journal: state.journal, eventID: eventID, sequence: sequence)
+        let payload = JSONValue.object([
+            "capabilities": .array(capabilities.sorted { $0.rawValue < $1.rawValue }
+                .map { .string($0.rawValue) })
+        ])
+        state.cursor = cursor
+        state.events.append(TimelineEvent(
+            eventID: eventID, journal: state.journal, sequence: sequence,
+            hostSequence: state.nextHostSequence, idempotencyKey: command.commandID,
+            command: command, previousEventID: state.events.last?.eventID,
+            causedByEventID: causedBy, session: session, work: state.work,
+            workHost: host, client: client, sessionAttachment: sessionAttachment,
+            run: state.currentRun,
+            actor: TimelineActor(actorID: hostInstance.instanceID, kind: "work-service"),
+            hostRecordedAt: Date(), type: TimelineEventType.sessionAttached,
+            payload: payload))
+        state.nextHostSequence += 1
+        return cursor
+    }
+
     private func appendEvent(kind: String, commandID: String?, command: CommandRef? = nil,
                              body: String? = nil, hostSequence: Int? = nil,
+                             session: SessionRef? = nil,
+                             sessionAttachment: SessionAttachmentRef? = nil,
                              state: inout WorkState) -> JournalCursor {
         let sequence = state.nextEventSequence
         state.nextEventSequence += 1
@@ -3418,8 +4147,8 @@ public actor InMemoryWorkService: WorkServiceClient {
             causedByEventID: command?.causalCursor?.eventID.map {
                 EventRef(journal: state.journal, eventID: $0)
             },
-            session: state.session, work: state.work, workHost: host,
-            client: command?.client, sessionAttachment: command?.sessionAttachment,
+            session: session, work: state.work, workHost: host,
+            client: command?.client, sessionAttachment: sessionAttachment,
             run: state.currentRun,
             actor: TimelineActor(actorID: hostInstance.instanceID, kind: "work-service"),
             hostRecordedAt: Date(), type: WorkServiceText.bound(kind) ?? "unknown",
@@ -3450,6 +4179,16 @@ public actor InMemoryWorkService: WorkServiceClient {
             actor: TimelineActor(actorID: hostInstance.instanceID, kind: "work-service"),
             hostRecordedAt: Date(), type: WorkServiceText.bound(kind) ?? "unknown",
             payload: payload))
+        if let sessionRecord = state.sessionRecords[session] {
+            state.sessionRecords[session] = SessionRecord(
+                session: sessionRecord.session, journal: sessionRecord.journal,
+                cursor: cursor, events: state.sessionEvents,
+                nextEventSequence: state.nextSessionEventSequence)
+        } else {
+            state.sessionRecords[session] = SessionRecord(
+                session: session, journal: journal, cursor: cursor,
+                events: state.sessionEvents, nextEventSequence: state.nextSessionEventSequence)
+        }
         return cursor
     }
 

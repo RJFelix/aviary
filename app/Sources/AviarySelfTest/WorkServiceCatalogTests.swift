@@ -26,6 +26,7 @@ private actor CatalogTestConnection: WorkServiceClientConnection {
     }
     func describeWork(_ request: WorkServiceDescribeRequest) async throws -> WorkServiceWorkDescriptor { throw CatalogTestError.unsupported }
     func createWork(_ request: WorkServiceCreateWorkRequest) async throws -> WorkServiceCreateWorkResponse { throw CatalogTestError.unsupported }
+    func createSession(_ request: WorkServiceCreateSessionRequest) async throws -> WorkServiceCreateSessionResponse { throw CatalogTestError.unsupported }
     func completeWork(_ request: WorkServiceCompleteWorkRequest) async throws -> WorkServiceCommandReceipt { throw CatalogTestError.unsupported }
     func attach(_ request: WorkServiceAttachRequest) async throws -> WorkServiceAttachResponse { throw CatalogTestError.unsupported }
     func detach(_ request: WorkServiceDetachRequest) async throws -> WorkServiceDetachResponse { throw CatalogTestError.unsupported }

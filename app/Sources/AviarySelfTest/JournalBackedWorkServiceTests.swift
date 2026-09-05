@@ -1821,6 +1821,453 @@ func testJournalBackedWorkServiceReconcilesExactControlMutationRetries() async t
     await service.controlJournal.close()
 }
 
+func testJournalBackedWorkServicePublishesCreateSessionAndReopensItsEvidence() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let creator = ClientRef("session-creator")
+    let viewer = ClientRef("session-viewer")
+    let grants = journalBackedAllCapabilities()
+    let store = JournalBackedTestManifestStore(productionCapable: true)
+    let authorizer = WorkServiceCapabilityPolicy(
+        grantsByClient: [creator: grants, viewer: grants])
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "session-instance-a", startIdentity: "session-start-a",
+        authorizer: authorizer, manifestStore: store)
+    let initial = try await service.handshake(
+        WorkServiceHandshakeRequest(client: creator)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: creator, commandID: "session-create-work", causalControlCursor: initial,
+        configuration: WorkServiceWorkConfiguration(providerID: "provider", modelID: "model"),
+        requestedCapabilities: [.observe, .control, .createSession, .send]))
+    let request = WorkServiceCreateSessionRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: creator,
+        commandID: "session-create", causalControlCursor: created.controlCursor,
+        causalWorkCursor: created.workCursor, requestedCapabilities: [.observe, .send])
+
+    let first: WorkServiceCreateSessionResponse
+    first = try await service.createSession(request)
+    XCTAssertEqual(first.state, .accepted)
+    XCTAssertEqual(first.receipt.operation, .createSession)
+    XCTAssertEqual(first.receipt.outcome, .sessionCreated)
+    XCTAssertEqual(first.controlCursor.sequence, created.controlCursor.sequence + 2)
+    XCTAssertEqual(first.workCursor.sequence, created.workCursor.sequence + 1)
+    let session = try XCTUnwrap(first.session)
+    let sessionJournal = try XCTUnwrap(first.sessionJournal)
+    let sessionAttachment = try XCTUnwrap(first.sessionAttachment)
+    _ = try XCTUnwrap(first.attachment)
+    let relationship = try XCTUnwrap(first.relationship)
+    XCTAssertEqual(relationship.publication, .mirrored)
+    XCTAssertEqual(relationship.session, session)
+    XCTAssertEqual(relationship.sessionJournal, sessionJournal)
+    XCTAssertEqual(relationship.sessionAttachment, sessionAttachment)
+    XCTAssertEqual(relationship.causalWorkCursor, created.workCursor)
+    XCTAssertEqual(relationship.resultingWorkCursor, first.workCursor)
+    XCTAssertEqual(first.work.sessionAttachments.filter { $0.session == session }.count, 1)
+
+    let controlEventsAfterFirst = try await service.controlJournal.read().records.count
+    let duplicate = try await service.createSession(request)
+    XCTAssertEqual(duplicate.state, .duplicate)
+    XCTAssertEqual(duplicate.session, first.session)
+    XCTAssertEqual(duplicate.attachment, first.attachment)
+    XCTAssertEqual(duplicate.relationship, first.relationship)
+    XCTAssertEqual(duplicate.controlCursor, first.controlCursor)
+    XCTAssertEqual(try await service.controlJournal.read().records.count,
+                   controlEventsAfterFirst)
+
+    let second = try await service.createSession(WorkServiceCreateSessionRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: creator,
+        commandID: "session-create-after-first", causalControlCursor: first.controlCursor,
+        causalWorkCursor: first.workCursor, requestedCapabilities: [.observe]))
+    XCTAssertEqual(second.state, .accepted)
+    XCTAssertEqual(second.workCursor.sequence, first.workCursor.sequence + 1)
+    let controlEventsAfterSecond = try await service.controlJournal.read().records.count
+    let advancedDuplicate = try await service.createSession(request)
+    XCTAssertEqual(advancedDuplicate.state, .duplicate)
+    XCTAssertEqual(advancedDuplicate.session, first.session)
+    XCTAssertEqual(advancedDuplicate.attachment, first.attachment)
+    XCTAssertEqual(advancedDuplicate.relationship, first.relationship)
+    XCTAssertEqual(advancedDuplicate.controlCursor, first.controlCursor)
+    XCTAssertEqual(advancedDuplicate.workCursor, first.workCursor)
+    XCTAssertEqual(try await service.controlJournal.read().records.count,
+                   controlEventsAfterSecond)
+
+    let attached = try await service.attach(WorkServiceAttachRequest(
+        work: created.work.work, journal: created.work.journal, client: viewer,
+        session: session, sessionJournal: sessionJournal,
+        sessionAttachment: sessionAttachment, commandID: "session-viewer-attach",
+        causalControlCursor: second.controlCursor, requestedCapabilities: [.observe]))
+    let viewerAttachment = try XCTUnwrap(attached.attachment)
+    let sessionPage = try await service.snapshot(WorkServiceSnapshotRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: viewerAttachment.attachment, client: viewer,
+        target: .session(session: session, journal: sessionJournal), afterCursor: nil,
+        limit: 8))
+    XCTAssertEqual(sessionPage.events.map(\.type), [
+        TimelineEventType.sessionCreated, TimelineEventType.sessionAttached,
+        TimelineEventType.sessionAttachmentCursorAdvanced,
+    ])
+    XCTAssertEqual(sessionPage.servedCursor, first.sessionCursor)
+
+    await service.controlJournal.close()
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "session-instance-b", startIdentity: "session-start-b",
+        authorizer: authorizer, manifestStore: store)
+    // Rehydrate the exact idle Work template before projecting a response after restart.
+    _ = try await restarted.createWork(WorkServiceCreateWorkRequest(
+        client: creator, commandID: "session-create-work", causalControlCursor: initial,
+        configuration: WorkServiceWorkConfiguration(providerID: "provider", modelID: "model"),
+        requestedCapabilities: [.observe, .control, .createSession, .send]))
+    let reopened = try await restarted.createSession(request)
+    XCTAssertEqual(reopened.state, .duplicate)
+    XCTAssertEqual(reopened.session, first.session)
+    XCTAssertEqual(reopened.sessionCursor, first.sessionCursor)
+    XCTAssertEqual(reopened.workCursor, first.workCursor)
+    let reopenedDescriptor = try await restarted.describeWork(WorkServiceDescribeRequest(
+        work: created.work.work, journal: created.work.journal, client: creator))
+    XCTAssertEqual(reopenedDescriptor.sessionAttachments.filter { $0.session == session }.count, 1)
+    await restarted.controlJournal.close()
+}
+
+func testJournalBackedWorkServiceSessionAndClientBoundsPreserveExactRetry() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let creator = ClientRef("bounded-session-creator")
+    let grants = journalBackedAllCapabilities()
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "bounded-session-instance",
+        startIdentity: "bounded-session-start",
+        authorizer: WorkServiceCapabilityPolicy(grantsByClient: [creator: grants]),
+        manifestStore: JournalBackedTestManifestStore(productionCapable: true))
+    let initial = try await service.handshake(
+        WorkServiceHandshakeRequest(client: creator)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: creator, commandID: "bounded-create-work", causalControlCursor: initial,
+        configuration: WorkServiceWorkConfiguration(providerID: "provider", modelID: "model"),
+        requestedCapabilities: [.observe, .control, .createSession]))
+
+    var controlCursor = created.controlCursor
+    var workCursor = created.workCursor
+    var finalRequest: WorkServiceCreateSessionRequest?
+    var finalResponse: WorkServiceCreateSessionResponse?
+    // Create carries one primary Session/client attachment. Fill the remaining semantic and
+    // client attachment slots through the production durable saga.
+    for index in 1..<WorkServiceBounds.maxSessionAttachmentsPerWork {
+        let request = WorkServiceCreateSessionRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: creator,
+            commandID: "bounded-create-session-\(index)",
+            causalControlCursor: controlCursor, causalWorkCursor: workCursor,
+            requestedCapabilities: [.observe])
+        let response = try await service.createSession(request)
+        XCTAssertEqual(response.state, .accepted)
+        controlCursor = response.controlCursor
+        workCursor = response.workCursor
+        finalRequest = request
+        finalResponse = response
+    }
+
+    let exactRequest = try XCTUnwrap(finalRequest)
+    let exactResponse = try XCTUnwrap(finalResponse)
+    let duplicate = try await service.createSession(exactRequest)
+    XCTAssertEqual(duplicate.state, .duplicate)
+    XCTAssertEqual(duplicate.session, exactResponse.session)
+    XCTAssertEqual(duplicate.sessionAttachment, exactResponse.sessionAttachment)
+    XCTAssertEqual(duplicate.attachment, exactResponse.attachment)
+    XCTAssertEqual(duplicate.controlCursor, exactResponse.controlCursor)
+    XCTAssertEqual(duplicate.workCursor, exactResponse.workCursor)
+
+    let controlEventsBeforeRejections = try await service.controlJournal.read().records.count
+    let workBytesBeforeRejections = try Data(
+        contentsOf: home.timelineV2WorkJournalURL(created.work.work))
+    do {
+        _ = try await service.createSession(WorkServiceCreateSessionRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: creator,
+            commandID: "bounded-create-session-overflow",
+            causalControlCursor: controlCursor, causalWorkCursor: workCursor,
+            requestedCapabilities: [.observe]))
+        XCTFail("a new Session crossed the durable Work relationship/client attachment bound")
+    } catch WorkServiceProtocolError.invalidRequest {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try await service.attach(WorkServiceAttachRequest(
+            work: created.work.work, journal: created.work.journal,
+            client: creator, commandID: "bounded-client-attach-overflow",
+            causalControlCursor: controlCursor,
+            requestedCapabilities: [.observe]))
+        XCTFail("a new client attachment crossed the durable Work attachment bound")
+    } catch WorkServiceProtocolError.invalidRequest {
+        XCTAssertTrue(true)
+    }
+    XCTAssertEqual(try await service.controlJournal.read().records.count,
+                   controlEventsBeforeRejections)
+    XCTAssertEqual(try Data(contentsOf: home.timelineV2WorkJournalURL(created.work.work)),
+                   workBytesBeforeRejections)
+    await service.controlJournal.close()
+}
+
+func testJournalBackedWorkServiceTerminalSessionRequiresObserveBeforePublication() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let creator = ClientRef("terminal-session-creator")
+    let grants = journalBackedAllCapabilities()
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "terminal-session-instance",
+        startIdentity: "terminal-session-start",
+        authorizer: WorkServiceCapabilityPolicy(grantsByClient: [creator: grants]),
+        manifestStore: JournalBackedTestManifestStore(productionCapable: true))
+    let initial = try await service.handshake(
+        WorkServiceHandshakeRequest(client: creator)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: creator, commandID: "terminal-session-create-work",
+        causalControlCursor: initial,
+        configuration: WorkServiceWorkConfiguration(providerID: "provider", modelID: "model"),
+        requestedCapabilities: [.observe, .control, .createSession]))
+    let binding = WorkBinding(
+        session: created.session, work: created.work.work,
+        workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment)
+    let runBinding = WorkRunBinding(
+        workBinding: binding, run: RunRef("terminal-session-run"))
+    let execution = try await RunJournalBundle.openForExecution(
+        home: home, binding: runBinding, actorID: "terminal-session-execution")
+    _ = try await execution.finishRun(outcome: .completed)
+    let finishedCursor = try XCTUnwrap(await execution.latestWorkCursor)
+    try await execution.closeChecked()
+    let terminal = try await RunJournalBundle.openForTerminalMutation(
+        home: home, binding: runBinding,
+        actorID: "terminal-session-committer")
+    let terminalCommand = CommandRef(
+        commandID: "terminal-session-complete", client: creator,
+        sessionAttachment: created.sessionAttachment, causalCursor: finishedCursor)
+    let terminalCommits = try await terminal.completeWork(
+        detail: "complete before Session reference", command: terminalCommand)
+    try await terminal.closeChecked()
+    let terminalWorkCursor = terminalCommits[0].cursor
+    let controlEventsBefore = try await service.controlJournal.read().records.count
+    let sessionFilesBefore = try FileManager.default.contentsOfDirectory(
+        at: home.timelineV2SessionsDir,
+        includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]).count
+    let workBytesBefore = try Data(
+        contentsOf: home.timelineV2WorkJournalURL(created.work.work))
+
+    do {
+        _ = try await service.createSession(WorkServiceCreateSessionRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: creator,
+            commandID: "terminal-session-without-observe",
+            causalControlCursor: created.controlCursor,
+            causalWorkCursor: terminalWorkCursor,
+            requestedCapabilities: [.send]))
+        XCTFail("terminal Session publication accepted without an effective observe grant")
+    } catch WorkServiceProtocolError.capabilityDenied(.observe) {
+        XCTAssertTrue(true)
+    }
+    XCTAssertEqual(try await service.controlJournal.read().records.count,
+                   controlEventsBefore)
+    XCTAssertEqual(try FileManager.default.contentsOfDirectory(
+        at: home.timelineV2SessionsDir,
+        includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]).count,
+        sessionFilesBefore)
+    XCTAssertEqual(try Data(contentsOf: home.timelineV2WorkJournalURL(created.work.work)),
+                   workBytesBefore)
+    await service.controlJournal.close()
+}
+
+func testJournalBackedWorkServicePublishesTerminalSessionReferenceAndReopens() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let creator = ClientRef("terminal-reference-creator")
+    let viewer = ClientRef("terminal-reference-viewer")
+    let grants = journalBackedAllCapabilities()
+    let store = JournalBackedTestManifestStore(productionCapable: true)
+    let authorizer = WorkServiceCapabilityPolicy(grantsByClient: [
+        creator: grants, viewer: [.observe],
+    ])
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "terminal-reference-instance-a",
+        startIdentity: "terminal-reference-start-a",
+        authorizer: authorizer, manifestStore: store)
+    let initial = try await service.handshake(
+        WorkServiceHandshakeRequest(client: creator)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: creator, commandID: "terminal-reference-create-work",
+        causalControlCursor: initial,
+        configuration: WorkServiceWorkConfiguration(providerID: "provider", modelID: "model"),
+        requestedCapabilities: [.observe, .control, .createSession]))
+    let binding = WorkBinding(
+        session: created.session, work: created.work.work,
+        workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment)
+    let runBinding = WorkRunBinding(
+        workBinding: binding, run: RunRef("terminal-reference-run"))
+    let execution = try await RunJournalBundle.openForExecution(
+        home: home, binding: runBinding, actorID: "terminal-reference-execution")
+    _ = try await execution.finishRun(outcome: .completed)
+    let finishedCursor = try XCTUnwrap(await execution.latestWorkCursor)
+    try await execution.closeChecked()
+    let terminal = try await RunJournalBundle.openForTerminalMutation(
+        home: home, binding: runBinding, actorID: "terminal-reference-committer")
+    let terminalCommand = CommandRef(
+        commandID: "terminal-reference-complete", client: creator,
+        sessionAttachment: created.sessionAttachment, causalCursor: finishedCursor)
+    let terminalCommits = try await terminal.completeWork(
+        detail: "immutable completed Work", command: terminalCommand)
+    try await terminal.closeChecked()
+    let terminalWorkCursor = terminalCommits[0].cursor
+    let workBytesBeforeReference = try Data(
+        contentsOf: home.timelineV2WorkJournalURL(created.work.work))
+    let request = WorkServiceCreateSessionRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: creator,
+        commandID: "terminal-reference-create-session",
+        causalControlCursor: created.controlCursor,
+        causalWorkCursor: terminalWorkCursor,
+        requestedCapabilities: [.observe])
+    let referenced = try await service.createSession(request)
+    XCTAssertEqual(referenced.state, .accepted)
+    XCTAssertEqual(referenced.relationship?.publication, .terminalReference)
+    XCTAssertEqual(referenced.authorization.granted, [.observe])
+    XCTAssertEqual(referenced.workCursor, terminalWorkCursor)
+    XCTAssertEqual(try Data(contentsOf: home.timelineV2WorkJournalURL(created.work.work)),
+                   workBytesBeforeReference)
+    let referencedSession = try XCTUnwrap(referenced.session)
+    let referencedJournal = try XCTUnwrap(referenced.sessionJournal)
+    let referencedAttachment = try XCTUnwrap(referenced.sessionAttachment)
+    let sessionRead = TimelineJournalReader.read(
+        try Data(contentsOf: home.timelineV2SessionJournalURL(referencedSession)),
+        journal: referencedJournal,
+        actor: TimelineActor(actorID: "terminal-reference-reader", kind: "self-test"),
+        hostRecordedAt: Date(timeIntervalSince1970: 0))
+    XCTAssertEqual(sessionRead.records.map(\.event.type), [
+        TimelineEventType.sessionCreated, TimelineEventType.sessionAttached,
+        TimelineEventType.sessionAttachmentCursorAdvanced,
+    ])
+    XCTAssertEqual(sessionRead.records.last?.event.causedByEventID,
+                   terminalCommits[0].eventRef)
+
+    let attached = try await service.attach(WorkServiceAttachRequest(
+        work: created.work.work, journal: created.work.journal, client: viewer,
+        session: referencedSession, sessionJournal: referencedJournal,
+        sessionAttachment: referencedAttachment,
+        commandID: "terminal-reference-viewer-attach",
+        causalControlCursor: referenced.controlCursor,
+        requestedCapabilities: [.observe]))
+    let viewerAttachment = try XCTUnwrap(attached.attachment)
+    let workPage = try await service.snapshot(WorkServiceSnapshotRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: viewerAttachment.attachment, client: viewer,
+        target: .work(journal: created.work.journal), afterCursor: nil,
+        limit: WorkServiceBounds.maxEventsPerPage))
+    XCTAssertEqual(workPage.servedCursor, terminalWorkCursor)
+    XCTAssertEqual(workPage.events.last?.type, TimelineEventType.workCompleted)
+    XCTAssertFalse(workPage.events.contains {
+        $0.sessionAttachment == referencedAttachment
+            && $0.type == TimelineEventType.sessionAttached
+    })
+
+    await service.controlJournal.close()
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "terminal-reference-instance-b",
+        startIdentity: "terminal-reference-start-b",
+        authorizer: authorizer, manifestStore: store)
+    _ = try await restarted.createWork(WorkServiceCreateWorkRequest(
+        client: creator, commandID: "terminal-reference-create-work",
+        causalControlCursor: initial,
+        configuration: WorkServiceWorkConfiguration(providerID: "provider", modelID: "model"),
+        requestedCapabilities: [.observe, .control, .createSession]))
+    let reopened = try await restarted.createSession(request)
+    XCTAssertEqual(reopened.state, .duplicate)
+    XCTAssertEqual(reopened.session, referenced.session)
+    XCTAssertEqual(reopened.relationship, referenced.relationship)
+    XCTAssertEqual(reopened.workCursor, terminalWorkCursor)
+    XCTAssertEqual(reopened.controlCursor, referenced.controlCursor)
+    await restarted.controlJournal.close()
+}
+
+func testJournalBackedWorkServiceSecondarySessionDetachStaysDetachedAfterRestart() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let creator = ClientRef("secondary-detach-creator")
+    let grants = journalBackedAllCapabilities()
+    let store = JournalBackedTestManifestStore(productionCapable: true)
+    let authorizer = WorkServiceCapabilityPolicy(grantsByClient: [creator: grants])
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "secondary-detach-instance-a",
+        startIdentity: "secondary-detach-start-a",
+        authorizer: authorizer, manifestStore: store)
+    let initial = try await service.handshake(
+        WorkServiceHandshakeRequest(client: creator)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: creator, commandID: "secondary-detach-create-work",
+        causalControlCursor: initial,
+        configuration: WorkServiceWorkConfiguration(providerID: "provider", modelID: "model"),
+        requestedCapabilities: [.observe, .control, .createSession]))
+    let secondary = try await service.createSession(WorkServiceCreateSessionRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: creator,
+        commandID: "secondary-detach-create-session",
+        causalControlCursor: created.controlCursor,
+        causalWorkCursor: created.workCursor,
+        requestedCapabilities: [.observe, .control]))
+    let secondaryClientAttachment = try XCTUnwrap(secondary.attachment)
+    let secondarySession = try XCTUnwrap(secondary.session)
+    let secondaryJournal = try XCTUnwrap(secondary.sessionJournal)
+    _ = try await service.snapshot(WorkServiceSnapshotRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: secondaryClientAttachment.attachment, client: creator,
+        target: .session(session: secondarySession, journal: secondaryJournal)))
+
+    let detached = try await service.detach(WorkServiceDetachRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: secondaryClientAttachment.attachment, client: creator,
+        commandID: "secondary-detach", causalControlCursor: secondary.controlCursor))
+    XCTAssertEqual(detached.state, .accepted)
+    let afterDetach = try await service.describeWork(WorkServiceDescribeRequest(
+        work: created.work.work, journal: created.work.journal, client: creator))
+    XCTAssertFalse(afterDetach.attachments.contains {
+        $0.attachment == secondaryClientAttachment.attachment
+    })
+    do {
+        _ = try await service.snapshot(WorkServiceSnapshotRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: secondaryClientAttachment.attachment, client: creator,
+            target: .session(session: secondarySession, journal: secondaryJournal)))
+        XCTFail("a detached secondary-Session client attachment remained authorized")
+    } catch WorkServiceProtocolError.attachmentNotFound {
+        XCTAssertTrue(true)
+    }
+
+    await service.controlJournal.close()
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "secondary-detach-instance-b",
+        startIdentity: "secondary-detach-start-b",
+        authorizer: authorizer, manifestStore: store)
+    _ = try await restarted.createWork(WorkServiceCreateWorkRequest(
+        client: creator, commandID: "secondary-detach-create-work",
+        causalControlCursor: initial,
+        configuration: WorkServiceWorkConfiguration(providerID: "provider", modelID: "model"),
+        requestedCapabilities: [.observe, .control, .createSession]))
+    let afterRestart = try await restarted.describeWork(WorkServiceDescribeRequest(
+        work: created.work.work, journal: created.work.journal, client: creator))
+    XCTAssertFalse(afterRestart.attachments.contains {
+        $0.attachment == secondaryClientAttachment.attachment
+    })
+    do {
+        _ = try await restarted.snapshot(WorkServiceSnapshotRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: secondaryClientAttachment.attachment, client: creator,
+            target: .session(session: secondarySession, journal: secondaryJournal)))
+        XCTFail("restart resurrected a detached secondary-Session client attachment")
+    } catch WorkServiceProtocolError.attachmentNotFound {
+        XCTAssertTrue(true)
+    }
+    await restarted.controlJournal.close()
+}
+
 func testJournalBackedWorkServiceReadsLongWorkAndSessionJournalsThroughControllerPages() async throws {
     let (home, root) = try journalBackedHome()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -2481,6 +2928,21 @@ let casesJournalBackedWorkService: [Case] = [
     }),
     ("journal-backed service Create remains idle with production material", {
         try await testJournalBackedWorkServiceCreateStaysIdleWithProductionManifest()
+    }),
+    ("journal-backed service publishes and reopens Create Session evidence", {
+        try await testJournalBackedWorkServicePublishesCreateSessionAndReopensItsEvidence()
+    }),
+    ("journal-backed service bounds Session/client relationships without breaking retry", {
+        try await testJournalBackedWorkServiceSessionAndClientBoundsPreserveExactRetry()
+    }),
+    ("journal-backed service rejects terminal Session publication before source writes", {
+        try await testJournalBackedWorkServiceTerminalSessionRequiresObserveBeforePublication()
+    }),
+    ("journal-backed service publishes terminal Session references and reopens", {
+        try await testJournalBackedWorkServicePublishesTerminalSessionReferenceAndReopens()
+    }),
+    ("journal-backed service keeps secondary Session client detach durable", {
+        try await testJournalBackedWorkServiceSecondarySessionDetachStaysDetachedAfterRestart()
     }),
     ("journal-backed service classifies pre-marker Start as recovery", {
         try await testJournalBackedWorkServiceDoesNotProjectPreMarkerStartAsIdle()

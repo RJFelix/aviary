@@ -62,6 +62,11 @@ private actor HangingWorkService: WorkServiceClient {
         fatalError("unused hanging-service operation")
     }
 
+    func createSession(_ request: WorkServiceCreateSessionRequest) async throws
+        -> WorkServiceCreateSessionResponse {
+        fatalError("unused hanging-service operation")
+    }
+
     func completeWork(_ request: WorkServiceCompleteWorkRequest) async throws
         -> WorkServiceCommandReceipt {
         fatalError("unused hanging-service operation")
@@ -130,6 +135,11 @@ private actor HangingMutationWorkService: WorkServiceClient {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         throw WorkServiceProtocolError.sourceIncomplete
+    }
+
+    func createSession(_ request: WorkServiceCreateSessionRequest) async throws
+        -> WorkServiceCreateSessionResponse {
+        fatalError("unused hanging-mutation operation")
     }
 
     func listWorks(_ request: WorkServiceListRequest) async throws -> WorkServiceWorkPage {

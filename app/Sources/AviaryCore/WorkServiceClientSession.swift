@@ -207,6 +207,13 @@ public actor WorkServiceClientSession: WorkServiceClient {
         return try await perform { try await $0.createWork(request) }
     }
 
+    public func createSession(
+        _ request: WorkServiceCreateSessionRequest
+    ) async throws -> WorkServiceCreateSessionResponse {
+        try requireClient(request.client)
+        return try await perform { try await $0.createSession(request) }
+    }
+
     public func completeWork(
         _ request: WorkServiceCompleteWorkRequest
     ) async throws -> WorkServiceCommandReceipt {

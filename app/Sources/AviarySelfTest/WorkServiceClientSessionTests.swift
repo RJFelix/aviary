@@ -90,6 +90,12 @@ private actor ClientSessionObservedConnection: WorkServiceClientConnection {
         return response
     }
 
+    func createSession(
+        _ request: WorkServiceCreateSessionRequest
+    ) async throws -> WorkServiceCreateSessionResponse {
+        try await base.createSession(request)
+    }
+
     func completeWork(
         _ request: WorkServiceCompleteWorkRequest
     ) async throws -> WorkServiceCommandReceipt {
@@ -343,7 +349,7 @@ func testWorkServiceClientSessionDoesNotReplayMutationAfterDisconnect() async th
         let reconnected = try await session.connect()
         let page = try await session.listWorks(WorkServiceListRequest(client: client))
         XCTAssertEqual(page.works.count, 1)
-        XCTAssertEqual(reconnected.controlCursor.sequence, 1)
+        XCTAssertEqual(reconnected.controlCursor.sequence, 3)
         await session.disconnect()
     } catch {
         await server.stop()

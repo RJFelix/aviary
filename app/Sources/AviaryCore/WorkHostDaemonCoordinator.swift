@@ -116,6 +116,12 @@ public actor WorkHostDaemonAdmissionGate: WorkServiceClient {
         return try await service.createWork(request)
     }
 
+    public func createSession(_ request: WorkServiceCreateSessionRequest) async throws
+        -> WorkServiceCreateSessionResponse {
+        try enter(); defer { leave() }
+        return try await service.createSession(request)
+    }
+
     public func completeWork(_ request: WorkServiceCompleteWorkRequest) async throws
         -> WorkServiceCommandReceipt {
         try enter(); defer { leave() }

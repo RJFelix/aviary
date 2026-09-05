@@ -11,6 +11,7 @@ private enum WorkHostControlLimits {
     static let maxCapabilities = 64
     static let maxCapabilityCharacters = 128
     static let maxDigestCharacters = 80
+    static let sourceAbsenceVerificationChunkBytes = 64 * 1024
     static let maxDurabilitySealBytes = 16 * 1024
     /// Temporary supported state envelope until the persistent projection store lands. This is a
     /// record-count bound, not a journal byte ceiling; it keeps reducer copy-on-write costs
@@ -24,6 +25,14 @@ private enum WorkHostControlLimits {
 public enum WorkHostControlEventType {
     public static let creationReserved = "creation.reserved"
     public static let workRegistered = "work.registered"
+    /// A Session relationship is reserved in the Work Host control journal before either
+    /// source journal is touched.  The source-journal result is recorded separately because
+    /// these files do not share an atomic commit primitive yet.
+    public static let sessionCreationReserved = "session_creation.reserved"
+    public static let sessionCreationCompleted = "session_creation.completed"
+    /// A reservation may be resolved only after a fresh, owner-locked source check proves that
+    /// no Session source claim exists.  This is not a generic cancellation or timeout event.
+    public static let sessionCreationAborted = "session_creation.aborted"
 }
 
 /// Opaque identities minted by a Work Host before either source journal is created. Keeping the
@@ -391,6 +400,240 @@ public struct WorkHostControlWorkRegistration: Codable, Hashable, Sendable {
     }
 }
 
+/// The bounded control-plane intent for adding a Session to an existing Work.  All Session,
+/// SessionAttachment, and ClientAttachment identities are host-minted and are present here
+/// before source-journal publication.  This is deliberately separate from WorkService's wire
+/// request: the control journal stores the complete retry identity, not an untrusted request
+/// object or any source body.
+public struct WorkHostControlSessionCreationRequest: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let workJournal: JournalRef
+    public let authorizingAttachment: ClientAttachmentRef
+    public let client: ClientRef
+    public let command: CommandRef
+    public let causalControlCursor: JournalCursor
+    public let causalWorkCursor: JournalCursor
+    public let requestedCapabilities: [String]
+    public let session: SessionRef
+    public let sessionJournal: JournalRef
+    public let sessionAttachment: SessionAttachmentRef
+    public let clientAttachment: ClientAttachmentRef
+
+    public init(
+        work: WorkRef,
+        workJournal: JournalRef,
+        authorizingAttachment: ClientAttachmentRef,
+        client: ClientRef,
+        command: CommandRef,
+        causalControlCursor: JournalCursor,
+        causalWorkCursor: JournalCursor,
+        requestedCapabilities: [String],
+        session: SessionRef,
+        sessionJournal: JournalRef,
+        sessionAttachment: SessionAttachmentRef,
+        clientAttachment: ClientAttachmentRef
+    ) {
+        self.work = work
+        self.workJournal = workJournal
+        self.authorizingAttachment = authorizingAttachment
+        self.client = client
+        self.command = command
+        self.causalControlCursor = causalControlCursor
+        self.causalWorkCursor = causalWorkCursor
+        self.requestedCapabilities = requestedCapabilities.sorted()
+        self.session = session
+        self.sessionJournal = sessionJournal
+        self.sessionAttachment = sessionAttachment
+        self.clientAttachment = clientAttachment
+    }
+
+    public var key: String {
+        controlSessionCreationKey(work: work, client: client, commandID: command.commandID)
+    }
+}
+
+/// Source-journal evidence recorded after a Session relationship reservation.  Event refs and
+/// cursors are retained rather than inferred from prose, so a restart can either replay the
+/// exact response or expose the reservation as incomplete. `publication` is the wire enum's
+/// stable raw value (`mirrored` or `terminal_reference`) to keep this control file independent
+/// of the transport module.
+public struct WorkHostControlSessionCreationResult: Codable, Hashable, Sendable {
+    public let causalControlCursor: JournalCursor
+    /// The control-journal cursor of the durable `session_creation.completed` event. This is
+    /// captured from the append commit rather than reread after the mutation gate is released.
+    public let resultingControlCursor: JournalCursor
+    public let publication: String
+    public let capabilities: [String]
+    public let causalSessionCursor: JournalCursor
+    public let sessionCursor: JournalCursor
+    public let causalWorkCursor: JournalCursor
+    public let resultingWorkCursor: JournalCursor
+    public let sessionCreatedEvent: EventRef
+    public let sessionAttachedEvent: EventRef
+    public let workMirrorEvent: EventRef?
+    public let cursorAdvancedEvent: EventRef
+    public let resultEvent: EventRef
+
+    public init(
+        causalControlCursor: JournalCursor,
+        resultingControlCursor: JournalCursor,
+        publication: String,
+        capabilities: [String],
+        causalSessionCursor: JournalCursor,
+        sessionCursor: JournalCursor,
+        causalWorkCursor: JournalCursor,
+        resultingWorkCursor: JournalCursor,
+        sessionCreatedEvent: EventRef,
+        sessionAttachedEvent: EventRef,
+        workMirrorEvent: EventRef?,
+        cursorAdvancedEvent: EventRef,
+        resultEvent: EventRef
+    ) {
+        self.causalControlCursor = causalControlCursor
+        self.resultingControlCursor = resultingControlCursor
+        self.publication = publication
+        self.capabilities = capabilities.sorted()
+        self.causalSessionCursor = causalSessionCursor
+        self.sessionCursor = sessionCursor
+        self.causalWorkCursor = causalWorkCursor
+        self.resultingWorkCursor = resultingWorkCursor
+        self.sessionCreatedEvent = sessionCreatedEvent
+        self.sessionAttachedEvent = sessionAttachedEvent
+        self.workMirrorEvent = workMirrorEvent
+        self.cursorAdvancedEvent = cursorAdvancedEvent
+        self.resultEvent = resultEvent
+    }
+}
+
+/// Source evidence supplied when the multi-journal operation reaches its result boundary. The
+/// control journal validates this against its reservation and assigns the control result event
+/// identity itself; callers cannot forge that final EventRef.
+public struct WorkHostControlSessionCreationResultRequest: Codable, Hashable, Sendable {
+    public let reservationEvent: EventRef
+    public let commandID: String
+    public let causalControlCursor: JournalCursor
+    public let publication: String
+    public let capabilities: [String]
+    public let causalSessionCursor: JournalCursor
+    public let sessionCursor: JournalCursor
+    public let causalWorkCursor: JournalCursor
+    public let resultingWorkCursor: JournalCursor
+    public let sessionCreatedEvent: EventRef
+    public let sessionAttachedEvent: EventRef
+    public let workMirrorEvent: EventRef?
+    public let cursorAdvancedEvent: EventRef
+
+    public init(
+        reservationEvent: EventRef,
+        commandID: String,
+        causalControlCursor: JournalCursor,
+        publication: String,
+        capabilities: [String],
+        causalSessionCursor: JournalCursor,
+        sessionCursor: JournalCursor,
+        causalWorkCursor: JournalCursor,
+        resultingWorkCursor: JournalCursor,
+        sessionCreatedEvent: EventRef,
+        sessionAttachedEvent: EventRef,
+        workMirrorEvent: EventRef?,
+        cursorAdvancedEvent: EventRef
+    ) {
+        self.reservationEvent = reservationEvent
+        self.commandID = commandID
+        self.causalControlCursor = causalControlCursor
+        self.publication = publication
+        self.capabilities = capabilities.sorted()
+        self.causalSessionCursor = causalSessionCursor
+        self.sessionCursor = sessionCursor
+        self.causalWorkCursor = causalWorkCursor
+        self.resultingWorkCursor = resultingWorkCursor
+        self.sessionCreatedEvent = sessionCreatedEvent
+        self.sessionAttachedEvent = sessionAttachedEvent
+        self.workMirrorEvent = workMirrorEvent
+        self.cursorAdvancedEvent = cursorAdvancedEvent
+    }
+}
+
+/// Durable resolution for a Session reservation whose source operation is proven not to have
+/// created a Session journal.  The only currently supported outcome is `sourcePresence == .none`;
+/// partial or indeterminate source prefixes remain blocked and retryable.
+public struct WorkHostControlSessionCreationAbort: Codable, Hashable, Sendable {
+    public let causalControlCursor: JournalCursor
+    public let resultingControlCursor: JournalCursor
+    public let sourcePresence: WorkHostControlCreationSourcePresence
+    public let resultEvent: EventRef
+
+    public init(
+        causalControlCursor: JournalCursor,
+        resultingControlCursor: JournalCursor,
+        sourcePresence: WorkHostControlCreationSourcePresence,
+        resultEvent: EventRef
+    ) {
+        self.causalControlCursor = causalControlCursor
+        self.resultingControlCursor = resultingControlCursor
+        self.sourcePresence = sourcePresence
+        self.resultEvent = resultEvent
+    }
+}
+
+public struct WorkHostControlSessionCreationSnapshot: Codable, Hashable, Sendable {
+    public let reservation: WorkHostControlSessionCreationRequest
+    public let reservationEvent: EventRef
+    public let reservationCursor: JournalCursor
+    public var result: WorkHostControlSessionCreationResult?
+    public var abort: WorkHostControlSessionCreationAbort?
+    public var isConflicted: Bool
+    public var conflictEventRefs: [EventRef]
+
+    public init(
+        reservation: WorkHostControlSessionCreationRequest,
+        reservationEvent: EventRef,
+        reservationCursor: JournalCursor,
+        result: WorkHostControlSessionCreationResult? = nil,
+        abort: WorkHostControlSessionCreationAbort? = nil,
+        isConflicted: Bool = false,
+        conflictEventRefs: [EventRef] = []
+    ) {
+        self.reservation = reservation
+        self.reservationEvent = reservationEvent
+        self.reservationCursor = reservationCursor
+        self.result = result
+        self.abort = abort
+        self.isConflicted = isConflicted
+        self.conflictEventRefs = Array(conflictEventRefs.prefix(TimelineEvent.maxEvidenceLinks))
+    }
+
+    public var isResolved: Bool { result != nil || abort != nil }
+}
+
+/// The owner-mediated result of the cross-journal Session publication saga. The control mutation
+/// gate remains held while the source writers run, so the result always spans exactly one
+/// reservation and one completion event; another control mutation cannot silently widen it.
+public struct WorkHostControlSessionCreationPublication: Sendable {
+    public let reservation: WorkHostControlSessionCreationSnapshot
+    public let source: RunJournalBundleSessionPublication
+    public let result: WorkHostControlSessionCreationResult
+
+    public var resultingControlCursor: JournalCursor { result.resultingControlCursor }
+
+    public init(
+        reservation: WorkHostControlSessionCreationSnapshot,
+        source: RunJournalBundleSessionPublication,
+        result: WorkHostControlSessionCreationResult
+    ) {
+        self.reservation = reservation
+        self.source = source
+        self.result = result
+    }
+}
+
+private func controlSessionCreationKey(
+    work: WorkRef, client: ClientRef, commandID: String
+) -> String {
+    "work:\(work.workHostID.utf8.count):\(work.workHostID)/\(work.workID.utf8.count):\(work.workID)/"
+        + controlLengthPrefixedKey(client, commandID: commandID)
+}
+
 /// A cold reader can supply source presence without exposing filesystem paths. `notObserved`
 /// means the control journal alone is insufficient to make a claim; it is not an assertion that
 /// the source journal is absent.
@@ -626,6 +869,10 @@ public struct WorkHostControlSnapshot: Codable, Hashable, Sendable {
     /// Durable Create transactions keyed by length-prefixed client/command identity. The map is
     /// a projection of the control journal, not a second manifest or registry.
     public var creations: [String: WorkHostControlCreationSnapshot] = [:]
+    /// Session relationship transactions are keyed by the existing Work/client/command tuple.
+    /// A reservation without a result is intentionally visible to recovery code but is never a
+    /// Session or attachment fact until the source journals prove the corresponding result.
+    public var sessionCreations: [String: WorkHostControlSessionCreationSnapshot] = [:]
     public var lastEventID: String?
     public var lastSequence: Int = 0
     public var eventSequences: [String: Int] = [:]
@@ -654,6 +901,13 @@ public struct WorkHostControlSnapshot: Codable, Hashable, Sendable {
 
     public func creation(client: ClientRef, commandID: String) -> WorkHostControlCreationSnapshot? {
         creations[controlLengthPrefixedKey(client, commandID: commandID)]
+    }
+
+    public func sessionCreation(
+        work: WorkRef, client: ClientRef, commandID: String
+    ) -> WorkHostControlSessionCreationSnapshot? {
+        sessionCreations[controlSessionCreationKey(
+            work: work, client: client, commandID: commandID)]
     }
 
     /// Project one durable reservation against bounded source-presence evidence supplied by a
@@ -751,6 +1005,12 @@ public struct WorkHostControlReducer: Sendable {
             applyCreationReserved(event)
         case WorkHostControlEventType.workRegistered:
             applyWorkRegistered(event)
+        case WorkHostControlEventType.sessionCreationReserved:
+            applySessionCreationReserved(event)
+        case WorkHostControlEventType.sessionCreationCompleted:
+            applySessionCreationCompleted(event)
+        case WorkHostControlEventType.sessionCreationAborted:
+            applySessionCreationAborted(event)
         case TimelineEventType.clientAttached:
             applyClientAttached(event)
         case TimelineEventType.clientDetached:
@@ -1101,6 +1361,306 @@ public struct WorkHostControlReducer: Sendable {
         }
         existing.registration = registration
         snapshot.creations[key] = existing
+    }
+
+    // MARK: Existing-Work Session transactions
+
+    /// Reduce the reservation half of an existing-Work Session transaction. This record is
+    /// intentionally not a client attachment: until the source journals are proven, exposing
+    /// it as an attachment would turn a control-plane intent into a false Session fact.
+    private mutating func applySessionCreationReserved(_ event: TimelineEvent) {
+        guard let work = event.work,
+              let workHost = event.workHost,
+              let client = event.client,
+              let command = event.command,
+              let session = event.session,
+              let sessionAttachment = event.sessionAttachment,
+              let clientAttachment = event.clientAttachment,
+              command.client == client,
+              command.sessionAttachment == nil,
+              let causalControlCursor = command.causalCursor,
+              causalControlCursor == controlCursorBefore(event),
+              let workJournal: JournalRef = event.payload["work_journal"].flatMap(decodeControlValue),
+              let sessionJournal: JournalRef = event.payload["session_journal"].flatMap(decodeControlValue),
+              let authorizingAttachment: ClientAttachmentRef = event.payload[
+                  "authorizing_attachment"].flatMap(decodeControlValue),
+              let causalWorkCursor: JournalCursor = event.payload["causal_work_cursor"].flatMap(
+                  decodeControlValue),
+              let requestedCapabilities = controlCapabilities(
+                  event.payload["requested_capabilities"]),
+              controlSessionCreationPayloadIsExact(event.payload),
+              work.workHostID == workHost.workHostID,
+              workJournal.owner == .work(work),
+              workJournal.authority.authorityID == workHost.workHostID,
+              causalWorkCursor.journal == workJournal,
+              sessionJournal.owner == .session(session),
+              sessionJournal.authority.authorityID == workHost.workHostID,
+              controlBoundedIdentity(authorizingAttachment.attachmentID),
+              controlBoundedIdentity(work.workHostID),
+              controlBoundedIdentity(work.workID),
+              controlBoundedIdentity(client.clientID),
+              controlBoundedIdentity(command.commandID),
+              controlBoundedIdentity(session.sessionID),
+              controlBoundedIdentity(sessionAttachment.attachmentID),
+              controlBoundedIdentity(clientAttachment.attachmentID),
+              controlBoundedCursor(causalWorkCursor),
+              controlBoundedCursor(causalControlCursor) else {
+            quarantine(event, reason: "Work Host Session creation reservation is malformed")
+            return
+        }
+        let request = WorkHostControlSessionCreationRequest(
+            work: work, workJournal: workJournal, authorizingAttachment: authorizingAttachment,
+            client: client, command: command,
+            causalControlCursor: causalControlCursor, causalWorkCursor: causalWorkCursor,
+            requestedCapabilities: requestedCapabilities, session: session,
+            sessionJournal: sessionJournal, sessionAttachment: sessionAttachment,
+            clientAttachment: clientAttachment)
+        let key = request.key
+        if let existing = snapshot.sessionCreations[key] {
+            guard existing.reservation == request else {
+                markSessionCreationConflict(key: key, event: event)
+                return
+            }
+            return
+        }
+        snapshot.sessionCreations[key] = WorkHostControlSessionCreationSnapshot(
+            reservation: request,
+            reservationEvent: EventRef(journal: event.journal, eventID: event.eventID),
+            reservationCursor: JournalCursor(
+                journal: event.journal, eventID: event.eventID, sequence: event.sequence))
+    }
+
+    private mutating func applySessionCreationCompleted(_ event: TimelineEvent) {
+        guard controlSessionCreationPayloadIsExact(event.payload),
+              let reservationEvent: EventRef = event.payload["reservation_event"].flatMap(
+                  decodeControlValue),
+              let causalControlCursor: JournalCursor = event.payload[
+                  "causal_control_cursor"].flatMap(decodeControlValue),
+              let publication = event.payload["publication"]?.stringValue,
+              publication == "mirrored" || publication == "terminal_reference",
+              let capabilities = controlCapabilities(event.payload["capabilities"]),
+              let causalSessionCursor: JournalCursor = event.payload[
+                  "causal_session_cursor"].flatMap(decodeControlValue),
+              let sessionCursor: JournalCursor = event.payload["session_cursor"].flatMap(
+                  decodeControlValue),
+              let causalWorkCursor: JournalCursor = event.payload["causal_work_cursor"].flatMap(
+                  decodeControlValue),
+              let resultingWorkCursor: JournalCursor = event.payload[
+                  "resulting_work_cursor"].flatMap(decodeControlValue),
+              let sessionCreatedEvent: EventRef = event.payload[
+                  "session_created_event"].flatMap(decodeControlValue),
+              let sessionAttachedEvent: EventRef = event.payload[
+                  "session_attached_event"].flatMap(decodeControlValue),
+              let cursorAdvancedEvent: EventRef = event.payload[
+                  "cursor_advanced_event"].flatMap(decodeControlValue),
+              let work = event.work,
+              let client = event.client,
+              let commandID = event.payload["command_id"]?.stringValue,
+              let reservation = snapshot.sessionCreations.values.first(where: {
+                  $0.reservation.work == work
+                      && $0.reservation.client == client
+                      && $0.reservation.command.commandID == commandID
+                      && $0.reservationEvent == reservationEvent
+              }) else {
+            quarantine(event, reason: "Work Host Session creation result is malformed")
+            return
+        }
+        let (expectedSessionSequence, sessionSequenceOverflow) =
+            causalSessionCursor.sequence.addingReportingOverflow(3)
+        let workMirrorEvent = workMirrorEventFromPayload(event.payload)
+        let (expectedMirroredWorkSequence, mirroredWorkSequenceOverflow) =
+            causalWorkCursor.sequence.addingReportingOverflow(1)
+        guard !sessionSequenceOverflow,
+              causalSessionCursor.journal == reservation.reservation.sessionJournal,
+              sessionCursor.journal == reservation.reservation.sessionJournal,
+              causalWorkCursor == reservation.reservation.causalWorkCursor,
+              event.causedByEventID == reservationEvent,
+              causalControlCursor == controlCursorBefore(event),
+              event.session == reservation.reservation.session,
+              event.sessionAttachment == reservation.reservation.sessionAttachment,
+              event.work == reservation.reservation.work,
+              event.workHost == snapshot.workHost,
+              event.client == reservation.reservation.client,
+              resultingWorkCursor.journal == reservation.reservation.workJournal,
+              sessionCreatedEvent.journal == reservation.reservation.sessionJournal,
+              sessionAttachedEvent.journal == reservation.reservation.sessionJournal,
+              cursorAdvancedEvent.journal == reservation.reservation.sessionJournal,
+              (publication == "mirrored"
+                  ? workMirrorEvent != nil
+                      && !mirroredWorkSequenceOverflow
+                      && resultingWorkCursor.sequence == expectedMirroredWorkSequence
+                      && workMirrorEvent?.journal == resultingWorkCursor.journal
+                      && workMirrorEvent?.eventID == resultingWorkCursor.eventID
+                  : workMirrorEvent == nil && resultingWorkCursor == causalWorkCursor),
+              Set(capabilities).isSubset(of: Set(reservation.reservation.requestedCapabilities)),
+              (publication == "terminal_reference" ? capabilities == ["observe"] : true),
+              controlBoundedCursor(causalSessionCursor),
+              controlBoundedCursor(sessionCursor),
+              controlBoundedCursor(causalWorkCursor),
+              controlBoundedCursor(resultingWorkCursor),
+              sessionCursor.sequence == expectedSessionSequence,
+              sessionCursor.eventID == cursorAdvancedEvent.eventID,
+              capabilities.count <= WorkHostControlLimits.maxCapabilities else {
+            quarantine(event, reason: "Work Host Session creation result has mismatched evidence")
+            return
+        }
+        let result = WorkHostControlSessionCreationResult(
+            causalControlCursor: causalControlCursor,
+            resultingControlCursor: JournalCursor(
+                journal: event.journal, eventID: event.eventID, sequence: event.sequence),
+            publication: publication, capabilities: capabilities,
+            causalSessionCursor: causalSessionCursor, sessionCursor: sessionCursor,
+            causalWorkCursor: causalWorkCursor, resultingWorkCursor: resultingWorkCursor,
+            sessionCreatedEvent: sessionCreatedEvent, sessionAttachedEvent: sessionAttachedEvent,
+            workMirrorEvent: workMirrorEvent, cursorAdvancedEvent: cursorAdvancedEvent,
+            resultEvent: EventRef(journal: event.journal, eventID: event.eventID))
+        let key = reservation.reservation.key
+        guard var existing = snapshot.sessionCreations[key], !existing.isConflicted else {
+            quarantine(event, reason: "Work Host Session creation result has no reservation")
+            return
+        }
+        guard existing.abort == nil else {
+            quarantine(event, reason: "Work Host Session creation result follows an abort")
+            return
+        }
+        if let prior = existing.result {
+            guard prior == result else {
+                markSessionCreationConflict(key: key, event: event)
+                return
+            }
+            return
+        }
+        let attachment = WorkHostClientAttachmentSnapshot(
+            attachment: reservation.reservation.clientAttachment,
+            client: reservation.reservation.client,
+            work: reservation.reservation.work,
+            workJournal: reservation.reservation.workJournal,
+            session: reservation.reservation.session,
+            sessionJournal: reservation.reservation.sessionJournal,
+            sessionAttachment: reservation.reservation.sessionAttachment,
+            capabilities: Set(result.capabilities), isAttached: true,
+            attachedEvent: result.resultEvent)
+        if let priorAttachment = snapshot.clientAttachments[attachment.attachment.attachmentID] {
+            guard priorAttachment == attachment else {
+                quarantine(event, reason: "Session creation client attachment conflicts")
+                return
+            }
+        } else {
+            snapshot.clientAttachments[attachment.attachment.attachmentID] = attachment
+        }
+        existing.result = result
+        snapshot.sessionCreations[key] = existing
+    }
+
+    private mutating func applySessionCreationAborted(_ event: TimelineEvent) {
+        guard controlSessionCreationAbortPayloadIsExact(event.payload),
+              let reservationEvent: EventRef = event.payload["reservation_event"].flatMap(
+                  decodeControlValue),
+              let causalControlCursor: JournalCursor = event.payload[
+                  "causal_control_cursor"].flatMap(decodeControlValue),
+              event.payload["source_presence"]?.stringValue ==
+                  WorkHostControlCreationSourcePresence.none.rawValue,
+              let commandID = event.payload["command_id"]?.stringValue,
+              let work = event.work,
+              let client = event.client,
+              let reservation = snapshot.sessionCreations.values.first(where: {
+                  $0.reservation.work == work
+                      && $0.reservation.client == client
+                      && $0.reservation.command.commandID == commandID
+                      && $0.reservationEvent == reservationEvent
+              }) else {
+            quarantine(event, reason: "Work Host Session creation abort is malformed")
+            return
+        }
+        let actualCursor = JournalCursor(
+            journal: event.journal, eventID: event.eventID, sequence: event.sequence)
+        guard event.causedByEventID == reservationEvent,
+              causalControlCursor == controlCursorBefore(event),
+              reservationEvent.journal == event.journal,
+              causalControlCursor.journal == event.journal,
+              event.session == reservation.reservation.session,
+              event.sessionAttachment == reservation.reservation.sessionAttachment,
+              event.work == reservation.reservation.work,
+              event.workHost == snapshot.workHost,
+              event.client == reservation.reservation.client,
+              controlBoundedCursor(causalControlCursor),
+              controlBoundedIdentity(commandID) else {
+            quarantine(event, reason: "Work Host Session creation abort has mismatched evidence")
+            return
+        }
+        let abort = WorkHostControlSessionCreationAbort(
+            causalControlCursor: causalControlCursor,
+            resultingControlCursor: actualCursor,
+            sourcePresence: .none,
+            resultEvent: EventRef(journal: event.journal, eventID: event.eventID))
+        let key = reservation.reservation.key
+        guard var existing = snapshot.sessionCreations[key], !existing.isConflicted else {
+            quarantine(event, reason: "Work Host Session creation abort has no reservation")
+            return
+        }
+        guard existing.result == nil else {
+            quarantine(event, reason: "Work Host Session creation abort follows a completion")
+            return
+        }
+        if let prior = existing.abort {
+            guard prior == abort else {
+                markSessionCreationConflict(key: key, event: event)
+                return
+            }
+            return
+        }
+        existing.abort = abort
+        snapshot.sessionCreations[key] = existing
+    }
+
+    private func controlSessionCreationPayloadIsExact(_ payload: JSONValue) -> Bool {
+        guard let object = payload.objectValue else { return false }
+        let keys = Set(object.keys)
+        let reservation: Set<String> = [
+            "work_journal", "session_journal", "authorizing_attachment",
+            "causal_work_cursor", "requested_capabilities",
+        ]
+        let result: Set<String> = [
+            "reservation_event", "command_id", "causal_control_cursor", "publication", "capabilities",
+            "causal_session_cursor", "session_cursor", "causal_work_cursor",
+            "resulting_work_cursor", "session_created_event", "session_attached_event",
+            "work_mirror_event", "cursor_advanced_event",
+        ]
+        return keys == reservation || keys == result
+    }
+
+    private func controlSessionCreationAbortPayloadIsExact(_ payload: JSONValue) -> Bool {
+        guard let object = payload.objectValue else { return false }
+        return Set(object.keys) == [
+            "reservation_event", "command_id", "causal_control_cursor", "source_presence",
+        ]
+    }
+
+    private func controlCapabilities(_ value: JSONValue?) -> [String]? {
+        guard let values = value?.arrayValue else { return nil }
+        let strings = values.compactMap(\JSONValue.stringValue)
+        guard strings.count == values.count,
+              strings == strings.sorted(),
+              Set(strings).count == strings.count,
+              strings.allSatisfy({ controlBoundedIdentity($0) }) else { return nil }
+        return strings
+    }
+
+    private func workMirrorEventFromPayload(_ payload: JSONValue) -> EventRef? {
+        guard let value = payload["work_mirror_event"] else { return nil }
+        return decodeControlValue(value)
+    }
+
+    private mutating func markSessionCreationConflict(key: String, event: TimelineEvent) {
+        if var existing = snapshot.sessionCreations[key] {
+            existing.isConflicted = true
+            if existing.conflictEventRefs.count < TimelineEvent.maxEvidenceLinks {
+                existing.conflictEventRefs.append(
+                    EventRef(journal: event.journal, eventID: event.eventID))
+            }
+            snapshot.sessionCreations[key] = existing
+        }
+        quarantine(event, reason: "Work Host Session creation transaction conflicts")
     }
 
     private mutating func markCreationConflict(key: String, event: TimelineEvent, reason: String) {
@@ -1789,6 +2349,7 @@ public actor WorkHostControlJournal {
             }
             return existing.reservation
         }
+        try rejectNewMutationWhileSessionCreationIncomplete(current)
         guard request.causalControlCursor == actualCursor else {
             throw TimelineJournalWriter.WriterError.invalidDraft(
                 reason: "creation reservation causal control cursor is stale")
@@ -1851,6 +2412,7 @@ public actor WorkHostControlJournal {
             }
             return prior
         }
+        try rejectNewMutationWhileSessionCreationIncomplete(current)
         guard request.causalControlCursor == actualCursor else {
             throw TimelineJournalWriter.WriterError.invalidDraft(
                 reason: "Work registration causal control cursor is stale")
@@ -1883,6 +2445,330 @@ public actor WorkHostControlJournal {
             sessionGenesisCursor: request.sessionGenesisCursor,
             causalControlCursor: request.causalControlCursor,
             registrationEvent: commit.eventRef, registrationCursor: commit.cursor)
+    }
+
+    /// Reserve an existing-Work Session relationship in the host control journal. All three
+    /// Session-side identities are host-minted before this call and are retained in the durable
+    /// reservation. Exact retries return the original reservation before stale-cursor checks;
+    /// conflicting envelopes fail without minting or appending anything.
+    ///
+    /// This is intentionally only the control half of the cross-journal operation. The current
+    /// RunJournalBundle owns live Work writers and has no primitive for atomically coordinating a
+    /// new Session writer with that Work writer. Until that seam exists, a reservation without a
+    /// result is the truthful recovery state, not a successful Session attachment.
+    public func reserveSessionCreation(
+        _ request: WorkHostControlSessionCreationRequest
+    ) async throws -> WorkHostControlSessionCreationSnapshot {
+        await acquireMutationGate()
+        defer { releaseMutationGate() }
+        return try await reserveSessionCreationLocked(request)
+    }
+
+    private func reserveSessionCreationLocked(
+        _ request: WorkHostControlSessionCreationRequest
+    ) async throws -> WorkHostControlSessionCreationSnapshot {
+        if let controlFailure {
+            throw TimelineJournalWriter.WriterError.unavailable(controlFailure)
+        }
+        try validateSessionCreationRequest(request)
+        let (current, actualCursor) = try readControlState()
+        if let existing = current.sessionCreations[request.key] {
+            guard !existing.isConflicted, existing.reservation == request else {
+                throw TimelineJournalWriter.WriterError.invalidDraft(
+                    reason: "Session creation command conflicts with its reservation")
+            }
+            if existing.abort != nil {
+                throw TimelineJournalWriter.WriterError.invalidDraft(
+                    reason: "Session creation reservation was durably aborted")
+            }
+            if case .failed(let reason) = await writer.health {
+                throw TimelineJournalWriter.WriterError.unavailable(reason)
+            }
+            return existing
+        }
+        try rejectNewMutationWhileSessionCreationIncomplete(current)
+        guard request.causalControlCursor == actualCursor else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation reservation causal control cursor is stale")
+        }
+        guard current.clientAttachments[request.authorizingAttachment.attachmentID].map({
+            $0.client == request.client && $0.work == request.work
+                && $0.workJournal == request.workJournal && $0.isAttached
+                && $0.capabilities.contains("create_session")
+        }) == true else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation reservation lacks an attached authorizing client")
+        }
+        let payload: JSONValue = .object([
+            "work_journal": encodeControlValue(request.workJournal),
+            "session_journal": encodeControlValue(request.sessionJournal),
+            "authorizing_attachment": encodeControlValue(request.authorizingAttachment),
+            "causal_work_cursor": encodeControlValue(request.causalWorkCursor),
+            "requested_capabilities": .array(
+                request.requestedCapabilities.sorted().map { .string($0) }),
+        ])
+        let draft = TimelineEventDraft(
+            command: request.command, session: request.session, work: request.work,
+            workHost: workHost, client: request.client,
+            sessionAttachment: request.sessionAttachment,
+            clientAttachment: request.clientAttachment,
+            type: WorkHostControlEventType.sessionCreationReserved,
+            declaredDomains: [.work, .session], payload: payload)
+        let digest = try sessionCreationRequestDigest(request)
+        let commit = try await appendSessionCreationDraft(
+            draft, digest: digest, current: current, causalCursor: actualCursor)
+        return WorkHostControlSessionCreationSnapshot(
+            reservation: request, reservationEvent: commit.eventRef,
+            reservationCursor: commit.cursor)
+    }
+
+    /// Resolve a failed Session publication only when the host can freshly prove that the
+    /// reserved Session journal has no source bytes at all.  A missing source is a safe negative
+    /// outcome; a partial, malformed, or unreadable source remains indeterminate and must be
+    /// retried or repaired by the source owner.  This event is deliberately not a generic timeout
+    /// or client cancellation, and it does not create an attachment or Session fact.
+    public func abortSessionCreation(
+        work: WorkRef, client: ClientRef, commandID: String
+    ) async throws -> WorkHostControlSessionCreationAbort {
+        await acquireMutationGate()
+        defer { releaseMutationGate() }
+        return try await abortSessionCreationLocked(
+            work: work, client: client, commandID: commandID)
+    }
+
+    private func abortSessionCreationLocked(
+        work: WorkRef, client: ClientRef, commandID: String
+    ) async throws -> WorkHostControlSessionCreationAbort {
+        if let controlFailure {
+            throw TimelineJournalWriter.WriterError.unavailable(controlFailure)
+        }
+        guard controlBoundedIdentity(work.workHostID), work.workHostID == workHost.workHostID,
+              controlBoundedIdentity(work.workID), controlBoundedIdentity(client.clientID),
+              controlBoundedIdentity(commandID) else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation abort identity is unbounded or foreign")
+        }
+        try ensureControlCache()
+        guard let current = cachedSnapshot,
+              let existing = current.sessionCreation(
+                  work: work, client: client, commandID: commandID),
+              !existing.isConflicted else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation abort has no matching reservation")
+        }
+        if let abort = existing.abort {
+            if case .failed(let reason) = await writer.health {
+                throw TimelineJournalWriter.WriterError.unavailable(reason)
+            }
+            return abort
+        }
+        guard existing.result == nil else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation already completed")
+        }
+        guard try proveSessionSourceAbsent(existing.reservation) else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session source outcome is not provably absent")
+        }
+        let actualCursor = cachedCursor ?? currentCursor(of: current)
+        guard actualCursor == existing.reservationCursor else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation abort causal control cursor is stale")
+        }
+        let payload: JSONValue = .object([
+            "reservation_event": encodeControlValue(existing.reservationEvent),
+            "command_id": .string(commandID),
+            "causal_control_cursor": encodeControlValue(existing.reservationCursor),
+            "source_presence": .string(
+                WorkHostControlCreationSourcePresence.none.rawValue),
+        ])
+        let draft = TimelineEventDraft(
+            causedByEventID: existing.reservationEvent,
+            session: existing.reservation.session, work: existing.reservation.work,
+            workHost: workHost, client: existing.reservation.client,
+            sessionAttachment: existing.reservation.sessionAttachment,
+            type: WorkHostControlEventType.sessionCreationAborted,
+            declaredDomains: [.work, .session], payload: payload)
+        let digest = try sessionCreationAbortDigest(
+            reservationEvent: existing.reservationEvent,
+            commandID: commandID, causalControlCursor: existing.reservationCursor)
+        let commit = try await appendSessionCreationDraft(
+            draft, digest: digest, current: current, causalCursor: actualCursor)
+        return WorkHostControlSessionCreationAbort(
+            causalControlCursor: existing.reservationCursor,
+            resultingControlCursor: commit.cursor,
+            sourcePresence: .none,
+            resultEvent: commit.eventRef)
+    }
+
+    /// Append the control-journal result for a source-journal Session publication. The exact
+    /// result is reconciled before checking the current control cursor, so a lost response can
+    /// be recovered without reminting. This does not assert that the referenced source bytes
+    /// exist; the Work Host's source verifier must make that independent check before exposing a
+    /// successful descriptor or granting the new Session any authority.
+    public func completeSessionCreation(
+        work: WorkRef, client: ClientRef, commandID: String,
+        _ request: WorkHostControlSessionCreationResultRequest
+    ) async throws -> WorkHostControlSessionCreationResult {
+        await acquireMutationGate()
+        defer { releaseMutationGate() }
+        return try await completeSessionCreationLocked(
+            work: work, client: client, commandID: commandID, request)
+    }
+
+    private func completeSessionCreationLocked(
+        work: WorkRef, client: ClientRef, commandID: String,
+        _ request: WorkHostControlSessionCreationResultRequest
+    ) async throws -> WorkHostControlSessionCreationResult {
+        if let controlFailure {
+            throw TimelineJournalWriter.WriterError.unavailable(controlFailure)
+        }
+        try validateSessionCreationResultRequest(request)
+        let (current, actualCursor) = try readControlState()
+        guard let existing = current.sessionCreation(
+            work: work, client: client, commandID: commandID),
+              existing.reservationEvent == request.reservationEvent else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation result has no matching reservation")
+        }
+        if let prior = existing.result {
+            let expected = WorkHostControlSessionCreationResult(
+                causalControlCursor: request.causalControlCursor,
+                resultingControlCursor: prior.resultingControlCursor,
+                publication: request.publication, capabilities: request.capabilities,
+                causalSessionCursor: request.causalSessionCursor, sessionCursor: request.sessionCursor,
+                causalWorkCursor: request.causalWorkCursor,
+                resultingWorkCursor: request.resultingWorkCursor,
+                sessionCreatedEvent: request.sessionCreatedEvent,
+                sessionAttachedEvent: request.sessionAttachedEvent,
+                workMirrorEvent: request.workMirrorEvent,
+                cursorAdvancedEvent: request.cursorAdvancedEvent,
+                resultEvent: prior.resultEvent)
+            guard prior == expected else {
+                throw TimelineJournalWriter.WriterError.invalidDraft(
+                    reason: "Session creation result conflicts with its prior evidence")
+            }
+            if case .failed(let reason) = await writer.health {
+                throw TimelineJournalWriter.WriterError.unavailable(reason)
+            }
+            return prior
+        }
+        guard existing.abort == nil else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation reservation was durably aborted")
+        }
+        guard request.reservationEvent.journal == journal,
+              request.reservationEvent == existing.reservationEvent,
+              request.commandID == existing.reservation.command.commandID,
+              work == existing.reservation.work,
+              client == existing.reservation.client,
+              request.causalWorkCursor == existing.reservation.causalWorkCursor,
+              request.causalSessionCursor.sequence == 0,
+              request.causalSessionCursor.eventID == nil,
+              request.causalSessionCursor.journal == existing.reservation.sessionJournal,
+              request.sessionCursor.journal == existing.reservation.sessionJournal,
+              request.sessionCreatedEvent.journal == existing.reservation.sessionJournal,
+              request.sessionAttachedEvent.journal == existing.reservation.sessionJournal,
+              request.cursorAdvancedEvent.journal == existing.reservation.sessionJournal,
+              request.causalWorkCursor.journal == existing.reservation.workJournal,
+              request.resultingWorkCursor.journal == existing.reservation.workJournal,
+              Set(request.capabilities).isSubset(
+                  of: Set(existing.reservation.requestedCapabilities)),
+              (request.publication == "terminal_reference"
+                  ? request.capabilities == ["observe"] : true),
+              request.publication == "mirrored"
+                  ? request.workMirrorEvent != nil
+                  : request.publication == "terminal_reference"
+                      && request.workMirrorEvent == nil
+                      && request.resultingWorkCursor == request.causalWorkCursor,
+              request.causalControlCursor == actualCursor else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation result evidence does not match reservation")
+        }
+        let payload: JSONValue = .object([
+            "reservation_event": encodeControlValue(request.reservationEvent),
+            "command_id": .string(request.commandID),
+            "causal_control_cursor": encodeControlValue(request.causalControlCursor),
+            "publication": .string(request.publication),
+            "capabilities": .array(request.capabilities.sorted().map { .string($0) }),
+            "causal_session_cursor": encodeControlValue(request.causalSessionCursor),
+            "session_cursor": encodeControlValue(request.sessionCursor),
+            "causal_work_cursor": encodeControlValue(request.causalWorkCursor),
+            "resulting_work_cursor": encodeControlValue(request.resultingWorkCursor),
+            "session_created_event": encodeControlValue(request.sessionCreatedEvent),
+            "session_attached_event": encodeControlValue(request.sessionAttachedEvent),
+            "work_mirror_event": request.workMirrorEvent.map(encodeControlValue) ?? .null,
+            "cursor_advanced_event": encodeControlValue(request.cursorAdvancedEvent),
+        ])
+        let draft = TimelineEventDraft(
+            causedByEventID: existing.reservationEvent,
+            session: existing.reservation.session, work: existing.reservation.work,
+            workHost: workHost, client: existing.reservation.client,
+            sessionAttachment: existing.reservation.sessionAttachment,
+            type: WorkHostControlEventType.sessionCreationCompleted,
+            declaredDomains: [.work, .session], payload: payload)
+        let digest = try sessionCreationResultDigest(request)
+        let commit = try await appendSessionCreationDraft(
+            draft, digest: digest, current: current, causalCursor: actualCursor)
+        return WorkHostControlSessionCreationResult(
+            causalControlCursor: request.causalControlCursor,
+            resultingControlCursor: commit.cursor,
+            publication: request.publication, capabilities: request.capabilities,
+            causalSessionCursor: request.causalSessionCursor, sessionCursor: request.sessionCursor,
+            causalWorkCursor: request.causalWorkCursor,
+            resultingWorkCursor: request.resultingWorkCursor,
+            sessionCreatedEvent: request.sessionCreatedEvent,
+            sessionAttachedEvent: request.sessionAttachedEvent,
+            workMirrorEvent: request.workMirrorEvent,
+            cursorAdvancedEvent: request.cursorAdvancedEvent,
+            resultEvent: commit.eventRef)
+    }
+
+    /// Run the source-journal publication while the control mutation gate is held. This is the
+    /// owner-mediated seam for the two-file saga: reservation and completion are adjacent control
+    /// records even when the source writer has to recover a partial prefix or awaits a filesystem
+    /// synchronize. A failed source operation remains durable and retryable unless the host can
+    /// immediately prove source absence, in which case it records an adjacent abort while still
+    /// rethrowing the original source error.
+    public func publishSessionCreation(
+        _ request: WorkHostControlSessionCreationRequest,
+        source: @escaping @Sendable
+            (WorkHostControlSessionCreationRequest) async throws
+            -> RunJournalBundleSessionPublication
+    ) async throws -> WorkHostControlSessionCreationPublication {
+        await acquireMutationGate()
+        defer { releaseMutationGate() }
+        let reservation = try await reserveSessionCreationLocked(request)
+        let publication: RunJournalBundleSessionPublication
+        do {
+            publication = try await source(reservation.reservation)
+        } catch {
+            // Preserve the source failure for the caller.  A fresh, owner-locked proof may still
+            // safely resolve the reservation when no Session bytes were created; otherwise the
+            // reservation remains the truthful blocked/retryable state.
+            _ = try? await abortSessionCreationLocked(
+                work: request.work, client: request.client,
+                commandID: request.command.commandID)
+            throw error
+        }
+        let result = try await completeSessionCreationLocked(
+            work: request.work, client: request.client, commandID: request.command.commandID,
+            WorkHostControlSessionCreationResultRequest(
+                reservationEvent: reservation.reservationEvent,
+                commandID: request.command.commandID,
+                causalControlCursor: reservation.reservationCursor,
+                publication: publication.publication,
+                capabilities: publication.capabilities,
+                causalSessionCursor: publication.causalSessionCursor,
+                sessionCursor: publication.sessionCursor,
+                causalWorkCursor: publication.causalWorkCursor,
+                resultingWorkCursor: publication.resultingWorkCursor,
+                sessionCreatedEvent: publication.sessionCreated.eventRef,
+                sessionAttachedEvent: publication.sessionAttached.eventRef,
+                workMirrorEvent: publication.workMirror?.eventRef,
+                cursorAdvancedEvent: publication.cursorAdvanced.eventRef))
+        return WorkHostControlSessionCreationPublication(
+            reservation: reservation, source: publication, result: result)
     }
 
     /// Independently verify the two source journals for one durable registration. This is a
@@ -2054,6 +2940,333 @@ public actor WorkHostControlJournal {
             throw TimelineJournalWriter.WriterError.invalidDraft(
                 reason: "creation request contains unbounded or mismatched identities")
         }
+    }
+
+    private func validateSessionCreationRequest(
+        _ request: WorkHostControlSessionCreationRequest
+    ) throws {
+        let identities = [
+            request.work.workHostID, request.work.workID, request.client.clientID,
+            request.command.commandID, request.authorizingAttachment.attachmentID,
+            request.session.sessionID, request.sessionAttachment.attachmentID,
+            request.clientAttachment.attachmentID,
+        ]
+        guard identities.allSatisfy(controlBoundedIdentity),
+              request.work.workHostID == workHost.workHostID,
+              request.command.client == request.client,
+              request.command.sessionAttachment == nil,
+              request.command.causalCursor == request.causalControlCursor,
+              request.causalControlCursor.journal == journal,
+              controlBoundedCursor(request.causalControlCursor),
+              controlBoundedCursor(request.causalWorkCursor),
+              request.workJournal.owner == .work(request.work),
+              request.workJournal.authority.authorityID == workHost.workHostID,
+              request.workJournal.kind == .work,
+              request.causalWorkCursor.journal == request.workJournal,
+              request.sessionJournal.owner == .session(request.session),
+              request.sessionJournal.authority.authorityID == workHost.workHostID,
+              request.sessionJournal.kind == .session,
+              request.sessionAttachment != SessionAttachmentRef(request.authorizingAttachment.attachmentID),
+              request.clientAttachment != ClientAttachmentRef(request.authorizingAttachment.attachmentID),
+              request.requestedCapabilities == request.requestedCapabilities.sorted(),
+              Set(request.requestedCapabilities).count == request.requestedCapabilities.count else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation reservation identities or journals are mismatched")
+        }
+        try validateCapabilities(Set(request.requestedCapabilities))
+    }
+
+    private func validateSessionCreationResultRequest(
+        _ request: WorkHostControlSessionCreationResultRequest
+    ) throws {
+        guard controlBoundedIdentity(request.commandID),
+              request.publication == "mirrored" || request.publication == "terminal_reference",
+              request.capabilities == request.capabilities.sorted(),
+              Set(request.capabilities).count == request.capabilities.count,
+              request.reservationEvent.journal == journal,
+              controlBoundedIdentity(request.reservationEvent.eventID),
+              controlBoundedCursor(request.causalControlCursor),
+              controlBoundedCursor(request.causalSessionCursor),
+              controlBoundedCursor(request.sessionCursor),
+              controlBoundedCursor(request.causalWorkCursor),
+              controlBoundedCursor(request.resultingWorkCursor) else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation result is outside the bounded contract")
+        }
+        try validateCapabilities(Set(request.capabilities))
+    }
+
+    private func sessionCreationRequestDigest(
+        _ request: WorkHostControlSessionCreationRequest
+    ) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return controlSHA256(try encoder.encode(request))
+    }
+
+    private func sessionCreationResultDigest(
+        _ request: WorkHostControlSessionCreationResultRequest
+    ) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return controlSHA256(try encoder.encode(request))
+    }
+
+    private func sessionCreationAbortDigest(
+        reservationEvent: EventRef, commandID: String, causalControlCursor: JournalCursor
+    ) throws -> String {
+        let value: JSONValue = .object([
+            "reservation_event": encodeControlValue(reservationEvent),
+            "command_id": .string(commandID),
+            "causal_control_cursor": encodeControlValue(causalControlCursor),
+            "source_presence": .string(WorkHostControlCreationSourcePresence.none.rawValue),
+        ])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return controlSHA256(try encoder.encode(value))
+    }
+
+    /// Check the reserved source paths while holding their canonical owner locks. The absence of
+    /// the Session file, or the canonical zero-byte file created before a Session writer's first
+    /// append, plus an unchanged complete Work journal at the exact reserved tip is the only
+    /// supported negative proof. Existing Session bytes, partial/malformed Work bytes, symlinks,
+    /// path replacement, or otherwise unreadable paths are not classified as "no source". This
+    /// is an owner-coordination invariant, not a sandbox or hostile-filesystem security boundary.
+    private func proveSessionSourceAbsent(
+        _ reservation: WorkHostControlSessionCreationRequest
+    ) throws -> Bool {
+        guard let home else {
+            throw TimelineJournalWriter.WriterError.unavailable(
+                "Session source absence cannot be proved without a Work Host AgentHome")
+        }
+        let sourceURL = home.timelineV2SessionJournalURL(reservation.session)
+        let workURL = home.timelineV2WorkJournalURL(reservation.work)
+        return try TimelineJournalWriter.withAdvisoryOwnerLock(
+            home: home, journal: reservation.sessionJournal, dataURL: sourceURL
+        ) {
+            guard try Self.sessionSourceIsAbsentOrCanonicalEmpty(at: sourceURL) else {
+                return false
+            }
+            return try TimelineJournalWriter.withAdvisoryOwnerLock(
+                home: home, journal: reservation.workJournal, dataURL: workURL
+            ) {
+                try Self.streamCanonicalJournalToExactTip(
+                    at: workURL, journal: reservation.workJournal,
+                    cursor: reservation.causalWorkCursor)
+            }
+        }
+    }
+
+    /// A source writer creates the owner directory and an empty regular file before its first
+    /// append. That state is still a truthful negative source claim. The descriptor and pathname
+    /// are compared before and after the zero-byte check so a final-component symlink or path
+    /// replacement cannot be accepted as the canonical pre-write state.
+    private static func sessionSourceIsAbsentOrCanonicalEmpty(at url: URL) throws -> Bool {
+        let path = url.standardizedFileURL.path
+        let directoryPath = url.deletingLastPathComponent().standardizedFileURL.path
+        var directoryBefore = stat()
+        let directoryBeforeResult = directoryPath.withCString { lstat($0, &directoryBefore) }
+        if directoryBeforeResult == 0 {
+            guard (directoryBefore.st_mode & S_IFMT) == S_IFDIR,
+                  directoryBefore.st_uid == geteuid() else { return false }
+        } else if errno != ENOENT {
+            throw TimelineJournalWriter.WriterError.unavailable(
+                "Session source directory could not be read")
+        }
+        var observed = stat()
+        let observedResult = path.withCString { lstat($0, &observed) }
+        if observedResult != 0 {
+            guard errno == ENOENT else {
+                throw TimelineJournalWriter.WriterError.unavailable(
+                    "Session source absence could not be read")
+            }
+            var directoryAfter = stat()
+            let directoryAfterResult = directoryPath.withCString { lstat($0, &directoryAfter) }
+            if directoryBeforeResult == 0 {
+                guard directoryAfterResult == 0,
+                      (directoryAfter.st_mode & S_IFMT) == S_IFDIR,
+                      directoryAfter.st_uid == geteuid(),
+                      directoryAfter.st_dev == directoryBefore.st_dev,
+                      directoryAfter.st_ino == directoryBefore.st_ino else { return false }
+            } else {
+                guard directoryAfterResult != 0, errno == ENOENT else { return false }
+            }
+            return true
+        }
+        guard (observed.st_mode & S_IFMT) == S_IFREG, observed.st_uid == geteuid() else {
+            return false
+        }
+        let descriptor = path.withCString {
+            AviaryPOSIX.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            throw TimelineJournalWriter.WriterError.unavailable(
+                "Session source pre-write state could not be opened")
+        }
+        defer { _ = AviaryPOSIX.close(descriptor) }
+        var before = stat()
+        var beforePath = stat()
+        let beforePathResult = path.withCString { lstat($0, &beforePath) }
+        guard fstat(descriptor, &before) == 0,
+              beforePathResult == 0,
+              (before.st_mode & S_IFMT) == S_IFREG,
+              before.st_uid == geteuid(),
+              before.st_dev == beforePath.st_dev, before.st_ino == beforePath.st_ino,
+              before.st_dev == observed.st_dev, before.st_ino == observed.st_ino,
+              before.st_size == 0 else {
+            return false
+        }
+        var byte: UInt8 = 0
+        let readCount = withUnsafeMutableBytes(of: &byte) { buffer in
+            AviaryPOSIX.read(descriptor, buffer.baseAddress, 1)
+        }
+        guard readCount == 0 else { return false }
+        var after = stat()
+        var afterPath = stat()
+        var directoryAfter = stat()
+        let afterPathResult = path.withCString { lstat($0, &afterPath) }
+        let directoryAfterResult = directoryPath.withCString { lstat($0, &directoryAfter) }
+        guard fstat(descriptor, &after) == 0,
+              afterPathResult == 0,
+              directoryBeforeResult == 0, directoryAfterResult == 0,
+              (directoryAfter.st_mode & S_IFMT) == S_IFDIR,
+              directoryAfter.st_uid == geteuid(),
+              directoryAfter.st_dev == directoryBefore.st_dev,
+              directoryAfter.st_ino == directoryBefore.st_ino,
+              (after.st_mode & S_IFMT) == S_IFREG,
+              after.st_uid == geteuid(),
+              after.st_dev == afterPath.st_dev, after.st_ino == afterPath.st_ino,
+              after.st_dev == before.st_dev, after.st_ino == before.st_ino,
+              after.st_size == 0 else {
+            return false
+        }
+        return true
+    }
+
+    /// Stream one native journal through EOF while retaining only parser framing, the last event,
+    /// and the duplicate-identity index required by the canonical writer contract. There is no
+    /// whole-journal Data allocation or total byte ceiling; individual Timeline records remain
+    /// bounded by the writer's record limit. The final descriptor/path identity and size fence
+    /// prevents a replaced or concurrently extended pathname from satisfying the reserved tip.
+    private static func streamCanonicalJournalToExactTip(
+        at url: URL, journal: JournalRef, cursor: JournalCursor
+    ) throws -> Bool {
+        guard cursor.sequence > 0, cursor.eventID != nil else { return false }
+        let path = url.standardizedFileURL.path
+        let descriptor = path.withCString {
+            AviaryPOSIX.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        if descriptor < 0 {
+            if errno == ENOENT { return false }
+            throw TimelineJournalWriter.WriterError.unavailable(
+                "Work source absence evidence could not be opened")
+        }
+        defer { _ = AviaryPOSIX.close(descriptor) }
+        var before = stat()
+        var beforePath = stat()
+        let beforePathResult = path.withCString { lstat($0, &beforePath) }
+        guard fstat(descriptor, &before) == 0,
+              beforePathResult == 0,
+              (before.st_mode & S_IFMT) == S_IFREG,
+              before.st_uid == geteuid(), before.st_size >= 0,
+              before.st_dev == beforePath.st_dev, before.st_ino == beforePath.st_ino else {
+            return false
+        }
+
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        let decoder = JSONDecoder()
+        var eventIDs = Set<String>()
+        var lastEvent: TimelineEvent?
+        var pendingLine = Data()
+        var expectedSequence = 1
+        var previousEventID: String?
+        var canonical = true
+
+        func consumeLine() {
+            guard !pendingLine.isEmpty,
+                  let event = try? decoder.decode(TimelineEvent.self, from: pendingLine),
+                  event.journal == journal,
+                  event.sequence == expectedSequence,
+                  event.previousEventID == previousEventID,
+                  event.provenance == .native,
+                  event.schemaVersion == TimelineEvent.currentSchemaVersion,
+                  event.payloadVersion <= 1,
+                  controlBoundedIdentity(event.eventID),
+                  eventIDs.insert(event.eventID).inserted,
+                  expectedSequence < Int.max else {
+                canonical = false
+                return
+            }
+            do {
+                try TimelineJournalWriter.validate(
+                    TimelineEventDraft(
+                        session: event.session, work: event.work, workHost: event.workHost,
+                        type: event.type, declaredDomains: event.declaredDomains,
+                        links: event.links),
+                    for: journal)
+            } catch {
+                canonical = false
+                return
+            }
+            lastEvent = event
+            previousEventID = event.eventID
+            expectedSequence += 1
+            pendingLine.removeAll(keepingCapacity: true)
+        }
+
+        while canonical {
+            let chunk = try handle.read(
+                upToCount: WorkHostControlLimits.sourceAbsenceVerificationChunkBytes) ?? Data()
+            if chunk.isEmpty { break }
+            var start = chunk.startIndex
+            while canonical, start < chunk.endIndex {
+                let suffix = chunk[start..<chunk.endIndex]
+                if let newline = suffix.firstIndex(of: 0x0A) {
+                    let fragment = chunk[start..<newline]
+                    let (lineBytes, lineOverflow) = pendingLine.count.addingReportingOverflow(
+                        fragment.count + 1)
+                    guard !lineOverflow,
+                          lineBytes <= TimelineJournalWriter.maximumRecordBytes else {
+                        canonical = false
+                        break
+                    }
+                    pendingLine.append(contentsOf: fragment)
+                    consumeLine()
+                    start = chunk.index(after: newline)
+                } else {
+                    let fragment = chunk[start..<chunk.endIndex]
+                    let (lineBytes, lineOverflow) = pendingLine.count.addingReportingOverflow(
+                        fragment.count)
+                    guard !lineOverflow,
+                          lineBytes < TimelineJournalWriter.maximumRecordBytes else {
+                        canonical = false
+                        break
+                    }
+                    pendingLine.append(contentsOf: fragment)
+                    start = chunk.endIndex
+                }
+                if pendingLine.count >= TimelineJournalWriter.maximumRecordBytes {
+                    canonical = false
+                    break
+                }
+            }
+        }
+        if !pendingLine.isEmpty { canonical = false }
+
+        var after = stat()
+        var afterPath = stat()
+        let afterPathResult = path.withCString { lstat($0, &afterPath) }
+        guard fstat(descriptor, &after) == 0,
+              afterPathResult == 0,
+              (after.st_mode & S_IFMT) == S_IFREG,
+              after.st_uid == geteuid(),
+              after.st_dev == afterPath.st_dev, after.st_ino == afterPath.st_ino,
+              after.st_dev == before.st_dev, after.st_ino == before.st_ino,
+              after.st_size == before.st_size else {
+            return false
+        }
+        guard canonical, let lastEvent else { return false }
+        return lastEvent.eventID == cursor.eventID && lastEvent.sequence == cursor.sequence
     }
 
     private func validateRegistrationRequest(
@@ -2459,9 +3672,83 @@ public actor WorkHostControlJournal {
         }
     }
 
+    /// Append one of the typed Session-creation control facts. It uses the same preflight,
+    /// canonical append, and independently synchronized seal path as ordinary control
+    /// mutations; keeping it here avoids a second persistence mechanism for recovery state.
+    private func appendSessionCreationDraft(
+        _ draft: TimelineEventDraft,
+        digest: String,
+        current: WorkHostControlSnapshot,
+        causalCursor: JournalCursor
+    ) async throws -> TimelineJournalCommit {
+        guard causalCursor == currentCursor(of: current), causalCursor.journal == journal else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation control cursor is stale")
+        }
+        let (expectedSequence, sequenceOverflow) = causalCursor.sequence.addingReportingOverflow(1)
+        guard !sequenceOverflow else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control journal sequence cannot advance")
+        }
+        let preflightEvent = TimelineEvent(
+            eventID: "control-preflight-\(UUID().uuidString.lowercased())",
+            journal: journal, sequence: expectedSequence,
+            command: draft.command, previousEventID: causalCursor.eventID,
+            causedByEventID: draft.causedByEventID,
+            session: draft.session, work: draft.work, workHost: draft.workHost,
+            client: draft.client, sessionAttachment: draft.sessionAttachment,
+            clientAttachment: draft.clientAttachment,
+            actor: readerActor, hostRecordedAt: Date(), type: draft.type,
+            declaredDomains: draft.declaredDomains, payload: draft.payload)
+        var preflight = WorkHostControlReducer(snapshot: current)
+        preflight.apply(preflightEvent)
+        guard preflight.snapshot.structuralIntegrityValid,
+              preflight.snapshot.semanticProjectionValid,
+              preflight.snapshot.quarantinedEvents.count == current.quarantinedEvents.count else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "Session creation control fact is not valid for current state")
+        }
+        let boundedDraft = TimelineEventDraft(
+            idempotencyKey: digest, command: draft.command,
+            causedByEventID: draft.causedByEventID,
+            session: draft.session, work: draft.work, workHost: draft.workHost,
+            client: draft.client, sessionAttachment: draft.sessionAttachment,
+            clientAttachment: draft.clientAttachment, type: draft.type,
+            declaredDomains: draft.declaredDomains, payload: draft.payload)
+        let commit: TimelineJournalCommit
+        do {
+            commit = try await writer.append(boundedDraft)
+        } catch {
+            if case .failed(let reason) = await writer.health { controlFailure = reason }
+            throw error
+        }
+        do {
+            try appendToCacheAndSeal(commit: commit, current: current)
+            return commit
+        } catch {
+            let reason = "Work Host control durability seal failed: \(error.localizedDescription)"
+            controlFailure = reason
+            throw TimelineJournalWriter.WriterError.unavailable(reason)
+        }
+    }
+
     private func currentCursor(of snapshot: WorkHostControlSnapshot) -> JournalCursor {
         JournalCursor(
             journal: journal, eventID: snapshot.lastEventID, sequence: snapshot.lastSequence)
+    }
+
+    /// A source-journal failure leaves the Session reservation durable, but there is no atomic
+    /// cross-journal commit which could make a later control event part of that transaction. Keep
+    /// the reservation cursor current until its matching completion or a source-absence abort is
+    /// recorded. Exact retries are handled before this guard, so replaying an already committed
+    /// mutation remains safe.
+    private func rejectNewMutationWhileSessionCreationIncomplete(
+        _ snapshot: WorkHostControlSnapshot
+    ) throws {
+        guard !snapshot.sessionCreations.values.contains(where: { !$0.isResolved }) else {
+            throw TimelineJournalWriter.WriterError.invalidDraft(
+                reason: "control mutation is blocked by an incomplete Session creation reservation")
+        }
     }
 
     private static func commandIndexKey(
@@ -2595,6 +3882,8 @@ public actor WorkHostControlJournal {
                     journal: journal, eventID: record.event.eventID,
                     sequence: record.event.sequence))
         }
+
+        try rejectNewMutationWhileSessionCreationIncomplete(current)
 
         // Verification is deliberately after exact-command reconciliation. Once this exact
         // acknowledgement is durable, a lost-response retry must not start depending on mutable

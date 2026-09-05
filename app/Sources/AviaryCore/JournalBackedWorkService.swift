@@ -1206,7 +1206,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 WorkServiceProtocol.maximumSupportedVersion,
             host: host, hostInstance: hostInstance,
             controlJournal: cursor.journal, controlCursor: cursor,
-            capabilities: Set(WorkServiceCapability.allCases), workspaceCatalog: catalog)
+            capabilities: Set(WorkServiceCapability.allCases),
+            workspaceCatalog: catalog)
     }
 
     public func listWorks(_ request: WorkServiceListRequest) async throws -> WorkServiceWorkPage {
@@ -1442,6 +1443,273 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 outcome: .created))
     }
 
+    public func createSession(_ request: WorkServiceCreateSessionRequest) async throws
+        -> WorkServiceCreateSessionResponse {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        let control = try await controlSnapshot()
+        let existing = control.sessionCreation(
+            work: request.work, client: request.client, commandID: request.commandID)
+        if let existing {
+            let same = existing.reservation.workJournal == request.journal
+                && existing.reservation.authorizingAttachment == request.attachment
+                && existing.reservation.causalControlCursor == request.causalControlCursor
+                && existing.reservation.causalWorkCursor == request.causalWorkCursor
+                && existing.reservation.requestedCapabilities
+                    == request.requestedCapabilities.map { $0.rawValue }.sorted()
+            guard same, !existing.isConflicted else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "create Session command conflicts with a prior request")
+            }
+        }
+        if let existing, let prior = existing.result {
+            // A completed exact retry is a reconstruction, not another publication attempt.
+            // The Work may have advanced after the response was lost, so reopening the old
+            // source saga would incorrectly require its historical cursor to still be the tail.
+            // Re-read and authenticate the referenced Session/Work evidence, then replay the
+            // exact recorded transition cursors without consulting mutable authorization state.
+            let verifiedAttachments = try await completedSessionAttachments(
+                for: request.work, source: source, control: control)
+            guard let verified = verifiedAttachments.first(where: {
+                $0.attachment == existing.reservation.clientAttachment
+                    && $0.session == existing.reservation.session
+                    && $0.sessionAttachment == existing.reservation.sessionAttachment
+            }) else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let effective = Set(
+                prior.capabilities.compactMap(WorkServiceCapability.init(rawValue:)))
+            let authorization = WorkServiceAuthorizationOutcome(
+                requested: request.requestedCapabilities, granted: effective,
+                denied: request.requestedCapabilities.subtracting(effective),
+                diagnostic: effective == request.requestedCapabilities
+                    ? nil : "capabilities were limited by the authorizing attachment or Work state")
+            let attachment = try clientAttachment(
+                verified, control: control, authorizationOverride: authorization)
+            let relationship = WorkServiceSessionAttachmentDescriptor(
+                session: existing.reservation.session,
+                sessionJournal: existing.reservation.sessionJournal,
+                sessionAttachment: existing.reservation.sessionAttachment,
+                publication: prior.publication == "terminal_reference"
+                    ? .terminalReference : .mirrored,
+                causalSessionCursor: prior.causalSessionCursor,
+                sessionCursor: prior.sessionCursor,
+                causalWorkCursor: prior.causalWorkCursor,
+                resultingWorkCursor: prior.resultingWorkCursor,
+                capabilities: effective)
+            let descriptor = try await descriptor(for: request.work, client: request.client)
+            let receipt = controlReceipt(
+                .createSession, work: request.work, commandID: request.commandID,
+                state: .duplicate, causal: request.causalControlCursor,
+                resulting: prior.resultingControlCursor,
+                authorization: authorization, outcome: .sessionCreated)
+            return WorkServiceCreateSessionResponse(
+                work: descriptor, session: existing.reservation.session,
+                sessionJournal: existing.reservation.sessionJournal,
+                sessionAttachment: existing.reservation.sessionAttachment,
+                attachment: attachment, relationship: relationship,
+                workCursor: prior.resultingWorkCursor,
+                sessionCursor: prior.sessionCursor,
+                controlCursor: prior.resultingControlCursor,
+                authorization: authorization, commandID: request.commandID,
+                state: .duplicate, host: hostInstance,
+                causalControlCursor: request.causalControlCursor,
+                causalWorkCursor: request.causalWorkCursor, receipt: receipt,
+                diagnostic: "idempotent duplicate")
+        }
+        let authorizing = control.clientAttachments[request.attachment.attachmentID]
+        let operationAuthorization = authorizer.authorization(
+            for: request.client, requested: [.createSession])
+        let attachedClientCount = control.clientAttachments.values.filter {
+            $0.work == request.work && $0.workJournal == request.journal && $0.isAttached
+        }.count
+        guard existing != nil || attachedClientCount < WorkServiceBounds.maxAttachmentsPerWork else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "Work client attachment bound reached")
+        }
+        let terminal = source.workState.lifecycle != .active
+        let semanticCapabilities: Set<WorkServiceCapability> = terminal
+            ? [.observe] : Set(WorkServiceCapability.allCases).subtracting([.createSession])
+        let authorization: WorkServiceAuthorizationOutcome
+        let effective: Set<WorkServiceCapability>
+        if let prior = existing?.result {
+            // An exact retry replays the capabilities that were durably published. Current
+            // attachment/auth state may have changed after the original response; rechecking it
+            // here would turn a lost response into a false denial.
+            effective = Set(prior.capabilities.compactMap(WorkServiceCapability.init(rawValue:)))
+            authorization = WorkServiceAuthorizationOutcome(
+                requested: request.requestedCapabilities, granted: effective,
+                denied: request.requestedCapabilities.subtracting(effective),
+                diagnostic: effective == request.requestedCapabilities
+                    ? nil : "capabilities were limited by the authorizing attachment or Work state")
+        } else {
+            guard let authorizing,
+                  authorizing.work == request.work,
+                  authorizing.workJournal == request.journal,
+                  authorizing.client == request.client,
+                  authorizing.isAttached,
+                  operationAuthorization.allows(.createSession),
+                  authorizing.capabilities.contains(WorkServiceCapability.createSession.rawValue)
+            else {
+                throw control.clientAttachments[request.attachment.attachmentID] == nil
+                    ? WorkServiceProtocolError.attachmentNotFound
+                    : WorkServiceProtocolError.capabilityDenied(.createSession)
+            }
+            let principal = authorizer.authorization(
+                for: request.client, requested: request.requestedCapabilities)
+            let authorizingCapabilities = Set(
+                authorizing.capabilities.compactMap(WorkServiceCapability.init(rawValue:)))
+            effective = request.requestedCapabilities
+                .intersection(principal.granted)
+                .intersection(authorizingCapabilities)
+                .intersection(semanticCapabilities)
+            authorization = WorkServiceAuthorizationOutcome(
+                requested: request.requestedCapabilities, granted: effective,
+                denied: request.requestedCapabilities.subtracting(effective),
+                diagnostic: effective == request.requestedCapabilities
+                    ? nil : "capabilities were limited by the authorizing attachment or Work state")
+        }
+        let controlCursor = try await currentControlCursor()
+        guard existing != nil || request.causalControlCursor == controlCursor else {
+            throw WorkServiceProtocolError.staleCursor(
+                expected: request.causalControlCursor, actual: controlCursor)
+        }
+        guard existing != nil || request.causalWorkCursor == source.workCursor else {
+            throw WorkServiceProtocolError.staleCursor(
+                expected: request.causalWorkCursor, actual: source.workCursor)
+        }
+        let terminalEvent: EventRef? = terminal
+            ? source.workRead.records.last.map {
+                EventRef(journal: source.workJournal, eventID: $0.event.eventID)
+            } : nil
+        if terminal {
+            guard source.workState.activeRun == nil,
+                  let last = source.workRead.records.last,
+                  [TimelineEventType.workCompleted, TimelineEventType.workDestroyed,
+                   TimelineEventType.workFailed].contains(last.event.type) else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            guard request.requestedCapabilities.contains(.observe),
+                  effective == [.observe] else {
+                throw WorkServiceProtocolError.capabilityDenied(.observe)
+            }
+        }
+        var relationshipIDs = Set(source.workState.sessionAttachments.keys)
+        relationshipIDs.formUnion(control.sessionCreations.values.compactMap { creation in
+            guard creation.reservation.work == request.work, creation.result != nil else {
+                return nil
+            }
+            return creation.reservation.sessionAttachment.attachmentID
+        })
+        guard existing != nil || relationshipIDs.count < WorkServiceBounds.maxSessionAttachmentsPerWork else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "Work Session attachment bound reached")
+        }
+
+        // A durable reservation is the minting boundary. On an exact retry all identities below
+        // come from that reservation; no random value is generated before the control journal
+        // has admitted the operation.
+        let reservation: WorkHostControlSessionCreationRequest
+        if let existing {
+            reservation = existing.reservation
+        } else {
+            let identities = try await mintSessionPublicationIdentities(work: request.work)
+            let sessionJournal = JournalRef.session(
+                identities.session, journalID: "session",
+                authority: TimelineAuthorityRef(host.workHostID))
+            let command = CommandRef(
+                commandID: request.commandID, client: request.client,
+                sessionAttachment: nil,
+                causalCursor: request.causalControlCursor)
+            reservation = WorkHostControlSessionCreationRequest(
+                work: request.work, workJournal: request.journal,
+                authorizingAttachment: request.attachment, client: request.client,
+                command: command, causalControlCursor: request.causalControlCursor,
+                causalWorkCursor: request.causalWorkCursor,
+                requestedCapabilities: request.requestedCapabilities.map { $0.rawValue },
+                session: identities.session, sessionJournal: sessionJournal,
+                sessionAttachment: identities.sessionAttachment,
+                clientAttachment: identities.clientAttachment)
+        }
+        let requestedPublicationCapabilities = existing?.result?.capabilities
+            ?? effective.map { $0.rawValue }
+        let publicationHome = home
+        let publicationHost = host
+        let publicationActorID = actor.actorID
+        let publicationActorKind = actor.kind
+        let result: WorkHostControlSessionCreationResult
+        if let prior = existing?.result {
+            // The source verifier is the authority for a completed result. It must still see the
+            // exact three Session records and the required Work mirror/reference, but no source
+            // append is attempted on retry (the Work may have advanced after publication).
+            guard try await completedSessionAttachments(
+                for: request.work, source: source, control: control).contains(where: {
+                    $0.attachment == reservation.clientAttachment && $0.client == request.client
+                }) else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            result = prior
+        } else {
+            let transaction = try await controlJournal.publishSessionCreation(reservation) {
+                [publicationHome, publicationHost, publicationActorID, publicationActorKind,
+                 requestedPublicationCapabilities, terminalEvent] reserved in
+                try await RunJournalBundle.publishSessionAttachment(
+                    home: publicationHome,
+                    request: RunJournalBundleSessionPublicationRequest(
+                        work: reserved.work, workHost: publicationHost,
+                        workJournal: reserved.workJournal, session: reserved.session,
+                        sessionJournal: reserved.sessionJournal,
+                        sessionAttachment: reserved.sessionAttachment, client: reserved.client,
+                        command: CommandRef(
+                            commandID: reserved.command.commandID, client: reserved.client,
+                            sessionAttachment: reserved.sessionAttachment,
+                            causalCursor: reserved.causalWorkCursor),
+                        capabilities: requestedPublicationCapabilities,
+                        causalWorkCursor: reserved.causalWorkCursor,
+                        terminalEvent: terminalEvent),
+                    actorID: publicationActorID, actorKind: publicationActorKind)
+            }
+            result = transaction.result
+        }
+        // The owner returns the completion commit cursor captured while its mutation gate was
+        // still held. A fresh read here could include an unrelated control mutation that raced
+        // after completion and would make the accepted +2 span unverifiable.
+        let resultControlCursor = result.resultingControlCursor
+        let updatedControl = try await controlSnapshot()
+        let attachment = try completedSessionClientAttachment(
+            reservation: reservation, result: result, control: updatedControl)
+        let relationship = WorkServiceSessionAttachmentDescriptor(
+            session: reservation.session, sessionJournal: reservation.sessionJournal,
+            sessionAttachment: reservation.sessionAttachment,
+            publication: result.publication == "terminal_reference"
+                ? .terminalReference : .mirrored,
+            causalSessionCursor: result.causalSessionCursor,
+            sessionCursor: result.sessionCursor,
+            causalWorkCursor: result.causalWorkCursor,
+            resultingWorkCursor: result.resultingWorkCursor,
+            capabilities: Set(result.capabilities.compactMap {
+                WorkServiceCapability(rawValue: $0)
+            }))
+        let descriptor = try await descriptor(for: request.work, client: request.client)
+        let receipt = controlReceipt(
+            .createSession, work: request.work, commandID: request.commandID,
+            state: existing?.result == nil ? .accepted : .duplicate,
+            causal: request.causalControlCursor, resulting: resultControlCursor,
+            authorization: authorization, outcome: .sessionCreated)
+        return WorkServiceCreateSessionResponse(
+            work: descriptor, session: reservation.session,
+            sessionJournal: reservation.sessionJournal,
+            sessionAttachment: reservation.sessionAttachment, attachment: attachment,
+            relationship: relationship, workCursor: result.resultingWorkCursor,
+            sessionCursor: result.sessionCursor, controlCursor: resultControlCursor,
+            authorization: authorization, commandID: request.commandID,
+            state: existing?.result == nil ? .accepted : .duplicate,
+            host: hostInstance, causalControlCursor: request.causalControlCursor,
+            causalWorkCursor: request.causalWorkCursor, receipt: receipt,
+            diagnostic: existing?.result == nil ? nil : "idempotent duplicate")
+    }
+
     public func attach(_ request: WorkServiceAttachRequest) async throws -> WorkServiceAttachResponse {
         try await ensureLoaded()
         try validateClient(request.client)
@@ -1540,7 +1808,15 @@ public actor JournalBackedWorkService: WorkServiceClient {
         guard request.causalControlCursor == cursor else {
             throw WorkServiceProtocolError.staleCursor(expected: request.causalControlCursor, actual: cursor)
         }
-        let sessionTuple = try normalizedSessionTuple(
+        let control = try await controlSnapshot()
+        let attachedClientCount = control.clientAttachments.values.filter {
+            $0.work == request.work && $0.workJournal == request.journal && $0.isAttached
+        }.count
+        guard attachedClientCount < WorkServiceBounds.maxAttachmentsPerWork else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "Work client attachment bound reached")
+        }
+        let sessionTuple = try await normalizedSessionTuple(
             request.session, request.sessionJournal, request.sessionAttachment, source: source)
         let attachmentRef = try await mintClientAttachment()
         let command = CommandRef(
@@ -1548,14 +1824,14 @@ public actor JournalBackedWorkService: WorkServiceClient {
             // The normalized tuple is the authority for this attachment's Session identity.
             // Keep the command envelope tied to it rather than the source's shorthand field.
             sessionAttachment: sessionTuple.attachment, causalCursor: request.causalControlCursor)
-        _ = try await controlJournal.attachClient(
+        let attachmentCommit = try await controlJournal.attachClient(
             work: request.work, workJournal: request.journal, attachment: attachmentRef,
             client: request.client, capabilities: Set(auth.granted.map(\.rawValue)),
             requestedCapabilities: Set(request.requestedCapabilities.map(\.rawValue)),
             session: sessionTuple.session, sessionJournal: sessionTuple.journal,
             sessionAttachment: sessionTuple.attachment, command: command,
             causalControlCursor: request.causalControlCursor)
-        let resulting = try await currentControlCursor()
+        let resulting = attachmentCommit.cursor
         let descriptor = try await descriptor(for: request.work, client: request.client)
         let updatedControl = try await controlSnapshot()
         guard let record = updatedControl.clientAttachments[attachmentRef.attachmentID] else {
@@ -1634,10 +1910,18 @@ public actor JournalBackedWorkService: WorkServiceClient {
         guard current.capabilities.contains(WorkServiceCapability.control.rawValue) else {
             throw WorkServiceProtocolError.capabilityDenied(.control)
         }
-        try validateSessionTuple(
-            current.session, current.sessionJournal, current.sessionAttachment,
-            expectedSession: source.session, expectedJournal: source.sessionJournal,
-            expectedAttachment: source.sessionAttachment)
+        let relationships = try await sessionRelationships(for: source, control: control)
+        guard let currentSession = current.session,
+              let currentSessionJournal = current.sessionJournal,
+              let currentSessionAttachment = current.sessionAttachment,
+              relationships.contains(where: {
+                  $0.session == currentSession
+                      && $0.sessionJournal == currentSessionJournal
+                      && $0.sessionAttachment == currentSessionAttachment
+                      && $0.isAttached
+              }) else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
         let cursor = try await currentControlCursor()
         guard request.causalControlCursor == cursor else {
             throw WorkServiceProtocolError.staleCursor(expected: request.causalControlCursor, actual: cursor)
@@ -1646,12 +1930,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
             commandID: request.commandID, client: request.client,
             sessionAttachment: current.sessionAttachment,
             causalCursor: request.causalControlCursor)
-        _ = try await controlJournal.explicitlyDetachClient(
+        let detachCommit = try await controlJournal.explicitlyDetachClient(
             work: request.work, workJournal: request.journal, attachment: request.attachment,
             client: request.client, session: current.session, sessionJournal: current.sessionJournal,
             sessionAttachment: current.sessionAttachment, command: command,
             causalControlCursor: request.causalControlCursor)
-        let resulting = try await currentControlCursor()
+        let resulting = detachCommit.cursor
         let receipt = controlReceipt(.detach, work: request.work, commandID: request.commandID,
                                     state: .accepted, causal: request.causalControlCursor,
                                     resulting: resulting, authorization: authorization(current),
@@ -1754,14 +2038,14 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let command = CommandRef(commandID: request.commandID, client: request.client,
                                  sessionAttachment: current.sessionAttachment,
                                  causalCursor: request.causalControlCursor)
-        _ = try await controlJournal.updateClientCapabilities(
+        let capabilityCommit = try await controlJournal.updateClientCapabilities(
             work: request.work, workJournal: request.journal, attachment: request.attachment,
             client: request.client, capabilities: Set(auth.granted.map(\.rawValue)),
             requestedCapabilities: Set(request.requestedCapabilities.map(\.rawValue)),
             session: current.session, sessionJournal: current.sessionJournal,
             sessionAttachment: current.sessionAttachment, command: command,
             causalControlCursor: request.causalControlCursor)
-        let resulting = try await currentControlCursor()
+        let resulting = capabilityCommit.cursor
         let snapshot = try await controlSnapshot()
         guard let updated = snapshot.clientAttachments[request.attachment.attachmentID] else {
             throw WorkServiceProtocolError.sourceIncomplete
@@ -1851,8 +2135,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
         guard current.capabilities.contains(WorkServiceCapability.observe.rawValue) else {
             throw WorkServiceProtocolError.capabilityDenied(.observe)
         }
-        try validateTarget(request.target, source: source)
-        let actualTargetCursor = request.target.session == nil ? source.workCursor : source.sessionCursor
+        let serviceAttachment = try clientAttachment(current, control: control)
+        try await validateReadableTarget(
+            request.target, attachment: serviceAttachment, source: source)
+        let targetRecords = try await records(for: request.target, source: source)
+        let actualTargetCursor = cursor(
+            targetRecords.result.records, journal: request.target.journal)
         guard request.cursor.sequence <= actualTargetCursor.sequence else {
             throw WorkServiceProtocolError.staleCursor(expected: request.cursor, actual: actualTargetCursor)
         }
@@ -1863,13 +2151,13 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let command = CommandRef(commandID: request.commandID, client: request.client,
                                  sessionAttachment: current.sessionAttachment,
                                  causalCursor: request.causalControlCursor)
-        _ = try await controlJournal.acknowledgeRead(
+        let acknowledgementCommit = try await controlJournal.acknowledgeRead(
             work: request.work, workJournal: request.journal, attachment: request.attachment,
             client: request.client, targetJournal: request.target.journal, cursor: request.cursor,
             session: current.session, sessionJournal: current.sessionJournal,
             sessionAttachment: current.sessionAttachment, command: command,
             causalControlCursor: request.causalControlCursor)
-        let resulting = try await currentControlCursor()
+        let resulting = acknowledgementCommit.cursor
         return WorkServiceAcknowledgeReadResponse(
             work: request.work, target: request.target, cursor: request.cursor,
             commandID: request.commandID, state: .accepted, host: hostInstance,
@@ -1885,10 +2173,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
         try await ensureLoaded()
         try validateClient(request.client)
         let source = try await requireCanonical(work: request.work, journal: request.journal)
-        try await requireAttached(
+        let attachment = try await requireAttached(
             work: request.work, journal: request.journal, attachment: request.attachment,
             client: request.client, capability: .observe)
-        let records = try records(for: request.target, source: source)
+        try await validateReadableTarget(
+            request.target, attachment: attachment, source: source)
+        let records = try await records(for: request.target, source: source)
         let page = try await page(
             entry: records, journal: request.target.journal,
             expectedURL: expectedURL(for: request.target, source: source),
@@ -1906,10 +2196,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
         try await ensureLoaded()
         try validateClient(request.client)
         let source = try await requireCanonical(work: request.work, journal: request.journal)
-        try await requireAttached(
+        let attachment = try await requireAttached(
             work: request.work, journal: request.journal, attachment: request.attachment,
             client: request.client, capability: .observe)
-        let records = try records(for: request.target, source: source)
+        try await validateReadableTarget(
+            request.target, attachment: attachment, source: source)
+        let records = try await records(for: request.target, source: source)
         let page = try await page(
             entry: records, journal: request.target.journal,
             expectedURL: expectedURL(for: request.target, source: source),
@@ -1946,7 +2238,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
             throw WorkServiceProtocolError.invalidRequest("body offset and limit must be positive")
         }
         guard request.reference.authority == request.journal
-                || request.reference.authority == source.sessionJournal else {
+                || request.reference.authority == attachment.sessionJournal else {
             throw WorkServiceProtocolError.journalMismatch
         }
         if artifacts(in: source).contains(where: { $0.bodyReference == request.reference })
@@ -3312,14 +3604,23 @@ public actor JournalBackedWorkService: WorkServiceClient {
             execution = .recoveryRequired
         }
         let control = try await controlSnapshot()
-        let attachments = try control.clientAttachments.values
+        // Every completed Session creation is inserted into the canonical control attachment
+        // table by the reducer. Source verification below authenticates those records; it must
+        // not synthesize a second always-attached copy that could resurrect a later detach.
+        _ = try await completedSessionAttachments(for: work, source: source, control: control)
+        let allAttachments = Array(control.clientAttachments.values)
+        let attachments = try allAttachments
             .filter {
                 $0.work == work && $0.workJournal == source.workJournal && $0.isAttached
+            }
+            .reduce(into: [WorkHostClientAttachmentSnapshot]()) { result, value in
+                guard !result.contains(where: { $0.attachment == value.attachment }) else { return }
+                result.append(value)
             }
             .sorted { $0.attachment.attachmentID < $1.attachment.attachmentID }
             .prefix(WorkServiceBounds.maxAttachmentsPerWork)
             .map { try clientAttachment($0, control: control) }
-        let omitted = control.clientAttachments.values.filter {
+        let omitted = allAttachments.filter {
             $0.work == work && $0.workJournal == source.workJournal && $0.isAttached
         }.count - attachments.count
         guard let config = manifests[work]?.requestedConfiguration
@@ -3338,7 +3639,10 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 includeContextFiles: config.includeContextFiles,
                 recordPayloads: config.recordPayloads, resumePolicy: config.resumePolicy),
             hostObservation: observation,
-            attachments: Array(attachments), artifacts: artifacts(in: source),
+            attachments: Array(attachments),
+            sessionAttachments: try await sessionRelationships(
+                for: source, control: control),
+            artifacts: artifacts(in: source),
             omissions: omitted > 0 ? [WorkServiceOmission(category: "attachments", count: omitted)] : [])
     }
 
@@ -3367,6 +3671,233 @@ public actor JournalBackedWorkService: WorkServiceClient {
             sessionJournal: value.sessionJournal, sessionAttachment: value.sessionAttachment,
             authorization: authorizationOverride ?? auth,
             readAcknowledgements: Array(acknowledgements))
+    }
+
+    private func completedSessionAttachments(
+        for work: WorkRef, source: CanonicalSource,
+        control: WorkHostControlSnapshot
+    ) async throws -> [WorkHostClientAttachmentSnapshot] {
+        var result: [WorkHostClientAttachmentSnapshot] = []
+        func capabilities(_ event: TimelineEvent) -> [String]? {
+            guard let values = event.payload["capabilities"]?.arrayValue else { return nil }
+            let names = values.compactMap(\.stringValue)
+            return names.count == values.count ? names.sorted() : nil
+        }
+        for creation in control.sessionCreations.values where creation.reservation.work == work {
+            guard let publication = creation.result else { continue }
+            guard publication.publication == "mirrored"
+                    || publication.publication == "terminal_reference",
+                  publication.sessionCreatedEvent.journal == creation.reservation.sessionJournal,
+                  publication.sessionAttachedEvent.journal == creation.reservation.sessionJournal,
+                  publication.cursorAdvancedEvent.journal == creation.reservation.sessionJournal,
+                  publication.causalWorkCursor == creation.reservation.causalWorkCursor else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            // A control result is not source truth by itself. Re-read the newly-created Session
+            // and verify every referenced event before projecting its client attachment.
+            let session = try readJournal(
+                publication.sessionCreatedEvent.journal,
+                expectedURL: home.timelineV2SessionJournalURL(creation.reservation.session))
+            let advancedCause: EventRef?
+            if publication.publication == "mirrored" {
+                advancedCause = publication.workMirrorEvent
+            } else {
+                advancedCause = source.workRead.records
+                    .last
+                    .map { EventRef(journal: source.workJournal, eventID: $0.event.eventID) }
+            }
+            guard session.result.quarantinedSuffix == nil,
+                  session.result.truncatedTail == nil,
+                  session.result.records.count == 3,
+                  let created = session.result.records.first(where: {
+                      $0.event.eventID == publication.sessionCreatedEvent.eventID
+                  }),
+                  let attached = session.result.records.first(where: {
+                      $0.event.eventID == publication.sessionAttachedEvent.eventID
+                  }),
+                  let advanced = session.result.records.first(where: {
+                      $0.event.eventID == publication.cursorAdvancedEvent.eventID
+                  }),
+                  attached.event.type == TimelineEventType.sessionAttached,
+                  advanced.event.type == TimelineEventType.sessionAttachmentCursorAdvanced,
+                  created.event.type == TimelineEventType.sessionCreated,
+                  created.event.session == creation.reservation.session,
+                  attached.event.session == creation.reservation.session,
+                  attached.event.work == work,
+                  created.event.workHost == nil,
+                  attached.event.workHost == host,
+                  attached.event.client == creation.reservation.client,
+                  attached.event.sessionAttachment == creation.reservation.sessionAttachment,
+                  attached.event.causedByEventID == publication.sessionCreatedEvent,
+                  created.event.journal == creation.reservation.sessionJournal,
+                  attached.event.journal == creation.reservation.sessionJournal,
+                  created.event.sequence == 1,
+                  attached.event.sequence == 2,
+                  advanced.event.session == creation.reservation.session,
+                  advanced.event.work == work,
+                  advanced.event.workHost == host,
+                  advanced.event.client == creation.reservation.client,
+                  advanced.event.sessionAttachment == creation.reservation.sessionAttachment,
+                  advanced.event.causedByEventID == advancedCause,
+                  advanced.event.journal == creation.reservation.sessionJournal,
+                  advanced.event.sequence == 3,
+                  capabilities(advanced.event) == publication.capabilities.sorted(),
+                  capabilities(attached.event) == publication.capabilities.sorted(),
+                  (advanced.event.payload["cursor"].flatMap {
+                      decodeTimelineValue($0) as JournalCursor?
+                  }) == publication.resultingWorkCursor,
+                  session.result.records.last?.event.eventID == publication.cursorAdvancedEvent.eventID,
+                  JournalCursor(
+                      journal: publication.sessionCursor.journal,
+                      eventID: publication.sessionCursor.eventID,
+                      sequence: publication.sessionCursor.sequence)
+                      == JournalCursor(journal: session.result.records.last!.event.journal,
+                                       eventID: session.result.records.last!.event.eventID,
+                                       sequence: session.result.records.last!.event.sequence) else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            if publication.publication == "mirrored" {
+                guard let mirror = publication.workMirrorEvent,
+                      source.workRead.records.contains(where: {
+                          $0.event.eventID == mirror.eventID
+                              && $0.event.type == TimelineEventType.sessionAttached
+                              && $0.event.session == creation.reservation.session
+                              && $0.event.workHost == host
+                              && $0.event.client == creation.reservation.client
+                              && $0.event.sessionAttachment == creation.reservation.sessionAttachment
+                              && $0.event.causedByEventID == publication.sessionAttachedEvent
+                              && JournalCursor(
+                                  journal: source.workJournal,
+                                  eventID: $0.event.eventID,
+                                  sequence: $0.event.sequence)
+                                  == publication.resultingWorkCursor
+                      }) else { throw WorkServiceProtocolError.sourceIncomplete }
+            } else {
+                guard publication.workMirrorEvent == nil,
+                      publication.resultingWorkCursor == publication.causalWorkCursor,
+                      source.workCursor == publication.causalWorkCursor,
+                      let terminalEvent = source.workRead.records.last,
+                      [TimelineEventType.workCompleted, TimelineEventType.workDestroyed,
+                       TimelineEventType.workFailed].contains(terminalEvent.event.type),
+                      JournalCursor(
+                          journal: source.workJournal,
+                          eventID: terminalEvent.event.eventID,
+                          sequence: terminalEvent.event.sequence)
+                          == publication.causalWorkCursor,
+                      let terminal = advanced.event.causedByEventID,
+                      source.workRead.records.contains(where: {
+                          EventRef(journal: source.workJournal, eventID: $0.event.eventID) == terminal
+                      }) else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+            }
+            guard let recorded = control.clientAttachments[
+                creation.reservation.clientAttachment.attachmentID],
+                  recorded.attachment == creation.reservation.clientAttachment,
+                  recorded.client == creation.reservation.client,
+                  recorded.work == work,
+                  recorded.workJournal == source.workJournal,
+                  recorded.session == creation.reservation.session,
+                  recorded.sessionJournal == creation.reservation.sessionJournal,
+                  recorded.sessionAttachment == creation.reservation.sessionAttachment,
+                  recorded.capabilities == Set(publication.capabilities),
+                  recorded.attachedEvent == publication.resultEvent else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            result.append(recorded)
+        }
+        return result
+    }
+
+    private func sessionRelationships(
+        for source: CanonicalSource, control: WorkHostControlSnapshot
+    ) async throws -> [WorkServiceSessionAttachmentDescriptor] {
+        var relationships: [WorkServiceSessionAttachmentDescriptor] = []
+        let primaryAttached = source.sessionRead.records.first {
+            let event = $0.event
+            return event.type == TimelineEventType.sessionAttached
+                && event.session == source.session && event.work == source.registration.reservation.work
+                && event.sessionAttachment == source.sessionAttachment
+        }
+        let primaryMirror = primaryAttached.flatMap { attached in
+            source.workRead.records.filter {
+                let event = $0.event
+                return event.type == TimelineEventType.sessionAttached
+                    && event.session == source.session
+                    && event.work == source.registration.reservation.work
+                    && event.sessionAttachment == source.sessionAttachment
+                    && event.causedByEventID == EventRef(
+                        journal: source.sessionJournal, eventID: attached.event.eventID)
+            }.first
+        }
+        if let attached = primaryAttached, let mirror = primaryMirror {
+            let prior = source.workRead.records.last(where: { $0.event.sequence < mirror.event.sequence })
+                .map { JournalCursor(journal: source.workJournal,
+                                      eventID: $0.event.eventID, sequence: $0.event.sequence) }
+                ?? JournalCursor(journal: source.workJournal, sequence: 0)
+            relationships.append(WorkServiceSessionAttachmentDescriptor(
+                session: source.session, sessionJournal: source.sessionJournal,
+                sessionAttachment: source.sessionAttachment, publication: .mirrored,
+                causalSessionCursor: JournalCursor(journal: source.sessionJournal, sequence: 0),
+                sessionCursor: JournalCursor(journal: source.sessionJournal,
+                                             eventID: source.sessionCursor.eventID,
+                                             sequence: source.sessionCursor.sequence),
+                causalWorkCursor: prior,
+                resultingWorkCursor: JournalCursor(journal: source.workJournal,
+                                                   eventID: mirror.event.eventID,
+                                                   sequence: mirror.event.sequence),
+                capabilities: Set((attached.event.payload["capabilities"]?.arrayValue ?? [])
+                    .compactMap { $0.stringValue }
+                    .compactMap { WorkServiceCapability(rawValue: $0) })))
+        }
+        let verifiedAttachments = try await completedSessionAttachments(
+            for: source.registration.reservation.work, source: source, control: control)
+        for creation in control.sessionCreations.values
+            where creation.reservation.work == source.registration.reservation.work {
+            guard let result = creation.result else { continue }
+            guard verifiedAttachments.contains(where: {
+                $0.attachment == creation.reservation.clientAttachment
+            }) else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            relationships.append(WorkServiceSessionAttachmentDescriptor(
+                session: creation.reservation.session,
+                sessionJournal: creation.reservation.sessionJournal,
+                sessionAttachment: creation.reservation.sessionAttachment,
+                publication: result.publication == "terminal_reference"
+                    ? .terminalReference : .mirrored,
+                causalSessionCursor: result.causalSessionCursor,
+                sessionCursor: result.sessionCursor,
+                causalWorkCursor: result.causalWorkCursor,
+                resultingWorkCursor: result.resultingWorkCursor,
+                capabilities: Set(result.capabilities.compactMap {
+                    WorkServiceCapability(rawValue: $0)
+                })))
+        }
+        return relationships.sorted {
+            $0.sessionAttachment.attachmentID < $1.sessionAttachment.attachmentID
+        }
+    }
+
+    private func completedSessionClientAttachment(
+        reservation: WorkHostControlSessionCreationRequest,
+        result: WorkHostControlSessionCreationResult,
+        control: WorkHostControlSnapshot
+    ) throws -> WorkServiceClientAttachment {
+        guard let value = control.clientAttachments[reservation.clientAttachment.attachmentID],
+              value.attachment == reservation.clientAttachment,
+              value.client == reservation.client,
+              value.work == reservation.work,
+              value.workJournal == reservation.workJournal,
+              value.session == reservation.session,
+              value.sessionJournal == reservation.sessionJournal,
+              value.sessionAttachment == reservation.sessionAttachment,
+              value.capabilities == Set(result.capabilities),
+              value.isAttached,
+              value.attachedEvent == result.resultEvent else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return try clientAttachment(value, control: control)
     }
 
     private func decodeControlPayload<T: Decodable>(_ value: JSONValue?) -> T? {
@@ -3414,8 +3945,10 @@ public actor JournalBackedWorkService: WorkServiceClient {
     ) async throws -> WorkServiceClientAttachment {
         let control = try await controlSnapshot()
         guard let value = control.clientAttachments[attachment.attachmentID],
-              value.work == work, value.workJournal == journal, value.client == client,
-              value.isAttached else { throw WorkServiceProtocolError.attachmentNotFound }
+              value.work == work, value.workJournal == journal,
+              value.client == client, value.isAttached else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
         let result = try clientAttachment(value, control: control)
         guard result.authorization.allows(capability) else {
             throw WorkServiceProtocolError.capabilityDenied(capability)
@@ -3436,9 +3969,48 @@ public actor JournalBackedWorkService: WorkServiceClient {
 
     private func records(
         for target: WorkServiceReadTarget, source: CanonicalSource
-    ) throws -> JournalReadCacheEntry {
-        try validateTarget(target, source: source)
-        return target.session == nil ? source.workCache : source.sessionCache
+    ) async throws -> JournalReadCacheEntry {
+        switch target {
+        case .work(let journal):
+            guard journal == source.workJournal else {
+                throw WorkServiceProtocolError.journalMismatch
+            }
+            return source.workCache
+        case .session(let session, let journal):
+            if session == source.session && journal == source.sessionJournal {
+                return source.sessionCache
+            }
+            let control = try await controlSnapshot()
+            guard try await sessionRelationships(for: source, control: control).contains(where: {
+                $0.session == session && $0.sessionJournal == journal
+            }) else { throw WorkServiceProtocolError.journalMismatch }
+            return try readJournal(
+                journal, expectedURL: home.timelineV2SessionJournalURL(session))
+        }
+    }
+
+    private func validateReadableTarget(
+        _ target: WorkServiceReadTarget,
+        attachment: WorkServiceClientAttachment,
+        source: CanonicalSource
+    ) async throws {
+        switch target {
+        case .work(let journal):
+            guard journal == source.workJournal else {
+                throw WorkServiceProtocolError.journalMismatch
+            }
+        case .session(let session, let journal):
+            guard attachment.session == session,
+                  attachment.sessionJournal == journal,
+                  attachment.sessionAttachment != nil else {
+                throw WorkServiceProtocolError.journalMismatch
+            }
+            let control = try await controlSnapshot()
+            guard try await sessionRelationships(for: source, control: control).contains(where: {
+                $0.session == session && $0.sessionJournal == journal
+                    && $0.sessionAttachment == attachment.sessionAttachment
+            }) else { throw WorkServiceProtocolError.journalMismatch }
+        }
     }
 
     private func expectedURL(
@@ -3446,6 +4018,9 @@ public actor JournalBackedWorkService: WorkServiceClient {
     ) -> URL {
         if target.session == nil {
             return home.timelineV2WorkJournalURL(source.registration.reservation.work)
+        }
+        if case .session(let session, _) = target {
+            return home.timelineV2SessionJournalURL(session)
         }
         return home.timelineV2SessionJournalURL(source.registration.reservation.session)
     }
@@ -4306,7 +4881,26 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 return true
             }
         }
+        if case .session(let session) = reference.authority.owner,
+           session != source.session {
+            let entry = try readJournal(
+                reference.authority,
+                expectedURL: home.timelineV2SessionJournalURL(session))
+            if entry.bodyReferences.contains(reference) { return true }
+            if !entry.bodyReferencesComplete,
+               try streamContainsBodyReference(
+                   entry: entry, journal: reference.authority,
+                   expectedURL: home.timelineV2SessionJournalURL(session), reference: reference) {
+                return true
+            }
+        }
         return false
+    }
+
+    private struct SessionPublicationIdentities: Sendable {
+        let session: SessionRef
+        let sessionAttachment: SessionAttachmentRef
+        let clientAttachment: ClientAttachmentRef
     }
 
     private func streamContainsBodyReference(
@@ -4391,6 +4985,34 @@ public actor JournalBackedWorkService: WorkServiceClient {
             causalWorkCursor: request.causalWorkCursor, resultingWorkCursor: proof.resultingWorkCursor,
             authorization: attachment.authorization,
             outcome: operation == .complete ? .completed : .destroyed, terminalProof: proof)
+    }
+
+    private func mintSessionPublicationIdentities(
+        work: WorkRef
+    ) async throws -> SessionPublicationIdentities {
+        for _ in 0..<32 {
+            let session = SessionRef("session-" + UUID().uuidString.lowercased())
+            let sessionAttachment = SessionAttachmentRef(
+                "session-attachment-" + UUID().uuidString.lowercased())
+            let clientAttachment = ClientAttachmentRef(
+                "client-attachment-" + UUID().uuidString.lowercased())
+            let journal = JournalRef.session(
+                session, journalID: "session", authority: TimelineAuthorityRef(host.workHostID))
+            let control = try await controlSnapshot()
+            let used = control.sessionCreations.values.contains {
+                $0.reservation.work == work
+                    && ($0.reservation.session == session
+                        || $0.reservation.sessionAttachment == sessionAttachment
+                        || $0.reservation.clientAttachment == clientAttachment)
+            }
+            guard !used, !FileManager.default.fileExists(
+                atPath: home.timelineV2SessionJournalURL(session).path) else { continue }
+            _ = journal
+            return SessionPublicationIdentities(
+                session: session, sessionAttachment: sessionAttachment,
+                clientAttachment: clientAttachment)
+        }
+        throw WorkServiceProtocolError.sourceIncomplete
     }
 
     private func mintClientAttachment() async throws -> ClientAttachmentRef {
@@ -4508,14 +5130,21 @@ public actor JournalBackedWorkService: WorkServiceClient {
     private func normalizedSessionTuple(
         _ session: SessionRef?, _ journal: JournalRef?, _ attachment: SessionAttachmentRef?,
         source: CanonicalSource
-    ) throws -> (session: SessionRef, journal: JournalRef, attachment: SessionAttachmentRef) {
+    ) async throws -> (session: SessionRef, journal: JournalRef, attachment: SessionAttachmentRef) {
         if session == nil && journal == nil && attachment == nil {
             return (source.session, source.sessionJournal, source.sessionAttachment)
         }
-        try validateSessionTuple(
-            session, journal, attachment, expectedSession: source.session,
-            expectedJournal: source.sessionJournal, expectedAttachment: source.sessionAttachment)
-        return (source.session, source.sessionJournal, source.sessionAttachment)
+        if session == source.session && journal == source.sessionJournal
+                && attachment == source.sessionAttachment {
+            return (source.session, source.sessionJournal, source.sessionAttachment)
+        }
+        let control = try await controlSnapshot()
+        let relationships = try await sessionRelationships(for: source, control: control)
+        guard let relationship = relationships.first(where: {
+            $0.session == session && $0.sessionJournal == journal
+                && $0.sessionAttachment == attachment && $0.isAttached
+        }) else { throw WorkServiceProtocolError.journalMismatch }
+        return (relationship.session, relationship.sessionJournal, relationship.sessionAttachment)
     }
 
     private func parsePageToken(_ token: String?, total: Int) throws -> Int {

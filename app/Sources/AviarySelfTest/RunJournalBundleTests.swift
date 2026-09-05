@@ -1199,6 +1199,7 @@ func test_runJournalBundleTerminalCommitterRecoversExactRetryWithoutSecondEvent(
                 && $0.command == command
         }.count,
         1)
+
 }
 
 func test_runJournalBundleTerminalMutationReopensWithoutStartingAnotherRun() async throws {
@@ -1266,6 +1267,24 @@ func test_runJournalBundleTerminalMutationReopensWithoutStartingAnotherRun() asy
                 && $0.command == command
         }.count,
         1)
+
+    // Recovery proof is descriptor-based and must never follow a replaced canonical locator.
+    let workURL = home.timelineV2WorkJournalURL(identity.work)
+    let movedWorkURL = workURL.appendingPathExtension("terminal-proof-source")
+    try FileManager.default.moveItem(at: workURL, to: movedWorkURL)
+    try FileManager.default.createSymbolicLink(at: workURL, withDestinationURL: movedWorkURL)
+    do {
+        _ = try RunJournalBundle.readTerminalCommit(
+            home: home, identity: identity, sessionAttachment: attachment,
+            command: command, detail: "complete after End")
+        XCTFail("terminal proof must reject a symlinked canonical Work journal")
+    } catch let error as RunJournalBundleError {
+        guard case .invalidJournal(let journal, _) = error else {
+            XCTFail("wrong symlinked terminal proof error: \(error)")
+            return
+        }
+        XCTAssertEqual(journal, workJournal)
+    }
 }
 
 func test_runJournalBundleCreatesIdleWorkBeforeAnyRunStarts() async throws {
@@ -1329,6 +1348,156 @@ func test_runJournalBundleCreatesIdleWorkBeforeAnyRunStarts() async throws {
     XCTAssertEqual(afterStart.last?.run, RunRef("idle-create-run"))
     _ = try await execution.finishRun(outcome: .canceled)
     try await execution.closeChecked()
+}
+
+func test_runJournalBundleSessionPublicationRejectsStalePartialSaga() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let host = try home.requirePersistedWorkHost()
+    let primary = WorkBinding(
+        session: SessionRef("publication-primary-session"),
+        work: WorkRef(workHostID: host.workHostID, workID: "publication-shared-work"),
+        workHost: host,
+        sessionAttachment: SessionAttachmentRef("publication-primary-attachment"))
+    let idle = try await RunJournalBundle.createIdleWork(
+        home: home, binding: primary, actorID: "publication-idle-control")
+
+    func request(
+        suffix: String, client: ClientRef
+    ) -> RunJournalBundleSessionPublicationRequest {
+        let session = SessionRef("publication-session-\(suffix)")
+        let attachment = SessionAttachmentRef("publication-attachment-\(suffix)")
+        return RunJournalBundleSessionPublicationRequest(
+            work: primary.work, workHost: host, workJournal: primary.workJournal,
+            session: session,
+            sessionJournal: .session(
+                session, journalID: "session",
+                authority: TimelineAuthorityRef(host.workHostID)),
+            sessionAttachment: attachment, client: client,
+            command: CommandRef(
+                commandID: "publication-command-\(suffix)", client: client,
+                sessionAttachment: attachment, causalCursor: idle.workCursor),
+            capabilities: [WorkServiceCapability.observe.rawValue],
+            causalWorkCursor: idle.workCursor)
+    }
+    let requestA = request(suffix: "a", client: ClientRef("publication-client-a"))
+    let requestB = request(suffix: "b", client: ClientRef("publication-client-b"))
+
+    do {
+        _ = try await RunJournalBundle.publishSessionAttachment(
+            home: home, request: requestA, actorID: "publication-host",
+            failurePlan: (.none, .init(point: .beforeWrite)))
+        XCTFail("injected Work-mirror failure unexpectedly completed publication A")
+    } catch {
+        XCTAssertTrue(true)
+    }
+    let partialA = try bundleEvents(
+        home, requestA.sessionJournal,
+        home.timelineV2SessionJournalURL(requestA.session))
+    XCTAssertEqual(partialA.map(\.type), [
+        TimelineEventType.sessionCreated, TimelineEventType.sessionAttached,
+    ])
+
+    let publicationB = try await RunJournalBundle.publishSessionAttachment(
+        home: home, request: requestB, actorID: "publication-host")
+    XCTAssertEqual(publicationB.resultingWorkCursor.sequence,
+                   idle.workCursor.sequence + 1)
+    let workBytesAfterB = try Data(
+        contentsOf: home.timelineV2WorkJournalURL(primary.work))
+    do {
+        _ = try await RunJournalBundle.publishSessionAttachment(
+            home: home, request: requestA, actorID: "publication-host")
+        XCTFail("stale publication A appended after publication B won the causal Work cursor")
+    } catch let error as RunJournalBundleError {
+        guard case .invalidOperation(let reason) = error,
+              reason.contains("cursor advanced") else {
+            XCTFail("wrong stale publication error: \(error)")
+            return
+        }
+    }
+    XCTAssertEqual(try Data(contentsOf: home.timelineV2WorkJournalURL(primary.work)),
+                   workBytesAfterB)
+    let stillPartialA = try bundleEvents(
+        home, requestA.sessionJournal,
+        home.timelineV2SessionJournalURL(requestA.session))
+    XCTAssertEqual(stillPartialA.map(\.type), partialA.map(\.type))
+    let exactB = try await RunJournalBundle.publishSessionAttachment(
+        home: home, request: requestB, actorID: "publication-host")
+    XCTAssertEqual(exactB, publicationB)
+}
+
+func test_runJournalBundleSessionPublicationRejectsCursorWithoutMirror() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let host = try home.requirePersistedWorkHost()
+    let primary = WorkBinding(
+        session: SessionRef("publication-orphan-primary"),
+        work: WorkRef(workHostID: host.workHostID, workID: "publication-orphan-work"),
+        workHost: host,
+        sessionAttachment: SessionAttachmentRef("publication-orphan-primary-attachment"))
+    let idle = try await RunJournalBundle.createIdleWork(
+        home: home, binding: primary, actorID: "publication-orphan-control")
+    let session = SessionRef("publication-orphan-session")
+    let attachment = SessionAttachmentRef("publication-orphan-attachment")
+    let client = ClientRef("publication-orphan-client")
+    let sessionJournal = JournalRef.session(
+        session, journalID: "session", authority: TimelineAuthorityRef(host.workHostID))
+    let command = CommandRef(
+        commandID: "publication-orphan-command", client: client,
+        sessionAttachment: attachment, causalCursor: idle.workCursor)
+    let request = RunJournalBundleSessionPublicationRequest(
+        work: primary.work, workHost: host, workJournal: primary.workJournal,
+        session: session, sessionJournal: sessionJournal,
+        sessionAttachment: attachment, client: client, command: command,
+        capabilities: [WorkServiceCapability.observe.rawValue],
+        causalWorkCursor: idle.workCursor)
+    do {
+        _ = try await RunJournalBundle.publishSessionAttachment(
+            home: home, request: request, actorID: "publication-orphan-host",
+            failurePlan: (.none, .init(point: .beforeWrite)))
+        XCTFail("injected Work-mirror failure unexpectedly completed publication")
+    } catch {
+        XCTAssertTrue(true)
+    }
+
+    let writer = try TimelineJournalWriter(
+        reopening: home.timelineV2SessionJournalURL(session),
+        journal: sessionJournal,
+        actor: TimelineActor(actorID: "publication-orphan-host", kind: "work-host-control"),
+        home: home)
+    let workCause = EventRef(
+        journal: primary.workJournal, eventID: try XCTUnwrap(idle.workCursor.eventID))
+    let encodedCursor = try XCTUnwrap(
+        JSONValue.parse(try JSONEncoder().encode(idle.workCursor)))
+    _ = try await writer.append(TimelineEventDraft(
+        hostSequence: 100, idempotencyKey: command.commandID, command: command,
+        causedByEventID: workCause,
+        session: session, work: primary.work, workHost: host, client: client,
+        sessionAttachment: attachment,
+        type: TimelineEventType.sessionAttachmentCursorAdvanced,
+        declaredDomains: [.session, .work], payload: .object([
+            "capabilities": .array([.string(WorkServiceCapability.observe.rawValue)]),
+            "cursor": encodedCursor,
+        ])))
+    try await writer.closeChecked()
+    let workBytesBeforeRetry = try Data(
+        contentsOf: home.timelineV2WorkJournalURL(primary.work))
+    do {
+        _ = try await RunJournalBundle.publishSessionAttachment(
+            home: home, request: request, actorID: "publication-orphan-host")
+        XCTFail("Session cursor evidence without its Work mirror was repaired as success")
+    } catch let error as RunJournalBundleError {
+        guard case .invalidGenesis(_, let reason) = error,
+              reason.contains("without its Work publication mirror") else {
+            XCTFail("wrong orphaned Session cursor error: \(error)")
+            return
+        }
+    }
+    XCTAssertEqual(try Data(contentsOf: home.timelineV2WorkJournalURL(primary.work)),
+                   workBytesBeforeRetry)
+    XCTAssertEqual(try bundleEvents(
+        home, sessionJournal,
+        home.timelineV2SessionJournalURL(session)).count, 3)
 }
 
 func test_runJournalBundleTerminalMutationRejectsStaleRunGeneration() async throws {
@@ -1454,6 +1623,41 @@ func test_runJournalBundleDestroyWorkRequiresQuiescedResourcesAndWritesOneTombst
         try await assertTerminalDetailRoundTrip(
             operation: .destroy, detail: detail, index: index)
     }
+}
+
+func test_timelineJournalWriterStreamingReopenStreamsAndRecoversTail() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let host = try home.requirePersistedWorkHost()
+    let binding = WorkBinding(
+        session: SessionRef("bounded-reopen-session"),
+        work: WorkRef(workHostID: host.workHostID, workID: "bounded-reopen-work"),
+        workHost: host,
+        sessionAttachment: SessionAttachmentRef("bounded-reopen-attachment"))
+    let created = try await RunJournalBundle.createIdleWork(
+        home: home, binding: binding, actorID: "bounded-reopen-genesis")
+    let url = home.timelineV2WorkJournalURL(binding.work)
+    let partial = try FileHandle(forWritingTo: url)
+    try partial.seekToEnd()
+    try partial.write(contentsOf: Data("{\"unterminated\":\"tail".utf8))
+    try partial.close()
+
+    let writer = try TimelineJournalWriter(
+        reopeningStreaming: url, journal: binding.workJournal,
+        actor: TimelineActor(actorID: "bounded-reopen", kind: "work-host-control"),
+        home: home, maximumChunkBytes: 32, maximumRecordBytes: 4 * 1_024)
+    XCTAssertEqual(await writer.nextSequenceNumber, created.workCursor.sequence + 1)
+    try await writer.closeChecked()
+
+    let bytes = try Data(contentsOf: url)
+    XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains("unterminated"))
+    let read = TimelineJournalReader.read(
+        bytes, journal: binding.workJournal,
+        actor: TimelineActor(actorID: "bounded-reopen", kind: "work-host-control"),
+        hostRecordedAt: Date(timeIntervalSince1970: 0))
+    XCTAssertNil(read.truncatedTail)
+    XCTAssertNil(read.quarantinedSuffix)
+    XCTAssertEqual(read.records.count, created.workCursor.sequence)
 }
 
 func test_workTerminalReducerRejectsCompletionAndDestructionWithLiveCanonicalHandle() {

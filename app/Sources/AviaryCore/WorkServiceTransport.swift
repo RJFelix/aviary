@@ -15,6 +15,7 @@ public enum WorkServiceTransportOperation: String, Codable, Hashable, Sendable {
     case listWorks = "list_works"
     case describeWork = "describe_work"
     case createWork = "create_work"
+    case createSession = "create_session"
     case completeWork = "complete_work"
     case attach
     case detach
@@ -313,6 +314,29 @@ public enum WorkServiceTransportCodec {
                 try validateCursor(data["controlCursor"], required: true)
                 try validateAuthorization(data["authorization"], required: true)
                 try validateControlReceipt(data["receipt"] ?? .null)
+            case .createSession:
+                try validateWorkDescriptor(data["work"] ?? .null)
+                try validateIdentity(data["session"]?["sessionID"])
+                if let journal = data["sessionJournal"], !journal.isNull {
+                    try validateJournalReference(journal)
+                }
+                try validateIdentity(data["sessionAttachment"]?["attachmentID"])
+                if let attachment = data["attachment"], !attachment.isNull {
+                    try validateClientAttachment(attachment)
+                }
+                if let relationship = data["relationship"], !relationship.isNull {
+                    try validateSessionAttachmentDescriptor(relationship)
+                }
+                try validateCursor(data["workCursor"], required: true)
+                try validateCursor(data["sessionCursor"])
+                try validateCursor(data["controlCursor"], required: true)
+                try validateAuthorization(data["authorization"], required: true)
+                try validateIdentity(data["commandID"], required: true)
+                try validateHostInstance(data["host"], required: true)
+                try validateCursor(data["causalControlCursor"], required: true)
+                try validateCursor(data["causalWorkCursor"], required: true)
+                try validateControlReceipt(data["receipt"] ?? .null)
+                try validateDiagnostic(data["diagnostic"])
             case .completeWork, .command:
                 try validateReceipt(data)
             case .updateCapabilities:
@@ -435,6 +459,7 @@ public enum WorkServiceTransportCodec {
             try validateControlResultCursor(
                 response.receipt.resultingControlCursor,
                 causal: request.causalControlCursor, state: response.receipt.state,
+                acceptedAdvance: 3,
                 expectedHostInstance: expectedHostInstance)
             if let expectedHostInstance {
                 try validateDescriptorHost(response.work, expected: expectedHostInstance)
@@ -445,6 +470,103 @@ public enum WorkServiceTransportCodec {
                     throw WorkServiceTransportError.invalidResponse
                 }
                 guard response.attachment.client == request.client else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+            }
+        case .createSession:
+            let response: WorkServiceCreateSessionResponse = try decodeResponseValue(
+                WorkServiceCreateSessionResponse.self, from: data)
+            let request: WorkServiceCreateSessionRequest = try decodeRequestValue(
+                WorkServiceCreateSessionRequest.self, from: request.payload)
+            guard response.work.work == request.work,
+                  response.work.journal == request.journal,
+                  response.workCursor.journal == request.journal,
+                  response.commandID == request.commandID,
+                  response.host == response.receipt.host,
+                  response.causalControlCursor == request.causalControlCursor,
+                  response.causalWorkCursor == request.causalWorkCursor,
+                  response.controlCursor == response.receipt.resultingControlCursor,
+                  response.authorization == response.receipt.authorization,
+                  response.state == response.receipt.state,
+                  response.rejection == response.receipt.rejection,
+                  response.receipt.operation == .createSession,
+                  response.receipt.work == request.work,
+                  response.receipt.commandID == request.commandID,
+                  response.receipt.causalControlCursor == request.causalControlCursor else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+            try validateControlResultCursor(
+                response.controlCursor, causal: request.causalControlCursor,
+                state: response.state, acceptedAdvance: 2,
+                expectedHostInstance: expectedHostInstance)
+            try validateRequestedAuthorization(
+                response.authorization, requested: request.requestedCapabilities)
+            switch response.state {
+            case .accepted, .duplicate:
+                guard let session = response.session,
+                      let sessionJournal = response.sessionJournal,
+                      let sessionAttachment = response.sessionAttachment,
+                      let attachment = response.attachment,
+                      let relationship = response.relationship,
+                      let sessionCursor = response.sessionCursor,
+                      response.rejection == nil,
+                      response.receipt.outcome == .sessionCreated,
+                      sessionJournal.owner == .session(session),
+                      sessionCursor.journal == sessionJournal,
+                      attachment.client == request.client,
+                      attachment.session == session,
+                      attachment.sessionJournal == sessionJournal,
+                      attachment.sessionAttachment == sessionAttachment,
+                      attachment.authorization == response.authorization,
+                      relationship.session == session,
+                      relationship.sessionJournal == sessionJournal,
+                      relationship.sessionAttachment == sessionAttachment,
+                      relationship.isAttached,
+                      relationship.capabilities == response.authorization.granted,
+                      relationship.causalSessionCursor.sequence == 0,
+                      relationship.causalSessionCursor.eventID == nil,
+                      relationship.sessionCursor.sequence == 3,
+                      relationship.sessionCursor.eventID != nil,
+                      relationship.sessionCursor == sessionCursor,
+                      attachment.attachment != request.attachment,
+                      relationship.causalWorkCursor == request.causalWorkCursor,
+                      relationship.resultingWorkCursor == response.workCursor,
+                      response.work.sessionAttachments.contains(relationship),
+                      response.work.attachments.contains(attachment)
+                        || response.state == .duplicate else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+                if let observation = response.work.hostObservation {
+                    guard observation.servedCursor == response.workCursor else {
+                        throw WorkServiceTransportError.invalidResponse
+                    }
+                }
+                switch response.work.recordedDisposition {
+                case .reusable:
+                    guard relationship.publication == .mirrored else {
+                        throw WorkServiceTransportError.invalidResponse
+                    }
+                case .completed, .destroyed:
+                    guard relationship.publication == .terminalReference,
+                          response.workCursor == request.causalWorkCursor,
+                          response.authorization.granted == [.observe] else {
+                        throw WorkServiceTransportError.invalidResponse
+                    }
+                }
+            case .rejected:
+                guard response.session == nil, response.sessionJournal == nil,
+                      response.sessionAttachment == nil, response.attachment == nil,
+                      response.relationship == nil, response.sessionCursor == nil,
+                      response.rejection != nil, response.receipt.outcome == nil else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+            }
+            if let expectedHostInstance {
+                try validateDescriptorHost(response.work, expected: expectedHostInstance)
+                try validateHost(response.host, expected: expectedHostInstance)
+                try validateHost(response.receipt.host, expected: expectedHostInstance)
+                if let sessionJournal = response.sessionJournal,
+                   sessionJournal.authority.authorityID != expectedHostInstance.host.workHostID {
                     throw WorkServiceTransportError.invalidResponse
                 }
             }
@@ -488,16 +610,29 @@ public enum WorkServiceTransportCodec {
             }
             switch response.state {
             case .accepted, .duplicate:
+                let requestSessionTupleIsOmitted = request.session == nil
+                    && request.sessionJournal == nil
+                    && request.sessionAttachment == nil
+                let returnedSessionTupleIsComplete = response.attachment.map {
+                    ($0.session == nil && $0.sessionJournal == nil
+                        && $0.sessionAttachment == nil)
+                        || ($0.session != nil && $0.sessionJournal != nil
+                            && $0.sessionAttachment != nil)
+                } ?? false
+                let sessionTupleMatches = requestSessionTupleIsOmitted
+                    || (response.attachment?.session == request.session
+                        && response.attachment?.sessionJournal == request.sessionJournal
+                        && response.attachment?.sessionAttachment == request.sessionAttachment)
                 guard let attachment = response.attachment,
                       response.receipt.outcome == .attached,
                       response.receipt.rejection == nil,
                       response.rejection == nil,
                       attachment.client == request.client,
-                      attachment.session == request.session,
-                      attachment.sessionJournal == request.sessionJournal,
-                      attachment.sessionAttachment == request.sessionAttachment,
+                      returnedSessionTupleIsComplete,
+                      sessionTupleMatches,
                       attachment.authorization == response.authorization,
-                      response.work.attachments.contains(attachment) else {
+                      response.work.attachments.contains(attachment)
+                        || response.state == .duplicate else {
                     throw WorkServiceTransportError.invalidResponse
                 }
                 try validateRequestedAuthorization(
@@ -505,11 +640,13 @@ public enum WorkServiceTransportCodec {
                 try validateControlResultCursor(
                     response.resultingControlCursor,
                     causal: request.causalControlCursor, state: response.state,
+                    acceptedAdvance: 1,
                     expectedHostInstance: expectedHostInstance)
             case .rejected:
                 try validateControlResultCursor(
                     response.resultingControlCursor,
                     causal: request.causalControlCursor, state: response.state,
+                    acceptedAdvance: 1,
                     expectedHostInstance: expectedHostInstance)
                 guard response.attachment == nil,
                       response.receipt.outcome == nil,
@@ -550,11 +687,13 @@ public enum WorkServiceTransportCodec {
                 try validateControlResultCursor(
                     response.resultingControlCursor,
                     causal: request.causalControlCursor, state: response.state,
+                    acceptedAdvance: 1,
                     expectedHostInstance: expectedHostInstance)
             case .rejected:
                 try validateControlResultCursor(
                     response.resultingControlCursor,
                     causal: request.causalControlCursor, state: response.state,
+                    acceptedAdvance: 1,
                     expectedHostInstance: expectedHostInstance)
                 guard response.receipt.outcome == nil,
                       response.rejection != nil else {
@@ -598,11 +737,13 @@ public enum WorkServiceTransportCodec {
                 try validateControlResultCursor(
                     response.resultingControlCursor,
                     causal: request.causalControlCursor, state: response.state,
+                    acceptedAdvance: 1,
                     expectedHostInstance: expectedHostInstance)
             case .rejected:
                 try validateControlResultCursor(
                     response.resultingControlCursor,
                     causal: request.causalControlCursor, state: response.state,
+                    acceptedAdvance: 1,
                     expectedHostInstance: expectedHostInstance)
                 guard response.attachment == nil,
                       response.receipt.outcome == nil,
@@ -649,11 +790,13 @@ public enum WorkServiceTransportCodec {
                 try validateControlResultCursor(
                     response.resultingControlCursor,
                     causal: request.causalControlCursor, state: response.state,
+                    acceptedAdvance: 1,
                     expectedHostInstance: expectedHostInstance)
             case .rejected:
                 try validateControlResultCursor(
                     response.resultingControlCursor,
                     causal: request.causalControlCursor, state: response.state,
+                    acceptedAdvance: 1,
                     expectedHostInstance: expectedHostInstance)
                 guard response.receipt.outcome == nil,
                       response.rejection != nil else {
@@ -770,6 +913,7 @@ public enum WorkServiceTransportCodec {
         _ resulting: JournalCursor,
         causal: JournalCursor,
         state: WorkServiceCommandReceiptState,
+        acceptedAdvance: Int,
         expectedHostInstance: WorkHostInstanceRef?
     ) throws {
         guard resulting.journal == causal.journal,
@@ -787,7 +931,10 @@ public enum WorkServiceTransportCodec {
         }
         switch state {
         case .accepted, .duplicate:
-            guard resulting.sequence > causal.sequence, resulting.eventID != nil else {
+            let (expectedSequence, overflow) = causal.sequence.addingReportingOverflow(
+                acceptedAdvance)
+            guard !overflow, resulting.sequence == expectedSequence,
+                  resulting.eventID != nil else {
                 throw WorkServiceTransportError.invalidResponse
             }
         case .rejected:
@@ -1412,6 +1559,52 @@ public enum WorkServiceTransportCodec {
         }
     }
 
+    private static func validateSessionAttachmentDescriptor(_ value: JSONValue) throws {
+        guard case .object(let object) = value,
+              let publication = object["publication"]?.stringValue,
+              WorkServiceSessionAttachmentPublication(rawValue: publication) != nil else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        try validateIdentity(object["session"]?["sessionID"], required: true)
+        try validateJournalReference(object["sessionJournal"] ?? .null)
+        try validateIdentity(object["sessionAttachment"]?["attachmentID"], required: true)
+        try validateCursor(object["causalSessionCursor"], required: true)
+        try validateCursor(object["sessionCursor"], required: true)
+        try validateCursor(object["causalWorkCursor"], required: true)
+        try validateCursor(object["resultingWorkCursor"], required: true)
+        try validateArray(
+            object["capabilities"], maxCount: WorkServiceCapability.allCases.count)
+        for capability in object["capabilities"]?.arrayValue ?? [] {
+            try validateIdentity(capability, required: true)
+        }
+        let descriptor = try decodeResponseValue(
+            WorkServiceSessionAttachmentDescriptor.self, from: value)
+        guard descriptor.sessionJournal.owner == .session(descriptor.session),
+              descriptor.causalSessionCursor.journal == descriptor.sessionJournal,
+              descriptor.sessionCursor.journal == descriptor.sessionJournal,
+              case .work(let work) = descriptor.causalWorkCursor.journal.owner,
+              descriptor.resultingWorkCursor.journal == descriptor.causalWorkCursor.journal,
+              descriptor.sessionJournal.authority.authorityID == work.workHostID,
+              !descriptor.capabilities.contains(.createSession) else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        switch descriptor.publication {
+        case .mirrored:
+            let (expectedSequence, overflow) = descriptor.causalWorkCursor.sequence
+                .addingReportingOverflow(1)
+            guard !overflow,
+                  descriptor.resultingWorkCursor.sequence == expectedSequence,
+                  descriptor.resultingWorkCursor.eventID != nil else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        case .terminalReference:
+            guard descriptor.resultingWorkCursor == descriptor.causalWorkCursor,
+                  descriptor.capabilities == [.observe] else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
+    }
+
     private static func validateWorkDescriptor(_ value: JSONValue) throws {
         guard case .object(let object) = value else {
             throw WorkServiceTransportError.invalidResponse
@@ -1427,10 +1620,29 @@ public enum WorkServiceTransportCodec {
         _ = try decodeResponseValue(
             WorkServiceWorkConfiguration.self, from: object["configuration"] ?? .null)
         try validateArray(object["attachments"], maxCount: WorkServiceBounds.maxAttachmentsPerWork)
+        try validateArray(
+            object["sessionAttachments"],
+            maxCount: WorkServiceBounds.maxSessionAttachmentsPerWork)
         try validateArray(object["artifacts"], maxCount: WorkServiceBounds.maxArtifactsPerWork)
         try validateArray(object["omissions"], maxCount: WorkServiceBounds.maxOmissions)
+        var clientAttachments: Set<ClientAttachmentRef> = []
         for attachment in object["attachments"]?.arrayValue ?? [] {
             try validateClientAttachment(attachment, workJournal: workJournal)
+            let decoded = try decodeResponseValue(
+                WorkServiceClientAttachment.self, from: attachment)
+            guard clientAttachments.insert(decoded.attachment).inserted else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
+        var sessionAttachments: Set<SessionAttachmentRef> = []
+        for relationshipValue in object["sessionAttachments"]?.arrayValue ?? [] {
+            try validateSessionAttachmentDescriptor(relationshipValue)
+            let relationship = try decodeResponseValue(
+                WorkServiceSessionAttachmentDescriptor.self, from: relationshipValue)
+            guard relationship.causalWorkCursor.journal == workJournal,
+                  sessionAttachments.insert(relationship.sessionAttachment).inserted else {
+                throw WorkServiceTransportError.invalidResponse
+            }
         }
         for artifact in object["artifacts"]?.arrayValue ?? [] {
             try validateArtifactDescriptor(artifact)
@@ -2886,6 +3098,13 @@ public actor WorkServiceUnixSocketServer {
                     WorkServiceCreateWorkRequest.self, from: envelope.payload)
                 guard request.client == client else { throw identityMismatch() }
                 return try success(id: envelope.id, value: try await service.createWork(request), connectionID: connectionID)
+            case .createSession:
+                let request = try WorkServiceTransportCodec.decodePayload(
+                    WorkServiceCreateSessionRequest.self, from: envelope.payload)
+                guard request.client == client else { throw identityMismatch() }
+                return try success(
+                    id: envelope.id, value: try await service.createSession(request),
+                    connectionID: connectionID)
             case .completeWork:
                 let request = try WorkServiceTransportCodec.decodePayload(
                     WorkServiceCompleteWorkRequest.self, from: envelope.payload)
@@ -3164,6 +3383,12 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
         _ request: WorkServiceCreateWorkRequest
     ) async throws -> WorkServiceCreateWorkResponse {
         try await call(.createWork, request)
+    }
+
+    public func createSession(
+        _ request: WorkServiceCreateSessionRequest
+    ) async throws -> WorkServiceCreateSessionResponse {
+        try await call(.createSession, request)
     }
 
     public func completeWork(

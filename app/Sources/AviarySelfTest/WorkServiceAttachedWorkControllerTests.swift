@@ -270,6 +270,11 @@ private actor AttachedControllerTestService: WorkServiceClient {
         fixture.response
     }
 
+    func createSession(_ request: WorkServiceCreateSessionRequest) async throws
+        -> WorkServiceCreateSessionResponse {
+        throw AttachedControllerTestError.unsupported
+    }
+
     func completeWork(_ request: WorkServiceCompleteWorkRequest) async throws -> WorkServiceCommandReceipt {
         throw AttachedControllerTestError.unsupported
     }

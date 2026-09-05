@@ -702,3 +702,118 @@ func test_timelineJournalWriterDeterministicSeamsAndAgentHomeAuthority() async t
         XCTAssertEqual(error, .invalidPersistedWorkHostID)
     }
 }
+
+func test_timelineJournalWriterRejectsOversizedBatchBeforeWriting() async throws {
+    let home = try writerTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let url = home.timelineV2WorkJournalURL(writerTestWork)
+    let ids = WriterTestSequence(["batch-small", "batch-oversized", "after-rejection"])
+    let fixedDate = Date(timeIntervalSince1970: 1)
+    let oversized = writerDraft(payload: .object([
+        "body": .string(String(repeating: "x", count: 128)),
+    ]))
+    let boundaryEvent = TimelineEvent(
+        eventID: "batch-oversized", journal: writerTestWorkJournal, sequence: 2,
+        previousEventID: "batch-small", actor: writerTestActor, hostRecordedAt: fixedDate,
+        type: oversized.type, declaredDomains: oversized.declaredDomains, provenance: .native,
+        links: oversized.links, payload: oversized.payload)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.withoutEscapingSlashes]
+    let recordLimitWithoutNewline = try encoder.encode(boundaryEvent).count
+    let writer = try TimelineJournalWriter(
+        freshAt: url, journal: writerTestWorkJournal, actor: writerTestActor, home: home,
+        eventIDProvider: { ids.next() }, now: { fixedDate },
+        maximumRecordBytes: recordLimitWithoutNewline)
+
+    do {
+        _ = try await writer.appendBatch([writerDraft(), oversized])
+        XCTFail("an oversized record must reject the complete batch before its first write")
+    } catch let error as TimelineJournalWriter.WriterError {
+        guard case .invalidDraft = error else {
+            XCTFail("wrong oversized record error: \(error)")
+            return
+        }
+    }
+    XCTAssertEqual(try writerData(url), Data())
+    XCTAssertEqual(await writer.nextSequenceNumber, 1)
+    if case .healthy = await writer.health {
+        XCTAssertTrue(true)
+    } else {
+        XCTFail("pre-write size rejection must leave the writer healthy")
+    }
+
+    let committed = try await writer.append(writerDraft())
+    XCTAssertEqual(committed.cursor.sequence, 1)
+    try await writer.closeChecked()
+    let events = try TimelineJournalWriter.readNativeEventsStreaming(
+        at: url, journal: writerTestWorkJournal, actor: writerTestActor,
+        maximumChunkBytes: 7, maximumRecordBytes: recordLimitWithoutNewline)
+    XCTAssertEqual(events.map(\.eventID), ["after-rejection"])
+
+    let oversizedURL = url.appendingPathExtension("oversized-record")
+    let oversizedEvent = TimelineEvent(
+        eventID: "oversized-fixture", journal: writerTestWorkJournal, sequence: 1,
+        work: writerTestWork, workHost: WorkHostRef(writerTestWork.workHostID),
+        actor: writerTestActor, hostRecordedAt: Date(timeIntervalSince1970: 1),
+        type: TimelineEventType.workCreated, provenance: .native,
+        payload: .object(["body": .string(String(repeating: "x", count: 2_048))]))
+    var oversizedBytes = try JSONEncoder().encode(oversizedEvent)
+    oversizedBytes.append(UInt8(ascii: "\n"))
+    try writeWriterFixture(oversizedBytes, at: oversizedURL)
+    do {
+        _ = try TimelineJournalWriter(
+            reopeningStreaming: oversizedURL, journal: writerTestWorkJournal,
+            actor: writerTestActor, home: home, maximumChunkBytes: 31,
+            maximumRecordBytes: recordLimitWithoutNewline)
+        XCTFail("streaming reopen must enforce the same configured record ceiling")
+    } catch let error as TimelineJournalWriter.WriterError {
+        guard case .invalidJournal = error else {
+            XCTFail("wrong oversized reopen error: \(error)")
+            return
+        }
+    }
+}
+
+func test_timelineJournalStreamingReadFencesSymlinkAndReplacement() async throws {
+    let home = try writerTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let url = home.timelineV2WorkJournalURL(writerTestWork)
+    let writer = try TimelineJournalWriter(
+        freshAt: url, journal: writerTestWorkJournal, actor: writerTestActor, home: home,
+        eventIDProvider: { "stable-read-event" })
+    _ = try await writer.append(writerDraft(
+        TimelineEventType.workCreated, work: writerTestWork,
+        workHost: WorkHostRef(writerTestWork.workHostID)))
+    try await writer.closeChecked()
+
+    let symlink = url.appendingPathExtension("symlink")
+    try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: url)
+    do {
+        _ = try TimelineJournalWriter.readNativeEventsStreaming(
+            at: symlink, journal: writerTestWorkJournal, actor: writerTestActor)
+        XCTFail("a symlink must not be accepted as canonical journal proof")
+    } catch {
+        XCTAssertTrue(true)
+    }
+
+    let moved = url.appendingPathExtension("opened-inode")
+    var replaced = false
+    do {
+        _ = try TimelineJournalWriter.readNativeEventsStreaming(
+            at: url, journal: writerTestWorkJournal, actor: writerTestActor,
+            maximumChunkBytes: 8,
+            afterReadChunk: { _ in
+                guard !replaced else { return }
+                replaced = true
+                try FileManager.default.moveItem(at: url, to: moved)
+                try FileManager.default.copyItem(at: moved, to: url)
+            })
+        XCTFail("a path replacement during proof collection must be rejected")
+    } catch let error as TimelineJournalWriter.WriterError {
+        guard case .dataPathReplaced = error else {
+            XCTFail("wrong path replacement error: \(error)")
+            return
+        }
+    }
+    XCTAssertTrue(replaced)
+}

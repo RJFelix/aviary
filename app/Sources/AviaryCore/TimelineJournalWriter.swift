@@ -106,6 +106,12 @@ public struct TimelineJournalCommit: Codable, Hashable, Sendable {
 /// is the separate process boundary: a GUI, CLI, or service cannot accidentally become a second
 /// writer merely because it has a different actor instance.
 public actor TimelineJournalWriter {
+    /// Canonical maximum for one encoded Timeline record, including its trailing newline.
+    /// Writers reject larger records before touching the journal, and streaming readers use the
+    /// same ceiling before decoding. The reader and writer still retain history-indexed semantic
+    /// state; this bound is specifically the per-record allocation and wire contract.
+    public nonisolated static let maximumRecordBytes = 64 * 1_024 * 1_024
+
     public enum FailurePoint: String, CaseIterable, Hashable, Sendable {
         case beforeWrite
         case partialWrite
@@ -207,6 +213,7 @@ public actor TimelineJournalWriter {
     private let eventIDProvider: @Sendable () -> String
     private let now: @Sendable () -> Date
     private let didSynchronize: (@Sendable () -> Void)?
+    private let recordByteLimit: Int
     private var nextSequence: Int
     private var previousEventID: String?
     private var eventIDs: Set<String>
@@ -224,7 +231,8 @@ public actor TimelineJournalWriter {
         failurePlan: FailurePlan = .none,
         eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
         now: @escaping @Sendable () -> Date = { Date() },
-        didSynchronize: (@Sendable () -> Void)? = nil
+        didSynchronize: (@Sendable () -> Void)? = nil,
+        maximumRecordBytes: Int = TimelineJournalWriter.maximumRecordBytes
     ) throws {
         let opened = try Self.openFreshWriter(
             fileURL, journal: journal, home: home ?? Self.inferHome(for: fileURL))
@@ -237,6 +245,7 @@ public actor TimelineJournalWriter {
         self.eventIDProvider = eventIDProvider
         self.now = now
         self.didSynchronize = didSynchronize
+        self.recordByteLimit = Self.boundedRecordLimit(maximumRecordBytes)
         self.nextSequence = opened.journal.nextSequence
         self.previousEventID = opened.journal.previousEventID
         self.eventIDs = opened.journal.eventIDs
@@ -253,12 +262,14 @@ public actor TimelineJournalWriter {
         failurePlan: FailurePlan = .none,
         eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
         now: @escaping @Sendable () -> Date = { Date() },
-        didSynchronize: (@Sendable () -> Void)? = nil
+        didSynchronize: (@Sendable () -> Void)? = nil,
+        maximumRecordBytes: Int = TimelineJournalWriter.maximumRecordBytes
     ) throws {
         let opened = try Self.openExistingWriter(
             fileURL, journal: journal, actor: actor,
             home: home ?? Self.inferHome(for: fileURL),
-            recoveryCommittedByteCount: recoveryCommittedByteCount)
+            recoveryCommittedByteCount: recoveryCommittedByteCount,
+            maximumRecordBytes: maximumRecordBytes)
         self.journal = journal
         self.hostActor = actor
         self.fileURL = fileURL
@@ -268,6 +279,46 @@ public actor TimelineJournalWriter {
         self.eventIDProvider = eventIDProvider
         self.now = now
         self.didSynchronize = didSynchronize
+        self.recordByteLimit = Self.boundedRecordLimit(maximumRecordBytes)
+        self.nextSequence = opened.journal.nextSequence
+        self.previousEventID = opened.journal.previousEventID
+        self.eventIDs = opened.journal.eventIDs
+        self.failurePlan = failurePlan
+    }
+
+    /// Reopen a journal by streaming its bytes rather than materializing one complete Data value.
+    /// The transient event-ID index remains intentionally retained to preserve exact duplicate
+    /// detection; this is therefore streaming-but-history-indexed, not a fully bounded-memory
+    /// reopen. A future durable identity index can remove that transient index.
+    public init(
+        reopeningStreaming fileURL: URL,
+        journal: JournalRef,
+        actor: TimelineActor,
+        home: AgentHome? = nil,
+        allowTruncatedTail: Bool = true,
+        maximumChunkBytes: Int = 64 * 1_024,
+        maximumRecordBytes: Int = TimelineJournalWriter.maximumRecordBytes,
+        failurePlan: FailurePlan = .none,
+        eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
+        now: @escaping @Sendable () -> Date = { Date() },
+        didSynchronize: (@Sendable () -> Void)? = nil
+    ) throws {
+        let opened = try Self.openExistingFileStreaming(
+            fileURL, journal: journal, actor: actor,
+            home: home ?? Self.inferHome(for: fileURL),
+            allowTruncatedTail: allowTruncatedTail,
+            maximumChunkBytes: maximumChunkBytes,
+            maximumRecordBytes: maximumRecordBytes)
+        self.journal = journal
+        self.hostActor = actor
+        self.fileURL = fileURL
+        self.handle = opened.journal.handle
+        self.lockHandle = opened.lockHandle
+        self.lockFileURL = opened.lockURL
+        self.eventIDProvider = eventIDProvider
+        self.now = now
+        self.didSynchronize = didSynchronize
+        self.recordByteLimit = Self.boundedRecordLimit(maximumRecordBytes)
         self.nextSequence = opened.journal.nextSequence
         self.previousEventID = opened.journal.previousEventID
         self.eventIDs = opened.journal.eventIDs
@@ -331,6 +382,92 @@ public actor TimelineJournalWriter {
                              work: draft.work, workHost: draft.workHost, journal: journal)
     }
 
+    /// Read one stable native journal snapshot through a no-follow descriptor. Bytes are parsed
+    /// incrementally under the same per-record ceiling enforced by ``append``; the returned event
+    /// array and duplicate-ID set remain history-indexed because reducers still require complete
+    /// semantic history. Descriptor and path fingerprints must agree before and after the scan, so
+    /// a symlink, append, rewrite, chmod, or path replacement cannot be used as recovery proof.
+    static func readNativeEventsStreaming(
+        at fileURL: URL,
+        journal: JournalRef,
+        actor: TimelineActor,
+        maximumChunkBytes: Int = 64 * 1_024,
+        maximumRecordBytes: Int = TimelineJournalWriter.maximumRecordBytes,
+        afterReadChunk: ((Int) throws -> Void)? = nil
+    ) throws -> [TimelineEvent] {
+        let descriptor = fileURL.path.withCString {
+            AviaryPOSIX.open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else {
+            throw openError(fileURL, operation: "read")
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+
+        let before = try stableReadFingerprint(descriptor: descriptor, fileURL: fileURL)
+        let chunkLimit = max(1, min(maximumChunkBytes, 4 * 1_024 * 1_024))
+        let recordLimit = boundedRecordLimit(maximumRecordBytes)
+        var parser = TimelineJournalReaderState(
+            journal: journal, actor: actor, hostRecordedAt: Date(timeIntervalSince1970: 0))
+        var events: [TimelineEvent] = []
+        var eventIDs = Set<String>()
+        var recordBytes = 0
+        var bytesRead = 0
+        var chunkIndex = 0
+
+        func consume(_ result: TimelineJournalReadResult) throws {
+            guard result.quarantinedSuffix == nil else {
+                throw WriterError.invalidJournal(reason: "journal contains malformed bytes")
+            }
+            for record in result.records {
+                let event = record.event
+                guard event.provenance == .native else {
+                    throw WriterError.invalidJournal(
+                        reason: "legacy event at byte \(record.byteStart)")
+                }
+                guard event.schemaVersion == TimelineEvent.currentSchemaVersion else {
+                    throw WriterError.invalidJournal(reason: "event schema is not native v2")
+                }
+                guard !event.eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      eventIDs.insert(event.eventID).inserted else {
+                    throw WriterError.invalidJournal(reason: "event ids are not unique")
+                }
+                try validateEvent(event, for: journal)
+                events.append(event)
+            }
+        }
+
+        while let chunk = try handle.read(upToCount: chunkLimit), !chunk.isEmpty {
+            let (newByteCount, overflow) = bytesRead.addingReportingOverflow(chunk.count)
+            guard !overflow else {
+                throw WriterError.invalidJournal(reason: "journal byte count overflowed")
+            }
+            bytesRead = newByteCount
+            for byte in chunk {
+                recordBytes += 1
+                guard recordBytes <= recordLimit else {
+                    throw WriterError.invalidJournal(
+                        reason: "journal record exceeds the maximum byte count")
+                }
+                if byte == UInt8(ascii: "\n") { recordBytes = 0 }
+            }
+            try consume(parser.append(chunk))
+            try afterReadChunk?(chunkIndex)
+            chunkIndex += 1
+        }
+        let final = parser.append(Data(), final: true)
+        try consume(final)
+        guard final.truncatedTail == nil, recordBytes == 0, !events.isEmpty else {
+            throw WriterError.invalidJournal(
+                reason: "journal is empty or has an incomplete tail")
+        }
+        let after = try stableReadFingerprint(descriptor: descriptor, fileURL: fileURL)
+        guard before == after, bytesRead == before.size else {
+            throw WriterError.dataPathReplaced(path: fileURL.path)
+        }
+        return events
+    }
+
     public var health: WriterHealth { healthState }
     public var nextSequenceNumber: Int { nextSequence }
     public var lastEventID: String? { previousEventID }
@@ -351,21 +488,39 @@ public actor TimelineJournalWriter {
     @discardableResult
     public func append(_ draft: TimelineEventDraft) throws -> TimelineJournalCommit {
         try ensureAppendable()
-        try Self.validate(draft, for: journal)
+        var reservedEventIDs = eventIDs
+        let prepared = try prepareAppend(
+            draft, sequence: nextSequence, previousEventID: previousEventID,
+            reservedEventIDs: &reservedEventIDs)
+        return try commit(prepared)
+    }
 
+    private struct PreparedAppend {
+        let event: TimelineEvent
+        let bytes: Data
+    }
+
+    private func prepareAppend(
+        _ draft: TimelineEventDraft,
+        sequence: Int,
+        previousEventID: String?,
+        reservedEventIDs: inout Set<String>
+    ) throws -> PreparedAppend {
+        try Self.validate(draft, for: journal)
+        guard sequence < Int.max else {
+            throw WriterError.invalidDraft(reason: "journal sequence cannot advance")
+        }
         let eventID = eventIDProvider()
         guard !eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !eventIDs.contains(eventID)
-        else {
+              reservedEventIDs.insert(eventID).inserted else {
             let error = WriterError.eventIDCollision(eventID)
             healthState = .failed(reason: error.localizedDescription)
             throw error
         }
-
         let event = TimelineEvent(
             eventID: eventID,
             journal: journal,
-            sequence: nextSequence,
+            sequence: sequence,
             hostSequence: draft.hostSequence,
             idempotencyKey: draft.idempotencyKey,
             command: draft.command,
@@ -402,9 +557,16 @@ public actor TimelineJournalWriter {
         } catch {
             throw WriterError.encodingFailed(error.localizedDescription)
         }
+        guard bytes.count <= recordByteLimit else {
+            throw WriterError.invalidDraft(
+                reason: "encoded Timeline record exceeds the maximum byte count")
+        }
+        return PreparedAppend(event: event, bytes: bytes)
+    }
 
+    private func commit(_ prepared: PreparedAppend) throws -> TimelineJournalCommit {
         do {
-            try writeAndSynchronize(bytes)
+            try writeAndSynchronize(prepared.bytes)
         } catch let error as WriterError {
             healthState = .failed(reason: error.localizedDescription)
             throw error
@@ -415,26 +577,38 @@ public actor TimelineJournalWriter {
         }
 
         // These facts advance only after the complete line and its synchronize have succeeded.
-        eventIDs.insert(eventID)
-        previousEventID = eventID
+        eventIDs.insert(prepared.event.eventID)
+        previousEventID = prepared.event.eventID
         nextSequence += 1
-        let eventRef = EventRef(journal: journal, eventID: eventID)
+        let eventRef = EventRef(journal: journal, eventID: prepared.event.eventID)
         return TimelineJournalCommit(
             eventRef: eventRef,
-            cursor: JournalCursor(journal: journal, eventID: eventID, sequence: event.sequence))
+            cursor: JournalCursor(
+                journal: journal, eventID: prepared.event.eventID,
+                sequence: prepared.event.sequence))
     }
 
     /// Validate the entire batch before writing its first line. A write failure after that point
     /// remains intentionally visible; committed prefix bytes are never rolled back or repaired.
     public func appendBatch(_ drafts: [TimelineEventDraft]) throws -> [TimelineJournalCommit] {
         try ensureAppendable()
+        var prepared: [PreparedAppend] = []
+        prepared.reserveCapacity(drafts.count)
+        var reservedEventIDs = eventIDs
+        var sequence = nextSequence
+        var previous = previousEventID
         for draft in drafts {
-            try Self.validate(draft, for: journal)
+            let next = try prepareAppend(
+                draft, sequence: sequence, previousEventID: previous,
+                reservedEventIDs: &reservedEventIDs)
+            prepared.append(next)
+            previous = next.event.eventID
+            sequence += 1
         }
         var commits: [TimelineJournalCommit] = []
         commits.reserveCapacity(drafts.count)
-        for draft in drafts {
-            commits.append(try append(draft))
+        for next in prepared {
+            commits.append(try commit(next))
         }
         return commits
     }
@@ -575,14 +749,16 @@ public actor TimelineJournalWriter {
 
     private static func openExistingWriter(
         _ url: URL, journal: JournalRef, actor: TimelineActor, home: AgentHome,
-        recoveryCommittedByteCount: (@Sendable (Data) throws -> Int)?
+        recoveryCommittedByteCount: (@Sendable (Data) throws -> Int)?,
+        maximumRecordBytes: Int
     ) throws -> OpenedWriter {
         let lockURL = home.timelineV2JournalLockURL(for: journal)
         let lock = try openLock(at: lockURL, reporting: url)
         do {
             let opened = try openExistingFile(
                 url, journal: journal, actor: actor,
-                recoveryCommittedByteCount: recoveryCommittedByteCount)
+                recoveryCommittedByteCount: recoveryCommittedByteCount,
+                maximumRecordBytes: maximumRecordBytes)
             return OpenedWriter(journal: opened, lockHandle: lock, lockURL: lockURL)
         } catch {
             try? lock.close()
@@ -648,14 +824,16 @@ public actor TimelineJournalWriter {
 
     private static func openExistingFile(
         _ url: URL, journal: JournalRef, actor: TimelineActor,
-        recoveryCommittedByteCount: (@Sendable (Data) throws -> Int)? = nil
+        recoveryCommittedByteCount: (@Sendable (Data) throws -> Int)? = nil,
+        maximumRecordBytes: Int = TimelineJournalWriter.maximumRecordBytes
     ) throws -> OpenedJournal {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw WriterError.missing(path: url.path)
         }
         let fd = url.path.withCString {
             AviaryPOSIX.openExclusiveLock(
-                $0, flags: O_RDWR | O_NONBLOCK | O_CLOEXEC, mode: mode_t(0o600))
+                $0, flags: O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW,
+                mode: mode_t(0o600))
         }
         guard fd >= 0 else { throw openError(url, operation: "open") }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
@@ -699,6 +877,9 @@ public actor TimelineJournalWriter {
                                      previousEventID: nil, eventIDs: [])
             }
 
+            try validateRecordLengths(
+                bytes, maximumRecordBytes: boundedRecordLimit(maximumRecordBytes))
+
             let read = TimelineJournalReader.read(
                 bytes, journal: journal, actor: actor, hostRecordedAt: Date())
             guard read.quarantinedSuffix == nil, read.truncatedTail == nil else {
@@ -737,6 +918,200 @@ public actor TimelineJournalWriter {
         } catch {
             try? handle.close()
             throw error
+        }
+    }
+
+    /// The streaming counterpart to ``openExistingFile``. It avoids a whole-file Data allocation,
+    /// but retains an event-ID index for exact duplicate detection. A final unterminated line may
+    /// be discarded explicitly; malformed interior bytes are never skipped or repaired.
+    private static func openExistingFileStreaming(
+        _ url: URL, journal: JournalRef, actor: TimelineActor, home: AgentHome,
+        allowTruncatedTail: Bool, maximumChunkBytes: Int, maximumRecordBytes: Int
+    ) throws -> OpenedWriter {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw WriterError.missing(path: url.path)
+        }
+        let chunkBytes = max(1, min(maximumChunkBytes, 4 * 1_024 * 1_024))
+        let recordBytes = boundedRecordLimit(maximumRecordBytes)
+        let lockURL = home.timelineV2JournalLockURL(for: journal)
+        let lock = try openLock(at: lockURL, reporting: url)
+        do {
+            let fd = url.path.withCString {
+                AviaryPOSIX.openExclusiveLock(
+                    $0, flags: O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW,
+                    mode: mode_t(0o600))
+            }
+            guard fd >= 0 else { throw openError(url, operation: "open") }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            do {
+                var status = stat()
+                guard fstat(handle.fileDescriptor, &status) == 0,
+                      (status.st_mode & S_IFMT) == S_IFREG else {
+                    throw WriterError.openFailed(path: url.path, reason: "journal is not a regular file")
+                }
+                try handle.seek(toOffset: 0)
+                var parser = TimelineJournalReaderState(
+                    journal: journal, actor: actor, hostRecordedAt: Date())
+                var ids = Set<String>()
+                var lastEvent: TimelineEvent?
+                var lineLength = 0
+                var sawBytes = false
+
+                func consume(_ result: TimelineJournalReadResult) throws {
+                    if result.quarantinedSuffix != nil {
+                        throw WriterError.invalidJournal(reason: "journal contains malformed interior bytes")
+                    }
+                    for record in result.records {
+                        let event = record.event
+                        guard event.provenance == .native else {
+                            throw WriterError.invalidJournal(reason: "legacy event at byte \(record.byteStart)")
+                        }
+                        guard event.schemaVersion == TimelineEvent.currentSchemaVersion else {
+                            throw WriterError.invalidJournal(reason: "event schema is not native v2")
+                        }
+                        guard !event.eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                              ids.insert(event.eventID).inserted else {
+                            throw WriterError.invalidJournal(reason: "event ids are not unique")
+                        }
+                        try validateEvent(event, for: journal)
+                        lastEvent = event
+                    }
+                }
+
+                while let chunk = try handle.read(upToCount: chunkBytes), !chunk.isEmpty {
+                    sawBytes = true
+                    for byte in chunk {
+                        lineLength += 1
+                        if lineLength > recordBytes {
+                            throw WriterError.invalidJournal(reason: "journal line exceeds bounded reopen limit")
+                        }
+                        if byte == 0x0A { lineLength = 0 }
+                    }
+                    try consume(parser.append(chunk))
+                }
+                let finalResult = parser.append(Data(), final: true)
+                try consume(finalResult)
+                if let tail = finalResult.truncatedTail {
+                    guard allowTruncatedTail else {
+                        throw WriterError.invalidJournal(reason: "journal has malformed or truncated tail")
+                    }
+                    var pathStatus = stat()
+                    let pathResult = url.path.withCString { lstat($0, &pathStatus) }
+                    guard fstat(handle.fileDescriptor, &status) == 0,
+                          pathResult == 0,
+                          status.st_dev == pathStatus.st_dev,
+                          status.st_ino == pathStatus.st_ino,
+                          ftruncate(handle.fileDescriptor, off_t(tail.byteStart)) == 0 else {
+                        throw WriterError.invalidJournal(reason: "uncommitted journal suffix could not be discarded safely")
+                    }
+                    try handle.synchronize()
+                }
+                var finalPathStatus = stat()
+                let finalPathResult = url.path.withCString { lstat($0, &finalPathStatus) }
+                guard fstat(handle.fileDescriptor, &status) == 0,
+                      finalPathResult == 0,
+                      status.st_dev == finalPathStatus.st_dev,
+                      status.st_ino == finalPathStatus.st_ino else {
+                    throw WriterError.dataPathReplaced(path: url.path)
+                }
+                guard sawBytes, let lastEvent else {
+                    try handle.seekToEnd()
+                    return OpenedWriter(
+                        journal: OpenedJournal(handle: handle, nextSequence: 1,
+                                               previousEventID: nil, eventIDs: []),
+                        lockHandle: lock, lockURL: lockURL)
+                }
+                guard lastEvent.sequence < Int.max else {
+                    throw WriterError.invalidJournal(reason: "journal sequence cannot advance")
+                }
+                try handle.seekToEnd()
+                return OpenedWriter(
+                    journal: OpenedJournal(handle: handle, nextSequence: lastEvent.sequence + 1,
+                                           previousEventID: lastEvent.eventID, eventIDs: ids),
+                    lockHandle: lock, lockURL: lockURL)
+            } catch {
+                try? handle.close()
+                throw error
+            }
+        } catch {
+            try? lock.close()
+            throw error
+        }
+    }
+
+    private struct StableReadFingerprint: Equatable {
+        let device: UInt64
+        let inode: UInt64
+        let mode: UInt32
+        let owner: UInt64
+        let linkCount: UInt64
+        let size: Int
+        let modificationSeconds: Int64
+        let modificationNanoseconds: Int64
+        let changeSeconds: Int64
+        let changeNanoseconds: Int64
+    }
+
+    private static func stableReadFingerprint(
+        descriptor: Int32, fileURL: URL
+    ) throws -> StableReadFingerprint {
+        var descriptorStatus = stat()
+        var pathStatus = stat()
+        let pathResult = fileURL.path.withCString { lstat($0, &pathStatus) }
+        guard fstat(descriptor, &descriptorStatus) == 0,
+              pathResult == 0,
+              (descriptorStatus.st_mode & S_IFMT) == S_IFREG,
+              (pathStatus.st_mode & S_IFMT) == S_IFREG,
+              descriptorStatus.st_dev == pathStatus.st_dev,
+              descriptorStatus.st_ino == pathStatus.st_ino,
+              descriptorStatus.st_size >= 0,
+              descriptorStatus.st_size <= off_t(Int.max) else {
+            throw WriterError.dataPathReplaced(path: fileURL.path)
+        }
+        #if canImport(Darwin)
+        let modificationSeconds = Int64(descriptorStatus.st_mtimespec.tv_sec)
+        let modificationNanoseconds = Int64(descriptorStatus.st_mtimespec.tv_nsec)
+        let changeSeconds = Int64(descriptorStatus.st_ctimespec.tv_sec)
+        let changeNanoseconds = Int64(descriptorStatus.st_ctimespec.tv_nsec)
+        #elseif canImport(Glibc)
+        let modificationSeconds = Int64(descriptorStatus.st_mtim.tv_sec)
+        let modificationNanoseconds = Int64(descriptorStatus.st_mtim.tv_nsec)
+        let changeSeconds = Int64(descriptorStatus.st_ctim.tv_sec)
+        let changeNanoseconds = Int64(descriptorStatus.st_ctim.tv_nsec)
+        #else
+        let modificationSeconds: Int64 = 0
+        let modificationNanoseconds: Int64 = 0
+        let changeSeconds: Int64 = 0
+        let changeNanoseconds: Int64 = 0
+        #endif
+        return StableReadFingerprint(
+            device: UInt64(descriptorStatus.st_dev),
+            inode: UInt64(descriptorStatus.st_ino),
+            mode: UInt32(descriptorStatus.st_mode),
+            owner: UInt64(descriptorStatus.st_uid),
+            linkCount: UInt64(descriptorStatus.st_nlink),
+            size: Int(descriptorStatus.st_size),
+            modificationSeconds: modificationSeconds,
+            modificationNanoseconds: modificationNanoseconds,
+            changeSeconds: changeSeconds,
+            changeNanoseconds: changeNanoseconds)
+    }
+
+    private static func boundedRecordLimit(_ proposed: Int) -> Int {
+        max(1, min(proposed, maximumRecordBytes))
+    }
+
+    private static func validateRecordLengths(
+        _ bytes: Data, maximumRecordBytes: Int
+    ) throws {
+        var recordBytes = 0
+        for byte in bytes {
+            recordBytes += 1
+            guard recordBytes <= maximumRecordBytes else {
+                throw WriterError.invalidJournal(
+                    reason: "journal record exceeds the maximum byte count")
+            }
+            if byte == UInt8(ascii: "\n") { recordBytes = 0 }
         }
     }
 

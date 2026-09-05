@@ -67,8 +67,53 @@ enum LinuxSelfTestMain {
             ("Linux platform: bounded URLSession streaming and cancellation", {
                 try await test_linuxURLSessionStreamingBoundsAndCancellation()
             }),
+            ("Linux platform: disposable projection store", {
+                for (_, body) in casesDisposableTimelineProjectionStore {
+                    try await body()
+                }
+            }),
+            ("Linux platform: local projection source lease", {
+                for (_, body) in casesLocalTimelineProjectionSource {
+                    try await body()
+                }
+            }),
+            ("Linux platform: local Timeline projection reader", {
+                for (_, body) in casesLocalTimelineProjectionReader {
+                    try await body()
+                }
+            }),
+            ("Linux platform: bounded Timeline reducer projection", {
+                for (_, body) in casesBoundedTimelineReducerProjection {
+                    try await body()
+                }
+            }),
+            ("Linux platform: persistent projection radix map", {
+                for (_, body) in casesPersistentProjectionRadixMap {
+                    try await body()
+                }
+            }),
+            ("Linux platform: persistent Work exact state", {
+                for (_, body) in casesPersistentWorkExactState {
+                    try await body()
+                }
+            }),
+            ("Linux platform: Work reducer transition parity", {
+                for (_, body) in casesWorkReducerTransition {
+                    try await body()
+                }
+            }),
+            ("Linux platform: Session reducer transition parity", {
+                for (_, body) in casesSessionReducerTransition {
+                    try await body()
+                }
+            }),
             ("Work service: transport handshake and read projection", {
                 try await test_workServiceTransportHandshakeAndReadProjection()
+            }),
+            ("Work service: create Session for existing Work", {
+                for (_, body) in casesWorkServiceCreateSession {
+                    try await body()
+                }
             }),
             ("Work service: transport independent clients and ordered mutations", {
                 try await test_workServiceTransportSupportsIndependentClientsAndOrderedMutations()

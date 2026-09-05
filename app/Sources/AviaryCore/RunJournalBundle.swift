@@ -198,6 +198,88 @@ public struct IdleWorkCreation: Codable, Hashable, Sendable {
     }
 }
 
+/// The source-journal half of an existing-Work Session creation.  The control journal owns the
+/// reservation and result record; this value contains only the evidence which was actually
+/// committed in the Session/Work journals.  A caller may safely discard it after recording the
+/// result because every field is reconstructable from those journals.
+public struct RunJournalBundleSessionPublication: Codable, Hashable, Sendable {
+    public let session: SessionRef
+    public let sessionJournal: JournalRef
+    public let sessionAttachment: SessionAttachmentRef
+    public let publication: String
+    public let capabilities: [String]
+    public let causalSessionCursor: JournalCursor
+    public let sessionCursor: JournalCursor
+    public let causalWorkCursor: JournalCursor
+    public let resultingWorkCursor: JournalCursor
+    public let sessionCreated: TimelineJournalCommit
+    public let sessionAttached: TimelineJournalCommit
+    public let workMirror: TimelineJournalCommit?
+    public let cursorAdvanced: TimelineJournalCommit
+
+    public init(
+        session: SessionRef, sessionJournal: JournalRef,
+        sessionAttachment: SessionAttachmentRef, publication: String,
+        capabilities: [String], causalSessionCursor: JournalCursor,
+        sessionCursor: JournalCursor, causalWorkCursor: JournalCursor,
+        resultingWorkCursor: JournalCursor, sessionCreated: TimelineJournalCommit,
+        sessionAttached: TimelineJournalCommit, workMirror: TimelineJournalCommit?,
+        cursorAdvanced: TimelineJournalCommit
+    ) {
+        self.session = session
+        self.sessionJournal = sessionJournal
+        self.sessionAttachment = sessionAttachment
+        self.publication = publication
+        self.capabilities = capabilities.sorted()
+        self.causalSessionCursor = causalSessionCursor
+        self.sessionCursor = sessionCursor
+        self.causalWorkCursor = causalWorkCursor
+        self.resultingWorkCursor = resultingWorkCursor
+        self.sessionCreated = sessionCreated
+        self.sessionAttached = sessionAttached
+        self.workMirror = workMirror
+        self.cursorAdvanced = cursorAdvanced
+    }
+}
+
+/// Bounded, host-minted input for ``publishSessionAttachment``.  In particular, no event id or
+/// cursor is accepted from the caller; those remain writer-owned facts.
+public struct RunJournalBundleSessionPublicationRequest: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let workHost: WorkHostRef
+    public let workJournal: JournalRef
+    public let session: SessionRef
+    public let sessionJournal: JournalRef
+    public let sessionAttachment: SessionAttachmentRef
+    public let client: ClientRef
+    public let command: CommandRef
+    public let capabilities: [String]
+    public let causalWorkCursor: JournalCursor
+    /// Required only for a terminal reference. The event must be the exact final Work event at
+    /// ``causalWorkCursor``; the Work writer is still locked and checked, but never appended.
+    public let terminalEvent: EventRef?
+
+    public init(
+        work: WorkRef, workHost: WorkHostRef, workJournal: JournalRef,
+        session: SessionRef, sessionJournal: JournalRef,
+        sessionAttachment: SessionAttachmentRef, client: ClientRef,
+        command: CommandRef, capabilities: [String], causalWorkCursor: JournalCursor,
+        terminalEvent: EventRef? = nil
+    ) {
+        self.work = work
+        self.workHost = workHost
+        self.workJournal = workJournal
+        self.session = session
+        self.sessionJournal = sessionJournal
+        self.sessionAttachment = sessionAttachment
+        self.client = client
+        self.command = command
+        self.capabilities = capabilities.sorted()
+        self.causalWorkCursor = causalWorkCursor
+        self.terminalEvent = terminalEvent
+    }
+}
+
 public enum RunJournalBundleError: LocalizedError, Equatable, Sendable {
     case invalidConfiguration(String)
     case missingCounterpart(path: String)
@@ -527,6 +609,449 @@ public actor RunJournalBundle {
             sessionCursor: sessionCursor,
             workCursor: workCursor,
             commits: commits)
+    }
+
+    /// Publish one new Session relationship against an already-created Work.  The two native
+    /// writers are held for the whole operation, so a live Run owner cannot race the Work mirror
+    /// and a retry can distinguish a complete prefix from a foreign one.  This is deliberately a
+    /// recoverable saga rather than an invented cross-file transaction: Session events are written
+    /// first, the Work mirror second (unless the Work is terminal), and the final Session cursor
+    /// event records the exact Work evidence.  Every prefix is validated before it is continued.
+    /// Journal bytes and event records are streamed in bounded chunks, but the current exact
+    /// duplicate-identity index and in-memory Work reducer remain proportional to journal history.
+    /// This is intentionally described as streaming-but-history-indexed until a durable identity
+    /// index and persistent reducer checkpoint can be used here.
+    public static func publishSessionAttachment(
+        home: AgentHome,
+        request: RunJournalBundleSessionPublicationRequest,
+        actorID: String,
+        actorKind: String = "work-host-control",
+        failurePlan: (session: TimelineJournalWriter.FailurePlan,
+                      work: TimelineJournalWriter.FailurePlan) = (.none, .none),
+        eventIDProvider: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) async throws -> RunJournalBundleSessionPublication {
+        let persistedHost = try home.requirePersistedWorkHost()
+        guard request.workHost == persistedHost,
+              request.work.workHostID == persistedHost.workHostID,
+              request.workJournal == .work(request.work, journalID: "work"),
+              request.sessionJournal == .session(
+                  request.session, journalID: "session",
+                  authority: TimelineAuthorityRef(persistedHost.workHostID)),
+              !request.session.sessionID.isEmpty,
+              !request.sessionAttachment.attachmentID.isEmpty,
+              !request.client.clientID.isEmpty,
+              !request.command.commandID.isEmpty,
+              request.command.client == request.client,
+              request.command.sessionAttachment == request.sessionAttachment,
+              request.command.causalCursor == request.causalWorkCursor,
+              request.causalWorkCursor.journal == request.workJournal,
+              request.causalWorkCursor.sequence >= 0,
+              request.causalWorkCursor.sequence < Int.max,
+              request.capabilities.count <= 64,
+              Set(request.capabilities).count == request.capabilities.count,
+              request.capabilities.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 128 }) else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "Session publication request contains a foreign or incomplete identity")
+        }
+        let actor = TimelineActor(actorID: actorID, kind: actorKind)
+        guard !actorID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RunJournalBundleError.invalidConfiguration("publication actor identity is empty")
+        }
+        let sessionURL = home.timelineV2SessionJournalURL(request.session)
+        let workURL = home.timelineV2WorkJournalURL(request.work)
+        guard FileManager.default.fileExists(atPath: workURL.path) else {
+            throw RunJournalBundleError.missingCounterpart(path: workURL.path)
+        }
+
+        struct StreamSummary {
+            var count = 0
+            var last: TimelineEvent?
+            var maximumHostSequence = 0
+        }
+
+        /// Consume a journal with bounded framing storage. The writer was opened first under the
+        /// canonical owner lock, so duplicate IDs, event envelopes, and any recoverable tail have
+        /// already been validated by its streaming-but-history-indexed reopen path. This pass
+        /// retains only the reducer's state plus the small publication prefix; it never constructs
+        /// a Data copy of the file.
+        func streamEvents(
+            _ url: URL,
+            journal: JournalRef,
+            onEvent: (TimelineEvent) throws -> Void
+        ) throws -> StreamSummary {
+            let handle: FileHandle
+            do {
+                handle = try FileHandle(forReadingFrom: url)
+            } catch {
+                throw TimelineJournalWriter.WriterError.unavailable(error.localizedDescription)
+            }
+            defer { try? handle.close() }
+            var openedStatus = stat()
+            var openedPathStatus = stat()
+            let openedPathResult = url.path.withCString { lstat($0, &openedPathStatus) }
+            guard fstat(handle.fileDescriptor, &openedStatus) == 0,
+                  openedPathResult == 0,
+                  openedStatus.st_dev == openedPathStatus.st_dev,
+                  openedStatus.st_ino == openedPathStatus.st_ino else {
+                throw TimelineJournalWriter.WriterError.dataPathReplaced(path: url.path)
+            }
+            var parser = TimelineJournalReaderState(
+                journal: journal, actor: actor, hostRecordedAt: Date(timeIntervalSince1970: 0))
+            var summary = StreamSummary()
+            let chunkBytes = 64 * 1_024
+            let maximumLineBytes = TimelineJournalWriter.maximumRecordBytes
+            var lineLength = 0
+
+            func consume(_ result: TimelineJournalReadResult) throws {
+                guard result.quarantinedSuffix == nil else {
+                    throw TimelineJournalWriter.WriterError.invalidJournal(
+                        reason: "publication journal contains a corrupt interior suffix")
+                }
+                for record in result.records {
+                    // The incremental reader validates journal, sequence, and previous-event
+                    // links. Keep the final identity and host ordering without retaining history.
+                    try onEvent(record.event)
+                    summary.count += 1
+                    summary.last = record.event
+                    summary.maximumHostSequence = max(
+                        summary.maximumHostSequence, record.event.hostSequence ?? 0)
+                }
+            }
+
+            while let chunk = try handle.read(upToCount: chunkBytes), !chunk.isEmpty {
+                for byte in chunk {
+                    lineLength += 1
+                    guard lineLength <= maximumLineBytes else {
+                        throw TimelineJournalWriter.WriterError.invalidJournal(
+                            reason: "publication journal line exceeds bounded read limit")
+                    }
+                    if byte == 0x0A { lineLength = 0 }
+                }
+                try consume(parser.append(chunk))
+            }
+            let final = parser.append(Data(), final: true)
+            try consume(final)
+            guard final.truncatedTail == nil else {
+                throw TimelineJournalWriter.WriterError.invalidJournal(
+                    reason: "publication journal contains an unterminated tail")
+            }
+            var finalStatus = stat()
+            var finalPathStatus = stat()
+            let finalPathResult = url.path.withCString { lstat($0, &finalPathStatus) }
+            guard fstat(handle.fileDescriptor, &finalStatus) == 0,
+                  finalPathResult == 0,
+                  finalStatus.st_dev == finalPathStatus.st_dev,
+                  finalStatus.st_ino == finalPathStatus.st_ino else {
+                throw TimelineJournalWriter.WriterError.dataPathReplaced(path: url.path)
+            }
+            return summary
+        }
+
+        func caps(_ event: TimelineEvent) -> [String]? {
+            guard let values = event.payload["capabilities"]?.arrayValue else { return nil }
+            let result = values.compactMap(\ .stringValue)
+            return result.count == values.count ? result.sorted() : nil
+        }
+
+        func cursor(for event: TimelineEvent, journal: JournalRef) -> JournalCursor {
+            JournalCursor(journal: journal, eventID: event.eventID, sequence: event.sequence)
+        }
+
+        func commit(_ event: TimelineEvent, journal: JournalRef) -> TimelineJournalCommit {
+            TimelineJournalCommit(eventRef: EventRef(journal: journal, eventID: event.eventID),
+                                  cursor: cursor(for: event, journal: journal))
+        }
+
+        let sessionExists = FileManager.default.fileExists(atPath: sessionURL.path)
+        let sessionWriter: TimelineJournalWriter
+        do {
+            if sessionExists {
+                sessionWriter = try TimelineJournalWriter(
+                    reopeningStreaming: sessionURL, journal: request.sessionJournal, actor: actor,
+                    home: home, allowTruncatedTail: true, failurePlan: failurePlan.session,
+                    eventIDProvider: eventIDProvider, now: now)
+            } else {
+                sessionWriter = try TimelineJournalWriter(
+                    freshAt: sessionURL, journal: request.sessionJournal, actor: actor, home: home,
+                    failurePlan: failurePlan.session,
+                    eventIDProvider: eventIDProvider, now: now)
+            }
+        } catch let error as TimelineJournalWriter.WriterError {
+            throw mapWriterOpenError(error)
+        }
+
+        let workWriter: TimelineJournalWriter
+        do {
+            workWriter = try TimelineJournalWriter(
+                reopeningStreaming: workURL, journal: request.workJournal, actor: actor,
+                home: home, allowTruncatedTail: true, failurePlan: failurePlan.work,
+                eventIDProvider: eventIDProvider, now: now)
+        } catch let error as TimelineJournalWriter.WriterError {
+            try? await sessionWriter.closeChecked()
+            throw mapWriterOpenError(error)
+        } catch {
+            try? await sessionWriter.closeChecked()
+            throw RunJournalBundleError.writer(
+                .unavailable(error.localizedDescription))
+        }
+
+        func closeWriters() async {
+            try? await sessionWriter.closeChecked()
+            try? await workWriter.closeChecked()
+        }
+
+        do {
+            var sessionEvents = [TimelineEvent]()
+            let sessionSummary = try streamEvents(sessionURL, journal: request.sessionJournal) { event in
+                if sessionEvents.count < 4 { sessionEvents.append(event) }
+            }
+            guard sessionSummary.count <= 3 else {
+                throw RunJournalBundleError.invalidGenesis(
+                    journal: request.sessionJournal,
+                    reason: "publication source prefix is empty or has extra Session events")
+            }
+            var workReducer = WorkReducer()
+            var workEventsCount = 0
+            var workLast: TimelineEvent?
+            var terminalEvent: TimelineEvent?
+            var existingMirror: TimelineEvent?
+            let existingSessionAttach = sessionEvents.dropFirst().first
+            let validCommand: (TimelineEvent) -> Bool = { event in
+                event.idempotencyKey == request.command.commandID && event.command == request.command
+            }
+            let validSessionIdentity: (TimelineEvent) -> Bool = { event in
+                event.session == request.session && event.work == request.work
+                    && event.workHost == request.workHost
+                    && event.sessionAttachment == request.sessionAttachment
+                    && event.client == request.client
+            }
+            let workSummary = try streamEvents(workURL, journal: request.workJournal) { event in
+                guard event.provenance == .native else {
+                    throw RunJournalBundleError.invalidGenesis(
+                        journal: request.workJournal, reason: "publication source contains a legacy event")
+                }
+                workReducer.apply(event)
+                workEventsCount += 1
+                workLast = event
+                if let requestedTerminal = request.terminalEvent,
+                   event.eventID == requestedTerminal.eventID,
+                   event.journal == requestedTerminal.journal {
+                    terminalEvent = event
+                }
+                if event.type == TimelineEventType.sessionAttached,
+                   event.session == request.session, event.work == request.work,
+                   event.workHost == request.workHost,
+                   event.sessionAttachment == request.sessionAttachment,
+                   event.client == request.client,
+                   event.causedByEventID == existingSessionAttach.map({ attached in
+                       EventRef(journal: request.sessionJournal, eventID: attached.eventID)
+                   }), caps(event) == request.capabilities.sorted(), validCommand(event) {
+                    existingMirror = event
+                }
+            }
+            guard workEventsCount > 0, workSummary.last != nil else {
+                throw RunJournalBundleError.invalidGenesis(
+                    journal: request.sessionJournal, reason: "publication source prefix is empty or has extra Session events")
+            }
+            let workState = workReducer.snapshot
+            guard workState.structuralIntegrityValid, workState.semanticProjectionValid,
+                  workState.quarantinedEvents.isEmpty,
+                  workState.work == request.work, workState.journal == request.workJournal,
+                  workState.workHost == request.workHost,
+                  let workLast else {
+                throw RunJournalBundleError.invalidJournal(
+                    journal: request.workJournal, reason: "Work source is not a canonical projection")
+            }
+            let actualWorkCursor = cursor(for: workLast, journal: request.workJournal)
+            let terminal = request.terminalEvent != nil
+            let terminalRef = terminalEvent.map { event in
+                EventRef(journal: request.workJournal, eventID: event.eventID)
+            }
+            if terminal {
+                guard workState.lifecycle != .active, workState.activeRun == nil,
+                      request.terminalEvent == terminalRef,
+                      actualWorkCursor == request.causalWorkCursor else {
+                    throw RunJournalBundleError.workTerminal(workState.lifecycle)
+                }
+            } else {
+                guard workState.lifecycle == .active, workState.activeRun == nil,
+                      workState.activeTurn == nil,
+                      actualWorkCursor == request.causalWorkCursor
+                          || actualWorkCursor.sequence == request.causalWorkCursor.sequence + 1 else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "reusable Work cursor changed during Session publication")
+                }
+            }
+
+            if let created = sessionEvents.first {
+                guard created.sequence == 1, created.type == TimelineEventType.sessionCreated,
+                      created.session == request.session, created.work == nil,
+                      created.workHost == nil, created.client == nil,
+                      created.sessionAttachment == nil, created.causedByEventID == nil,
+                      created.payload == .object([:]), validCommand(created) else {
+                    throw RunJournalBundleError.invalidGenesis(
+                        journal: request.sessionJournal,
+                        reason: "Session creation event does not match reservation")
+                }
+            }
+            if let attached = sessionEvents.dropFirst().first {
+                guard attached.sequence == 2, attached.type == TimelineEventType.sessionAttached,
+                      validSessionIdentity(attached), attached.causedByEventID == EventRef(
+                          journal: request.sessionJournal, eventID: sessionEvents[0].eventID),
+                      caps(attached) == request.capabilities.sorted(), validCommand(attached) else {
+                    throw RunJournalBundleError.invalidGenesis(
+                        journal: request.sessionJournal,
+                        reason: "Session attachment event does not match reservation")
+                }
+            }
+            if let advanced = sessionEvents.dropFirst(2).first {
+                let expectedCause = terminalEvent.map {
+                    EventRef(journal: request.workJournal, eventID: $0.eventID)
+                } ?? EventRef(journal: request.workJournal, eventID: workLast.eventID)
+                let advancedCursor: JournalCursor? = advanced.payload["cursor"].flatMap {
+                    decodeTimelineValue($0)
+                }
+                guard sessionEvents.count == 3,
+                      advanced.sequence == 3,
+                      advanced.type == TimelineEventType.sessionAttachmentCursorAdvanced,
+                      validSessionIdentity(advanced), advanced.causedByEventID == expectedCause,
+                      caps(advanced) == request.capabilities.sorted(), validCommand(advanced),
+                      advancedCursor == actualWorkCursor else {
+                    throw RunJournalBundleError.invalidGenesis(
+                        journal: request.sessionJournal,
+                        reason: "Session cursor evidence does not match Work source")
+                }
+            }
+
+            let existingSessionAdvanced = sessionEvents.dropFirst(2).first
+            if !terminal, let mirror = existingMirror {
+                guard actualWorkCursor == cursor(for: mirror, journal: request.workJournal) else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "Work contains evidence after the Session publication mirror")
+                }
+            } else if !terminal {
+                guard actualWorkCursor == request.causalWorkCursor else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "Work cursor advanced before this Session publication mirror")
+                }
+            }
+            if terminal { guard existingMirror == nil else {
+                throw RunJournalBundleError.invalidOperation("terminal publication has a Work mirror")
+            }}
+            if !terminal, existingSessionAdvanced != nil, existingMirror == nil {
+                throw RunJournalBundleError.invalidGenesis(
+                    journal: request.sessionJournal,
+                    reason: "Session cursor evidence exists without its Work publication mirror")
+            }
+            guard sessionEvents.count >= (existingSessionAdvanced == nil ? 0 : 3) else {
+                throw RunJournalBundleError.invalidGenesis(
+                    journal: request.sessionJournal, reason: "Session prefix is not contiguous")
+            }
+
+            var hostOrder = max(sessionSummary.maximumHostSequence, workSummary.maximumHostSequence)
+            func nextHostSequence() -> Int { hostOrder += 1; return hostOrder }
+            var sessionCreated = sessionEvents.first.map { commit($0, journal: request.sessionJournal) }
+            var sessionAttached = existingSessionAttach.map { commit($0, journal: request.sessionJournal) }
+            var workMirror = existingMirror.map { commit($0, journal: request.workJournal) }
+            var cursorAdvanced = existingSessionAdvanced.map {
+                commit($0, journal: request.sessionJournal)
+            }
+
+            if sessionCreated == nil {
+                sessionCreated = try await sessionWriter.append(TimelineEventDraft(
+                    hostSequence: nextHostSequence(), idempotencyKey: request.command.commandID,
+                    command: request.command, session: request.session,
+                    type: TimelineEventType.sessionCreated, declaredDomains: [.session]))
+            }
+            if sessionAttached == nil {
+                guard let created = sessionCreated else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "Session attachment has no creation predecessor")
+                }
+                sessionAttached = try await sessionWriter.append(TimelineEventDraft(
+                    hostSequence: nextHostSequence(), idempotencyKey: request.command.commandID,
+                    command: request.command, causedByEventID: created.eventRef,
+                    session: request.session, work: request.work, workHost: request.workHost,
+                    client: request.client, sessionAttachment: request.sessionAttachment,
+                    type: TimelineEventType.sessionAttached,
+                    declaredDomains: [.session, .work],
+                    payload: .object(["capabilities": .array(
+                        request.capabilities.sorted().map { .string($0) })])))
+            }
+            let resultingWorkCursor: JournalCursor
+            if terminal {
+                resultingWorkCursor = request.causalWorkCursor
+            } else if let mirror = workMirror {
+                resultingWorkCursor = mirror.cursor
+            } else {
+                guard let attached = sessionAttached else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "Work mirror has no Session attachment predecessor")
+                }
+                workMirror = try await workWriter.append(TimelineEventDraft(
+                    hostSequence: nextHostSequence(), idempotencyKey: request.command.commandID,
+                    command: request.command, causedByEventID: attached.eventRef,
+                    session: request.session, work: request.work, workHost: request.workHost,
+                    client: request.client, sessionAttachment: request.sessionAttachment,
+                    type: TimelineEventType.sessionAttached,
+                    declaredDomains: [.work, .session],
+                    payload: .object(["capabilities": .array(
+                        request.capabilities.sorted().map { .string($0) })])))
+                resultingWorkCursor = workMirror!.cursor
+            }
+            if cursorAdvanced == nil {
+                guard sessionAttached != nil else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "Session cursor has no attachment predecessor")
+                }
+                let cause = terminal
+                    ? terminalEvent.map { EventRef(journal: request.workJournal, eventID: $0.eventID) }
+                    : workMirror?.eventRef
+                guard let cause else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "Session cursor has no Work evidence predecessor")
+                }
+                cursorAdvanced = try await sessionWriter.append(TimelineEventDraft(
+                    hostSequence: nextHostSequence(), idempotencyKey: request.command.commandID,
+                    command: request.command, causedByEventID: cause,
+                    session: request.session, work: request.work, workHost: request.workHost,
+                    client: request.client, sessionAttachment: request.sessionAttachment,
+                    type: TimelineEventType.sessionAttachmentCursorAdvanced,
+                    declaredDomains: [.session, .work], payload: .object([
+                        "capabilities": .array(request.capabilities.sorted().map { .string($0) }),
+                        "cursor": encodeTimelineValue(resultingWorkCursor)
+                    ])))
+            } else {
+                guard cursorAdvanced!.cursor == JournalCursor(
+                    journal: request.sessionJournal,
+                    eventID: cursorAdvanced!.eventRef.eventID,
+                    sequence: cursorAdvanced!.cursor.sequence) else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "Session cursor evidence has a foreign journal")
+                }
+            }
+            guard let created = sessionCreated, let attached = sessionAttached,
+                  let advanced = cursorAdvanced else {
+                throw RunJournalBundleError.invalidOperation(
+                    "Session publication did not produce all evidence")
+            }
+            try await sessionWriter.closeChecked()
+            try await workWriter.closeChecked()
+            return RunJournalBundleSessionPublication(
+                session: request.session, sessionJournal: request.sessionJournal,
+                sessionAttachment: request.sessionAttachment,
+                publication: terminal ? "terminal_reference" : "mirrored",
+                capabilities: request.capabilities,
+                causalSessionCursor: JournalCursor(journal: request.sessionJournal, sequence: 0),
+                sessionCursor: advanced.cursor, causalWorkCursor: request.causalWorkCursor,
+                resultingWorkCursor: resultingWorkCursor, sessionCreated: created,
+                sessionAttached: attached, workMirror: workMirror,
+                cursorAdvanced: advanced)
+        } catch {
+            await closeWriters()
+            throw error
+        }
     }
 
     private static func continueIdleWork(
@@ -3432,19 +3957,13 @@ public actor RunJournalBundle {
     private static func readNativeJournal(
         at url: URL, journal: JournalRef, actor: TimelineActor
     ) throws -> [TimelineEvent] {
-        let data: Data
-        do { data = try Data(contentsOf: url) }
-        catch { throw RunJournalBundleError.invalidJournal(journal: journal, reason: error.localizedDescription) }
-        let read = TimelineJournalReader.read(
-            data, journal: journal, actor: actor, hostRecordedAt: Date(timeIntervalSince1970: 0))
-        guard read.quarantinedSuffix == nil, read.truncatedTail == nil, !read.records.isEmpty else {
+        do {
+            return try TimelineJournalWriter.readNativeEventsStreaming(
+                at: url, journal: journal, actor: actor)
+        } catch {
             throw RunJournalBundleError.invalidJournal(
-                journal: journal, reason: "journal is empty, corrupt, or has an incomplete tail")
+                journal: journal, reason: error.localizedDescription)
         }
-        guard read.records.allSatisfy({ $0.event.provenance == .native }) else {
-            throw RunJournalBundleError.invalidJournal(journal: journal, reason: "legacy event in native bundle")
-        }
-        return read.records.map(\.event)
     }
 
     private static func validateGenesis(

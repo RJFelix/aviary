@@ -7018,6 +7018,15 @@ let casesTimelineWriter: [Case] = [
     ("phase1 writer: deterministic seams and persisted authority", {
         try await test_timelineJournalWriterDeterministicSeamsAndAgentHomeAuthority()
     }),
+    ("phase1 writer: streaming reopen recovers a truncated tail", {
+        try await test_timelineJournalWriterStreamingReopenStreamsAndRecoversTail()
+    }),
+    ("phase1 writer: oversized batches are rejected before writing", {
+        try await test_timelineJournalWriterRejectsOversizedBatchBeforeWriting()
+    }),
+    ("phase1 writer: streaming reads fence symlinks and replacements", {
+        try await test_timelineJournalStreamingReadFencesSymlinkAndReplacement()
+    }),
 ]
 
 let casesRunJournalBundle: [Case] = [
@@ -7093,6 +7102,12 @@ let casesRunJournalBundle: [Case] = [
     ("phase1 bundle: idle Work creation precedes Run Start", {
         try await test_runJournalBundleCreatesIdleWorkBeforeAnyRunStarts()
     }),
+    ("phase1 bundle: stale partial Session publication cannot cross a newer mirror", {
+        try await test_runJournalBundleSessionPublicationRejectsStalePartialSaga()
+    }),
+    ("phase1 bundle: Session cursor without Work mirror stays unavailable", {
+        try await test_runJournalBundleSessionPublicationRejectsCursorWithoutMirror()
+    }),
     ("phase1 bundle: terminal mutation rejects stale Run generation", {
         try await test_runJournalBundleTerminalMutationRejectsStaleRunGeneration()
     }),
@@ -7116,6 +7131,7 @@ await Harness.run(
         + casesCanonicalSessionSearch
         + casesLocalTimelineCatalog + casesCanonicalWorkRecoveryProjection
         + casesWorkService + casesWorkHostControlJournal + casesWorkHostControlCreation
+        + casesWorkServiceCreateSession
         + casesWorkHostRegistry
         + casesHostedInHouseWork + casesInHouseWorkFactory
         + casesInHouseModelResolver + casesLocalWorkHostLaunchResolver
@@ -7127,6 +7143,14 @@ await Harness.run(
         + casesLocalAviaryDaemonLauncher
         + casesServiceBackedIntentStores
         + casesWorkServiceAttachedWorkController
+        + casesDisposableTimelineProjectionStore
+        + casesLocalTimelineProjectionSource
+        + casesLocalTimelineProjectionReader
+        + casesBoundedTimelineReducerProjection
+        + casesPersistentProjectionRadixMap
+        + casesPersistentWorkExactState
+        + casesWorkReducerTransition
+        + casesSessionReducerTransition
         + casesWorkHostWorkspaceRegistry
         + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal

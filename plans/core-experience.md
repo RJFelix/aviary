@@ -1,8 +1,49 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; the transactional projection/index and new-Session-to-existing-Work seam are next
+Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; the transactional projection/index and new-Session-to-existing-Work service seam are implemented and hardened, with exact Session continuation, production service-reader cutover, and the GUI composition flow next
 Date: 2026-09-04
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
+
+Transactional projection foundation (2026-09-04): the first Darwin/Linux disposable projection
+store now publishes a checksummed, generation-fenced `HEAD` only after content-addressed bucket,
+recent-page, and reducer-head objects plus deterministic sealed-bucket references are durable. Every
+load requires a fresh canonical source observation; the production bootstrap seam supplies the
+checksummed stored boundary and exact indexed terminal row to a synchronous source validator rather
+than exposing an unvalidated cache header. Journal/source generation, cursor, byte range, canonical
+event-line digest, prefix hash chain, recent event bodies, seek anchors, and exact pending read-
+acknowledgement requests are mutually checked. A partial bucket can only extend or seal its exact
+predecessor, nonzero prefix seeds cannot skip buckets, same-tip metadata commits remain possible,
+and ordinary reads/commits stay constant-work even when historical anchors are retained. Replaced
+bounded payloads are reclaimed after publication; crash or unlink-failure orphans remain harmless,
+while total namespace quota/semantic garbage collection remains explicitly deferred policy rather
+than a claimed hard disk bound.
+
+The local source lease, typed bounded Work/Session heads, shared one-event reducer transitions,
+copy-on-write radix map, and an exact persistent Work reducer root are now implemented on both
+platform source lists. The production local projection reader publishes the bounded head and exact
+Work root atomically, validates the root before reuse, and continues stateful Work semantics across
+reopen. The lease distinguishes strict unchanged-source proof from an explicit cooperating-writer
+append contract held under the canonical owner lock; it does not claim to detect an arbitrary
+external middle rewrite followed by an append. Typed heads separate controlling scalar truth from
+per-index completeness, retain active/unsettled rows before historical rows, and keep raw messages,
+payloads, error reasons, prompt labels, and unhashed identity keys out of persisted metadata.
+
+This is still a production-cutover checkpoint, not the completed bounded-reader promise. A bounded
+head is not itself an exact reducer checkpoint and must never be fed back into the canonical
+reducer. Work has a disk-keyed exact continuation root; Session message-parent/context accounting
+still needs the corresponding exact persistent state. When the current reader cannot prove an
+exact suffix continuation it deliberately streams and replays from byte zero under the owner lock,
+rather than claiming incremental work it did not perform. The journal-backed service and control-
+journal verifier still contain full semantic scans that must move behind the proven projection
+boundary before normal long-lived Work reads are bounded.
+
+The first-class service operation for creating a new Session attached to existing active or
+terminal Work is implemented with independent Session identity, a paired Work mirror where the Work
+is mutable, client-qualified attachment/capability records, a two-record durable control
+reservation/result, exact retry after restart, detach/revocation, bounded relationship counts, and
+transport correlation. The GUI can explicitly attach another client to an existing Session today;
+the separate user-facing “new Session on this Work” composition flow remains to be built on this
+service seam.
 
 Phase 3C closure checkpoint (2026-09-04): accepted and duplicate service commands no longer
 become UI truth on the strength of a transport receipt. The client retains the exact command
@@ -17,16 +58,18 @@ receipts carry the exact attachment outcome required by transport correlation. S
 distinguishes timeout and cancellation and performs bounded TERM-to-KILL cleanup without opening
 an implicit interactive stdin channel.
 
-The integrated macOS suite passes 787 cases / 8,450 assertions. The 100,000-event Timeline
-benchmark reads and reduces 46,766,700 bytes in 5.774 seconds on the checkpoint machine. Release
-assembly signs the GUI and its nested `aviaryd`; all 9 canonical 1600×1000 screens render and were
-visually inspected. On a fresh Ubuntu 24.04 x86_64 snapshot with Swift 6.3.3, the selected headless
-suite passes 18 cases / 188 assertions, the real reconnect/provider process proof passes 1 case /
-53 assertions, and the normal daemon proof passes 1 case / 12 assertions. A freshly rebuilt macOS
-client then handshakes that Linux daemon through SSH stream-local forwarding with the expected
-Work Host identity. The remaining named convergence work is the disposable transactional
-projection/index, followed by the first-class new-Session-to-existing-Work protocol and GUI flow;
-native remote discovery and device authentication remain later product surfaces.
+The integrated macOS suite passes 893 cases / 10,549 assertions in 243.13 seconds. The 100,000-event
+Timeline benchmark generates 46,766,700 bytes in 0.890 seconds and reads plus reduces them in 5.586
+seconds on the checkpoint machine. Release assembly signs the GUI and its nested `aviaryd`; all 9
+canonical 1600×1000 screens render and were visually inspected. On a fresh Ubuntu 24.04 x86_64
+snapshot with Swift 6.3.3, `aviaryd` and `AviarySelfTest` build and the selected headless suite passes
+27 cases / 1,978 assertions in 730.88 seconds, including the real daemon, reconnect, provider,
+parent-lease, projection, and Session-creation paths. A freshly rebuilt macOS client handshakes that
+exact Linux daemon through SSH stream-local forwarding with the expected Work Host and process-
+instance identity. The remaining named convergence work is exact persistent Session continuation,
+cutting the journal-backed service and control reader over to the proven projection boundary, and
+the first-class new-Session-on-existing-Work GUI flow; native remote discovery and device
+authentication remain later product surfaces.
 
 Phase 3C implementation checkpoint (2026-09-03): the production path now composes the durable
 workspace registry, journal-backed Work service, launch manifests, execution factory, and
@@ -346,10 +389,13 @@ peak-RSS budget. The semantic component measure is deliberately not claimed to b
 HTTP wire size. The 100,000-event benchmark fixes an encoded-input and read/reduce baseline, but does
 not claim incremental rendering or bounded peak memory. Phase 3 now has an out-of-process local Work
 Host, GUI-independent process survival, reconnecting clients, durable paired read checkpoints and
-acknowledgements, and a Linux/SSH transport proof. It still owes the disposable transactional
-projection store that makes host/client catch-up and cold resume bounded, the independent
-new-Session-to-existing-Work transaction, integrated multi-client fault matrix, and native remote
-discovery/authentication UX before the entire many-to-many architecture is complete.
+acknowledgements, a transactional disposable projection store, bounded local source leases and
+typed heads, a persistent exact Work continuation root, first-class creation of a new Session on
+existing Work, and a Linux/SSH transport proof. It still owes the corresponding exact persistent
+Session state, replacement of the remaining journal-backed service/control full scans with the
+proven projection boundary, the user-facing new-Session-on-Work composition flow, an integrated
+multi-client fault matrix, and native remote discovery/authentication UX before the entire
+many-to-many architecture is complete.
 
 ## Outcome
 
