@@ -61,6 +61,7 @@ enum ServiceBackedRunBridgeError: Error, LocalizedError, Sendable {
 final class ServiceBackedRunBridge {
     let controller: WorkServiceAttachedWorkController
     let work: WorkRef
+    let serviceAttachmentKey: ServiceAttachmentKey
     let sessionID: String
     let workspaceID: WorkHostWorkspaceID?
     let workspaceLabel: String
@@ -73,6 +74,7 @@ final class ServiceBackedRunBridge {
     init(
         controller: WorkServiceAttachedWorkController,
         projection: WorkServiceAttachedWorkProjection,
+        serviceAttachmentKey: ServiceAttachmentKey,
         workspaceLabel: String,
         modelLabel: String?,
         thinkingLevel: String?
@@ -80,6 +82,7 @@ final class ServiceBackedRunBridge {
         self.controller = controller
         self.projection = projection
         self.work = projection.descriptor.work
+        self.serviceAttachmentKey = serviceAttachmentKey
         self.sessionID = projection.attachment.session?.sessionID ?? ""
         self.workspaceID = projection.descriptor.configuration.workspaceID
         self.workspaceLabel = workspaceLabel
@@ -121,18 +124,45 @@ final class ServiceBackedRunBridge {
         projection.pendingCommand
     }
 
+    private var controlPolicy: ServiceBackedGUIControlPolicy {
+        ServiceBackedGUIControlPolicy(projection: projection)
+    }
+
+    /// A retained Start may be retried while the Work has no Run owner.  Every other retained
+    /// command must still belong to this exact active Session relationship; keep the repair UI
+    /// disabled when a refresh observes an ownership transfer.
+    var canRetryPendingCommand: Bool {
+        guard let pending = projection.pendingCommand else { return false }
+        return controlPolicy.canRetryPendingCommand(kind: pending.kind)
+    }
+
+    /// An active Work run is owned by exactly one Session relationship.  A descriptor that
+    /// omits or mismatches that owner is safe to inspect, but must never receive text controls.
+    var hasExactRunOwner: Bool {
+        controlPolicy.hasExactRunOwner
+    }
+
+    /// An idle Session without a Run is a conversation ready for its first `Start`, not a
+    /// settled Run ready for `Send`. The distinction comes entirely from the canonical Work
+    /// projection; local message count and GUI construction time are not lifecycle evidence.
+    var requiresStartForNextInput: Bool {
+        controlPolicy.requiresStartForNextInput
+    }
+
+    var canSubmitText: Bool {
+        controlPolicy.canSubmitText
+    }
+
+    var canEnd: Bool {
+        controlPolicy.canEnd
+    }
+
     /// Capabilities are observations from the attached Work, never assumptions made by the
     /// GUI.  The protocol currently exposes cancellation as one bounded agent-loop scope;
     /// model-stream/current-action interruption remains unavailable unless a future capability
     /// says so explicitly.
     var commandCapabilities: SessionCommandCapabilities {
-        let granted = projection.capabilities
-        var scopes: Set<SessionCancellationScope> = []
-        if granted.contains(.cancel) { scopes.insert(.agentLoop) }
-        return SessionCommandCapabilities(
-            supportsSteering: granted.contains(.steer),
-            supportsQueuedFollowUps: granted.contains(.queue),
-            cancellationScopes: scopes)
+        controlPolicy.commandCapabilities
     }
 
     /// Work execution has a richer state machine than the legacy LiveRun view.  A held or
@@ -244,6 +274,7 @@ final class ServiceBackedRunBridge {
     }
 
     func start(_ prompt: String, commandID: String? = nil) async throws -> WorkServiceCommandReceipt {
+        try requireExactRunOwner()
         if let commandID {
             return try await issue { try await self.controller.start(prompt, commandID: commandID) }
         }
@@ -251,25 +282,36 @@ final class ServiceBackedRunBridge {
     }
 
     func send(_ prompt: String) async throws -> WorkServiceCommandReceipt {
-        try await issue { try await self.controller.send(prompt) }
+        try requireExactRunOwner()
+        return try await issue { try await self.controller.send(prompt) }
     }
 
     func steer(_ text: String) async throws -> WorkServiceCommandReceipt {
-        try await issue { try await self.controller.steer(text) }
+        try requireExactRunOwner()
+        return try await issue { try await self.controller.steer(text) }
     }
 
     func queue(_ text: String) async throws -> WorkServiceCommandReceipt {
-        try await issue { try await self.controller.queue(text) }
+        try requireExactRunOwner()
+        return try await issue { try await self.controller.queue(text) }
     }
 
     func cancel(scope: SessionCancellationScope) async throws -> WorkServiceCommandReceipt {
-        try await issue { try await self.controller.cancel(scope: scope) }
+        try requireExactRunOwner()
+        return try await issue { try await self.controller.cancel(scope: scope) }
     }
 
     /// The only service-backed lifecycle termination operation.  Generic GUI disconnect and
     /// process termination never call this method.
     func end() async throws -> WorkServiceCommandReceipt {
-        try await issue { try await self.controller.end() }
+        try requireExactRunOwner()
+        return try await issue { try await self.controller.end() }
+    }
+
+    private func requireExactRunOwner() throws {
+        guard hasExactRunOwner else {
+            throw WorkServiceAttachedWorkControllerError.recoveryRequired
+        }
     }
 
     /// Retry the controller's one explicitly retained command, preserving its original command

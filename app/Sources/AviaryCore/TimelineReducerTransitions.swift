@@ -16,6 +16,8 @@ internal struct BoundedWorkScalarContinuation: Equatable, Sendable {
     var lifecycle: WorkLifecycle
     var execution: WorkExecution
     var activeRun: RunRef?
+    var activeRunSession: SessionRef?
+    var activeRunSessionAttachment: SessionAttachmentRef?
     var modelID: String?
     var activeTurn: TurnRef?
     var lastHostSequence: Int?
@@ -33,6 +35,8 @@ internal struct BoundedWorkScalarContinuation: Equatable, Sendable {
         lifecycle = snapshot.lifecycle
         execution = snapshot.execution
         activeRun = snapshot.activeRun
+        activeRunSession = snapshot.activeRunSession
+        activeRunSessionAttachment = snapshot.activeRunSessionAttachment
         modelID = snapshot.modelID
         activeTurn = snapshot.activeTurn
         lastHostSequence = snapshot.lastHostSequence
@@ -51,6 +55,8 @@ internal struct BoundedWorkScalarContinuation: Equatable, Sendable {
         snapshot.lifecycle = lifecycle
         snapshot.execution = execution
         snapshot.activeRun = activeRun
+        snapshot.activeRunSession = activeRunSession
+        snapshot.activeRunSessionAttachment = activeRunSessionAttachment
         snapshot.modelID = modelID
         snapshot.activeTurn = activeTurn
         snapshot.lastHostSequence = lastHostSequence
@@ -421,6 +427,8 @@ internal enum WorkReducerTransition {
                 $0.lifecycle = .completed
                 $0.execution = activeActionCount == 0 ? .idle : .running
                 $0.activeRun = nil
+                $0.activeRunSession = nil
+                $0.activeRunSessionAttachment = nil
                 $0.activeTurn = nil
             }
         case TimelineEventType.workFailed:
@@ -449,6 +457,8 @@ internal enum WorkReducerTransition {
                 $0.lifecycle = .destroyed
                 $0.execution = activeActionCount == 0 ? .idle : .running
                 $0.activeRun = nil
+                $0.activeRunSession = nil
+                $0.activeRunSessionAttachment = nil
                 $0.activeTurn = nil
             }
         case TimelineEventType.sessionAttached:
@@ -489,14 +499,22 @@ internal enum WorkReducerTransition {
         case TimelineEventType.runStarted:
             guard !isTerminalLifecycle(state), state.scalar.activeRun == nil,
                   let run = event.run, !run.runID.isEmpty,
-                  !state.hasObservedRun(run.runID) else {
+                  !state.hasObservedRun(run.runID),
+                  let session = event.session, !session.sessionID.isEmpty,
+                  let sessionAttachment = event.sessionAttachment,
+                  !sessionAttachment.attachmentID.isEmpty,
+                  let attached = state.sessionAttachment(
+                      for: sessionAttachment.attachmentID),
+                  attached.session == session, attached.isAttached else {
                 quarantine(event, state: &state,
-                           reason: "run cannot start without a fresh identity, while another Run is active, or on terminal Work")
+                           reason: "run cannot start without a fresh identity, an exact attached Session/attachment pair, while another Run is active, or on terminal Work")
                 return
             }
             state.stageObservedRun(run)
             updateScalar(&state) {
                 $0.activeRun = run
+                $0.activeRunSession = session
+                $0.activeRunSessionAttachment = sessionAttachment
                 $0.modelID = event.payload["model_id"]?.stringValue
                     ?? event.payload["model"]?.stringValue
                 $0.execution = .running
@@ -507,13 +525,19 @@ internal enum WorkReducerTransition {
             // `activeRun == nil` here made every run.finished event self-contradictory;
             // only actions, a turn, or live Handles must be quiescent first.
             guard let run = event.run, run == state.scalar.activeRun,
+                  let session = event.session,
+                  session == state.scalar.activeRunSession,
+                  let sessionAttachment = event.sessionAttachment,
+                  sessionAttachment == state.scalar.activeRunSessionAttachment,
                   !hasOutstandingRunWork(state) else {
                 quarantine(event, state: &state,
-                           reason: "run finish does not match the active Run or Work remains outstanding")
+                           reason: "run finish does not match the active Run owner or Work remains outstanding")
                 return
             }
             updateScalar(&state) {
                 $0.activeRun = nil
+                $0.activeRunSession = nil
+                $0.activeRunSessionAttachment = nil
                 $0.execution = executionAfterRun(event.payload)
             }
         case TimelineEventType.modelChanged:

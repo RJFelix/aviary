@@ -247,6 +247,15 @@ final class AppModel {
     /// Work rows after the first page of attached runs from being starved forever.
     private var servicePollOffset = 0
     private var serviceCreateInFlight = false
+    /// Create Session is independently serialized per Work. The exact request is retained on
+    /// disk before transport, so this flag is only presentation/admission backpressure rather
+    /// than the durability boundary.
+    private var serviceSessionCreationsInFlight: Set<WorkRef> = []
+    private enum CreateSessionReconciliationOutcome: Equatable {
+        case clear
+        case recovered
+        case blocked
+    }
     /// Exact Attach requests retained across an ambiguous response.  The request's causal
     /// control cursor and host instance are part of the logical attach epoch; a later retry uses
     /// this same envelope only while the descriptor has not already proven the attachment.
@@ -254,11 +263,11 @@ final class AppModel {
         let request: WorkServiceAttachRequest
         let hostInstance: WorkHostInstanceRef
     }
-    private var pendingServiceAttaches: [WorkRef: PendingServiceAttach] = [:]
+    private var pendingServiceAttaches: [AttachTargetKey: PendingServiceAttach] = [:]
     /// Local presentation state only.  Closing a completed service row must not cause the next
     /// catalog poll to recreate it; a relaunch starts with an empty set and can inspect terminal
     /// Work again from the canonical Sessions/catalog surface.
-    private var hiddenServiceWorkIDs: Set<WorkRef> = []
+    private var hiddenServiceAttachmentKeys: Set<ServiceAttachmentKey> = []
 
     var workRuns: [LiveRun] { runs + detachedRuns }
 
@@ -545,6 +554,8 @@ final class AppModel {
             guard await reconcilePendingCreateIntents(session: session, client: client) else {
                 return
             }
+            guard await reconcilePendingCreateSessionIntents(
+                session: session, client: client) != .blocked else { return }
             await restoreServiceWork(
                 session: session, client: client, handshake: freshHandshake)
         } catch {
@@ -600,41 +611,58 @@ final class AppModel {
             localWorkServiceError = nil
         }
         localServiceCatalogWorks = catalog.works.filter { descriptor in
-            guard !hiddenServiceWorkIDs.contains(descriptor.work) else { return false }
-            let hasOwnAttachment = descriptor.attachments.contains { $0.client == client }
-            let alreadyRepresented = workRuns.contains {
-                $0.serviceProjection?.descriptor.work == descriptor.work
+            let ownAttachments = descriptor.attachments.filter { $0.client == client }
+            let hasOwnAttachment = !ownAttachments.isEmpty
+            let representedKeys = Set(workRuns.compactMap { $0.serviceAttachmentKey })
+            let hasUnrepresentedOwnAttachment = ownAttachments.contains { attachment in
+                guard let key = ServiceAttachmentKey(work: descriptor.work, attachment: attachment)
+                else { return false }
+                return !representedKeys.contains(key)
+            }
+            let hasUnattachedSemanticTarget = descriptor.attachmentQualifiedSessionTargets.contains {
+                target in
+                !ownAttachments.contains {
+                    $0.session == target.session
+                        && $0.sessionJournal == target.sessionJournal
+                        && $0.sessionAttachment == target.sessionAttachment
+                }
+            }
+            let canCreateSession = ownAttachments.contains {
+                $0.authorization.allows(.createSession)
+                    && ServiceAttachmentKey(work: descriptor.work, attachment: $0) != nil
             }
             // Reusable Work with this client's attachment is reconstructed into LiveRun below.
             // Terminal Work stays in the explicit catalog even when it retains that attachment,
             // so a relaunch can reopen it for inspection instead of silently losing history.
-            return !alreadyRepresented
-                && (!hasOwnAttachment || descriptor.recordedDisposition != .reusable)
+            return !hasOwnAttachment || descriptor.recordedDisposition != .reusable
+                || hasUnrepresentedOwnAttachment || hasUnattachedSemanticTarget
+                || canCreateSession
         }
         for descriptor in catalog.works {
-            guard !hiddenServiceWorkIDs.contains(descriptor.work) else { continue }
             // Terminal Work remains available from Sessions/catalog and through the explicit
             // Attach action below, but relaunch should not flood Live with completed history.
             guard descriptor.recordedDisposition == .reusable else { continue }
             let attachments = descriptor.attachments.filter { $0.client == client }
             for attachment in attachments {
+                guard let key = ServiceAttachmentKey(work: descriptor.work, attachment: attachment),
+                      !hiddenServiceAttachmentKeys.contains(key) else { continue }
                 await adoptServiceAttachment(
                     descriptor: descriptor, attachment: attachment,
-                    session: session, client: client)
+                    session: session, client: client, focus: false)
             }
         }
         // A Start seed may outlive both its GUI and its Run. Terminal Work is not auto-opened
         // into Live, but its exact command evidence can still settle the local marker so a later
         // relaunch never retries an already-ended Start or leaves a stale bootstrap obligation.
         for descriptor in catalog.works {
-            guard !hiddenServiceWorkIDs.contains(descriptor.work),
-                  descriptor.recordedDisposition != .reusable,
-                  let attachment = descriptor.attachments.first(where: { $0.client == client }) else {
-                continue
+            guard descriptor.recordedDisposition != .reusable else { continue }
+            for attachment in descriptor.attachments where attachment.client == client {
+                guard let key = ServiceAttachmentKey(work: descriptor.work, attachment: attachment),
+                      !hiddenServiceAttachmentKeys.contains(key) else { continue }
+                await reconcileTerminalStartIntent(
+                    descriptor: descriptor, attachment: attachment,
+                    session: session, client: client)
             }
-            await reconcileTerminalStartIntent(
-                descriptor: descriptor, attachment: attachment,
-                session: session, client: client)
         }
     }
 
@@ -650,8 +678,10 @@ final class AppModel {
         client: ClientRef
     ) async {
         do {
+            guard let key = ServiceAttachmentKey(work: descriptor.work, attachment: attachment)
+            else { throw ServiceBackedStartIntentError.corrupt }
             let store = try ServiceBackedStartIntentStore(
-                home: home, client: client, work: descriptor.work)
+                home: home, key: key)
             guard let intent = try store.load() else { return }
             guard attachment.session == intent.session,
                   attachment.sessionJournal == intent.sessionJournal,
@@ -661,7 +691,7 @@ final class AppModel {
                 return
             }
             let intentStore = try WorkServiceAttachedWorkIntentStore(
-                home: home, client: client, work: descriptor.work)
+                home: home, key: key)
             let controller = try WorkServiceAttachedWorkController(
                 session: session, seed: .existing(work: descriptor, attachment: attachment),
                 intentStore: intentStore)
@@ -681,25 +711,58 @@ final class AppModel {
         }
     }
 
+    @discardableResult
     private func adoptServiceAttachment(
         descriptor: WorkServiceWorkDescriptor,
         attachment: WorkServiceClientAttachment,
         session: WorkServiceClientSession,
-        client: ClientRef
-    ) async {
+        client: ClientRef,
+        focus: Bool
+    ) async -> String? {
         guard attachment.session != nil,
               attachment.sessionJournal != nil,
               attachment.sessionAttachment != nil else {
-            localWorkServiceError = "A Work attachment without a Session identity was withheld."
-            return
+            let message = "A Work attachment without a Session identity was withheld."
+            localWorkServiceError = message
+            return message
         }
-        guard !workRuns.contains(where: { $0.serviceProjection?.descriptor.work == descriptor.work })
-        else { return }
+        guard let key = ServiceAttachmentKey(work: descriptor.work, attachment: attachment) else {
+            let message = "A Work attachment without a complete identity was withheld."
+            localWorkServiceError = message
+            return message
+        }
+        let sameSessionAttachments = descriptor.attachments.filter {
+            $0.client == key.client
+                && $0.session == key.workSession.session
+                && $0.sessionJournal == key.workSession.sessionJournal
+                && $0.sessionAttachment == key.workSession.sessionAttachment
+        }
+        guard sameSessionAttachments.count == 1,
+              sameSessionAttachments.first.map({
+                  ServiceAttachmentKey(work: descriptor.work, attachment: $0) == key
+              }) == true else {
+            let message =
+                "This Work has conflicting records for one client Session attachment."
+            localWorkServiceError = message
+            return message
+        }
+        hiddenServiceAttachmentKeys.remove(key)
+        if let existing = workRuns.first(where: { $0.serviceAttachmentKey == key }) {
+            if focus {
+                if detachedRuns.contains(where: { $0.id == existing.id }) {
+                    reattachRun(existing)
+                } else {
+                    focusedRunID = existing.id
+                    section = .live
+                }
+            }
+            return nil
+        }
         do {
             let intentStore = try WorkServiceAttachedWorkIntentStore(
-                home: home, client: client, work: descriptor.work)
+                home: home, key: key)
             let startIntentStore = try ServiceBackedStartIntentStore(
-                home: home, client: client, work: descriptor.work)
+                home: home, key: key)
             let initialStart = try startIntentStore.load()
             let controller = try WorkServiceAttachedWorkController(
                 session: session,
@@ -731,6 +794,7 @@ final class AppModel {
             let bridge = ServiceBackedRunBridge(
                 controller: controller,
                 projection: projection,
+                serviceAttachmentKey: key,
                 workspaceLabel: workspaceLabel(for: descriptor),
                 modelLabel: [descriptor.configuration.providerID,
                              descriptor.configuration.modelID]
@@ -740,6 +804,10 @@ final class AppModel {
                 service: bridge, initialStart: unresolvedInitialStart,
                 initialStartStore: startIntentStore)
             runs.append(run)
+            if focus {
+                focusedRunID = run.id
+                section = .live
+            }
             run.observeService()
             // A Create may have been durably accepted just before the previous GUI disappeared.
             // Re-drive that exact first prompt only after the attachment has been reconstructed;
@@ -754,8 +822,11 @@ final class AppModel {
                 run.commandNotice = .warning(
                     "The retained initial Start belongs to a different Session attachment; review and retry it explicitly.")
             }
+            return nil
         } catch {
-            localWorkServiceError = "A Work attachment could not be reconstructed safely."
+            let message = "A Work attachment could not be reconstructed safely."
+            localWorkServiceError = message
+            return message
         }
     }
 
@@ -842,6 +913,160 @@ final class AppModel {
         }
     }
 
+    /// Reconcile every host-minted Session request before admitting another one. Unlike a
+    /// normal command, the identities in the result do not exist until the Work Host commits;
+    /// only replaying the exact retained request can distinguish a lost response from no effect.
+    private func reconcilePendingCreateSessionIntents(
+        session: WorkServiceClientSession, client: ClientRef,
+        mode: ServiceBackedGUIOrchestration.ReconciliationMode = .passivePolling
+    ) async -> CreateSessionReconciliationOutcome {
+        do {
+            guard let handshake = await session.negotiatedHandshake else {
+                localWorkServiceError =
+                    "A retained Session creation could not be reconciled without a Work Host handshake."
+                return .blocked
+            }
+            let store = try ServiceBackedCreateSessionIntentStore(
+                home: home, client: client, host: handshake.host)
+            var blockedMessage: String?
+            var clearedMessage: String?
+            var recoveredPresentationMessage: String?
+            let pending = try store.load()
+            var observations: [ServiceBackedGUIOrchestration.CreateSessionObservation] = []
+            var recoveredResponses:
+                [(ServiceBackedGUIOrchestration.RecoveredCreateSession,
+                    WorkServiceCreateSessionResponse)] = []
+            for request in pending {
+                do {
+                    let response = try await session.createSession(request)
+                    guard Self.validCreateSessionResponse(
+                        response, request: request, expectedHost: handshake.hostInstance) else {
+                        blockedMessage = blockedMessage
+                            ?? "The Work Host returned an invalid result for a retained Session creation; the exact intent remains pending."
+                        observations.append(.init(request: request, outcome: .blocked))
+                        continue
+                    }
+                    if response.state == .accepted || response.state == .duplicate {
+                        guard let responseAttachment = response.attachment,
+                              let responseKey = ServiceAttachmentKey(
+                                  work: response.work.work, attachment: responseAttachment),
+                              let recovery = ServiceBackedGUIOrchestration.RecoveredCreateSession(
+                                  request: request, attachmentKey: responseKey) else {
+                            blockedMessage = blockedMessage
+                                ?? "The Work Host returned a Session identity that did not match the retained request; the exact intent remains pending."
+                            observations.append(.init(request: request, outcome: .blocked))
+                            continue
+                        }
+                        observations.append(
+                            .init(request: request, outcome: .recovered(recovery)))
+                        recoveredResponses.append((recovery, response))
+                        continue
+                    }
+                    // A typed rejection proves the host did not mint the requested Session.
+                    observations.append(.init(request: request, outcome: .rejected))
+                    clearedMessage = response.rejection == .staleCursor
+                        ? "A retained Session creation was stale and was cleared; retry against the current Work cursor."
+                        : "A retained Session creation was rejected and cleared."
+                } catch {
+                    if Self.isDefinitiveCreateSessionFailure(error) {
+                        observations.append(.init(request: request, outcome: .rejected))
+                        clearedMessage =
+                            "A retained Session creation was definitively rejected and cleared; retry against the current Work Host state."
+                        continue
+                    }
+                    blockedMessage = blockedMessage
+                        ?? "A retained Session creation has an indeterminate result; its exact request remains pending until the Work Host can reconcile it."
+                    observations.append(.init(request: request, outcome: .blocked))
+                }
+            }
+
+            // The pure decision owns the safety classification. AppModel only applies its
+            // durable clears and presents the exact response facts it observed above.
+            let decision = ServiceBackedGUIOrchestration.reconcileCreateSession(
+                pending: pending, observations: observations, mode: mode)
+            var clearedRequests: Set<WorkServiceCreateSessionRequest> = []
+            var applicationBlocked = false
+            for request in decision.cleared {
+                do {
+                    try store.clear(request)
+                    clearedRequests.insert(request)
+                } catch {
+                    applicationBlocked = true
+                    blockedMessage = blockedMessage
+                        ?? "A retained Session creation could not be cleared safely; its exact intent remains pending."
+                }
+            }
+            for recovery in decision.recoveries where clearedRequests.contains(recovery.request) {
+                guard let response = recoveredResponses.first(where: {
+                    $0.0 == recovery
+                })?.1 else {
+                    applicationBlocked = true
+                    blockedMessage = blockedMessage
+                        ?? "A recovered Session response could not be matched to its exact intent; the intent remains pending."
+                    continue
+                }
+                if let message = await presentRecoveredCreateSession(
+                    response, request: recovery.request, session: session, client: client,
+                    focus: decision.shouldFocusRecovery) {
+                    recoveredPresentationMessage = recoveredPresentationMessage ?? message
+                }
+            }
+            let hasBlockedWork = !decision.retained.isEmpty
+                || clearedRequests.count != decision.cleared.count
+                || decision.recoveries.contains {
+                    !clearedRequests.contains($0.request)
+                }
+            if applicationBlocked || hasBlockedWork {
+                localWorkServiceError = blockedMessage
+                    ?? "A retained Session creation remains pending and blocks a new mutation."
+                return .blocked
+            }
+            if !decision.recoveries.isEmpty {
+                localWorkServiceError = if let recoveredPresentationMessage {
+                    recoveredPresentationMessage
+                } else if clearedMessage != nil {
+                    "Recovered an exact prior Session creation; another retained request was rejected and cleared. Choose New Session again only if you want another conversation."
+                } else {
+                    "Recovered the exact prior Session creation. Choose New Session again only if you want another conversation."
+                }
+                return .recovered
+            }
+            if let clearedMessage { localWorkServiceError = clearedMessage }
+            return .clear
+        } catch {
+            localWorkServiceError =
+                "Retained Session creation state could not be read safely; new Session creation is withheld."
+            return .blocked
+        }
+    }
+
+    @discardableResult
+    private func presentRecoveredCreateSession(
+        _ response: WorkServiceCreateSessionResponse,
+        request: WorkServiceCreateSessionRequest,
+        session: WorkServiceClientSession,
+        client: ClientRef,
+        focus: Bool = true
+    ) async -> String? {
+        if let index = localServiceCatalogWorks.firstIndex(where: {
+            $0.work == response.work.work
+        }) {
+            localServiceCatalogWorks[index] = response.work
+        } else {
+            localServiceCatalogWorks.append(response.work)
+        }
+        guard let attachment = Self.currentCreateSessionAttachment(
+            response, request: request) else {
+            let message =
+                "Recovered the exact prior Session creation, but this client is no longer attached to it. The Session remains available for inspection in the Work catalog."
+            localWorkServiceError = message
+            return message
+        }
+        return await adoptServiceAttachment(
+            descriptor: response.work, attachment: attachment,
+            session: session, client: client, focus: focus)
+    }
+
     private static func isProvenStaleCreateFailure(_ error: Error) -> Bool {
         guard let transport = error as? WorkServiceTransportError else { return false }
         guard case .remote(let code, _) = transport else { return false }
@@ -862,6 +1087,158 @@ final class AppModel {
         return code == .staleCursor
     }
 
+    private static func isDefinitiveCreateSessionFailure(_ error: Error) -> Bool {
+        if let protocolError = error as? WorkServiceProtocolError {
+            switch protocolError {
+            case .staleCursor, .attachmentNotFound, .capabilityDenied, .invalidRequest,
+                 .workNotFound, .journalMismatch:
+                return true
+            case .unsupportedVersion, .hostUnavailable, .artifactNotFound,
+                 .eventPageCannotProgress, .sourceIncomplete:
+                return false
+            }
+        }
+        guard let transport = error as? WorkServiceTransportError,
+              case .remote(let code, _) = transport else { return false }
+        switch code {
+        case .staleCursor, .attachmentNotFound, .capabilityDenied, .invalidRequest,
+             .workNotFound, .journalMismatch:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func currentCreateSessionAttachment(
+        _ response: WorkServiceCreateSessionResponse,
+        request: WorkServiceCreateSessionRequest,
+        requiringObserve: Bool = true
+    ) -> WorkServiceClientAttachment? {
+        guard let recorded = response.attachment else { return nil }
+        let current = response.work.attachments.filter {
+            $0.attachment == recorded.attachment
+                && $0.client == request.client
+                && $0.session == recorded.session
+                && $0.sessionJournal == recorded.sessionJournal
+                && $0.sessionAttachment == recorded.sessionAttachment
+                && (!requiringObserve || $0.authorization.allows(.observe))
+        }
+        return current.count == 1 ? current[0] : nil
+    }
+
+    private static func validCreateSessionResponse(
+        _ response: WorkServiceCreateSessionResponse,
+        request: WorkServiceCreateSessionRequest,
+        expectedHost: WorkHostInstanceRef
+    ) -> Bool {
+        guard response.work.work == request.work,
+              response.work.journal == request.journal,
+              response.commandID == request.commandID,
+              response.host == expectedHost,
+              response.causalControlCursor == request.causalControlCursor,
+              response.causalWorkCursor == request.causalWorkCursor,
+              response.receipt.operation == .createSession,
+              response.receipt.work == request.work,
+              response.receipt.commandID == request.commandID,
+              response.receipt.state == response.state,
+              response.receipt.host == response.host,
+              response.receipt.causalControlCursor == request.causalControlCursor,
+              response.receipt.resultingControlCursor == response.controlCursor,
+              response.receipt.authorization == response.authorization,
+              response.receipt.rejection == response.rejection,
+              validServiceCursor(
+                response.controlCursor,
+                journal: .workHost(WorkHostRef(request.work.workHostID))),
+              validServiceCursor(response.workCursor, journal: request.journal) else {
+            return false
+        }
+        switch response.state {
+        case .accepted, .duplicate:
+            guard response.rejection == nil,
+                  response.receipt.rejection == nil,
+                  response.receipt.outcome == .sessionCreated,
+                  let createdSession = response.session,
+                  let sessionJournal = response.sessionJournal,
+                  let sessionAttachment = response.sessionAttachment,
+                  let clientAttachment = response.attachment,
+                  let relationship = response.relationship,
+                  let sessionCursor = response.sessionCursor,
+                  sessionJournal.owner == .session(createdSession),
+                  sessionJournal.authority.authorityID == request.work.workHostID,
+                  validServiceCursor(sessionCursor, journal: sessionJournal),
+                  relationship.session == createdSession,
+                  relationship.sessionJournal == sessionJournal,
+                  relationship.sessionAttachment == sessionAttachment,
+                  relationship.causalWorkCursor == request.causalWorkCursor,
+                  relationship.resultingWorkCursor == response.workCursor,
+                  relationship.sessionCursor == sessionCursor,
+                  relationship.capabilities == response.authorization.granted,
+                  relationship.isAttached,
+                  clientAttachment.attachment != request.attachment,
+                  clientAttachment.client == request.client,
+                  clientAttachment.session == createdSession,
+                  clientAttachment.sessionJournal == sessionJournal,
+                  clientAttachment.sessionAttachment == sessionAttachment,
+                  response.work.sessionAttachments.filter({
+                      $0.session == createdSession
+                          && $0.sessionJournal == sessionJournal
+                          && $0.sessionAttachment == sessionAttachment
+                  }) == [relationship] else {
+                return false
+            }
+            if response.state == .accepted {
+                guard clientAttachment.authorization == response.authorization,
+                      Self.currentCreateSessionAttachment(
+                          response, request: request, requiringObserve: false)
+                        == clientAttachment else { return false }
+            } else {
+                // Exact duplicate replay returns the original immutable publication facts but
+                // the attachment's current capabilities while it remains attached. Once it has
+                // been detached, the response carries the verified historical minted row only
+                // for identity correlation: it must be absent from the descriptor and retain the
+                // immutable publication authorization, so the GUI cannot adopt it as authority.
+                let rowsWithMintedIdentity = response.work.attachments.filter {
+                    $0.attachment == clientAttachment.attachment
+                }
+                if rowsWithMintedIdentity.isEmpty {
+                    guard clientAttachment.authorization == response.authorization else {
+                        return false
+                    }
+                } else {
+                    guard rowsWithMintedIdentity == [clientAttachment],
+                          Self.currentCreateSessionAttachment(
+                              response, request: request, requiringObserve: false)
+                            == clientAttachment else { return false }
+                }
+            }
+            return true
+        case .rejected:
+            return response.rejection != nil
+                && response.receipt.outcome == nil
+                && response.session == nil
+                && response.sessionJournal == nil
+                && response.sessionAttachment == nil
+                && response.attachment == nil
+                && response.relationship == nil
+                && response.sessionCursor == nil
+        }
+    }
+
+    private static func validServiceCursor(
+        _ cursor: JournalCursor, journal: JournalRef
+    ) -> Bool {
+        cursor.journal == journal
+            && cursor.sequence >= 0
+            && cursor.sequence < Int.max
+            && (cursor.sequence == 0
+                ? cursor.eventID == nil
+                : cursor.eventID.map({
+                    !$0.isEmpty
+                        && $0.utf8.count <= WorkServiceBounds.maxIdentityCharacters
+                        && !$0.unicodeScalars.contains(where: { $0.value == 0 })
+                }) == true)
+    }
+
     private static func retainStartIntent(
         _ seed: ServiceBackedCreateIntentStore.InitialStart,
         response: WorkServiceCreateWorkResponse,
@@ -870,8 +1247,12 @@ final class AppModel {
     ) throws {
         let intent = try ServiceBackedStartIntent(
             seed: seed, response: response, client: client)
+        guard let key = ServiceAttachmentKey(
+            work: response.work.work, attachment: response.attachment) else {
+            throw ServiceBackedStartIntentError.invalid
+        }
         let store = try ServiceBackedStartIntentStore(
-            home: home, client: client, work: response.work.work)
+            home: home, key: key)
         try store.retain(intent)
     }
 
@@ -899,18 +1280,28 @@ final class AppModel {
     /// the exact causal control cursor, Session tuple, and capability envelope, so a lost
     /// response can be retried exactly while a real Detach followed by Attach creates a new
     /// logical attachment epoch.
-    func attachServiceWork(_ descriptor: WorkServiceWorkDescriptor) {
+    func serviceAttachTargets(for descriptor: WorkServiceWorkDescriptor) -> [WorkSessionKey] {
+        descriptor.attachmentQualifiedSessionTargets
+    }
+
+    func attachServiceWork(
+        _ descriptor: WorkServiceWorkDescriptor,
+        targetSessionAttachment: SessionAttachmentRef
+    ) {
         guard let client = localWorkServiceClient, localWorkService != nil else {
             localWorkServiceError = "The local Work Host is not connected."
             return
         }
         Task { @MainActor [weak self] in
-            await self?.attachServiceWorkNow(descriptor, client: client)
+            await self?.attachServiceWorkNow(
+                descriptor, targetSessionAttachment: targetSessionAttachment, client: client)
         }
     }
 
     private func attachServiceWorkNow(
-        _ requested: WorkServiceWorkDescriptor, client: ClientRef
+        _ requested: WorkServiceWorkDescriptor,
+        targetSessionAttachment: SessionAttachmentRef,
+        client: ClientRef
     ) async {
         guard localWorkService != nil else { return }
         do {
@@ -942,32 +1333,38 @@ final class AppModel {
                     "The Work Host catalog changed or is incomplete; Attach was withheld."
                 return
             }
-            if let existing = descriptor.attachments.first(where: { $0.client == client }) {
-                await adoptServiceAttachment(
-                    descriptor: descriptor, attachment: existing,
-                    session: session, client: client)
+            // Resolve the target only from the host's semantic relationship projection; never
+            // choose the first Session on a Work because ordering is not identity.
+            guard let inspectDecision = ServiceBackedGUIOrchestration.inspect(
+                descriptor: descriptor,
+                client: client,
+                targetSessionAttachment: targetSessionAttachment) else {
+                localWorkServiceError =
+                    "This Work does not expose one exact Session relationship for Attach."
                 return
             }
-            guard let canonical = descriptor.attachments.first(where: {
-                $0.session != nil && $0.sessionJournal != nil && $0.sessionAttachment != nil
-            }) else {
-                localWorkServiceError =
-                    "This Work has no canonical Session attachment available for inspection."
+            let target = inspectDecision.target.workSession
+            let targetKey = inspectDecision.target
+            if let existing = inspectDecision.existingAttachment {
+                await adoptServiceAttachment(
+                    descriptor: descriptor, attachment: existing,
+                    session: session, client: client, focus: inspectDecision.shouldFocus)
                 return
             }
             let requestedCapabilities: Set<WorkServiceCapability> = [
-                .observe, .control, .start, .send, .steer, .queue, .cancel, .end
+                .observe, .control, .start, .send, .steer, .queue, .cancel, .end,
+                .createSession,
             ]
-            let pending = pendingServiceAttaches[descriptor.work]
+            let pending = pendingServiceAttaches[targetKey]
             let request: WorkServiceAttachRequest
             if let pending,
                pending.hostInstance == handshake.hostInstance,
                pending.request.work == descriptor.work,
                pending.request.journal == descriptor.journal,
                pending.request.client == client,
-               pending.request.session == canonical.session,
-               pending.request.sessionJournal == canonical.sessionJournal,
-               pending.request.sessionAttachment == canonical.sessionAttachment,
+               pending.request.session == target.session,
+               pending.request.sessionJournal == target.sessionJournal,
+               pending.request.sessionAttachment == target.sessionAttachment,
                pending.request.requestedCapabilities == requestedCapabilities,
                pending.request.causalControlCursor.journal == handshake.controlJournal {
                 // This is the exact lost-response retry. Do not mint a new id from the newer
@@ -976,8 +1373,8 @@ final class AppModel {
             } else {
                 let commandMaterial = Self.attachCommandMaterial(
                     client: client, work: descriptor.work,
-                    session: canonical.session!, sessionJournal: canonical.sessionJournal!,
-                    sessionAttachment: canonical.sessionAttachment!,
+                    session: target.session, sessionJournal: target.sessionJournal,
+                    sessionAttachment: target.sessionAttachment,
                     capabilities: requestedCapabilities,
                     controlJournal: handshake.controlJournal,
                     causalControlCursor: handshake.controlCursor)
@@ -987,14 +1384,14 @@ final class AppModel {
                     work: descriptor.work,
                     journal: descriptor.journal,
                     client: client,
-                    session: canonical.session,
-                    sessionJournal: canonical.sessionJournal,
-                    sessionAttachment: canonical.sessionAttachment,
+                    session: target.session,
+                    sessionJournal: target.sessionJournal,
+                    sessionAttachment: target.sessionAttachment,
                     commandID: "attach-v2-\(digest.prefix(48))",
                     causalControlCursor: handshake.controlCursor,
                     requestedCapabilities: requestedCapabilities)
             }
-            pendingServiceAttaches[descriptor.work] = PendingServiceAttach(
+            pendingServiceAttaches[targetKey] = PendingServiceAttach(
                 request: request, hostInstance: handshake.hostInstance)
             let response: WorkServiceAttachResponse
             do {
@@ -1005,7 +1402,7 @@ final class AppModel {
                     // Do not preserve an exact request whose cursor can never become current;
                     // clear it and obtain fresh host/catalog evidence before exposing Attach
                     // again.
-                    pendingServiceAttaches.removeValue(forKey: descriptor.work)
+                    pendingServiceAttaches.removeValue(forKey: targetKey)
                     await refreshAfterStaleAttach(session)
                     return
                 }
@@ -1015,7 +1412,7 @@ final class AppModel {
             }
             guard (response.state == .accepted || response.state == .duplicate),
                   let attachment = response.attachment else {
-                pendingServiceAttaches.removeValue(forKey: descriptor.work)
+                pendingServiceAttaches.removeValue(forKey: targetKey)
                 if response.rejection == .staleCursor {
                     await refreshAfterStaleAttach(session)
                     return
@@ -1025,11 +1422,15 @@ final class AppModel {
                         + (response.diagnostic ?? "no attachment was admitted.")
                 return
             }
-            pendingServiceAttaches.removeValue(forKey: descriptor.work)
+            pendingServiceAttaches.removeValue(forKey: targetKey)
             await adoptServiceAttachment(
                 descriptor: response.work, attachment: attachment,
-                session: session, client: client)
-            localServiceCatalogWorks.removeAll { $0.work == descriptor.work }
+                session: session, client: client, focus: inspectDecision.shouldFocus)
+            if let index = localServiceCatalogWorks.firstIndex(where: { $0.work == descriptor.work }) {
+                // Keep the Work row: its other Session relationships remain independently
+                // attachable/inspectable after this client attaches one exact target.
+                localServiceCatalogWorks[index] = response.work
+            }
         } catch {
             localWorkServiceError = Self.serviceErrorMessage(error)
         }
@@ -1046,6 +1447,157 @@ final class AppModel {
         } catch {
             localWorkServiceError =
                 "The Work Host rejected Attach because its cursor was stale. The pending intent was cleared; reconnect before trying again."
+        }
+    }
+
+    /// Exact client attachments that may authorize a host-minted Session on this Work. Multiple
+    /// entries remain separate: choosing one is part of the mutation identity and must never be
+    /// inferred from array order.
+    func serviceSessionCreationAuthorizers(
+        for descriptor: WorkServiceWorkDescriptor
+    ) -> [WorkServiceClientAttachment] {
+        guard descriptor.omissions.isEmpty,
+              descriptor.hostObservation?.sourceCompleteness == .complete,
+              let client = localWorkServiceClient else { return [] }
+        return descriptor.attachments.filter {
+            $0.client == client
+                && $0.authorization.allows(.createSession)
+                && ServiceAttachmentKey(work: descriptor.work, attachment: $0) != nil
+        }.sorted { $0.attachment.attachmentID < $1.attachment.attachmentID }
+    }
+
+    func createServiceSession(
+        _ descriptor: WorkServiceWorkDescriptor,
+        authorizingAttachment: ClientAttachmentRef
+    ) {
+        guard let client = localWorkServiceClient, localWorkService != nil else {
+            localWorkServiceError = "The local Work Host is not connected."
+            return
+        }
+        Task { @MainActor [weak self] in
+            await self?.createServiceSessionNow(
+                descriptor, authorizingAttachment: authorizingAttachment, client: client)
+        }
+    }
+
+    private func createServiceSessionNow(
+        _ requested: WorkServiceWorkDescriptor,
+        authorizingAttachment: ClientAttachmentRef,
+        client: ClientRef
+    ) async {
+        guard !serviceSessionCreationsInFlight.contains(requested.work) else {
+            localWorkServiceError =
+                "A Session creation is already in progress for this Work."
+            return
+        }
+        serviceSessionCreationsInFlight.insert(requested.work)
+        defer { serviceSessionCreationsInFlight.remove(requested.work) }
+        do {
+            let (session, initialHandshake) = try await reconnectLocalWorkService()
+            guard initialHandshake.host == WorkHostRef(requested.work.workHostID) else {
+                return
+            }
+            let reconciliation = await reconcilePendingCreateSessionIntents(
+                session: session, client: client, mode: .explicitCreate)
+            guard reconciliation != .blocked else { return }
+            guard reconciliation != .recovered else {
+                // The click served as the exact retry for a prior lost response. Requiring a
+                // second explicit click is what prevents one gesture from minting two Sessions.
+                return
+            }
+            let handshake = try await session.refreshHandshake()
+            guard handshake.host == initialHandshake.host,
+                  handshake.hostInstance == initialHandshake.hostInstance else {
+                await session.disconnect()
+                throw LocalWorkServiceBootstrapError.connectionFailed(.notConnected)
+            }
+            // Re-read after reconciliation because a recovered result may have advanced both
+            // Work and control cursors and added the very relationship this GUI was missing.
+            let catalog = await WorkServiceCatalog().refresh([
+                WorkServiceCatalogHost(host: handshake.host, session: session)
+            ])
+            guard let host = catalog.hosts.first,
+                  catalog.hosts.count == 1,
+                  connectionIsUsable(host.connectionState),
+                  host.omissions.isEmpty,
+                  host.diagnostics.isEmpty,
+                  host.quarantined.isEmpty,
+                  host.sourceCompleteness == .complete,
+                  host.negotiatedInstance == handshake.hostInstance,
+                  let descriptor = catalog.works.first(where: { $0.work == requested.work }),
+                  descriptor.journal == requested.journal,
+                  descriptor.omissions.isEmpty,
+                  descriptor.hostObservation?.sourceCompleteness == .complete,
+                  let causalWorkCursor = descriptor.hostObservation?.servedCursor,
+                  Self.validServiceCursor(causalWorkCursor, journal: descriptor.journal) else {
+                localWorkServiceError =
+                    "The Work Host catalog is not complete enough to create a Session."
+                return
+            }
+            let authorizers = serviceSessionCreationAuthorizers(for: descriptor).filter {
+                $0.attachment == authorizingAttachment
+            }
+            guard authorizers.count == 1 else {
+                localWorkServiceError =
+                    "The selected client attachment no longer uniquely authorizes Session creation."
+                return
+            }
+            let requestedCapabilities: Set<WorkServiceCapability> = [
+                .observe, .control, .start, .send, .steer, .queue, .cancel, .end,
+            ]
+            let request = WorkServiceCreateSessionRequest(
+                work: descriptor.work, journal: descriptor.journal,
+                attachment: authorizingAttachment, client: client,
+                commandID: "create-session-v1-" + UUID().uuidString.lowercased(),
+                causalControlCursor: handshake.controlCursor,
+                causalWorkCursor: causalWorkCursor,
+                requestedCapabilities: requestedCapabilities)
+            let store = try ServiceBackedCreateSessionIntentStore(
+                home: home, client: client, host: handshake.host)
+            try store.retain(request)
+            let response: WorkServiceCreateSessionResponse
+            do {
+                response = try await session.createSession(request)
+            } catch {
+                if Self.isDefinitiveCreateSessionFailure(error) {
+                    try store.clear(request)
+                    localWorkServiceError =
+                        "Session creation was definitively rejected before admission; its retained request was cleared."
+                    return
+                }
+                localWorkServiceError =
+                    "Session creation has an indeterminate result; its exact request was retained for reconciliation."
+                return
+            }
+            guard Self.validCreateSessionResponse(
+                response, request: request, expectedHost: handshake.hostInstance) else {
+                localWorkServiceError =
+                    "The Work Host returned an invalid Session creation result; its exact request remains retained."
+                return
+            }
+            guard response.state == .accepted || response.state == .duplicate else {
+                try store.clear(request)
+                localWorkServiceError = response.rejection == .staleCursor
+                    ? "Session creation was not admitted because its cursor was stale; refresh and try again."
+                    : "The Work Host rejected Session creation: "
+                        + (response.diagnostic ?? "no Session was minted.")
+                return
+            }
+            do {
+                try store.clear(request)
+            } catch {
+                // The exact retry is safe and will resolve as duplicate on launch. Continue to
+                // display the canonical result while making the cleanup failure visible.
+                localWorkServiceError =
+                    "The Session was created, but its local reconciliation marker could not be cleared."
+            }
+            localServiceCatalogWorks = catalog.works.map {
+                $0.work == response.work.work ? response.work : $0
+            }
+            await presentRecoveredCreateSession(
+                response, request: request, session: session, client: client, focus: true)
+        } catch {
+            localWorkServiceError = Self.serviceErrorMessage(error)
         }
     }
 
@@ -1092,6 +1644,8 @@ final class AppModel {
             }
             localWorkServiceHandshake = handshake
             localWorkspaceCatalog = handshake.workspaceCatalog
+            guard await reconcilePendingCreateSessionIntents(
+                session: session, client: client) != .blocked else { return }
             // Detached service rows still own this GUI's durable attachment and must continue
             // receiving canonical updates. Presentation detachment is not an observation opt-out.
             let attachedServiceRuns = workRuns
@@ -2212,7 +2766,8 @@ final class AppModel {
                 throw LocalWorkServiceBootstrapError.connectionFailed(.notConnected)
             }
             let requested: Set<WorkServiceCapability> = [
-                .observe, .control, .start, .send, .steer, .queue, .cancel, .end
+                .observe, .control, .start, .send, .steer, .queue, .cancel, .end,
+                .createSession,
             ]
             let configuration = WorkServiceWorkConfiguration(
                 providerID: providerSpec.id, modelID: model.id,
@@ -2264,13 +2819,17 @@ final class AppModel {
                 localWorkServiceError =
                     "Work was created, but its GUI Start intent could not be durably resolved; the exact request will be reconciled on relaunch."
             }
+            guard let serviceAttachmentKey = ServiceAttachmentKey(
+                work: response.work.work, attachment: response.attachment) else {
+                throw ServiceBackedStartIntentError.invalid
+            }
             let startIntentStore = try ServiceBackedStartIntentStore(
-                home: home, client: client, work: response.work.work)
+                home: home, key: serviceAttachmentKey)
             guard let retainedStart = try startIntentStore.load() else {
                 throw ServiceBackedStartIntentError.corrupt
             }
             let intentStore = try WorkServiceAttachedWorkIntentStore(
-                home: home, client: client, work: response.work.work)
+                home: home, key: serviceAttachmentKey)
             let controller = try WorkServiceAttachedWorkController(
                 session: session, seed: .created(response), intentStore: intentStore)
             let projection: WorkServiceAttachedWorkProjection
@@ -2292,6 +2851,7 @@ final class AppModel {
             }
             let bridge = ServiceBackedRunBridge(
                 controller: controller, projection: projection,
+                serviceAttachmentKey: serviceAttachmentKey,
                 workspaceLabel: workspace.label ?? advertised.workspaceID.rawValue,
                 modelLabel: model.qualifiedID, thinkingLevel: thinkingLevel)
             let run = LiveRun(
@@ -2433,8 +2993,8 @@ final class AppModel {
             detachRun(run)
             return
         }
-        if run.isServiceBacked, let work = run.serviceProjection?.descriptor.work {
-            hiddenServiceWorkIDs.insert(work)
+        if let serviceKey = run.serviceAttachmentKey {
+            hiddenServiceAttachmentKeys.insert(serviceKey)
         }
         if run.config.recordPayloads {
             // The log is complete now; make it discoverable from the Sessions tab.
@@ -2596,6 +3156,9 @@ final class LiveRun: Identifiable {
 
     var acceptsInput: Bool {
         guard errorBanner == nil, !hasExited, !isEnding else { return false }
+        if let serviceBridge {
+            return serviceBridge.canSubmitText
+        }
         switch commandState {
         case .idle: return true
         case .running:
@@ -2604,6 +3167,15 @@ final class LiveRun: Identifiable {
         case .prepared, .preparing, .committing, .canceling, .failed, .ending, .ended:
             return false
         }
+    }
+
+    var serviceControlsAvailable: Bool {
+        guard let serviceBridge else { return true }
+        return serviceBridge.canEnd
+    }
+
+    var serviceRetryAvailable: Bool {
+        serviceBridge?.canRetryPendingCommand ?? false
     }
 
     /// Set when Claude Code is driving this run instead of Aviary.
@@ -2615,6 +3187,9 @@ final class LiveRun: Identifiable {
     /// accidentally call a local stop path.
     private(set) var serviceBridge: ServiceBackedRunBridge? = nil
     var isServiceBacked: Bool { serviceBridge != nil }
+    /// Stable identity for a service-backed run. The process-local UUID above is presentation
+    /// state only; relaunch/reconstruction dedupes by this exact attachment relationship.
+    private(set) var serviceAttachmentKey: ServiceAttachmentKey?
     var serviceProjection: WorkServiceAttachedWorkProjection? { serviceBridge?.projection }
     var serviceActivities: [WorkActionSnapshot] { serviceBridge?.activities ?? [] }
     var serviceExecutionLabel: String? { serviceBridge?.executionLabel }
@@ -2685,6 +3260,7 @@ final class LiveRun: Identifiable {
             model: bridge.projection.descriptor.configuration.modelID,
             thinkingLevel: bridge.thinkingLevel)
         self.serviceBridge = bridge
+        self.serviceAttachmentKey = bridge.serviceAttachmentKey
         self.modelLabel = bridge.modelLabel
         self.thinkingLevel = bridge.thinkingLevel
         self.sessionID = bridge.sessionID
@@ -3011,8 +3587,15 @@ final class LiveRun: Identifiable {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
             commandNotice = .warning("Could not send: empty input.")
             return .rejected("empty input")
-            }
+        }
         if let serviceBridge {
+            guard serviceBridge.hasExactRunOwner, serviceBridge.projection.isCanonical else {
+                commandNotice = .warning("This Work's active Session owner is unavailable.")
+                return .rejected("exact Session owner unavailable")
+            }
+            if serviceBridge.requiresStartForNextInput {
+                return await startService(prompt: text)
+            }
             do {
                 let receipt: WorkServiceCommandReceipt
                 if serviceBridge.isStreaming {
@@ -3153,6 +3736,9 @@ final class LiveRun: Identifiable {
     ) async -> Bool {
         let attributed = "[message from \(displaySender)]\n\n" + text
         if let serviceBridge {
+            guard serviceBridge.hasExactRunOwner, serviceBridge.projection.isCanonical else {
+                return false
+            }
             do {
                 let receipt: WorkServiceCommandReceipt
                 if serviceBridge.isStreaming {
@@ -3251,7 +3837,11 @@ final class LiveRun: Identifiable {
     /// process-owned Claude/in-house paths; application termination uses `disconnect()` below.
     func end() async {
         if let serviceBridge {
-            guard !hasExited else { return }
+            guard !hasExited, serviceBridge.hasExactRunOwner,
+                  serviceBridge.projection.isCanonical else {
+                commandNotice = .warning("This Work's active Session owner is unavailable.")
+                return
+            }
             isEnding = true
             do {
                 _ = try await serviceBridge.end()

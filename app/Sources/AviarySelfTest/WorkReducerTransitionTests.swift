@@ -57,7 +57,8 @@ private func mixedTransitionJournal() -> [TimelineEvent] {
                             previous: "mixed-1", work: transitionTestWork,
                             session: transitionTestSession, attachment: attachment),
         transitionTestEvent(TimelineEventType.runStarted, id: "mixed-3", sequence: 3,
-                            previous: "mixed-2", work: transitionTestWork, run: run,
+                            previous: "mixed-2", work: transitionTestWork,
+                            session: transitionTestSession, attachment: attachment, run: run,
                             payload: .object(["model_id": "transition-model"])),
         transitionTestEvent(TimelineEventType.actionIntent, id: "mixed-4", sequence: 4,
                             previous: "mixed-3", work: transitionTestWork, run: run,
@@ -84,7 +85,8 @@ private func mixedTransitionJournal() -> [TimelineEvent] {
                             previous: "mixed-9", work: transitionTestWork, run: run,
                             handle: handle, payload: .object(["state": "completed"])),
         transitionTestEvent(TimelineEventType.runFinished, id: "mixed-11", sequence: 11,
-                            previous: "mixed-10", work: transitionTestWork, run: run),
+                            previous: "mixed-10", work: transitionTestWork,
+                            session: transitionTestSession, attachment: attachment, run: run),
         transitionTestEvent(TimelineEventType.sessionDetached, id: "mixed-12", sequence: 12,
                             previous: "mixed-11", work: transitionTestWork, session: transitionTestSession,
                             attachment: attachment),
@@ -157,26 +159,37 @@ func test_workReducerTransitionPreservesInconsistentActiveActionMembershipOnInte
 func test_workReducerTransitionRejectsDuplicateEventsAndRuns() {
     let first = transitionTestEvent(TimelineEventType.workCreated, id: "duplicate-event-1", sequence: 1,
                                     work: transitionTestWork)
+    let attachment = SessionAttachmentRef("duplicate-attachment")
+    let attached = transitionTestEvent(
+        TimelineEventType.sessionAttached, id: "duplicate-event-2", sequence: 2,
+        previous: first.eventID, work: transitionTestWork,
+        session: transitionTestSession, attachment: attachment)
     let run = RunRef("duplicate-run")
-    let started = transitionTestEvent(TimelineEventType.runStarted, id: "duplicate-event-2", sequence: 2,
-                                     previous: first.eventID, work: transitionTestWork, run: run)
-    let duplicateEvent = transitionTestEvent(TimelineEventType.runStarted, id: started.eventID, sequence: 3,
+    let started = transitionTestEvent(TimelineEventType.runStarted, id: "duplicate-event-3", sequence: 3,
+                                     previous: attached.eventID, work: transitionTestWork,
+                                     session: transitionTestSession, attachment: attachment, run: run)
+    let duplicateEvent = transitionTestEvent(TimelineEventType.runStarted, id: started.eventID, sequence: 4,
                                              previous: started.eventID, work: transitionTestWork, run: run)
 
     var eventReducer = WorkReducer()
     eventReducer.apply(first)
+    eventReducer.apply(attached)
     eventReducer.apply(started)
     eventReducer.apply(duplicateEvent)
     XCTAssertFalse(eventReducer.snapshot.structuralIntegrityValid)
-    XCTAssertEqual(eventReducer.snapshot.seenEventIDs, [first.eventID, started.eventID])
+    XCTAssertEqual(eventReducer.snapshot.seenEventIDs,
+                   [first.eventID, attached.eventID, started.eventID])
     XCTAssertEqual(eventReducer.snapshot.quarantinedEvents, [duplicateEvent])
 
-    let finished = transitionTestEvent(TimelineEventType.runFinished, id: "duplicate-run-3", sequence: 3,
-                                       previous: started.eventID, work: transitionTestWork, run: run)
-    let duplicateRun = transitionTestEvent(TimelineEventType.runStarted, id: "duplicate-run-4", sequence: 4,
-                                           previous: finished.eventID, work: transitionTestWork, run: run)
+    let finished = transitionTestEvent(TimelineEventType.runFinished, id: "duplicate-run-3", sequence: 4,
+                                       previous: started.eventID, work: transitionTestWork,
+                                       session: transitionTestSession, attachment: attachment, run: run)
+    let duplicateRun = transitionTestEvent(TimelineEventType.runStarted, id: "duplicate-run-4", sequence: 5,
+                                           previous: finished.eventID, work: transitionTestWork,
+                                           session: transitionTestSession, attachment: attachment, run: run)
     var runReducer = WorkReducer()
     runReducer.apply(first)
+    runReducer.apply(attached)
     runReducer.apply(started)
     runReducer.apply(finished)
     runReducer.apply(duplicateRun)
@@ -223,27 +236,32 @@ func test_workReducerTransitionPreservesCommandCausalIdentity() {
 }
 
 func test_workReducerTransitionProjectsActionLifecycleAndCheckedCount() {
+    let attachment = SessionAttachmentRef("action-attachment")
     let run = RunRef("action-run")
     let action = ActionRef("action-lifecycle")
     let events = [
         transitionTestEvent(TimelineEventType.workCreated, id: "action-1", sequence: 1,
                             work: transitionTestWork),
-        transitionTestEvent(TimelineEventType.runStarted, id: "action-2", sequence: 2,
-                            previous: "action-1", work: transitionTestWork, run: run),
-        transitionTestEvent(TimelineEventType.actionIntent, id: "action-3", sequence: 3,
-                            previous: "action-2", work: transitionTestWork, run: run, action: action,
-                            payload: .object(["state": "proposed", "kind": "python", "intent": "do it"])),
-        transitionTestEvent(TimelineEventType.actionStarted, id: "action-4", sequence: 4,
+        transitionTestEvent(TimelineEventType.sessionAttached, id: "action-2", sequence: 2,
+                            previous: "action-1", work: transitionTestWork,
+                            session: transitionTestSession, attachment: attachment),
+        transitionTestEvent(TimelineEventType.runStarted, id: "action-3", sequence: 3,
+                            previous: "action-2", work: transitionTestWork,
+                            session: transitionTestSession, attachment: attachment, run: run),
+        transitionTestEvent(TimelineEventType.actionIntent, id: "action-4", sequence: 4,
                             previous: "action-3", work: transitionTestWork, run: run, action: action,
-                            payload: .object(["state": "queued"])),
-        transitionTestEvent(TimelineEventType.actionOutcome, id: "action-5", sequence: 5,
+                            payload: .object(["state": "proposed", "kind": "python", "intent": "do it"])),
+        transitionTestEvent(TimelineEventType.actionStarted, id: "action-5", sequence: 5,
                             previous: "action-4", work: transitionTestWork, run: run, action: action,
-                            payload: .object(["state": "running"])),
+                            payload: .object(["state": "queued"])),
         transitionTestEvent(TimelineEventType.actionOutcome, id: "action-6", sequence: 6,
                             previous: "action-5", work: transitionTestWork, run: run, action: action,
-                            payload: .object(["state": "succeeded", "retry_safety": "idempotent"])),
+                            payload: .object(["state": "running"])),
         transitionTestEvent(TimelineEventType.actionOutcome, id: "action-7", sequence: 7,
                             previous: "action-6", work: transitionTestWork, run: run, action: action,
+                            payload: .object(["state": "succeeded", "retry_safety": "idempotent"])),
+        transitionTestEvent(TimelineEventType.actionOutcome, id: "action-8", sequence: 8,
+                            previous: "action-7", work: transitionTestWork, run: run, action: action,
                             payload: .object(["state": "succeeded", "retry_safety": "idempotent"])),
     ]
     var reducer = WorkReducer()
@@ -260,21 +278,26 @@ func test_workReducerTransitionProjectsActionLifecycleAndCheckedCount() {
 }
 
 func test_workReducerTransitionGuardsLiveHandleTerminalState() {
+    let attachment = SessionAttachmentRef("handle-attachment")
     let run = RunRef("handle-run")
     let handle = HandleRef("handle-terminal")
     let events = [
         transitionTestEvent(TimelineEventType.workCreated, id: "handle-1", sequence: 1,
                             work: transitionTestWork),
-        transitionTestEvent(TimelineEventType.runStarted, id: "handle-2", sequence: 2,
-                            previous: "handle-1", work: transitionTestWork, run: run),
-        transitionTestEvent(TimelineEventType.handleStarted, id: "handle-3", sequence: 3,
-                            previous: "handle-2", work: transitionTestWork, run: run, handle: handle,
-                            payload: .object(["state": "running"])),
-        transitionTestEvent(TimelineEventType.handleOutcome, id: "handle-4", sequence: 4,
+        transitionTestEvent(TimelineEventType.sessionAttached, id: "handle-2", sequence: 2,
+                            previous: "handle-1", work: transitionTestWork,
+                            session: transitionTestSession, attachment: attachment),
+        transitionTestEvent(TimelineEventType.runStarted, id: "handle-3", sequence: 3,
+                            previous: "handle-2", work: transitionTestWork,
+                            session: transitionTestSession, attachment: attachment, run: run),
+        transitionTestEvent(TimelineEventType.handleStarted, id: "handle-4", sequence: 4,
                             previous: "handle-3", work: transitionTestWork, run: run, handle: handle,
-                            payload: .object(["state": "completed"])),
+                            payload: .object(["state": "running"])),
         transitionTestEvent(TimelineEventType.handleOutcome, id: "handle-5", sequence: 5,
                             previous: "handle-4", work: transitionTestWork, run: run, handle: handle,
+                            payload: .object(["state": "completed"])),
+        transitionTestEvent(TimelineEventType.handleOutcome, id: "handle-6", sequence: 6,
+                            previous: "handle-5", work: transitionTestWork, run: run, handle: handle,
                             payload: .object(["state": "failed"])),
     ]
     var reducer = WorkReducer()

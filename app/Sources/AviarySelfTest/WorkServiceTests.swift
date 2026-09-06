@@ -223,11 +223,13 @@ private func serviceCommand(
 
 private func serviceFixture(
     source: WorkServiceSourceCompleteness = .complete,
-    disposition: WorkServiceRecordedDisposition = .reusable
+    disposition: WorkServiceRecordedDisposition = .reusable,
+    authorizer: (any WorkServiceAuthorizer)? = nil
 ) async throws -> (InMemoryWorkService, JournalCursor) {
     let service = InMemoryWorkService(
         host: serviceHost, instanceID: "instance-a", startIdentity: "start-a",
-        authorizer: permissiveServiceAuthorizer(), terminalCommitter: TestTerminalCommitter())
+        authorizer: authorizer ?? permissiveServiceAuthorizer(),
+        terminalCommitter: TestTerminalCommitter())
     let cursor = JournalCursor(journal: serviceJournal, sequence: 0)
     let body = Data("hello world!".utf8)
     let bodyDigest = "sha256:" + AviarySHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
@@ -295,20 +297,24 @@ func test_workServiceHandshakeIsVersionedAndHostIdentityIsOpaque() async throws 
 }
 
 func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities() async throws {
-    let (service, initialCursor) = try await serviceFixture()
+    let sessionCapable = allServiceCommands.union([.createSession])
+    let authorizer = WorkServiceCapabilityPolicy(grantsByClient: Dictionary(
+        uniqueKeysWithValues: allServiceClientIDs.map { (ClientRef($0), sessionCapable) }))
+    let (service, initialCursor) = try await serviceFixture(authorizer: authorizer)
     let clientA = ClientRef("gui-a")
     let clientB = ClientRef("gui-b")
     let attachA = try await service.attach(.init(
         work: serviceWork, journal: serviceJournal, client: clientA,
         commandID: "attach-a", causalControlCursor: serviceControlCursor(),
-        requestedCapabilities: allServiceCommands))
-    let attachmentA = try XCTUnwrap(attachA.attachment)
+        requestedCapabilities: sessionCapable))
+    let initialAttachmentA = try XCTUnwrap(attachA.attachment)
     let attachARetry = try await service.attach(.init(
         work: serviceWork, journal: serviceJournal, client: clientA,
         commandID: "attach-a", causalControlCursor: serviceControlCursor(),
-        requestedCapabilities: allServiceCommands))
+        requestedCapabilities: sessionCapable))
     XCTAssertEqual(attachARetry.state, .duplicate)
-    XCTAssertEqual(try XCTUnwrap(attachARetry.attachment).attachment, attachmentA.attachment)
+    XCTAssertEqual(try XCTUnwrap(attachARetry.attachment).attachment,
+                   initialAttachmentA.attachment)
     let staleAttachRequest = WorkServiceAttachRequest(
         work: serviceWork, journal: serviceJournal, client: ClientRef("gui-c"),
         commandID: "attach-stale", causalControlCursor: serviceControlCursor(),
@@ -332,10 +338,33 @@ func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities(
         requestedCapabilities: [.observe]))
     XCTAssertEqual(attachConflict.state, .rejected)
     XCTAssertEqual(attachConflict.rejection, .conflictingCommand)
-    let attachACursor = attachA.resultingControlCursor
+
+    // The active Run owner must be a canonical Session relationship. Create that relationship
+    // through the host, then close the temporary Work-only attachment before adding B so this
+    // test exercises two GUI attachments on one Session rather than the retired nil-owner path.
+    let createdSession = try await service.createSession(.init(
+        work: serviceWork, journal: serviceJournal,
+        attachment: initialAttachmentA.attachment, client: clientA,
+        commandID: "create-session-a",
+        causalControlCursor: attachA.resultingControlCursor,
+        causalWorkCursor: initialCursor,
+        requestedCapabilities: allServiceCommands))
+    let session = try XCTUnwrap(createdSession.session)
+    let sessionJournal = try XCTUnwrap(createdSession.sessionJournal)
+    let sessionAttachment = try XCTUnwrap(createdSession.sessionAttachment)
+    let attachmentA = try XCTUnwrap(createdSession.attachment)
+    let closedInitialA = try await service.detach(.init(
+        work: serviceWork, journal: serviceJournal,
+        attachment: initialAttachmentA.attachment, client: clientA,
+        commandID: "detach-initial-a",
+        causalControlCursor: createdSession.resultingControlCursor))
+    XCTAssertEqual(closedInitialA.state, .accepted)
+    let attachACursor = createdSession.resultingControlCursor
     let attachB = try await service.attach(.init(
         work: serviceWork, journal: serviceJournal, client: clientB,
-        commandID: "attach-b", causalControlCursor: attachACursor,
+        session: session, sessionJournal: sessionJournal,
+        sessionAttachment: sessionAttachment, commandID: "attach-b",
+        causalControlCursor: closedInitialA.resultingControlCursor,
         requestedCapabilities: allServiceCommands))
     let attachmentB = try XCTUnwrap(attachB.attachment)
     XCTAssertTrue(attachmentA.readAcknowledgements.isEmpty)
@@ -362,9 +391,9 @@ func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities(
         work: serviceWork, journal: serviceJournal, attachment: attachmentB.attachment,
         client: clientB, target: workTarget, afterCursor: nil))
     XCTAssertEqual(workSnapshot.target, workTarget)
-    XCTAssertTrue(workSnapshot.events.isEmpty)
+    XCTAssertEqual(workSnapshot.events.map(\.type), [TimelineEventType.sessionAttached])
     XCTAssertEqual(workSnapshot.servedCursor,
-                   JournalCursor(journal: serviceJournal, sequence: 0))
+                   createdSession.workCursor)
     let acknowledged = try await service.acknowledgeRead(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachmentB.attachment,
         client: clientB, target: workTarget,
@@ -386,12 +415,13 @@ func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities(
         JournalCursor(journal: serviceJournal, sequence: 0))
     let controlCursorAfterAck = acknowledged.resultingControlCursor
     let attachmentCursor = try XCTUnwrap(
-        attachA.work.hostObservation?.servedCursor)
+        createdSession.work.hostObservation?.servedCursor)
     let bAttachmentCursor = try XCTUnwrap(
         attachB.work.hostObservation?.servedCursor)
     XCTAssertEqual(bAttachmentCursor, attachmentCursor)
-    // Attachment control commits do not advance the execution journal cursor.
-    XCTAssertEqual(attachmentCursor, initialCursor)
+    // Attachment control commits do not advance the execution journal cursor; creating the
+    // canonical Session relationship did append one Work attachment fact.
+    XCTAssertEqual(attachmentCursor, createdSession.workCursor)
     XCTAssertNotEqual(attachmentA.attachment.attachmentID, attachmentB.attachment.attachmentID)
     let aSnapshot = try await service.snapshot(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachmentA.attachment,
@@ -402,9 +432,9 @@ func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities(
     let started = try await service.command(serviceCommand(
         .start, id: "shared-local-command", client: clientA,
         attachment: attachmentA.attachment,
-        cursor: aCursor, value: "first prompt"))
+        cursor: aCursor, sessionAttachment: sessionAttachment, value: "first prompt"))
     XCTAssertEqual(started.state, .accepted)
-    XCTAssertEqual(started.hostSequence, 1)
+    XCTAssertEqual(started.hostSequence, 2)
     let runningCursor = try XCTUnwrap(started.resultingWorkCursor)
     XCTAssertEqual(started.host, WorkHostInstanceRef(
         host: serviceHost, instanceID: "instance-a", startIdentity: "start-a"))
@@ -412,7 +442,7 @@ func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities(
     // B still has its own cursor.  It cannot accidentally issue a command against A's newer view.
     let stale = try await service.command(serviceCommand(
         .send, id: "cmd-b-stale", client: clientB, attachment: attachmentB.attachment,
-        cursor: initialCursor, value: "stale"))
+        cursor: initialCursor, sessionAttachment: sessionAttachment, value: "stale"))
     XCTAssertEqual(stale.state, .rejected)
     XCTAssertEqual(stale.rejection, .staleCursor)
     XCTAssertEqual(stale.resultingWorkCursor, runningCursor)
@@ -429,7 +459,7 @@ func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities(
     let sent = try await service.command(serviceCommand(
         .send, id: "shared-local-command", client: clientB,
         attachment: attachmentB.attachment,
-        cursor: runningCursor, value: "current"))
+        cursor: runningCursor, sessionAttachment: sessionAttachment, value: "current"))
     XCTAssertEqual(sent.state, .accepted)
     XCTAssertEqual(sent.outcome, .inputAccepted)
     XCTAssertEqual(started.commandID, sent.commandID)
@@ -466,13 +496,13 @@ func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities(
     let duplicate = try await service.command(serviceCommand(
         .send, id: "shared-local-command", client: clientB,
         attachment: attachmentB.attachment,
-        cursor: runningCursor, value: "current"))
+        cursor: runningCursor, sessionAttachment: sessionAttachment, value: "current"))
     XCTAssertEqual(duplicate.state, .duplicate)
     XCTAssertEqual(duplicate.resultingWorkCursor, sent.resultingWorkCursor)
     let conflict = try await service.command(serviceCommand(
         .steer, id: "shared-local-command", client: clientB,
         attachment: attachmentB.attachment,
-        cursor: runningCursor, value: "different"))
+        cursor: runningCursor, sessionAttachment: sessionAttachment, value: "different"))
     XCTAssertEqual(conflict.state, .rejected)
     XCTAssertEqual(conflict.rejection, .conflictingCommand)
 
@@ -496,6 +526,8 @@ func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities(
     // request (including a lost response retry) stays bound to the same B/epoch identity.
     let reattachRequest = WorkServiceAttachRequest(
         work: serviceWork, journal: serviceJournal, client: clientA,
+        session: session, sessionJournal: sessionJournal,
+        sessionAttachment: sessionAttachment,
         commandID: "attach-a-epoch-2", causalControlCursor: detached.resultingControlCursor,
         requestedCapabilities: allServiceCommands)
     let reattached = try await service.attach(reattachRequest)
@@ -507,23 +539,57 @@ func test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities(
     XCTAssertEqual(try XCTUnwrap(reattachedRetry.attachment).attachment,
                    reattachmentB.attachment)
 
-    XCTAssertNil(reattachmentB.sessionAttachment)
+    XCTAssertEqual(reattachmentB.sessionAttachment, sessionAttachment)
+}
+
+func test_workServiceStartRequiresCanonicalSessionWithoutTrapping() async throws {
+    let (service, cursor) = try await serviceFixture()
+    let client = ClientRef("gui")
+    let attached = try await service.attach(.init(
+        work: serviceWork, journal: serviceJournal, client: client,
+        commandID: "attach-work-only", causalControlCursor: serviceControlCursor(),
+        requestedCapabilities: allServiceCommands))
+    let attachment = try XCTUnwrap(attached.attachment)
+    let rejected = try await service.command(serviceCommand(
+        .start, id: "start-work-only", client: client,
+        attachment: attachment.attachment, cursor: cursor))
+    XCTAssertEqual(rejected.state, .rejected)
+    XCTAssertEqual(rejected.rejection, .malformedRequest)
+    let snapshot = try await service.snapshot(.init(
+        work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
+        client: client, target: .work(journal: serviceJournal), afterCursor: cursor))
+    XCTAssertTrue(snapshot.events.isEmpty)
+    XCTAssertNil(snapshot.work.currentRun)
 }
 
 func test_workServiceRunFinishedIsReusableEndIsTerminalizingAndCompletionIsSeparate() async throws {
-    let (service, _) = try await serviceFixture()
+    let sessionCapable = allServiceCommands.union([.createSession])
+    let (service, initialCursor) = try await serviceFixture(authorizer: WorkServiceCapabilityPolicy(
+        grantsByClient: Dictionary(uniqueKeysWithValues: allServiceClientIDs.map {
+            (ClientRef($0), sessionCapable)
+        })))
     let client = ClientRef("gui")
     let attached = try await service.attach(.init(
         work: serviceWork, journal: serviceJournal, client: client,
         commandID: "attach-run",
         causalControlCursor: serviceControlCursor(),
+        requestedCapabilities: sessionCapable))
+    let workOnlyAttachment = try XCTUnwrap(attached.attachment)
+    let createdSession = try await service.createSession(.init(
+        work: serviceWork, journal: serviceJournal,
+        attachment: workOnlyAttachment.attachment, client: client,
+        commandID: "create-session-run",
+        causalControlCursor: attached.resultingControlCursor,
+        causalWorkCursor: initialCursor,
         requestedCapabilities: allServiceCommands))
-    let attachment = try XCTUnwrap(attached.attachment)
-    let attachmentCursor = try XCTUnwrap(
-        attached.work.hostObservation?.servedCursor)
+    let attachment = try XCTUnwrap(createdSession.attachment)
+    let sessionAttachment = try XCTUnwrap(createdSession.sessionAttachment)
+    XCTAssertEqual(attachment.sessionAttachment, sessionAttachment)
+    let attachmentCursor = createdSession.workCursor
     let started = try await service.command(serviceCommand(
         .start, id: "start-1", client: client, attachment: attachment.attachment,
-        cursor: attachmentCursor))
+        cursor: attachmentCursor, sessionAttachment: sessionAttachment))
+    XCTAssertEqual(started.state, .accepted)
     let run = try XCTUnwrap((try await service.describeWork(describeRequest())).currentRun)
     try await service.finishRun(run, for: serviceWork)
     var descriptor = try await service.describeWork(describeRequest())
@@ -534,12 +600,14 @@ func test_workServiceRunFinishedIsReusableEndIsTerminalizingAndCompletionIsSepar
 
     let restart = try await service.command(serviceCommand(
         .start, id: "start-2", client: client, attachment: attachment.attachment,
-        cursor: try XCTUnwrap(descriptor.hostObservation?.servedCursor)))
+        cursor: try XCTUnwrap(descriptor.hostObservation?.servedCursor),
+        sessionAttachment: sessionAttachment))
     XCTAssertEqual(restart.state, .accepted)
     let secondRun = try XCTUnwrap((try await service.describeWork(describeRequest())).currentRun)
     let end = try await service.command(serviceCommand(
         .end, id: "end-1", client: client, attachment: attachment.attachment,
-        cursor: try XCTUnwrap(restart.resultingWorkCursor)))
+        cursor: try XCTUnwrap(restart.resultingWorkCursor),
+        sessionAttachment: sessionAttachment))
     XCTAssertEqual(end.state, .accepted)
     descriptor = try await service.describeWork(describeRequest())
     XCTAssertEqual(descriptor.execution, .ending)
@@ -549,7 +617,8 @@ func test_workServiceRunFinishedIsReusableEndIsTerminalizingAndCompletionIsSepar
     descriptor = try await service.describeWork(describeRequest())
     let idleEnd = try await service.command(serviceCommand(
         .end, id: "end-idle", client: client, attachment: attachment.attachment,
-        cursor: try XCTUnwrap(descriptor.hostObservation?.servedCursor)))
+        cursor: try XCTUnwrap(descriptor.hostObservation?.servedCursor),
+        sessionAttachment: sessionAttachment))
     XCTAssertEqual(idleEnd.state, .rejected)
     XCTAssertEqual(idleEnd.rejection, .invalidState)
     XCTAssertEqual((try await service.describeWork(describeRequest())).execution, .idle)
@@ -558,7 +627,8 @@ func test_workServiceRunFinishedIsReusableEndIsTerminalizingAndCompletionIsSepar
     // permanently non-startable state or rewrite reusable Work into completed Work.
     let reusableStart = try await service.command(serviceCommand(
         .start, id: "start-after-end", client: client, attachment: attachment.attachment,
-        cursor: try XCTUnwrap(descriptor.hostObservation?.servedCursor)))
+        cursor: try XCTUnwrap(descriptor.hostObservation?.servedCursor),
+        sessionAttachment: sessionAttachment))
     XCTAssertEqual(reusableStart.state, .accepted)
     XCTAssertEqual(reusableStart.outcome, .started)
     let reusableRun = try XCTUnwrap((try await service.describeWork(describeRequest())).currentRun)
@@ -601,8 +671,9 @@ func test_workServiceExplicitCompletionAndDestroyRemainSeparateCommands() async 
         target: .work(journal: serviceJournal),
         afterCursor: created.workCursor, limit: 1))
     XCTAssertEqual(completionEvents.events.count, 1)
-    XCTAssertEqual(completionEvents.events[0], completion.terminalProof?.terminalEvent)
-    XCTAssertEqual(completionEvents.events[0].type, TimelineEventType.workCompleted)
+    let completionEvent = try XCTUnwrap(completionEvents.events.first)
+    XCTAssertEqual(completionEvent, completion.terminalProof?.terminalEvent)
+    XCTAssertEqual(completionEvent.type, TimelineEventType.workCompleted)
     let completed = try await service.describeWork(.init(
         work: serviceWork, journal: serviceJournal, client: client))
     XCTAssertEqual(completed.recordedDisposition, .completed)
@@ -651,8 +722,9 @@ func test_workServiceExplicitCompletionAndDestroyRemainSeparateCommands() async 
         target: .work(journal: destroyJournal),
         afterCursor: destroyCreated.workCursor, limit: 1))
     XCTAssertEqual(destroyEvents.events.count, 1)
-    XCTAssertEqual(destroyEvents.events[0], destroy.terminalProof?.terminalEvent)
-    XCTAssertEqual(destroyEvents.events[0].type, TimelineEventType.workDestroyed)
+    let destroyEvent = try XCTUnwrap(destroyEvents.events.first)
+    XCTAssertEqual(destroyEvent, destroy.terminalProof?.terminalEvent)
+    XCTAssertEqual(destroyEvent.type, TimelineEventType.workDestroyed)
     let destroyed = try await destroyService.describeWork(describeRequest(
         work: destroyWork, journal: destroyJournal, client: client))
     XCTAssertEqual(destroyed.recordedDisposition, .destroyed)
@@ -1105,7 +1177,19 @@ func test_workServiceCreateIdempotencyKeyIsTypedAndInjective() async throws {
     let duplicate = try await service.createWork(.init(
         client: clientA, commandID: "client\u{1F}command",
         causalControlCursor: controlCursor))
-    XCTAssertEqual(duplicate, first)
+    // An exact retry preserves all host-minted identities and cursors, but its receipt truthfully
+    // reports `.duplicate` (and carries the duplicate diagnostic) instead of replaying the
+    // original accepted receipt byte-for-byte.
+    XCTAssertEqual(duplicate.work, first.work)
+    XCTAssertEqual(duplicate.session, first.session)
+    XCTAssertEqual(duplicate.sessionJournal, first.sessionJournal)
+    XCTAssertEqual(duplicate.sessionAttachment, first.sessionAttachment)
+    XCTAssertEqual(duplicate.attachment, first.attachment)
+    XCTAssertEqual(duplicate.workCursor, first.workCursor)
+    XCTAssertEqual(duplicate.sessionCursor, first.sessionCursor)
+    XCTAssertEqual(duplicate.controlCursor, first.controlCursor)
+    XCTAssertEqual(duplicate.receipt.state, .duplicate)
+    XCTAssertEqual(duplicate.receipt.outcome, .created)
     let second = try await service.createWork(.init(
         client: clientB, commandID: "command",
         causalControlCursor: first.controlCursor))
@@ -1152,7 +1236,8 @@ func test_workServiceIncompleteSourceIsVisibleButCannotAcceptControl() async thr
         requestedCapabilities: allServiceCommands))
     let listed = try await service.listWorks(listRequest(pageSize: 1000))
     XCTAssertEqual(listed.works.count, 1)
-    XCTAssertEqual(listed.works[0].hostObservation?.sourceCompleteness, .incomplete)
+    let listedWork = try XCTUnwrap(listed.works.first)
+    XCTAssertEqual(listedWork.hostObservation?.sourceCompleteness, .incomplete)
     XCTAssertEqual(attached.state, .rejected)
     XCTAssertEqual(attached.rejection, .sourceIncomplete)
     XCTAssertNil(attached.attachment)
@@ -1176,7 +1261,9 @@ func test_workServiceIncompleteSourceIsVisibleButCannotAcceptControl() async thr
     let stillRunning = try await runningService.describeWork(.init(
         work: runningWork, journal: runningJournal, client: client))
     XCTAssertEqual(stillRunning.execution, .running)
-    XCTAssertEqual(stillRunning.currentRun, runningRun)
+    // The seed deliberately has no canonical Session/attachment owner tuple. Its scalar
+    // execution label remains visible, but exact current-run identity is withheld.
+    XCTAssertNil(stillRunning.currentRun)
 
     // Recovery-required and unknown are explicit non-actionable states, including for the
     // in-memory conformance service. They are valid read seeds for compatibility tests, but no
@@ -1217,7 +1304,9 @@ func test_workServiceIncompleteSourceIsVisibleButCannotAcceptControl() async thr
                 causalWorkCursor: cursor, kind: kind,
                 value: kind == .start ? "must not start" : nil))
             XCTAssertEqual(receipt.state, .rejected)
-            XCTAssertEqual(receipt.rejection, .invalidState)
+            XCTAssertEqual(
+                receipt.rejection,
+                kind == .start ? .malformedRequest : .invalidState)
         }
     }
 }
@@ -1240,23 +1329,36 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
         XCTAssertTrue(true)
     }
 
-    let (service, _) = try await serviceFixture()
+    let sessionCapable = allServiceCommands.union([.createSession])
+    let (service, initialCursor) = try await serviceFixture(authorizer: WorkServiceCapabilityPolicy(
+        grantsByClient: Dictionary(uniqueKeysWithValues: allServiceClientIDs.map {
+            (ClientRef($0), sessionCapable)
+        })))
     let client = ClientRef("gui")
     let attached = try await service.attach(.init(
         work: serviceWork, journal: serviceJournal, client: client,
         commandID: "attach-events",
         causalControlCursor: serviceControlCursor(),
+        requestedCapabilities: sessionCapable))
+    let workOnlyAttachment = try XCTUnwrap(attached.attachment)
+    let createdSession = try await service.createSession(.init(
+        work: serviceWork, journal: serviceJournal,
+        attachment: workOnlyAttachment.attachment, client: client,
+        commandID: "create-session-events",
+        causalControlCursor: attached.resultingControlCursor,
+        causalWorkCursor: initialCursor,
         requestedCapabilities: allServiceCommands))
-    let attachment = try XCTUnwrap(attached.attachment)
-    let attachmentCursor = try XCTUnwrap(
-        attached.work.hostObservation?.servedCursor)
+    let attachment = try XCTUnwrap(createdSession.attachment)
+    let sessionAttachment = try XCTUnwrap(createdSession.sessionAttachment)
+    XCTAssertEqual(attachment.sessionAttachment, sessionAttachment)
+    let attachmentCursor = createdSession.workCursor
     let started = try await service.command(serviceCommand(
         .start, id: "bounded-start", client: client, attachment: attachment.attachment,
-        cursor: attachmentCursor))
+        cursor: attachmentCursor, sessionAttachment: sessionAttachment))
     let running = try XCTUnwrap(started.resultingWorkCursor)
     let sent = try await service.command(serviceCommand(
         .send, id: "bounded-send", client: client, attachment: attachment.attachment,
-        cursor: running, value: "page two"))
+        cursor: running, sessionAttachment: sessionAttachment, value: "page two"))
     let sentCursor = try XCTUnwrap(sent.resultingWorkCursor)
     let firstPage = try await service.eventsAfterCursor(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
@@ -1264,17 +1366,18 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
         target: .work(journal: serviceJournal),
         afterCursor: attachmentCursor, limit: 1))
     XCTAssertEqual(firstPage.events.count, 1)
+    let firstEvent = try XCTUnwrap(firstPage.events.first)
     XCTAssertEqual(
-        JournalCursor(journal: firstPage.events[0].journal,
-                      eventID: firstPage.events[0].eventID,
-                      sequence: firstPage.events[0].sequence),
+        JournalCursor(journal: firstEvent.journal,
+                      eventID: firstEvent.eventID,
+                      sequence: firstEvent.sequence),
         JournalCursor(
-            journal: serviceJournal, eventID: firstPage.events[0].eventID,
+            journal: serviceJournal, eventID: firstEvent.eventID,
             sequence: attachmentCursor.sequence + 1))
-    XCTAssertEqual(firstPage.events[0].type, TimelineEventType.runStarted)
-    XCTAssertFalse(firstPage.events[0].type.isEmpty)
-    XCTAssertEqual(firstPage.events[0].payload, .object([:]))
-    XCTAssertEqual(firstPage.events[0].provenance, .native)
+    XCTAssertEqual(firstEvent.type, TimelineEventType.runStarted)
+    XCTAssertFalse(firstEvent.type.isEmpty)
+    XCTAssertEqual(firstEvent.payload, .object([:]))
+    XCTAssertEqual(firstEvent.provenance, .native)
     XCTAssertEqual(firstPage.omissions.first?.category, "events")
     XCTAssertEqual(firstPage.omissions.first?.count, 2)
     do {
@@ -1295,24 +1398,26 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
         target: .work(journal: serviceJournal),
         afterCursor: try XCTUnwrap(firstPage.nextCursor), limit: 1))
     XCTAssertEqual(secondPage.events.count, 1)
+    let secondEvent = try XCTUnwrap(secondPage.events.first)
     XCTAssertEqual(
-        JournalCursor(journal: secondPage.events[0].journal,
-                      eventID: secondPage.events[0].eventID,
-                      sequence: secondPage.events[0].sequence), running)
-    XCTAssertEqual(secondPage.events[0].type, TimelineEventType.commandAccepted)
-    XCTAssertNotEqual(firstPage.events[0].eventID, secondPage.events[0].eventID)
+        JournalCursor(journal: secondEvent.journal,
+                      eventID: secondEvent.eventID,
+                      sequence: secondEvent.sequence), running)
+    XCTAssertEqual(secondEvent.type, TimelineEventType.commandAccepted)
+    XCTAssertNotEqual(firstEvent.eventID, secondEvent.eventID)
     let thirdPage = try await service.eventsAfterCursor(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
         client: client,
         target: .work(journal: serviceJournal),
         afterCursor: try XCTUnwrap(secondPage.nextCursor), limit: 1))
     XCTAssertEqual(thirdPage.events.count, 1)
+    let thirdEvent = try XCTUnwrap(thirdPage.events.first)
     XCTAssertEqual(
-        JournalCursor(journal: thirdPage.events[0].journal,
-                      eventID: thirdPage.events[0].eventID,
-                      sequence: thirdPage.events[0].sequence), sentCursor)
+        JournalCursor(journal: thirdEvent.journal,
+                      eventID: thirdEvent.eventID,
+                      sequence: thirdEvent.sequence), sentCursor)
     let eventBodyReference: TimelineBodyReference
-    if case .object(let payload) = thirdPage.events[0].payload,
+    if case .object(let payload) = thirdEvent.payload,
        let bodyReferenceValue = payload["body_reference"] {
         XCTAssertNil(payload["value"])
         eventBodyReference = try JSONDecoder().decode(
@@ -1376,7 +1481,7 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
     XCTAssertTrue(mismatch.diagnostic?.contains("digest") == true)
     let observeOnlyResponse = try await service.attach(.init(
         work: serviceWork, journal: serviceJournal, client: ClientRef("observe-only"),
-        commandID: "attach-observe-only", causalControlCursor: attached.resultingControlCursor,
+        commandID: "attach-observe-only", causalControlCursor: createdSession.controlCursor,
         requestedCapabilities: [.observe, .control]))
     let observeOnly = try XCTUnwrap(observeOnlyResponse.attachment)
     // Attachment IDs are addressable projection identities, never bearer authority. Even a
@@ -1432,7 +1537,7 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
     let oversized = String(repeating: "p", count: WorkServiceBounds.maxCommandValueCharacters + 1)
     let oversizedRequest = serviceCommand(
         .send, id: "oversized", client: client, attachment: attachment.attachment,
-        cursor: sentCursor, value: oversized)
+        cursor: sentCursor, sessionAttachment: sessionAttachment, value: oversized)
     XCTAssertEqual(oversizedRequest.value, oversized)
     XCTAssertTrue(oversizedRequest.valueWasTruncated)
     let rejected = try await service.command(oversizedRequest)
@@ -1468,8 +1573,9 @@ func test_workServiceRetainsSeedArtifactOverflowAsAnExplicitOmission() async thr
     XCTAssertEqual(descriptor.artifacts.count, WorkServiceBounds.maxArtifactsPerWork)
     XCTAssertEqual(
         descriptor.omissions.first(where: { $0.category == "artifacts" })?.count, 1)
-    XCTAssertTrue(descriptor.artifacts[0].metadataWasTruncated)
-    XCTAssertEqual(descriptor.artifacts[0].label.count, WorkServiceBounds.maxDiagnosticCharacters)
+    let firstArtifact = try XCTUnwrap(descriptor.artifacts.first)
+    XCTAssertTrue(firstArtifact.metadataWasTruncated)
+    XCTAssertEqual(firstArtifact.label.count, WorkServiceBounds.maxDiagnosticCharacters)
     XCTAssertEqual(
         descriptor.omissions.first(where: { $0.category == "artifact_metadata" })?.count, 1)
     let page = try await service.listWorks(listRequest(pageSize: 1))

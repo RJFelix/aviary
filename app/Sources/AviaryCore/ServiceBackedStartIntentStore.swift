@@ -5,6 +5,14 @@ import Darwin
 import Glibc
 #endif
 
+private struct ServiceBackedStartIntentCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int? = nil
+
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { self.stringValue = String(intValue) }
+}
+
 /// The GUI's durable first-Start obligation for a newly-created Work.
 ///
 /// This is deliberately separate from the controller's ordinary pending-command record.  It
@@ -13,7 +21,7 @@ import Glibc
 /// Host remains authoritative; this record only preserves the exact user intent and command
 /// identity needed to resume that admission after a process crash.
 public struct ServiceBackedStartIntent: Codable, Hashable, Sendable {
-    public static let schemaVersion = 3
+    public static let schemaVersion = 4
 
     public let schemaVersion: Int
     public let client: ClientRef
@@ -21,9 +29,15 @@ public struct ServiceBackedStartIntent: Codable, Hashable, Sendable {
     public let session: SessionRef
     public let sessionJournal: JournalRef
     public let sessionAttachment: SessionAttachmentRef
+    public let clientAttachment: ClientAttachmentRef
     public let causalWorkCursor: JournalCursor
     public let commandID: String
     public let prompt: String
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case schemaVersion, client, work, session, sessionJournal, sessionAttachment
+        case clientAttachment, causalWorkCursor, commandID, prompt
+    }
 
     /// Work-service journals qualify caller command IDs with the client identity before they
     /// enter the canonical command ledger. The original caller ID remains in this GUI-owned
@@ -36,6 +50,7 @@ public struct ServiceBackedStartIntent: Codable, Hashable, Sendable {
     public init(
         client: ClientRef, work: WorkRef, session: SessionRef,
         sessionJournal: JournalRef, sessionAttachment: SessionAttachmentRef,
+        clientAttachment: ClientAttachmentRef,
         causalWorkCursor: JournalCursor, commandID: String, prompt: String
     ) throws {
         guard !client.clientID.isEmpty,
@@ -43,7 +58,13 @@ public struct ServiceBackedStartIntent: Codable, Hashable, Sendable {
               !work.workHostID.isEmpty,
               !session.sessionID.isEmpty,
               !sessionJournal.journalID.isEmpty,
+              !sessionJournal.authority.authorityID.isEmpty,
+              sessionJournal.journalID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
+              sessionJournal.authority.authorityID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
+              sessionJournal.owner == .session(session),
+              sessionJournal.authority.authorityID == work.workHostID,
               !sessionAttachment.attachmentID.isEmpty,
+              !clientAttachment.attachmentID.isEmpty,
               causalWorkCursor.journal.owner == .work(work),
               causalWorkCursor.journal.authority.authorityID == work.workHostID,
               causalWorkCursor.sequence >= 0,
@@ -60,9 +81,39 @@ public struct ServiceBackedStartIntent: Codable, Hashable, Sendable {
         self.session = session
         self.sessionJournal = sessionJournal
         self.sessionAttachment = sessionAttachment
+        self.clientAttachment = clientAttachment
         self.causalWorkCursor = causalWorkCursor
         self.commandID = commandID
         self.prompt = prompt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let dynamic = try decoder.container(keyedBy: ServiceBackedStartIntentCodingKey.self)
+        let expected = Set(CodingKeys.allCases.map(\.rawValue))
+        guard Set(dynamic.allKeys.map(\.stringValue)) == expected else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: decoder.codingPath,
+                debugDescription: "ServiceBackedStartIntent fields must match its version"))
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        guard try container.decode(Int.self, forKey: .schemaVersion) == Self.schemaVersion else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .schemaVersion, in: container,
+                debugDescription: "unsupported ServiceBackedStartIntent schema")
+        }
+        self.schemaVersion = Self.schemaVersion
+        self.client = try container.decode(ClientRef.self, forKey: .client)
+        self.work = try container.decode(WorkRef.self, forKey: .work)
+        self.session = try container.decode(SessionRef.self, forKey: .session)
+        self.sessionJournal = try container.decode(JournalRef.self, forKey: .sessionJournal)
+        self.sessionAttachment = try container.decode(
+            SessionAttachmentRef.self, forKey: .sessionAttachment)
+        self.clientAttachment = try container.decode(
+            ClientAttachmentRef.self, forKey: .clientAttachment)
+        self.causalWorkCursor = try container.decode(
+            JournalCursor.self, forKey: .causalWorkCursor)
+        self.commandID = try container.decode(String.self, forKey: .commandID)
+        self.prompt = try container.decode(String.self, forKey: .prompt)
     }
 
     /// Construct the first-Start obligation from the exact host-minted Create response. This is
@@ -85,6 +136,7 @@ public struct ServiceBackedStartIntent: Codable, Hashable, Sendable {
             client: client, work: response.work.work,
             session: response.session, sessionJournal: response.sessionJournal,
             sessionAttachment: response.sessionAttachment,
+            clientAttachment: response.attachment.attachment,
             causalWorkCursor: response.workCursor,
             commandID: seed.commandID, prompt: seed.prompt)
     }
@@ -103,6 +155,7 @@ public struct ServiceBackedStartIntent: Codable, Hashable, Sendable {
               projection.descriptor.work == work,
               projection.descriptor.journal == causalWorkCursor.journal,
               projection.attachment.client == client,
+              projection.attachment.attachment == clientAttachment,
               projection.attachment.session == session,
               projection.attachment.sessionJournal == sessionJournal,
               projection.attachment.sessionAttachment == sessionAttachment,
@@ -119,6 +172,7 @@ public struct ServiceBackedStartIntent: Codable, Hashable, Sendable {
     ) -> Bool {
         projection.descriptor.work == work
             && projection.attachment.client == client
+            && projection.attachment.attachment == clientAttachment
             && projection.attachment.session == session
             && projection.attachment.sessionJournal == sessionJournal
             && projection.attachment.sessionAttachment == sessionAttachment
@@ -129,16 +183,24 @@ public struct ServiceBackedStartIntentStore: Sendable {
     public static let maximumRecordBytes = 64 * 1_024
 
     public let url: URL
-    private let expectedClient: ClientRef
-    private let expectedWork: WorkRef
+    private let expectedKey: ServiceAttachmentKey
     private let homeRoot: URL
 
-    public init(home: AgentHome, client: ClientRef, work: WorkRef) throws {
-        let identity = Data((client.clientID + "\u{0}" + work.workHostID + "\u{0}" + work.workID).utf8)
+    public init(home: AgentHome, key: ServiceAttachmentKey) throws {
+        guard key.isValid else {
+            throw ServiceBackedStartIntentError.invalid
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let identity: Data
+        do {
+            identity = try encoder.encode(key)
+        } catch {
+            throw ServiceBackedStartIntentError.invalid
+        }
         let digest = AviarySHA256.hash(data: identity)
             .map { String(format: "%02x", $0) }.joined()
-        self.expectedClient = client
-        self.expectedWork = work
+        self.expectedKey = key
         self.homeRoot = home.root
         self.url = home.root
             .appending(path: "work-service-clients", directoryHint: .isDirectory)
@@ -187,7 +249,12 @@ public struct ServiceBackedStartIntentStore: Sendable {
             throw ServiceBackedStartIntentError.corrupt
         }
         guard value.schemaVersion == ServiceBackedStartIntent.schemaVersion,
-              value.client == expectedClient, value.work == expectedWork,
+              value.client == expectedKey.client,
+              value.work == expectedKey.workSession.work,
+              value.session == expectedKey.workSession.session,
+              value.sessionJournal == expectedKey.workSession.sessionJournal,
+              value.sessionAttachment == expectedKey.workSession.sessionAttachment,
+              value.clientAttachment == expectedKey.clientAttachment,
               Self.validIdentity(value.client.clientID),
               Self.validIdentity(value.work.workHostID),
               Self.validIdentity(value.work.workID),
@@ -196,6 +263,7 @@ public struct ServiceBackedStartIntentStore: Sendable {
               Self.validIdentity(value.sessionJournal.authority.authorityID),
               value.sessionJournal.owner == .session(value.session),
               Self.validIdentity(value.sessionAttachment.attachmentID),
+              Self.validIdentity(value.clientAttachment.attachmentID),
               value.causalWorkCursor.journal.owner == .work(value.work),
               value.causalWorkCursor.journal.authority.authorityID == value.work.workHostID,
               value.causalWorkCursor.sequence >= 0,
@@ -210,7 +278,12 @@ public struct ServiceBackedStartIntentStore: Sendable {
     public func retain(_ intent: ServiceBackedStartIntent) throws {
         try prepareDirectory()
         try withLock {
-            guard intent.client == expectedClient, intent.work == expectedWork else {
+            guard intent.client == expectedKey.client,
+                  intent.work == expectedKey.workSession.work,
+                  intent.session == expectedKey.workSession.session,
+                  intent.sessionJournal == expectedKey.workSession.sessionJournal,
+                  intent.sessionAttachment == expectedKey.workSession.sessionAttachment,
+                  intent.clientAttachment == expectedKey.clientAttachment else {
                 throw ServiceBackedStartIntentError.conflict
             }
             if let existing = try readLocked() {

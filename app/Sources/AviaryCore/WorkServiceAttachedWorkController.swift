@@ -340,6 +340,8 @@ public actor WorkServiceAttachedWorkController {
 
     public let client: ClientRef
     public let work: WorkRef
+    /// Stable identity of this GUI's exact client attachment to the Work/Session relationship.
+    public let serviceAttachmentKey: ServiceAttachmentKey
 
     private let service: any WorkServiceClient
     private let connectIfNeeded: Connect?
@@ -355,6 +357,10 @@ public actor WorkServiceAttachedWorkController {
 
     private var descriptorStorage: WorkServiceWorkDescriptor
     private var attachmentStorage: WorkServiceClientAttachment
+    /// The last canonical attachment projection may remain visible when a later bounded catalog
+    /// omits the row, but it must not retain mutation authority until the exact row is observed
+    /// again.
+    private var attachmentActionableStorage = true
     private var workSnapshotStorage = WorkSnapshot()
     private var sessionSnapshotStorage = SessionSnapshot()
     private var workCursorStorage: JournalCursor
@@ -409,9 +415,21 @@ public actor WorkServiceAttachedWorkController {
         }
         let descriptor = seed.work
         let attachment = seed.attachment
+        let initiallyListed = descriptor.attachments.contains {
+            $0.attachment == attachment.attachment
+        }
         guard let session = attachment.session,
               let sessionJournal = attachment.sessionJournal,
               let sessionAttachment = attachment.sessionAttachment else {
+            throw WorkServiceAttachedWorkControllerError.invalidSeed
+        }
+        guard let serviceAttachmentKey = ServiceAttachmentKey(
+            client: attachment.client, clientAttachment: attachment.attachment,
+            work: descriptor.work, session: session,
+            sessionJournal: sessionJournal, sessionAttachment: sessionAttachment) else {
+            throw WorkServiceAttachedWorkControllerError.invalidSeed
+        }
+        if let storeKey = intentStore.serviceAttachmentKey, storeKey != serviceAttachmentKey {
             throw WorkServiceAttachedWorkControllerError.invalidSeed
         }
         let restored: PendingInternal?
@@ -430,8 +448,18 @@ public actor WorkServiceAttachedWorkController {
         } catch {
             throw WorkServiceAttachedWorkControllerError.sourceIncomplete
         }
-        let resolvedCheckpointStore = try checkpointStore ?? WorkServiceAttachedWorkCheckpointStore(
-            url: intentStore.url.deletingPathExtension().appendingPathExtension("checkpoint.json"))
+        let resolvedCheckpointStore: any WorkServiceAttachedWorkCheckpointStoring
+        if let checkpointStore {
+            resolvedCheckpointStore = checkpointStore
+        } else if intentStore.serviceAttachmentKey != nil {
+            resolvedCheckpointStore = try WorkServiceAttachedWorkCheckpointStore(
+                url: intentStore.checkpointURL, key: serviceAttachmentKey)
+        } else {
+            // The unkeyed constructor is internal test injection only. All production-created
+            // intent stores carry serviceAttachmentKey and take the keyed branch above.
+            resolvedCheckpointStore = try WorkServiceAttachedWorkCheckpointStore(
+                url: intentStore.checkpointURL)
+        }
         let persistedCheckpoint: WorkServiceAttachedWorkCheckpointStore.Record?
         let checkpointReadFailed: Bool
         do {
@@ -485,6 +513,7 @@ public actor WorkServiceAttachedWorkController {
         self.service = service
         self.client = attachment.client
         self.work = descriptor.work
+        self.serviceAttachmentKey = serviceAttachmentKey
         self.connectIfNeeded = connect
         self.connectivityProvider = connectivity
         self.pageLimit = pageLimit
@@ -500,6 +529,7 @@ public actor WorkServiceAttachedWorkController {
         // a fresh host read proves each checkpoint cursor/prefix pair.
         self.descriptorStorage = descriptor
         self.attachmentStorage = attachment
+        self.attachmentActionableStorage = initiallyListed
         self.workCursorStorage = JournalCursor(journal: descriptor.journal, sequence: 0)
         self.sessionCursorStorage = JournalCursor(journal: sessionJournal, sequence: 0)
         self.workSnapshotStorage = WorkSnapshot()
@@ -552,13 +582,16 @@ public actor WorkServiceAttachedWorkController {
     public func projection() -> WorkServiceAttachedWorkProjection {
         WorkServiceAttachedWorkProjection(
             descriptor: descriptorStorage, attachment: attachmentStorage,
-            capabilities: attachmentStorage.authorization.granted,
+            capabilities: attachmentActionableStorage
+                ? attachmentStorage.authorization.granted : [],
             workSnapshot: workSnapshotStorage, sessionSnapshot: sessionSnapshotStorage,
             workCursor: workCursorStorage, sessionCursor: sessionCursorStorage,
-            workSourceCompleteness: checkpointAwaitingHostValidationStorage ? .unknown
-                : workCompletenessStorage,
-            sessionSourceCompleteness: checkpointAwaitingHostValidationStorage ? .unknown
-                : sessionCompletenessStorage,
+            workSourceCompleteness: !attachmentActionableStorage
+                ? .incomplete : (checkpointAwaitingHostValidationStorage ? .unknown
+                    : workCompletenessStorage),
+            sessionSourceCompleteness: !attachmentActionableStorage
+                ? .incomplete : (checkpointAwaitingHostValidationStorage ? .unknown
+                    : sessionCompletenessStorage),
             workOmissions: workOmissionsStorage, sessionOmissions: sessionOmissionsStorage,
             readDiagnostics: readDiagnosticsStorage,
             connectivity: connectivityStorage,
@@ -715,13 +748,14 @@ public actor WorkServiceAttachedWorkController {
             // Keep a complete, validated candidate durable until both read acknowledgements and
             // the paired projection commit finish. A crash at either point can then resume from
             // reducer truth rather than using a bare host acknowledgement as a skip marker.
+            let descriptorsChanged = try !Self.descriptorsEquivalent(newWork.descriptor, descriptor)
             let candidateChanged = stagedWorkReadStorage != nil
                 || stagedSessionReadStorage != nil
                 || newWork.cursor != committedWorkCursor
                 || newSession.cursor != committedSessionCursor
                 || reducedWork != self.workSnapshotStorage
                 || reducedSession != self.sessionSnapshotStorage
-                || !Self.descriptorsEquivalent(newWork.descriptor, descriptor)
+                || descriptorsChanged
             stagedWorkReadStorage = stagedWork
             stagedSessionReadStorage = stagedSession
             // A failed cache write is noncanonical and must not hide a valid remote projection,
@@ -731,8 +765,20 @@ public actor WorkServiceAttachedWorkController {
             if candidateChanged || !checkpointPersistenceAvailableStorage {
                 _ = persistCheckpointIfPossible()
             }
-            var refreshedAttachment = try Self.attachmentProjection(
+            guard let initialRefreshedAttachment = try Self.attachmentProjection(
                 in: newWork.descriptor, expected: attachment)
+            else {
+                // Keep the previously published reducer/transcript available for inspection,
+                // but fence all capabilities when the exact client row disappears.  This is
+                // deliberately non-throwing so the UI can explain the source omission.
+                attachmentActionableStorage = false
+                workCompletenessStorage = .incomplete
+                sessionCompletenessStorage = .incomplete
+                appendReadDiagnostic(
+                    "The Work Host omitted this exact client attachment; controls are disabled until it reappears.")
+                return projection()
+            }
+            var refreshedAttachment = initialRefreshedAttachment
             try Self.validateReadAcknowledgements(
                 in: refreshedAttachment, workJournal: journal, session: session,
                 sessionJournal: sessionJournal)
@@ -758,9 +804,10 @@ public actor WorkServiceAttachedWorkController {
 
             // The event pages are now validated and the two reducers agree on the exact bound
             // relationship. Publish both together; no journal can expose a half-updated pair.
-            descriptorStorage = Self.descriptorByUpdatingAttachment(
+            descriptorStorage = try Self.descriptorByUpdatingAttachment(
                 newWork.descriptor, attachment: refreshedAttachment)
             attachmentStorage = refreshedAttachment
+            attachmentActionableStorage = true
             workSnapshotStorage = reducedWork
             sessionSnapshotStorage = reducedSession
             workCursorStorage = newWork.cursor
@@ -851,6 +898,11 @@ public actor WorkServiceAttachedWorkController {
         guard pending.state != .awaitingCanonicalEvidence else {
             throw WorkServiceAttachedWorkControllerError.sourceIncomplete
         }
+        // Re-admit the retained envelope against the latest reduced owner tuple before
+        // touching the intent store or dispatching.  In particular, a refresh may have
+        // transferred this Work's active Run to another Session since the original attempt.
+        try validateCommandAdmission(
+            kind: pending.request.kind, commandID: pending.request.command.commandID)
         return try await submit(pending.request, retainingState: pending.state)
     }
 
@@ -1095,6 +1147,9 @@ public actor WorkServiceAttachedWorkController {
         guard attachmentStorage.authorization.allows(.control) else {
             throw WorkServiceAttachedWorkControllerError.capabilityDenied(.control)
         }
+        guard attachmentActionableStorage else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
         let capability: WorkServiceCapability
         switch kind {
         case .start: capability = .start
@@ -1140,6 +1195,20 @@ public actor WorkServiceAttachedWorkController {
               sessionSnapshotStorage.unknownEvents.isEmpty,
               sessionSnapshotStorage.lifecycle == .active else {
             throw WorkServiceAttachedWorkControllerError.recoveryRequired
+        }
+        if kind != .start {
+            // Every non-Start operation is scoped to the exact Session relationship that owns
+            // the active Run.  This check deliberately compares both the reconstructed Work
+            // reducer and the descriptor's reduced owner envelope; a stale descriptor must not
+            // be allowed to write a new intent or reach the host service.
+            guard let activeRun = descriptorStorage.currentRun,
+                  descriptorStorage.currentRunSession == session,
+                  descriptorStorage.currentRunSessionAttachment == sessionAttachment,
+                  workSnapshotStorage.activeRun == activeRun,
+                  workSnapshotStorage.activeRunSession == session,
+                  workSnapshotStorage.activeRunSessionAttachment == sessionAttachment else {
+                throw WorkServiceAttachedWorkControllerError.recoveryRequired
+            }
         }
         switch (kind, reducedExecution) {
         // An idle Work with no current Run is the only valid Start boundary. Once a Run has
@@ -2182,17 +2251,18 @@ public actor WorkServiceAttachedWorkController {
                 && $0.attachment == sessionAttachment
                 && $0.isAttached
         } ?? false
-        // The protocol's reference service records the Session attachment in the Session
-        // journal and returns the host-issued tuple in the Work descriptor; native Work journals
-        // may additionally carry a mirrored `session.attached` event. Accept either canonical
-        // representation, but never synthesize a Session or accept a descriptor-less tuple.
-        let workAttachmentIsDescribed = descriptor.attachments.contains {
-            $0.attachment == attachment.attachment
-                && $0.client == attachment.client
-                && $0.session == session
+        let descriptorRelationshipsWithID = descriptor.sessionAttachments.filter {
+            $0.sessionAttachment == sessionAttachment
+        }
+        let descriptorRelationshipIsCanonical = descriptor.sessionAttachments.filter {
+            $0.session == session
                 && $0.sessionJournal == sessionJournal
                 && $0.sessionAttachment == sessionAttachment
-        }
+                && $0.isAttached
+        }.count == 1
+        // A client attachment envelope is not semantic Work/Session evidence. Require the
+        // relationship in both the reduced Work state and the descriptor; if a bounded omission
+        // makes that fact unknowable, this remains non-actionable rather than being guessed.
         guard descriptor.work == work.work,
               descriptor.journal == journal,
               journal.owner == .work(descriptor.work),
@@ -2204,7 +2274,9 @@ public actor WorkServiceAttachedWorkController {
               sessionSnapshot.journal == sessionJournal,
               sessionSnapshot.session == session,
               sessionSnapshot.lifecycle != .unknown,
-              workAttachmentIsCanonical || workAttachmentIsDescribed,
+              workAttachmentIsCanonical,
+              descriptorRelationshipsWithID.count == 1,
+              descriptorRelationshipIsCanonical,
               let sessionAttachmentState = sessionSnapshot.attachments[sessionAttachment.attachmentID],
               sessionAttachmentState.work == descriptor.work,
               sessionAttachmentState.attachment == sessionAttachment,
@@ -2214,6 +2286,11 @@ public actor WorkServiceAttachedWorkController {
               attachment.sessionAttachment == sessionAttachment else {
             throw WorkServiceAttachedWorkControllerError.sourceIncomplete
         }
+        guard descriptor.currentRun == work.activeRun,
+              descriptor.currentRunSession == work.activeRunSession,
+              descriptor.currentRunSessionAttachment == work.activeRunSessionAttachment else {
+            throw WorkServiceAttachedWorkControllerError.recoveryRequired
+        }
         guard sessionJournal.owner == .session(session) else {
             throw WorkServiceAttachedWorkControllerError.malformedResponse
         }
@@ -2222,15 +2299,15 @@ public actor WorkServiceAttachedWorkController {
     private static func attachmentProjection(
         in descriptor: WorkServiceWorkDescriptor,
         expected: WorkServiceClientAttachment
-    ) throws -> WorkServiceClientAttachment {
-        guard let listed = descriptor.attachments.first(where: {
-            $0.attachment == expected.attachment
-        }) else {
-            // Attachment lists are bounded and may legitimately omit an otherwise valid client
-            // attachment. The exact seed remains authoritative until a host lists a conflicting
-            // tuple for this attachment id.
-            return expected
+    ) throws -> WorkServiceClientAttachment? {
+        let matches = descriptor.attachments.filter { $0.attachment == expected.attachment }
+        guard matches.count <= 1 else {
+            // Duplicate IDs are unsafe because first(where:) would make order matter.  A
+            // missing row is allowed only for an existing controller's exact seed; its complete
+            // Work/Session relationship is checked independently by validateReducedBinding.
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
         }
+        guard let listed = matches.first else { return nil }
         guard listed.client == expected.client,
               listed.session == expected.session,
               listed.sessionJournal == expected.sessionJournal,
@@ -2243,16 +2320,20 @@ public actor WorkServiceAttachedWorkController {
     private static func descriptorByUpdatingAttachment(
         _ descriptor: WorkServiceWorkDescriptor,
         attachment: WorkServiceClientAttachment
-    ) -> WorkServiceWorkDescriptor {
-        WorkServiceWorkDescriptor(
+    ) throws -> WorkServiceWorkDescriptor {
+        try WorkServiceWorkDescriptor(
             work: descriptor.work, journal: descriptor.journal,
             recordedDisposition: descriptor.recordedDisposition, execution: descriptor.execution,
-            currentRun: descriptor.currentRun, configuration: descriptor.configuration,
+            currentRun: descriptor.currentRun,
+            currentRunSession: descriptor.currentRunSession,
+            currentRunSessionAttachment: descriptor.currentRunSessionAttachment,
+            configuration: descriptor.configuration,
             hostObservation: descriptor.hostObservation,
             attachments: descriptor.attachments.map {
                 $0.attachment == attachment.attachment
                     ? normalizedAttachment(attachment) : normalizedAttachment($0)
-            }, artifacts: descriptor.artifacts, omissions: descriptor.omissions)
+            }, sessionAttachments: descriptor.sessionAttachments,
+            artifacts: descriptor.artifacts, omissions: descriptor.omissions)
     }
 
     private static func normalizedAttachment(
@@ -2275,20 +2356,23 @@ public actor WorkServiceAttachedWorkController {
     private static func descriptorsEquivalent(
         _ lhs: WorkServiceWorkDescriptor,
         _ rhs: WorkServiceWorkDescriptor
-    ) -> Bool {
+    ) throws -> Bool {
         func normalized(_ descriptor: WorkServiceWorkDescriptor)
-            -> WorkServiceWorkDescriptor {
-            WorkServiceWorkDescriptor(
+            throws -> WorkServiceWorkDescriptor {
+            try WorkServiceWorkDescriptor(
                 work: descriptor.work, journal: descriptor.journal,
                 recordedDisposition: descriptor.recordedDisposition,
                 execution: descriptor.execution, currentRun: descriptor.currentRun,
+                currentRunSession: descriptor.currentRunSession,
+                currentRunSessionAttachment: descriptor.currentRunSessionAttachment,
                 configuration: descriptor.configuration,
                 hostObservation: descriptor.hostObservation,
                 attachments: descriptor.attachments.map(normalizedAttachment).sorted {
                     $0.attachment.attachmentID < $1.attachment.attachmentID
-                }, artifacts: descriptor.artifacts, omissions: descriptor.omissions)
+                }, sessionAttachments: descriptor.sessionAttachments,
+                artifacts: descriptor.artifacts, omissions: descriptor.omissions)
         }
-        return normalized(lhs) == normalized(rhs)
+        return try normalized(lhs) == normalized(rhs)
     }
 
     private static func validateRestoredPending(
@@ -2321,6 +2405,11 @@ public actor WorkServiceAttachedWorkController {
     private static func validateSeed(_ seed: WorkServiceAttachedWorkSeed) throws {
         let descriptor = seed.work
         let attachment = seed.attachment
+        guard Set(descriptor.attachments.map(\.attachment)).count == descriptor.attachments.count,
+              Set(descriptor.sessionAttachments.map(\.sessionAttachment)).count
+                  == descriptor.sessionAttachments.count else {
+            throw WorkServiceAttachedWorkControllerError.invalidSeed
+        }
         guard validIdentity(descriptor.work.workHostID), validIdentity(descriptor.work.workID),
               validIdentity(descriptor.journal.journalID),
               descriptor.journal.owner == .work(descriptor.work),
@@ -2338,7 +2427,13 @@ public actor WorkServiceAttachedWorkController {
               sessionJournal.owner == .session(session),
               sessionJournal.authority.authorityID == descriptor.work.workHostID,
               validIdentity(sessionJournal.authority.authorityID),
-              sessionJournal.kind == .session else {
+              sessionJournal.kind == .session,
+              descriptor.sessionAttachments.filter({
+                  $0.session == session
+                      && $0.sessionJournal == sessionJournal
+                      && $0.sessionAttachment == sessionAttachment
+                      && $0.isAttached
+              }).count == 1 else {
             throw WorkServiceAttachedWorkControllerError.invalidSeed
         }
         if let observation = descriptor.hostObservation {
@@ -2349,9 +2444,15 @@ public actor WorkServiceAttachedWorkController {
         switch seed {
         case .created(let response):
             let controlJournal = JournalRef.workHost(WorkHostRef(descriptor.work.workHostID))
-            let listedAttachment = descriptor.attachments.first {
+            let listedAttachments = descriptor.attachments.filter {
                 $0.attachment == attachment.attachment
             }
+            let attachmentOmitted = descriptor.omissions.contains { $0.category == "attachments" }
+            guard listedAttachments.count == 1
+                || (listedAttachments.isEmpty && attachmentOmitted) else {
+                throw WorkServiceAttachedWorkControllerError.invalidSeed
+            }
+            let listedAttachment = listedAttachments.first
             guard response.work == descriptor,
                   response.session == session,
                   response.sessionJournal == sessionJournal,
@@ -2390,9 +2491,15 @@ public actor WorkServiceAttachedWorkController {
                   existingAttachment == attachment else {
                 throw WorkServiceAttachedWorkControllerError.invalidSeed
             }
-            if let listed = descriptor.attachments.first(where: {
+            let listedAttachments = descriptor.attachments.filter {
                 $0.attachment == attachment.attachment
-            }) {
+            }
+            let attachmentOmitted = descriptor.omissions.contains { $0.category == "attachments" }
+            guard listedAttachments.count == 1
+                || (listedAttachments.isEmpty && attachmentOmitted) else {
+                throw WorkServiceAttachedWorkControllerError.invalidSeed
+            }
+            if let listed = listedAttachments.first {
                 guard listed.client == attachment.client,
                       listed.session == attachment.session,
                       listed.sessionJournal == attachment.sessionJournal,

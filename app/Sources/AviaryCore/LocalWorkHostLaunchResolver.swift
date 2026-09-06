@@ -356,7 +356,7 @@ public struct LocalWorkHostLaunchResolver: Sendable {
         _ template: WorkLaunchWorkTemplateRecord
     ) -> Bool {
         guard let persistedHost = configuration.home.persistedWorkHostID,
-              template.binding.workHost == WorkHostRef(persistedHost) else { return false }
+              template.workHost == WorkHostRef(persistedHost) else { return false }
         guard let workspaceID = template.template.draft.configuration.workspaceID,
               let workspace = try? resolveWorkspace(workspaceID),
               workspace.path == template.template.draft.workspace.locator,

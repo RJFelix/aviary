@@ -752,7 +752,8 @@ public actor WorkHostRegistry {
     /// Replace an ended Run actor with a fresh Run actor against the same reusable Work. The
     /// logical Work slot remains live throughout the bounded operation; only the per-Run actor
     /// changes. The old actor must have completed explicit End and closed its writers, and the
-    /// supplied binding must preserve the exact Session/attachment while changing Run identity.
+    /// The old actor's terminal boundary is verified before the slot is replaced. The next Run
+    /// may be selected by a different canonical Session/attachment on the same Work.
     @discardableResult
     public func replace(
         _ work: WorkRef,
@@ -781,19 +782,33 @@ public actor WorkHostRegistry {
         }
         let binding = configuration.workRunBinding
         guard binding.workBinding.work == work,
-              binding.workBinding.workHost == host,
-              binding.workBinding.session == SessionRef(oldSnapshot.identity.sessionID),
-              binding.workBinding.sessionAttachment == oldSnapshot.sessionAttachment else {
+              binding.workBinding.workHost == host else {
             throw WorkHostRegistryError.invalidReplacement(
-                work, reason: "replacement must preserve Work, Session, and attachment identity")
+                work, reason: "replacement must preserve Work and host identity")
         }
         guard binding.run.runID != oldSnapshot.identity.runID else {
             throw WorkHostRegistryError.invalidReplacement(
                 work, reason: "replacement Run identity must be new")
         }
-        guard configuration.projectionMode == .reopenHistorical else {
-            throw WorkHostRegistryError.invalidReplacement(
-                work, reason: "replacement must reopen the existing Session projection")
+        let sameSessionBoundary = binding.workBinding.session
+            == SessionRef(oldSnapshot.identity.sessionID)
+            && binding.workBinding.sessionAttachment == oldSnapshot.sessionAttachment
+        if sameSessionBoundary {
+            guard configuration.projectionMode == .reopenHistorical else {
+                throw WorkHostRegistryError.invalidReplacement(
+                    work, reason: "same-Session replacement must reopen its historical projection")
+            }
+        } else {
+            // A canonically attached replacement Session may have no legacy flat projection yet.
+            // Its native Session/Work journals are still the durable attachment boundary, so a
+            // different owner must launch a fresh projection rather than being rejected for the
+            // absence of a file that was never part of Session attachment publication.
+            guard configuration.modelContextMode == .launchFresh,
+                  (configuration.projectionMode == .fresh
+                      || configuration.projectionMode == .reopenHistorical) else {
+                throw WorkHostRegistryError.invalidReplacement(
+                    work, reason: "cross-Session replacement must use launch-fresh context")
+            }
         }
 
         let replacement = try await HostedInHouseWork.open(configuration: configuration)

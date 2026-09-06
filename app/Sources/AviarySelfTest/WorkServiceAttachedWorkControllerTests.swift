@@ -14,6 +14,8 @@ private enum AttachedControllerServiceMode: Sendable {
     case transport
     case remoteStale
     case forgedAcceptedReceipt
+    case missingAttachment
+    case omittedAttachment
 }
 
 private final class AttachedControllerCheckpointBox: @unchecked Sendable {
@@ -76,6 +78,15 @@ private struct AttachedControllerFixture: Sendable {
             attachment: clientAttachment, client: client, session: session,
             sessionJournal: sessionJournal, sessionAttachment: sessionAttachment,
             authorization: authorization)
+        // The fixture advertises both independent client attachments.  This keeps the second
+        // controller's exact existing seed on the canonical list instead of exercising a
+        // vanished-row fallback while testing observer independence.
+        let secondClient = ClientRef("controller-client-b")
+        let secondAttachment = WorkServiceClientAttachment(
+            attachment: ClientAttachmentRef(
+                "controller-client-attachment-" + secondClient.clientID + "-" + workID),
+            client: secondClient, session: session, sessionJournal: sessionJournal,
+            sessionAttachment: sessionAttachment, authorization: authorization)
 
         func event(
             journal: JournalRef, eventID: String, sequence: Int, previous: String?,
@@ -138,13 +149,27 @@ private struct AttachedControllerFixture: Sendable {
         let sessionCursor = JournalCursor(
             journal: sessionJournal, eventID: sessionEvents.last!.eventID,
             sequence: sessionEvents.last!.sequence)
-        let observation = WorkServiceHostObservation(
+        let observation = try WorkServiceHostObservation(
             instance: instance, reachability: .observedReachable, currentRun: nil,
+            currentRunSession: nil, currentRunSessionAttachment: nil,
             servedCursor: workCursor, sourceCompleteness: .complete)
-        descriptor = WorkServiceWorkDescriptor(
+        let relationship = WorkServiceSessionAttachmentDescriptor(
+            session: session, sessionJournal: sessionJournal,
+            sessionAttachment: sessionAttachment, publication: .mirrored,
+            causalSessionCursor: JournalCursor(
+                journal: sessionJournal, eventID: s1.eventID, sequence: s1.sequence),
+            sessionCursor: JournalCursor(
+                journal: sessionJournal, eventID: s2.eventID, sequence: s2.sequence),
+            causalWorkCursor: JournalCursor(
+                journal: workJournal, eventID: w1.eventID, sequence: w1.sequence),
+            resultingWorkCursor: JournalCursor(
+                journal: workJournal, eventID: w2.eventID, sequence: w2.sequence),
+            capabilities: [.observe, .control])
+        descriptor = try WorkServiceWorkDescriptor(
             work: work, journal: workJournal, recordedDisposition: disposition,
-            execution: .idle, currentRun: nil, hostObservation: observation,
-            attachments: [attachment])
+            execution: .idle, currentRun: nil, currentRunSession: nil,
+            currentRunSessionAttachment: nil, hostObservation: observation,
+            attachments: [attachment, secondAttachment], sessionAttachments: [relationship])
         let controlJournal = JournalRef.workHost(host)
         let controlCursor = JournalCursor(
             journal: controlJournal, eventID: "control-1", sequence: 1)
@@ -229,7 +254,6 @@ private actor AttachedControllerTestService: WorkServiceClient {
         readAcknowledgementRequests
     }
     func readAckEffectCount() -> Int { readAcknowledgementEffects }
-    func checkpointDescriptor() -> WorkServiceWorkDescriptor { currentDescriptor() }
     func setLoseReadAcknowledgementResponses(
         _ count: Int, beforeAdmission: Bool = false, target: WorkServiceReadTarget? = nil
     ) {
@@ -374,7 +398,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
             omissions.append(WorkServiceOmission(category: "events", count: 1))
         }
         return WorkServiceSnapshot(
-            work: currentDescriptor(), events: selected, target: request.target,
+            work: try currentDescriptor(), events: selected, target: request.target,
             servedCursor: served,
             basePrefixDigest: prefixDigest(events, cursor: request.afterCursor
                 ?? JournalCursor(journal: request.target.journal, sequence: 0)),
@@ -540,22 +564,40 @@ private actor AttachedControllerTestService: WorkServiceClient {
         return attachedControllerPrefixDigest(events, cursor: cursor)
     }
 
-    private func currentDescriptor() -> WorkServiceWorkDescriptor {
+    private func currentDescriptor() throws -> WorkServiceWorkDescriptor {
         let cursor = workEvents.last.map {
             JournalCursor(journal: fixture.workJournal, eventID: $0.eventID, sequence: $0.sequence)
         } ?? JournalCursor(journal: fixture.workJournal, sequence: 0)
-        let observation = fixture.descriptor.hostObservation.map {
-            WorkServiceHostObservation(
+        let reduced = WorkReducer.reduce(workEvents)
+        let execution: WorkServiceExecutionState
+        switch reduced.execution {
+        case .idle: execution = .idle
+        case .running: execution = .running
+        case .held: execution = .held
+        case .canceling: execution = .canceling
+        case .unknown, .preparing, .failed: execution = .unknown
+        }
+        let observation = try fixture.descriptor.hostObservation.map {
+            try WorkServiceHostObservation(
                 instance: hostInstanceStorage, reachability: $0.reachability,
-                currentRun: $0.currentRun, servedCursor: cursor,
+                currentRun: reduced.activeRun,
+                currentRunSession: reduced.activeRunSession,
+                currentRunSessionAttachment: reduced.activeRunSessionAttachment,
+                servedCursor: cursor,
                 sourceCompleteness: $0.sourceCompleteness)
         }
-        return WorkServiceWorkDescriptor(
-            work: fixture.descriptor.work, journal: fixture.descriptor.journal,
-            recordedDisposition: fixture.descriptor.recordedDisposition,
-            execution: fixture.descriptor.execution, currentRun: fixture.descriptor.currentRun,
-            configuration: fixture.descriptor.configuration, hostObservation: observation,
-            attachments: fixture.descriptor.attachments.map { attachment in
+        let listedAttachments: [WorkServiceClientAttachment]
+        let listedOmissions: [WorkServiceOmission]
+        switch mode {
+        case .missingAttachment:
+            listedAttachments = []
+            listedOmissions = []
+        case .omittedAttachment:
+            listedAttachments = []
+            listedOmissions = [WorkServiceOmission(
+                category: "attachments", count: fixture.descriptor.attachments.count)]
+        default:
+            listedAttachments = fixture.descriptor.attachments.map { attachment in
                 guard attachment.attachment == fixture.clientAttachment else { return attachment }
                 return WorkServiceClientAttachment(
                     attachment: attachment.attachment, client: attachment.client,
@@ -565,8 +607,19 @@ private actor AttachedControllerTestService: WorkServiceClient {
                     readAcknowledgements: readAcknowledgements.map {
                         WorkServiceReadAcknowledgement(target: $0.key, cursor: $0.value)
                     })
-            }, artifacts: fixture.descriptor.artifacts,
-            omissions: fixture.descriptor.omissions)
+            }
+            listedOmissions = fixture.descriptor.omissions
+        }
+        return try WorkServiceWorkDescriptor(
+            work: fixture.descriptor.work, journal: fixture.descriptor.journal,
+            recordedDisposition: fixture.descriptor.recordedDisposition,
+            execution: execution, currentRun: reduced.activeRun,
+            currentRunSession: reduced.activeRunSession,
+            currentRunSessionAttachment: reduced.activeRunSessionAttachment,
+            configuration: fixture.descriptor.configuration, hostObservation: observation,
+            attachments: listedAttachments, sessionAttachments: fixture.descriptor.sessionAttachments,
+            artifacts: fixture.descriptor.artifacts,
+            omissions: listedOmissions)
     }
 
     private func responseHandshake() throws -> WorkServiceHandshakeResponse {
@@ -968,6 +1021,80 @@ func testWorkServiceAttachedControllerCompletedWorkRemainsInspectableButRejectsM
     }
 }
 
+func testWorkServiceAttachedControllerMissingAttachmentDisablesMutation() async throws {
+    let seedFixture = try AttachedControllerFixture(workID: "missing-seed-validation")
+    let absentSeed = try WorkServiceWorkDescriptor(
+        work: seedFixture.descriptor.work, journal: seedFixture.descriptor.journal,
+        recordedDisposition: seedFixture.descriptor.recordedDisposition,
+        execution: seedFixture.descriptor.execution, currentRun: nil,
+        currentRunSession: nil, currentRunSessionAttachment: nil,
+        configuration: seedFixture.descriptor.configuration,
+        hostObservation: seedFixture.descriptor.hostObservation, attachments: [],
+        sessionAttachments: seedFixture.descriptor.sessionAttachments,
+        artifacts: seedFixture.descriptor.artifacts, omissions: [])
+    do {
+        _ = try makeAttachedController(
+            fixture: seedFixture, service: AttachedControllerTestService(fixture: seedFixture),
+            seed: .existing(work: absentSeed, attachment: seedFixture.response.attachment))
+        XCTFail("a complete seed with no attachment omission must name one current row")
+    } catch WorkServiceAttachedWorkControllerError.invalidSeed {}
+
+    let omittedSeed = try WorkServiceWorkDescriptor(
+        work: absentSeed.work, journal: absentSeed.journal,
+        recordedDisposition: absentSeed.recordedDisposition, execution: absentSeed.execution,
+        currentRun: nil, currentRunSession: nil, currentRunSessionAttachment: nil,
+        configuration: absentSeed.configuration, hostObservation: absentSeed.hostObservation,
+        attachments: [], sessionAttachments: absentSeed.sessionAttachments,
+        artifacts: absentSeed.artifacts,
+        omissions: [WorkServiceOmission(category: "attachments", count: 1)])
+    let omittedController = try makeAttachedController(
+        fixture: seedFixture, service: AttachedControllerTestService(fixture: seedFixture),
+        seed: .existing(work: omittedSeed, attachment: seedFixture.response.attachment))
+    XCTAssertTrue((await omittedController.projection()).capabilities.isEmpty)
+
+    for mode in [AttachedControllerServiceMode.missingAttachment,
+                 AttachedControllerServiceMode.omittedAttachment] {
+        let fixture = try AttachedControllerFixture(workID: "missing-\(String(describing: mode))")
+        let service = AttachedControllerTestService(fixture: fixture)
+        let intentURL = FileManager.default.temporaryDirectory.appending(
+            path: "aviary-missing-attachment-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: intentURL) }
+        let intentStore = try WorkServiceAttachedWorkIntentStore(url: intentURL)
+        let controller = try makeAttachedController(
+            fixture: fixture, service: service, intentStore: intentStore)
+        let initial = try await controller.refresh()
+        await service.setMode(mode)
+        let missing = try await controller.refresh()
+
+        XCTAssertFalse(missing.isCanonical)
+        XCTAssertTrue(missing.capabilities.isEmpty)
+        XCTAssertEqual(missing.visibleMessages, initial.visibleMessages)
+        let commandCount = await service.commandCount()
+        do {
+            _ = try await controller.send("must not dispatch")
+            XCTFail("Send must fail closed when the exact client attachment disappears")
+        } catch WorkServiceAttachedWorkControllerError.sourceIncomplete {}
+        do {
+            _ = try await controller.steer("must not dispatch")
+            XCTFail("Steer must fail closed when the exact client attachment disappears")
+        } catch WorkServiceAttachedWorkControllerError.sourceIncomplete {}
+        do {
+            _ = try await controller.queue("must not dispatch")
+            XCTFail("Queue must fail closed when the exact client attachment disappears")
+        } catch WorkServiceAttachedWorkControllerError.sourceIncomplete {}
+        do {
+            _ = try await controller.cancel(scope: .agentLoop)
+            XCTFail("Cancel must fail closed when the exact client attachment disappears")
+        } catch WorkServiceAttachedWorkControllerError.sourceIncomplete {}
+        do {
+            _ = try await controller.end()
+            XCTFail("End must fail closed when the exact client attachment disappears")
+        } catch WorkServiceAttachedWorkControllerError.sourceIncomplete {}
+        XCTAssertEqual(await service.commandCount(), commandCount)
+        XCTAssertNil(try intentStore.load())
+    }
+}
+
 func testWorkServiceAttachedControllersObserveIndependentlyAndDisconnectingOneDoesNotEndWork() async throws {
     let fixture = try AttachedControllerFixture()
     let service = AttachedControllerTestService(fixture: fixture)
@@ -1004,8 +1131,10 @@ func testWorkServiceAttachedControllerBoundsCanonicalActivitiesAndMessagesExplic
     ) -> TimelineEvent {
         TimelineEvent(
             eventID: eventID, journal: fixture.workJournal, sequence: sequence,
-            hostSequence: sequence, previousEventID: previous, work: fixture.work,
-            workHost: fixture.host, run: run, turn: turn, action: action,
+            hostSequence: sequence, previousEventID: previous,
+            session: fixture.session, work: fixture.work, workHost: fixture.host,
+            sessionAttachment: fixture.sessionAttachment,
+            run: run, turn: turn, action: action,
             actor: actionActor, hostRecordedAt: Date(timeIntervalSince1970: TimeInterval(sequence)),
             type: type, declaredDomains: [.work, .externalEffects], payload: payload)
     }
@@ -1289,7 +1418,7 @@ func testWorkServiceAttachedControllerPreservesCheckpointAcrossHostRestart() asy
     let checkpointStore = AttachedControllerCheckpointStore(box: box)
     let intentStore = try WorkServiceAttachedWorkIntentStore(
         url: FileManager.default.temporaryDirectory.appending(
-            path: "aviary-controller-host-restart-(UUID().uuidString).json"))
+            path: "aviary-controller-host-restart-\(UUID().uuidString).json"))
     defer { try? FileManager.default.removeItem(at: intentStore.url) }
     let connect: WorkServiceAttachedWorkController.Connect = {
         try await service.handshake(WorkServiceHandshakeRequest(client: fixture.client))
@@ -1554,6 +1683,9 @@ let casesWorkServiceAttachedWorkController: [Case] = [
     }),
     ("phase3 Work controller inspects terminal Work but rejects mutation", {
         try await testWorkServiceAttachedControllerCompletedWorkRemainsInspectableButRejectsMutation()
+    }),
+    ("phase3 Work controller disables mutation when attachment disappears", {
+        try await testWorkServiceAttachedControllerMissingAttachmentDisablesMutation()
     }),
     ("phase3 Work controllers observe independently", {
         try await testWorkServiceAttachedControllersObserveIndependentlyAndDisconnectingOneDoesNotEndWork()

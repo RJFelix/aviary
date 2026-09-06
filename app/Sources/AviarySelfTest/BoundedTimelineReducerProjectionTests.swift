@@ -7,6 +7,8 @@ private let boundedProjectionWork = WorkRef(
 private let boundedProjectionWorkJournal = JournalRef.work(
     boundedProjectionWork, journalID: "bounded-projection-work-journal")
 private let boundedProjectionSession = SessionRef("bounded-projection-session")
+private let boundedProjectionSessionAttachment = SessionAttachmentRef(
+    "bounded-projection-session-attachment")
 private let boundedProjectionSessionJournal = JournalRef.session(
     boundedProjectionSession, journalID: "bounded-projection-session-journal",
     authority: TimelineAuthorityRef("bounded-projection-authority"))
@@ -38,13 +40,14 @@ private func boundedProjectionWorkEvent(
     id: String, sequence: Int, type: String,
     payload: JSONValue = .object([:]), run: RunRef? = nil, handle: HandleRef? = nil,
     action: ActionRef? = nil,
+    session: SessionRef? = nil, sessionAttachment: SessionAttachmentRef? = nil,
     declaredDomains: Set<TimelineDomain> = []
 ) -> TimelineEvent {
     TimelineEvent(
         eventID: id, journal: boundedProjectionWorkJournal, sequence: sequence,
         previousEventID: sequence > 1 ? "w\(sequence - 1)" : nil,
-        work: boundedProjectionWork, workHost: boundedProjectionHost, run: run, action: action,
-        handle: handle,
+        session: session, work: boundedProjectionWork, workHost: boundedProjectionHost,
+        sessionAttachment: sessionAttachment, run: run, action: action, handle: handle,
         actor: boundedProjectionActor,
         hostRecordedAt: Date(timeIntervalSince1970: TimeInterval(sequence)),
         type: type, declaredDomains: declaredDomains, payload: payload)
@@ -189,21 +192,30 @@ func test_boundedProjectionScalarProvenanceTracksActualTransitions() throws {
         boundedProjectionWorkEvent(
             id: "w1", sequence: 1, type: TimelineEventType.workCreated),
         boundedProjectionWorkEvent(
-            id: "w2", sequence: 2, type: TimelineEventType.runStarted,
-            payload: .object(["model_id": .string("provenance-model")]), run: run),
+            id: "w2", sequence: 2, type: TimelineEventType.sessionAttached,
+            payload: .object(["capabilities": .array([.string("observe")])]),
+            session: boundedProjectionSession,
+            sessionAttachment: boundedProjectionSessionAttachment,
+            declaredDomains: [.work, .session]),
         boundedProjectionWorkEvent(
-            id: "w3", sequence: 3, type: TimelineEventType.actionIntent,
+            id: "w3", sequence: 3, type: TimelineEventType.runStarted,
+            payload: .object(["model_id": .string("provenance-model")]), run: run,
+            session: boundedProjectionSession,
+            sessionAttachment: boundedProjectionSessionAttachment,
+            declaredDomains: [.work]),
+        boundedProjectionWorkEvent(
+            id: "w4", sequence: 4, type: TimelineEventType.actionIntent,
             payload: .object([
                 "kind": .string(ActionKind.python.rawValue),
                 "intent": .string("exercise execution provenance"),
                 "state": .string(ActionExecutionState.proposed.rawValue),
             ]), run: run, action: action),
         boundedProjectionWorkEvent(
-            id: "w4", sequence: 4, type: TimelineEventType.actionStarted,
+            id: "w5", sequence: 5, type: TimelineEventType.actionStarted,
             payload: .object(["state": .string(ActionExecutionState.running.rawValue)]),
             run: run, action: action),
         boundedProjectionWorkEvent(
-            id: "w5", sequence: 5, type: TimelineEventType.actionOutcome,
+            id: "w6", sequence: 6, type: TimelineEventType.actionOutcome,
             payload: .object([
                 "state": .string(ActionExecutionState.failed.rawValue),
                 "failure_kind": .string(ActionFailureKind.task.rawValue),
@@ -215,9 +227,9 @@ func test_boundedProjectionScalarProvenanceTracksActualTransitions() throws {
         source: boundedProjectionSource(
             journal: boundedProjectionWorkJournal, events: actionEvents))
     XCTAssertEqual(actionHead.execution, .failed)
-    XCTAssertEqual(actionHead.executionEvent?.reference.eventID, "w5")
+    XCTAssertEqual(actionHead.executionEvent?.reference.eventID, "w6")
     XCTAssertEqual(actionHead.lifecycleEvent?.reference.eventID, "w1")
-    XCTAssertEqual(actionHead.modelEvent?.reference.eventID, "w2")
+    XCTAssertEqual(actionHead.modelEvent?.reference.eventID, "w3")
 }
 
 func test_boundedProjectionRetainsUnsettledRowsBeforeResolvedRows() throws {
@@ -225,20 +237,29 @@ func test_boundedProjectionRetainsUnsettledRowsBeforeResolvedRows() throws {
     var workEvents: [TimelineEvent] = [
         boundedProjectionWorkEvent(id: "w1", sequence: 1, type: TimelineEventType.workCreated),
         boundedProjectionWorkEvent(
-            id: "w2", sequence: 2, type: TimelineEventType.runStarted,
-            payload: .object(["model_id": .string("model-1")]), run: run),
+            id: "w2", sequence: 2, type: TimelineEventType.sessionAttached,
+            payload: .object(["capabilities": .array([.string("observe")])]),
+            session: boundedProjectionSession,
+            sessionAttachment: boundedProjectionSessionAttachment,
+            declaredDomains: [.work, .session]),
+        boundedProjectionWorkEvent(
+            id: "w3", sequence: 3, type: TimelineEventType.runStarted,
+            payload: .object(["model_id": .string("model-1")]), run: run,
+            session: boundedProjectionSession,
+            sessionAttachment: boundedProjectionSessionAttachment,
+            declaredDomains: [.work]),
     ]
     workEvents.append(contentsOf: [
         boundedProjectionWorkEvent(
-            id: "w3", sequence: 3, type: TimelineEventType.handleStarted,
+            id: "w4", sequence: 4, type: TimelineEventType.handleStarted,
             payload: .object(["state": .string("running")]), run: run,
             handle: HandleRef("finished-handle")),
         boundedProjectionWorkEvent(
-            id: "w4", sequence: 4, type: TimelineEventType.handleOutcome,
+            id: "w5", sequence: 5, type: TimelineEventType.handleOutcome,
             payload: .object(["state": .string("completed")]), run: run,
             handle: HandleRef("finished-handle")),
         boundedProjectionWorkEvent(
-            id: "w5", sequence: 5, type: TimelineEventType.handleStarted,
+            id: "w6", sequence: 6, type: TimelineEventType.handleStarted,
             payload: .object(["state": .string("running")]), run: run,
             handle: HandleRef("live-handle")),
     ])
@@ -247,43 +268,43 @@ func test_boundedProjectionRetainsUnsettledRowsBeforeResolvedRows() throws {
     let newAction = ActionRef("resolved-new")
     workEvents.append(contentsOf: [
         boundedProjectionWorkEvent(
-            id: "w6", sequence: 6, type: TimelineEventType.actionIntent,
+            id: "w7", sequence: 7, type: TimelineEventType.actionIntent,
             payload: .object([
                 "kind": .string(ActionKind.provider.rawValue),
                 "intent": .string("old"), "state": .string(ActionExecutionState.proposed.rawValue)
             ]), run: run, action: oldAction),
         boundedProjectionWorkEvent(
-            id: "w7", sequence: 7, type: TimelineEventType.actionStarted,
+            id: "w8", sequence: 8, type: TimelineEventType.actionStarted,
             payload: .object(["state": .string(ActionExecutionState.running.rawValue)]),
             run: run, action: oldAction),
         boundedProjectionWorkEvent(
-            id: "w8", sequence: 8, type: TimelineEventType.actionOutcome,
+            id: "w9", sequence: 9, type: TimelineEventType.actionOutcome,
             payload: .object([
                 "state": .string(ActionExecutionState.succeeded.rawValue),
                 "retry_safety": .string(ActionRetrySafety.safe.rawValue)
             ]), run: run, action: oldAction),
         boundedProjectionWorkEvent(
-            id: "w9", sequence: 9, type: TimelineEventType.actionIntent,
+            id: "w10", sequence: 10, type: TimelineEventType.actionIntent,
             payload: .object([
                 "kind": .string(ActionKind.provider.rawValue),
                 "intent": .string("active"), "state": .string(ActionExecutionState.proposed.rawValue)
             ]), run: run, action: activeAction),
         boundedProjectionWorkEvent(
-            id: "w10", sequence: 10, type: TimelineEventType.actionStarted,
+            id: "w11", sequence: 11, type: TimelineEventType.actionStarted,
             payload: .object(["state": .string(ActionExecutionState.running.rawValue)]),
             run: run, action: activeAction),
         boundedProjectionWorkEvent(
-            id: "w11", sequence: 11, type: TimelineEventType.actionIntent,
+            id: "w12", sequence: 12, type: TimelineEventType.actionIntent,
             payload: .object([
                 "kind": .string(ActionKind.python.rawValue),
                 "intent": .string("new"), "state": .string(ActionExecutionState.proposed.rawValue)
             ]), run: run, action: newAction),
         boundedProjectionWorkEvent(
-            id: "w12", sequence: 12, type: TimelineEventType.actionStarted,
+            id: "w13", sequence: 13, type: TimelineEventType.actionStarted,
             payload: .object(["state": .string(ActionExecutionState.running.rawValue)]),
             run: run, action: newAction),
         boundedProjectionWorkEvent(
-            id: "w13", sequence: 13, type: TimelineEventType.actionOutcome,
+            id: "w14", sequence: 14, type: TimelineEventType.actionOutcome,
             payload: .object([
                 "state": .string(ActionExecutionState.failed.rawValue),
                 "failure_kind": .string(ActionFailureKind.task.rawValue),
@@ -396,14 +417,23 @@ func test_boundedProjectionRejectsForgedCompleteIndexBeforeLookup() throws {
     let events = [
         boundedProjectionWorkEvent(id: "w1", sequence: 1, type: TimelineEventType.workCreated),
         boundedProjectionWorkEvent(
-            id: "w2", sequence: 2, type: TimelineEventType.runStarted,
-            payload: .object(["model_id": .string("model-1")]), run: run),
+            id: "w2", sequence: 2, type: TimelineEventType.sessionAttached,
+            payload: .object(["capabilities": .array([.string("observe")])]),
+            session: boundedProjectionSession,
+            sessionAttachment: boundedProjectionSessionAttachment,
+            declaredDomains: [.work, .session]),
         boundedProjectionWorkEvent(
-            id: "w3", sequence: 3, type: TimelineEventType.handleStarted,
+            id: "w3", sequence: 3, type: TimelineEventType.runStarted,
+            payload: .object(["model_id": .string("model-1")]), run: run,
+            session: boundedProjectionSession,
+            sessionAttachment: boundedProjectionSessionAttachment,
+            declaredDomains: [.work]),
+        boundedProjectionWorkEvent(
+            id: "w4", sequence: 4, type: TimelineEventType.handleStarted,
             payload: .object(["state": .string("running")]), run: run,
             handle: HandleRef("kept")),
         boundedProjectionWorkEvent(
-            id: "w4", sequence: 4, type: TimelineEventType.handleStarted,
+            id: "w5", sequence: 5, type: TimelineEventType.handleStarted,
             payload: .object(["state": .string("running")]), run: run,
             handle: HandleRef("evicted")),
     ]

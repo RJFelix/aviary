@@ -144,6 +144,7 @@ public protocol JournalBackedWorkServiceLaunchManifestStore: Sendable {
     /// consult ambient files, skills, or memory; a reserved retry must use its retained assembly.
     func reserveStart(
         _ template: WorkLaunchWorkTemplateRecord,
+        binding: WorkBinding,
         run: RunRef,
         intent: WorkLaunchStartIntent,
         expectedPrevious: WorkLaunchManifestGeneration?,
@@ -410,7 +411,10 @@ public struct DurableJournalBackedWorkLaunchManifestStore:
         binding: WorkBinding
     ) async throws -> JournalBackedWorkLaunchManifest {
         if let template = manifest.template {
-            guard template.binding == binding else { throw WorkServiceProtocolError.journalMismatch }
+            guard template.work == binding.work,
+                  template.workHost == binding.workHost else {
+                throw WorkServiceProtocolError.journalMismatch
+            }
             return manifest.withTemplate(template)
         }
         guard let retained = manifest.retainedRecord else {
@@ -422,16 +426,17 @@ public struct DurableJournalBackedWorkLaunchManifestStore:
 
     public func reserveStart(
         _ template: WorkLaunchWorkTemplateRecord,
+        binding: WorkBinding,
         run: RunRef,
         intent: WorkLaunchStartIntent,
         expectedPrevious: WorkLaunchManifestGeneration?,
         initialInputBodyReference: TimelineBodyReference
     ) async throws -> WorkLaunchStartAdmission {
-        guard template.binding.work.workHostID == (try? store.home.requirePersistedWorkHostID()) else {
+        guard template.workHost.workHostID == (try? store.home.requirePersistedWorkHostID()) else {
             throw WorkServiceProtocolError.sourceIncomplete
         }
         return try store.reserveStart(
-            template, run: run, startIntent: intent,
+            template, binding: binding, run: run, startIntent: intent,
             expectedPrevious: expectedPrevious,
             initialInputBodyReference: initialInputBodyReference)
     }
@@ -452,9 +457,17 @@ public struct DurableJournalBackedWorkLaunchManifestStore:
         let binding = WorkBinding(
             session: session, work: work, workHost: WorkHostRef(work.workHostID),
             sessionAttachment: sessionAttachment)
-        guard let reservation = try store.readStartReservation(for: binding) else {
+        let reservation: WorkLaunchStartReservation?
+        do {
+            reservation = try store.readStartReservation(for: binding)
+        } catch WorkLaunchManifestStoreError.requestConflict {
+            // The single Work-level reservation belongs to another exact binding. It is a
+            // durable fence, not recovery material that this caller may adopt.
             return nil
+        } catch {
+            throw WorkServiceProtocolError.sourceIncomplete
         }
+        guard let reservation else { return nil }
         return reservation.intent == intent ? reservation : nil
     }
 
@@ -479,7 +492,8 @@ public struct DurableJournalBackedWorkLaunchManifestStore:
         selectedPromptAssembly: WorkLaunchPromptAssembly? = nil
     ) async throws -> JournalBackedWorkLaunchManifest {
         guard let template = manifest.template,
-              template.binding == binding else {
+              template.work == binding.work,
+              template.workHost == binding.workHost else {
             throw WorkServiceProtocolError.sourceIncomplete
         }
         // Retain and verify the exact per-Run input before publication. Create's template may
@@ -498,16 +512,33 @@ public struct DurableJournalBackedWorkLaunchManifestStore:
         // never replace an in-flight pointer: exact retries join the same record, while a
         // different client-qualified Start fails closed. Replacement is reserved exclusively
         // for End -> Start and remains a compare-and-swap under the store lock.
-        let currentSelection = try store.readCurrentSelection(for: template.binding)
-        let replacingEndedRun = policy.projection == .reopenHistorical
+        let currentSelection = try store.readCurrentSelection(for: binding)
+        // The current pointer is Work-scoped, so an alternate canonical Session sees the prior
+        // owner's completed Run here as well.  Same-binding replacements reopen historical
+        // state; a different attached binding must use a fresh projection and is allowed to
+        // advance the Work pointer under the same CAS.  A fresh first Start has no current
+        // selection and is unaffected by this distinction.
+        let replacingEndedRun: Bool
+        let canReplaceDifferentBinding = policy.modelContext == .launchFresh
+            && (policy.projection == .fresh || policy.projection == .reopenHistorical)
+        if let current = currentSelection {
+            let currentBinding = current.record.manifest.workRunBinding.workBinding
+            let sameBinding = currentBinding.session == binding.session
+                && currentBinding.sessionAttachment == binding.sessionAttachment
+            replacingEndedRun = sameBinding
+                ? policy.projection == .reopenHistorical
+                : canReplaceDifferentBinding
+        } else {
+            replacingEndedRun = policy.projection == .reopenHistorical
+        }
 
         // A process can die after the exact Run pointer is published but before the Work-level
         // selection pointer. Recover that one pending intent before considering a fresh Run. The
         // caller's in-process gate and the durable Start intent are the two halves of this CAS;
         // no scan result is accepted for a different intent or silently made current.
-        if let pending = try store.readPendingStart(for: template.binding, intent: intent) {
+        if let pending = try store.readPendingStart(for: binding, intent: intent) {
             let mayRepair = try store.mayRepairPendingStart(
-                for: template.binding, intent: intent, currentSelection: currentSelection)
+                for: binding, intent: intent, currentSelection: currentSelection)
             if mayRepair {
                 let repaired = try store.repairCurrentSelection(
                     pending, expectedPrevious: currentSelection?.selectionGeneration)
@@ -524,10 +555,25 @@ public struct DurableJournalBackedWorkLaunchManifestStore:
         }
         let current = currentSelection?.record
         if let current, !replacingEndedRun {
-            guard current.manifest.startIntent == intent else {
-                throw WorkServiceProtocolError.sourceIncomplete
+            let currentBinding = current.manifest.workRunBinding.workBinding
+            let sameBinding = currentBinding.session == binding.session
+                && currentBinding.sessionAttachment == binding.sessionAttachment
+            // A Work-level current selection can belong to another canonical Session.  It is
+            // not an idempotent hit for this caller, but a completed predecessor which this
+            // exact fresh binding may replace under the expectedPrevious CAS.  All callers of
+            // this adapter reach here only after the service has proven the Work is idle and
+            // selected the corresponding launch policy.
+            if !sameBinding {
+                guard canReplaceDifferentBinding else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
             }
-            return manifest.withDurableRecord(current)
+            if sameBinding {
+                guard current.manifest.startIntent == intent else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                return manifest.withDurableRecord(current)
+            }
         }
         let expectedPrevious = currentSelection?.selectionGeneration
 
@@ -541,7 +587,8 @@ public struct DurableJournalBackedWorkLaunchManifestStore:
             throw WorkServiceProtocolError.sourceIncomplete
         }
         let admission = try store.reserveStart(
-            template, run: run, startIntent: intent, expectedPrevious: expectedPrevious,
+            template, binding: binding, run: run, startIntent: intent,
+            expectedPrevious: expectedPrevious,
             initialInputBodyReference: reference)
         let prepared: WorkLaunchStartReservation
         switch admission {
@@ -589,6 +636,7 @@ public struct DurableJournalBackedWorkLaunchManifestStore:
         }
         let record = try store.start(
             template,
+            binding: binding,
             run: prepared.run, startIntent: prepared.intent,
             expectedPrevious: prepared.expectedPrevious,
             initialInputBodyReference: prepared.initialInputBodyReference,
@@ -603,9 +651,8 @@ public struct DurableJournalBackedWorkLaunchManifestStore:
         sessionAttachment: SessionAttachmentRef
     ) async throws -> JournalBackedWorkLaunchManifest? {
         guard let template = try store.readTemplate(for: work),
-              template.binding.work == work,
-              template.binding.session == session,
-              template.binding.sessionAttachment == sessionAttachment else { return nil }
+              template.work == work,
+              template.workHost == WorkHostRef(work.workHostID) else { return nil }
         // The template's retention key is the durable Create proof.  Resolve must load and
         // verify that keyed retention after restart; a template payload alone is not enough to
         // reconstruct executable launch material.
@@ -1009,6 +1056,9 @@ public actor JournalBackedWorkService: WorkServiceClient {
     /// another local admin process, while launch resolution still revalidates the selected ID.
     private let workspaceCatalogProbe: BoundedWorkspaceCatalogProbe
     private let bounds: WorkHostRegistryBounds
+    /// Testable bound for raw live envelopes. Production keeps the one-million-record ceiling;
+    /// crossing it changes storage strategy, never source availability.
+    private let canonicalResidentRecordLimit: Int
     private var loaded = false
     private var manifests: [WorkRef: JournalBackedWorkLaunchManifest] = [:]
 
@@ -1060,6 +1110,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
     private struct JournalReadCacheEntry: Sendable {
         let fingerprint: JournalFileFingerprint
         let result: TimelineJournalReadResult
+        /// Bounded canonical genesis prefix retained even when `result.records` is nonresident.
+        let prefixRecords: [TimelineJournalRecord]
         let workSnapshot: WorkSnapshot?
         let sessionSnapshot: SessionSnapshot?
         let sequenceToIndex: [Int: Int]
@@ -1075,6 +1127,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let isFullyResident: Bool
         let latestRunStarted: RunRef?
         let latestRunFinished: RunRef?
+        let latestRunFinishedEvent: TimelineEvent?
         let runStartedIDs: Set<String>
         let runFinishedIDs: Set<String>
         let runFinishedExists: Bool
@@ -1105,6 +1158,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
     /// client-qualified Start intent; conflicting intents never join this task.
     private struct StartAdmissionKey: Hashable, Sendable {
         let work: WorkRef
+        let binding: WorkBinding
         let intent: WorkLaunchStartIntent
     }
     private struct StartActorAdmission: Sendable {
@@ -1124,6 +1178,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         bounds: WorkHostRegistryBounds = .default,
         workspaceCatalogProvider: @escaping WorkHostWorkspaceCatalogProvider = { .empty },
         workspaceCatalogTimeoutNanoseconds: UInt64 = 500_000_000,
+        canonicalResidentRecordLimit: Int = 1_000_000,
         creationIdentityMinter: @escaping @Sendable () -> WorkHostControlMintedIdentity = {
             WorkHostControlMintedIdentity(
                 workID: "work-" + UUID().uuidString.lowercased(),
@@ -1144,6 +1199,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
             provider: workspaceCatalogProvider,
             timeoutNanoseconds: workspaceCatalogTimeoutNanoseconds)
         self.bounds = bounds
+        self.canonicalResidentRecordLimit = max(
+            1, min(canonicalResidentRecordLimit, JournalReadLimits.maximumResidentRecords))
         let instance = WorkHostInstanceRef(
             host: persistedHost, instanceID: instanceID, startIdentity: startIdentity)
         self.hostInstance = instance
@@ -1316,7 +1373,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
                     }
                 }
                 guard let template = resolved.template,
-                      template.binding == priorBinding,
+                      template.work == priorBinding.work,
+                      template.workHost == priorBinding.workHost,
                       resolved.identity == nil,
                       resolved.bodyDigest == reservation.bodyDigest,
                       resolved.configurationDigest == reservation.configurationDigest else {
@@ -1394,7 +1452,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
         }
         try validateManifest(manifest)
         guard let template = manifest.template,
-              template.binding == binding,
+              template.work == binding.work,
+              template.workHost == binding.workHost,
               manifest.identity == nil,
               manifest.bodyDigest == reservation.bodyDigest,
               manifest.configurationDigest == reservation.configurationDigest else {
@@ -1485,8 +1544,36 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 denied: request.requestedCapabilities.subtracting(effective),
                 diagnostic: effective == request.requestedCapabilities
                     ? nil : "capabilities were limited by the authorizing attachment or Work state")
-            let attachment = try clientAttachment(
-                verified, control: control, authorizationOverride: authorization)
+            // The CreateSession relationship and response authorization are immutable
+            // publication evidence, but the client attachment is mutable control state. An
+            // exact retry after updateCapabilities must replay the original relationship while
+            // returning the attachment's current grant; never let publication capabilities
+            // resurrect a grant that the control journal has since reduced.
+            let attachment: WorkServiceClientAttachment?
+            if let current = control.clientAttachments[existing.reservation.clientAttachment.attachmentID] {
+                guard current.attachment == verified.attachment,
+                      current.client == verified.client,
+                      current.work == verified.work,
+                      current.workJournal == verified.workJournal,
+                      current.session == verified.session,
+                      current.sessionJournal == verified.sessionJournal,
+                      current.sessionAttachment == verified.sessionAttachment,
+                      current.attachedEvent == verified.attachedEvent else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                // A detached historical row remains valid publication evidence but cannot be
+                // returned as a live authority. Preserve the minted attachment identity and
+                // immutable publication grant; the descriptor deliberately omits this row, so a
+                // client can correlate the duplicate without adopting it as current authority.
+                attachment = current.isAttached
+                    ? try clientAttachment(current, control: control)
+                    : try clientAttachment(
+                        verified, control: control, authorizationOverride: authorization)
+            } else {
+                // A compacted/omitted current row is likewise historical evidence only.
+                attachment = try clientAttachment(
+                    verified, control: control, authorizationOverride: authorization)
+            }
             let relationship = WorkServiceSessionAttachmentDescriptor(
                 session: existing.reservation.session,
                 sessionJournal: existing.reservation.sessionJournal,
@@ -1580,12 +1667,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 expected: request.causalWorkCursor, actual: source.workCursor)
         }
         let terminalEvent: EventRef? = terminal
-            ? source.workRead.records.last.map {
+            ? source.workCache.lastRecord.map {
                 EventRef(journal: source.workJournal, eventID: $0.event.eventID)
             } : nil
         if terminal {
             guard source.workState.activeRun == nil,
-                  let last = source.workRead.records.last,
+                  let last = source.workCache.lastRecord,
                   [TimelineEventType.workCompleted, TimelineEventType.workDestroyed,
                    TimelineEventType.workFailed].contains(last.event.type) else {
                 throw WorkServiceProtocolError.sourceIncomplete
@@ -2273,12 +2360,95 @@ public actor JournalBackedWorkService: WorkServiceClient {
               request.command.causalCursor == request.causalWorkCursor else {
             throw WorkServiceProtocolError.invalidRequest("command causal cursor is inconsistent")
         }
-        let source = try await requireCanonical(work: request.work, journal: request.journal)
         let attachment = try await requireAttached(
             work: request.work, journal: request.journal, attachment: request.attachment,
             client: client, capability: capability(for: request.kind))
         guard request.command.sessionAttachment == attachment.sessionAttachment else {
             throw WorkServiceProtocolError.invalidRequest("command Session attachment does not match client attachment")
+        }
+        // The first Start can have crossed the native run.started boundary while its Hosted
+        // actor is still being admitted to the registry. In that narrow window there is no cold
+        // source read available (the actor owns both journal locks), but an exact same-intent
+        // caller can still join the in-process admission task. Match the complete client/body/
+        // cursor identity and the authenticated Session binding before waiting; a different
+        // binding or intent must continue through the normal fail-closed path below.
+        var joinedInFlightStart = false
+        if request.kind == .start,
+           let session = attachment.session,
+           let sessionAttachment = attachment.sessionAttachment,
+           let client = request.command.client {
+            let intent = WorkLaunchStartIntent(
+                client: client, commandID: request.command.commandID,
+                causalWorkCursor: request.causalWorkCursor,
+                bodyDigest: digest(Data((request.value ?? "").utf8)))
+            let binding = WorkBinding(
+                session: session, work: request.work, workHost: host,
+                sessionAttachment: sessionAttachment)
+            if let task = startsInProgress.first(where: {
+                $0.key.work == request.work
+                    && $0.key.binding == binding
+                    && $0.key.intent == intent
+            })?.value {
+                _ = try await task.value
+                joinedInFlightStart = true
+            }
+        }
+        // Authenticate the caller's exact control attachment before attempting a canonical
+        // source read. During an active Run the owning actor keeps its journal locks held, so a
+        // foreign Session must receive the stable owner rejection rather than an incidental
+        // sourceIncomplete result from the cold registration Session. This is negative-only: a
+        // matching owner still goes through the full canonical verifier below.
+        if [.send, .steer, .queue, .cancel, .end].contains(request.kind) {
+            try await rejectCrossSessionLiveOwner(
+                work: request.work, attachment: attachment)
+        }
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        let callerBinding = try callerWorkBinding(attachment, source: source, work: request.work)
+        let commandLedgerID = qualifiedCommandID(clientID: client.clientID,
+                                                  commandID: request.command.commandID)
+        let priorCommand = source.workState.commands[commandLedgerID]
+        switch request.kind {
+        case .start:
+            // A Start is a Work-level admission, but its selected Session/attachment is the
+            // caller's authenticated canonical attachment. A stale owner tuple is never
+            // silently inherited from the creation reservation. An exact retry of an already
+            // recorded Start is allowed through to the duplicate/recovery projection below,
+            // including after a service restart; a new Start remains refused while any Run is
+            // active even when it comes from that same Session.
+            let sameActiveOwner = source.workState.activeRunSession == callerBinding.session
+                && source.workState.activeRunSessionAttachment == callerBinding.sessionAttachment
+            let exactRecordedStart = priorCommand != nil && sameActiveOwner
+            if source.workState.activeRun != nil {
+                // A same-Session caller may be observing the narrow opener window after the
+                // native run.started marker but before command.accepted is durable. That is not
+                // an ownership conflict; it is an unjoinable, incomplete admission and must
+                // fail closed as source-incomplete. A different Session remains a stable public
+                // invalidRequest and never reaches actor/ledger admission.
+                guard sameActiveOwner else {
+                    throw WorkServiceProtocolError.invalidRequest(
+                        "Start is owned by another active Session attachment")
+                }
+                guard exactRecordedStart || joinedInFlightStart else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+            } else {
+                guard source.workState.activeRunSession == nil,
+                      source.workState.activeRunSessionAttachment == nil else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+            }
+        case .send, .steer, .queue, .cancel, .end:
+            // All mutable text/run controls are owner-qualified. This check precedes every
+            // ledger/actor path, so a secondary Session can observe but cannot create a
+            // transcript event or command-acceptance event.
+            guard source.workState.activeRun != nil,
+                  source.workState.activeRunSession == callerBinding.session,
+                  source.workState.activeRunSessionAttachment == callerBinding.sessionAttachment else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "active Run belongs to a different Session attachment")
+            }
+        case .hold, .complete, .destroy:
+            break
         }
         guard !request.valueWasTruncated,
               (request.value?.utf8.count ?? 0) <= WorkServiceBounds.maxCommandValueCharacters else {
@@ -2290,17 +2460,14 @@ public actor JournalBackedWorkService: WorkServiceClient {
             // the same Run reservation to different prompt bytes.
             guard let store = manifestStore,
                   try await store.resolve(
-                      work: request.work, session: source.session,
-                      sessionAttachment: source.sessionAttachment) != nil else {
+                      work: request.work, session: callerBinding.session,
+                      sessionAttachment: callerBinding.sessionAttachment) != nil else {
                 throw WorkServiceProtocolError.sourceIncomplete
             }
             // The per-Run body is retained at Start admission. The Run-free template is only
             // configuration/reconstruction material and must not constrain a replacement's
             // exact input bytes.
         }
-        let commandLedgerID = qualifiedCommandID(clientID: client.clientID,
-                                                  commandID: request.command.commandID)
-        let priorCommand = source.workState.commands[commandLedgerID]
         let liveActor: WorkHostRegistryLiveEntry?
         if let lookup = await registry.lookup(request.work), case .live(let entry) = lookup {
             liveActor = entry
@@ -2308,7 +2475,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
             liveActor = nil
         }
         let exactLiveActor = if let liveActor {
-            await exactLiveHostedActor(liveActor, source: source)
+            await exactLiveHostedActor(liveActor, source: source, binding: callerBinding)
         } else {
             false
         }
@@ -2320,8 +2487,6 @@ public actor JournalBackedWorkService: WorkServiceClient {
         if let liveActor {
             let snapshot = await liveActor.hostedWork.snapshot()
             endedLiveActor = snapshot.identity.work == source.registration.reservation.work
-                && snapshot.identity.sessionID == source.session.sessionID
-                && snapshot.sessionAttachment == source.sessionAttachment
                 && snapshot.lifecycle == .ended
                 && snapshot.journalHealth == .closed
         } else {
@@ -2334,7 +2499,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let exactStartRecoveryRetry: Bool
         if request.kind == .start {
             exactStartRecoveryRetry = try await isExactStartRecoveryRetry(
-                request, source: source, client: client)
+                request, source: source, client: client, binding: callerBinding)
         } else {
             exactStartRecoveryRetry = false
         }
@@ -2343,14 +2508,15 @@ public actor JournalBackedWorkService: WorkServiceClient {
         // reservation is classified as an unfinished crash; a different intent remains fenced.
         let inFlightStartAdmission: Bool = if request.kind == .start {
             startsInProgress[startAdmissionKey(
-                work: request.work, client: client,
+                work: request.work, binding: callerBinding, client: client,
                 commandID: request.command.commandID,
                 causalWorkCursor: request.causalWorkCursor,
                 prompt: request.value ?? "")] != nil
         } else {
             false
         }
-        let unstartedStartReservation = try await hasUnstartedStartReservation(source)
+        let unstartedStartReservation = try await hasUnstartedStartReservation(
+            source, binding: callerBinding)
         let registryRequiresRecovery: Bool = if let lookup = await registry.lookup(request.work) {
             switch lookup {
             case .recovering, .unavailable: true
@@ -2386,7 +2552,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
             }
             guard let priorManifest = try await resolveStartManifest(
                 work: request.work, source: source, client: client,
-                commandID: request.command.commandID, prompt: request.value ?? ""),
+                commandID: request.command.commandID, prompt: request.value ?? "",
+                binding: callerBinding),
                   let priorRecord = priorManifest.durableRecord,
                   startBodyMatches(
                     request.value ?? "", record: priorRecord) else {
@@ -2503,25 +2670,30 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 startsInProgress.removeValue(forKey: key)
             }
         }
-        var commandSource = source
         if request.kind == .start {
-            let admission = try await admitStartActor(
-                work: request.work, source: source, client: client,
-                commandID: request.command.commandID,
-                causalWorkCursor: request.causalWorkCursor,
-                prompt: request.value ?? "")
+            let admission: StartActorAdmission
+            do {
+                admission = try await admitStartActor(
+                    work: request.work, source: source, client: client,
+                    commandID: request.command.commandID,
+                    causalWorkCursor: request.causalWorkCursor,
+                    prompt: request.value ?? "", binding: callerBinding)
+            } catch WorkLaunchManifestStoreError.requestConflict,
+                    WorkLaunchManifestStoreError.generationMismatch {
+                // The durable Work-scoped Start CAS may be won by another Session after this
+                // caller's idle observation. Surface the stable service rejection rather than
+                // leaking a store implementation error or retrying with a second Run identity.
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
             live = admission.entry
             ownsStartAdmission = admission.ownsTask
             if ownsStartAdmission {
                 startAdmissionKeyToRelease = startAdmissionKey(
-                    work: request.work, client: client,
+                    work: request.work, binding: callerBinding, client: client,
                     commandID: request.command.commandID,
                     causalWorkCursor: request.causalWorkCursor,
                     prompt: request.value ?? "")
             }
-            commandSource = try await canonicalSource(
-                work: request.work, journal: request.journal,
-                registration: source.registration)
         } else if let lookup = await registry.lookup(request.work), case .live(let entry) = lookup {
             live = entry
         } else {
@@ -2543,8 +2715,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
         case .hold, .destroy, .complete: fatalError("terminal/hold handled above")
         }
         let hosted = HostedInHouseWorkCommand(
-            work: request.work, session: SessionRef(commandSource.session.sessionID),
-            sessionAttachment: commandSource.sessionAttachment, client: client,
+            work: request.work, session: callerBinding.session,
+            sessionAttachment: callerBinding.sessionAttachment, client: client,
             commandID: request.command.commandID,
             // The caller's cursor is the command's canonical causal identity. The execution
             // opener must provide a journal-level bridge for the preceding `run.started` marker;
@@ -2650,7 +2822,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
                     hostedConfigurationResolves = false
                 }
                 let lookup = await registry.lookup(reservation.work)
-                let hasUnstartedStartReservation = try await self.hasUnstartedStartReservation(source)
+                let hasUnstartedStartReservation = try await self.hasUnstartedStartReservation(
+                    source, binding: primaryWorkBinding(source))
                 let disposition: JournalBackedWorkRecoveryDisposition
                 let host: WorkHostInstanceRef?
                 switch source.workState.lifecycle {
@@ -2721,6 +2894,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let sessionCursor: JournalCursor
         var session: SessionRef { registration.reservation.session }
         var sessionAttachment: SessionAttachmentRef { registration.reservation.sessionAttachment }
+        var boundedWorkRecords: [TimelineJournalRecord] {
+            workRead.records.isEmpty ? workCache.prefixRecords : workRead.records
+        }
+        var boundedSessionRecords: [TimelineJournalRecord] {
+            sessionRead.records.isEmpty ? sessionCache.prefixRecords : sessionRead.records
+        }
     }
 
     /// Admit a Hosted actor only as part of an explicit Start. Create deliberately leaves the
@@ -2733,10 +2912,11 @@ public actor JournalBackedWorkService: WorkServiceClient {
         client: ClientRef,
         commandID: String,
         causalWorkCursor: JournalCursor,
-        prompt: String
+        prompt: String,
+        binding: WorkBinding
     ) async throws -> StartActorAdmission {
         let key = startAdmissionKey(
-            work: work, client: client, commandID: commandID,
+            work: work, binding: binding, client: client, commandID: commandID,
             causalWorkCursor: causalWorkCursor, prompt: prompt)
         let intent = key.intent
         if let existing = startsInProgress[key] {
@@ -2748,7 +2928,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let task = Task { [self] in
             try await performStartActor(
                 work: work, source: source, client: client, commandID: commandID,
-                prompt: prompt, intent: intent)
+                prompt: prompt, intent: intent, selectedBinding: binding)
         }
         startsInProgress[key] = task
         do {
@@ -2766,7 +2946,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
         client: ClientRef,
         commandID: String,
         prompt: String,
-        intent: WorkLaunchStartIntent
+        intent: WorkLaunchStartIntent,
+        selectedBinding: WorkBinding
     ) async throws -> WorkHostRegistryLiveEntry {
         guard source.workState.lifecycle == .active else {
             throw WorkServiceProtocolError.invalidRequest("Start requires an active Work")
@@ -2800,7 +2981,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
         // proof and can otherwise let two concurrent Start calls race on stale launch material.
         let base: JournalBackedWorkLaunchManifest
         if let resolved = try await store.resolve(
-            work: work, session: source.session, sessionAttachment: source.sessionAttachment) {
+            work: work, session: selectedBinding.session,
+            sessionAttachment: selectedBinding.sessionAttachment) {
             manifests[work] = resolved
             base = resolved
         } else {
@@ -2819,11 +3001,11 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let hasFinishedRun = source.workCache.runFinishedExists
         let replacingEndedRun = endedEntry != nil || hasFinishedRun
         let workBinding = WorkBinding(
-            session: source.session, work: work, workHost: host,
-            sessionAttachment: source.sessionAttachment)
+            session: selectedBinding.session, work: work, workHost: host,
+            sessionAttachment: selectedBinding.sessionAttachment)
         let prior = try await store.resolveStart(
-            work: work, session: source.session,
-            sessionAttachment: source.sessionAttachment, intent: intent)
+            work: work, session: selectedBinding.session,
+            sessionAttachment: selectedBinding.sessionAttachment, intent: intent)
         var recoveringStartedRun = false
         if let priorRun = prior?.identity?.run, source.workState.activeRun == priorRun {
             guard recoveryCursor != nil else { throw WorkServiceProtocolError.sourceIncomplete }
@@ -2845,18 +3027,27 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 sourceRun: priorPolicy.sourceRun)
         } else if replacingEndedRun {
             guard let predecessorRun else { throw WorkServiceProtocolError.sourceIncomplete }
+            // Cold replay is only valid when the latest finished Run was owned by this exact
+            // selected Session/attachment. When ownership alternates across Sessions, the
+            // selected Session has no exact predecessor crossing; reopening it with a fresh
+            // context is the safe, reusable Work path.
+            let predecessorBinding = latestFinishedRunBinding(source, run: predecessorRun)
             let priorContext: NativeColdResumeResult?
-            do {
-                priorContext = try NativeSessionCommandJournal.preflightPriorContext(
-                    home: home, binding: workBinding)
-            } catch NativeColdResumeError.noCompleteContextManifest {
-                // This is the ordinary empty/no-crossing predecessor. Historical projection
-                // reopening remains required, but the provider receives a fresh context.
+            if predecessorBinding == workBinding {
+                do {
+                    priorContext = try NativeSessionCommandJournal.preflightPriorContext(
+                        home: home, binding: workBinding)
+                } catch NativeColdResumeError.noCompleteContextManifest {
+                    // This is the ordinary empty/no-crossing predecessor. Historical projection
+                    // reopening remains required, but the provider receives a fresh context.
+                    priorContext = nil
+                } catch {
+                    // A recorded crossing with incomplete/corrupt retained state is not
+                    // equivalent to "no context". Refuse before publishing the replacement Run.
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+            } else {
                 priorContext = nil
-            } catch {
-                // A recorded crossing with incomplete/corrupt retained state is not equivalent
-                // to "no context". Refuse before bindStart publishes the replacement Run.
-                throw WorkServiceProtocolError.sourceIncomplete
             }
             if let priorContext {
                 // The native bridge will replay this exact predecessor assembly. A source-less
@@ -2864,8 +3055,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 // a valid substitute for the recorded crossing.
                 let materializedAssembly = priorContext.systemPromptAssembly
                 guard let durableAssembly = try await store.resolvePromptAssemblyRecord(
-                          work: work, session: source.session,
-                          sessionAttachment: source.sessionAttachment, run: predecessorRun),
+                          work: work, session: workBinding.session,
+                          sessionAttachment: workBinding.sessionAttachment, run: predecessorRun),
                       let recordedAssembly = try? durableAssembly.materialize(
                           using: ContextBodyStore(home: home)),
                       recordedAssembly == materializedAssembly else {
@@ -2873,10 +3064,21 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 }
                 selectedPromptAssembly = durableAssembly
             }
+            // A newly selected Session may have canonical native attachment history but no
+            // legacy flat projection yet.  Reopen the selected Session's existing projection
+            // only when it owns the immediately preceding Run; an alternating owner gets a
+            // genuinely fresh projection while the Work-level Run remains a replacement.
+            // A Session may alternate ownership after End. Its existing Aviary flat projection
+            // is safe to reopen even when the new context is launch-fresh; an untouched Session
+            // has no projection yet and must use the staged fresh path.
+            let selectedProjectionURL = home.sessionFile(id: selectedBinding.session.sessionID)
+            let projection: WorkLaunchProjectionMode = predecessorBinding == workBinding
+                || FileManager.default.fileExists(atPath: selectedProjectionURL.path)
+                ? .reopenHistorical : .fresh
             launchPolicy = WorkLaunchExecutionPolicy(
-                projection: .reopenHistorical,
+                projection: projection,
                 modelContext: priorContext == nil ? .launchFresh : .exactColdResume,
-                sourceSession: priorContext == nil ? nil : source.session,
+                sourceSession: priorContext == nil ? nil : selectedBinding.session,
                 sourceRun: priorContext == nil ? nil : predecessorRun)
         } else {
             launchPolicy = WorkLaunchExecutionPolicy(
@@ -2921,8 +3123,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
             let run = RunRef("run-" + UUID().uuidString.lowercased())
             let binding = WorkRunBinding(
                 workBinding: WorkBinding(
-                    session: source.session, work: work, workHost: host,
-                    sessionAttachment: source.sessionAttachment), run: run)
+                    session: selectedBinding.session, work: work, workHost: host,
+                    sessionAttachment: selectedBinding.sessionAttachment), run: run)
             // A replacement has a new Run identity but the exact same logical Work binding. The
             // manifest store publishes this generation and its Work-level current-start pointer
             // before any journal opener runs. Its compare-and-swap is the durable half of the
@@ -2940,8 +3142,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
         }
         let binding = WorkRunBinding(
             workBinding: WorkBinding(
-                session: source.session, work: work, workHost: host,
-                sessionAttachment: source.sessionAttachment), run: run)
+                session: selectedBinding.session, work: work, workHost: host,
+                sessionAttachment: selectedBinding.sessionAttachment), run: run)
         try validateStartManifest(
             manifest, intent: intent, body: Data(prompt.utf8), binding: binding)
         let configuration = try await hostedConfiguration(
@@ -3072,7 +3274,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
         source: CanonicalSource,
         client: ClientRef,
         commandID: String,
-        prompt: String
+        prompt: String,
+        binding: WorkBinding
     ) async throws -> JournalBackedWorkLaunchManifest? {
         guard let store = manifestStore else { return nil }
         let key = qualifiedCommandID(clientID: client.clientID, commandID: commandID)
@@ -3083,14 +3286,15 @@ public actor JournalBackedWorkService: WorkServiceClient {
             return nil
         }
         guard try await store.resolve(
-            work: work, session: source.session, sessionAttachment: source.sessionAttachment)
+            work: work, session: binding.session,
+            sessionAttachment: binding.sessionAttachment)
                 != nil else { return nil }
         let intent = WorkLaunchStartIntent(
             client: client, commandID: commandID, causalWorkCursor: causalCursor,
             bodyDigest: digest(Data(prompt.utf8)))
         if let current = try await store.resolveStart(
-            work: work, session: source.session,
-            sessionAttachment: source.sessionAttachment, intent: intent) {
+            work: work, session: binding.session,
+            sessionAttachment: binding.sessionAttachment, intent: intent) {
             return current
         }
         return nil
@@ -3102,12 +3306,13 @@ public actor JournalBackedWorkService: WorkServiceClient {
     /// command merely because the registry retains a reference to it.
     private func exactLiveHostedActor(
         _ entry: WorkHostRegistryLiveEntry,
-        source: CanonicalSource
+        source: CanonicalSource,
+        binding: WorkBinding
     ) async -> Bool {
         let snapshot = await entry.hostedWork.snapshot()
         guard snapshot.identity.work == source.registration.reservation.work,
-              snapshot.identity.sessionID == source.session.sessionID,
-              snapshot.sessionAttachment == source.sessionAttachment,
+              snapshot.identity.sessionID == binding.session.sessionID,
+              snapshot.sessionAttachment == binding.sessionAttachment,
               snapshot.runtimeState == .connected,
               snapshot.journalHealth == .healthy,
               snapshot.lifecycle != .failed else { return false }
@@ -3126,7 +3331,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
     private func isExactStartRecoveryRetry(
         _ request: WorkServiceCommandRequest,
         source: CanonicalSource,
-        client: ClientRef
+        client: ClientRef,
+        binding: WorkBinding
     ) async throws -> Bool {
         guard request.kind == .start, let store = manifestStore else { return false }
         let intent = WorkLaunchStartIntent(
@@ -3135,12 +3341,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
             bodyDigest: digest(Data((request.value ?? "").utf8)))
         let selection = try await store.currentSelection(
             work: source.registration.reservation.work,
-            session: source.registration.reservation.session,
-            sessionAttachment: source.registration.reservation.sessionAttachment)
+            session: binding.session,
+            sessionAttachment: binding.sessionAttachment)
         if let record = selection {
             guard record.manifest.identity.work == request.work,
-                  record.manifest.identity.session == source.session,
-                  record.manifest.identity.sessionAttachment == source.sessionAttachment,
+                  record.manifest.identity.session == binding.session,
+                  record.manifest.identity.sessionAttachment == binding.sessionAttachment,
                   record.manifest.startIntent == intent,
                   startBodyMatches(request.value ?? "", record: record) else { return false }
             let run = record.manifest.identity.run
@@ -3167,8 +3373,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
         // remains recovery-required and must never call the ambient resolver again.
         guard let reservation = try await store.resolveStartReservation(
             work: source.registration.reservation.work,
-            session: source.registration.reservation.session,
-            sessionAttachment: source.registration.reservation.sessionAttachment,
+            session: binding.session,
+            sessionAttachment: binding.sessionAttachment,
             intent: intent), reservation.promptAssembly != nil else {
             return false
         }
@@ -3193,8 +3399,30 @@ public actor JournalBackedWorkService: WorkServiceClient {
             sequence: predecessor.event.sequence)
     }
 
+    private func latestFinishedRunBinding(
+        _ source: CanonicalSource, run: RunRef
+    ) -> WorkBinding? {
+        guard let event = source.workCache.latestRunFinishedEvent
+            ?? source.workRead.records.reversed().first(where: {
+                $0.event.type == TimelineEventType.runFinished && $0.event.run == run
+            })?.event,
+        event.type == TimelineEventType.runFinished,
+        event.run == run,
+        let session = event.session,
+        let sessionAttachment = event.sessionAttachment,
+        source.workState.sessionAttachments[sessionAttachment.attachmentID].map({
+            $0.session == session && $0.attachment == sessionAttachment
+        }) == true else {
+            return nil
+        }
+        return WorkBinding(
+            session: session, work: source.registration.reservation.work, workHost: host,
+            sessionAttachment: sessionAttachment)
+    }
+
     private func startAdmissionKey(
         work: WorkRef,
+        binding: WorkBinding,
         client: ClientRef,
         commandID: String,
         causalWorkCursor: JournalCursor,
@@ -3202,6 +3430,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
     ) -> StartAdmissionKey {
         StartAdmissionKey(
             work: work,
+            binding: binding,
             intent: WorkLaunchStartIntent(
                 client: client, commandID: commandID,
                 causalWorkCursor: causalWorkCursor,
@@ -3213,12 +3442,14 @@ public actor JournalBackedWorkService: WorkServiceClient {
     /// must be repaired only by the exact client-qualified Start retry. A completed prior Run
     /// remains the normal current selection after End, so its historical marker/terminal event
     /// explicitly excludes it from this classification.
-    private func hasUnstartedStartReservation(_ source: CanonicalSource) async throws -> Bool {
+    private func hasUnstartedStartReservation(
+        _ source: CanonicalSource, binding: WorkBinding
+    ) async throws -> Bool {
         guard let store = manifestStore else { return false }
         let selection = try await store.currentSelection(
             work: source.registration.reservation.work,
-            session: source.registration.reservation.session,
-            sessionAttachment: source.registration.reservation.sessionAttachment)
+            session: binding.session,
+            sessionAttachment: binding.sessionAttachment)
         if let selection {
             let run = selection.manifest.identity.run
             let hasStarted = source.workCache.runStartedIDs.contains(run.runID)
@@ -3227,8 +3458,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
         }
         return try await store.hasPendingStart(
             work: source.registration.reservation.work,
-            session: source.registration.reservation.session,
-            sessionAttachment: source.registration.reservation.sessionAttachment)
+            session: binding.session,
+            sessionAttachment: binding.sessionAttachment)
     }
 
     private func ensureLoaded() async throws {
@@ -3284,7 +3515,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 } else {
                     hasHostedConfiguration = false
                 }
-                let hasUnstartedStartReservation = try await self.hasUnstartedStartReservation(source)
+                let hasUnstartedStartReservation = try await self.hasUnstartedStartReservation(
+                    source, binding: primaryWorkBinding(source))
                 let canReconstructIdle = source.workState.lifecycle == .active
                     && source.workState.execution == .idle
                     && source.workState.activeRun == nil
@@ -3426,14 +3658,38 @@ public actor JournalBackedWorkService: WorkServiceClient {
 
     private func canonicalSource(
         work: WorkRef, journal: JournalRef,
-        registration: WorkHostControlWorkRegistration
+        registration: WorkHostControlWorkRegistration,
+        liveObservation: RunJournalBundleCanonicalObservation? = nil
     ) async throws -> CanonicalSource {
         guard journal == registration.workJournal,
               registration.reservation.work == work else { throw WorkServiceProtocolError.journalMismatch }
-        let workCache = try readJournal(journal, expectedURL: home.timelineV2WorkJournalURL(work))
-        let sessionCache = try readJournal(
-            registration.sessionJournal,
-            expectedURL: home.timelineV2SessionJournalURL(registration.reservation.session))
+        let activeObservation = try await liveObservationIfActive(
+            work: work, supplied: liveObservation)
+        let workCache: JournalReadCacheEntry
+        if let activeObservation {
+            guard activeObservation.workOnly.journal == journal else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            workCache = try journalCacheEntry(from: activeObservation.workOnly, work: work)
+        } else {
+            workCache = try readJournal(journal, expectedURL: home.timelineV2WorkJournalURL(work))
+        }
+        let sessionCache: JournalReadCacheEntry
+        if let activeObservation,
+           activeObservation.session.journal == registration.sessionJournal,
+           activeObservation.session.sessionSnapshot?.session == registration.reservation.session {
+            // The selected actor owns both journals for this binding.  Use the same
+            // actor-serialized read for the Session side too; an unlocked cold read here can
+            // observe the Work's run.started before the Session writer has flushed its mirror.
+            sessionCache = try journalCacheEntry(
+                from: activeObservation.session, work: work)
+        } else {
+            // An alternate active Session owns the Work while the creation Session is cold.
+            // It must never be substituted as the registered Session source.
+            sessionCache = try readJournal(
+                registration.sessionJournal,
+                expectedURL: home.timelineV2SessionJournalURL(registration.reservation.session))
+        }
         let workRead = workCache.result
         let sessionRead = sessionCache.result
         guard workRead.quarantinedSuffix == nil, workRead.truncatedTail == nil,
@@ -3467,6 +3723,115 @@ public actor JournalBackedWorkService: WorkServiceClient {
                                          eventID: sessionLast.eventID, sequence: sessionLast.sequence))
     }
 
+    /// Return a live Work observation only while its Hosted actor still owns open native writers.
+    /// An ended actor has released those locks and is intentionally allowed to use the existing
+    /// cold projection path. Any other live actor read failure is surfaced; it must never silently
+    /// downgrade to an unlocked service read while a Run is active.
+    private func liveObservationIfActive(
+        work: WorkRef,
+        supplied: RunJournalBundleCanonicalObservation?
+    ) async throws -> RunJournalBundleCanonicalObservation? {
+        if let supplied { return supplied }
+        guard let lookup = await registry.lookup(work), case .live(let entry) = lookup else {
+            return nil
+        }
+        let snapshot = await entry.hostedWork.snapshot()
+        if snapshot.lifecycle == .ended && snapshot.journalHealth == .closed {
+            return nil
+        }
+        return try await entry.hostedWork.canonicalObservation(
+            maximumResidentRecords: canonicalResidentRecordLimit)
+    }
+
+    private func journalCacheEntry(
+        from live: TimelineJournalCanonicalRead,
+        work: WorkRef
+    ) throws -> JournalReadCacheEntry {
+        let records = live.records
+        guard live.fileFingerprint.byteCount == live.source.sourceByteCount,
+              live.pagePrefixSeed == prefixSeed(for: live.journal),
+              live.sparseIndex.first?.sequence == 1,
+              live.sparseIndex.last.map({ $0.sequence <= live.eventCount }) == true else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let result = TimelineJournalReadResult(records: records)
+        let sequenceToIndex = Dictionary(uniqueKeysWithValues: records.enumerated().map {
+            ($0.element.event.sequence, $0.offset)
+        })
+        let references = records.reduce(into: Set<TimelineBodyReference>()) { refs, record in
+            refs.formUnion(collectBodyReferences(in: record.event.payload))
+        }
+        let artifacts = records.compactMap {
+            artifactDescriptor(from: $0.event, work: work)
+        }
+        let fingerprint = JournalFileFingerprint(
+            identity: JournalFileIdentity(
+                device: live.fileFingerprint.device, inode: live.fileFingerprint.inode,
+                mode: live.fileFingerprint.mode),
+            byteCount: live.fileFingerprint.byteCount,
+            modificationSeconds: live.fileFingerprint.modificationSeconds,
+            modificationNanoseconds: live.fileFingerprint.modificationNanoseconds,
+            changeSeconds: live.fileFingerprint.changeSeconds,
+            changeNanoseconds: live.fileFingerprint.changeNanoseconds,
+            lastByte: live.fileFingerprint.lastByte,
+            prefixEvidence: live.fileFingerprint.prefixEvidence)
+        let last = TimelineJournalRecord(
+            event: live.lastEvent.event, rawLineBytes: Data(),
+            byteStart: live.lastEvent.byteStart, byteEnd: live.lastEvent.byteEnd)
+        let penultimate = live.penultimateEvent.map {
+            TimelineJournalRecord(event: $0.event, rawLineBytes: Data(),
+                                  byteStart: $0.byteStart, byteEnd: $0.byteEnd)
+        }
+        // Live canonical observations use the projection store's raw 64-hex seed, while the
+        // service's page protocol uses its namespaced `sha256:` digest chain. Normalize the
+        // live seed before retaining the entry so the first page's base token and every
+        // subsequent token have one wire representation. If the live observation is resident,
+        // rebuild the bounded service chain over its retained records; a nonresident live read
+        // takes the streaming path and will rebuild the chain while serving a page.
+        let prefixSeed = live.pagePrefixSeed
+        let prefixDigest = live.pagePrefixDigest
+        let sparseIndex = live.sparseIndex.map {
+            JournalRecordIndex(
+                eventID: $0.eventID, sequence: $0.sequence,
+                byteStart: $0.byteStart, byteEnd: $0.byteEnd,
+                previousEventID: $0.previousEventID,
+                prefixDigestBefore: $0.prefixDigestBefore,
+                prefixDigest: $0.prefixDigest)
+        }
+        if live.isFullyResident {
+            var recomputed = prefixSeed
+            for record in records {
+                recomputed = try advancePrefixDigest(recomputed, event: record.event)
+            }
+            guard records.count == live.eventCount, recomputed == prefixDigest else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+        } else {
+            guard records.isEmpty else { throw WorkServiceProtocolError.sourceIncomplete }
+        }
+        let (nextSequence, overflow) = live.lastEvent.event.sequence.addingReportingOverflow(1)
+        guard !overflow else { throw WorkServiceProtocolError.sourceIncomplete }
+        return JournalReadCacheEntry(
+            fingerprint: fingerprint, result: result, prefixRecords: live.prefixRecords,
+            workSnapshot: live.workSnapshot, sessionSnapshot: live.sessionSnapshot,
+            sequenceToIndex: sequenceToIndex, sparseIndex: sparseIndex,
+            recordCount: live.eventCount,
+            lastRecord: last, penultimateRecord: penultimate,
+            terminalLineDigest: live.terminalLineDigest,
+            prefixSeed: prefixSeed, prefixDigest: prefixDigest,
+            nextSequence: nextSequence,
+            previousEventID: live.lastEvent.event.eventID,
+            isFullyResident: live.isFullyResident,
+            latestRunStarted: live.latestRunStarted,
+            latestRunFinished: live.latestRunFinished,
+            latestRunFinishedEvent: live.latestRunFinishedEvent,
+            runStartedIDs: live.runStartedIDs, runFinishedIDs: live.runFinishedIDs,
+            runFinishedExists: !live.runFinishedIDs.isEmpty,
+            artifactDescriptors: artifacts, bodyReferences: references,
+            bodyReferenceCount: references.count,
+            bodyReferencesComplete: live.isFullyResident)
+    }
+
     private func requireCanonical(work: WorkRef, journal: JournalRef) async throws -> CanonicalSource {
         let control = try await controlSnapshot()
         guard let creation = control.creations.values.first(where: {
@@ -3474,13 +3839,21 @@ public actor JournalBackedWorkService: WorkServiceClient {
         }), creation.registration != nil else {
             throw WorkServiceProtocolError.workNotFound(work)
         }
+        let liveObservation = try await liveObservationIfActive(work: work, supplied: nil)
         let verified = await controlJournal.verifiedCreationProjection(
-            client: creation.reservation.client, commandID: creation.reservation.command.commandID)
+            client: creation.reservation.client, commandID: creation.reservation.command.commandID,
+            canonicalWork: liveObservation?.workOnly, canonicalSession: liveObservation?.session)
+        // A live actor may own the Work through an alternate canonical Session while the
+        // Session recorded by creation is only available through the cold reader. The control
+        // verifier must still prove both the live Work and the exact registered Session prefix;
+        // a Work-only result is never sufficient for a canonical service operation.
         guard verified.verification.isVerified,
               let verifiedRegistration = verified.projection?.registration else {
             throw WorkServiceProtocolError.sourceIncomplete
         }
-        return try await canonicalSource(work: work, journal: journal, registration: verifiedRegistration)
+        return try await canonicalSource(
+            work: work, journal: journal, registration: verifiedRegistration,
+            liveObservation: liveObservation)
     }
 
     private func controlSnapshot() async throws -> WorkHostControlSnapshot { try await controlJournal.snapshot() }
@@ -3499,8 +3872,13 @@ public actor JournalBackedWorkService: WorkServiceClient {
     }
 
     private func descriptor(for work: WorkRef, client: ClientRef) async throws -> WorkServiceWorkDescriptor {
-        let source = try await requireCanonical(
-            work: work, journal: JournalRef.work(work))
+        let source: CanonicalSource
+        do {
+            source = try await requireCanonical(
+                work: work, journal: JournalRef.work(work))
+        } catch {
+            throw error
+        }
         let lookup = await registry.lookup(work)
         let recorded: WorkServiceRecordedDisposition
         switch source.workState.lifecycle {
@@ -3539,8 +3917,11 @@ public actor JournalBackedWorkService: WorkServiceClient {
             case .live(let entry):
                 let hosted = await entry.hostedWork.snapshot()
                 let exactBinding = hosted.identity.work == source.registration.reservation.work
-                    && hosted.identity.sessionID == source.session.sessionID
-                    && hosted.sessionAttachment == source.sessionAttachment
+                    && (source.workState.activeRun == nil
+                        || (hosted.identity.sessionID
+                                == source.workState.activeRunSession?.sessionID
+                            && hosted.sessionAttachment
+                                == source.workState.activeRunSessionAttachment))
                 let exactRun = source.workState.activeRun.map {
                     hosted.identity.runID == $0.runID
                 } ?? [.prepared, .idle, .ended].contains(hosted.lifecycle)
@@ -3568,11 +3949,13 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 } else if source.workState.execution != .unknown {
                     execution = .recoveryRequired
                 }
-                observation = WorkServiceHostObservation(
+                observation = try WorkServiceHostObservation(
                     instance: entry.hostInstance,
                     reachability: hosted.runtimeState == .connected
                         && hosted.journalHealth == .healthy ? .observedReachable : .recovering,
                     currentRun: source.workState.activeRun,
+                    currentRunSession: source.workState.activeRunSession,
+                    currentRunSessionAttachment: source.workState.activeRunSessionAttachment,
                     servedCursor: source.workCursor,
                     sourceCompleteness: .complete)
             case .recovering(let fact):
@@ -3580,9 +3963,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 // durable run.started record does not turn this descriptor into `running` or
                 // leave an otherwise idle projection actionable.
                 if execution != .unknown { execution = .recoveryRequired }
-                observation = WorkServiceHostObservation(
+                observation = try WorkServiceHostObservation(
                     instance: fact.hostInstance ?? hostInstance, reachability: .recovering,
-                    currentRun: source.workState.activeRun, servedCursor: source.workCursor,
+                    currentRun: source.workState.activeRun,
+                    currentRunSession: source.workState.activeRunSession,
+                    currentRunSessionAttachment: source.workState.activeRunSessionAttachment,
+                    servedCursor: source.workCursor,
                     sourceCompleteness: .complete)
             case .historical:
                 // Historical is a durable terminal/retired registry fact, not liveness. An idle
@@ -3599,7 +3985,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
         }
         // A durable pre-marker Start selection has no activeRun in the Work reducer yet, but it
         // is still an unfinished admission. Only its exact Start retry may cross the opener.
-        let hasUnstartedReservation = try await hasUnstartedStartReservation(source)
+        let hasUnstartedReservation = try await hasUnstartedStartReservation(
+            source, binding: primaryWorkBinding(source))
         if execution == .idle && hasUnstartedReservation {
             execution = .recoveryRequired
         }
@@ -3629,9 +4016,11 @@ public actor JournalBackedWorkService: WorkServiceClient {
             // descriptor after restart.  Do not substitute the resolved runtime route here.
             throw WorkServiceProtocolError.sourceIncomplete
         }
-        return WorkServiceWorkDescriptor(
+        return try WorkServiceWorkDescriptor(
             work: work, journal: source.workJournal, recordedDisposition: recorded,
             execution: execution, currentRun: source.workState.activeRun,
+            currentRunSession: source.workState.activeRunSession,
+            currentRunSessionAttachment: source.workState.activeRunSessionAttachment,
             configuration: WorkServiceWorkConfiguration(
                 providerID: config.providerID, modelID: config.modelID,
                 thinkingLevel: config.thinkingLevel, contextPolicy: config.contextPolicy,
@@ -3698,24 +4087,25 @@ public actor JournalBackedWorkService: WorkServiceClient {
             let session = try readJournal(
                 publication.sessionCreatedEvent.journal,
                 expectedURL: home.timelineV2SessionJournalURL(creation.reservation.session))
+            let sessionRecords = session.result.records.isEmpty
+                ? session.prefixRecords : session.result.records
             let advancedCause: EventRef?
             if publication.publication == "mirrored" {
                 advancedCause = publication.workMirrorEvent
             } else {
-                advancedCause = source.workRead.records
-                    .last
+                advancedCause = source.workCache.lastRecord
                     .map { EventRef(journal: source.workJournal, eventID: $0.event.eventID) }
             }
             guard session.result.quarantinedSuffix == nil,
                   session.result.truncatedTail == nil,
-                  session.result.records.count == 3,
-                  let created = session.result.records.first(where: {
+                  sessionRecords.count >= 3,
+                  let created = sessionRecords.first(where: {
                       $0.event.eventID == publication.sessionCreatedEvent.eventID
                   }),
-                  let attached = session.result.records.first(where: {
+                  let attached = sessionRecords.first(where: {
                       $0.event.eventID == publication.sessionAttachedEvent.eventID
                   }),
-                  let advanced = session.result.records.first(where: {
+                  let advanced = sessionRecords.first(where: {
                       $0.event.eventID == publication.cursorAdvancedEvent.eventID
                   }),
                   attached.event.type == TimelineEventType.sessionAttached,
@@ -3746,19 +4136,16 @@ public actor JournalBackedWorkService: WorkServiceClient {
                   (advanced.event.payload["cursor"].flatMap {
                       decodeTimelineValue($0) as JournalCursor?
                   }) == publication.resultingWorkCursor,
-                  session.result.records.last?.event.eventID == publication.cursorAdvancedEvent.eventID,
-                  JournalCursor(
-                      journal: publication.sessionCursor.journal,
-                      eventID: publication.sessionCursor.eventID,
-                      sequence: publication.sessionCursor.sequence)
-                      == JournalCursor(journal: session.result.records.last!.event.journal,
-                                       eventID: session.result.records.last!.event.eventID,
-                                       sequence: session.result.records.last!.event.sequence) else {
+                  publication.sessionCursor == JournalCursor(
+                      journal: advanced.event.journal,
+                      eventID: advanced.event.eventID,
+                      sequence: advanced.event.sequence),
+                  sessionRecords[2].event.eventID == publication.cursorAdvancedEvent.eventID else {
                 throw WorkServiceProtocolError.sourceIncomplete
             }
             if publication.publication == "mirrored" {
                 guard let mirror = publication.workMirrorEvent,
-                      source.workRead.records.contains(where: {
+                      source.boundedWorkRecords.contains(where: {
                           $0.event.eventID == mirror.eventID
                               && $0.event.type == TimelineEventType.sessionAttached
                               && $0.event.session == creation.reservation.session
@@ -3771,12 +4158,14 @@ public actor JournalBackedWorkService: WorkServiceClient {
                                   eventID: $0.event.eventID,
                                   sequence: $0.event.sequence)
                                   == publication.resultingWorkCursor
-                      }) else { throw WorkServiceProtocolError.sourceIncomplete }
+                      }) else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
             } else {
                 guard publication.workMirrorEvent == nil,
                       publication.resultingWorkCursor == publication.causalWorkCursor,
                       source.workCursor == publication.causalWorkCursor,
-                      let terminalEvent = source.workRead.records.last,
+                      let terminalEvent = source.workCache.lastRecord,
                       [TimelineEventType.workCompleted, TimelineEventType.workDestroyed,
                        TimelineEventType.workFailed].contains(terminalEvent.event.type),
                       JournalCursor(
@@ -3785,26 +4174,52 @@ public actor JournalBackedWorkService: WorkServiceClient {
                           sequence: terminalEvent.event.sequence)
                           == publication.causalWorkCursor,
                       let terminal = advanced.event.causedByEventID,
-                      source.workRead.records.contains(where: {
-                          EventRef(journal: source.workJournal, eventID: $0.event.eventID) == terminal
-                      }) else {
+                      EventRef(
+                          journal: source.workJournal,
+                          eventID: terminalEvent.event.eventID) == terminal else {
                     throw WorkServiceProtocolError.sourceIncomplete
                 }
             }
-            guard let recorded = control.clientAttachments[
-                creation.reservation.clientAttachment.attachmentID],
-                  recorded.attachment == creation.reservation.clientAttachment,
-                  recorded.client == creation.reservation.client,
-                  recorded.work == work,
-                  recorded.workJournal == source.workJournal,
-                  recorded.session == creation.reservation.session,
-                  recorded.sessionJournal == creation.reservation.sessionJournal,
-                  recorded.sessionAttachment == creation.reservation.sessionAttachment,
-                  recorded.capabilities == Set(publication.capabilities),
-                  recorded.attachedEvent == publication.resultEvent else {
-                throw WorkServiceProtocolError.sourceIncomplete
+            // The control attachment row is mutable relationship state: an explicit capability
+            // update changes its current grant, and a detach may remove it from a transport's
+            // current view.  The completed Session publication itself is immutable source
+            // evidence.  Reconstruct the relationship from that evidence and preserve only the
+            // current attached/detached bit when the row is still present.  This keeps an exact
+            // historical create-session retry truthful after updateCapabilities or detach.
+            let recorded = control.clientAttachments[
+                creation.reservation.clientAttachment.attachmentID]
+            if let recorded {
+                guard recorded.attachment == creation.reservation.clientAttachment,
+                      recorded.client == creation.reservation.client,
+                      recorded.work == work,
+                      recorded.workJournal == source.workJournal,
+                      recorded.session == creation.reservation.session,
+                      recorded.sessionJournal == creation.reservation.sessionJournal,
+                      recorded.sessionAttachment == creation.reservation.sessionAttachment,
+                      recorded.attachedEvent == publication.resultEvent else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                result.append(WorkHostClientAttachmentSnapshot(
+                    attachment: recorded.attachment, client: recorded.client,
+                    work: recorded.work, workJournal: recorded.workJournal,
+                    session: recorded.session, sessionJournal: recorded.sessionJournal,
+                    sessionAttachment: recorded.sessionAttachment,
+                    capabilities: Set(publication.capabilities), isAttached: recorded.isAttached,
+                    attachedEvent: recorded.attachedEvent,
+                    detachedEvent: recorded.detachedEvent))
+            } else {
+                // A compacted/terminal historical control projection may omit the now-detached
+                // client row.  The immutable publication still proves the exact relationship;
+                // represent it as detached so no historical replay silently grants authority.
+                result.append(WorkHostClientAttachmentSnapshot(
+                    attachment: creation.reservation.clientAttachment,
+                    client: creation.reservation.client, work: work,
+                    workJournal: source.workJournal, session: creation.reservation.session,
+                    sessionJournal: creation.reservation.sessionJournal,
+                    sessionAttachment: creation.reservation.sessionAttachment,
+                    capabilities: Set(publication.capabilities), isAttached: false,
+                    attachedEvent: publication.resultEvent))
             }
-            result.append(recorded)
         }
         return result
     }
@@ -3813,14 +4228,14 @@ public actor JournalBackedWorkService: WorkServiceClient {
         for source: CanonicalSource, control: WorkHostControlSnapshot
     ) async throws -> [WorkServiceSessionAttachmentDescriptor] {
         var relationships: [WorkServiceSessionAttachmentDescriptor] = []
-        let primaryAttached = source.sessionRead.records.first {
+        let primaryAttached = source.boundedSessionRecords.first {
             let event = $0.event
             return event.type == TimelineEventType.sessionAttached
                 && event.session == source.session && event.work == source.registration.reservation.work
                 && event.sessionAttachment == source.sessionAttachment
         }
         let primaryMirror = primaryAttached.flatMap { attached in
-            source.workRead.records.filter {
+            source.boundedWorkRecords.filter {
                 let event = $0.event
                 return event.type == TimelineEventType.sessionAttached
                     && event.session == source.session
@@ -3831,7 +4246,9 @@ public actor JournalBackedWorkService: WorkServiceClient {
             }.first
         }
         if let attached = primaryAttached, let mirror = primaryMirror {
-            let prior = source.workRead.records.last(where: { $0.event.sequence < mirror.event.sequence })
+            let prior = source.boundedWorkRecords.last(where: {
+                $0.event.sequence < mirror.event.sequence
+            })
                 .map { JournalCursor(journal: source.workJournal,
                                       eventID: $0.event.eventID, sequence: $0.event.sequence) }
                 ?? JournalCursor(journal: source.workJournal, sequence: 0)
@@ -3892,7 +4309,6 @@ public actor JournalBackedWorkService: WorkServiceClient {
               value.session == reservation.session,
               value.sessionJournal == reservation.sessionJournal,
               value.sessionAttachment == reservation.sessionAttachment,
-              value.capabilities == Set(result.capabilities),
               value.isAttached,
               value.attachedEvent == result.resultEvent else {
             throw WorkServiceProtocolError.sourceIncomplete
@@ -3954,6 +4370,67 @@ public actor JournalBackedWorkService: WorkServiceClient {
             throw WorkServiceProtocolError.capabilityDenied(capability)
         }
         return result
+    }
+
+    /// Convert the authenticated client attachment into the exact canonical Work binding. The
+    /// control registration's reservation is only the creation provenance; it is never a command
+    /// identity or a substitute for the Session selected by this caller.
+    private func callerWorkBinding(
+        _ attachment: WorkServiceClientAttachment,
+        source: CanonicalSource,
+        work: WorkRef
+    ) throws -> WorkBinding {
+        guard let session = attachment.session,
+              let sessionJournal = attachment.sessionJournal,
+              let sessionAttachment = attachment.sessionAttachment,
+              sessionJournal == WorkBinding(
+                session: session, work: work, workHost: host,
+                sessionAttachment: sessionAttachment).sessionJournal,
+              let relationship = source.workState.sessionAttachments[
+                sessionAttachment.attachmentID],
+              relationship.attachment == sessionAttachment,
+              relationship.session == session,
+              relationship.isAttached else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
+        return WorkBinding(
+            session: session, work: work, workHost: host,
+            sessionAttachment: sessionAttachment)
+    }
+
+    /// Reject only a clearly foreign live actor before the canonical source read. The control
+    /// attachment is authenticated by ``requireAttached``; the Hosted snapshot contributes the
+    /// live actor's exact Session/attachment identity. This helper intentionally has no positive
+    /// authorization result: callers whose identity matches, whose actor is absent, or whose
+    /// actor has ended still require the normal canonical Work/Session verification.
+    private func rejectCrossSessionLiveOwner(
+        work: WorkRef,
+        attachment: WorkServiceClientAttachment
+    ) async throws {
+        guard let session = attachment.session,
+              let sessionJournal = attachment.sessionJournal,
+              let sessionAttachment = attachment.sessionAttachment,
+              sessionJournal.owner == .session(session),
+              sessionJournal.kind == .session,
+              sessionJournal.authority.authorityID == host.workHostID else {
+            return
+        }
+        guard let lookup = await registry.lookup(work), case .live(let entry) = lookup else {
+            return
+        }
+        let snapshot = await entry.hostedWork.snapshot()
+        guard snapshot.lifecycle != .ended else { return }
+        guard snapshot.identity.sessionID == session.sessionID,
+              snapshot.sessionAttachment == sessionAttachment else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "active Run belongs to a different Session attachment")
+        }
+    }
+
+    private func primaryWorkBinding(_ source: CanonicalSource) -> WorkBinding {
+        WorkBinding(
+            session: source.session, work: source.registration.reservation.work, workHost: host,
+            sessionAttachment: source.sessionAttachment)
     }
 
     private func validateTarget(_ target: WorkServiceReadTarget, source: CanonicalSource) throws {
@@ -4346,7 +4823,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 throw WorkServiceProtocolError.sourceIncomplete
             }
             let entry = JournalReadCacheEntry(
-                fingerprint: after, result: scan.result,
+                fingerprint: after, result: scan.result, prefixRecords: scan.prefixRecords,
                 workSnapshot: scan.workSnapshot, sessionSnapshot: scan.sessionSnapshot,
                 sequenceToIndex: scan.sequenceToIndex,
                 sparseIndex: scan.sparseIndex, recordCount: scan.recordCount,
@@ -4357,6 +4834,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 isFullyResident: scan.isFullyResident,
                 latestRunStarted: scan.latestRunStarted,
                 latestRunFinished: scan.latestRunFinished,
+                latestRunFinishedEvent: scan.latestRunFinishedEvent,
                 runStartedIDs: scan.runStartedIDs, runFinishedIDs: scan.runFinishedIDs,
                 runFinishedExists: scan.runFinishedExists,
                 artifactDescriptors: scan.artifactDescriptors,
@@ -4395,6 +4873,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
 
     private struct JournalScanResult {
         let result: TimelineJournalReadResult
+        let prefixRecords: [TimelineJournalRecord]
         let workSnapshot: WorkSnapshot?
         let sessionSnapshot: SessionSnapshot?
         let sequenceToIndex: [Int: Int]
@@ -4410,6 +4889,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let isFullyResident: Bool
         let latestRunStarted: RunRef?
         let latestRunFinished: RunRef?
+        let latestRunFinishedEvent: TimelineEvent?
         let runStartedIDs: Set<String>
         let runFinishedIDs: Set<String>
         let runFinishedExists: Bool
@@ -4444,6 +4924,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         var isFullyResident = targetByteCount <= JournalReadLimits.maximumResidentBytes
             && previous?.isFullyResident != false
         var records = isFullyResident ? (previous?.result.records ?? []) : []
+        var prefixRecords = previous?.prefixRecords ?? []
         var sequenceToIndex = isFullyResident ? (previous?.sequenceToIndex ?? [:]) : [:]
         var sparseIndex = previous?.sparseIndex ?? []
         var recordCount = previous?.recordCount ?? 0
@@ -4467,6 +4948,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         }
         var latestRunStarted = previous?.latestRunStarted
         var latestRunFinished = previous?.latestRunFinished
+        var latestRunFinishedEvent = previous?.latestRunFinishedEvent
         var runStartedIDs = previous?.runStartedIDs ?? []
         var runFinishedIDs = previous?.runFinishedIDs ?? []
         var runFinishedExists = previous?.runFinishedExists ?? false
@@ -4495,6 +4977,9 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 let compact = TimelineJournalRecord(
                     event: record.event, rawLineBytes: Data(), byteStart: record.byteStart,
                     byteEnd: record.byteEnd, legacyRawID: record.legacyRawID)
+                if prefixRecords.count < JournalReadLimits.sparseStride {
+                    prefixRecords.append(compact)
+                }
                 let priorRecord = lastRecord
                 penultimateRecord = lastRecord
                 lastRecord = compact
@@ -4511,6 +4996,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
                     runFinishedExists = true
                     if let run = record.event.run {
                         latestRunFinished = run
+                        latestRunFinishedEvent = record.event
                         runFinishedIDs.insert(run.runID)
                     }
                 }
@@ -4579,6 +5065,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         }
         return JournalScanResult(
             result: TimelineJournalReadResult(records: isFullyResident ? records : []),
+            prefixRecords: prefixRecords,
             workSnapshot: workReducer?.snapshot,
             sessionSnapshot: sessionReducer?.snapshot,
             sequenceToIndex: sequenceToIndex, sparseIndex: sparseIndex,
@@ -4588,6 +5075,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
             prefixDigest: currentPrefixDigest, nextSequence: nextSequence,
             previousEventID: previousEventID, isFullyResident: isFullyResident,
             latestRunStarted: latestRunStarted, latestRunFinished: latestRunFinished,
+            latestRunFinishedEvent: latestRunFinishedEvent,
             runStartedIDs: runStartedIDs, runFinishedIDs: runFinishedIDs,
             runFinishedExists: runFinishedExists,
             artifactDescriptors: artifactDescriptors, bodyReferences: cachedBodyReferences,
@@ -4627,16 +5115,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
         digest(Data("aviary-prefix-v1\u{0}seed\u{0}\(journal.stableKey)".utf8))
     }
 
-    private func canonicalEventLine(_ event: TimelineEvent) throws -> Data {
-        let encoder = JSONEncoder()
-        // Prefix tokens cross requests and process lifetimes. Dictionary iteration order must not
-        // make the same canonical event produce a different checkpoint digest on a later read.
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        return try encoder.encode(event) + Data([UInt8(ascii: "\n")])
-    }
-
     private func advancePrefixDigest(_ prefix: String, event: TimelineEvent) throws -> String {
-        let lineDigest = digest(try canonicalEventLine(event))
+        let lineDigest = try DisposableTimelineProjectionStore.canonicalEventLineDigest(event)
         var material = Data("aviary-prefix-v1\u{0}".utf8)
         material.append(Data(prefix.utf8))
         material.append(0)

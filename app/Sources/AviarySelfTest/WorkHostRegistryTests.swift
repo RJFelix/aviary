@@ -493,15 +493,44 @@ func test_workHostRegistryRequiresCanonicalProofAndSerializesReleaseRace() async
     }
     XCTAssertEqual(await registry.liveCount, 1)
 
-    // An ended Run leaves its Work reusable. Rotate the actor against the exact same durable
-    // Session/attachment, changing only the Run generation, and keep the logical Work slot live.
+    // An ended Run leaves its Work reusable. Rotate the actor against a different canonical
+    // Session/attachment, changing both ownership and Run generation while keeping the logical
+    // Work slot live.
     let oldActorID = ObjectIdentifier(work)
     let replacementHost = try XCTUnwrap(makeHost(.reference))
     let replacementBinding = WorkBinding(
-        session: SessionRef(ended.identity.sessionID),
+        session: SessionRef("registry-race-replacement-session"),
         work: ended.identity.work,
         workHost: try home.requirePersistedWorkHost(),
-        sessionAttachment: ended.sessionAttachment)
+        sessionAttachment: SessionAttachmentRef("registry-race-replacement-attachment"))
+    let replacementCausalCursor = try XCTUnwrap(ended.latestWorkCursor)
+    let replacementSessionJournal = JournalRef.session(
+        replacementBinding.session,
+        authority: TimelineAuthorityRef(replacementBinding.workHost.workHostID))
+    let replacementClient = ClientRef("registry-replacement-client")
+    let replacementCommand = CommandRef(
+        commandID: "registry-race-publish-replacement-session",
+        client: replacementClient,
+        sessionAttachment: replacementBinding.sessionAttachment,
+        causalCursor: replacementCausalCursor)
+    let replacementPublication = try await RunJournalBundle.publishSessionAttachment(
+        home: home,
+        request: RunJournalBundleSessionPublicationRequest(
+            work: replacementBinding.work,
+            workHost: replacementBinding.workHost,
+            workJournal: replacementCausalCursor.journal,
+            session: replacementBinding.session,
+            sessionJournal: replacementSessionJournal,
+            sessionAttachment: replacementBinding.sessionAttachment,
+            client: replacementClient,
+            command: replacementCommand,
+            capabilities: ["observe", "control", "start", "end"],
+            causalWorkCursor: replacementCausalCursor),
+        actorID: "registry-replacement-session-publisher")
+    XCTAssertEqual(replacementPublication.session, replacementBinding.session)
+    XCTAssertEqual(
+        replacementPublication.sessionAttachment,
+        replacementBinding.sessionAttachment)
     let replacementConfiguration = HostedInHouseWorkConfiguration(
         home: home,
         cwd: "/tmp",
@@ -514,13 +543,15 @@ func test_workHostRegistryRequiresCanonicalProofAndSerializesReleaseRace() async
         actorKind: "registry-test-replacement",
         systemPrompt: "Registry replacement agent.",
         maxIterations: 1,
-        projectionMode: .reopenHistorical)
+        projectionMode: .fresh,
+        modelContextMode: .launchFresh)
     let replacementEntry = try await registry.replace(
         work.identity.work, configuration: replacementConfiguration)
     let activeWork = replacementEntry.hostedWork
     XCTAssertNotEqual(ObjectIdentifier(activeWork), oldActorID)
     XCTAssertEqual(activeWork.identity.work, work.identity.work)
-    XCTAssertEqual(activeWork.identity.sessionID, ended.identity.sessionID)
+    XCTAssertEqual(activeWork.identity.sessionID, replacementBinding.session.sessionID)
+    XCTAssertEqual(activeWork.sessionAttachment, replacementBinding.sessionAttachment)
     XCTAssertEqual(activeWork.identity.runID, "registry-race-replacement-run")
     XCTAssertEqual(await registry.liveCount, 1)
 

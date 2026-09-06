@@ -252,6 +252,22 @@ func test_workServiceColdSeedRetainsCanonicalActiveRunSessionProvenance() async 
     let secondaryAttachment = SessionAttachmentRef("cold-secondary-attachment")
     let run = RunRef("cold-secondary-run")
     let actor = TimelineActor(actorID: "cold-host", kind: "self-test")
+    let sessionJournal = JournalRef.session(
+        secondarySession, authority: TimelineAuthorityRef(host.workHostID))
+    let sessionCreated = TimelineEvent(
+        eventID: "cold-session-1", journal: sessionJournal, sequence: 1,
+        session: secondarySession, actor: actor,
+        hostRecordedAt: Date(timeIntervalSince1970: 1),
+        type: TimelineEventType.sessionCreated)
+    let sessionAttached = TimelineEvent(
+        eventID: "cold-session-2", journal: sessionJournal, sequence: 2,
+        previousEventID: sessionCreated.eventID,
+        causedByEventID: EventRef(journal: sessionJournal, eventID: sessionCreated.eventID),
+        session: secondarySession, work: work, workHost: host,
+        sessionAttachment: secondaryAttachment, actor: actor,
+        hostRecordedAt: Date(timeIntervalSince1970: 2),
+        type: TimelineEventType.sessionAttached,
+        payload: .object(["capabilities": .array([.string("observe")])]))
     let events = [
         TimelineEvent(
             eventID: "cold-work-1", journal: journal, sequence: 1,
@@ -260,10 +276,13 @@ func test_workServiceColdSeedRetainsCanonicalActiveRunSessionProvenance() async 
             type: TimelineEventType.workCreated),
         TimelineEvent(
             eventID: "cold-work-2", journal: journal, sequence: 2,
-            previousEventID: "cold-work-1", session: secondarySession,
+            previousEventID: "cold-work-1",
+            causedByEventID: EventRef(journal: sessionJournal, eventID: sessionAttached.eventID),
+            session: secondarySession,
             work: work, workHost: host, sessionAttachment: secondaryAttachment,
             actor: actor, hostRecordedAt: Date(timeIntervalSince1970: 2),
-            type: TimelineEventType.sessionAttached),
+            type: TimelineEventType.sessionAttached,
+            payload: .object(["capabilities": .array([.string("observe")])])),
         TimelineEvent(
             eventID: "cold-work-3", journal: journal, sequence: 3,
             previousEventID: "cold-work-2", session: secondarySession,
@@ -272,6 +291,19 @@ func test_workServiceColdSeedRetainsCanonicalActiveRunSessionProvenance() async 
             type: TimelineEventType.runStarted,
             payload: .object(["model_id": .string("cold-model")]))
     ]
+    let sessionAdvanced = TimelineEvent(
+        eventID: "cold-session-3", journal: sessionJournal, sequence: 3,
+        previousEventID: sessionAttached.eventID,
+        causedByEventID: EventRef(journal: journal, eventID: "cold-work-2"),
+        session: secondarySession, work: work, workHost: host,
+        sessionAttachment: secondaryAttachment, actor: actor,
+        hostRecordedAt: Date(timeIntervalSince1970: 3),
+        type: TimelineEventType.sessionAttachmentCursorAdvanced,
+        payload: .object([
+            "capabilities": .array([.string("observe")]),
+            "cursor": createSessionJSON(
+                JournalCursor(journal: journal, eventID: "cold-work-2", sequence: 2)),
+        ]))
     let client = ClientRef("cold-run-reader")
     let service = InMemoryWorkService(
         host: host,
@@ -279,10 +311,62 @@ func test_workServiceColdSeedRetainsCanonicalActiveRunSessionProvenance() async 
     try await service.register(.init(
         work: work, journal: journal, execution: .running, currentRun: run,
         cursor: JournalCursor(journal: journal, eventID: "cold-work-3", sequence: 3),
-        session: primarySession,
-        sessionJournal: .session(
-            primarySession, authority: TimelineAuthorityRef(host.workHostID)),
-        sessionAttachment: primaryAttachment, events: events))
+        session: secondarySession, sessionJournal: sessionJournal,
+        sessionAttachment: secondaryAttachment,
+        sessionCursor: JournalCursor(
+            journal: sessionJournal, eventID: sessionAdvanced.eventID, sequence: 3),
+        events: events, sessionEvents: [sessionCreated, sessionAttached, sessionAdvanced]))
+    let immediatelyDescribed = try await service.describeWork(.init(
+        work: work, journal: journal, client: client))
+    XCTAssertEqual(immediatelyDescribed.currentRun, run)
+    XCTAssertEqual(immediatelyDescribed.currentRunSession, secondarySession)
+    XCTAssertEqual(immediatelyDescribed.currentRunSessionAttachment, secondaryAttachment)
+    XCTAssertEqual(immediatelyDescribed.sessionAttachments.count, 1)
+    XCTAssertEqual(immediatelyDescribed.sessionAttachments.first?.session, secondarySession)
+    XCTAssertEqual(immediatelyDescribed.sessionAttachments.first?.resultingWorkCursor,
+                   JournalCursor(journal: journal, eventID: "cold-work-2", sequence: 2))
+
+    let missingReciprocal = InMemoryWorkService(
+        host: host, authorizer: WorkServiceCapabilityPolicy(
+            grantsByClient: [client: [.observe]]))
+    do {
+        try await missingReciprocal.register(.init(
+            work: work, journal: journal, execution: .running, currentRun: run,
+            cursor: JournalCursor(journal: journal, eventID: "cold-work-3", sequence: 3),
+            session: secondarySession, sessionJournal: sessionJournal,
+            sessionAttachment: secondaryAttachment,
+            events: events))
+        XCTFail("an active seed without reciprocal Session evidence must be rejected")
+    } catch WorkServiceProtocolError.invalidRequest(let diagnostic) {
+        XCTAssertTrue(diagnostic.contains("reciprocal Session evidence"))
+    }
+    XCTAssertTrue(try await missingReciprocal.listWorks(.init(client: client)).works.isEmpty)
+
+    let tamperedAttached = TimelineEvent(
+        eventID: sessionAttached.eventID, journal: sessionJournal, sequence: 2,
+        previousEventID: sessionCreated.eventID,
+        causedByEventID: EventRef(journal: sessionJournal, eventID: "not-session-created"),
+        session: secondarySession, work: work, workHost: host,
+        sessionAttachment: secondaryAttachment, actor: actor,
+        hostRecordedAt: Date(timeIntervalSince1970: 2),
+        type: TimelineEventType.sessionAttached,
+        payload: .object(["capabilities": .array([.string("observe")])]))
+    let tamperedReciprocal = InMemoryWorkService(
+        host: host, authorizer: WorkServiceCapabilityPolicy(
+            grantsByClient: [client: [.observe]]))
+    do {
+        try await tamperedReciprocal.register(.init(
+            work: work, journal: journal, execution: .running, currentRun: run,
+            cursor: JournalCursor(journal: journal, eventID: "cold-work-3", sequence: 3),
+            session: secondarySession, sessionJournal: sessionJournal,
+            sessionAttachment: secondaryAttachment, sessionCursor: JournalCursor(
+                journal: sessionJournal, eventID: sessionAdvanced.eventID, sequence: 3),
+            events: events, sessionEvents: [sessionCreated, tamperedAttached, sessionAdvanced]))
+        XCTFail("tampered reciprocal Session evidence must be rejected")
+    } catch WorkServiceProtocolError.invalidRequest(let diagnostic) {
+        XCTAssertTrue(diagnostic.contains("reciprocal Session evidence"))
+    }
+    XCTAssertTrue(try await tamperedReciprocal.listWorks(.init(client: client)).works.isEmpty)
     try await service.finishRun(run, for: work)
     let attached = try await service.attach(.init(
         work: work, journal: journal, client: client, commandID: "cold-run-observe",

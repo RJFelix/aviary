@@ -137,7 +137,8 @@ private func startWithRetainedAssembly(
     expectedPrevious: WorkLaunchManifestGeneration? = nil
 ) throws -> WorkLaunchManifestRecord {
     let admission = try fixture.store.reserveStart(
-        template, run: run, startIntent: intent, expectedPrevious: expectedPrevious,
+        template, binding: fixture.binding.workBinding, run: run, startIntent: intent,
+        expectedPrevious: expectedPrevious,
         initialInputBodyReference: fixture.bodyReference)
     let reservation: WorkLaunchStartReservation
     switch admission {
@@ -147,7 +148,8 @@ private func startWithRetainedAssembly(
     let prepared = try fixture.store.prepareStart(
         reservation, promptAssembly: fixture.promptAssembly)
     return try fixture.store.start(
-        template, run: prepared.run, startIntent: prepared.intent,
+        template, binding: fixture.binding.workBinding,
+        run: prepared.run, startIntent: prepared.intent,
         expectedPrevious: prepared.expectedPrevious,
         initialInputBodyReference: prepared.initialInputBodyReference,
         promptAssembly: try XCTUnwrap(prepared.promptAssembly))
@@ -157,7 +159,9 @@ private func retainStaleStartReservation(
     _ reservation: WorkLaunchStartReservation,
     store: WorkLaunchManifestStore
 ) throws {
-    let digest = bindingAddressDigest(reservation.binding)
+    // Start reservations are now the single Work-scoped admission fence. The selected
+    // Session/attachment remains payload, but all contenders must address one durable slot.
+    let digest = workAddressDigest(reservation.binding.work)
     let url = store.startReservationDirectory.appending(
         path: digest + ".json",
         directoryHint: .notDirectory)
@@ -167,10 +171,9 @@ private func retainStaleStartReservation(
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
 }
 
-private func bindingAddressDigest(_ binding: WorkBinding) -> String {
+private func workAddressDigest(_ work: WorkRef) -> String {
     let material = [
-        "binding", binding.work.workHostID, binding.work.workID,
-        binding.session.sessionID, binding.sessionAttachment.attachmentID,
+        "work", work.workHostID, work.workID,
     ].map { "\($0.utf8.count):\($0)" }.joined(separator: "\u{0}")
     return "sha256:" + AviarySHA256.hash(data: Data(material.utf8))
         .map { String(format: "%02x", $0) }.joined()
@@ -198,7 +201,7 @@ private func retainStalePendingPointer(
     let data = try JSONSerialization.data(
         withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
     let url = store.pendingPointerDirectory.appending(
-        path: bindingAddressDigest(binding) + ".json", directoryHint: .notDirectory)
+        path: workAddressDigest(binding.work) + ".json", directoryHint: .notDirectory)
     try data.write(to: url)
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
 }
@@ -262,6 +265,51 @@ func test_workLaunchManifestTwoStageBindingUsesReservedIdentity() throws {
     XCTAssertEqual(record.manifest.identity, fixture.identity)
     XCTAssertEqual(record.manifest.workRunBinding, fixture.binding)
     XCTAssertEqual(try fixture.store.read(fixture.identity), record)
+
+    // The current/pending admission fence is Work-scoped even though each Run payload retains
+    // its selected Session binding. A second attached Session can propose the next Run only
+    // after observing the predecessor selection, and a competing first reservation cannot create
+    // a second manifest under a separate Session-qualified path.
+    let alternateSession = SessionRef("alternate-\(fixture.session.sessionID)")
+    let alternateAttachment = SessionAttachmentRef("alternate-\(fixture.attachment.attachmentID)")
+    XCTAssertNotEqual(alternateSession, fixture.session)
+    XCTAssertNotEqual(alternateAttachment, fixture.attachment)
+    let alternateBinding = WorkBinding(
+        session: alternateSession, work: fixture.work, workHost: fixture.host,
+        sessionAttachment: alternateAttachment)
+    let alternateJournal = JournalRef.session(
+        alternateSession, authority: TimelineAuthorityRef(fixture.host.workHostID))
+    let alternateBodyReference = try ContextBodyStore(home: fixture.home).retain(
+        fixture.body, authority: alternateJournal, mediaType: "text/plain")
+    let alternateIntent = WorkLaunchStartIntent(
+        client: ClientRef("alternate-client"), commandID: "alternate-start",
+        causalWorkCursor: fixture.startIntent.causalWorkCursor,
+        bodyDigest: fixture.startIntent.bodyDigest)
+    let predecessorSelection = try XCTUnwrap(
+        try fixture.store.readCurrentSelection(for: fixture.binding.workBinding))
+    let alternateAdmission = try fixture.store.reserveStart(
+        template, binding: alternateBinding, run: RunRef("alternate-run"),
+        startIntent: alternateIntent,
+        expectedPrevious: predecessorSelection.selectionGeneration,
+        initialInputBodyReference: alternateBodyReference)
+    guard case .winner = alternateAdmission else {
+        XCTFail("alternate Session must win only the next Work-level reservation")
+        return
+    }
+    try expectWorkLaunchError({
+        _ = try fixture.store.reserveStart(
+            template, binding: fixture.binding.workBinding, run: RunRef("loser-run"),
+            startIntent: WorkLaunchStartIntent(
+                client: ClientRef("loser-client"), commandID: "loser-start",
+                causalWorkCursor: fixture.startIntent.causalWorkCursor,
+                bodyDigest: fixture.startIntent.bodyDigest),
+            expectedPrevious: predecessorSelection.selectionGeneration,
+            initialInputBodyReference: fixture.bodyReference)
+    }) {
+        if case .requestConflict = $0 { return true }
+        return false
+    }
+    XCTAssertTrue(try fixture.store.hasPendingStart(for: fixture.binding.workBinding))
 }
 
 func test_workLaunchManifestRetentionTemplateAndStartAreIdempotentAndCAS() throws {

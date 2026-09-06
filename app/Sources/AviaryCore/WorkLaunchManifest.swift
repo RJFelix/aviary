@@ -1305,22 +1305,25 @@ public struct WorkLaunchDraftRetentionRecord: Codable, Hashable, Sendable {
 /// what recovery looks up by Work; it deliberately carries no Run identity and cannot start an
 /// execution on its own.
 public struct WorkLaunchWorkTemplate: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
 
     public let schemaVersion: Int
-    public let binding: WorkBinding
+    public let work: WorkRef
+    public let workHost: WorkHostRef
     public let draft: WorkLaunchManifestDraft
     /// The keyed Create retention which produced this template.  A template without that
     /// durable request proof is not reconstructable and therefore cannot be published.
     public let retentionKey: WorkLaunchCreateKey
 
     public init(
-        binding: WorkBinding,
+        work: WorkRef,
+        workHost: WorkHostRef,
         draft: WorkLaunchManifestDraft,
         retentionKey: WorkLaunchCreateKey
     ) {
         self.schemaVersion = Self.currentSchemaVersion
-        self.binding = binding
+        self.work = work
+        self.workHost = workHost
         self.draft = draft
         self.retentionKey = retentionKey
     }
@@ -1375,7 +1378,8 @@ public struct WorkLaunchWorkTemplateRecord: Codable, Hashable, Sendable {
 
     public var digest: String { generation.digest }
     public var byteCount: Int { templateByteCount }
-    public var binding: WorkBinding { template.binding }
+    public var work: WorkRef { template.work }
+    public var workHost: WorkHostRef { template.workHost }
 }
 
 /// The exact client-qualified Start admission that creates one Run. Its cursor and body digest
@@ -1891,17 +1895,18 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
             directoryHint: .notDirectory)
     }
 
-    /// The current Run pointer is deliberately addressed by the Run-free reservation tuple.
-    /// Its payload names the Run, so a recovery reader never has to guess an unknown Run id.
+    /// The current Run pointer is addressed by Work, not by its selected Session. Its payload
+    /// carries the exact binding, so replacement Start admissions from another attached Session
+    /// still contend on one durable Work slot/CAS.
     public func bindingPointerURL(for binding: WorkBinding) -> URL {
         bindingPointerDirectory.appending(
-            path: WorkLaunchDurableIO.identityDigest(Self.addressMaterial(for: binding)) + ".json",
+            path: WorkLaunchDurableIO.identityDigest(Self.addressMaterial(for: binding.work)) + ".json",
             directoryHint: .notDirectory)
     }
 
     private func pendingPointerURL(for binding: WorkBinding) -> URL {
         pendingPointerDirectory.appending(
-            path: WorkLaunchDurableIO.identityDigest(Self.addressMaterial(for: binding)) + ".json",
+            path: WorkLaunchDurableIO.identityDigest(Self.addressMaterial(for: binding.work)) + ".json",
             directoryHint: .notDirectory)
     }
 
@@ -1923,7 +1928,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
 
     private func startReservationURL(for binding: WorkBinding) -> URL {
         startReservationDirectory.appending(
-            path: WorkLaunchDurableIO.identityDigest(Self.addressMaterial(for: binding)) + ".json",
+            path: WorkLaunchDurableIO.identityDigest(Self.addressMaterial(for: binding.work)) + ".json",
             directoryHint: .notDirectory)
     }
 
@@ -2189,7 +2194,8 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
             }
             try validateCreateRequestDigest(pointer.key, draft: durableDraft.draft)
             let template = WorkLaunchWorkTemplate(
-                binding: binding, draft: retained.draft.draft, retentionKey: retained.key)
+                work: binding.work, workHost: binding.workHost,
+                draft: retained.draft.draft, retentionKey: retained.key)
             return try saveTemplateLocked(template)
         }
     }
@@ -2221,8 +2227,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         _ template: WorkLaunchWorkTemplate, expected: WorkLaunchWorkTemplateGeneration
     ) throws -> WorkLaunchWorkTemplateRecord {
         try withPreparedStorage {
-            try validateBinding(template.binding)
-            guard let current = try readTemplatePointer(for: template.binding.work),
+            guard let current = try readTemplatePointer(for: template.work),
                   current == expected else {
                 throw WorkLaunchManifestStoreError.generationMismatch
             }
@@ -2242,7 +2247,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
     /// manifest. A retry of the same Run and Start returns the existing generation; a conflicting
     /// Start for that Run is rejected.
     internal func bind(
-        _ template: WorkLaunchWorkTemplateRecord, run: RunRef,
+        _ template: WorkLaunchWorkTemplateRecord, binding: WorkBinding, run: RunRef,
         startIntent: WorkLaunchStartIntent,
         expectedPrevious: WorkLaunchManifestGeneration? = nil,
         initialInputBodyReference: TimelineBodyReference? = nil,
@@ -2251,13 +2256,12 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
     ) throws -> WorkLaunchManifestRecord {
         try withPreparedStorage {
             let expectedAuthority = try home.requirePersistedWorkHostID()
-            try validateBinding(template.binding)
-            guard template.template.binding.work.workHostID == expectedAuthority else {
+            guard template.workHost.workHostID == expectedAuthority else {
                 throw WorkLaunchManifestStoreError.wrongAuthority(
                     expected: expectedAuthority,
-                    actual: template.template.binding.work.workHostID)
+                    actual: template.workHost.workHostID)
             }
-            guard let current = try readTemplatePointer(for: template.binding.work),
+            guard let current = try readTemplatePointer(for: template.work),
                   current == template.generation else {
                 throw WorkLaunchManifestStoreError.generationMismatch
             }
@@ -2270,8 +2274,12 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
             guard let promptAssembly else {
                 throw WorkLaunchManifestStoreError.invalidReference
             }
-            let binding = WorkRunBinding(workBinding: template.binding, run: run)
-            if let existing = try readStartLocked(for: template.binding, intent: startIntent) {
+            guard binding.work == template.work,
+                  binding.workHost == template.workHost else {
+                throw WorkLaunchManifestStoreError.identityMismatch
+            }
+            let runBinding = WorkRunBinding(workBinding: binding, run: run)
+            if let existing = try readStartLocked(for: binding, intent: startIntent) {
                 guard existing.manifest.identity.run == run,
                       existing.manifest.promptAssembly == promptAssembly,
                       existing.manifest.initialInputBodyReference == initialInputBodyReference else {
@@ -2279,7 +2287,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
                 }
                 return existing
             }
-            let reservation = try readStartReservationLocked(for: template.binding)
+            let reservation = try readStartReservationLocked(for: binding)
             guard let reservation,
                   reservation.run == run,
                   reservation.intent == startIntent,
@@ -2289,7 +2297,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
                 throw WorkLaunchManifestStoreError.requestConflict
             }
             var manifest = try template.template.draft.bind(
-                to: binding, startIntent: startIntent,
+                to: runBinding, startIntent: startIntent,
                 initialInputBodyReference: initialInputBodyReference,
                 promptAssembly: promptAssembly)
             if let resumePolicy {
@@ -2307,7 +2315,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
     }
 
     internal func start(
-        _ template: WorkLaunchWorkTemplateRecord, run: RunRef,
+        _ template: WorkLaunchWorkTemplateRecord, binding: WorkBinding, run: RunRef,
         startIntent: WorkLaunchStartIntent,
         expectedPrevious: WorkLaunchManifestGeneration? = nil,
         initialInputBodyReference: TimelineBodyReference? = nil,
@@ -2315,7 +2323,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         resumePolicy: WorkLaunchResumePolicy? = nil
     ) throws -> WorkLaunchManifestRecord {
         try bind(
-            template, run: run, startIntent: startIntent, expectedPrevious: expectedPrevious,
+            template, binding: binding, run: run, startIntent: startIntent, expectedPrevious: expectedPrevious,
             initialInputBodyReference: initialInputBodyReference,
             promptAssembly: promptAssembly,
             resumePolicy: resumePolicy)
@@ -2441,8 +2449,8 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
             try validateBinding(binding)
             guard let pointer = try readBindingPointer(for: binding) else { return nil }
             let identity = WorkLaunchManifestIdentity(
-                work: binding.work, session: binding.session,
-                sessionAttachment: binding.sessionAttachment, run: pointer.run)
+                work: pointer.binding.work, session: pointer.binding.session,
+                sessionAttachment: pointer.binding.sessionAttachment, run: pointer.run)
             let runPointer = try readPointer(identity)
             let record: WorkLaunchManifestRecord
             if let runPointer {
@@ -2483,7 +2491,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
                 // clearing the mutex; otherwise a later Run would erase the old duplicate's
                 // lookup path.
                 try ensureStartPointer(
-                    for: binding, intent: record.manifest.startIntent,
+                    for: pointer.binding, intent: record.manifest.startIntent,
                     identity: identity, digest: pointer.digest)
                 try? removePendingPointer(for: binding)
             }
@@ -2511,12 +2519,17 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
             let pending: PendingPointer
             do { pending = try JSONDecoder().decode(PendingPointer.self, from: data) }
             catch { throw WorkLaunchManifestStoreError.malformedRecord }
-            guard pending.schemaVersion == 1, pending.binding == binding,
+            guard pending.schemaVersion == 1,
+                  pending.binding.work == binding.work,
+                  pending.binding.workHost == binding.workHost,
                   pending.identity == WorkLaunchManifestIdentity(
-                    work: binding.work, session: binding.session,
-                    sessionAttachment: binding.sessionAttachment, run: pending.identity.run),
+                    work: pending.binding.work, session: pending.binding.session,
+                    sessionAttachment: pending.binding.sessionAttachment, run: pending.identity.run),
                   WorkLaunchDurableIO.validDigest(pending.digest) else {
                 throw WorkLaunchManifestStoreError.identityMismatch
+            }
+            guard pending.binding == binding else {
+                throw WorkLaunchManifestStoreError.requestConflict
             }
             guard let payload = try WorkLaunchDurableIO.readBounded(
                 manifestURL(forDigest: pending.digest), maximumBytes: limits.maximumRecordBytes) else {
@@ -2616,6 +2629,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
     /// its already-retained assembly or report recovery-required.
     public func reserveStart(
         _ template: WorkLaunchWorkTemplateRecord,
+        binding: WorkBinding,
         run: RunRef,
         startIntent: WorkLaunchStartIntent,
         expectedPrevious: WorkLaunchManifestGeneration? = nil,
@@ -2623,10 +2637,11 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
     ) throws -> WorkLaunchStartAdmission {
         try withPreparedStorage {
             let expectedAuthority = try home.requirePersistedWorkHostID()
-            try validateBinding(template.binding)
-            guard template.template.binding == template.binding,
-                  template.binding.work.workHostID == expectedAuthority,
-                  let currentTemplate = try readTemplatePointer(for: template.binding.work),
+            try validateBinding(binding)
+            guard template.work == binding.work,
+                  template.workHost == binding.workHost,
+                  binding.work.workHostID == expectedAuthority,
+                  let currentTemplate = try readTemplatePointer(for: template.work),
                   currentTemplate == template.generation else {
                 throw WorkLaunchManifestStoreError.generationMismatch
             }
@@ -2637,8 +2652,8 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
             }
             try validateTemplate(template.template)
             let identity = WorkLaunchManifestIdentity(
-                work: template.binding.work, session: template.binding.session,
-                sessionAttachment: template.binding.sessionAttachment, run: run)
+                work: binding.work, session: binding.session,
+                sessionAttachment: binding.sessionAttachment, run: run)
             try WorkLaunchManifest.validateIdentity(identity, limits: limits)
             try WorkLaunchManifest.validateStartIntent(
                 startIntent, identity: identity,
@@ -2654,18 +2669,26 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
 
             // An already-indexed exact Start is a completed publication. It wins over any stale
             // reservation marker and is returned without touching prompt assembly.
-            if let existing = try readStartLocked(for: template.binding, intent: startIntent) {
+            if let existing = try readStartLocked(for: binding, intent: startIntent) {
                 guard existing.manifest.identity.run == run else {
                     throw WorkLaunchManifestStoreError.requestConflict
                 }
                 return .existing(existing)
             }
 
-            if let existing = try readStartReservationLocked(for: template.binding) {
+            if let existing = try readStartReservationLocked(for: binding) {
+                // The reservation occupies the Work-scoped admission slot, so its payload may
+                // belong to another attached Session. Validate it against its own binding before
+                // comparing provenance; projecting the caller's Session into that identity would
+                // turn a legitimate cross-Session CAS conflict into an identity-mismatch path.
+                try validateStartReservation(existing)
+                guard existing.binding == binding else {
+                    throw WorkLaunchManifestStoreError.requestConflict
+                }
                 try validateStartReservation(
                     existing, identity: WorkLaunchManifestIdentity(
-                        work: template.binding.work, session: template.binding.session,
-                        sessionAttachment: template.binding.sessionAttachment, run: existing.run))
+                        work: binding.work, session: binding.session,
+                        sessionAttachment: binding.sessionAttachment, run: existing.run))
                 // Cleanup after final publication is deliberately best-effort, so a process
                 // crash or an injected removal failure can leave the binding-wide reservation
                 // beside its already-complete historical Run.  A fully validated final record
@@ -2673,15 +2696,15 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
                 // unpaired reservation remains an active CAS fence and must still reject any
                 // different intent.
                 if let completed = try readStartLocked(
-                    for: template.binding, intent: existing.intent),
+                    for: binding, intent: existing.intent),
                    completed.manifest.identity.run == existing.run,
                    completed.manifest.initialInputBodyReference
                         == existing.initialInputBodyReference,
                    completed.manifest.promptAssembly == existing.promptAssembly,
                    try isFullyPublishedStartLocked(
-                       for: template.binding, identity: completed.manifest.identity,
+                       for: binding, identity: completed.manifest.identity,
                        digest: completed.manifestDigest) {
-                    try removeStartReservation(for: template.binding)
+                    try removeStartReservation(for: binding)
                 } else {
                     guard existing.intent == startIntent,
                           existing.templateGeneration == template.generation,
@@ -2692,10 +2715,10 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
                 }
             }
 
-            let current = try readBindingPointer(for: template.binding).map {
+            let current = try readBindingPointer(for: binding).map {
                 WorkLaunchManifestGeneration(generation: $0.generation, digest: $0.digest)
             }
-            if let currentPointer = try readBindingPointer(for: template.binding),
+            if let currentPointer = try readBindingPointer(for: binding),
                currentPointer.run == run {
                 throw WorkLaunchManifestStoreError.requestConflict
             }
@@ -2703,7 +2726,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
                 throw WorkLaunchManifestStoreError.generationMismatch
             }
             let reservation = WorkLaunchStartReservation(
-                binding: template.binding, run: run, intent: startIntent,
+                binding: binding, run: run, intent: startIntent,
                 templateGeneration: template.generation,
                 initialInputBodyReference: initialInputBodyReference,
                 expectedPrevious: expectedPrevious)
@@ -2778,6 +2801,13 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         try withPreparedStorage {
             try validateBinding(binding)
             guard let reservation = try readStartReservationLocked(for: binding) else { return nil }
+            // The reservation path is the exact selected Start binding, unlike the Work-level
+            // current-selection pointer. A caller for another Session may observe that Work is
+            // fenced through hasPendingStart, but must not receive or reuse the first caller's
+            // reservation provenance.
+            guard reservation.binding == binding else {
+                throw WorkLaunchManifestStoreError.requestConflict
+            }
             let identity = WorkLaunchManifestIdentity(
                 work: binding.work, session: binding.session,
                 sessionAttachment: binding.sessionAttachment, run: reservation.run)
@@ -3025,14 +3055,16 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
 
     private struct TemplatePointer: Codable, Hashable {
         let schemaVersion: Int
-        let binding: WorkBinding
+        let work: WorkRef
+        let workHost: WorkHostRef
         let generation: Int
         let digest: String
     }
 
     private struct TemplateEnvelope: Codable, Hashable {
         let schemaVersion: Int
-        let binding: WorkBinding
+        let work: WorkRef
+        let workHost: WorkHostRef
         let digest: String
         let templateByteCount: Int
         let template: WorkLaunchWorkTemplate
@@ -3292,14 +3324,14 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         guard template.schemaVersion == WorkLaunchWorkTemplate.currentSchemaVersion else {
             throw WorkLaunchManifestStoreError.invalidManifest("unsupported template schema")
         }
-        try validateBinding(template.binding)
         try template.draft.validate(limits: limits)
         // A Work template has no Run or Start identity yet. In particular, its exact input and
         // prompt bodies do not exist until Start retains them under the winning Run reservation.
         let expectedAuthority = try home.requirePersistedWorkHostID()
-        guard template.binding.work.workHostID == expectedAuthority else {
+        guard template.work.workHostID == expectedAuthority,
+              template.workHost == WorkHostRef(expectedAuthority) else {
             throw WorkLaunchManifestStoreError.wrongAuthority(
-                expected: expectedAuthority, actual: template.binding.work.workHostID)
+                expected: expectedAuthority, actual: template.work.workHostID)
         }
         // A template is executable recovery material only when its draft is tied to the
         // client-qualified Create retention pointer.  This check is intentionally performed on
@@ -3333,15 +3365,16 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
             throw WorkLaunchManifestStoreError.manifestTooLarge
         }
         let digest = WorkLaunchDurableIO.digest(bytes)
-        if let current = try readTemplatePointer(for: template.binding.work) {
+        if let current = try readTemplatePointer(for: template.work) {
             guard let payload = try WorkLaunchDurableIO.readBounded(
                 templateURL(forDigest: current.digest), maximumBytes: limits.maximumRecordBytes) else {
                 throw WorkLaunchManifestStoreError.notFound
             }
             let existing = try decodeTemplatePayload(
-                payload, work: template.binding.work, pointer: current)
+                payload, work: template.work, pointer: current)
             if current.digest == digest {
-                guard existing.template.binding == template.binding else {
+                guard existing.template.work == template.work,
+                      existing.template.workHost == template.workHost else {
                     throw WorkLaunchManifestStoreError.identityMismatch
                 }
                 return existing
@@ -3349,7 +3382,8 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
             // A second Create for this Work must use the durable replacement API with an
             // expected generation. Silent replacement here could move a Work to different
             // Session/attachment material after a lost response.
-            guard existing.template.binding == template.binding else {
+            guard existing.template.work == template.work,
+                  existing.template.workHost == template.workHost else {
                 throw WorkLaunchManifestStoreError.identityMismatch
             }
             throw WorkLaunchManifestStoreError.requestConflict
@@ -3367,7 +3401,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         }
         let digest = WorkLaunchDurableIO.digest(bytes)
         let envelope = TemplateEnvelope(
-            schemaVersion: 1, binding: template.binding, digest: digest,
+            schemaVersion: 2, work: template.work, workHost: template.workHost, digest: digest,
             templateByteCount: bytes.count, template: template)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -3384,7 +3418,8 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
                 payload, to: payloadURL, maximumBytes: limits.maximumRecordBytes)
         }
         let pointer = TemplatePointer(
-            schemaVersion: 1, binding: template.binding, generation: generation, digest: digest)
+            schemaVersion: 2, work: template.work, workHost: template.workHost,
+            generation: generation, digest: digest)
         try writeTemplatePointer(pointer)
         return WorkLaunchWorkTemplateRecord(
             template: template,
@@ -3400,7 +3435,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
             throw WorkLaunchManifestStoreError.recordTooLarge
         }
         try WorkLaunchDurableIO.replace(
-            data, at: templatePointerURL(for: pointer.binding.work),
+            data, at: templatePointerURL(for: pointer.work),
             maximumBytes: limits.maximumMetadataBytes)
     }
 
@@ -3412,8 +3447,8 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         let pointer: TemplatePointer
         do { pointer = try JSONDecoder().decode(TemplatePointer.self, from: data) }
         catch { throw WorkLaunchManifestStoreError.malformedRecord }
-        guard pointer.schemaVersion == 1, pointer.binding.work == work,
-              pointer.binding.workHost == WorkHostRef(work.workHostID),
+        guard pointer.schemaVersion == 2, pointer.work == work,
+              pointer.workHost == WorkHostRef(work.workHostID),
               pointer.generation > 0, WorkLaunchDurableIO.validDigest(pointer.digest) else {
             throw WorkLaunchManifestStoreError.identityMismatch
         }
@@ -3427,9 +3462,10 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         let envelope: TemplateEnvelope
         do { envelope = try JSONDecoder().decode(TemplateEnvelope.self, from: payload) }
         catch { throw WorkLaunchManifestStoreError.malformedRecord }
-        guard envelope.schemaVersion == 1,
-              envelope.binding.work == work,
-              envelope.binding == envelope.template.binding,
+        guard envelope.schemaVersion == 2,
+              envelope.work == work,
+              envelope.workHost == envelope.template.workHost,
+              envelope.template.work == work,
               envelope.digest == pointer.digest,
               envelope.templateByteCount >= 0,
               envelope.templateByteCount <= limits.maximumManifestBytes,
@@ -3525,10 +3561,12 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         let pointer: PendingPointer
         do { pointer = try JSONDecoder().decode(PendingPointer.self, from: data) }
         catch { throw WorkLaunchManifestStoreError.malformedRecord }
-        guard pointer.schemaVersion == 1, pointer.binding == binding,
-              pointer.identity.work == binding.work,
-              pointer.identity.session == binding.session,
-              pointer.identity.sessionAttachment == binding.sessionAttachment,
+        guard pointer.schemaVersion == 1,
+              pointer.binding.work == binding.work,
+              pointer.binding.workHost == binding.workHost,
+              pointer.identity.work == pointer.binding.work,
+              pointer.identity.session == pointer.binding.session,
+              pointer.identity.sessionAttachment == pointer.binding.sessionAttachment,
               WorkLaunchDurableIO.validDigest(pointer.digest) else {
             throw WorkLaunchManifestStoreError.identityMismatch
         }
@@ -3759,7 +3797,9 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         let pointer: BindingPointer
         do { pointer = try JSONDecoder().decode(BindingPointer.self, from: data) }
         catch { throw WorkLaunchManifestStoreError.malformedRecord }
-        guard pointer.schemaVersion == 1, pointer.binding == binding,
+        guard pointer.schemaVersion == 1,
+              pointer.binding.work == binding.work,
+              pointer.binding.workHost == binding.workHost,
               pointer.run.runID.utf8.count <= limits.maximumIdentityBytes,
               !pointer.run.runID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               pointer.generation > 0,

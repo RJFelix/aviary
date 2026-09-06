@@ -5,6 +5,14 @@ import Darwin
 import Glibc
 #endif
 
+private struct WorkServiceCheckpointCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int? = nil
+
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { self.stringValue = String(intValue) }
+}
+
 public protocol WorkServiceAttachedWorkCheckpointStoring: Sendable {
     func load() throws -> WorkServiceAttachedWorkCheckpointStore.Record?
     func save(_ record: WorkServiceAttachedWorkCheckpointStore.Record) throws
@@ -17,6 +25,13 @@ public protocol WorkServiceAttachedWorkCheckpointStoring: Sendable {
 /// snapshots and their exact cursors together with the attachment/journal generation that made
 /// them meaningful.  A checkpoint with a mismatched identity, an invalid cursor, or an
 /// unreconstructable reducer state is ignored by the controller and the next read starts at zero.
+///
+/// This cache is intentionally not metadata-only. Below the 32 MiB bound, `SessionSnapshot`
+/// carries the bounded raw message and compaction text needed to restore the GUI's exact visible
+/// conversation without replaying from byte zero. The file is private (0600) inside a private
+/// per-user directory and has the same sensitivity as the Aviary transcript it accelerates; it is
+/// neither encrypted nor a security boundary. A future encrypted/metadata-only cache would be a
+/// different retention contract, not a compatible interpretation of this record.
 public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
     WorkServiceAttachedWorkCheckpointStoring {
     public static let maximumRecordBytes = 32 * 1_024 * 1_024
@@ -29,12 +44,40 @@ public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
         let record: Record
         let recordChecksum: String
 
-        static let currentSchemaVersion = 1
+        static let currentSchemaVersion = 2
+
+        private enum CodingKeys: String, CodingKey, CaseIterable {
+            case schemaVersion, record, recordChecksum
+        }
+
+        init(schemaVersion: Int, record: Record, recordChecksum: String) {
+            self.schemaVersion = schemaVersion
+            self.record = record
+            self.recordChecksum = recordChecksum
+        }
+
+        init(from decoder: Decoder) throws {
+            let dynamic = try decoder.container(keyedBy: WorkServiceCheckpointCodingKey.self)
+            let expected = Set(CodingKeys.allCases.map(\.rawValue))
+            guard Set(dynamic.allKeys.map(\.stringValue)) == expected else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "checkpoint envelope fields must match its version"))
+            }
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+            self.record = try container.decode(Record.self, forKey: .record)
+            self.recordChecksum = try container.decode(String.self, forKey: .recordChecksum)
+        }
     }
 
     public struct PendingAcknowledgement: Codable, Hashable, Sendable {
         public let request: WorkServiceAcknowledgeReadRequest
         public let stale: Bool
+
+        private enum CodingKeys: String, CodingKey, CaseIterable {
+            case request, stale
+        }
 
         public init(
             request: WorkServiceAcknowledgeReadRequest,
@@ -43,10 +86,24 @@ public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
             self.request = request
             self.stale = stale
         }
+
+        public init(from decoder: Decoder) throws {
+            let dynamic = try decoder.container(keyedBy: WorkServiceCheckpointCodingKey.self)
+            let expected = Set(CodingKeys.allCases.map(\.rawValue))
+            guard Set(dynamic.allKeys.map(\.stringValue)) == expected else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "pending acknowledgement fields must match its version"))
+            }
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.request = try container.decode(
+                WorkServiceAcknowledgeReadRequest.self, forKey: .request)
+            self.stale = try container.decode(Bool.self, forKey: .stale)
+        }
     }
 
     public struct Record: Codable, Hashable, Sendable {
-        public static let currentSchemaVersion = 3
+        public static let currentSchemaVersion = 4
 
         public let schemaVersion: Int
         public let client: ClientRef
@@ -80,6 +137,17 @@ public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
         public let stagedSessionSnapshot: SessionSnapshot?
         public let stagedSessionOmissions: [WorkServiceOmission]
         public let pendingAcknowledgements: [PendingAcknowledgement]
+
+        private enum CodingKeys: String, CodingKey, CaseIterable {
+            case schemaVersion, client, work, journal, session, sessionJournal
+            case sessionAttachment, attachment, hostInstance, descriptor, attachmentProjection
+            case controlCursor, committedWorkCursor, committedWorkPrefixDigest
+            case committedWorkSnapshot, committedSessionCursor, committedSessionPrefixDigest
+            case committedSessionSnapshot, stagedWorkCursor, stagedWorkPrefixDigest
+            case stagedWorkSnapshot, stagedWorkOmissions, stagedSessionCursor
+            case stagedSessionPrefixDigest, stagedSessionSnapshot, stagedSessionOmissions
+            case pendingAcknowledgements
+        }
 
         public init(
             client: ClientRef,
@@ -139,6 +207,65 @@ public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
                 WorkServiceBounds.maxReadAcknowledgementsPerAttachment))
         }
 
+        public init(from decoder: Decoder) throws {
+            let dynamic = try decoder.container(keyedBy: WorkServiceCheckpointCodingKey.self)
+            let allowed = Set(CodingKeys.allCases.map(\.rawValue))
+            guard Set(dynamic.allKeys.map(\.stringValue)).subtracting(allowed).isEmpty else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "unknown checkpoint record field"))
+            }
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+            self.client = try container.decode(ClientRef.self, forKey: .client)
+            self.work = try container.decode(WorkRef.self, forKey: .work)
+            self.journal = try container.decode(JournalRef.self, forKey: .journal)
+            self.session = try container.decode(SessionRef.self, forKey: .session)
+            self.sessionJournal = try container.decode(JournalRef.self, forKey: .sessionJournal)
+            self.sessionAttachment = try container.decode(
+                SessionAttachmentRef.self, forKey: .sessionAttachment)
+            self.attachment = try container.decode(
+                ClientAttachmentRef.self, forKey: .attachment)
+            self.hostInstance = try container.decodeIfPresent(
+                WorkHostInstanceRef.self, forKey: .hostInstance)
+            self.descriptor = try container.decode(
+                WorkServiceWorkDescriptor.self, forKey: .descriptor)
+            self.attachmentProjection = try container.decode(
+                WorkServiceClientAttachment.self, forKey: .attachmentProjection)
+            self.controlCursor = try container.decodeIfPresent(
+                JournalCursor.self, forKey: .controlCursor)
+            self.committedWorkCursor = try container.decode(
+                JournalCursor.self, forKey: .committedWorkCursor)
+            self.committedWorkPrefixDigest = try container.decodeIfPresent(
+                String.self, forKey: .committedWorkPrefixDigest)
+            self.committedWorkSnapshot = try container.decodeIfPresent(
+                WorkSnapshot.self, forKey: .committedWorkSnapshot)
+            self.committedSessionCursor = try container.decode(
+                JournalCursor.self, forKey: .committedSessionCursor)
+            self.committedSessionPrefixDigest = try container.decodeIfPresent(
+                String.self, forKey: .committedSessionPrefixDigest)
+            self.committedSessionSnapshot = try container.decodeIfPresent(
+                SessionSnapshot.self, forKey: .committedSessionSnapshot)
+            self.stagedWorkCursor = try container.decodeIfPresent(
+                JournalCursor.self, forKey: .stagedWorkCursor)
+            self.stagedWorkPrefixDigest = try container.decodeIfPresent(
+                String.self, forKey: .stagedWorkPrefixDigest)
+            self.stagedWorkSnapshot = try container.decodeIfPresent(
+                WorkSnapshot.self, forKey: .stagedWorkSnapshot)
+            self.stagedWorkOmissions = try container.decode(
+                [WorkServiceOmission].self, forKey: .stagedWorkOmissions)
+            self.stagedSessionCursor = try container.decodeIfPresent(
+                JournalCursor.self, forKey: .stagedSessionCursor)
+            self.stagedSessionPrefixDigest = try container.decodeIfPresent(
+                String.self, forKey: .stagedSessionPrefixDigest)
+            self.stagedSessionSnapshot = try container.decodeIfPresent(
+                SessionSnapshot.self, forKey: .stagedSessionSnapshot)
+            self.stagedSessionOmissions = try container.decode(
+                [WorkServiceOmission].self, forKey: .stagedSessionOmissions)
+            self.pendingAcknowledgements = try container.decode(
+                [PendingAcknowledgement].self, forKey: .pendingAcknowledgements)
+        }
+
         /// Remove reducer state that cannot be bounded without losing canonical transcript data.
         /// Cursors/digests and pending idempotent requests remain durable evidence, but the next
         /// process must reconstruct the reducer from the journal rather than trusting this record
@@ -162,18 +289,63 @@ public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
     }
 
     public let url: URL
+    private let serviceAttachmentKey: ServiceAttachmentKey?
 
-    public init(url: URL) throws {
+    /// Test-only storage injection. Production callers must use a key-qualified URL.
+    init(url: URL) throws {
         guard url.isFileURL, !url.path.isEmpty,
               !url.path.unicodeScalars.contains(where: { $0.value == 0 }) else {
             throw WorkServiceAttachedWorkControllerError.invalidOptions
         }
         self.url = url
+        self.serviceAttachmentKey = nil
+    }
+
+    /// Stable per-client/per-attachment checkpoint location.  The controller normally obtains
+    /// this URL from its intent store so both records are guaranteed to share the same key.
+    public init(home: AgentHome, key: ServiceAttachmentKey) throws {
+        guard key.isValid else {
+            throw WorkServiceAttachedWorkControllerError.invalidOptions
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let identity: Data
+        do {
+            identity = try encoder.encode(key)
+        } catch {
+            throw WorkServiceAttachedWorkControllerError.invalidOptions
+        }
+        let digest = AviarySHA256.hash(data: identity).map { String(format: "%02x", $0) }.joined()
+        self.url = home.root
+            .appending(path: "work-service-clients", directoryHint: .isDirectory)
+            .appending(path: "pending-intents", directoryHint: .isDirectory)
+            .appending(path: digest + ".checkpoint.json", directoryHint: .notDirectory)
+        self.serviceAttachmentKey = key
+    }
+
+    init(url: URL, key: ServiceAttachmentKey) throws {
+        guard key.isValid else {
+            throw WorkServiceAttachedWorkControllerError.invalidOptions
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let identity = try encoder.encode(key)
+        let digest = AviarySHA256.hash(data: identity)
+            .map { String(format: "%02x", $0) }.joined()
+        guard url.lastPathComponent == digest + ".checkpoint.json" else {
+            throw WorkServiceAttachedWorkControllerError.invalidOptions
+        }
+        self.url = url
+        self.serviceAttachmentKey = key
     }
 
     public func load() throws -> Record? {
         try prepareDirectory()
-        return try withLock { try readLocked() }
+        guard let record = try withLock({ try readLocked() }) else { return nil }
+        guard Self.matches(record, key: serviceAttachmentKey) else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        return record
     }
 
     public func save(_ record: Record) throws {
@@ -239,6 +411,9 @@ public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
     }
 
     private func writeLocked(_ record: Record) throws {
+        guard Self.matches(record, key: serviceAttachmentKey) else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
         let data: Data
         do {
             let envelope = DiskEnvelope(
@@ -294,6 +469,23 @@ public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
             throw WorkServiceAttachedWorkControllerError.sourceIncomplete
         }
         try synchronizeDirectory(directory)
+    }
+
+    private static func matches(_ record: Record, key: ServiceAttachmentKey?) -> Bool {
+        guard let key else { return true }
+        guard key.isValid else { return false }
+        return record.client == key.client
+            && record.work == key.workSession.work
+            && record.session == key.workSession.session
+            && record.sessionJournal == key.workSession.sessionJournal
+            && record.sessionAttachment == key.workSession.sessionAttachment
+            && record.attachment == key.clientAttachment
+            && record.descriptor.work == key.workSession.work
+            && record.attachmentProjection.client == key.client
+            && record.attachmentProjection.attachment == key.clientAttachment
+            && record.attachmentProjection.session == key.workSession.session
+            && record.attachmentProjection.sessionJournal == key.workSession.sessionJournal
+            && record.attachmentProjection.sessionAttachment == key.workSession.sessionAttachment
     }
 
     /// Keep the on-disk cache bounded even when the reducer's canonical message history is much

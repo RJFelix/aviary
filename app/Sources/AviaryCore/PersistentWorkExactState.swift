@@ -10,7 +10,7 @@ import Foundation
 /// event payload is never copied into this map; child state is classified and recovery caveats are
 /// represented by count/digest metadata.
 public struct PersistentWorkExactState: Sendable {
-    public static let schemaVersion = 1
+    public static let schemaVersion = 2
     public static let maximumIdentityBytes = 1_024
     /// One mutation may need to authenticate every active attachment in the affected Session.
     /// WorkService bounds those relationships to 64, leaving room for the event's other typed
@@ -30,7 +30,7 @@ public struct PersistentWorkExactState: Sendable {
             case .missingScalar: return "Persistent Work exact state has no scalar continuation."
             case .invalidRecord: return "Persistent Work exact state contains an invalid typed record."
             case .duplicateEvent(let id): return "Persistent Work event was already observed: \(id)."
-            case .unsupportedEvent(let type): return "Persistent Work event family is not exact in v1: \(type)."
+            case .unsupportedEvent(let type): return "Persistent Work event family is not exact in v2: \(type)."
             case .tooManyPrefetchedSlots: return "Persistent Work exact-state prefetch exceeds its bound."
             case .map(let error): return error.localizedDescription
             }
@@ -57,7 +57,7 @@ public struct PersistentWorkExactState: Sendable {
         }
     }
 
-    private static let scalarKey = "work-exact-v1/scalar"
+    private static let scalarKey = "work-exact-v2/scalar"
     private let map: PersistentProjectionRadixMap
     private var root: PersistentProjectionRadixMap.Root?
     private var lastSnapshot: WorkSnapshot
@@ -188,7 +188,7 @@ public struct PersistentWorkExactState: Sendable {
 
     private static func slotKey(kind: String, identity: String) -> String {
         let material = "work-exact-slot-v1\0\(kind.count):\(kind)\0\(identity.utf8.count):\(identity)"
-        return "work-exact-v1/\(kind)/" + AviarySHA256.hash(data: Data(material.utf8)).description
+        return "work-exact-v2/\(kind)/" + AviarySHA256.hash(data: Data(material.utf8)).description
     }
 
     private static func validateIncomingIdentities(_ event: TimelineEvent) throws {
@@ -225,6 +225,8 @@ public struct PersistentWorkExactState: Sendable {
         var value = WorkSnapshot()
         value.journal = scalar.journal; value.work = scalar.work; value.workHost = scalar.workHost
         value.lifecycle = scalar.lifecycle; value.execution = scalar.execution; value.activeRun = scalar.activeRun
+        value.activeRunSession = scalar.activeRunSession
+        value.activeRunSessionAttachment = scalar.activeRunSessionAttachment
         value.modelID = scalar.modelID; value.activeTurn = scalar.activeTurn
         value.lastHostSequence = scalar.lastHostSequence; value.unknownDomains = scalar.unknownDomains
         value.lastEventID = scalar.lastEventID; value.lastSequence = scalar.lastSequence
@@ -248,7 +250,9 @@ public struct PersistentWorkExactState: Sendable {
     private struct ScalarRecord: Codable, Hashable, Sendable {
         let schemaVersion: Int; let kind: String; let journal: JournalRef?
         let work: WorkRef?; let workHost: WorkHostRef?; let lifecycle: WorkLifecycle; let execution: WorkExecution
-        let activeRun: RunRef?; let modelID: String?; let activeTurn: TurnRef?; let lastHostSequence: Int?
+        let activeRun: RunRef?; let activeRunSession: SessionRef?
+        let activeRunSessionAttachment: SessionAttachmentRef?
+        let modelID: String?; let activeTurn: TurnRef?; let lastHostSequence: Int?
         let unknownDomains: Set<TimelineDomain>; let lastEventID: String?; let lastSequence: Int
         let causalOrderValid: Bool; let structuralIntegrityValid: Bool; let semanticProjectionValid: Bool
         let seenEventCount: Int; let activeActionCount: Int; let outstandingHandleCount: Int
@@ -273,7 +277,9 @@ public struct PersistentWorkExactState: Sendable {
              lastUnknownEventID: String? = nil, lastQuarantineEventID: String? = nil) {
             schemaVersion = PersistentWorkExactState.schemaVersion; kind = "scalar"; journal = scalar.journal; work = scalar.work
             workHost = scalar.workHost; lifecycle = scalar.lifecycle; execution = scalar.execution
-            activeRun = scalar.activeRun; modelID = scalar.modelID; activeTurn = scalar.activeTurn
+            activeRun = scalar.activeRun; activeRunSession = scalar.activeRunSession
+            activeRunSessionAttachment = scalar.activeRunSessionAttachment
+            modelID = scalar.modelID; activeTurn = scalar.activeTurn
             lastHostSequence = scalar.lastHostSequence; unknownDomains = scalar.unknownDomains
             lastEventID = scalar.lastEventID; lastSequence = scalar.lastSequence
             causalOrderValid = scalar.causalOrderValid; structuralIntegrityValid = scalar.structuralIntegrityValid
@@ -291,6 +297,8 @@ public struct PersistentWorkExactState: Sendable {
                   activeActionCount >= 0, activeActionCount <= seenEventCount,
                   outstandingHandleCount >= 0, outstandingHandleCount <= seenEventCount,
                   lastHostSequence.map({ $0 >= 0 && $0 < Int.max }) ?? true,
+                  (activeRunSession == nil) == (activeRunSessionAttachment == nil),
+                  (activeRun == nil) == (activeRunSession == nil),
                   [lastEventID, lastUnknownEventID, lastQuarantineEventID].compactMap({ $0 })
                       .allSatisfy({ !$0.isEmpty && $0.utf8.count <= PersistentWorkExactState.maximumIdentityBytes })
             else { throw Error.invalidRecord }
@@ -299,7 +307,8 @@ public struct PersistentWorkExactState: Sendable {
                   workHost == WorkHostRef(owner.workHostID),
                   lastSequence == 0 ? lastEventID == nil : lastEventID != nil,
                   [work?.workID, work?.workHostID, workHost?.workHostID,
-                   activeRun?.runID, modelID, activeTurn?.turnID]
+                   activeRun?.runID, activeRunSession?.sessionID,
+                   activeRunSessionAttachment?.attachmentID, modelID, activeTurn?.turnID]
                     .compactMap({ $0 })
                     .allSatisfy({ !$0.isEmpty && $0.utf8.count <= PersistentWorkExactState.maximumIdentityBytes })
             else { throw Error.invalidRecord }
@@ -385,6 +394,7 @@ public struct PersistentWorkExactState: Sendable {
                 || event.type == TimelineEventType.sessionDetached
                 || event.type == TimelineEventType.sessionAttachmentCapabilityChanged
             let needsStoredAttachment = isAttachmentMutation
+                || event.type == TimelineEventType.runStarted
                 || event.type == TimelineEventType.recoveryCoverage
             var affectedSessions = Set<SessionRef>()
             var storedAttachment: AttachmentRecord?
@@ -416,6 +426,13 @@ public struct PersistentWorkExactState: Sendable {
                     affectedSessions.insert(session)
                 }
             case TimelineEventType.recoveryCoverage:
+                if let session = storedAttachment?.attachment.session {
+                    affectedSessions.insert(session)
+                }
+            case TimelineEventType.runStarted:
+                // run.started authenticates its exact Session/attachment pair through the
+                // stored attachment. Prefetch that Session's bounded membership before the
+                // shared transition checks the attachment is currently attached.
                 if let session = storedAttachment?.attachment.session {
                     affectedSessions.insert(session)
                 }
@@ -505,6 +522,8 @@ public struct PersistentWorkExactState: Sendable {
             continuation.journal = scalar.journal; continuation.work = scalar.work; continuation.workHost = scalar.workHost
             continuation.lifecycle = scalar.lifecycle; continuation.execution = scalar.execution
             continuation.activeRun = scalar.activeRun; continuation.modelID = scalar.modelID; continuation.activeTurn = scalar.activeTurn
+            continuation.activeRunSession = scalar.activeRunSession
+            continuation.activeRunSessionAttachment = scalar.activeRunSessionAttachment
             continuation.lastHostSequence = scalar.lastHostSequence; continuation.unknownDomains = scalar.unknownDomains
             continuation.lastEventID = scalar.lastEventID; continuation.lastSequence = scalar.lastSequence
             continuation.causalOrderValid = scalar.causalOrderValid; continuation.structuralIntegrityValid = scalar.structuralIntegrityValid
@@ -633,6 +652,8 @@ public struct PersistentWorkExactState: Sendable {
             var value = WorkSnapshot()
             value.journal = scalar.journal; value.work = scalar.work; value.workHost = scalar.workHost
             value.lifecycle = scalar.lifecycle; value.execution = scalar.execution; value.activeRun = scalar.activeRun
+            value.activeRunSession = scalar.activeRunSession
+            value.activeRunSessionAttachment = scalar.activeRunSessionAttachment
             value.modelID = scalar.modelID; value.activeTurn = scalar.activeTurn
             value.lastHostSequence = scalar.lastHostSequence; value.unknownDomains = scalar.unknownDomains
             value.lastEventID = scalar.lastEventID; value.lastSequence = scalar.lastSequence

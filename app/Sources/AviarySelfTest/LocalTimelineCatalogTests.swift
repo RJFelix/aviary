@@ -81,6 +81,7 @@ func test_localTimelineCatalogDiscoversNativeSessionAndIndependentWork() throws 
     defer { try? FileManager.default.removeItem(at: home.root) }
     let session = SessionRef("catalog-session")
     let work = WorkRef(workHostID: "catalog-host", workID: "catalog-work")
+    let attachment = SessionAttachmentRef("attachment-1")
     let sessionJournal = JournalRef.session(
         session, journalID: "session-journal", authority: TimelineAuthorityRef("session-service"))
     let workJournal = JournalRef.work(work, journalID: "work-journal")
@@ -90,8 +91,15 @@ func test_localTimelineCatalogDiscoversNativeSessionAndIndependentWork() throws 
         work: work, workHost: WorkHostRef(work.workHostID))
     workData.append(try localCatalogEvent(
         id: "w2", journal: workJournal, sequence: 2, previous: "w1",
-        type: TimelineEventType.runStarted, work: work, workHost: WorkHostRef(work.workHostID),
-        run: RunRef("run-1"), payload: .object(["model_id": .string("model-1")])))
+        type: TimelineEventType.sessionAttached, session: session, work: work,
+        workHost: WorkHostRef(work.workHostID), sessionAttachment: attachment,
+        payload: .object(["capabilities": .array([.string("observe")])])))
+    workData.append(try localCatalogEvent(
+        id: "w3", journal: workJournal, sequence: 3, previous: "w2",
+        type: TimelineEventType.runStarted, session: session, work: work,
+        workHost: WorkHostRef(work.workHostID), sessionAttachment: attachment,
+        run: RunRef("run-1"),
+        payload: .object(["model_id": .string("model-1")])))
     try localCatalogWrite(workData, to: home.timelineV2WorkJournalURL(work))
 
     var sessionData = try localCatalogEvent(
@@ -100,7 +108,7 @@ func test_localTimelineCatalogDiscoversNativeSessionAndIndependentWork() throws 
     sessionData.append(try localCatalogEvent(
         id: "s2", journal: sessionJournal, sequence: 2, previous: "s1",
         type: TimelineEventType.sessionAttached, session: session, work: work,
-        sessionAttachment: SessionAttachmentRef("attachment-1"),
+        sessionAttachment: attachment,
         payload: .object(["capabilities": .array([.string("observe")])])))
     try localCatalogWrite(sessionData, to: home.timelineV2SessionJournalURL(session))
 
@@ -110,7 +118,7 @@ func test_localTimelineCatalogDiscoversNativeSessionAndIndependentWork() throws 
                   "this fixture intentionally has no Work Host control journal")
     let workRow = try XCTUnwrap(catalog.works.first { $0.work == work })
     XCTAssertTrue(workRow.isAvailable)
-    XCTAssertEqual(workRow.cursor?.sequence, 2)
+    XCTAssertEqual(workRow.cursor?.sequence, 3)
     XCTAssertEqual(workRow.lifecycle, .active)
     XCTAssertEqual(workRow.execution, .running)
     XCTAssertEqual(workRow.modelID, "model-1")
@@ -398,7 +406,9 @@ func test_localTimelineCatalogBlocksMalformedNativeSessionAtLegacyActionBoundary
 func test_localTimelineCatalogSuppressesFactsInUnknownDeclaredDomains() throws {
     let home = try localCatalogHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
+    let session = SessionRef("unknown-session")
     let work = WorkRef(workHostID: "unknown-host", workID: "unknown-work")
+    let attachment = SessionAttachmentRef("unknown-attachment")
     let journal = JournalRef.work(work)
     var data = try localCatalogEvent(
         id: "w1", journal: journal, sequence: 1,
@@ -406,11 +416,16 @@ func test_localTimelineCatalogSuppressesFactsInUnknownDeclaredDomains() throws {
         workHost: WorkHostRef(work.workHostID))
     data.append(try localCatalogEvent(
         id: "w2", journal: journal, sequence: 2, previous: "w1",
-        type: TimelineEventType.runStarted, work: work,
-        workHost: WorkHostRef(work.workHostID), run: RunRef("run-unknown"),
-        payload: .object(["model_id": .string("model-before-unknown")])))
+        type: TimelineEventType.sessionAttached, session: session, work: work,
+        workHost: WorkHostRef(work.workHostID), sessionAttachment: attachment))
     data.append(try localCatalogEvent(
         id: "w3", journal: journal, sequence: 3, previous: "w2",
+        type: TimelineEventType.runStarted, session: session, work: work,
+        workHost: WorkHostRef(work.workHostID),
+        sessionAttachment: attachment, run: RunRef("run-unknown"),
+        payload: .object(["model_id": .string("model-before-unknown")])))
+    data.append(try localCatalogEvent(
+        id: "w4", journal: journal, sequence: 4, previous: "w3",
         type: "future.work_semantics", work: work,
         workHost: WorkHostRef(work.workHostID), declaredDomains: [.work]))
     try localCatalogWrite(data, to: home.timelineV2WorkJournalURL(work))
@@ -424,10 +439,8 @@ func test_localTimelineCatalogSuppressesFactsInUnknownDeclaredDomains() throws {
         journal: controlJournal,
         to: home.timelineV2WorkHostControlJournalURL(workHostID: work.workHostID))
 
-    let session = SessionRef("unknown-session")
     let sessionJournal = JournalRef.session(
         session, authority: TimelineAuthorityRef("session-service"))
-    let attachment = SessionAttachmentRef("unknown-attachment")
     var sessionData = try localCatalogEvent(
         id: "s1", journal: sessionJournal, sequence: 1,
         type: TimelineEventType.sessionCreated, session: session)
@@ -441,7 +454,7 @@ func test_localTimelineCatalogSuppressesFactsInUnknownDeclaredDomains() throws {
         sessionAttachment: attachment,
         payload: .object([
             "cursor": try localCatalogCursorValue(JournalCursor(
-                journal: journal, eventID: "w3", sequence: 3)),
+                journal: journal, eventID: "w4", sequence: 4)),
         ])))
     try localCatalogWrite(sessionData, to: home.timelineV2SessionJournalURL(session))
 
@@ -449,7 +462,7 @@ func test_localTimelineCatalogSuppressesFactsInUnknownDeclaredDomains() throws {
     let row = try XCTUnwrap(catalog.works.first)
     XCTAssertTrue(row.isAvailable, "the append chain remains readable")
     XCTAssertEqual(row.unknownDomains, [.work])
-    XCTAssertEqual(row.unknownEventRefs.map(\.eventID), ["w3"])
+    XCTAssertEqual(row.unknownEventRefs.map(\.eventID), ["w4"])
     XCTAssertNil(row.lifecycle)
     XCTAssertNil(row.execution)
     XCTAssertNil(row.modelID)

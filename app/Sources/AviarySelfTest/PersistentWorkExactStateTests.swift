@@ -28,7 +28,7 @@ private func persistentMap(at url: URL) throws -> PersistentProjectionRadixMap {
     try PersistentProjectionRadixMap(
         directory: url.appending(path: "map", directoryHint: .isDirectory),
         namespaceID: "persistent-work-namespace", journal: persistentJournal,
-        sourceGeneration: String(repeating: "b", count: 64), mapKind: "work-exact-v1")
+        sourceGeneration: String(repeating: "b", count: 64), mapKind: "work-exact-v2")
 }
 
 private func persistentValueFiles(
@@ -51,6 +51,7 @@ private func persistentEvent(
     _ type: String, _ id: String, _ sequence: Int, previous: String? = nil,
     run: RunRef? = nil, action: ActionRef? = nil, handle: HandleRef? = nil,
     session: SessionRef? = nil, attachment: SessionAttachmentRef? = nil,
+    turn: TurnRef? = nil,
     command: CommandRef? = nil, causedBy: EventRef? = nil,
     hostSequence: Int? = nil, domains: Set<TimelineDomain> = [],
     payload: JSONValue = .object([:])
@@ -60,7 +61,7 @@ private func persistentEvent(
         hostSequence: hostSequence, command: command, previousEventID: previous,
         causedByEventID: causedBy, session: session, work: persistentWork,
         workHost: persistentHost, sessionAttachment: attachment, run: run,
-        action: action, handle: handle,
+        turn: turn, action: action, handle: handle,
         actor: TimelineActor(actorID: "persistent-test", kind: "self-test"),
         hostRecordedAt: Date(timeIntervalSince1970: Double(sequence)), type: type,
         declaredDomains: domains, payload: payload)
@@ -81,6 +82,7 @@ private func persistentRepresentativeEvents() -> [TimelineEvent] {
         persistentEvent(TimelineEventType.sessionAttached, "pw-2", 2, previous: "pw-1",
                          session: session, attachment: attachment),
         persistentEvent(TimelineEventType.runStarted, "pw-3", 3, previous: "pw-2", run: run,
+                         session: session, attachment: attachment,
                          payload: .object(["model_id": .string("persistent-model")])),
         persistentEvent(TimelineEventType.actionIntent, "pw-4", 4, previous: "pw-3", run: run,
                          action: action, payload: .object([
@@ -97,7 +99,8 @@ private func persistentRepresentativeEvents() -> [TimelineEvent] {
                          handle: handle, payload: .object(["state": .string("running")])),
         persistentEvent(TimelineEventType.handleOutcome, "pw-8", 8, previous: "pw-7", run: run,
                          handle: handle, payload: .object(["state": .string("completed")])),
-        persistentEvent(TimelineEventType.runFinished, "pw-9", 9, previous: "pw-8", run: run),
+        persistentEvent(TimelineEventType.runFinished, "pw-9", 9, previous: "pw-8", run: run,
+                         session: session, attachment: attachment),
         persistentEvent(TimelineEventType.sessionDetached, "pw-10", 10, previous: "pw-9",
                          session: session, attachment: attachment),
         persistentEvent(TimelineEventType.commandAccepted, "pw-11", 11, previous: "pw-10",
@@ -126,6 +129,7 @@ private func testPersistentWorkExactStatePersistsChildAndRecoveryMetadata() thro
                         payload: .object(["child_id": .string("child-1"),
                                           "state": .string("running")])),
         persistentEvent(TimelineEventType.runStarted, "cr-4", 4, previous: "cr-3", run: run,
+                        session: session, attachment: attachment,
                         payload: .object(["model_id": .string("recovery-model")])),
         persistentEvent(TimelineEventType.recoveryCoverage, "cr-5", 5, previous: "cr-4",
                         run: run, session: session, attachment: attachment,
@@ -336,6 +340,61 @@ private func testPersistentWorkExactStateReopenRejectsDuplicate() throws {
     XCTAssertEqual(reopened.eventLocalSnapshot.lastSequence, first.eventLocalSnapshot.lastSequence)
 }
 
+private func testPersistentWorkExactStateReopenPreservesActiveRunOwner() throws {
+    let directory = try persistentDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let map = try persistentMap(at: directory)
+    let session = SessionRef("reopen-owner-session")
+    let attachment = SessionAttachmentRef("reopen-owner-attachment")
+    let run = RunRef("reopen-owner-run")
+    let turn = TurnRef("reopen-owner-turn")
+
+    var state = try PersistentWorkExactState(map: map)
+    var root = try state.apply(persistentEvent(
+        TimelineEventType.workCreated, "owner-1", 1)).root
+    state = try PersistentWorkExactState(map: map, root: root)
+    root = try state.apply(persistentEvent(
+        TimelineEventType.sessionAttached, "owner-2", 2, previous: "owner-1",
+        session: session, attachment: attachment)).root
+
+    // A cold reopen must retain the exact attachment membership needed to authenticate
+    // run.started, and the resulting owner must survive another reopen while the Run lives.
+    state = try PersistentWorkExactState(map: map, root: root)
+    let started = try state.apply(persistentEvent(
+        TimelineEventType.runStarted, "owner-3", 3, previous: "owner-2", run: run,
+        session: session, attachment: attachment,
+        payload: .object(["model_id": .string("owner-model")])) )
+    XCTAssertEqual(started.eventLocalSnapshot.activeRun, run)
+    XCTAssertEqual(started.eventLocalSnapshot.activeRunSession, session)
+    XCTAssertEqual(started.eventLocalSnapshot.activeRunSessionAttachment, attachment)
+
+    state = try PersistentWorkExactState(map: map, root: started.root)
+    let modeled = try state.apply(persistentEvent(
+        TimelineEventType.modelChanged, "owner-4", 4, previous: "owner-3", run: run,
+        payload: .object(["model_id": .string("owner-model-2")])) )
+    XCTAssertEqual(modeled.eventLocalSnapshot.activeRunSession, session)
+    XCTAssertEqual(modeled.eventLocalSnapshot.activeRunSessionAttachment, attachment)
+
+    state = try PersistentWorkExactState(map: map, root: modeled.root)
+    let turned = try state.apply(persistentEvent(
+        TimelineEventType.turnStarted, "owner-5", 5, previous: "owner-4", run: run,
+        turn: turn))
+    XCTAssertEqual(turned.eventLocalSnapshot.activeRunSession, session)
+    XCTAssertEqual(turned.eventLocalSnapshot.activeRunSessionAttachment, attachment)
+
+    state = try PersistentWorkExactState(map: map, root: turned.root)
+    let turnFinished = try state.apply(persistentEvent(
+        TimelineEventType.turnFinished, "owner-6", 6, previous: "owner-5", run: run,
+        turn: turn))
+    state = try PersistentWorkExactState(map: map, root: turnFinished.root)
+    let finished = try state.apply(persistentEvent(
+        TimelineEventType.runFinished, "owner-7", 7, previous: "owner-6", run: run,
+        session: session, attachment: attachment))
+    XCTAssertNil(finished.eventLocalSnapshot.activeRun)
+    XCTAssertNil(finished.eventLocalSnapshot.activeRunSession)
+    XCTAssertNil(finished.eventLocalSnapshot.activeRunSessionAttachment)
+}
+
 private func testPersistentWorkExactStateReattachCounts() throws {
     let directory = try persistentDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -422,7 +481,7 @@ private func testPersistentWorkExactStateUnknownQuarantinePrivacy() throws {
                                                       previous: "privacy-2", payload: .object(["model_id": .string("m")])))
     XCTAssertEqual(evidence.eventLocalSnapshot.unknownDomains, [.runtime])
     XCTAssertFalse(evidence.eventLocalSnapshot.corruptionReasons.isEmpty)
-    let bytes = try map.lookup(root: evidence.root, key: "work-exact-v1/scalar").value
+    let bytes = try map.lookup(root: evidence.root, key: "work-exact-v2/scalar").value
     XCTAssertNotNil(bytes)
     XCTAssertFalse(String(data: bytes!, encoding: .utf8)?.contains("do-not-persist") == true)
     let enumerator = try XCTUnwrap(FileManager.default.enumerator(
@@ -505,7 +564,7 @@ private func testPersistentWorkExactStateRejectsScalarWithoutExactWorkIdentity()
     var state = try PersistentWorkExactState(map: map)
     let root = try state.apply(persistentEvent(
         TimelineEventType.workCreated, "scalar-identity-1", 1)).root
-    let key = "work-exact-v1/scalar"
+    let key = "work-exact-v2/scalar"
     let encoded = try XCTUnwrap(try map.lookup(root: root, key: key).value)
     guard case .object(var object) = try XCTUnwrap(JSONValue.parse(encoded)) else {
         XCTFail("scalar record was not an object")
@@ -545,7 +604,7 @@ private func testPersistentWorkExactStateRejectsImpossibleAttachmentCount() thro
     let kind = "attachment-count"
     let identity = session.sessionID
     let material = "work-exact-slot-v1\0\(kind.count):\(kind)\0\(identity.utf8.count):\(identity)"
-    let key = "work-exact-v1/\(kind)/"
+    let key = "work-exact-v2/\(kind)/"
         + AviarySHA256.hash(data: Data(material.utf8)).description
     let forged = try JSONEncoder().encode(ForgedCountRecord(
         kind: kind, scope: persistentJournal.stableKey,
@@ -587,7 +646,7 @@ private func testPersistentWorkExactStateRejectsFeasibleButFalseAttachmentMember
     let kind = "attachment-count"
     let identity = session.sessionID
     let material = "work-exact-slot-v1\0\(kind.count):\(kind)\0\(identity.utf8.count):\(identity)"
-    let key = "work-exact-v1/\(kind)/"
+    let key = "work-exact-v2/\(kind)/"
         + AviarySHA256.hash(data: Data(material.utf8)).description
     let forged = try JSONEncoder().encode(ForgedCountRecord(
         kind: kind, scope: persistentJournal.stableKey, session: session, count: 2,
@@ -648,7 +707,7 @@ private func testPersistentWorkExactStateRejectsSequenceBoundaryWithoutPublishin
         activeActionCount: 0, outstandingHandleCount: 0,
         lastUnknownEventID: nil, lastQuarantineEventID: nil)
     let forgedRoot = try map.setting(
-        root: initialRoot, key: "work-exact-v1/scalar",
+        root: initialRoot, key: "work-exact-v2/scalar",
         value: try JSONEncoder().encode(forgedScalar)).newRoot
     for event in [
         persistentEvent(
@@ -680,6 +739,9 @@ let casesPersistentWorkExactState: [Case] = [
     }),
     ("phase3 persistent Work exact state rejects duplicate after reopen", {
         try testPersistentWorkExactStateReopenRejectsDuplicate()
+    }),
+    ("phase3 persistent Work exact state preserves active Run owner after reopen", {
+        try testPersistentWorkExactStateReopenPreservesActiveRunOwner()
     }),
     ("phase3 persistent Work exact state keeps reattach counts exact", {
         try testPersistentWorkExactStateReattachCounts()

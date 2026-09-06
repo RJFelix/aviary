@@ -583,6 +583,7 @@ func testDisposableProjectionStoreFreshCommitLoadAndBodies() throws {
     XCTAssertEqual(snapshot.nextSequence, 3)
     XCTAssertEqual(snapshot.currentBucket?.rowCount, 2)
     XCTAssertEqual(snapshot.recentPages.count, 1)
+    XCTAssertFalse(snapshot.recentEventsOmitted)
     XCTAssertNotNil(snapshot.reducerHead)
     XCTAssertEqual(snapshot.pendingAcknowledgements.count, 1)
 
@@ -1294,6 +1295,23 @@ func testDisposableProjectionStoreBindsPagesAnchorsSeedsAndSessionAcknowledgemen
             rows: rows, currentBucket: .init(bucketStart: 1, rows: rows),
             recentPages: [projectionStorePage(events: [events[0], tamperedEvent])]))
         XCTFail("recent pages must be exact views of their indexed canonical events")
+    } catch DisposableTimelineProjectionStore.StoreError.invalidCommit(.chainMismatch) {
+        XCTAssertTrue(true)
+    }
+
+    let gapEvents = projectionStoreEvents(count: 3)
+    let gapRows = try projectionStoreRows(for: gapEvents)
+    let gapPageStore = try DisposableTimelineProjectionStore(
+        directory: root.appending(path: "gap-page-store", directoryHint: .isDirectory),
+        journal: projectionStoreJournal)
+    do {
+        _ = try gapPageStore.commit(projectionStoreCommit(
+            rows: gapRows, currentBucket: .init(bucketStart: 1, rows: gapRows),
+            recentPages: [
+                projectionStorePage(events: [gapEvents[0]], id: "recent-one"),
+                projectionStorePage(events: [gapEvents[2]], id: "recent-three"),
+            ]))
+        XCTFail("recent pages may not silently omit an event between pages")
     } catch DisposableTimelineProjectionStore.StoreError.invalidCommit(.chainMismatch) {
         XCTAssertTrue(true)
     }

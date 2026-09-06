@@ -7,6 +7,7 @@ import PackageDescription
 // loopback, trash, or relative-date code merely because it happens to live beside the daemon.
 let packagePlatforms: [SupportedPlatform]? = nil
 let linuxCoreSources: [String] = [
+    "AttachmentQualifiedIdentity.swift",
     "AgentTree.swift",
     "AviaryPlatform.swift",
     "AviaryFormatting.swift",
@@ -43,6 +44,7 @@ let linuxCoreSources: [String] = [
     "NativeColdResume.swift",
     "NativeSessionCommandJournal.swift",
     "PersistentProjectionRadixMap.swift",
+    "PersistentSessionExactState.swift",
     "PersistentWorkExactState.swift",
     "Providers.swift",
     "RunConfiguration.swift",
@@ -54,6 +56,9 @@ let linuxCoreSources: [String] = [
     "Shell.swift",
     "SessionAssembler.swift",
     "ServiceBackedCreateIntentStore.swift",
+    "ServiceBackedCreateSessionIntentStore.swift",
+    "ServiceBackedGUIOrchestration.swift",
+    "ServiceBackedGUIControlPolicy.swift",
     "ServiceBackedStartIntentStore.swift",
     "SkillGate.swift",
     "SubAgents.swift",
@@ -84,6 +89,7 @@ let linuxCoreSources: [String] = [
     "WireLog.swift",
 ]
 let linuxSelfTestSources: [String] = [
+    "AttachmentQualifiedIdentityTests.swift",
     "AviaryPlatformTests.swift",
     "BoundedTimelineReducerProjectionTests.swift",
     "DisposableTimelineProjectionStoreTests.swift",
@@ -91,6 +97,7 @@ let linuxSelfTestSources: [String] = [
     "LocalTimelineProjectionReaderTests.swift",
     "LocalTimelineProjectionSourceTests.swift",
     "PersistentProjectionRadixMapTests.swift",
+    "PersistentSessionExactStateTests.swift",
     "PersistentWorkExactStateTests.swift",
     "WorkHostDaemonEndpointTests.swift",
     "WorkHostDaemonProcessTests.swift",
@@ -103,6 +110,8 @@ let linuxSelfTestSources: [String] = [
     "ShellTests.swift",
     "SessionReducerTransitionTests.swift",
     "ServiceBackedIntentStoreTests.swift",
+    "ServiceBackedGUIOrchestrationTests.swift",
+    "ServiceBackedGUIControlPolicyTests.swift",
     "LinuxSelfTestMain.swift",
 ]
 #else

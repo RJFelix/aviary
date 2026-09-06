@@ -13,6 +13,7 @@ private enum WorkHostControlLimits {
     static let maxDigestCharacters = 80
     static let sourceAbsenceVerificationChunkBytes = 64 * 1024
     static let maxDurabilitySealBytes = 16 * 1024
+    static let maxProjectedRegistrationPrefixBytes = 64 * 1024 * 1024
     /// Temporary supported state envelope until the persistent projection store lands. This is a
     /// record-count bound, not a journal byte ceiling; it keeps reducer copy-on-write costs
     /// explicit rather than silently accepting an unbounded projection.
@@ -203,12 +204,33 @@ public struct WorkHostControlJournalReadMetrics: Codable, Hashable, Sendable {
     public let targetVerificationBytesScanned: Int
     public let targetVerificationChunks: Int
     public let targetVerificationPeakChunkBytes: Int
+    /// Durable Work source projection observations. These are separate from control-journal
+    /// bytes because the Work projection is a source-read adapter, not control authority.
+    public let projectedWorkReadCalls: Int
+    public let projectedWorkCacheHits: Int
+    public let projectedWorkBytesRead: Int
+    public let projectedWorkSuffixBytesRead: Int
+    public let projectedWorkPrefixBytesRead: Int
+    /// Durable Session source projection observations. Session and Work are measured separately
+    /// because either journal may grow independently and neither total should disguise the
+    /// other's canonical verification cost.
+    public let projectedSessionReadCalls: Int
+    public let projectedSessionCacheHits: Int
+    public let projectedSessionBytesRead: Int
+    public let projectedSessionSuffixBytesRead: Int
+    public let projectedSessionPrefixBytesRead: Int
 
     public init(
         fullReads: Int = 0, cacheHits: Int = 0, incrementalReads: Int = 0,
         invalidations: Int = 0, bytesScanned: Int = 0, recordsApplied: Int = 0,
         targetVerificationBytesScanned: Int = 0, targetVerificationChunks: Int = 0,
-        targetVerificationPeakChunkBytes: Int = 0
+        targetVerificationPeakChunkBytes: Int = 0,
+        projectedWorkReadCalls: Int = 0, projectedWorkCacheHits: Int = 0,
+        projectedWorkBytesRead: Int = 0, projectedWorkSuffixBytesRead: Int = 0,
+        projectedWorkPrefixBytesRead: Int = 0,
+        projectedSessionReadCalls: Int = 0, projectedSessionCacheHits: Int = 0,
+        projectedSessionBytesRead: Int = 0, projectedSessionSuffixBytesRead: Int = 0,
+        projectedSessionPrefixBytesRead: Int = 0
     ) {
         self.fullReads = fullReads
         self.cacheHits = cacheHits
@@ -219,6 +241,16 @@ public struct WorkHostControlJournalReadMetrics: Codable, Hashable, Sendable {
         self.targetVerificationBytesScanned = targetVerificationBytesScanned
         self.targetVerificationChunks = targetVerificationChunks
         self.targetVerificationPeakChunkBytes = targetVerificationPeakChunkBytes
+        self.projectedWorkReadCalls = max(0, projectedWorkReadCalls)
+        self.projectedWorkCacheHits = max(0, projectedWorkCacheHits)
+        self.projectedWorkBytesRead = max(0, projectedWorkBytesRead)
+        self.projectedWorkSuffixBytesRead = max(0, projectedWorkSuffixBytesRead)
+        self.projectedWorkPrefixBytesRead = max(0, projectedWorkPrefixBytesRead)
+        self.projectedSessionReadCalls = max(0, projectedSessionReadCalls)
+        self.projectedSessionCacheHits = max(0, projectedSessionCacheHits)
+        self.projectedSessionBytesRead = max(0, projectedSessionBytesRead)
+        self.projectedSessionSuffixBytesRead = max(0, projectedSessionSuffixBytesRead)
+        self.projectedSessionPrefixBytesRead = max(0, projectedSessionPrefixBytesRead)
     }
 }
 
@@ -2794,7 +2826,26 @@ public actor WorkHostControlJournal {
         client: ClientRef,
         commandID: String
     ) async -> WorkHostControlCreationProjectionResult {
-        let outcome = verifyCreationSourcesNow(client: client, commandID: commandID)
+        await verifiedCreationProjection(
+            client: client, commandID: commandID,
+            canonicalWork: nil, canonicalSession: nil)
+    }
+
+    /// Verify a creation registration with an optional live canonical observation supplied by
+    /// its owning RunJournalBundle. A live Work read is authoritative only for this actor call;
+    /// it is accepted under the writer's lock and still has to prove the exact registered prefix
+    /// and a re-read of the control registration. A supplied observation for another Session is
+    /// never substituted for the registration's Session; alternate active bindings use the
+    /// Work-only form while the registered Session is checked through the cold path.
+    public func verifiedCreationProjection(
+        client: ClientRef,
+        commandID: String,
+        canonicalWork: TimelineJournalCanonicalRead?,
+        canonicalSession: TimelineJournalCanonicalRead?
+    ) async -> WorkHostControlCreationProjectionResult {
+        let outcome = verifyCreationSourcesNow(
+            client: client, commandID: commandID,
+            canonicalWork: canonicalWork, canonicalSession: canonicalSession)
         guard let snapshot = outcome.snapshot,
               let creation = snapshot.creation(client: client, commandID: commandID) else {
             return WorkHostControlCreationProjectionResult(
@@ -2815,7 +2866,9 @@ public actor WorkHostControlJournal {
 
     private func verifyCreationSourcesNow(
         client: ClientRef,
-        commandID: String
+        commandID: String,
+        canonicalWork: TimelineJournalCanonicalRead? = nil,
+        canonicalSession: TimelineJournalCanonicalRead? = nil
     ) -> WorkHostControlCreationVerificationOutcome {
         guard controlFailure == nil else {
             return WorkHostControlCreationVerificationOutcome(
@@ -2858,20 +2911,56 @@ public actor WorkHostControlJournal {
                     sourcePresence: .unverified, failure: .controlJournalUnavailable))
         }
 
-        let workObservation = observeSourceJournal(
-            registration.workJournal,
-            cursor: registration.workGenesisCursor,
-            expectedWork: registration.reservation.work,
-            expectedSession: registration.reservation.session,
-            expectedAttachment: registration.reservation.sessionAttachment,
-            expectedGenesisType: TimelineEventType.workCreated)
-        let sessionObservation = observeSourceJournal(
-            registration.sessionJournal,
-            cursor: registration.sessionGenesisCursor,
-            expectedWork: registration.reservation.work,
-            expectedSession: registration.reservation.session,
-            expectedAttachment: registration.reservation.sessionAttachment,
-            expectedGenesisType: TimelineEventType.sessionCreated)
+        let workObservation: WorkHostControlSourceObservation = if let canonicalWork {
+            observeSuppliedWorkSource(
+                canonicalWork, cursor: registration.workGenesisCursor,
+                expectedWork: registration.reservation.work,
+                expectedSession: registration.reservation.session,
+                expectedAttachment: registration.reservation.sessionAttachment)
+        } else {
+            observeSourceJournal(
+                registration.workJournal,
+                cursor: registration.workGenesisCursor,
+                expectedWork: registration.reservation.work,
+                expectedSession: registration.reservation.session,
+                expectedAttachment: registration.reservation.sessionAttachment,
+                expectedGenesisType: TimelineEventType.workCreated)
+        }
+        let sessionObservation: WorkHostControlSourceObservation = if let canonicalSession,
+            canonicalSession.journal == registration.sessionJournal {
+            observeSuppliedSessionSource(
+                canonicalSession, cursor: registration.sessionGenesisCursor,
+                expectedWork: registration.reservation.work,
+                expectedSession: registration.reservation.session,
+                expectedAttachment: registration.reservation.sessionAttachment)
+        } else {
+            observeSourceJournal(
+                registration.sessionJournal,
+                cursor: registration.sessionGenesisCursor,
+                expectedWork: registration.reservation.work,
+                expectedSession: registration.reservation.session,
+                expectedAttachment: registration.reservation.sessionAttachment,
+                expectedGenesisType: TimelineEventType.sessionCreated)
+        }
+
+        // Source reads can suspend in the live bundle or race a control mutation. Never project
+        // a success-shaped registration from the first snapshot if the control registration has
+        // changed in the meantime.
+        let rechecked: WorkHostControlSnapshot
+        do {
+            rechecked = try readControlState().snapshot
+        } catch {
+            return WorkHostControlCreationVerificationOutcome(
+                snapshot: current,
+                verification: WorkHostControlCreationSourceVerification(
+                    sourcePresence: .unverified, failure: .controlJournalUnavailable))
+        }
+        guard rechecked.creation(client: client, commandID: commandID)?.registration == registration else {
+            return WorkHostControlCreationVerificationOutcome(
+                snapshot: rechecked,
+                verification: WorkHostControlCreationSourceVerification(
+                    sourcePresence: .unverified, failure: .registrationMissing))
+        }
 
         switch (workObservation, sessionObservation) {
         case (.valid(let workEvidence), .valid(let sessionEvidence)):
@@ -2880,14 +2969,14 @@ public actor WorkHostControlJournal {
                   sessionEvidence.attachments == expected,
                   workEvidence.attachments == sessionEvidence.attachments else {
                 return WorkHostControlCreationVerificationOutcome(
-                    snapshot: current,
+                    snapshot: rechecked,
                     verification: WorkHostControlCreationSourceVerification(
                         sourcePresence: .unverified, failure: .attachmentMirrorMismatch,
                         workSourceDigest: workEvidence.dataDigest,
                         sessionSourceDigest: sessionEvidence.dataDigest))
             }
             return WorkHostControlCreationVerificationOutcome(
-                snapshot: current,
+                snapshot: rechecked,
                 verification: WorkHostControlCreationSourceVerification(
                     sourcePresence: .verified,
                     workSourceDigest: workEvidence.dataDigest,
@@ -2895,19 +2984,19 @@ public actor WorkHostControlJournal {
 
         case (.valid, let sessionObservation):
             return WorkHostControlCreationVerificationOutcome(
-                snapshot: current,
+                snapshot: rechecked,
                 verification: WorkHostControlCreationSourceVerification(
                     sourcePresence: .workOnly,
                     failure: sourceVerificationFailure(sessionObservation, source: .session)))
         case (let workObservation, .valid):
             return WorkHostControlCreationVerificationOutcome(
-                snapshot: current,
+                snapshot: rechecked,
                 verification: WorkHostControlCreationSourceVerification(
                     sourcePresence: .sessionOnly,
                     failure: sourceVerificationFailure(workObservation, source: .work)))
         case (.missing, .missing):
             return WorkHostControlCreationVerificationOutcome(
-                snapshot: current,
+                snapshot: rechecked,
                 verification: WorkHostControlCreationSourceVerification(
                     sourcePresence: .none, failure: .bothSourcesMissing))
         case (let workObservation, let sessionObservation):
@@ -2919,7 +3008,7 @@ public actor WorkHostControlJournal {
                 failure = sourceVerificationFailure(workObservation, source: .work)
             }
             return WorkHostControlCreationVerificationOutcome(
-                snapshot: current,
+                snapshot: rechecked,
                 verification: WorkHostControlCreationSourceVerification(
                     sourcePresence: .unverified, failure: failure))
         }
@@ -3339,80 +3428,416 @@ public actor WorkHostControlJournal {
             return .mismatch
         }
 
-        guard FileManager.default.fileExists(atPath: sourceURL.path) else {
-            return .missing
+        // Work and Session source verification are long-lived production read paths. Use each
+        // durable projection/typed exact-state checkpoint for the whole current source, then
+        // read only the registered prefix to preserve the creation-pair digest and attachment
+        // evidence.
+        if case .work = sourceJournal.owner {
+            return observeProjectedWorkSource(
+                sourceJournal, home: home, sourceURL: sourceURL, cursor: cursor,
+                expectedWork: expectedWork, expectedSession: expectedSession,
+                expectedAttachment: expectedAttachment,
+                expectedGenesisType: expectedGenesisType)
         }
-        let data: Data
-        do {
-            data = try Self.readFileData(at: sourceURL)
-        } catch {
-            return .unreadable
+        if case .session = sourceJournal.owner {
+            return observeProjectedSessionSource(
+                sourceJournal, home: home, sourceURL: sourceURL, cursor: cursor,
+                expectedWork: expectedWork, expectedSession: expectedSession,
+                expectedAttachment: expectedAttachment,
+                expectedGenesisType: expectedGenesisType)
         }
-        let read = TimelineJournalReader.read(
-            data, journal: sourceJournal, actor: readerActor,
-            hostRecordedAt: Date(timeIntervalSince1970: 0))
-        guard read.quarantinedSuffix == nil,
-              read.truncatedTail == nil,
-              !read.records.isEmpty else {
-            return .incomplete
-        }
+        return .mismatch
 
-        // A registration cursor names the exact prefix observed by the control transaction;
-        // it is not required to remain the source journal's current tip. Locate that prefix
-        // before checking semantic genesis/attachment evidence. The complete read above still
-        // validates every later record, so a corrupt or unverifiable suffix cannot be hidden by
-        // an earlier registered cursor.
-        guard cursor.sequence > 0,
-              cursor.sequence <= read.records.count,
-              read.records[cursor.sequence - 1].event.sequence == cursor.sequence,
-              read.records[cursor.sequence - 1].event.eventID == cursor.eventID else {
+    }
+
+    /// Validate the exact registered prefix against a writer-owned live read. This path never
+    /// opens the source file itself: the supplied read was produced by the owning writer while
+    /// its lock was held. The registration is still checked here because a live Work actor may
+    /// belong to a different Session than the original creation reservation.
+    private func observeSuppliedWorkSource(
+        _ read: TimelineJournalCanonicalRead,
+        cursor: JournalCursor,
+        expectedWork: WorkRef,
+        expectedSession: SessionRef,
+        expectedAttachment: SessionAttachmentRef
+    ) -> WorkHostControlSourceObservation {
+        let registrationRecords: [TimelineJournalRecord]
+        if read.isFullyResident {
+            guard read.records.count == read.eventCount else { return .mismatch }
+            registrationRecords = read.records
+        } else {
+            guard read.records.isEmpty,
+                  !read.prefixRecords.isEmpty,
+                  read.prefixRecords.count <= read.eventCount,
+                  cursor.sequence <= read.prefixRecords.count else { return .mismatch }
+            registrationRecords = read.prefixRecords
+        }
+        guard read.journal == cursor.journal,
+              read.source.journal == read.journal,
+              read.source.cursor == JournalCursor(
+                  journal: read.journal, eventID: read.lastEvent.event.eventID,
+                  sequence: read.lastEvent.event.sequence),
+              read.source.prefixByteCount == read.source.sourceByteCount,
+              case .work(let head) = read.projection,
+              head.source == read.source,
+              head.work == expectedWork,
+              head.workHost == workHost,
+              head.structuralIntegrityValid,
+              head.semanticProjectionValid,
+              let workSnapshot = read.workSnapshot,
+              workSnapshot.work == expectedWork,
+              workSnapshot.workHost == workHost else {
             return .mismatch
         }
-        let registeredRecords = Array(read.records.prefix(cursor.sequence))
+        return validateSuppliedPrefix(
+            registrationRecords.map(\.event), cursor: cursor,
+            expectedWork: expectedWork, expectedSession: expectedSession,
+            expectedAttachment: expectedAttachment, requireWorkHost: true,
+            expectedGenesisType: TimelineEventType.workCreated,
+            dataDigest: "sha256:" + read.source.prefixDigest,
+            allowAlternateSessionEnvelopes: true,
+            knownSessionAttachments: workSnapshot.sessionAttachments)
+    }
 
+    private func observeSuppliedSessionSource(
+        _ read: TimelineJournalCanonicalRead,
+        cursor: JournalCursor,
+        expectedWork: WorkRef,
+        expectedSession: SessionRef,
+        expectedAttachment: SessionAttachmentRef
+    ) -> WorkHostControlSourceObservation {
+        let registrationRecords: [TimelineJournalRecord]
+        if read.isFullyResident {
+            guard read.records.count == read.eventCount else { return .mismatch }
+            registrationRecords = read.records
+        } else {
+            guard read.records.isEmpty,
+                  !read.prefixRecords.isEmpty,
+                  read.prefixRecords.count <= read.eventCount,
+                  cursor.sequence <= read.prefixRecords.count else { return .mismatch }
+            registrationRecords = read.prefixRecords
+        }
+        guard read.journal == cursor.journal,
+              read.source.journal == read.journal,
+              read.source.cursor == JournalCursor(
+                  journal: read.journal, eventID: read.lastEvent.event.eventID,
+                  sequence: read.lastEvent.event.sequence),
+              read.source.prefixByteCount == read.source.sourceByteCount,
+              case .session(let head) = read.projection,
+              head.source == read.source,
+              head.session == expectedSession,
+              head.structuralIntegrityValid,
+              head.semanticProjectionValid else {
+            return .mismatch
+        }
+        return validateSuppliedPrefix(
+            registrationRecords.map(\.event), cursor: cursor,
+            expectedWork: expectedWork, expectedSession: expectedSession,
+            expectedAttachment: expectedAttachment, requireWorkHost: false,
+            expectedGenesisType: TimelineEventType.sessionCreated,
+            dataDigest: "sha256:" + read.source.prefixDigest)
+    }
+
+    private func validateSuppliedPrefix(
+        _ events: [TimelineEvent],
+        cursor: JournalCursor,
+        expectedWork: WorkRef,
+        expectedSession: SessionRef,
+        expectedAttachment: SessionAttachmentRef,
+        requireWorkHost: Bool,
+        expectedGenesisType: String,
+        dataDigest: String,
+        allowAlternateSessionEnvelopes: Bool = false,
+        knownSessionAttachments: [String: WorkSessionAttachmentSnapshot] = [:]
+    ) -> WorkHostControlSourceObservation {
+        guard cursor.sequence > 0,
+              cursor.sequence <= events.count,
+              let terminal = events.first(where: { $0.sequence == cursor.sequence }),
+              terminal.eventID == cursor.eventID else { return .mismatch }
+        let registered = Array(events.prefix(cursor.sequence))
+        guard registered.count == cursor.sequence,
+              let first = registered.first,
+              first.sequence == 1,
+              first.type == expectedGenesisType,
+              registered.dropFirst().allSatisfy({ $0.type != expectedGenesisType }) else {
+            return .mismatch
+        }
         var previousEventID: String?
         var eventIDs = Set<String>()
         var attachments = Set<SessionAttachmentRef>()
-        for (offset, record) in read.records.enumerated() {
-            let event = record.event
-            let isRegisteredPrefix = offset < cursor.sequence
-            guard event.journal == sourceJournal,
-                  event.sequence == offset + 1,
+        for event in registered {
+            guard event.journal == cursor.journal,
+                  event.sequence == eventIDs.count + 1,
                   event.previousEventID == previousEventID,
                   event.provenance == .native,
                   event.schemaVersion == TimelineEvent.currentSchemaVersion,
                   event.payloadVersion <= 1,
                   event.isKnownType,
-                  controlBoundedIdentity(event.eventID),
-                  eventIDs.insert(event.eventID).inserted else {
-                return .mismatch
-            }
-            switch sourceJournal.owner {
-            case .work:
-                // The journal owner and Work Host authority are invariant for the entire
-                // physical Work journal. Session/attachment identity is creation-pair evidence
-                // only for the registered prefix: a Work can later be attached to many Sessions.
-                guard event.work == expectedWork, event.workHost == workHost,
-                      event.session.map({ controlBoundedIdentity($0.sessionID) }) ?? true,
-                      event.sessionAttachment.map({ controlBoundedIdentity($0.attachmentID) }) ?? true else {
+                  eventIDs.insert(event.eventID).inserted,
+                  event.work == expectedWork || event.work == nil else { return .mismatch }
+            if allowAlternateSessionEnvelopes {
+                switch (event.session, event.sessionAttachment) {
+                case (nil, nil):
+                    break
+                case (.some(let session), .some(let attachment)):
+                    guard knownSessionAttachments[attachment.attachmentID].map({
+                        $0.session == session
+                    }) == true else { return .mismatch }
+                default:
                     return .mismatch
                 }
-                if isRegisteredPrefix {
-                    guard event.session.map({ $0 == expectedSession }) ?? true,
-                          event.sessionAttachment.map({ $0 == expectedAttachment }) ?? true else {
+            } else {
+                guard event.session == expectedSession || event.session == nil,
+                      event.sessionAttachment == expectedAttachment
+                          || event.sessionAttachment == nil else { return .mismatch }
+            }
+            if requireWorkHost {
+                guard event.workHost == workHost || event.workHost == nil else {
+                    return .mismatch
+                }
+            }
+            if event.type == TimelineEventType.sessionAttached {
+                guard event.work == expectedWork else { return .mismatch }
+                if allowAlternateSessionEnvelopes {
+                    guard let session = event.session,
+                          let attachment = event.sessionAttachment,
+                          knownSessionAttachments[attachment.attachmentID].map({
+                              $0.session == session
+                          }) == true else {
                         return .mismatch
                     }
+                    if session == expectedSession && attachment == expectedAttachment {
+                        attachments.insert(expectedAttachment)
+                    }
+                } else {
+                    guard event.session == expectedSession,
+                          event.sessionAttachment == expectedAttachment else {
+                        return .mismatch
+                    }
+                    attachments.insert(expectedAttachment)
                 }
-            case .session:
-                // A Session journal is owned by one Session, but that Session may validly
-                // reference more than one Work over its lifetime. Keep the owner identity
-                // strict while limiting the creation-pair Work/attachment check to the prefix.
-                guard let eventSession = event.session,
-                      eventSession == expectedSession,
-                      controlBoundedIdentity(eventSession.sessionID),
-                      event.sessionAttachment.map({ controlBoundedIdentity($0.attachmentID) }) ?? true else {
+            }
+            previousEventID = event.eventID
+        }
+        return .valid(WorkHostControlSourceJournalEvidence(
+            attachments: attachments, dataDigest: dataDigest))
+    }
+
+    /// Verify a Work source through its persistent projection. The projection head authenticates
+    /// the complete canonical tip and exact reducer state; the small prefix read is retained only
+    /// for the control registration's exact genesis/attachment/digest proof. No projection result
+    /// is accepted as a second authority or as a substitute for the canonical prefix bytes.
+    private func observeProjectedWorkSource(
+        _ sourceJournal: JournalRef,
+        home: AgentHome,
+        sourceURL: URL,
+        cursor: JournalCursor,
+        expectedWork: WorkRef,
+        expectedSession: SessionRef,
+        expectedAttachment: SessionAttachmentRef,
+        expectedGenesisType: String,
+        cacheRepairAttempted: Bool = false
+    ) -> WorkHostControlSourceObservation {
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else { return .missing }
+        guard cursor.sequence > 0, cursor.eventID != nil else { return .mismatch }
+        let projectionDigest = AviarySHA256.hash(data: Data(sourceJournal.stableKey.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        let projectionDirectory = home.timelineV2Dir
+            .appending(path: "projections", directoryHint: .isDirectory)
+            .appending(path: "work-host-control", directoryHint: .isDirectory)
+            .appending(path: projectionDigest, directoryHint: .isDirectory)
+        do {
+            let store = try DisposableTimelineProjectionStore(
+                directory: projectionDirectory, journal: sourceJournal)
+            let reader = try LocalTimelineProjectionReader(
+                store: store, home: home,
+                limits: LocalTimelineProjectionReader.Limits(
+                    maximumBootstrapSourceBytes: 256 * 1024 * 1024))
+            addReadMetrics(projectedWorkReadCalls: 1)
+            let result = try reader.read()
+            addReadMetrics(
+                projectedWorkCacheHits: result.metrics.cacheHit ? 1 : 0,
+                projectedWorkBytesRead: result.metrics.bytesRead,
+                projectedWorkSuffixBytesRead: result.metrics.suffixBytesRead)
+            guard let head = result.reducerHead.work,
+                  head.source.journal == sourceJournal,
+                  head.source.cursor.sequence >= cursor.sequence,
+                  head.work == expectedWork,
+                  head.workHost == workHost else {
+                return .mismatch
+            }
+            // The canonical reducer reports a well-formed unknown/semantically invalid suffix as
+            // a mismatch. Incomplete is reserved for an uncommitted/quarantined tail below,
+            // matching the source verifier's pre-projection contract.
+            guard head.structuralIntegrityValid else { return .mismatch }
+            if head.coverage.unknownEventCount > 0 || head.coverage.corruptionCount > 0
+                    || !head.semanticProjectionValid {
+                return .mismatch
+            }
+            let bucket = try store.loadBucket(
+                containingSequence: cursor.sequence, proving: result.source)
+            guard let row = bucket.rows.first(where: { $0.sequence == cursor.sequence }),
+                  row.eventID == cursor.eventID,
+                  row.byteEnd > 0 else { return .mismatch }
+            let prefixData = try Self.readPrefixData(
+                at: sourceURL, offset: 0, expectedByteCount: row.byteEnd,
+                maximum: WorkHostControlLimits.maxProjectedRegistrationPrefixBytes,
+                expectedSourceByteCount: result.source.sourceByteCount)
+            addReadMetrics(projectedWorkPrefixBytesRead: prefixData.count)
+            let read = TimelineJournalReader.read(
+                prefixData, journal: sourceJournal, actor: readerActor,
+                hostRecordedAt: Date(timeIntervalSince1970: 0))
+            guard read.quarantinedSuffix == nil,
+                  read.truncatedTail == nil,
+                  read.records.count == cursor.sequence else { return .mismatch }
+            let registered = read.records.map(\.event)
+            guard let first = registered.first,
+                  first.sequence == 1,
+                  first.type == expectedGenesisType,
+                  registered.dropFirst().allSatisfy({ $0.type != expectedGenesisType }) else {
+                return .mismatch
+            }
+            var previousEventID: String?
+            var attachments = Set<SessionAttachmentRef>()
+            var eventIDs = Set<String>()
+            for event in registered {
+                guard event.journal == sourceJournal,
+                      event.sequence == eventIDs.count + 1,
+                      event.previousEventID == previousEventID,
+                      event.provenance == .native,
+                      event.schemaVersion == TimelineEvent.currentSchemaVersion,
+                      event.payloadVersion <= 1,
+                      event.isKnownType,
+                      controlBoundedIdentity(event.eventID),
+                      eventIDs.insert(event.eventID).inserted,
+                      event.work == expectedWork,
+                      event.workHost == workHost else { return .mismatch }
+                guard event.session.map({ $0 == expectedSession }) ?? true,
+                      event.sessionAttachment.map({ $0 == expectedAttachment }) ?? true else {
                     return .mismatch
                 }
+                if event.type == TimelineEventType.sessionAttached {
+                    guard event.session == expectedSession,
+                          event.work == expectedWork,
+                          event.sessionAttachment == expectedAttachment else { return .mismatch }
+                    attachments.insert(expectedAttachment)
+                }
+                previousEventID = event.eventID
+            }
+            return .valid(WorkHostControlSourceJournalEvidence(
+                attachments: attachments, dataDigest: controlSHA256(prefixData)))
+        } catch let error as LocalTimelineProjectionReader.ReaderError {
+            if (error == .cacheUnavailable || error == .sourceChanged
+                    || error == .invalidCachedProjection || error == .exactStateUnavailable),
+               !cacheRepairAttempted {
+                // The projection is disposable cache state.  A malformed HEAD/object must not
+                // turn an otherwise canonical source into a permanent registration failure;
+                // discard only this source's cache and retry from byte zero.  The source itself
+                // remains under the reader's owner lock and is still fully verified below.
+                try? FileManager.default.removeItem(at: projectionDirectory)
+                return observeProjectedWorkSource(
+                    sourceJournal, home: home, sourceURL: sourceURL, cursor: cursor,
+                    expectedWork: expectedWork, expectedSession: expectedSession,
+                    expectedAttachment: expectedAttachment,
+                    expectedGenesisType: expectedGenesisType, cacheRepairAttempted: true)
+            }
+            switch error {
+            case .malformedLine, .truncatedTail, .lineTooLarge:
+                return .incomplete
+            case .sourceChanged, .duplicateIdentity, .tooManyEvents, .sourceTooLarge,
+                 .invalidCachedProjection, .cacheUnavailable, .projectionFailed,
+                 .exactStateUnavailable, .storeRejected, .unsupportedJournal,
+                 .tooManyIndexedRows, .tooManyBuckets:
+                return .mismatch
+            }
+        } catch {
+            return .unreadable
+        }
+    }
+
+    /// Verify a Session source through its persistent projection. Session identity is fixed by
+    /// the journal owner, while Work identity is deliberately checked only for the registered
+    /// creation prefix because one Session may later attach to several Works.
+    private func observeProjectedSessionSource(
+        _ sourceJournal: JournalRef,
+        home: AgentHome,
+        sourceURL: URL,
+        cursor: JournalCursor,
+        expectedWork: WorkRef,
+        expectedSession: SessionRef,
+        expectedAttachment: SessionAttachmentRef,
+        expectedGenesisType: String,
+        cacheRepairAttempted: Bool = false
+    ) -> WorkHostControlSourceObservation {
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else { return .missing }
+        guard cursor.sequence > 0, cursor.eventID != nil else { return .mismatch }
+        let projectionDigest = AviarySHA256.hash(data: Data(sourceJournal.stableKey.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        let projectionDirectory = home.timelineV2Dir
+            .appending(path: "projections", directoryHint: .isDirectory)
+            .appending(path: "work-host-control", directoryHint: .isDirectory)
+            .appending(path: projectionDigest, directoryHint: .isDirectory)
+        do {
+            let store = try DisposableTimelineProjectionStore(
+                directory: projectionDirectory, journal: sourceJournal)
+            let reader = try LocalTimelineProjectionReader(
+                store: store, home: home,
+                limits: LocalTimelineProjectionReader.Limits(
+                    maximumBootstrapSourceBytes: 256 * 1024 * 1024))
+            addReadMetrics(projectedSessionReadCalls: 1)
+            let result = try reader.read()
+            addReadMetrics(
+                projectedSessionCacheHits: result.metrics.cacheHit ? 1 : 0,
+                projectedSessionBytesRead: result.metrics.bytesRead,
+                projectedSessionSuffixBytesRead: result.metrics.suffixBytesRead)
+            guard let head = result.reducerHead.session,
+                  head.source.journal == sourceJournal,
+                  head.source.cursor.sequence >= cursor.sequence,
+                  head.session == expectedSession else {
+                return .mismatch
+            }
+            guard head.structuralIntegrityValid else { return .mismatch }
+            if head.coverage.unknownEventCount > 0 || head.coverage.corruptionCount > 0
+                    || !head.semanticProjectionValid {
+                return .mismatch
+            }
+            let bucket = try store.loadBucket(
+                containingSequence: cursor.sequence, proving: result.source)
+            guard let row = bucket.rows.first(where: { $0.sequence == cursor.sequence }),
+                  row.eventID == cursor.eventID,
+                  row.byteEnd > 0 else { return .mismatch }
+            let prefixData = try Self.readPrefixData(
+                at: sourceURL, offset: 0, expectedByteCount: row.byteEnd,
+                maximum: WorkHostControlLimits.maxProjectedRegistrationPrefixBytes,
+                expectedSourceByteCount: result.source.sourceByteCount)
+            addReadMetrics(projectedSessionPrefixBytesRead: prefixData.count)
+            let read = TimelineJournalReader.read(
+                prefixData, journal: sourceJournal, actor: readerActor,
+                hostRecordedAt: Date(timeIntervalSince1970: 0))
+            guard read.quarantinedSuffix == nil,
+                  read.truncatedTail == nil,
+                  read.records.count == cursor.sequence else { return .mismatch }
+            let registered = read.records.map(\.event)
+            guard let first = registered.first,
+                  first.sequence == 1,
+                  first.type == expectedGenesisType,
+                  registered.dropFirst().allSatisfy({ $0.type != expectedGenesisType }) else {
+                return .mismatch
+            }
+            var previousEventID: String?
+            var attachments = Set<SessionAttachmentRef>()
+            var eventIDs = Set<String>()
+            for event in registered {
+                guard event.journal == sourceJournal,
+                      event.sequence == eventIDs.count + 1,
+                      event.previousEventID == previousEventID,
+                      event.provenance == .native,
+                      event.schemaVersion == TimelineEvent.currentSchemaVersion,
+                      event.payloadVersion <= 1,
+                      event.isKnownType,
+                      controlBoundedIdentity(event.eventID),
+                      eventIDs.insert(event.eventID).inserted,
+                      event.session == expectedSession else { return .mismatch }
                 if let eventWork = event.work {
                     guard controlBoundedIdentity(eventWork.workHostID),
                           controlBoundedIdentity(eventWork.workID),
@@ -3422,76 +3847,45 @@ public actor WorkHostControlJournal {
                 } else if event.workHost != nil {
                     return .mismatch
                 }
-                if isRegisteredPrefix {
-                    guard event.work.map({ $0 == expectedWork }) ?? true,
-                          event.workHost.map({ $0 == workHost }) ?? true,
-                          event.sessionAttachment.map({ $0 == expectedAttachment }) ?? true else {
-                        return .mismatch
-                    }
-                }
-            case .workHost:
-                return .mismatch
-            }
-            if event.type == TimelineEventType.sessionAttached {
-                // Every attachment event must carry a complete, bounded identity envelope. Only
-                // the registered prefix must mirror this creation's exact Session/Work pair.
-                guard let attachedSession = event.session,
-                      let attachedWork = event.work,
-                      let attachedAttachment = event.sessionAttachment,
-                      controlBoundedIdentity(attachedSession.sessionID),
-                      controlBoundedIdentity(attachedWork.workHostID),
-                      controlBoundedIdentity(attachedWork.workID),
-                      controlBoundedIdentity(attachedAttachment.attachmentID) else {
+                guard event.work.map({ $0 == expectedWork }) ?? true,
+                      event.workHost.map({ $0 == workHost }) ?? true,
+                      event.sessionAttachment.map({ $0 == expectedAttachment }) ?? true else {
                     return .mismatch
                 }
-                if isRegisteredPrefix {
-                    guard attachedSession == expectedSession,
-                          attachedWork == expectedWork,
-                          attachedAttachment == expectedAttachment else {
-                        return .mismatch
-                    }
+                if event.type == TimelineEventType.sessionAttached {
+                    guard event.work == expectedWork,
+                          event.sessionAttachment == expectedAttachment else { return .mismatch }
                     attachments.insert(expectedAttachment)
                 }
+                previousEventID = event.eventID
             }
-            previousEventID = event.eventID
-        }
-
-        // The envelope checks above are deliberately source-kind generic for suffix records, but
-        // the canonical reducers still own per-event semantic rules (for example, a Work-side
-        // attachment must have an identity envelope, and a Session attachment must reference a
-        // Work). Reduce the complete read so a foreign or otherwise malformed suffix cannot be
-        // hidden behind an earlier registered cursor.
-        switch sourceJournal.owner {
-        case .work:
-            let reduced = WorkReducer.reduce(read.records.map(\TimelineJournalRecord.event))
-            guard reduced.structuralIntegrityValid,
-                  reduced.semanticProjectionValid,
-                  reduced.unknownEvents.isEmpty else {
+            return .valid(WorkHostControlSourceJournalEvidence(
+                attachments: attachments, dataDigest: controlSHA256(prefixData)))
+        } catch let error as LocalTimelineProjectionReader.ReaderError {
+            if (error == .cacheUnavailable || error == .sourceChanged
+                    || error == .invalidCachedProjection || error == .exactStateUnavailable),
+               !cacheRepairAttempted {
+                // HEAD and exact-state objects are disposable. Rebuild after a cache boundary
+                // failure, but never relax the canonical prefix/suffix checks below.
+                try? FileManager.default.removeItem(at: projectionDirectory)
+                return observeProjectedSessionSource(
+                    sourceJournal, home: home, sourceURL: sourceURL, cursor: cursor,
+                    expectedWork: expectedWork, expectedSession: expectedSession,
+                    expectedAttachment: expectedAttachment,
+                    expectedGenesisType: expectedGenesisType, cacheRepairAttempted: true)
+            }
+            switch error {
+            case .malformedLine, .truncatedTail, .lineTooLarge:
+                return .incomplete
+            case .sourceChanged, .duplicateIdentity, .tooManyEvents, .sourceTooLarge,
+                 .invalidCachedProjection, .cacheUnavailable, .projectionFailed,
+                 .exactStateUnavailable, .storeRejected, .unsupportedJournal,
+                 .tooManyIndexedRows, .tooManyBuckets:
                 return .mismatch
             }
-        case .session:
-            let reduced = SessionReducer.reduce(read.records.map(\TimelineJournalRecord.event))
-            guard reduced.structuralIntegrityValid,
-                  reduced.semanticProjectionValid,
-                  reduced.unknownEvents.isEmpty else {
-                return .mismatch
-            }
-        case .workHost:
-            return .mismatch
+        } catch {
+            return .unreadable
         }
-
-        guard let first = registeredRecords.first?.event,
-              first.sequence == 1,
-              first.type == expectedGenesisType,
-              registeredRecords.dropFirst().allSatisfy({ $0.event.type != expectedGenesisType }) else {
-            return .mismatch
-        }
-        var registeredPrefixData = Data()
-        for record in registeredRecords {
-            registeredPrefixData.append(record.rawLineBytes)
-        }
-        return .valid(WorkHostControlSourceJournalEvidence(
-            attachments: attachments, dataDigest: controlSHA256(registeredPrefixData)))
     }
 
     private func sourceVerificationFailure(
@@ -3982,7 +4376,13 @@ public actor WorkHostControlJournal {
         fullReads: Int = 0, cacheHits: Int = 0, incrementalReads: Int = 0,
         invalidations: Int = 0, bytesScanned: Int = 0, recordsApplied: Int = 0,
         targetVerificationBytesScanned: Int = 0, targetVerificationChunks: Int = 0,
-        targetVerificationPeakChunkBytes: Int = 0
+        targetVerificationPeakChunkBytes: Int = 0,
+        projectedWorkReadCalls: Int = 0, projectedWorkCacheHits: Int = 0,
+        projectedWorkBytesRead: Int = 0, projectedWorkSuffixBytesRead: Int = 0,
+        projectedWorkPrefixBytesRead: Int = 0,
+        projectedSessionReadCalls: Int = 0, projectedSessionCacheHits: Int = 0,
+        projectedSessionBytesRead: Int = 0, projectedSessionSuffixBytesRead: Int = 0,
+        projectedSessionPrefixBytesRead: Int = 0
     ) {
         func add(_ value: Int, _ delta: Int) -> Int {
             let (result, overflow) = value.addingReportingOverflow(delta)
@@ -4000,7 +4400,27 @@ public actor WorkHostControlJournal {
             targetVerificationChunks: add(
                 readMetrics.targetVerificationChunks, targetVerificationChunks),
             targetVerificationPeakChunkBytes: max(
-                readMetrics.targetVerificationPeakChunkBytes, targetVerificationPeakChunkBytes))
+                readMetrics.targetVerificationPeakChunkBytes, targetVerificationPeakChunkBytes),
+            projectedWorkReadCalls: add(
+                readMetrics.projectedWorkReadCalls, projectedWorkReadCalls),
+            projectedWorkCacheHits: add(
+                readMetrics.projectedWorkCacheHits, projectedWorkCacheHits),
+            projectedWorkBytesRead: add(
+                readMetrics.projectedWorkBytesRead, projectedWorkBytesRead),
+            projectedWorkSuffixBytesRead: add(
+                readMetrics.projectedWorkSuffixBytesRead, projectedWorkSuffixBytesRead),
+            projectedWorkPrefixBytesRead: add(
+                readMetrics.projectedWorkPrefixBytesRead, projectedWorkPrefixBytesRead),
+            projectedSessionReadCalls: add(
+                readMetrics.projectedSessionReadCalls, projectedSessionReadCalls),
+            projectedSessionCacheHits: add(
+                readMetrics.projectedSessionCacheHits, projectedSessionCacheHits),
+            projectedSessionBytesRead: add(
+                readMetrics.projectedSessionBytesRead, projectedSessionBytesRead),
+            projectedSessionSuffixBytesRead: add(
+                readMetrics.projectedSessionSuffixBytesRead, projectedSessionSuffixBytesRead),
+            projectedSessionPrefixBytesRead: add(
+                readMetrics.projectedSessionPrefixBytesRead, projectedSessionPrefixBytesRead))
     }
 
     private func invalidateCache() {
@@ -4613,6 +5033,65 @@ public actor WorkHostControlJournal {
               after.st_size == off_t(expectedByteCount) else {
             throw TimelineJournalWriter.WriterError.invalidJournal(
                 reason: "Work Host control journal changed while extending its cache")
+        }
+        return data
+    }
+
+    /// Read a bounded canonical prefix while allowing the source to have a newer suffix. This is
+    /// used only for the registration proof after the persistent Work projection has verified the
+    /// current tip; it must not be confused with append-cache range reads above, which require an
+    /// exact file size.
+    private static func readPrefixData(
+        at url: URL, offset: Int, expectedByteCount: Int, maximum: Int?,
+        expectedSourceByteCount: Int
+    ) throws -> Data {
+        guard offset >= 0, expectedByteCount >= offset,
+              maximum.map({ expectedByteCount - offset <= $0 }) ?? true else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host control prefix range is invalid")
+        }
+        let descriptor = url.path.withCString {
+            open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host source is unavailable while reading its prefix")
+        }
+        defer { _ = AviaryPOSIX.close(descriptor) }
+        var before = stat()
+        var path = stat()
+        let pathResult = url.path.withCString { lstat($0, &path) }
+        guard fstat(descriptor, &before) == 0,
+              pathResult == 0,
+              (before.st_mode & S_IFMT) == S_IFREG,
+              before.st_dev == path.st_dev, before.st_ino == path.st_ino,
+              before.st_size == off_t(expectedSourceByteCount),
+              before.st_size >= off_t(expectedByteCount) else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host source changed while reading its prefix")
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        try handle.seek(toOffset: UInt64(offset))
+        var data = Data()
+        while data.count < expectedByteCount - offset {
+            let requested = min(1024 * 1024, expectedByteCount - offset - data.count)
+            guard let chunk = try handle.read(upToCount: requested), !chunk.isEmpty else {
+                throw TimelineJournalWriter.WriterError.invalidJournal(
+                    reason: "Work Host source prefix was truncated")
+            }
+            data.append(chunk)
+        }
+        var after = stat()
+        var afterPath = stat()
+        let afterPathResult = url.path.withCString { lstat($0, &afterPath) }
+        guard fstat(descriptor, &after) == 0,
+              afterPathResult == 0,
+              after.st_dev == afterPath.st_dev, after.st_ino == afterPath.st_ino,
+              after.st_dev == before.st_dev, after.st_ino == before.st_ino,
+              after.st_size == off_t(expectedSourceByteCount),
+              after.st_size >= off_t(expectedByteCount) else {
+            throw TimelineJournalWriter.WriterError.invalidJournal(
+                reason: "Work Host source changed while reading its prefix")
         }
         return data
     }

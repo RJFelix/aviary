@@ -5,12 +5,14 @@ import Foundation
 /// a prompt or a path: those belong to the real WorkLaunchManifestStore adapter.  The service
 /// still refuses to create when this seam is absent, which protects restart reconstruction from
 /// treating control-journal digests as executable material.
-private actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchManifestStore {
+actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchManifestStore {
     private let digest: String
     private let expectedInputDigest: String?
     private let productionCapable: Bool
     private let simulateUnstartedReservation: Bool
     private let draft: WorkLaunchManifestDraft
+    private var requestedConfiguration: WorkServiceWorkConfiguration?
+    private var requestedCapabilities: Set<WorkServiceCapability>?
     private var failAfterTemplatePublication: Bool
     private var templates: [WorkRef: WorkLaunchWorkTemplateRecord] = [:]
     private var starts: [WorkRef: WorkLaunchManifestRecord] = [:]
@@ -34,6 +36,8 @@ private actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchMani
         self.productionCapable = productionCapable
         self.simulateUnstartedReservation = simulateUnstartedReservation
         self.failAfterTemplatePublication = failAfterTemplatePublication
+        self.requestedConfiguration = nil
+        self.requestedCapabilities = nil
         draft = WorkLaunchManifestDraft(
             workspace: WorkLaunchWorkspace(
                 locator: "/tmp/aviary-journal-service",
@@ -48,12 +52,16 @@ private actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchMani
     func retain(
         _ request: WorkServiceCreateWorkRequest
     ) async throws -> JournalBackedWorkLaunchManifest {
+        requestedConfiguration = request.configuration
+        requestedCapabilities = request.requestedCapabilities
         return JournalBackedWorkLaunchManifest(
             bodyDigest: digest, configurationDigest: digest,
             launchMetadata: WorkHostLaunchMetadata(
                 providerID: request.configuration.providerID,
                 modelID: request.configuration.modelID),
-            hostedConfiguration: productionResolver())
+            hostedConfiguration: productionResolver(),
+            requestedConfiguration: request.configuration,
+            requestedCapabilities: request.requestedCapabilities)
     }
 
     func resolve(
@@ -61,15 +69,15 @@ private actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchMani
         session: SessionRef,
         sessionAttachment: SessionAttachmentRef
     ) async throws -> JournalBackedWorkLaunchManifest? {
-        guard let template = templates[work],
-              template.binding.session == session,
-              template.binding.sessionAttachment == sessionAttachment else { return nil }
+        guard let template = templates[work], template.work == work else { return nil }
         return JournalBackedWorkLaunchManifest(
             bodyDigest: digest, configurationDigest: template.digest,
             launchMetadata: WorkHostLaunchMetadata(
                 providerID: template.template.draft.runtime.providerID,
                 modelID: template.template.draft.runtime.modelID),
-            hostedConfiguration: productionResolver(), template: template)
+            hostedConfiguration: productionResolver(), template: template,
+            requestedConfiguration: template.template.draft.configuration,
+            requestedCapabilities: template.template.draft.requestedCapabilities)
     }
 
     func bindTemplate(
@@ -77,14 +85,21 @@ private actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchMani
         binding: WorkBinding
     ) async throws -> JournalBackedWorkLaunchManifest {
         if let existing = templates[binding.work] {
-            guard existing.binding == binding else { throw WorkServiceProtocolError.journalMismatch }
+            guard existing.work == binding.work,
+                  existing.workHost == binding.workHost else {
+                throw WorkServiceProtocolError.journalMismatch
+            }
             return JournalBackedWorkLaunchManifest(
                 bodyDigest: digest, configurationDigest: existing.digest,
                 launchMetadata: WorkHostLaunchMetadata(
                     providerID: existing.template.draft.runtime.providerID,
                     modelID: existing.template.draft.runtime.modelID),
-                template: existing)
+                template: existing,
+                requestedConfiguration: existing.template.draft.configuration,
+                requestedCapabilities: existing.template.draft.requestedCapabilities)
         }
+        let effectiveConfiguration = requestedConfiguration ?? draft.configuration
+        let effectiveCapabilities = requestedCapabilities ?? draft.requestedCapabilities
         let templateKey: WorkLaunchCreateKey
         if let retainedKey = manifest.retainedRecord?.key {
             templateKey = retainedKey
@@ -92,14 +107,28 @@ private actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchMani
             templateKey = WorkLaunchCreateKey(
                 client: ClientRef("test-template"),
                 requestDigest: try WorkLaunchCreateKey.requestDigest(
-                    configuration: draft.configuration,
-                    requestedCapabilities: draft.requestedCapabilities),
+                    configuration: effectiveConfiguration,
+                    requestedCapabilities: effectiveCapabilities),
                 commandID: "test-template",
                 causalControlCursor: JournalCursor(
                     journal: JournalRef.work(binding.work), sequence: 2))
         }
         let template = WorkLaunchWorkTemplate(
-            binding: binding, draft: draft, retentionKey: templateKey)
+            work: binding.work, workHost: binding.workHost,
+            draft: WorkLaunchManifestDraft(
+                workspace: draft.workspace, runtime: draft.runtime,
+                configuration: effectiveConfiguration,
+                requestedCapabilities: effectiveCapabilities,
+                contextPolicy: draft.contextPolicy,
+                recordingPolicy: draft.recordingPolicy,
+                resumePolicy: draft.resumePolicy,
+                reasoningPolicy: draft.reasoningPolicy,
+                budgetPolicy: draft.budgetPolicy,
+                goal: draft.goal,
+                hooks: draft.hooks,
+                peerScheduler: draft.peerScheduler,
+                provenance: draft.provenance),
+            retentionKey: templateKey)
         let bytes = try template.canonicalBytes()
         let templateRecord = WorkLaunchWorkTemplateRecord(
             template: template,
@@ -114,7 +143,7 @@ private actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchMani
                 bodyDigest: "sha256:" + AviarySHA256.hash(data: Data())
                     .map { String(format: "%02x", $0) }.joined())
             let runBinding = WorkRunBinding(workBinding: binding, run: RunRef("unstarted-run"))
-            let manifest = try draft.bind(
+            let manifest = try template.draft.bind(
                 to: runBinding, startIntent: reservationIntent,
                 initialInputBodyReference: nil)
             let record = WorkLaunchManifestRecord(
@@ -130,8 +159,11 @@ private actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchMani
         return JournalBackedWorkLaunchManifest(
             bodyDigest: digest, configurationDigest: digest,
             launchMetadata: WorkHostLaunchMetadata(
-                providerID: draft.runtime.providerID, modelID: draft.runtime.modelID),
-            hostedConfiguration: productionResolver(), template: templateRecord)
+                providerID: template.draft.runtime.providerID,
+                modelID: template.draft.runtime.modelID),
+            hostedConfiguration: productionResolver(), template: templateRecord,
+            requestedConfiguration: effectiveConfiguration,
+            requestedCapabilities: effectiveCapabilities)
     }
 
     func currentSelection(
@@ -139,12 +171,10 @@ private actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchMani
         session: SessionRef,
         sessionAttachment: SessionAttachmentRef
     ) async throws -> WorkLaunchManifestRecord? {
-        guard let selection = selections[work],
-              selection.manifest.identity.session == session,
-              selection.manifest.identity.sessionAttachment == sessionAttachment else {
-            return nil
-        }
-        return selection
+        // The current-selection CAS is Work-scoped. The selected binding remains payload in the
+        // record, while callers use their own exact attachment when proposing the next Run.
+        _ = (session, sessionAttachment)
+        return selections[work]
     }
 
     func hasPendingStart(
@@ -165,7 +195,9 @@ private actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchMani
         policy: WorkLaunchExecutionPolicy,
         selectedPromptAssembly: WorkLaunchPromptAssembly?
     ) async throws -> JournalBackedWorkLaunchManifest {
-        guard let template = manifest.template, template.binding == binding else {
+        guard let template = manifest.template,
+              template.work == binding.work,
+              template.workHost == binding.workHost else {
             throw WorkServiceProtocolError.sourceIncomplete
         }
         guard bodyDigest(body) == intent.bodyDigest else {
@@ -200,12 +232,12 @@ private actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchMani
 
     func reserveStart(
         _ template: WorkLaunchWorkTemplateRecord,
+        binding: WorkBinding,
         run: RunRef,
         intent: WorkLaunchStartIntent,
         expectedPrevious: WorkLaunchManifestGeneration?,
         initialInputBodyReference: TimelineBodyReference
     ) async throws -> WorkLaunchStartAdmission {
-        let binding = template.binding
         if let existing = starts[binding.work] {
             guard existing.manifest.startIntent == intent,
                   existing.manifest.identity.run == run else {
@@ -369,6 +401,10 @@ func testJournalBackedWorkServiceBindsPerRunStartInputAndAcceptsEmptyDigest() as
             causalWorkCursor: emptyCreated.workCursor, kind: .start, value: nil))
         XCTFail("the test store has no Hosted resolver")
     } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    } catch WorkServiceProtocolError.staleCursor {
+        XCTAssertTrue(true)
+    } catch WorkServiceProtocolError.invalidRequest {
         XCTAssertTrue(true)
     }
     await emptyService.controlJournal.close()
@@ -630,6 +666,29 @@ func testDurableStartAdapterReservesBeforeAssemblyAndReusesRecordedPrompt() asyn
         try store.resolveSystemPromptBody(for: firstRecord.manifest),
         Data("ambient-one|exact-input".utf8))
 
+    // The current selection is addressed by Work, not by the Session which won the prior Run.
+    // A different canonically selected binding may replace that completed predecessor only with
+    // a fresh projection; the adapter must advance one pointer rather than strand a second
+    // per-Session current slot.
+    let alternateBinding = WorkBinding(
+        session: SessionRef("adapter-alternate-session"), work: binding.work,
+        workHost: binding.workHost, sessionAttachment: SessionAttachmentRef(
+            "adapter-alternate-attachment"))
+    let alternateIntent = WorkLaunchStartIntent(
+        client: ClientRef("adapter-alternate-client"), commandID: "adapter-alternate-start",
+        causalWorkCursor: intent.causalWorkCursor, bodyDigest: intent.bodyDigest)
+    let alternate = try await durable.bindStart(
+        template, binding: alternateBinding, run: RunRef("adapter-alternate-run"),
+        intent: alternateIntent, body: Data("exact-input".utf8),
+        policy: WorkLaunchExecutionPolicy(projection: .fresh, modelContext: .launchFresh),
+        selectedPromptAssembly: firstAssembly)
+    XCTAssertEqual(alternate.durableRecord?.manifest.identity.session,
+                   alternateBinding.session)
+    XCTAssertEqual(alternate.durableRecord?.manifest.identity.sessionAttachment,
+                   alternateBinding.sessionAttachment)
+    XCTAssertEqual(try store.readCurrentSelection(for: binding)?.record
+        .manifest.identity.session, alternateBinding.session)
+
     // A fresh adapter instance and changed ambient input must use the already-published Run record.
     await route.set("ambient-two")
     let restarted = DurableJournalBackedWorkLaunchManifestStore(
@@ -693,7 +752,7 @@ func testDurableStartAssemblyCrashReservationFailsClosedWithoutReassembly() asyn
         causalWorkCursor: JournalCursor(journal: .work(binding.work), eventID: nil, sequence: 2),
         bodyDigest: adapterDigest(body))
     let reservation = try store.reserveStart(
-        templateRecord, run: RunRef("crash-adapter-run"), startIntent: intent,
+        templateRecord, binding: binding, run: RunRef("crash-adapter-run"), startIntent: intent,
         expectedPrevious: nil, initialInputBodyReference: bodyReference)
     guard case .winner = reservation else {
         XCTFail("the crash fixture must own the first Start reservation")
@@ -706,6 +765,8 @@ func testDurableStartAssemblyCrashReservationFailsClosedWithoutReassembly() asyn
             body: body, policy: WorkLaunchExecutionPolicy(projection: .fresh, modelContext: .launchFresh))
         XCTFail("a reservation which crashed during assembly must remain recovery-required")
     } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    } catch WorkServiceProtocolError.invalidRequest {
         XCTAssertTrue(true)
     }
     XCTAssertEqual(await route.calls, 0)
@@ -721,7 +782,7 @@ func testJournalBackedWorkServiceRestartReconcilesDeliveredStartWithoutRedispatc
     defer { try? FileManager.default.removeItem(at: root) }
     let host = try home.requirePersistedWorkHost()
     let client = ClientRef("restart-client")
-    let capabilities: Set<WorkServiceCapability> = [.observe, .control, .start]
+    let capabilities: Set<WorkServiceCapability> = [.observe, .control, .start, .end]
     let route = JournalPromptRoute(value: "restart-ambient")
     let makeDurable: @Sendable () -> DurableJournalBackedWorkLaunchManifestStore = {
         DurableJournalBackedWorkLaunchManifestStore(
@@ -759,19 +820,19 @@ func testJournalBackedWorkServiceRestartReconcilesDeliveredStartWithoutRedispatc
             reconstructabilityProbe: { _ in true })
     }
 
-    let serviceA = try JournalBackedWorkService(
+    var serviceA: JournalBackedWorkService? = try JournalBackedWorkService(
         home: home, instanceID: "restart-instance-a", startIdentity: "restart-start-a",
         authorizer: WorkServiceCapabilityPolicy(
             grantsByClient: [client: capabilities]),
         manifestStore: makeDurable())
-    let control = try await serviceA.handshake(
+    let control = try await serviceA!.handshake(
         WorkServiceHandshakeRequest(client: client)).controlCursor
-    let created = try await serviceA.createWork(WorkServiceCreateWorkRequest(
+    let created = try await serviceA!.createWork(WorkServiceCreateWorkRequest(
         client: client, commandID: "restart-create", causalControlCursor: control,
         configuration: WorkServiceWorkConfiguration(
             providerID: "restart-provider", modelID: "restart-model"),
         requestedCapabilities: capabilities))
-    let start = try await serviceA.command(WorkServiceCommandRequest(
+    let start = try await serviceA!.command(WorkServiceCommandRequest(
         work: created.work.work, journal: created.work.journal,
         attachment: created.attachment.attachment, commandID: "restart-start",
         client: client, sessionAttachment: created.sessionAttachment,
@@ -792,8 +853,9 @@ func testJournalBackedWorkServiceRestartReconcilesDeliveredStartWithoutRedispatc
     // Hosted Start is queued out of the public command call. Wait for its durable delivery before
     // discarding the first service, so the restart assertion covers an accepted+delivered Run.
     var delivered = false
+    var turnSettled = false
     let deliveryDeadline = Date().addingTimeInterval(15)
-    while Date() < deliveryDeadline && !delivered {
+    while Date() < deliveryDeadline && (!delivered || !turnSettled) {
         let read = try TimelineJournalReader.read(
             Data(contentsOf: home.timelineV2WorkJournalURL(created.work.work)),
             journal: created.work.journal,
@@ -802,31 +864,84 @@ func testJournalBackedWorkServiceRestartReconcilesDeliveredStartWithoutRedispatc
         delivered = read.records.map(\.event).contains {
             $0.type == TimelineEventType.commandDelivered && $0.run == run1
         }
-        if !delivered { try await Task.sleep(nanoseconds: 50_000_000) }
+        turnSettled = read.records.map(\.event).contains {
+            $0.type == TimelineEventType.turnFinished && $0.run == run1
+        }
+        if !delivered || !turnSettled { try await Task.sleep(nanoseconds: 50_000_000) }
     }
     XCTAssertTrue(delivered, "restart fixture must durably deliver Start before service loss")
-    let beforeRestartEvents = try TimelineJournalReader.read(
-        Data(contentsOf: home.timelineV2WorkJournalURL(created.work.work)),
+    XCTAssertTrue(turnSettled, "restart fixture must stop mutating before simulating process loss")
+    let workURL = home.timelineV2WorkJournalURL(created.work.work)
+    let sessionURL = home.timelineV2SessionJournalURL(created.session)
+    let beforeRestartWorkData = try Data(contentsOf: workURL)
+    let beforeRestartSessionData = try Data(contentsOf: sessionURL)
+    let beforeRestartEvents = TimelineJournalReader.read(
+        beforeRestartWorkData,
         journal: created.work.journal,
         actor: TimelineActor(actorID: "restart-before-reader", kind: "self-test"),
         hostRecordedAt: Date(timeIntervalSince1970: 0)).records.map(\.event)
     XCTAssertEqual(beforeRestartEvents.filter { $0.type == TimelineEventType.runStarted }.count, 1)
     XCTAssertEqual(await route.calls, 1)
 
+    // A real Work Host process loss closes the writer descriptors without appending End. This
+    // in-process fixture cannot ask the OS to reap only one object graph, so first use the public
+    // End path to quiesce and close every writer, then restore the exact pre-End bytes. The
+    // restored disposable fixture is the durable prefix an abrupt process exit would have left.
+    let beforeRestartEvent = try XCTUnwrap(beforeRestartEvents.last)
+    let beforeRestartCursor = JournalCursor(
+        journal: created.work.journal,
+        eventID: beforeRestartEvent.eventID,
+        sequence: beforeRestartEvent.sequence)
+    let fixtureEnd = try await serviceA!.command(WorkServiceCommandRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, commandID: "restart-fixture-host-loss",
+        client: client, sessionAttachment: created.sessionAttachment,
+        causalWorkCursor: beforeRestartCursor, kind: .end))
+    XCTAssertEqual(fixtureEnd.state, .accepted)
+    var oldWritersClosed = false
+    let closeDeadline = Date().addingTimeInterval(15)
+    while Date() < closeDeadline && !oldWritersClosed {
+        if let lookup = await serviceA!.registry.lookup(created.work.work),
+           case .live(let entry) = lookup {
+            let snapshot = await entry.hostedWork.snapshot()
+            oldWritersClosed = snapshot.lifecycle == .ended && snapshot.journalHealth == .closed
+        }
+        if !oldWritersClosed { try await Task.sleep(nanoseconds: 25_000_000) }
+    }
+    XCTAssertTrue(oldWritersClosed, "simulated process loss must first release native writers")
+    try beforeRestartWorkData.write(to: workURL, options: .atomic)
+    try beforeRestartSessionData.write(to: sessionURL, options: .atomic)
+
     // Closing the old control journal models the service generation ending. Its registry/Hosted
     // actor is not supplied to the replacement service, so identity alone cannot be a liveness
-    // proof. The control journal remains the durable source of the original command receipt.
-    await serviceA.controlJournal.close()
+    // proof. The control journal remains the durable source of the original Start receipt.
+    await serviceA!.controlJournal.close()
+    serviceA = nil
     let serviceB = try JournalBackedWorkService(
         home: home, instanceID: "restart-instance-b", startIdentity: "restart-start-b",
         authorizer: WorkServiceCapabilityPolicy(
             grantsByClient: [client: capabilities]),
         manifestStore: makeDurable())
-    let duplicate = try await serviceB.command(WorkServiceCommandRequest(
-        work: created.work.work, journal: created.work.journal,
-        attachment: created.attachment.attachment, commandID: "restart-start",
-        client: client, sessionAttachment: created.sessionAttachment,
-        causalWorkCursor: created.workCursor, kind: .start, value: "restart-input"))
+    let ownerAfterRestart: WorkServiceWorkDescriptor
+    do {
+        ownerAfterRestart = try await serviceB.describeWork(WorkServiceDescribeRequest(
+            work: created.work.work, journal: created.work.journal, client: client))
+    } catch {
+        throw UnwrapFailure(description: "restart descriptor reconciliation failed: \(error)")
+    }
+    XCTAssertEqual(ownerAfterRestart.currentRun, run1)
+    XCTAssertEqual(ownerAfterRestart.currentRunSession, created.session)
+    XCTAssertEqual(ownerAfterRestart.currentRunSessionAttachment, created.sessionAttachment)
+    let duplicate: WorkServiceCommandReceipt
+    do {
+        duplicate = try await serviceB.command(WorkServiceCommandRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, commandID: "restart-start",
+            client: client, sessionAttachment: created.sessionAttachment,
+            causalWorkCursor: created.workCursor, kind: .start, value: "restart-input"))
+    } catch {
+        throw UnwrapFailure(description: "restart duplicate reconciliation failed: \(error)")
+    }
     XCTAssertEqual(duplicate.state, .duplicate)
     XCTAssertEqual(duplicate.outcome, .startRecoveryRequired)
     XCTAssertEqual(duplicate.recoveryState, .delivered)
@@ -851,6 +966,368 @@ func testJournalBackedWorkServiceRestartReconcilesDeliveredStartWithoutRedispatc
                    beforeRestartEvents.filter { $0.type == TimelineEventType.commandDelivered }.count)
     XCTAssertEqual(await route.calls, 1, "restart duplicate must not reassemble ambient prompt")
     await serviceB.controlJournal.close()
+}
+
+/// Exercise the production JournalBackedWorkService boundary with two canonical Session
+/// attachments.  The first Start is deliberately held after its durable reservation, so a
+/// second Session races the same idle Work and must lose before prompt/manifest publication.  The
+/// completed Run is then handed to the other Session, and finally back to the first after a
+/// service restart; every replacement is one Work-level current-selection CAS.
+func testJournalBackedWorkServiceQualifiesRunOwnerAcrossSessionsAndRestart() async throws {
+    guard let runtimeHost = try makeHost(.reference) else { return }
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let host = try home.requirePersistedWorkHost()
+    let clientA = ClientRef("routing-client-a")
+    let clientB = ClientRef("routing-client-b")
+    let secondGUI = ClientRef("routing-client-a-gui-2")
+    let grants = journalBackedAllCapabilities()
+    let promptGate = JournalStartGate()
+    let hostedGate = JournalStartGate()
+    let route = JournalPromptRoute(value: "routing-ambient")
+    let capabilities: Set<WorkServiceCapability> = [
+        .observe, .control, .createSession, .start, .send, .end,
+    ]
+
+    let makeDurable: @Sendable () -> DurableJournalBackedWorkLaunchManifestStore = {
+        DurableJournalBackedWorkLaunchManifestStore(
+            store: WorkLaunchManifestStore(home: home), bodyAuthority: .workHost(host),
+            draftResolver: { request in
+                WorkLaunchManifestDraft(
+                    workspace: WorkLaunchWorkspace(locator: "/tmp/routing", policy: .temporary),
+                    runtime: WorkLaunchRuntime(
+                        providerID: "routing-provider", modelID: "routing-model",
+                        runtimeVariant: "reference"),
+                    configuration: request.configuration,
+                    requestedCapabilities: request.requestedCapabilities,
+                    provenance: WorkLaunchManifestProvenance(source: "routing-test"))
+            },
+            hostedResolver: { manifest, binding, policy in
+                let prompt = try WorkLaunchManifestStore(home: home)
+                    .resolvePromptAssembly(for: manifest)
+                var model = fakeModel()
+                model.providerID = "routing-provider"
+                model.id = "routing-model"
+                return HostedInHouseWorkConfiguration(
+                    home: home, cwd: "/tmp/routing", model: model,
+                    provider: JournalServiceRaceProvider(), runtimeHost: runtimeHost,
+                    workRunBinding: binding, serviceActorID: "routing-service",
+                    systemPrompt: prompt.flattenedText, systemPromptAssembly: prompt,
+                    projectionMode: policy.projection, modelContextMode: policy.modelContext,
+                    startAdmissionGate: { await hostedGate.enterAndWait() })
+            },
+            promptAssemblyResolver: { _, body, _ in
+                await promptGate.enterAndWait()
+                let ambient = await route.next()
+                return try adapterPromptAssembly(
+                    "\(ambient)|\(String(decoding: body, as: UTF8.self))")
+            },
+            reconstructabilityProbe: { _ in true })
+    }
+    let authorizer = WorkServiceCapabilityPolicy(grantsByClient: [
+        clientA: grants, clientB: grants, secondGUI: grants,
+    ])
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "routing-instance-a", startIdentity: "routing-start-a",
+        authorizer: authorizer, manifestStore: makeDurable(),
+        canonicalResidentRecordLimit: 2)
+
+    let initialControl = try await service.handshake(.init(client: clientA)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: clientA, commandID: "routing-create-work", causalControlCursor: initialControl,
+        configuration: WorkServiceWorkConfiguration(
+            providerID: "routing-provider", modelID: "routing-model"),
+        requestedCapabilities: capabilities))
+    let createdWork = created.work.work
+    let primarySession = created.session
+    let primaryAttachment = created.sessionAttachment
+    let primaryClientAttachment = try XCTUnwrap(created.attachment)
+
+    func latestWorkCursor() throws -> JournalCursor {
+        let work = try XCTUnwrap(try Data(
+            contentsOf: home.timelineV2WorkJournalURL(createdWork)))
+        let read = TimelineJournalReader.read(
+            work, journal: JournalRef.work(createdWork),
+            actor: TimelineActor(actorID: "routing-work-reader", kind: "self-test"),
+            hostRecordedAt: Date(timeIntervalSince1970: 0))
+        let event = try XCTUnwrap(read.records.last?.event)
+        return JournalCursor(
+            journal: JournalRef.work(createdWork), eventID: event.eventID, sequence: event.sequence)
+    }
+
+    func latestControlCursor() async throws -> JournalCursor {
+        let response = try await service.handshake(.init(client: clientA))
+        return response.controlCursor
+    }
+
+    func endRun(
+        service runService: JournalBackedWorkService,
+        attachment: ClientAttachmentRef, sessionAttachment: SessionAttachmentRef,
+        client: ClientRef, commandID: String
+    ) async throws -> WorkServiceCommandReceipt {
+        for attempt in 0..<8 {
+            do {
+                let receipt = try await runService.command(WorkServiceCommandRequest(
+                    work: createdWork, journal: JournalRef.work(createdWork),
+                    attachment: attachment,
+                    commandID: attempt == 0 ? commandID : "\(commandID)-\(attempt)",
+                    client: client,
+                    sessionAttachment: sessionAttachment,
+                    causalWorkCursor: try latestWorkCursor(), kind: .end))
+                if receipt.state != .rejected || receipt.rejection != .staleCursor {
+                    return receipt
+                }
+                if attempt < 7 {
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                }
+            } catch WorkServiceProtocolError.staleCursor where attempt < 7 {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+        }
+        throw WorkServiceProtocolError.sourceIncomplete
+    }
+
+    let secondary = try await service.createSession(WorkServiceCreateSessionRequest(
+        work: createdWork, journal: created.work.journal,
+        attachment: primaryClientAttachment.attachment, client: clientA,
+        commandID: "routing-create-secondary-session",
+        causalControlCursor: try await latestControlCursor(),
+        causalWorkCursor: try latestWorkCursor(),
+        requestedCapabilities: [.observe, .control, .start, .send, .end]))
+    let secondarySession = try XCTUnwrap(secondary.session)
+    let secondaryJournal = try XCTUnwrap(secondary.sessionJournal)
+    let secondarySessionAttachment = try XCTUnwrap(secondary.sessionAttachment)
+    let secondaryClientResponse = try await service.attach(WorkServiceAttachRequest(
+        work: createdWork, journal: created.work.journal, client: clientB,
+        session: secondarySession, sessionJournal: secondaryJournal,
+        sessionAttachment: secondarySessionAttachment,
+        commandID: "routing-attach-secondary-client",
+        causalControlCursor: try await latestControlCursor(),
+        requestedCapabilities: [.observe, .control, .start, .send, .end]))
+    let secondaryClient = try XCTUnwrap(secondaryClientResponse.attachment?.attachment)
+    let secondGUIResponse = try await service.attach(WorkServiceAttachRequest(
+        work: createdWork, journal: created.work.journal, client: secondGUI,
+        session: primarySession, sessionJournal: created.sessionJournal,
+        sessionAttachment: primaryAttachment,
+        commandID: "routing-attach-second-gui",
+        causalControlCursor: try await latestControlCursor(),
+        requestedCapabilities: [.observe, .send]))
+    let secondGUIClientAttachment = try XCTUnwrap(secondGUIResponse.attachment?.attachment)
+
+    let firstStartCursor = try latestWorkCursor()
+    let firstStart = WorkServiceCommandRequest(
+        work: createdWork, journal: created.work.journal,
+        attachment: primaryClientAttachment.attachment, commandID: "routing-start-a-1",
+        client: clientA, sessionAttachment: primaryAttachment,
+        causalWorkCursor: firstStartCursor, kind: .start, value: "first-a")
+    let secondStart = WorkServiceCommandRequest(
+        work: createdWork, journal: created.work.journal,
+        attachment: secondaryClient, commandID: "routing-start-b-race",
+        client: clientB, sessionAttachment: secondarySessionAttachment,
+        causalWorkCursor: firstStartCursor, kind: .start, value: "first-b")
+    let firstStartTask = Task { try await service.command(firstStart) }
+    await promptGate.waitUntilEntered()
+    do {
+        _ = try await service.command(secondStart)
+        XCTFail("a second Session must lose the Work-scoped Start admission")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    } catch WorkServiceProtocolError.staleCursor {
+        XCTAssertTrue(true)
+    } catch WorkServiceProtocolError.invalidRequest {
+        XCTAssertTrue(true)
+    }
+
+    await promptGate.release()
+    await hostedGate.waitUntilEntered()
+    // Force the live writer past its resident envelope with a tiny diagnostic bound. The Work
+    // stays actor-owned while both the first page and a continuation are served from its sparse
+    // locked-read evidence; production uses the same path after one million records.
+    let liveFirstPage = try await service.eventsAfterCursor(WorkServiceEventsRequest(
+        work: createdWork, journal: created.work.journal,
+        attachment: primaryClientAttachment.attachment, client: clientA,
+        target: .work(journal: created.work.journal),
+        afterCursor: JournalCursor(journal: created.work.journal, sequence: 0), limit: 1))
+    XCTAssertEqual(liveFirstPage.events.count, 1)
+    XCTAssertNotNil(liveFirstPage.nextCursor)
+    let liveContinuation = try await service.eventsAfterCursor(WorkServiceEventsRequest(
+        work: createdWork, journal: created.work.journal,
+        attachment: primaryClientAttachment.attachment, client: clientA,
+        target: .work(journal: created.work.journal),
+        afterCursor: try XCTUnwrap(liveFirstPage.servedCursor), limit: 1))
+    XCTAssertEqual(liveContinuation.events.count, 1)
+    XCTAssertEqual(liveContinuation.basePrefixDigest, liveFirstPage.prefixDigest)
+    let workBeforeCrossSessionSend = try Data(
+        contentsOf: home.timelineV2WorkJournalURL(createdWork))
+    let primaryBeforeCrossSessionSend = try Data(
+        contentsOf: home.timelineV2SessionJournalURL(primarySession))
+    let secondaryBeforeCrossSessionSend = try Data(
+        contentsOf: home.timelineV2SessionJournalURL(secondarySession))
+    let controlBeforeCrossSessionSend = try await service.controlJournal.read().records.count
+    do {
+        _ = try await service.command(WorkServiceCommandRequest(
+            work: createdWork, journal: created.work.journal,
+            attachment: secondaryClient, commandID: "routing-send-b-while-a-active",
+            client: clientB, sessionAttachment: secondarySessionAttachment,
+            causalWorkCursor: try latestWorkCursor(), kind: .send, value: "must-not-write"))
+        XCTFail("a different Session must not send while A owns the active Run")
+    } catch WorkServiceProtocolError.invalidRequest {
+        XCTAssertTrue(true)
+    }
+    XCTAssertEqual(try Data(contentsOf: home.timelineV2WorkJournalURL(createdWork)),
+                   workBeforeCrossSessionSend)
+    XCTAssertEqual(try Data(contentsOf: home.timelineV2SessionJournalURL(primarySession)),
+                   primaryBeforeCrossSessionSend)
+    XCTAssertEqual(try Data(contentsOf: home.timelineV2SessionJournalURL(secondarySession)),
+                   secondaryBeforeCrossSessionSend)
+    XCTAssertEqual(try await service.controlJournal.read().records.count,
+                   controlBeforeCrossSessionSend)
+
+    await hostedGate.release()
+    let firstReceipt = try await firstStartTask.value
+    XCTAssertEqual(firstReceipt.state, .accepted)
+    XCTAssertEqual(firstReceipt.outcome, .started)
+    var firstRunPrepared = false
+    let preparationDeadline = Date().addingTimeInterval(15)
+    while Date() < preparationDeadline {
+        if let lookup = await service.registry.lookup(createdWork),
+           case .live(let entry) = lookup {
+            firstRunPrepared = await entry.hostedWork.snapshot().agentAvailable
+        }
+        if firstRunPrepared { break }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    XCTAssertTrue(firstRunPrepared, "the active owner must be ready before GUI controls are exercised")
+    var sameSessionSendReceipt: WorkServiceCommandReceipt?
+    for attempt in 0..<8 {
+        do {
+            let candidate = try await service.command(WorkServiceCommandRequest(
+                work: createdWork, journal: created.work.journal,
+                attachment: secondGUIClientAttachment,
+                commandID: attempt == 0 ? "routing-send-a-gui-2" : "routing-send-a-gui-2-\(attempt)",
+                client: secondGUI, sessionAttachment: primaryAttachment,
+                causalWorkCursor: try latestWorkCursor(), kind: .send,
+                value: "same-session-send"))
+            if candidate.state == .accepted {
+                sameSessionSendReceipt = candidate
+                break
+            }
+            // A runner may append a bounded progress event between the cursor observation and
+            // native command admission. A structured stale/rejected receipt has no acceptance
+            // event; retry the exact body with a fresh command ID and cursor.
+            if attempt < 7 {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+        } catch WorkServiceProtocolError.staleCursor where attempt < 7 {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+    let sameSessionSend = try XCTUnwrap(sameSessionSendReceipt)
+    XCTAssertEqual(sameSessionSend.state, .accepted)
+    XCTAssertEqual(sameSessionSend.outcome, .inputAccepted)
+    let firstEnd = try await endRun(
+        service: service,
+        attachment: primaryClientAttachment.attachment, sessionAttachment: primaryAttachment,
+        client: clientA, commandID: "routing-end-a-1")
+    XCTAssertEqual(firstEnd.state, .accepted)
+
+    // End's receipt is emitted at the Hosted boundary, while the service's cold projection may
+    // need one bounded refresh after the actor closes its native writers. Do not race the next
+    // Session's Start against that legitimate handoff; require both the old actor's terminal
+    // snapshot and a canonical Work observation with its owner tuple cleared.
+    var replacementReady = false
+    let replacementDeadline = Date().addingTimeInterval(5)
+    while Date() < replacementDeadline {
+        if let lookup = await service.registry.lookup(createdWork),
+           case .live(let oldEntry) = lookup {
+            let oldSnapshot = await oldEntry.hostedWork.snapshot()
+            if oldSnapshot.lifecycle == .ended && oldSnapshot.journalHealth == .closed {
+                if let settled = try? await service.describeWork(.init(
+                    work: createdWork, journal: created.work.journal, client: clientB)),
+                   settled.currentRun == nil {
+                    replacementReady = true
+                    break
+                }
+            }
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    XCTAssertTrue(replacementReady, "End must settle to a reusable canonical Work boundary")
+
+    let secondStartReceipt = try await service.command(WorkServiceCommandRequest(
+            work: createdWork, journal: created.work.journal,
+            attachment: secondaryClient, commandID: "routing-start-b-2", client: clientB,
+            sessionAttachment: secondarySessionAttachment, causalWorkCursor: try latestWorkCursor(),
+            kind: .start, value: "second-b"))
+    XCTAssertEqual(secondStartReceipt.state, .accepted)
+    XCTAssertEqual(secondStartReceipt.outcome, .started)
+    var secondRunPrepared = false
+    let secondPreparationDeadline = Date().addingTimeInterval(15)
+    while Date() < secondPreparationDeadline {
+        if let lookup = await service.registry.lookup(createdWork),
+           case .live(let entry) = lookup {
+            let snapshot = await entry.hostedWork.snapshot()
+            secondRunPrepared = snapshot.identity.sessionID == secondarySession.sessionID
+                && snapshot.agentAvailable
+        }
+        if secondRunPrepared { break }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    XCTAssertTrue(
+        secondRunPrepared,
+        "the replacement Session owner must be ready before its End is exercised")
+    let afterBStart = try await service.describeWork(.init(
+        work: createdWork, journal: created.work.journal, client: clientB))
+    XCTAssertEqual(afterBStart.currentRunSession, secondarySession)
+    XCTAssertEqual(afterBStart.currentRunSessionAttachment, secondarySessionAttachment)
+    let secondEnd = try await endRun(
+        service: service,
+        attachment: secondaryClient, sessionAttachment: secondarySessionAttachment,
+        client: clientB, commandID: "routing-end-b-2")
+    guard secondEnd.state == .accepted else {
+        throw UnwrapFailure(
+            description: "second End was \(secondEnd.state), rejection=\(String(describing: secondEnd.rejection)), diagnostic=\(String(describing: secondEnd.diagnostic))")
+    }
+    XCTAssertEqual(secondEnd.state, .accepted)
+    await service.controlJournal.close()
+
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "routing-instance-b", startIdentity: "routing-start-b",
+        authorizer: authorizer, manifestStore: makeDurable(),
+        canonicalResidentRecordLimit: 2)
+    let thirdStartReceipt = try await restarted.command(WorkServiceCommandRequest(
+            work: createdWork, journal: created.work.journal,
+            attachment: primaryClientAttachment.attachment, commandID: "routing-start-a-3",
+            client: clientA, sessionAttachment: primaryAttachment,
+            causalWorkCursor: try latestWorkCursor(), kind: .start, value: "third-a"))
+    XCTAssertEqual(thirdStartReceipt.state, .accepted)
+    XCTAssertEqual(thirdStartReceipt.outcome, .started)
+    var thirdRunPrepared = false
+    let thirdPreparationDeadline = Date().addingTimeInterval(15)
+    while Date() < thirdPreparationDeadline {
+        if let lookup = await restarted.registry.lookup(createdWork),
+           case .live(let entry) = lookup {
+            let snapshot = await entry.hostedWork.snapshot()
+            thirdRunPrepared = snapshot.identity.sessionID == primarySession.sessionID
+                && snapshot.agentAvailable
+        }
+        if thirdRunPrepared { break }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    XCTAssertTrue(
+        thirdRunPrepared,
+        "the restarted Session owner must be ready before its End is exercised")
+    let afterRestartA = try await restarted.describeWork(.init(
+        work: createdWork, journal: created.work.journal, client: clientA))
+    XCTAssertEqual(afterRestartA.currentRunSession, primarySession)
+    XCTAssertEqual(afterRestartA.currentRunSessionAttachment, primaryAttachment)
+    let thirdEnd = try await endRun(
+        service: restarted,
+        attachment: primaryClientAttachment.attachment,
+        sessionAttachment: primaryAttachment, client: clientA,
+        commandID: "routing-end-a-3")
+    XCTAssertEqual(thirdEnd.state, .accepted)
+    await restarted.controlJournal.close()
 }
 
 private struct JournalReservationProvider: ChatProvider {
@@ -1501,11 +1978,18 @@ func testJournalBackedWorkServiceJoinsExactStartAndRejectsNewerCursor() async th
     for attempt in 0..<8 {
         let endCursor = try latestWorkCursor()
         do {
-            end = try await service.command(WorkServiceCommandRequest(
+            let candidate = try await service.command(WorkServiceCommandRequest(
                 work: created.work.work, journal: created.work.journal,
-                attachment: created.attachment.attachment, commandID: "race-end", client: client,
+                attachment: created.attachment.attachment,
+                commandID: attempt == 0 ? "race-end" : "race-end-\(attempt)", client: client,
                 sessionAttachment: created.sessionAttachment, causalWorkCursor: endCursor,
                 kind: .end))
+            if candidate.state == .rejected,
+               candidate.rejection == .staleCursor, attempt < 7 {
+                try await Task.sleep(nanoseconds: 20_000_000)
+                continue
+            }
+            end = candidate
             break
         } catch WorkServiceProtocolError.staleCursor where attempt < 7 {
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -1843,10 +2327,9 @@ func testJournalBackedWorkServicePublishesCreateSessionAndReopensItsEvidence() a
         work: created.work.work, journal: created.work.journal,
         attachment: created.attachment.attachment, client: creator,
         commandID: "session-create", causalControlCursor: created.controlCursor,
-        causalWorkCursor: created.workCursor, requestedCapabilities: [.observe, .send])
-
-    let first: WorkServiceCreateSessionResponse
-    first = try await service.createSession(request)
+        causalWorkCursor: created.workCursor,
+        requestedCapabilities: [.observe, .control, .send])
+    let first = try await service.createSession(request)
     XCTAssertEqual(first.state, .accepted)
     XCTAssertEqual(first.receipt.operation, .createSession)
     XCTAssertEqual(first.receipt.outcome, .sessionCreated)
@@ -1855,7 +2338,7 @@ func testJournalBackedWorkServicePublishesCreateSessionAndReopensItsEvidence() a
     let session = try XCTUnwrap(first.session)
     let sessionJournal = try XCTUnwrap(first.sessionJournal)
     let sessionAttachment = try XCTUnwrap(first.sessionAttachment)
-    _ = try XCTUnwrap(first.attachment)
+    let firstClientAttachment = try XCTUnwrap(first.attachment)
     let relationship = try XCTUnwrap(first.relationship)
     XCTAssertEqual(relationship.publication, .mirrored)
     XCTAssertEqual(relationship.session, session)
@@ -1866,19 +2349,57 @@ func testJournalBackedWorkServicePublishesCreateSessionAndReopensItsEvidence() a
     XCTAssertEqual(first.work.sessionAttachments.filter { $0.session == session }.count, 1)
 
     let controlEventsAfterFirst = try await service.controlJournal.read().records.count
+    let updatedCapabilities = try await service.updateCapabilities(
+        WorkServiceUpdateCapabilitiesRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: firstClientAttachment.attachment, client: creator,
+            requestedCapabilities: [.observe, .control],
+            commandID: "session-create-capability-update",
+            causalControlCursor: first.controlCursor))
+    XCTAssertEqual(updatedCapabilities.state, .accepted)
+    XCTAssertEqual(
+        Set(try XCTUnwrap(updatedCapabilities.attachment).authorization.granted),
+        [.observe, .control])
+    let controlEventsBeforeDuplicate = try await service.controlJournal.read().records.count
     let duplicate = try await service.createSession(request)
     XCTAssertEqual(duplicate.state, .duplicate)
     XCTAssertEqual(duplicate.session, first.session)
-    XCTAssertEqual(duplicate.attachment, first.attachment)
+    XCTAssertEqual(duplicate.attachment?.attachment, first.attachment?.attachment)
+    XCTAssertEqual(duplicate.attachment?.client, first.attachment?.client)
     XCTAssertEqual(duplicate.relationship, first.relationship)
+    XCTAssertEqual(Set(duplicate.authorization.granted), Set(first.authorization.granted))
+    XCTAssertEqual(
+        Set(try XCTUnwrap(duplicate.attachment).authorization.granted), [.observe, .control])
+    let duplicateDescriptorAttachment = try XCTUnwrap(duplicate.work.attachments.first {
+        $0.attachment == firstClientAttachment.attachment
+    })
+    XCTAssertEqual(
+        Set(duplicateDescriptorAttachment.authorization.granted), [.observe, .control])
     XCTAssertEqual(duplicate.controlCursor, first.controlCursor)
+    XCTAssertEqual(controlEventsBeforeDuplicate, controlEventsAfterFirst + 1)
     XCTAssertEqual(try await service.controlJournal.read().records.count,
-                   controlEventsAfterFirst)
+                   controlEventsBeforeDuplicate)
+
+    let detached = try await service.detach(WorkServiceDetachRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: firstClientAttachment.attachment, client: creator,
+        commandID: "session-create-detach",
+        causalControlCursor: updatedCapabilities.resultingControlCursor))
+    XCTAssertEqual(detached.state, .accepted)
+    let detachedDuplicate = try await service.createSession(request)
+    XCTAssertEqual(detachedDuplicate.state, .duplicate)
+    XCTAssertEqual(detachedDuplicate.attachment, first.attachment)
+    XCTAssertEqual(detachedDuplicate.authorization, first.authorization)
+    XCTAssertEqual(detachedDuplicate.relationship, first.relationship)
+    XCTAssertFalse(detachedDuplicate.work.attachments.contains {
+        $0.attachment == firstClientAttachment.attachment
+    })
 
     let second = try await service.createSession(WorkServiceCreateSessionRequest(
         work: created.work.work, journal: created.work.journal,
         attachment: created.attachment.attachment, client: creator,
-        commandID: "session-create-after-first", causalControlCursor: first.controlCursor,
+        commandID: "session-create-after-first",
+        causalControlCursor: detached.resultingControlCursor,
         causalWorkCursor: first.workCursor, requestedCapabilities: [.observe]))
     XCTAssertEqual(second.state, .accepted)
     XCTAssertEqual(second.workCursor.sequence, first.workCursor.sequence + 1)
@@ -1886,7 +2407,11 @@ func testJournalBackedWorkServicePublishesCreateSessionAndReopensItsEvidence() a
     let advancedDuplicate = try await service.createSession(request)
     XCTAssertEqual(advancedDuplicate.state, .duplicate)
     XCTAssertEqual(advancedDuplicate.session, first.session)
-    XCTAssertEqual(advancedDuplicate.attachment, first.attachment)
+    XCTAssertEqual(advancedDuplicate.attachment?.attachment, first.attachment?.attachment)
+    XCTAssertEqual(advancedDuplicate.attachment?.client, first.attachment?.client)
+    XCTAssertEqual(
+        Set(try XCTUnwrap(advancedDuplicate.attachment).authorization.granted),
+        Set(first.authorization.granted))
     XCTAssertEqual(advancedDuplicate.relationship, first.relationship)
     XCTAssertEqual(advancedDuplicate.controlCursor, first.controlCursor)
     XCTAssertEqual(advancedDuplicate.workCursor, first.workCursor)
@@ -1924,9 +2449,14 @@ func testJournalBackedWorkServicePublishesCreateSessionAndReopensItsEvidence() a
     XCTAssertEqual(reopened.session, first.session)
     XCTAssertEqual(reopened.sessionCursor, first.sessionCursor)
     XCTAssertEqual(reopened.workCursor, first.workCursor)
+    XCTAssertEqual(Set(reopened.authorization.granted), Set(first.authorization.granted))
+    XCTAssertEqual(reopened.attachment, first.attachment)
     let reopenedDescriptor = try await restarted.describeWork(WorkServiceDescribeRequest(
         work: created.work.work, journal: created.work.journal, client: creator))
     XCTAssertEqual(reopenedDescriptor.sessionAttachments.filter { $0.session == session }.count, 1)
+    XCTAssertFalse(reopenedDescriptor.attachments.contains {
+        $0.attachment == firstClientAttachment.attachment
+    })
     await restarted.controlJournal.close()
 }
 
@@ -2359,8 +2889,10 @@ func testJournalBackedWorkServiceReadsLongWorkAndSessionJournalsThroughControlle
 
     let descriptor = try await service.describeWork(WorkServiceDescribeRequest(
         work: created.work.work, journal: created.work.journal, client: client))
+    let attachmentKey = try XCTUnwrap(
+        ServiceAttachmentKey(work: created.work.work, attachment: created.attachment))
     let intentStore = try WorkServiceAttachedWorkIntentStore(
-        home: home, client: client, work: created.work.work)
+        home: home, key: attachmentKey)
     let controller = try WorkServiceAttachedWorkController(
         service: service, seed: .existing(work: descriptor, attachment: created.attachment),
         intentStore: intentStore,
@@ -2429,8 +2961,11 @@ func testJournalBackedWorkServiceKeepsOversizedJournalsReadableAndIncrementallyC
         try Data(contentsOf: workURL), journal: created.work.journal,
         actor: TimelineActor(actorID: "oversized-fixture", kind: "test"), hostRecordedAt: Date())
     let lastInitial = try XCTUnwrap(initial.records.last?.event)
-    let padding = String(repeating: "x", count: 8_192)
-    let eventCount = 8_000
+    // Keep the fixture above the historical 64 MiB source threshold without making the exact
+    // state overlay perform thousands of expensive immutable-map publications. The property
+    // under test is byte-size/nonresident handling, not event-count throughput.
+    let padding = String(repeating: "x", count: 700_000)
+    let eventCount = 100
     let handle = try FileHandle(forWritingTo: workURL)
     try handle.seekToEnd()
     var previousID = lastInitial.eventID
@@ -2905,6 +3440,9 @@ func testJournalBackedWorkServiceRequiresExactCanonicalEvidenceForAcceptedReceip
 }
 
 let casesJournalBackedWorkService: [Case] = [
+    ("journal-backed service qualifies Run ownership across Sessions and restart", {
+        try await testJournalBackedWorkServiceQualifiesRunOwnerAcrossSessionsAndRestart()
+    }),
     ("journal-backed service joins exact concurrent Start and rejects newer cursor", {
         try await testJournalBackedWorkServiceJoinsExactStartAndRejectsNewerCursor()
     }),

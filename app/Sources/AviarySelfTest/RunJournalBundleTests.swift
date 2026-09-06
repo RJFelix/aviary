@@ -1664,17 +1664,21 @@ func test_workTerminalReducerRejectsCompletionAndDestructionWithLiveCanonicalHan
     let work = WorkRef(workHostID: "terminal-handle-host", workID: "terminal-handle-work")
     let journal = JournalRef.work(work, journalID: "work")
     let host = WorkHostRef(work.workHostID)
+    let session = SessionRef("terminal-handle-session")
+    let attachment = SessionAttachmentRef("terminal-handle-attachment")
     let run = RunRef("terminal-handle-run")
     let handle = HandleRef("terminal-handle")
     func event(
         _ type: String, _ id: String, _ sequence: Int,
+        session: SessionRef? = nil, attachment: SessionAttachmentRef? = nil,
         run: RunRef? = nil, handle: HandleRef? = nil,
         payload: JSONValue = .object([:])
     ) -> TimelineEvent {
         TimelineEvent(
             eventID: id, journal: journal, sequence: sequence,
             hostSequence: sequence, previousEventID: sequence == 1 ? nil : "e\(sequence - 1)",
-            work: work, workHost: host, run: run, handle: handle,
+            session: session, work: work, workHost: host,
+            sessionAttachment: attachment, run: run, handle: handle,
             actor: TimelineActor(actorID: "terminal-test", kind: "test"),
             hostRecordedAt: Date(timeIntervalSince1970: Double(sequence)),
             type: type, declaredDomains: [.work], payload: payload)
@@ -1682,11 +1686,14 @@ func test_workTerminalReducerRejectsCompletionAndDestructionWithLiveCanonicalHan
 
     let events = [
         event(TimelineEventType.workCreated, "e1", 1),
-        event(TimelineEventType.runStarted, "e2", 2, run: run),
-        event(TimelineEventType.handleStarted, "e3", 3, run: run, handle: handle,
+        event(TimelineEventType.sessionAttached, "e2", 2,
+              session: session, attachment: attachment),
+        event(TimelineEventType.runStarted, "e3", 3,
+              session: session, attachment: attachment, run: run),
+        event(TimelineEventType.handleStarted, "e4", 4, run: run, handle: handle,
               payload: .object(["state": .string("running")])),
-        event(TimelineEventType.workCompleted, "e4", 4),
-        event(TimelineEventType.workDestroyed, "e5", 5),
+        event(TimelineEventType.workCompleted, "e5", 5),
+        event(TimelineEventType.workDestroyed, "e6", 6),
     ]
     let reduced = WorkReducer.reduce(events)
     XCTAssertFalse(reduced.semanticProjectionValid)

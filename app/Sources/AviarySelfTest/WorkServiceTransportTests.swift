@@ -188,12 +188,14 @@ func test_workServiceTransportHandshakeAndReadProjection() async throws {
         func replacingWork(
             attachments: [WorkServiceClientAttachment]? = nil,
             relationship: WorkServiceSessionAttachmentDescriptor? = nil
-        ) -> WorkServiceWorkDescriptor {
-            WorkServiceWorkDescriptor(
+        ) throws -> WorkServiceWorkDescriptor {
+            try WorkServiceWorkDescriptor(
                 work: createdSession.work.work, journal: createdSession.work.journal,
                 recordedDisposition: createdSession.work.recordedDisposition,
                 execution: createdSession.work.execution,
                 currentRun: createdSession.work.currentRun,
+                currentRunSession: createdSession.work.currentRunSession,
+                currentRunSessionAttachment: createdSession.work.currentRunSessionAttachment,
                 configuration: createdSession.work.configuration,
                 hostObservation: createdSession.work.hostObservation,
                 attachments: attachments ?? createdSession.work.attachments,
@@ -207,7 +209,7 @@ func test_workServiceTransportHandshakeAndReadProjection() async throws {
             relationship: WorkServiceSessionAttachmentDescriptor,
             sessionCursor: JournalCursor,
             controlCursor: JournalCursor? = nil
-        ) -> WorkServiceCreateSessionResponse {
+        ) throws -> WorkServiceCreateSessionResponse {
             let resultingControlCursor = controlCursor ?? createdSession.controlCursor
             let receipt = WorkServiceControlReceipt(
                 operation: createdSession.receipt.operation,
@@ -258,7 +260,7 @@ func test_workServiceTransportHandshakeAndReadProjection() async throws {
             sessionAttachment: baseAttachment.sessionAttachment,
             authorization: baseAttachment.authorization,
             readAcknowledgements: baseAttachment.readAcknowledgements)
-        let reusedAttachmentDescriptor = replacingWork(attachments:
+        let reusedAttachmentDescriptor = try replacingWork(attachments:
             createdSession.work.attachments.filter {
                 $0.attachment != baseAttachment.attachment
                     && $0.attachment != createSessionRequest.attachment
@@ -271,58 +273,61 @@ func test_workServiceTransportHandshakeAndReadProjection() async throws {
             journal: baseRelationship.causalWorkCursor.journal,
             eventID: "overflow-causal-work", sequence: Int.max)
         let mutants: [(String, WorkServiceCreateSessionResponse)] = [
-            ("descriptor omits minted client attachment", replacingResponse(
-                work: replacingWork(attachments: []), attachment: baseAttachment,
+            ("descriptor omits minted client attachment", try replacingResponse(
+                work: try replacingWork(attachments: []), attachment: baseAttachment,
                 relationship: baseRelationship, sessionCursor: baseSessionCursor)),
-            ("client attachment authorization differs", replacingResponse(
-                work: replacingWork(attachments: [forgedAttachment]),
+            ("client attachment authorization differs", try replacingResponse(
+                // A changed current grant is valid only when the descriptor carries the same
+                // current attachment. Keep the descriptor's immutable publication attachment
+                // here so this mutant remains a forged, uncorrelated response.
+                work: try replacingWork(attachments: [baseAttachment]),
                 attachment: forgedAttachment, relationship: baseRelationship,
                 sessionCursor: baseSessionCursor)),
-            ("relationship capabilities differ", {
+            ("relationship capabilities differ", try {
                 let relationship = replacingRelationship(capabilities: [.observe])
-                return replacingResponse(
-                    work: replacingWork(relationship: relationship), attachment: baseAttachment,
+                return try replacingResponse(
+                    work: try replacingWork(relationship: relationship), attachment: baseAttachment,
                     relationship: relationship, sessionCursor: baseSessionCursor)
             }()),
-            ("relationship is detached", {
+            ("relationship is detached", try {
                 let relationship = replacingRelationship(isAttached: false)
-                return replacingResponse(
-                    work: replacingWork(relationship: relationship), attachment: baseAttachment,
+                return try replacingResponse(
+                    work: try replacingWork(relationship: relationship), attachment: baseAttachment,
                     relationship: relationship, sessionCursor: baseSessionCursor)
             }()),
-            ("publication contradicts reusable Work", {
+            ("publication contradicts reusable Work", try {
                 let relationship = replacingRelationship(publication: .terminalReference)
-                return replacingResponse(
-                    work: replacingWork(relationship: relationship), attachment: baseAttachment,
+                return try replacingResponse(
+                    work: try replacingWork(relationship: relationship), attachment: baseAttachment,
                     relationship: relationship, sessionCursor: baseSessionCursor)
             }()),
-            ("Session creation does not begin at baseline", {
+            ("Session creation does not begin at baseline", try {
                 let relationship = replacingRelationship(causalSessionCursor: nonbaseline)
-                return replacingResponse(
-                    work: replacingWork(relationship: relationship), attachment: baseAttachment,
+                return try replacingResponse(
+                    work: try replacingWork(relationship: relationship), attachment: baseAttachment,
                     relationship: relationship, sessionCursor: baseSessionCursor)
             }()),
-            ("Session creation omits one of three events", {
+            ("Session creation omits one of three events", try {
                 let relationship = replacingRelationship(sessionCursor: shortenedSessionCursor)
-                return replacingResponse(
-                    work: replacingWork(relationship: relationship), attachment: baseAttachment,
+                return try replacingResponse(
+                    work: try replacingWork(relationship: relationship), attachment: baseAttachment,
                     relationship: relationship, sessionCursor: shortenedSessionCursor)
             }()),
-            ("minted attachment reuses the authorizing attachment identity", replacingResponse(
+            ("minted attachment reuses the authorizing attachment identity", try replacingResponse(
                 work: reusedAttachmentDescriptor, attachment: reusedAttachment,
                 relationship: baseRelationship, sessionCursor: baseSessionCursor)),
-            ("descriptor repeats one client attachment identity", replacingResponse(
-                work: replacingWork(attachments: [baseAttachment, baseAttachment]),
+            ("descriptor repeats one client attachment identity", try replacingResponse(
+                work: try replacingWork(attachments: [baseAttachment, baseAttachment]),
                 attachment: baseAttachment, relationship: baseRelationship,
                 sessionCursor: baseSessionCursor)),
-            ("control result skips an unobserved journal event", replacingResponse(
-                work: replacingWork(), attachment: baseAttachment,
+            ("control result skips an unobserved journal event", try replacingResponse(
+                work: try replacingWork(), attachment: baseAttachment,
                 relationship: baseRelationship, sessionCursor: baseSessionCursor,
                 controlCursor: skippedControlCursor)),
-            ("mirrored causal Work cursor overflows", {
+            ("mirrored causal Work cursor overflows", try {
                 let relationship = replacingRelationship(causalWorkCursor: overflowWorkCursor)
-                return replacingResponse(
-                    work: replacingWork(relationship: relationship), attachment: baseAttachment,
+                return try replacingResponse(
+                    work: try replacingWork(relationship: relationship), attachment: baseAttachment,
                     relationship: relationship, sessionCursor: baseSessionCursor)
             }()),
         ]
@@ -374,6 +379,331 @@ func test_workServiceTransportHandshakeAndReadProjection() async throws {
     }
 }
 
+func test_workServiceTransportCreateSessionReplayKeepsMutableAttachmentCurrent()
+    async throws {
+    let path = transportSocketPath()
+    let socketRoot = URL(fileURLWithPath: path).deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: socketRoot, withIntermediateDirectories: true)
+    let homeRoot = FileManager.default.temporaryDirectory
+        .appending(path: "aviary-transport-jbs-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: homeRoot, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: socketRoot)
+        try? FileManager.default.removeItem(at: homeRoot)
+    }
+    let home = AgentHome(root: homeRoot)
+    let host = try home.requirePersistedWorkHost()
+    let store = DurableJournalBackedWorkLaunchManifestStore(
+        store: WorkLaunchManifestStore(home: home), bodyAuthority: .workHost(host),
+        draftResolver: { request in
+            WorkLaunchManifestDraft(
+                workspace: WorkLaunchWorkspace(
+                    locator: "/tmp/transport-jbs", policy: .temporary),
+                runtime: WorkLaunchRuntime(
+                    providerID: "transport-jbs-provider",
+                    modelID: request.configuration.modelID ?? "transport-jbs-model",
+                    runtimeVariant: "transport-test"),
+                configuration: request.configuration,
+                requestedCapabilities: request.requestedCapabilities,
+                provenance: WorkLaunchManifestProvenance(source: "transport-jbs-test"))
+        },
+        reconstructabilityProbe: { _ in true })
+    let authorizer = WorkServiceCapabilityPolicy(
+        grantsByClient: [transportClientA: transportCapabilities])
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "transport-jbs-a", startIdentity: "transport-jbs-start-a",
+        authorizer: authorizer, manifestStore: store)
+    let server = WorkServiceUnixSocketServer(
+        endpoint: WorkServiceTransportEndpoint(path: path), service: service)
+    let client = WorkServiceUnixSocketClient(
+        endpoint: WorkServiceTransportEndpoint(path: path), client: transportClientA)
+    do {
+        try await server.start()
+        let handshake = try await client.connect()
+        let createRequest = WorkServiceCreateWorkRequest(
+            client: transportClientA, commandID: "transport-jbs-create",
+            causalControlCursor: handshake.controlCursor,
+            configuration: WorkServiceWorkConfiguration(modelID: "transport-jbs-model"),
+            requestedCapabilities: [.observe, .control, .createSession, .send])
+        let created = try await client.createWork(createRequest)
+        let sessionRequest = WorkServiceCreateSessionRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: transportClientA,
+            commandID: "transport-jbs-session", causalControlCursor: created.controlCursor,
+            causalWorkCursor: created.workCursor,
+            requestedCapabilities: [.observe, .control, .send])
+        let first = try await client.createSession(sessionRequest)
+        let firstAttachment = try XCTUnwrap(first.attachment)
+        let firstAuthorization = first.authorization
+        let firstRelationship = try XCTUnwrap(first.relationship)
+        let updated = try await client.updateCapabilities(.init(
+            work: created.work.work, journal: created.work.journal,
+            attachment: firstAttachment.attachment, client: transportClientA,
+            requestedCapabilities: [.observe, .control], commandID: "transport-jbs-update",
+            causalControlCursor: first.controlCursor))
+        XCTAssertEqual(updated.state, .accepted)
+        XCTAssertEqual(
+            Set(try XCTUnwrap(updated.attachment).authorization.granted), [.observe, .control])
+
+        // Transport must accept mutable current capabilities while preserving the immutable
+        // CreateSession authorization and relationship in the duplicate response.
+        let duplicate = try await client.createSession(sessionRequest)
+        XCTAssertEqual(duplicate.state, .duplicate)
+        XCTAssertEqual(duplicate.authorization, firstAuthorization)
+        XCTAssertEqual(duplicate.relationship, firstRelationship)
+        XCTAssertEqual(
+            Set(try XCTUnwrap(duplicate.attachment).authorization.granted),
+            [.observe, .control])
+        XCTAssertTrue(duplicate.work.attachments.contains {
+            $0.attachment == firstAttachment.attachment
+                && $0.authorization.granted == [.observe, .control]
+        })
+
+        // A later Session publication advances the Work journal. An exact CreateSession retry
+        // must still replay the immutable first relationship while projecting the current
+        // attachment row and the newer host observation over the Unix socket.
+        let advanced = try await client.createSession(.init(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: transportClientA,
+            commandID: "transport-jbs-session-advanced",
+            causalControlCursor: updated.resultingControlCursor,
+            causalWorkCursor: first.workCursor,
+            requestedCapabilities: [.observe]))
+        XCTAssertEqual(advanced.state, .accepted)
+        XCTAssertEqual(advanced.relationship?.publication, .mirrored)
+        XCTAssertTrue(advanced.workCursor.sequence > first.workCursor.sequence)
+
+        let advancedDuplicate = try await client.createSession(sessionRequest)
+        XCTAssertEqual(advancedDuplicate.state, .duplicate)
+        XCTAssertEqual(advancedDuplicate.relationship, firstRelationship)
+        XCTAssertEqual(advancedDuplicate.attachment?.attachment, first.attachment?.attachment)
+        XCTAssertEqual(
+            Set(try XCTUnwrap(advancedDuplicate.attachment).authorization.granted),
+            [.observe, .control])
+        XCTAssertEqual(advancedDuplicate.workCursor, first.workCursor)
+        XCTAssertTrue(advancedDuplicate.work.attachments.contains {
+            $0.attachment == firstAttachment.attachment
+                && $0.authorization.granted == [.observe, .control]
+        })
+
+        // A missing attachment in a duplicate response is forged while the current descriptor
+        // still carries the exact row; the transport correlation boundary must reject it.
+        let forgedOmission = WorkServiceCreateSessionResponse(
+            work: duplicate.work, session: duplicate.session,
+            sessionJournal: duplicate.sessionJournal,
+            sessionAttachment: duplicate.sessionAttachment, attachment: nil,
+            relationship: duplicate.relationship, workCursor: duplicate.workCursor,
+            sessionCursor: duplicate.sessionCursor, controlCursor: duplicate.controlCursor,
+            authorization: duplicate.authorization, commandID: duplicate.commandID,
+            state: .duplicate, host: duplicate.host,
+            causalControlCursor: duplicate.causalControlCursor,
+            causalWorkCursor: duplicate.causalWorkCursor, receipt: duplicate.receipt)
+        let requestEnvelope = WorkServiceTransportRequestEnvelope(
+            id: "transport-jbs-session", operation: .createSession,
+            client: transportClientA, payload: try transportEnvelopePayload(sessionRequest))
+        let omissionEnvelope = WorkServiceTransportResponseEnvelope(
+            id: requestEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedOmission), hostInstance: duplicate.host)
+        do {
+            try WorkServiceTransportCodec.validateResponseSemantics(
+                omissionEnvelope, operation: .createSession)
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                omissionEnvelope, request: requestEnvelope, expectedHostInstance: duplicate.host)
+            XCTFail("transport accepted a duplicate response omitting a current attachment")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        // A same-ID row with different identity fields is not historical evidence. It must not
+        // be accepted merely because the returned attachment has the immutable publication grant.
+        let currentAttachment = try XCTUnwrap(duplicate.attachment)
+        let forgedRow = WorkServiceClientAttachment(
+            attachment: currentAttachment.attachment, client: ClientRef("forged-client"),
+            session: currentAttachment.session, sessionJournal: currentAttachment.sessionJournal,
+            sessionAttachment: currentAttachment.sessionAttachment,
+            authorization: currentAttachment.authorization,
+            readAcknowledgements: currentAttachment.readAcknowledgements)
+        let forgedDescriptor = try WorkServiceWorkDescriptor(
+            work: duplicate.work.work, journal: duplicate.work.journal,
+            recordedDisposition: duplicate.work.recordedDisposition,
+            execution: duplicate.work.execution, currentRun: duplicate.work.currentRun,
+            currentRunSession: duplicate.work.currentRunSession,
+            currentRunSessionAttachment: duplicate.work.currentRunSessionAttachment,
+            configuration: duplicate.work.configuration,
+            hostObservation: duplicate.work.hostObservation, attachments: [forgedRow],
+            sessionAttachments: duplicate.work.sessionAttachments,
+            artifacts: duplicate.work.artifacts, omissions: duplicate.work.omissions)
+        let forgedSameID = WorkServiceCreateSessionResponse(
+            work: forgedDescriptor, session: duplicate.session,
+            sessionJournal: duplicate.sessionJournal,
+            sessionAttachment: duplicate.sessionAttachment,
+            attachment: duplicate.attachment, relationship: duplicate.relationship,
+            workCursor: duplicate.workCursor, sessionCursor: duplicate.sessionCursor,
+            controlCursor: duplicate.controlCursor, authorization: duplicate.authorization,
+            commandID: duplicate.commandID, state: .duplicate, host: duplicate.host,
+            causalControlCursor: duplicate.causalControlCursor,
+            causalWorkCursor: duplicate.causalWorkCursor, receipt: duplicate.receipt)
+        let forgedSameIDEnvelope = WorkServiceTransportResponseEnvelope(
+            id: requestEnvelope.id, ok: true,
+            data: try transportEnvelopePayload(forgedSameID), hostInstance: duplicate.host)
+        do {
+            try WorkServiceTransportCodec.validateResponseSemantics(
+                forgedSameIDEnvelope, operation: .createSession)
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedSameIDEnvelope, request: requestEnvelope,
+                expectedHostInstance: duplicate.host)
+            XCTFail("transport accepted a mismatched same-ID attachment row")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+
+        let detached = try await client.detach(.init(
+            work: created.work.work, journal: created.work.journal,
+            attachment: firstAttachment.attachment, client: transportClientA,
+            commandID: "transport-jbs-detach", causalControlCursor: advanced.resultingControlCursor))
+        XCTAssertEqual(detached.state, .accepted)
+        let historical = try await client.createSession(sessionRequest)
+        XCTAssertEqual(historical.state, .duplicate)
+        XCTAssertEqual(historical.attachment, first.attachment)
+        XCTAssertEqual(historical.authorization, firstAuthorization)
+        XCTAssertFalse(historical.work.attachments.contains {
+            $0.attachment == firstAttachment.attachment
+        })
+
+        // Complete the Work through its canonical journal proof, then replay the same command
+        // over a live Unix socket. The immutable mirrored relationship and historical minted
+        // attachment remain replayable, while the terminal Work projection stays attachment-free.
+        let firstSession = try XCTUnwrap(first.session)
+        let firstSessionAttachment = try XCTUnwrap(first.sessionAttachment)
+        let workBinding = WorkBinding(
+            session: firstSession, work: created.work.work,
+            workHost: WorkHostRef(created.work.work.workHostID),
+            sessionAttachment: firstSessionAttachment)
+        let runBinding = WorkRunBinding(
+            workBinding: workBinding, run: RunRef("transport-jbs-terminal-run"))
+        let execution = try await RunJournalBundle.openForExecution(
+            home: home, binding: runBinding, actorID: "transport-jbs-terminal-execution")
+        _ = try await execution.finishRun(outcome: .completed)
+        let finishedCursor = try XCTUnwrap(await execution.latestWorkCursor)
+        try await execution.closeChecked()
+        let terminal = try await RunJournalBundle.openForTerminalMutation(
+            home: home, binding: runBinding, actorID: "transport-jbs-terminal-committer")
+        let terminalCommand = CommandRef(
+            commandID: "transport-jbs-terminal-complete", client: transportClientA,
+            sessionAttachment: firstSessionAttachment, causalCursor: finishedCursor)
+        let terminalCommits = try await terminal.completeWork(
+            detail: "transport terminal replay", command: terminalCommand)
+        try await terminal.closeChecked()
+        XCTAssertTrue(terminalCommits.count > 0)
+        XCTAssertEqual(terminalCommits[0].cursor.sequence, finishedCursor.sequence + 1)
+
+        let terminalDuplicate = try await client.createSession(sessionRequest)
+        XCTAssertEqual(terminalDuplicate.state, .duplicate)
+        XCTAssertEqual(terminalDuplicate.work.recordedDisposition, .completed)
+        XCTAssertEqual(terminalDuplicate.relationship, firstRelationship)
+        XCTAssertEqual(terminalDuplicate.attachment, first.attachment)
+        XCTAssertEqual(terminalDuplicate.authorization, firstAuthorization)
+        XCTAssertEqual(terminalDuplicate.workCursor, first.workCursor)
+        XCTAssertFalse(terminalDuplicate.work.attachments.contains {
+            $0.attachment == firstAttachment.attachment
+        })
+
+        await client.close()
+        await server.stop()
+        await service.controlJournal.close()
+
+        let restarted = try JournalBackedWorkService(
+            home: home, instanceID: "transport-jbs-b", startIdentity: "transport-jbs-start-b",
+            authorizer: authorizer, manifestStore: store)
+        let restartCreateRequest = WorkServiceCreateWorkRequest(
+            client: transportClientA, commandID: createRequest.commandID,
+            causalControlCursor: createRequest.causalControlCursor,
+            configuration: createRequest.configuration,
+            requestedCapabilities: createRequest.requestedCapabilities)
+        // Rehydrate the durable Work template before reconnecting the transport. CreateWork's
+        // direct retry is the host restart seam; the response under test is the exact
+        // CreateSession replay carried over the new socket.
+        _ = try await restarted.createWork(restartCreateRequest)
+        let restartedPath = transportSocketPath()
+        let restartedRoot = URL(fileURLWithPath: restartedPath).deletingLastPathComponent()
+        let restartedServer = WorkServiceUnixSocketServer(
+            endpoint: WorkServiceTransportEndpoint(path: restartedPath), service: restarted)
+        let restartedClient = WorkServiceUnixSocketClient(
+            endpoint: WorkServiceTransportEndpoint(path: restartedPath), client: transportClientA)
+        defer {
+            Task {
+                await restartedClient.close()
+                await restartedServer.stop()
+                await restarted.controlJournal.close()
+                try? FileManager.default.removeItem(at: restartedRoot)
+            }
+        }
+        try await restartedServer.start()
+        _ = try await restartedClient.connect()
+        let reopened = try await restartedClient.createSession(sessionRequest)
+        XCTAssertEqual(reopened.state, .duplicate)
+        XCTAssertEqual(reopened.attachment, first.attachment)
+        XCTAssertEqual(reopened.authorization, firstAuthorization)
+        XCTAssertFalse(reopened.work.attachments.contains {
+            $0.attachment == firstAttachment.attachment
+        })
+        await restartedClient.close()
+        await restartedServer.stop()
+        await restarted.controlJournal.close()
+        try? FileManager.default.removeItem(at: restartedRoot)
+    } catch {
+        await client.close()
+        await server.stop()
+        await service.controlJournal.close()
+        throw error
+    }
+}
+
+func test_workServiceTransportInMemoryCreateWorkReplayKeepsMutableAttachmentCurrent()
+    async throws {
+    let path = transportSocketPath()
+    let fixture = try await transportFixture(path: path)
+    do {
+        let handshake = try await fixture.clientA.connect()
+        let request = WorkServiceCreateWorkRequest(
+            client: transportClientA, commandID: "in-memory-replay-create",
+            causalControlCursor: handshake.controlCursor,
+            requestedCapabilities: [.observe, .control, .createSession])
+        let created = try await fixture.clientA.createWork(request)
+        let originalAttachment = created.attachment
+        let updated = try await fixture.clientA.updateCapabilities(.init(
+            work: created.work.work, journal: created.work.journal,
+            attachment: originalAttachment.attachment, client: transportClientA,
+            requestedCapabilities: [.observe], commandID: "in-memory-replay-update",
+            causalControlCursor: created.controlCursor))
+        let attachedDuplicate = try await fixture.clientA.createWork(request)
+        XCTAssertEqual(attachedDuplicate.receipt.state, .duplicate)
+        XCTAssertEqual(attachedDuplicate.authorization, created.authorization)
+        XCTAssertEqual(attachedDuplicate.attachment.authorization.granted, [.observe])
+        XCTAssertTrue(attachedDuplicate.work.attachments.contains {
+            $0.attachment == originalAttachment.attachment
+                && $0.authorization.granted == [.observe]
+        })
+
+        let detached = try await fixture.clientA.detach(.init(
+            work: created.work.work, journal: created.work.journal,
+            attachment: originalAttachment.attachment, client: transportClientA,
+            commandID: "in-memory-replay-detach",
+            causalControlCursor: updated.resultingControlCursor))
+        XCTAssertEqual(detached.state, .accepted)
+        let detachedDuplicate = try await fixture.clientA.createWork(request)
+        XCTAssertEqual(detachedDuplicate.receipt.state, .duplicate)
+        XCTAssertEqual(detachedDuplicate.attachment, originalAttachment)
+        XCTAssertFalse(detachedDuplicate.work.attachments.contains {
+            $0.attachment == originalAttachment.attachment
+        })
+        await stopTransport(fixture.server, [fixture.clientA])
+    } catch {
+        await stopTransport(fixture.server, [fixture.clientA])
+        throw error
+    }
+}
+
 func test_workServiceTransportRawCorrelationAllowsCanonicalShorthandAndUnobservedWork()
     async throws {
     let path = transportSocketPath()
@@ -399,10 +729,12 @@ func test_workServiceTransportRawCorrelationAllowsCanonicalShorthandAndUnobserve
 
         // A durable idle/historical projection need not carry an actor observation. Its journal,
         // relationship, and returned Work cursor still provide the canonical correlation.
-        let unobservedWork = WorkServiceWorkDescriptor(
+        let unobservedWork = try WorkServiceWorkDescriptor(
             work: createdSession.work.work, journal: createdSession.work.journal,
             recordedDisposition: createdSession.work.recordedDisposition,
             execution: createdSession.work.execution, currentRun: createdSession.work.currentRun,
+            currentRunSession: createdSession.work.currentRunSession,
+            currentRunSessionAttachment: createdSession.work.currentRunSessionAttachment,
             configuration: createdSession.work.configuration, hostObservation: nil,
             attachments: createdSession.work.attachments,
             sessionAttachments: createdSession.work.sessionAttachments,
@@ -429,10 +761,12 @@ func test_workServiceTransportRawCorrelationAllowsCanonicalShorthandAndUnobserve
         // A duplicate can be reconciled from its historical receipt after a later detach has
         // removed the old client attachment from the current descriptor. The exact duplicate
         // cursors and returned identities still make this a canonical replay.
-        let historicalDuplicateWork = WorkServiceWorkDescriptor(
+        let historicalDuplicateWork = try WorkServiceWorkDescriptor(
             work: createdSession.work.work, journal: createdSession.work.journal,
             recordedDisposition: createdSession.work.recordedDisposition,
             execution: createdSession.work.execution, currentRun: createdSession.work.currentRun,
+            currentRunSession: createdSession.work.currentRunSession,
+            currentRunSessionAttachment: createdSession.work.currentRunSessionAttachment,
             configuration: createdSession.work.configuration, hostObservation: nil,
             attachments: createdSession.work.attachments.filter {
                 $0.attachment != canonicalAttachment.attachment
@@ -466,15 +800,19 @@ func test_workServiceTransportRawCorrelationAllowsCanonicalShorthandAndUnobserve
             expectedHostInstance: expectedHost)
 
         // Observation, when present, remains a cursor fence rather than becoming optional data.
-        let staleObservation = WorkServiceHostObservation(
+        let staleObservation = try WorkServiceHostObservation(
             instance: expectedHost, reachability: .observedReachable,
             currentRun: createdSession.work.currentRun,
+            currentRunSession: createdSession.work.currentRunSession,
+            currentRunSessionAttachment: createdSession.work.currentRunSessionAttachment,
             servedCursor: JournalCursor(journal: createdSession.work.journal, sequence: 0),
             sourceCompleteness: .complete)
-        let staleWork = WorkServiceWorkDescriptor(
+        let staleWork = try WorkServiceWorkDescriptor(
             work: createdSession.work.work, journal: createdSession.work.journal,
             recordedDisposition: createdSession.work.recordedDisposition,
             execution: createdSession.work.execution, currentRun: createdSession.work.currentRun,
+            currentRunSession: createdSession.work.currentRunSession,
+            currentRunSessionAttachment: createdSession.work.currentRunSessionAttachment,
             configuration: createdSession.work.configuration, hostObservation: staleObservation,
             attachments: createdSession.work.attachments,
             sessionAttachments: createdSession.work.sessionAttachments,
@@ -507,10 +845,12 @@ func test_workServiceTransportRawCorrelationAllowsCanonicalShorthandAndUnobserve
             sequence: attachCausal.sequence + 1)
         let attachAuthorization = WorkServiceAuthorizationOutcome(
             requested: [.observe], granted: [.observe], denied: [])
-        let attachWork = WorkServiceWorkDescriptor(
+        let attachWork = try WorkServiceWorkDescriptor(
             work: createdSession.work.work, journal: createdSession.work.journal,
             recordedDisposition: createdSession.work.recordedDisposition,
             execution: createdSession.work.execution, currentRun: createdSession.work.currentRun,
+            currentRunSession: createdSession.work.currentRunSession,
+            currentRunSessionAttachment: createdSession.work.currentRunSessionAttachment,
             configuration: createdSession.work.configuration,
             hostObservation: createdSession.work.hostObservation,
             attachments: createdSession.work.attachments,
@@ -563,10 +903,12 @@ func test_workServiceTransportRawCorrelationAllowsCanonicalShorthandAndUnobserve
 
         // The exact duplicate remains valid after a later detach removes the historical
         // attachment from the current descriptor. Accepted responses must still project it.
-        let detachedDuplicateWork = WorkServiceWorkDescriptor(
+        let detachedDuplicateWork = try WorkServiceWorkDescriptor(
             work: attachWork.work, journal: attachWork.journal,
             recordedDisposition: attachWork.recordedDisposition,
             execution: attachWork.execution, currentRun: attachWork.currentRun,
+            currentRunSession: attachWork.currentRunSession,
+            currentRunSessionAttachment: attachWork.currentRunSessionAttachment,
             configuration: attachWork.configuration,
             hostObservation: attachWork.hostObservation,
             attachments: attachWork.attachments.filter {
@@ -763,7 +1105,7 @@ func test_workServiceTransportSupportsIndependentClientsAndOrderedMutations() as
         let attachedA = try await fixture.clientA.attach(.init(
             work: transportWork, journal: transportJournal, client: transportClientA,
             commandID: "attach-a", causalControlCursor: fixture.controlCursor,
-            requestedCapabilities: [.observe, .control, .start, .inspectArtifacts]))
+            requestedCapabilities: [.observe, .control, .start, .inspectArtifacts, .createSession]))
         let attachmentA = try XCTUnwrap(attachedA.attachment)
         let attachedControlCursor = attachedA.resultingControlCursor
         XCTAssertEqual(attachedA.state, .accepted)
@@ -838,23 +1180,42 @@ func test_workServiceTransportSupportsIndependentClientsAndOrderedMutations() as
             XCTAssertEqual(code, .attachmentNotFound)
         }
 
+        // A Run must carry an exact Session/SessionAttachment owner. Establish a canonical
+        // relationship before exercising the active-Run observation path; the earlier unqualified
+        // attachment remains useful for the artifact/read assertions above.
+        let createdSession = try await fixture.clientA.createSession(.init(
+            work: transportWork, journal: transportJournal,
+            attachment: attachmentA.attachment, client: transportClientA,
+            commandID: "create-session-a", causalControlCursor: acknowledged.resultingControlCursor,
+            causalWorkCursor: cursorB,
+            requestedCapabilities: [.observe, .control, .start]))
+        let sessionClientAttachmentA = try XCTUnwrap(createdSession.attachment)
+        let attachedSessionB = try await clientB.attach(.init(
+            work: transportWork, journal: transportJournal, client: transportClientB,
+            session: createdSession.session, sessionJournal: createdSession.sessionJournal,
+            sessionAttachment: createdSession.sessionAttachment,
+            commandID: "attach-session-b", causalControlCursor: createdSession.controlCursor,
+            requestedCapabilities: [.observe, .control, .start]))
+        let activeAttachmentB = try XCTUnwrap(attachedSessionB.attachment)
+        let sessionWorkCursor = createdSession.workCursor
         let started = try await fixture.clientA.command(.init(
             work: transportWork, journal: transportJournal,
-            attachment: attachmentA.attachment, commandID: "start-a",
-            client: transportClientA, causalWorkCursor: cursorB, kind: .start))
+            attachment: sessionClientAttachmentA.attachment, commandID: "start-a",
+            client: transportClientA, sessionAttachment: sessionClientAttachmentA.sessionAttachment,
+            causalWorkCursor: sessionWorkCursor, kind: .start))
         XCTAssertEqual(started.state, .accepted)
         XCTAssertEqual(started.outcome, .started)
-        XCTAssertEqual(started.causalWorkCursor, cursorB)
+        XCTAssertEqual(started.causalWorkCursor, sessionWorkCursor)
         // Start records the Run boundary before its command admission receipt.
-        XCTAssertEqual(started.resultingWorkCursor?.sequence, cursorB.sequence + 2)
+        XCTAssertEqual(started.resultingWorkCursor?.sequence, sessionWorkCursor.sequence + 2)
 
         // A second client can observe the same Work after the first client's mutation; no
         // connection-level host sequence or global client lock is needed for this join.
         let observed = try await clientB.snapshot(.init(
             work: transportWork, journal: transportJournal,
-            attachment: attachmentB.attachment, client: transportClientB,
+            attachment: activeAttachmentB.attachment, client: transportClientB,
             target: .work(journal: transportJournal),
-            afterCursor: cursorB, limit: 8))
+            afterCursor: sessionWorkCursor, limit: 8))
         let canonicalStartID = WorkServiceCommandLedgerIdentity.commandID(
             client: transportClientA, commandID: "start-a")
         XCTAssertTrue(observed.events.contains { $0.command?.commandID == canonicalStartID })
@@ -864,16 +1225,16 @@ func test_workServiceTransportSupportsIndependentClientsAndOrderedMutations() as
             of: firstObservedEvent)
         let exactBoundary = try await clientB.eventsAfterCursor(.init(
             work: transportWork, journal: transportJournal,
-            attachment: attachmentB.attachment, client: transportClientB,
+            attachment: activeAttachmentB.attachment, client: transportClientB,
             target: .work(journal: transportJournal),
-            afterCursor: cursorB, limit: 1, maxBytes: exactEventBytes))
+            afterCursor: sessionWorkCursor, limit: 1, maxBytes: exactEventBytes))
         XCTAssertEqual(exactBoundary.events, [firstObservedEvent])
         do {
             _ = try await clientB.eventsAfterCursor(.init(
                 work: transportWork, journal: transportJournal,
-                attachment: attachmentB.attachment, client: transportClientB,
+                attachment: activeAttachmentB.attachment, client: transportClientB,
                 target: .work(journal: transportJournal),
-                afterCursor: cursorB, limit: 8, maxBytes: 1))
+                afterCursor: sessionWorkCursor, limit: 8, maxBytes: 1))
             XCTFail("transport must surface an event page that cannot make progress")
         } catch WorkServiceTransportError.remote(let code, let diagnostic) {
             XCTAssertEqual(code, .eventPageCannotProgress)
@@ -893,14 +1254,14 @@ func test_workServiceTransportSupportsIndependentClientsAndOrderedMutations() as
         XCTAssertEqual(body.data, transportBody().data)
         let events = try await clientB.eventsAfterCursor(.init(
             work: transportWork, journal: transportJournal,
-            attachment: attachmentB.attachment, client: transportClientB,
+            attachment: activeAttachmentB.attachment, client: transportClientB,
             target: .work(journal: transportJournal),
-            afterCursor: cursorB, limit: 8))
+            afterCursor: sessionWorkCursor, limit: 8))
         XCTAssertTrue(events.events.contains { $0.command?.commandID == canonicalStartID })
         let detached = try await clientB.detach(.init(
             work: transportWork, journal: transportJournal,
-            attachment: attachmentB.attachment, client: transportClientB,
-            commandID: "detach-b", causalControlCursor: acknowledged.resultingControlCursor))
+            attachment: activeAttachmentB.attachment, client: transportClientB,
+            commandID: "detach-b", causalControlCursor: attachedSessionB.resultingControlCursor))
         XCTAssertEqual(detached.state, .accepted)
         await stopTransport(fixture.server, [fixture.clientA, clientB])
     } catch {
@@ -1627,6 +1988,34 @@ func test_workServiceTransportRejectsFalsePageProgressAndBodyEOFClaims() async t
     } catch WorkServiceTransportError.invalidResponse {
         XCTAssertTrue(true)
     }
+    let correlatedFailure = WorkServiceTransportResponseEnvelope(
+        id: envelope.id, ok: false,
+        error: .init(code: .staleCursor, detail: "stale"), hostInstance: instance)
+    try WorkServiceTransportCodec.validateResponseCorrelation(
+        correlatedFailure, request: envelope, expectedHostInstance: instance)
+    let uncorrelatedFailure = WorkServiceTransportResponseEnvelope(
+        id: envelope.id, ok: false,
+        error: .init(code: .staleCursor, detail: "stale"))
+    do {
+        try WorkServiceTransportCodec.validateResponseCorrelation(
+            uncorrelatedFailure, request: envelope, expectedHostInstance: instance)
+        XCTFail("an uncorrelated stale-cursor error was accepted as host proof")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+    let foreignFailure = WorkServiceTransportResponseEnvelope(
+        id: envelope.id, ok: false,
+        error: .init(code: .staleCursor, detail: "stale"),
+        hostInstance: WorkHostInstanceRef(
+            host: transportHost, instanceID: "foreign-instance",
+            startIdentity: "foreign-start"))
+    do {
+        try WorkServiceTransportCodec.validateResponseCorrelation(
+            foreignFailure, request: envelope, expectedHostInstance: instance)
+        XCTFail("a stale-cursor error from another host instance was accepted")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
 
     let skipped = event("page-3", 3, first.eventID)
     let badPage = WorkServiceEventPage(
@@ -1863,10 +2252,12 @@ func test_workServiceTransportBindsMutationReceiptShapesAndIdentities() async th
             session: created.attachment.session, sessionJournal: created.attachment.sessionJournal,
             sessionAttachment: created.attachment.sessionAttachment,
             authorization: forgedCreateAuthorization)
-        let forgedCreateWork = WorkServiceWorkDescriptor(
+        let forgedCreateWork = try WorkServiceWorkDescriptor(
             work: created.work.work, journal: created.work.journal,
             recordedDisposition: created.work.recordedDisposition,
             execution: created.work.execution, currentRun: created.work.currentRun,
+            currentRunSession: created.work.currentRunSession,
+            currentRunSessionAttachment: created.work.currentRunSessionAttachment,
             configuration: created.work.configuration,
             hostObservation: created.work.hostObservation,
             attachments: [forgedCreateAttachment], artifacts: created.work.artifacts,
@@ -1938,10 +2329,12 @@ func test_workServiceTransportBindsMutationReceiptShapesAndIdentities() async th
             sessionJournal: attachedClientAttachment.sessionJournal,
             sessionAttachment: attachedClientAttachment.sessionAttachment,
             authorization: forgedAttachAuthorization)
-        let forgedAttachWork = WorkServiceWorkDescriptor(
+        let forgedAttachWork = try WorkServiceWorkDescriptor(
             work: attached.work.work, journal: attached.work.journal,
             recordedDisposition: attached.work.recordedDisposition,
             execution: attached.work.execution, currentRun: attached.work.currentRun,
+            currentRunSession: attached.work.currentRunSession,
+            currentRunSessionAttachment: attached.work.currentRunSessionAttachment,
             configuration: attached.work.configuration,
             hostObservation: attached.work.hostObservation,
             attachments: attached.work.attachments.map {
@@ -2314,7 +2707,100 @@ func test_workServiceTransportRejectsAttachmentOverflowBeforeSessionPublication(
     }
 }
 
+private func test_workServiceDescriptorOwnerValidationDoesNotTrap() throws {
+    let host = WorkHostRef("descriptor-validation-host")
+    let work = WorkRef(workHostID: host.workHostID, workID: "descriptor-validation-work")
+    let journal = JournalRef.work(work)
+    let run = RunRef("descriptor-validation-run")
+    let session = SessionRef("descriptor-validation-session")
+    let attachment = SessionAttachmentRef("descriptor-validation-attachment")
+    let sessionJournal = JournalRef.session(
+        session, authority: TimelineAuthorityRef(host.workHostID))
+    let workCursor = JournalCursor(journal: journal, sequence: 0)
+    let sessionCursor = JournalCursor(journal: sessionJournal, sequence: 0)
+    let relationship = WorkServiceSessionAttachmentDescriptor(
+        session: session, sessionJournal: sessionJournal, sessionAttachment: attachment,
+        publication: .mirrored, causalSessionCursor: sessionCursor,
+        sessionCursor: JournalCursor(journal: sessionJournal, eventID: "session-attachment", sequence: 1),
+        causalWorkCursor: workCursor,
+        resultingWorkCursor: JournalCursor(journal: journal, eventID: "work-mirror", sequence: 1),
+        capabilities: [.observe])
+
+    do {
+        _ = try WorkServiceHostObservation(
+            instance: WorkHostInstanceRef(host: host, instanceID: "instance", startIdentity: "start"),
+            reachability: .observedReachable, currentRun: run,
+            currentRunSession: nil, currentRunSessionAttachment: nil,
+            servedCursor: nil, sourceCompleteness: .complete)
+        XCTFail("a partial host owner tuple must be rejected")
+    } catch let error as WorkServiceProtocolError {
+        XCTAssertEqual(error, .invalidRequest(
+            "an observed Run must have exactly one Session/attachment owner envelope"))
+    }
+
+    let observation = try WorkServiceHostObservation(
+        instance: WorkHostInstanceRef(host: host, instanceID: "instance", startIdentity: "start"),
+        reachability: .observedReachable, currentRun: nil,
+        currentRunSession: nil, currentRunSessionAttachment: nil,
+        servedCursor: nil, sourceCompleteness: .complete)
+    do {
+        _ = try WorkServiceWorkDescriptor(
+            work: work, journal: journal, recordedDisposition: .reusable, execution: .idle,
+            currentRun: run, currentRunSession: session,
+            currentRunSessionAttachment: attachment, hostObservation: observation,
+            sessionAttachments: [relationship])
+        XCTFail("a complete mismatched host owner must be rejected")
+    } catch let error as WorkServiceProtocolError {
+        XCTAssertEqual(error, .invalidRequest(
+            "complete host observation must name the descriptor's exact Run owner"))
+    }
+
+    let valid = try WorkServiceWorkDescriptor(
+        work: work, journal: journal, recordedDisposition: .reusable, execution: .running,
+        currentRun: run, currentRunSession: session,
+        currentRunSessionAttachment: attachment, hostObservation: nil,
+        sessionAttachments: [relationship])
+    guard case .object(var forgedObject) = try transportEnvelopePayload(valid) else {
+        XCTFail("descriptor must encode as an object")
+        return
+    }
+    forgedObject["sessionAttachments"] = .array([])
+    let forgedOwnerEnvelope = WorkServiceTransportResponseEnvelope(
+        id: "forged-owner-descriptor", ok: true, data: .object(forgedObject))
+    do {
+        try WorkServiceTransportCodec.validateResponseSemantics(
+            forgedOwnerEnvelope, operation: .describeWork)
+        XCTFail("transport accepted an active owner with no attached Session relationship")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+    guard case .object(var detachedRelationship) = try transportEnvelopePayload(relationship) else {
+        XCTFail("relationship must encode as an object")
+        return
+    }
+    detachedRelationship["isAttached"] = .bool(false)
+    forgedObject["sessionAttachments"] = .array([.object(detachedRelationship)])
+    let detachedOwnerEnvelope = WorkServiceTransportResponseEnvelope(
+        id: "detached-owner-descriptor", ok: true, data: .object(forgedObject))
+    do {
+        try WorkServiceTransportCodec.validateResponseSemantics(
+            detachedOwnerEnvelope, operation: .describeWork)
+        XCTFail("transport accepted an active owner with a detached Session relationship")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+}
+
 let casesWorkServiceTransport: [Case] = [
+    ("phase3 Work service transport: owner validation fails closed without trapping", {
+        try test_workServiceDescriptorOwnerValidationDoesNotTrap()
+    }),
+    ("phase3 Work service transport: CreateSession replay preserves mutable attachment state", {
+        try await test_workServiceTransportCreateSessionReplayKeepsMutableAttachmentCurrent()
+    }),
+    ("phase3 Work service transport: InMemory CreateWork replay preserves mutable attachment state", {
+        try await test_workServiceTransportInMemoryCreateWorkReplayKeepsMutableAttachmentCurrent()
+    }),
     ("phase3 Work service transport: handshake and read projection", {
         try await test_workServiceTransportHandshakeAndReadProjection()
     }),

@@ -103,8 +103,10 @@ private func recoveryProjectionWorkData(
     } else {
         data.append(try recoveryProjectionEvent(
             id: stateID, journal: journal, sequence: sequence, previous: lastID,
-            type: TimelineEventType.runStarted, work: work,
-            workHost: WorkHostRef(work.workHostID), run: RunRef("recovery-run"),
+            type: TimelineEventType.runStarted, session: SessionRef("recovery-session"),
+            work: work, workHost: WorkHostRef(work.workHostID),
+            sessionAttachment: SessionAttachmentRef("recovery-attachment"),
+            run: RunRef("recovery-run"),
             declaredDomains: [.work], payload: .object(["model_id": .string("recovery-model")])))
     }
     if unknownSession {
@@ -198,12 +200,14 @@ func test_canonicalWorkRecoveryProjectionUsesDurableWorkEvidenceAndScopesObserve
     let catalog = LocalTimelineCatalog.scan(home: home)
     let row = try XCTUnwrap(catalog.works.first { $0.work == work })
     XCTAssertTrue(row.isAvailable)
+    let workAttachment = try XCTUnwrap(row.sessionAttachments.first)
     XCTAssertEqual(row.sessionAttachments.count, 1)
-    XCTAssertEqual(row.sessionAttachments[0].session, SessionRef("recovery-session"))
+    XCTAssertEqual(workAttachment.session, SessionRef("recovery-session"))
     XCTAssertEqual(row.clientAttachments.map(\.attachment.attachmentID).sorted(),
                    ["client-a", "client-b"])
+    let controlRow = try XCTUnwrap(catalog.workHostControls.first)
     XCTAssertEqual(catalog.workHostControls.count, 1)
-    XCTAssertTrue(catalog.workHostControls[0].isAvailable)
+    XCTAssertTrue(controlRow.isAvailable)
     XCTAssertEqual(row.lifecycle, .active)
     XCTAssertEqual(row.activeRun, RunRef("recovery-run"))
 
@@ -218,8 +222,9 @@ func test_canonicalWorkRecoveryProjectionUsesDurableWorkEvidenceAndScopesObserve
     XCTAssertEqual(global.rows.first?.disposition, .recordedActive)
     XCTAssertEqual(global.rows.first?.clientDisposition, .notRequested)
     XCTAssertFalse(global.rows.first?.clientCanControl ?? true)
+    let globalAttachment = try XCTUnwrap(global.rows.first?.sessionAttachments.first)
     XCTAssertEqual(global.rows.first?.sessionAttachments.count, 1)
-    XCTAssertFalse(global.rows.first?.sessionAttachments[0].isExact ?? true)
+    XCTAssertFalse(globalAttachment.isExact)
 
     let scoped = CanonicalWorkRecoveryProjection(
         catalog: catalog, observations: [observation], observingClient: ClientRef("gui-a"))
@@ -586,12 +591,19 @@ func test_canonicalWorkRecoveryProjectionBoundsClientCursorAndHandleMetadata() t
         work: work, workHost: WorkHostRef(work.workHostID), declaredDomains: [.work])
     data.append(try recoveryProjectionEvent(
         id: "b2", journal: journal, sequence: 2, previous: "b1",
-        type: TimelineEventType.runStarted, work: work,
-        workHost: WorkHostRef(work.workHostID), run: RunRef("bound-run"),
+        type: TimelineEventType.sessionAttached, session: SessionRef("bound-session"),
+        work: work, workHost: WorkHostRef(work.workHostID),
+        sessionAttachment: SessionAttachmentRef("bound-attachment"),
+        declaredDomains: [.work, .session]))
+    data.append(try recoveryProjectionEvent(
+        id: "b3", journal: journal, sequence: 3, previous: "b2",
+        type: TimelineEventType.runStarted, session: SessionRef("bound-session"),
+        work: work, workHost: WorkHostRef(work.workHostID),
+        sessionAttachment: SessionAttachmentRef("bound-attachment"), run: RunRef("bound-run"),
         declaredDomains: [.work]))
     let longEventID = String(repeating: "e", count: 48)
     data.append(try recoveryProjectionEvent(
-        id: longEventID, journal: journal, sequence: 3, previous: "b2",
+        id: longEventID, journal: journal, sequence: 4, previous: "b3",
         type: TimelineEventType.handleStarted, work: work,
         workHost: WorkHostRef(work.workHostID), run: RunRef("bound-run"),
         handle: HandleRef("bound-handle"),
@@ -642,15 +654,15 @@ func test_canonicalWorkRecoveryProjectionUsesCompleteRunMembershipBeyondDisplayC
         let started = "cap-w\(sequence)"
         workData.append(try recoveryProjectionEvent(
             id: started, journal: workJournal, sequence: sequence, previous: previous,
-            type: TimelineEventType.runStarted, work: work,
-            workHost: WorkHostRef(work.workHostID), run: run,
+            type: TimelineEventType.runStarted, session: session, work: work,
+            workHost: WorkHostRef(work.workHostID), sessionAttachment: attachment, run: run,
             declaredDomains: [.work]))
         sequence += 1
         let finished = "cap-w\(sequence)"
         workData.append(try recoveryProjectionEvent(
             id: finished, journal: workJournal, sequence: sequence, previous: started,
-            type: TimelineEventType.runFinished, work: work,
-            workHost: WorkHostRef(work.workHostID), run: run,
+            type: TimelineEventType.runFinished, session: session, work: work,
+            workHost: WorkHostRef(work.workHostID), sessionAttachment: attachment, run: run,
             declaredDomains: [.work], payload: .object(["state": .string("completed")])))
         previous = finished
     }
@@ -704,19 +716,26 @@ func test_canonicalWorkRecoveryProjectionRequiresReciprocalWorkSessionAttachment
         session, journalID: "reciprocal-session-journal",
         authority: TimelineAuthorityRef("reciprocal-session-service"))
 
-    // The Work page has exact Run/action evidence but deliberately has no
-    // session.attached record for this Session attachment.
+    // The Work page has exact Run/action evidence, but its canonical attachment is deliberately
+    // different from the Session attachment below. This keeps the Work run valid under the
+    // run-owner law while exercising the reciprocal-attachment rejection.
     var workData = try recoveryProjectionEvent(
         id: "rw1", journal: workJournal, sequence: 1,
         type: TimelineEventType.workCreated, work: work,
         workHost: WorkHostRef(work.workHostID), declaredDomains: [.work])
+    let workRunAttachment = SessionAttachmentRef("work-only-attachment")
     workData.append(try recoveryProjectionEvent(
         id: "rw2", journal: workJournal, sequence: 2, previous: "rw1",
-        type: TimelineEventType.runStarted, work: work,
-        workHost: WorkHostRef(work.workHostID), run: run,
-        declaredDomains: [.work], payload: .object(["model_id": .string("reciprocal-model")])))
+        type: TimelineEventType.sessionAttached, session: session, work: work,
+        workHost: WorkHostRef(work.workHostID), sessionAttachment: workRunAttachment,
+        declaredDomains: [.work, .session]))
     workData.append(try recoveryProjectionEvent(
         id: "rw3", journal: workJournal, sequence: 3, previous: "rw2",
+        type: TimelineEventType.runStarted, session: session, work: work,
+        workHost: WorkHostRef(work.workHostID), sessionAttachment: workRunAttachment, run: run,
+        declaredDomains: [.work], payload: .object(["model_id": .string("reciprocal-model")])))
+    workData.append(try recoveryProjectionEvent(
+        id: "rw4", journal: workJournal, sequence: 4, previous: "rw3",
         type: TimelineEventType.actionIntent, work: work,
         workHost: WorkHostRef(work.workHostID), action: action,
         declaredDomains: [.work, .externalEffects],
@@ -725,13 +744,13 @@ func test_canonicalWorkRecoveryProjectionRequiresReciprocalWorkSessionAttachment
             "intent": .string("tool invocation")
         ])))
     workData.append(try recoveryProjectionEvent(
-        id: "rw4", journal: workJournal, sequence: 4, previous: "rw3",
+        id: "rw5", journal: workJournal, sequence: 5, previous: "rw4",
         type: TimelineEventType.actionStarted, work: work,
         workHost: WorkHostRef(work.workHostID), action: action,
         declaredDomains: [.work, .externalEffects],
         payload: .object(["state": .string("running"), "kind": .string("mcp")])))
     workData.append(try recoveryProjectionEvent(
-        id: "rw5", journal: workJournal, sequence: 5, previous: "rw4",
+        id: "rw6", journal: workJournal, sequence: 6, previous: "rw5",
         type: TimelineEventType.actionOutcome, work: work,
         workHost: WorkHostRef(work.workHostID), action: action,
         declaredDomains: [.work, .externalEffects],
@@ -752,7 +771,7 @@ func test_canonicalWorkRecoveryProjectionRequiresReciprocalWorkSessionAttachment
         type: TimelineEventType.sessionAttached, session: session, work: work,
         sessionAttachment: sessionAttachment, declaredDomains: [.session, .work],
         payload: .object(["capabilities": .array([.string("observe"), .string("control")])])))
-    let workCursor = JournalCursor(journal: workJournal, eventID: "rw5", sequence: 5)
+    let workCursor = JournalCursor(journal: workJournal, eventID: "rw6", sequence: 6)
     sessionData.append(try recoveryProjectionEvent(
         id: "rs3", journal: sessionJournal, sequence: 3, previous: "rs2",
         type: TimelineEventType.sessionAttachmentCursorAdvanced, session: session,

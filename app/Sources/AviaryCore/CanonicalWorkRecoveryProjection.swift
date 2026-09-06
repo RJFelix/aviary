@@ -657,8 +657,13 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
                 }
             }
         }
-        let sessionGroups = sessionFactsByKey.values.map { values in
-            let first = values[0]
+        let sessionGroups = sessionFactsByKey.values.compactMap {
+            (values: [CanonicalWorkRecoverySessionAttachment])
+                -> (CanonicalWorkRecoverySessionAttachment, Bool)? in
+            // Keep this public projection boundary fail-closed if a caller supplies an empty
+            // bucket through a future catalog adapter. Dictionary grouping currently creates
+            // non-empty buckets, but indexing here must not turn malformed input into a trap.
+            guard let first = values.first else { return nil }
             let duplicate = values.dropFirst().contains { $0 != first }
             return (first, duplicate)
         }

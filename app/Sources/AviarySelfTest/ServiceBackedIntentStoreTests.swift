@@ -9,7 +9,9 @@ private func serviceBackedIntentFixture()
     let home = AgentHome(root: root.appending(path: "home", directoryHint: .isDirectory))
     let host = WorkHostRef("intent-host")
     let client = ClientRef("intent-client")
-    let capabilities: Set<WorkServiceCapability> = [.observe, .control, .start, .send]
+    let capabilities: Set<WorkServiceCapability> = [
+        .observe, .control, .start, .send, .createSession,
+    ]
     let service = InMemoryWorkService(
         host: host,
         authorizer: WorkServiceCapabilityPolicy(grantsByClient: [client: capabilities]))
@@ -44,6 +46,8 @@ func testServiceBackedIntentStoresCarryCreateIntoCanonicalStartEvidence() async 
     let (home, root, service, response, seed) = try await serviceBackedIntentFixture()
     defer { try? FileManager.default.removeItem(at: root) }
     let client = response.attachment.client
+    let attachmentKey = try XCTUnwrap(
+        ServiceAttachmentKey(work: response.work.work, attachment: response.attachment))
     let createStore = try ServiceBackedCreateIntentStore(home: home, client: client)
     let retainedCreate = try XCTUnwrap(createStore.loadPending().first)
     XCTAssertEqual(retainedCreate.initialStart, seed)
@@ -51,7 +55,7 @@ func testServiceBackedIntentStoresCarryCreateIntoCanonicalStartEvidence() async 
     let startIntent = try ServiceBackedStartIntent(
         seed: seed, response: response, client: client)
     let startStore = try ServiceBackedStartIntentStore(
-        home: home, client: client, work: response.work.work)
+        home: home, key: attachmentKey)
     try startStore.retain(startIntent)
     try createStore.clear(retainedCreate.request)
     XCTAssertTrue(try createStore.loadPending().isEmpty)
@@ -63,7 +67,7 @@ func testServiceBackedIntentStoresCarryCreateIntoCanonicalStartEvidence() async 
         controller = try WorkServiceAttachedWorkController(
             service: service, seed: .created(response),
             intentStore: WorkServiceAttachedWorkIntentStore(
-                home: home, client: client, work: response.work.work))
+                home: home, key: attachmentKey))
     } catch {
         throw UnwrapFailure(description: "attached controller construction failed: \(error)")
     }
@@ -99,6 +103,8 @@ func testServiceBackedIntentStoresRejectConflictsForeignBindingsAndCorruption() 
     let (home, root, _, response, seed) = try await serviceBackedIntentFixture()
     defer { try? FileManager.default.removeItem(at: root) }
     let client = response.attachment.client
+    let attachmentKey = try XCTUnwrap(
+        ServiceAttachmentKey(work: response.work.work, attachment: response.attachment))
     let createStore = try ServiceBackedCreateIntentStore(home: home, client: client)
     let retained = try XCTUnwrap(createStore.loadPending().first)
     do {
@@ -120,7 +126,7 @@ func testServiceBackedIntentStoresRejectConflictsForeignBindingsAndCorruption() 
 
     let intent = try ServiceBackedStartIntent(seed: seed, response: response, client: client)
     let store = try ServiceBackedStartIntentStore(
-        home: home, client: client, work: response.work.work)
+        home: home, key: attachmentKey)
     try store.retain(intent)
     try Data("{\"schemaVersion\":3".utf8).write(to: store.url, options: .atomic)
     do {
@@ -135,9 +141,11 @@ func testServiceBackedStartIntentClearFailurePreservesRecoveryMarker() async thr
     let (home, root, _, response, seed) = try await serviceBackedIntentFixture()
     defer { try? FileManager.default.removeItem(at: root) }
     let client = response.attachment.client
+    let attachmentKey = try XCTUnwrap(
+        ServiceAttachmentKey(work: response.work.work, attachment: response.attachment))
     let intent = try ServiceBackedStartIntent(seed: seed, response: response, client: client)
     let store = try ServiceBackedStartIntentStore(
-        home: home, client: client, work: response.work.work)
+        home: home, key: attachmentKey)
     try store.retain(intent)
     let directory = store.url.deletingLastPathComponent()
     try FileManager.default.setAttributes(
@@ -160,6 +168,8 @@ func testServiceBackedIntentStoresRejectSymlinksModesAndOversizeRecords() async 
     let (home, root, _, response, seed) = try await serviceBackedIntentFixture()
     defer { try? FileManager.default.removeItem(at: root) }
     let client = response.attachment.client
+    let attachmentKey = try XCTUnwrap(
+        ServiceAttachmentKey(work: response.work.work, attachment: response.attachment))
     let createStore = try ServiceBackedCreateIntentStore(home: home, client: client)
     let createRequest = try XCTUnwrap(try createStore.loadPending().first?.request)
     let createDirectory = createStore.directory
@@ -214,7 +224,7 @@ func testServiceBackedIntentStoresRejectSymlinksModesAndOversizeRecords() async 
 
     let startIntent = try ServiceBackedStartIntent(seed: seed, response: response, client: client)
     let startStore = try ServiceBackedStartIntentStore(
-        home: home, client: client, work: response.work.work)
+        home: home, key: attachmentKey)
     try startStore.retain(startIntent)
     let startDirectory = startStore.url.deletingLastPathComponent()
     let movedStartDirectory = root.appending(path: "moved-start-intents", directoryHint: .isDirectory)
@@ -267,6 +277,8 @@ func testServiceBackedIntentStoresConvergeUnderConcurrentIdenticalRetains() asyn
     let (home, root, _, response, seed) = try await serviceBackedIntentFixture()
     defer { try? FileManager.default.removeItem(at: root) }
     let client = response.attachment.client
+    let attachmentKey = try XCTUnwrap(
+        ServiceAttachmentKey(work: response.work.work, attachment: response.attachment))
     let createStore = try ServiceBackedCreateIntentStore(home: home, client: client)
     let request = try XCTUnwrap(try createStore.loadPending().first?.request)
     try await withThrowingTaskGroup(of: Void.self) { group in
@@ -282,18 +294,185 @@ func testServiceBackedIntentStoresConvergeUnderConcurrentIdenticalRetains() asyn
 
     let intent = try ServiceBackedStartIntent(seed: seed, response: response, client: client)
     let startStore = try ServiceBackedStartIntentStore(
-        home: home, client: client, work: response.work.work)
+        home: home, key: attachmentKey)
     try await withThrowingTaskGroup(of: Void.self) { group in
         for _ in 0..<8 {
             group.addTask {
                 let store = try ServiceBackedStartIntentStore(
-                    home: home, client: client, work: response.work.work)
+                    home: home, key: attachmentKey)
                 try store.retain(intent)
             }
         }
         try await group.waitForAll()
     }
     XCTAssertEqual(try startStore.load(), intent)
+}
+
+func testServiceBackedCreateSessionIntentSurvivesAndRejectsIdentityDrift() async throws {
+    let (home, root, _, response, _) = try await serviceBackedIntentFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = response.attachment.client
+    let host = WorkHostRef(response.work.work.workHostID)
+    let store = try ServiceBackedCreateSessionIntentStore(
+        home: home, client: client, host: host)
+    let request = WorkServiceCreateSessionRequest(
+        work: response.work.work, journal: response.work.journal,
+        attachment: response.attachment.attachment, client: client,
+        commandID: "intent-create-session",
+        causalControlCursor: response.controlCursor,
+        causalWorkCursor: response.workCursor,
+        requestedCapabilities: [.observe, .control, .start, .send])
+    try store.retain(request)
+    try store.retain(request)
+    XCTAssertEqual(try store.load(), [request])
+
+    let conflict = WorkServiceCreateSessionRequest(
+        work: request.work, journal: request.journal, attachment: request.attachment,
+        client: request.client, commandID: request.commandID,
+        causalControlCursor: request.causalControlCursor,
+        causalWorkCursor: request.causalWorkCursor,
+        requestedCapabilities: [.observe])
+    do {
+        try store.retain(conflict)
+        XCTFail("one Create Session command identity cannot change its capability envelope")
+    } catch LocalCreateIntentError.conflict {
+        XCTAssertTrue(true)
+    }
+
+    let foreignHost = WorkHostRef("foreign-intent-host")
+    let foreignWork = WorkRef(workHostID: foreignHost.workHostID, workID: request.work.workID)
+    let foreignJournal = JournalRef.work(foreignWork)
+    do {
+        try store.retain(WorkServiceCreateSessionRequest(
+            work: foreignWork, journal: foreignJournal, attachment: request.attachment,
+            client: request.client, commandID: "foreign-create-session",
+            causalControlCursor: JournalCursor(
+                journal: .workHost(foreignHost), eventID: "foreign-control", sequence: 1),
+            causalWorkCursor: JournalCursor(
+                journal: foreignJournal, eventID: "foreign-work", sequence: 1),
+            requestedCapabilities: [.observe]))
+        XCTFail("one Work Host's intent store accepted another host's request")
+    } catch LocalCreateIntentError.corrupt {
+        XCTAssertTrue(true)
+    }
+
+    let recordURL = try XCTUnwrap(try FileManager.default.contentsOfDirectory(
+        at: store.directory, includingPropertiesForKeys: nil).first(where: {
+            $0.pathExtension == "json"
+        }))
+    var object = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: recordURL)) as? [String: Any])
+    var nested = try XCTUnwrap(object["request"] as? [String: Any])
+    nested["unexpected"] = "must fail closed"
+    object["request"] = nested
+    try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        .write(to: recordURL, options: .atomic)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: recordURL.path)
+    do {
+        _ = try store.load()
+        XCTFail("Create Session intent decoding accepted an unknown request field")
+    } catch LocalCreateIntentError.corrupt {
+        XCTAssertTrue(true)
+    }
+
+    try FileManager.default.removeItem(at: recordURL)
+    try store.retain(request)
+    var topLevel = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: recordURL)) as? [String: Any])
+    topLevel["unexpected"] = "must fail closed"
+    try JSONSerialization.data(withJSONObject: topLevel, options: [.sortedKeys])
+        .write(to: recordURL, options: .atomic)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: recordURL.path)
+    do {
+        _ = try store.load()
+        XCTFail("Create Session intent decoding accepted an unknown record field")
+    } catch LocalCreateIntentError.corrupt {
+        XCTAssertTrue(true)
+    }
+
+    try FileManager.default.removeItem(at: recordURL)
+    try store.retain(request)
+    try store.clear(request)
+    XCTAssertTrue(try store.load().isEmpty)
+
+    for index in 0..<ServiceBackedCreateSessionIntentStore.maximumPendingRecords {
+        try store.retain(WorkServiceCreateSessionRequest(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            client: request.client, commandID: "bounded-create-session-\(index)",
+            causalControlCursor: request.causalControlCursor,
+            causalWorkCursor: request.causalWorkCursor,
+            requestedCapabilities: request.requestedCapabilities))
+    }
+    XCTAssertEqual(
+        try store.load().count,
+        ServiceBackedCreateSessionIntentStore.maximumPendingRecords)
+    do {
+        try store.retain(WorkServiceCreateSessionRequest(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            client: request.client, commandID: "bounded-create-session-overflow",
+            causalControlCursor: request.causalControlCursor,
+            causalWorkCursor: request.causalWorkCursor,
+            requestedCapabilities: request.requestedCapabilities))
+        XCTFail("Create Session intent store admitted a record beyond its durable bound")
+    } catch LocalCreateIntentError.tooLarge {
+        XCTAssertTrue(true)
+    }
+    XCTAssertEqual(
+        try store.load().count,
+        ServiceBackedCreateSessionIntentStore.maximumPendingRecords)
+
+    for pending in try store.load() { try store.clear(pending) }
+    let crashLeftTemporary = store.directory.appending(
+        path: ".pending-write.tmp", directoryHint: .notDirectory)
+    try Data("unpublished crash-left bytes".utf8).write(
+        to: crashLeftTemporary, options: .withoutOverwriting)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: Int16(0o600))],
+        ofItemAtPath: crashLeftTemporary.path)
+    try store.retain(request)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: crashLeftTemporary.path))
+    XCTAssertEqual(try store.load(), [request])
+    try store.clear(request)
+
+    let concurrentResult = await withTaskGroup(of: (Bool, Bool).self) { group in
+        for index in 0..<(ServiceBackedCreateSessionIntentStore.maximumPendingRecords + 8) {
+            group.addTask {
+                do {
+                    try store.retain(WorkServiceCreateSessionRequest(
+                        work: request.work, journal: request.journal,
+                        attachment: request.attachment, client: request.client,
+                        commandID: "concurrent-create-session-\(index)",
+                        causalControlCursor: request.causalControlCursor,
+                        causalWorkCursor: request.causalWorkCursor,
+                        requestedCapabilities: request.requestedCapabilities))
+                    return (true, false)
+                } catch LocalCreateIntentError.tooLarge {
+                    return (false, true)
+                } catch {
+                    return (false, false)
+                }
+            }
+        }
+        var successes = 0
+        var expectedRejections = 0
+        var unexpectedFailures = 0
+        for await result in group {
+            if result.0 { successes += 1 }
+            else if result.1 { expectedRejections += 1 }
+            else { unexpectedFailures += 1 }
+        }
+        return (successes, expectedRejections, unexpectedFailures)
+    }
+    XCTAssertEqual(
+        concurrentResult.0,
+        ServiceBackedCreateSessionIntentStore.maximumPendingRecords)
+    XCTAssertEqual(concurrentResult.1, 8)
+    XCTAssertEqual(concurrentResult.2, 0)
+    XCTAssertEqual(
+        try store.load().count,
+        ServiceBackedCreateSessionIntentStore.maximumPendingRecords)
 }
 
 let casesServiceBackedIntentStores: [Case] = [
@@ -311,5 +490,8 @@ let casesServiceBackedIntentStores: [Case] = [
     }),
     ("phase3 GUI intents converge concurrent identical retains", {
         try await testServiceBackedIntentStoresConvergeUnderConcurrentIdenticalRetains()
+    }),
+    ("phase3 GUI intents retain exact Create Session mutation", {
+        try await testServiceBackedCreateSessionIntentSurvivesAndRejectsIdentityDrift()
     }),
 ]

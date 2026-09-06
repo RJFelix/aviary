@@ -412,6 +412,13 @@ public struct WorkServiceCatalog: Sendable {
         if let observation = descriptor.hostObservation, observation.instance != instance {
             return "Work observation belongs to a different negotiated host instance"
         }
+        // ClientAttachmentRef is Work-scoped identity.  A repeated id is ambiguous even when
+        // the rows claim different clients or Session relationships, so quarantine the entire
+        // descriptor before any consumer can first-pick one row.
+        var attachmentIDs = Set<ClientAttachmentRef>()
+        guard descriptor.attachments.allSatisfy({ attachmentIDs.insert($0.attachment).inserted }) else {
+            return "duplicate ClientAttachmentRef within Work descriptor"
+        }
         return nil
     }
 }

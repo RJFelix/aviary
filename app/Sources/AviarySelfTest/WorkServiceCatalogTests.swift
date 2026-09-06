@@ -55,9 +55,10 @@ private func catalogTestDescriptor(
     observation: WorkServiceHostObservation? = nil
 ) throws -> WorkServiceWorkDescriptor {
     let work = WorkRef(workHostID: host.workHostID, workID: id)
-    return WorkServiceWorkDescriptor(
+    return try WorkServiceWorkDescriptor(
         work: work, journal: try journal ?? catalogTestJournal(work),
         recordedDisposition: .reusable, execution: .idle, currentRun: nil,
+        currentRunSession: nil, currentRunSessionAttachment: nil,
         hostObservation: observation)
 }
 
@@ -123,9 +124,10 @@ func testWorkServiceCatalogQuarantinesDuplicateInvalidAndRepeatedPagination() as
     let host = WorkHostRef("catalog-adversarial-host")
     let instance = WorkHostInstanceRef(host: host, instanceID: "good-instance", startIdentity: "good-start")
     let work = try catalogTestDescriptor(host: host, id: "same")
-    let staleObservation = WorkServiceHostObservation(
+    let staleObservation = try WorkServiceHostObservation(
         instance: WorkHostInstanceRef(host: host, instanceID: "stale-instance", startIdentity: "stale-start"),
-        reachability: .observedReachable, currentRun: nil, servedCursor: nil,
+        reachability: .observedReachable, currentRun: nil,
+        currentRunSession: nil, currentRunSessionAttachment: nil, servedCursor: nil,
         sourceCompleteness: .complete)
     let stale = try catalogTestDescriptor(host: host, id: "stale", observation: staleObservation)
     let foreignWork = WorkRef(workHostID: "other-host", workID: "foreign")
@@ -238,6 +240,46 @@ func testWorkServiceCatalogExactHostRowBoundCanFinishCompletely() async throws {
     XCTAssertTrue(snapshot.omissions.isEmpty)
 }
 
+func testWorkServiceCatalogQuarantinesWorkScopedClientAttachmentDuplicates() async throws {
+    let host = WorkHostRef("catalog-duplicate-attachment-host")
+    let instance = WorkHostInstanceRef(
+        host: host, instanceID: "duplicate-attachment-instance", startIdentity: "duplicate-start")
+    let work = WorkRef(workHostID: host.workHostID, workID: "duplicate-attachment-work")
+    let workJournal = try catalogTestJournal(work)
+    let sessionA = SessionRef("duplicate-session-a")
+    let sessionB = SessionRef("duplicate-session-b")
+    let journalA = JournalRef.session(
+        sessionA, journalID: "duplicate-session-journal-a",
+        authority: TimelineAuthorityRef(host.workHostID))
+    let journalB = JournalRef.session(
+        sessionB, journalID: "duplicate-session-journal-b",
+        authority: TimelineAuthorityRef(host.workHostID))
+    let authorization = WorkServiceAuthorizationOutcome(
+        requested: [.observe], granted: [.observe], denied: [])
+    let repeated = ClientAttachmentRef("repeated-client-attachment")
+    let first = WorkServiceClientAttachment(
+        attachment: repeated, client: ClientRef("duplicate-client-a"), session: sessionA,
+        sessionJournal: journalA, sessionAttachment: SessionAttachmentRef("duplicate-a"),
+        authorization: authorization)
+    let second = WorkServiceClientAttachment(
+        attachment: repeated, client: ClientRef("duplicate-client-b"), session: sessionB,
+        sessionJournal: journalB, sessionAttachment: SessionAttachmentRef("duplicate-b"),
+        authorization: authorization)
+    let descriptor = try WorkServiceWorkDescriptor(
+        work: work, journal: workJournal, recordedDisposition: .reusable, execution: .idle,
+        currentRun: nil, currentRunSession: nil, currentRunSessionAttachment: nil,
+        hostObservation: nil, attachments: [second, first])
+    let session = try catalogTestSession(
+        host: host, instance: instance,
+        pages: WorkServiceWorkPage(works: [descriptor], nextPageToken: nil))
+    let snapshot = await WorkServiceCatalog().refresh([
+        WorkServiceCatalogHost(host: host, session: session)
+    ])
+    XCTAssertTrue(snapshot.works.isEmpty)
+    XCTAssertEqual(snapshot.hosts.first?.quarantined.count, 1)
+    XCTAssertTrue(snapshot.hosts.first?.quarantined.first?.diagnostic.contains("duplicate") == true)
+}
+
 let casesWorkServiceCatalog: [Case] = [
     ("phase3 Work service catalog isolates unavailable hosts and consumes pages", {
         try await testWorkServiceCatalogRefreshesHostsConcurrentlyAndIsolatesUnavailable()
@@ -250,5 +292,8 @@ let casesWorkServiceCatalog: [Case] = [
     }),
     ("phase3 Work service catalog accepts an exact complete host row bound", {
         try await testWorkServiceCatalogExactHostRowBoundCanFinishCompletely()
+    }),
+    ("phase3 Work service catalog quarantines Work-scoped client attachment duplicates", {
+        try await testWorkServiceCatalogQuarantinesWorkScopedClientAttachmentDuplicates()
     }),
 ]

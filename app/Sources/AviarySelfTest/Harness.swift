@@ -24,7 +24,7 @@ enum Harness {
     static func run(_ cases: [(String, () async throws -> Void)]) async {
         let filter = ProcessInfo.processInfo.environment["AVIARY_SELFTEST_FILTER"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let selected: [(String, () async throws -> Void)]
+        var selected: [(String, () async throws -> Void)]
         if let filter, !filter.isEmpty {
             selected = cases.filter {
                 $0.0.localizedCaseInsensitiveContains(filter)

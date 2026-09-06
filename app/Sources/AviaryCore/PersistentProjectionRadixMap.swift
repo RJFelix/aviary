@@ -15,8 +15,11 @@ import Glibc
 /// Route collisions do not alias keys. A leaf retains the bounded original key and compares it
 /// exactly. Collision buckets are themselves bounded and fail closed if exhausted. The map is
 /// same-user cooperating storage, not a sandbox: its immediate parent must already be an owned,
-/// private directory. The map creates only one path component at a time and fsyncs the parent
-/// entry; it does not claim to defend an arbitrary ancestor path from concurrent replacement.
+/// private directory. The map creates only one path component at a time. It deliberately does
+/// not `fsync` immutable cache objects or their directory entries: the canonical journal remains
+/// the durability authority, and a missing or partial post-crash object invalidates the
+/// disposable projection and causes a rebuild. This avoids turning one reducer replay into
+/// thousands of synchronous disk barriers on remote or low-IOPS Work Hosts.
 public struct PersistentProjectionRadixMap: Sendable {
     public static let schemaVersion = 1
     public static let routeByteCount = 32
@@ -863,7 +866,6 @@ public struct PersistentProjectionRadixMap: Sendable {
             let existing = try readObject(
                 at: url, maximumBytes: limits.maximumObjectBytes, metrics: &metrics)
             guard existing == data else { throw MapError.checksumMismatch }
-            try synchronizeDirectory(url.deletingLastPathComponent())
             return false
         }
         guard errno == ENOENT else {
@@ -895,7 +897,6 @@ public struct PersistentProjectionRadixMap: Sendable {
                     else { throw MapError.ioFailure }
                 }
             }
-            guard fsync(fd) == 0 else { throw MapError.ioFailure }
             guard AviaryPOSIX.close(fd) == 0 else { throw MapError.ioFailure }
             descriptorOpen = false
         } catch {
@@ -912,13 +913,11 @@ public struct PersistentProjectionRadixMap: Sendable {
             let existing = try readObject(
                 at: url, maximumBytes: limits.maximumObjectBytes, metrics: &metrics)
             guard existing == data else { throw MapError.checksumMismatch }
-            try synchronizeDirectory(url.deletingLastPathComponent())
             return false
         }
         guard unlink(temporary.path) == 0 else { throw MapError.ioFailure }
         temporaryExists = false
         metrics.created(data.count)
-        try synchronizeDirectory(url.deletingLastPathComponent())
         return true
     }
 
@@ -1011,8 +1010,6 @@ public struct PersistentProjectionRadixMap: Sendable {
                   (status.st_mode & mode_t(0o777)) == mode_t(0o700) else {
                 throw MapError.insecurePermissions
             }
-            try synchronizeDirectory(url)
-            try synchronizeDirectory(parent)
             return
         }
         guard errno == ENOENT else { throw MapError.accessDenied }
@@ -1029,8 +1026,6 @@ public struct PersistentProjectionRadixMap: Sendable {
               (status.st_mode & mode_t(0o777)) == mode_t(0o700) else {
             throw MapError.insecurePermissions
         }
-        try synchronizeDirectory(url)
-        try synchronizeDirectory(parent)
     }
 
     private func withLock<T>(_ body: () throws -> T) throws -> T {
@@ -1049,15 +1044,6 @@ public struct PersistentProjectionRadixMap: Sendable {
             throw MapError.insecurePermissions
         }
         return try body()
-    }
-
-    private func synchronizeDirectory(_ url: URL) throws {
-        let fd = url.path.withCString {
-            open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        }
-        guard fd >= 0 else { throw MapError.ioFailure }
-        defer { _ = AviaryPOSIX.close(fd) }
-        guard fsync(fd) == 0 else { throw MapError.ioFailure }
     }
 
     // MARK: Deterministic helpers

@@ -389,15 +389,15 @@ public enum WorkServiceTransportCodec {
         request: WorkServiceTransportRequestEnvelope,
         expectedHostInstance: WorkHostInstanceRef? = nil
     ) throws {
-        guard response.ok else { return }
-        guard let data = response.data else {
-            throw WorkServiceTransportError.invalidResponse
-        }
         if request.operation != .handshake {
             guard let expectedHostInstance,
                   response.hostInstance == expectedHostInstance else {
                 throw WorkServiceTransportError.invalidResponse
             }
+        }
+        guard response.ok else { return }
+        guard let data = response.data else {
+            throw WorkServiceTransportError.invalidResponse
         }
         switch request.operation {
         case .handshake:
@@ -434,6 +434,9 @@ public enum WorkServiceTransportCodec {
                 WorkServiceCreateWorkResponse.self, from: data)
             let request: WorkServiceCreateWorkRequest = try decodeRequestValue(
                 WorkServiceCreateWorkRequest.self, from: request.payload)
+            let attachmentRows = response.work.attachments.filter {
+                $0.attachment == response.attachment.attachment
+            }
             guard response.receipt.operation == .createWork,
                   response.receipt.state == .accepted || response.receipt.state == .duplicate,
                   response.receipt.outcome == .created,
@@ -447,12 +450,20 @@ public enum WorkServiceTransportCodec {
                   response.sessionJournal == response.attachment.sessionJournal,
                   response.sessionAttachment == response.attachment.sessionAttachment,
                   response.attachment.client == request.client,
-                  response.attachment.authorization == response.authorization,
                   response.work.journal.owner == .work(response.work.work),
                   response.workCursor.journal == response.work.journal,
                   response.sessionCursor.journal == response.sessionJournal,
-                  response.work.attachments.contains(response.attachment) else {
+                  attachmentRows.count <= 1,
+                  (attachmentRows.first == response.attachment
+                      || (response.receipt.state == .duplicate
+                          && attachmentRows.isEmpty
+                          && response.attachment.authorization == response.authorization)) else {
                 throw WorkServiceTransportError.invalidResponse
+            }
+            if response.receipt.state == .accepted {
+                guard response.attachment.authorization == response.authorization else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
             }
             try validateRequestedAuthorization(
                 response.authorization, requested: request.requestedCapabilities)
@@ -513,11 +524,6 @@ public enum WorkServiceTransportCodec {
                       response.receipt.outcome == .sessionCreated,
                       sessionJournal.owner == .session(session),
                       sessionCursor.journal == sessionJournal,
-                      attachment.client == request.client,
-                      attachment.session == session,
-                      attachment.sessionJournal == sessionJournal,
-                      attachment.sessionAttachment == sessionAttachment,
-                      attachment.authorization == response.authorization,
                       relationship.session == session,
                       relationship.sessionJournal == sessionJournal,
                       relationship.sessionAttachment == sessionAttachment,
@@ -528,29 +534,78 @@ public enum WorkServiceTransportCodec {
                       relationship.sessionCursor.sequence == 3,
                       relationship.sessionCursor.eventID != nil,
                       relationship.sessionCursor == sessionCursor,
-                      attachment.attachment != request.attachment,
                       relationship.causalWorkCursor == request.causalWorkCursor,
                       relationship.resultingWorkCursor == response.workCursor,
                       response.work.sessionAttachments.contains(relationship),
-                      response.work.attachments.contains(attachment)
-                        || response.state == .duplicate else {
+                      attachment.client == request.client,
+                      attachment.session == session,
+                      attachment.sessionJournal == sessionJournal,
+                      attachment.sessionAttachment == sessionAttachment,
+                      attachment.attachment != request.attachment else {
                     throw WorkServiceTransportError.invalidResponse
                 }
-                if let observation = response.work.hostObservation {
-                    guard observation.servedCursor == response.workCursor else {
+                let attachmentRows = response.work.attachments.filter {
+                    $0.attachment == attachment.attachment
+                }
+                guard attachmentRows.count <= 1,
+                      (attachmentRows.first == attachment
+                          || (response.state == .duplicate
+                              && attachmentRows.isEmpty
+                              && attachment.authorization == response.authorization)) else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+                if response.state == .accepted {
+                    guard attachment.authorization == response.authorization else {
                         throw WorkServiceTransportError.invalidResponse
                     }
                 }
-                switch response.work.recordedDisposition {
-                case .reusable:
-                    guard relationship.publication == .mirrored else {
+                if let observation = response.work.hostObservation {
+                    guard let served = observation.servedCursor,
+                          served.journal == response.workCursor.journal else {
                         throw WorkServiceTransportError.invalidResponse
                     }
-                case .completed, .destroyed:
-                    guard relationship.publication == .terminalReference,
-                          response.workCursor == request.causalWorkCursor,
-                          response.authorization.granted == [.observe] else {
+                    if response.state == .accepted {
+                        guard served == response.workCursor else {
+                            throw WorkServiceTransportError.invalidResponse
+                        }
+                    } else {
+                        // A duplicate replays immutable creation cursors while the descriptor's
+                        // observation may have advanced (or terminalized) since publication.
+                        // Require the observation to cover the replayed cursor without coupling
+                        // the response to the Work's current disposition.
+                        guard served.sequence >= response.workCursor.sequence,
+                              served.sequence > response.workCursor.sequence
+                                  || served.eventID == response.workCursor.eventID else {
+                            throw WorkServiceTransportError.invalidResponse
+                        }
+                    }
+                }
+                switch relationship.publication {
+                case .mirrored:
+                    guard relationship.resultingWorkCursor.sequence
+                        > relationship.causalWorkCursor.sequence else {
                         throw WorkServiceTransportError.invalidResponse
+                    }
+                case .terminalReference:
+                    guard relationship.resultingWorkCursor == relationship.causalWorkCursor else {
+                        throw WorkServiceTransportError.invalidResponse
+                    }
+                }
+                if response.state == .accepted {
+                    // A fresh publication must agree with the Work state it just observed. Only
+                    // exact duplicates are allowed to replay immutable relationship evidence after
+                    // the Work has advanced or terminalized.
+                    switch response.work.recordedDisposition {
+                    case .reusable:
+                        guard relationship.publication == .mirrored else {
+                            throw WorkServiceTransportError.invalidResponse
+                        }
+                    case .completed, .destroyed:
+                        guard relationship.publication == .terminalReference,
+                              response.workCursor == request.causalWorkCursor,
+                              response.authorization.granted == [.observe] else {
+                            throw WorkServiceTransportError.invalidResponse
+                        }
                     }
                 }
             case .rejected:
@@ -1310,6 +1365,13 @@ public enum WorkServiceTransportCodec {
         }
     }
 
+    private static func decodeResponseValueIfPresent<T: Decodable>(
+        _ type: T.Type, from value: JSONValue?
+    ) throws -> T? {
+        guard let value, !value.isNull else { return nil }
+        return try decodeResponseValue(type, from: value)
+    }
+
     private static func decodeRequestValue<T: Decodable>(
         _ type: T.Type, from value: JSONValue?
     ) throws -> T {
@@ -1635,12 +1697,34 @@ public enum WorkServiceTransportCodec {
             }
         }
         var sessionAttachments: Set<SessionAttachmentRef> = []
+        var decodedSessionAttachmentRelationships: [WorkServiceSessionAttachmentDescriptor] = []
         for relationshipValue in object["sessionAttachments"]?.arrayValue ?? [] {
             try validateSessionAttachmentDescriptor(relationshipValue)
             let relationship = try decodeResponseValue(
                 WorkServiceSessionAttachmentDescriptor.self, from: relationshipValue)
             guard relationship.causalWorkCursor.journal == workJournal,
                   sessionAttachments.insert(relationship.sessionAttachment).inserted else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+            decodedSessionAttachmentRelationships.append(relationship)
+        }
+        let currentRun = try decodeResponseValueIfPresent(
+            RunRef.self, from: object["currentRun"])
+        let currentRunSession = try decodeResponseValueIfPresent(
+            SessionRef.self, from: object["currentRunSession"])
+        let currentRunSessionAttachment = try decodeResponseValueIfPresent(
+            SessionAttachmentRef.self, from: object["currentRunSessionAttachment"])
+        guard (currentRun == nil) == (currentRunSession == nil),
+              (currentRun == nil) == (currentRunSessionAttachment == nil) else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        if currentRun != nil {
+            let ownerRelationshipCount = decodedSessionAttachmentRelationships.count {
+                $0.session == currentRunSession
+                    && $0.sessionAttachment == currentRunSessionAttachment
+                    && $0.isAttached
+            }
+            guard ownerRelationshipCount == 1 else {
                 throw WorkServiceTransportError.invalidResponse
             }
         }
@@ -1652,6 +1736,10 @@ public enum WorkServiceTransportCodec {
             try validateDiagnostic(omission["diagnostic"])
             try validateNonnegativeInteger(omission["count"], required: true)
         }
+        // Decode the complete DTO after the bounded wire walk. This enforces the cross-field
+        // owner envelope and complete host-observation agreement at the transport boundary too,
+        // so a forged response cannot rely on the later client decode to quarantine it.
+        _ = try decodeResponseValue(WorkServiceWorkDescriptor.self, from: value)
     }
 
     private static func validateArtifactDescriptor(_ value: JSONValue) throws {
@@ -2879,7 +2967,8 @@ public actor WorkServiceUnixSocketServer {
                     WorkServiceTransportResponseEnvelope(
                         id: envelope.id, ok: false,
                         error: .init(code: .duplicateRequestID,
-                                     detail: "request id was already used on this connection")),
+                                     detail: "request id was already used on this connection"),
+                        hostInstance: hostInstances[connectionID]),
                     connectionID: connectionID, generation: generation)
                 return
             }
@@ -2889,7 +2978,8 @@ public actor WorkServiceUnixSocketServer {
                         id: envelope.id, ok: false,
                         error: .init(
                             code: .invalidRequest,
-                            detail: "connection request-id budget is exhausted; reconnect")),
+                            detail: "connection request-id budget is exhausted; reconnect"),
+                        hostInstance: hostInstances[connectionID]),
                     connectionID: connectionID, generation: generation)
                 return
             }
@@ -2900,7 +2990,8 @@ public actor WorkServiceUnixSocketServer {
                         id: envelope.id, ok: false,
                         error: .init(
                             code: .invalidRequest,
-                            detail: "too many pending requests on this connection")),
+                            detail: "too many pending requests on this connection"),
+                        hostInstance: hostInstances[connectionID]),
                     connectionID: connectionID, generation: generation)
                 return
             }
@@ -2932,7 +3023,8 @@ public actor WorkServiceUnixSocketServer {
             }
             enqueue(
                 WorkServiceTransportResponseEnvelope(
-                    id: id, ok: false, error: .init(code: code, detail: detail)),
+                    id: id, ok: false, error: .init(code: code, detail: detail),
+                    hostInstance: hostInstances[connectionID]),
                 connectionID: connectionID, generation: generation)
             return
         }
@@ -2944,7 +3036,8 @@ public actor WorkServiceUnixSocketServer {
             WorkServiceTransportResponseEnvelope(
                 id: "overflow", ok: false,
                 error: .init(code: .frameTooLarge,
-                             detail: "request frame exceeded the transport bound")),
+                             detail: "request frame exceeded the transport bound"),
+                hostInstance: hostInstances[connectionID]),
             connectionID: connectionID, generation: generation)
         inputPumps[connectionID]?.finish()
     }
@@ -3029,7 +3122,8 @@ public actor WorkServiceUnixSocketServer {
             enqueue(
                 WorkServiceTransportResponseEnvelope(
                     id: envelope.id, ok: false,
-                    error: .init(code: code, detail: detail)),
+                    error: .init(code: code, detail: detail),
+                    hostInstance: hostInstances[connectionID]),
                 connectionID: connectionID, generation: generation)
         }
     }

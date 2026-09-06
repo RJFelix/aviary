@@ -1,12 +1,17 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; the transactional projection/index and new-Session-to-existing-Work service seam are implemented and hardened, with exact Session continuation, production service-reader cutover, and the GUI composition flow next
-Date: 2026-09-04
+Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; exact Work/Session continuation, production service/control-reader cutover, Session-qualified Run routing, and GUI new-Session-to-existing-Work composition have completed integrated macOS/Linux/cross-device verification
+Date: 2026-09-05
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
 Transactional projection foundation (2026-09-04): the first Darwin/Linux disposable projection
-store now publishes a checksummed, generation-fenced `HEAD` only after content-addressed bucket,
-recent-page, and reducer-head objects plus deterministic sealed-bucket references are durable. Every
+store now publishes a checksummed, generation-fenced `HEAD` only after its content-addressed bucket,
+recent-page, reducer-head, and deterministic sealed-bucket-reference objects cross the store's
+durability boundary. The independently content-addressed exact-state radix nodes are deliberately
+rebuildable cache material: they use private no-follow writes and atomic installation but do not
+issue an `fsync` for every immutable node or directory entry. If a crash loses one, validation
+rejects the `HEAD` and rebuilds from canonical JSONL; the cache never becomes durable authority.
+Every
 load requires a fresh canonical source observation; the production bootstrap seam supplies the
 checksummed stored boundary and exact indexed terminal row to a synchronous source validator rather
 than exposing an unvalidated cache header. Journal/source generation, cursor, byte range, canonical
@@ -19,31 +24,55 @@ while total namespace quota/semantic garbage collection remains explicitly defer
 than a claimed hard disk bound.
 
 The local source lease, typed bounded Work/Session heads, shared one-event reducer transitions,
-copy-on-write radix map, and an exact persistent Work reducer root are now implemented on both
-platform source lists. The production local projection reader publishes the bounded head and exact
-Work root atomically, validates the root before reuse, and continues stateful Work semantics across
-reopen. The lease distinguishes strict unchanged-source proof from an explicit cooperating-writer
-append contract held under the canonical owner lock; it does not claim to detect an arbitrary
-external middle rewrite followed by an append. Typed heads separate controlling scalar truth from
-per-index completeness, retain active/unsettled rows before historical rows, and keep raw messages,
-payloads, error reasons, prompt labels, and unhashed identity keys out of persisted metadata.
+copy-on-write radix map, and exact persistent Work and Session reducer roots are now implemented on
+both platform source lists. The production local projection reader publishes each bounded head and
+exact root atomically, authenticates the retained prefix separately, validates the root before
+reuse, and continues stateful Work and Session semantics across reopen. Session growth decodes and
+applies only the append-only suffix to both exact and bounded presentation state. Work growth applies
+only the suffix to its exact reducer root, but still streams from byte zero to rebuild and authenticate
+the bounded index/query head; it therefore does not yet satisfy the stronger no-byte-zero normal-read
+goal below. The lease distinguishes strict unchanged-source proof from an explicit
+cooperating-writer append contract held under the canonical owner lock; it does not claim to detect
+an arbitrary external middle rewrite followed by an append. Typed heads separate controlling
+scalar truth from per-index completeness, retain active/unsettled rows before historical rows, and
+keep raw messages, payloads, error reasons, prompt labels, and unhashed identity keys out of
+persisted metadata.
 
-This is still a production-cutover checkpoint, not the completed bounded-reader promise. A bounded
-head is not itself an exact reducer checkpoint and must never be fed back into the canonical
-reducer. Work has a disk-keyed exact continuation root; Session message-parent/context accounting
-still needs the corresponding exact persistent state. When the current reader cannot prove an
-exact suffix continuation it deliberately streams and replays from byte zero under the owner lock,
-rather than claiming incremental work it did not perform. The journal-backed service and control-
-journal verifier still contain full semantic scans that must move behind the proven projection
-boundary before normal long-lived Work reads are bounded.
+The production service/control verification path now consumes those projections for cold sources
+and uses an actor-serialized canonical observation while a Hosted run owns open writers. A bounded
+head is never fed back into the canonical reducer as though it were an exact checkpoint. The
+control journal still reads the small immutable registration prefix needed to prove the exact
+published Work/Session relationship; that is bounded identity evidence, not a lifetime semantic
+scan. Disposable cache damage triggers a strict rebuild and does not relax source, cursor, owner,
+unknown-event, corruption, or tail checks. Exact suffix continuation remains dependent on
+cooperating canonical writers and the authenticated persistent root; absence or mismatch fails
+closed instead of manufacturing a partial projection.
+
+Live actor reads also remain addressable after their one-million-record resident-envelope limit.
+The locked scan retains a path-free file identity, bounded genesis prefix, sparse byte anchors,
+prefix-digest chain, reducer state, and exact terminal/run evidence; raw resident events may then
+be dropped without making the Work unavailable. Service pages reopen the exact fenced inode and
+stream from the nearest authenticated anchor. A reduced-limit end-to-end fixture forces this path
+after two records and proves first-page/continuation correlation plus alternating Session ownership.
 
 The first-class service operation for creating a new Session attached to existing active or
 terminal Work is implemented with independent Session identity, a paired Work mirror where the Work
 is mutable, client-qualified attachment/capability records, a two-record durable control
 reservation/result, exact retry after restart, detach/revocation, bounded relationship counts, and
-transport correlation. The GUI can explicitly attach another client to an existing Session today;
-the separate user-facing “new Session on this Work” composition flow remains to be built on this
-service seam.
+transport correlation. Duplicate reconciliation preserves the immutable creation relationship but
+uses the current attachment row and capabilities when that attachment still exists; a detached
+historical attachment is evidence only and cannot regain authority. The GUI exposes both explicit
+new-Session-on-existing-Work and attach-another-client-to-an-existing-Session paths.
+
+Executable routing is now Session-qualified. Each active Run records the exact Session and
+Session-attachment owner; multiple GUI clients attached to that same Session may control it, while
+a different Session may observe but cannot write conversation or command events. After explicit End
+has reached both the Hosted ended/closed boundary and canonical Work has cleared its active Run, a
+later replacement may select any canonically attached Session. Alternating Session A→B→A across a
+service restart preserves Work identity, changes only the explicit Run owner tuple, and launches
+fresh model context for the newly selected Session unless an exact same-Session cold-resume proof
+exists. End acknowledgement and actor teardown remain deliberately distinct observable boundaries;
+replacement does not race an accepted receipt as though it proved teardown was complete.
 
 Phase 3C closure checkpoint (2026-09-04): accepted and duplicate service commands no longer
 become UI truth on the strength of a transport receipt. The client retains the exact command
@@ -58,18 +87,21 @@ receipts carry the exact attachment outcome required by transport correlation. S
 distinguishes timeout and cancellation and performs bounded TERM-to-KILL cleanup without opening
 an implicit interactive stdin channel.
 
-The integrated macOS suite passes 893 cases / 10,549 assertions in 243.13 seconds. The 100,000-event
-Timeline benchmark generates 46,766,700 bytes in 0.890 seconds and reads plus reduces them in 5.586
-seconds on the checkpoint machine. Release assembly signs the GUI and its nested `aviaryd`; all 9
-canonical 1600×1000 screens render and were visually inspected. On a fresh Ubuntu 24.04 x86_64
-snapshot with Swift 6.3.3, `aviaryd` and `AviarySelfTest` build and the selected headless suite passes
-27 cases / 1,978 assertions in 730.88 seconds, including the real daemon, reconnect, provider,
-parent-lease, projection, and Session-creation paths. A freshly rebuilt macOS client handshakes that
-exact Linux daemon through SSH stream-local forwarding with the expected Work Host and process-
-instance identity. The remaining named convergence work is exact persistent Session continuation,
-cutting the journal-backed service and control reader over to the proven projection boundary, and
-the first-class new-Session-on-existing-Work GUI flow; native remote discovery and device
-authentication remain later product surfaces.
+Current convergence checkpoint (2026-09-05): after the cache-performance correction and final
+independent-review hardening, the integrated macOS suite passes 932 cases / 12,627 assertions in
+374.76 seconds. Its 100,000-event Timeline benchmark generates 46,766,700 bytes in 0.941 seconds
+and reads plus reduces them in 5.558 seconds on the checkpoint machine. Release assembly signs the
+GUI and its nested `aviaryd`. All 9 canonical 1600×1000 snapshot routes render, but the current composite
+capture is not a visual certification: ScreenCaptureKit returned `SCStreamError -3811` for several
+pure-SwiftUI panels while the bare Cockpit route rendered correctly, and the Mac was locked for
+interactive inspection. On the fresh Ubuntu 24.04 x86_64 snapshot
+`aviary-linux-probe-20260905-final2` with Swift 6.3.3, `aviaryd` and `AviarySelfTest` build and the
+current selected headless suite passes 30 groups / 3,761 assertions in 223.41 seconds. It includes
+the real daemon, reconnect and replacement, provider, parent-lease, projection, exact Work/Session
+state, transport, and Session-creation paths. A freshly rebuilt macOS client handshakes that exact
+Linux daemon through SSH stream-local forwarding as Work Host
+`host-20b54e4c-9b3e-4268-8cae-59a157f2ec0e`, process instance `streamlocal-final2`, with zero
+catalog omissions. Native remote discovery and device authentication remain later product surfaces.
 
 Phase 3C implementation checkpoint (2026-09-03): the production path now composes the durable
 workspace registry, journal-backed Work service, launch manifests, execution factory, and
@@ -93,11 +125,14 @@ provides the encrypted/authenticated transport, and Aviary does not yet claim a 
 discovery or device-authentication product surface.
 
 Paired client checkpoints, exact end-to-end read acknowledgements, detached-attachment
-reconciliation, and bounded Linux provider streaming are implemented. This remains an intermediate
-checkpoint until production readers stop rescanning and retaining whole journals and large catch-up
-is cold-resumable rather than safely replaying from zero. A disposable disk-backed projection/index
-layer over canonical JSONL is the next named Phase 3C convergence slice, not postponed scalability
-polish.
+reconciliation, and bounded Linux provider streaming were implemented at that checkpoint. The
+disposable disk-backed projection/index and exact Work/Session continuation roots described above
+close the former lifetime-array dependency: a proven prefix is authenticated separately and exact
+semantic state advances from the suffix. Session presentation catch-up is suffix-only. Work's exact
+state is suffix-only, while its bounded index/query projection still performs a byte-zero streaming
+rebuild on growth. Repair may also rebuild all disposable indexes from canonical JSONL. Neither path
+loads a lifetime-sized event array, but the remaining Work index scan is measured debt rather than a
+claimed completed incremental-read contract.
 
 Implementation checkpoint (2026-09-02): stable session/Work/run identity, serialized command
 admission, immutable admission plus delivery receipts, writer-confirmed input delivery, live
@@ -196,7 +231,7 @@ canonical terminal proof. `HostedInHouseWork` can start from the pre-created idl
 binding without silently minting another identity, and its runtime remains owned by the actor rather
 than by an observer. The transport now carries complete canonical Timeline events, proves contiguous
 page chains and bounded body progress, rejects undeclared retained-body sizes, fences every response
-to the negotiated host instance (including empty responses), and rechecks the backing service
+to the negotiated host instance (including empty and error responses), and rechecks the backing service
 instance on every request. Agent Home persists and synchronizes one strict host-instance identity.
 `InMemoryWorkService` remains a conformance harness rather than the production composition. Phase
 3C subsequently bound these pieces to real journals and execution factories inside `aviaryd` and
@@ -380,9 +415,8 @@ transport correlation, retained-body length validation, and per-response host-in
 closed adversarially.
 
 Phase 0 still owes real VoiceOver/keyboard UI automation and broader driver focus/race proof. Phase 1
-still owes the remaining canonical consumer migrations (the Work Host service recovery source and
-other named pre-canonical
-readers); individual skill/memory identity and included-versus-listed
+still owes the remaining named pre-canonical reader migrations outside the production Work-service/
+control recovery path; individual skill/memory identity and included-versus-listed
 provenance inside the now-durable block-level prompt sources; independent native Work bundles for
 children; actual disk-full and permission fault reachability; and a measured
 peak-RSS budget. The semantic component measure is deliberately not claimed to be provider-specific
@@ -390,12 +424,13 @@ HTTP wire size. The 100,000-event benchmark fixes an encoded-input and read/redu
 not claim incremental rendering or bounded peak memory. Phase 3 now has an out-of-process local Work
 Host, GUI-independent process survival, reconnecting clients, durable paired read checkpoints and
 acknowledgements, a transactional disposable projection store, bounded local source leases and
-typed heads, a persistent exact Work continuation root, first-class creation of a new Session on
-existing Work, and a Linux/SSH transport proof. It still owes the corresponding exact persistent
-Session state, replacement of the remaining journal-backed service/control full scans with the
-proven projection boundary, the user-facing new-Session-on-Work composition flow, an integrated
-multi-client fault matrix, and native remote discovery/authentication UX before the entire
-many-to-many architecture is complete.
+typed heads, persistent exact Work and Session continuation roots, projection-backed cold service
+verification, actor-serialized live reads, first-class durable and GUI composition flows for a new
+Session on existing Work, Session-qualified active-Run routing/replacement, a current Linux
+headless regression receipt, and a macOS-client-to-Linux-daemon SSH transport proof. It still owes a
+broader injected-kill multi-client fault matrix, a complete current visual/assistive-technology pass,
+and native remote discovery/authentication UX before the entire many-to-many architecture is
+complete.
 
 ## Outcome
 
@@ -593,6 +628,38 @@ GUI C                 ●                                           ●
 - Remote client authentication and transport encryption protect who may reach a Work Host. They do
   not constrain the trusted agent inside that host. Secrets and execution credentials stay on the
   Work Host; client-visible events/artifacts follow an explicit disclosure policy.
+
+### One active Run has one conversation-owning Session
+
+A Work may have many Session attachments, but an active Run has exactly one Session/attachment
+pair that owns its conversational context and message journal. That binding is a canonical Work
+fact established by `run.started`; it is not inferred from the Work's creation record, current GUI
+selection, or whichever client most recently sent a command.
+
+- Another GUI attached to that same Session may use every capability granted to its own client
+  attachment. Client multiplicity does not change conversational ownership.
+- A different Session may observe the active Work and use genuinely Work-scoped, non-textual
+  controls such as supported cancellation or explicit End when authorized. The Work command keeps
+  the originating Session attachment as provenance even though it does not change the Run's
+  conversation owner.
+- `send`, `steer`, and `queue` are text-bearing conversation operations. They may target the active
+  Run only from its owning Session until a future multi-journal operation can durably record the
+  originating Session input and its delivery without merging transcripts. Substituting the active
+  Session identity for a different caller is forbidden.
+- After explicit End leaves Work reusable, `start` may select any canonically attached mutable
+  Session. The Work-level launch configuration is independent of the Session selected for that
+  Run; the Run manifest, native journal pair, and live actor use the selected binding exactly.
+- GUI controllers, drafts, pending intents, checkpoints, visibility, and selection are keyed by
+  the client/Session attachment identity rather than bare Work. Closing or hiding one Session view
+  cannot hide, overwrite, detach, or end another Session attached to the same Work.
+
+The cutover is complete only when the canonical and live paths agree under an adversarial matrix:
+Session A starts and accepts text from two separately attached GUIs; Session B can observe but its
+text commands are rejected without writing either conversation; End returns the Work to reusable;
+Session B then starts the next Run with its own journal/context; a daemon restart between each
+boundary reconstructs the same owner; and two racing Starts from different Sessions admit exactly
+one complete binding while the loser receives a stable rejection. Descriptors and notifications
+must name the active Run's Session/attachment explicitly rather than asking clients to infer it.
 
 ### Conversation first, activity progressively disclosed
 

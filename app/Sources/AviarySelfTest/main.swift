@@ -6913,6 +6913,9 @@ let casesWorkService: [Case] = [
     ("phase3 Work service: many-to-many attachments and reattach epochs", {
         try await test_workServiceManyToManyAttachmentsHaveIndependentCursorsAndCapabilities()
     }),
+    ("phase3 Work service: Start requires canonical Session without trapping", {
+        try await test_workServiceStartRequiresCanonicalSessionWithoutTrapping()
+    }),
     ("phase3 Work service: run finish, End, and completion stay distinct", {
         try await test_workServiceRunFinishedIsReusableEndIsTerminalizingAndCompletionIsSeparate()
     }),
@@ -7141,13 +7144,17 @@ await Harness.run(
         + casesWorkServiceCatalog
         + casesLocalWorkServiceBootstrap
         + casesLocalAviaryDaemonLauncher
+        + casesAttachmentQualifiedIdentity
         + casesServiceBackedIntentStores
+        + casesServiceBackedGUIOrchestration
+        + casesServiceBackedGUIControlPolicy
         + casesWorkServiceAttachedWorkController
         + casesDisposableTimelineProjectionStore
         + casesLocalTimelineProjectionSource
         + casesLocalTimelineProjectionReader
         + casesBoundedTimelineReducerProjection
         + casesPersistentProjectionRadixMap
+        + casesPersistentSessionExactState
         + casesPersistentWorkExactState
         + casesWorkReducerTransition
         + casesSessionReducerTransition

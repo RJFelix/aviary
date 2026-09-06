@@ -29,16 +29,19 @@ private func localReaderEvent(
     work: WorkRef? = nil,
     workHost: WorkHostRef? = nil,
     session: SessionRef? = nil,
-    text: String? = nil
+    text: String? = nil,
+    conversationParent: EventRef? = nil,
+    role: String = "user"
 ) -> TimelineEvent {
     let prefix = String(journal.stableKey.prefix(1))
     let id = "\(prefix)-\(sequence)"
     var payload: [String: JSONValue] = [:]
     if let text { payload["text"] = .string(text) }
-    if type == TimelineEventType.messageCommitted { payload["role"] = .string("user") }
+    if type == TimelineEventType.messageCommitted { payload["role"] = .string(role) }
     return TimelineEvent(
         eventID: id, journal: journal, sequence: sequence,
         previousEventID: sequence == 1 ? nil : "\(prefix)-\(sequence - 1)",
+        conversationParent: conversationParent,
         session: session, work: work, workHost: workHost,
         actor: localReaderActor,
         hostRecordedAt: Date(timeIntervalSince1970: TimeInterval(sequence)),
@@ -98,9 +101,7 @@ private func localReaderValueFiles(
         let envelope = JSONValue.parse(try Data(contentsOf: url))
         guard let encoded = envelope?["body"]?["bytes"]?.stringValue,
               let bytes = Data(base64Encoded: encoded),
-              JSONValue.parse(bytes)?["kind"]?.stringValue == expectedKind else {
-            return nil
-        }
+              JSONValue.parse(bytes)?["kind"]?.stringValue == expectedKind else { return nil }
         return url
     }
 }
@@ -131,6 +132,7 @@ private struct LocalReaderFixture {
         journal: JournalRef = localReaderWorkJournal,
         events: [TimelineEvent],
         limits: LocalTimelineProjectionReader.Limits = .standard,
+        storeLimits: DisposableTimelineProjectionStore.Limits = .default,
         storeObserver: (@Sendable (DisposableTimelineProjectionStore.AccessOperation) -> Void)? = nil
     ) throws {
         root = try localReaderRoot()
@@ -153,7 +155,7 @@ private struct LocalReaderFixture {
         try localReaderWrite(events, to: file)
         store = try DisposableTimelineProjectionStore(
             directory: root.appending(path: "projection", directoryHint: .isDirectory),
-            journal: journal, observer: storeObserver)
+            journal: journal, limits: storeLimits, observer: storeObserver)
         reader = try LocalTimelineProjectionReader(
             store: store, home: home, limits: limits)
     }
@@ -213,7 +215,7 @@ func testLocalTimelineProjectionReaderCacheAndGrowth() throws {
     // the bounded index from byte zero, but the semantic Work reducer advances from the proven
     // persisted boundary and must report that bounded suffix read.
     XCTAssertTrue(grown.metrics.suffixBytesRead > 0)
-    XCTAssertEqual(grown.metrics.reducerReplayBytesRead, grown.snapshot.source.sourceByteCount)
+    XCTAssertEqual(grown.metrics.reducerReplayBytesRead, grown.metrics.suffixBytesRead)
 }
 
 func testLocalTimelineProjectionReaderCacheValidationIsBounded() throws {
@@ -277,17 +279,23 @@ func testLocalTimelineProjectionReaderRejectsMiddleRewriteFollowedByAppend() thr
 }
 
 func testLocalTimelineProjectionReaderBoundsExactStateValidationBeforeReuse() throws {
+    let session = SessionRef("deep-validation-session")
+    let attachment = SessionAttachmentRef("deep-validation-attachment")
     let run = RunRef("deep-run")
     let action = ActionRef("deep-action")
     let initial = [
         localReaderDetailedEvent(
             sequence: 1, type: TimelineEventType.workCreated, previous: nil),
         localReaderDetailedEvent(
-            sequence: 2, type: TimelineEventType.runStarted, previous: "w-1", run: run,
+            sequence: 2, type: TimelineEventType.sessionAttached, previous: "w-1",
+            session: session, attachment: attachment),
+        localReaderDetailedEvent(
+            sequence: 3, type: TimelineEventType.runStarted, previous: "w-2", run: run,
+            session: session, attachment: attachment,
             payload: .object(["model_id": .string("deep-model")])),
         localReaderDetailedEvent(
-            sequence: 3, type: TimelineEventType.actionIntent, previous: "w-2",
-            run: run, action: action,
+            sequence: 4, type: TimelineEventType.actionIntent, previous: "w-3",
+            run: run, action: action, session: session, attachment: attachment,
             payload: .object(["state": .string("proposed"),
                               "kind": .string("python"),
                               "intent": .string("deep validation")]))
@@ -304,14 +312,14 @@ func testLocalTimelineProjectionReaderBoundsExactStateValidationBeforeReuse() th
     XCTAssertTrue(cached.metrics.exactStateValidationObjectsRead <= 2)
     XCTAssertTrue(cached.metrics.exactStateValidationBytesRead > 0)
     let fourth = localReaderDetailedEvent(
-        sequence: 4, type: TimelineEventType.modelChanged, previous: "w-3",
+        sequence: 5, type: TimelineEventType.modelChanged, previous: "w-4",
         payload: .object(["model_id": .string("deep-model-2")]))
     try localReaderAppend(try localReaderLine(fourth), to: fixture.file)
     do {
         _ = try fixture.reader.read()
         XCTFail("publication must audit the missing historical value")
     } catch LocalTimelineProjectionReader.ReaderError.storeRejected {
-        XCTAssertEqual(try fixture.store.load(proving: cached.source).cursor.sequence, 3)
+        XCTAssertEqual(try fixture.store.load(proving: cached.source).cursor.sequence, 4)
     }
 }
 
@@ -354,17 +362,23 @@ func testLocalTimelineProjectionReaderRecoversAbandonedFirstNamespaceAfterGrowth
 }
 
 func testLocalTimelineProjectionReaderContinuesStatefulActionFromExactRoot() throws {
+    let session = SessionRef("stateful-session")
+    let attachment = SessionAttachmentRef("stateful-attachment")
     let run = RunRef("stateful-run")
     let action = ActionRef("stateful-action")
     let initial = [
         localReaderDetailedEvent(
             sequence: 1, type: TimelineEventType.workCreated, previous: nil),
         localReaderDetailedEvent(
-            sequence: 2, type: TimelineEventType.runStarted, previous: "w-1", run: run,
+            sequence: 2, type: TimelineEventType.sessionAttached, previous: "w-1",
+            session: session, attachment: attachment),
+        localReaderDetailedEvent(
+            sequence: 3, type: TimelineEventType.runStarted, previous: "w-2", run: run,
+            session: session, attachment: attachment,
             payload: .object(["model_id": .string("stateful-model")])),
         localReaderDetailedEvent(
-            sequence: 3, type: TimelineEventType.actionIntent, previous: "w-2",
-            run: run, action: action,
+            sequence: 4, type: TimelineEventType.actionIntent, previous: "w-3",
+            run: run, action: action, session: session, attachment: attachment,
             payload: .object(["state": .string("proposed"),
                               "kind": .string("python"),
                               "intent": .string("stateful continuation")]))
@@ -373,8 +387,9 @@ func testLocalTimelineProjectionReaderContinuesStatefulActionFromExactRoot() thr
     defer { fixture.remove() }
     _ = try fixture.reader.read()
     let started = localReaderDetailedEvent(
-        sequence: 4, type: TimelineEventType.actionStarted, previous: "w-3",
-        run: run, action: action, payload: .object(["state": .string("running")]))
+        sequence: 5, type: TimelineEventType.actionStarted, previous: "w-4",
+        run: run, action: action, session: session, attachment: attachment,
+        payload: .object(["state": .string("running")]))
     try localReaderAppend(try localReaderLine(started), to: fixture.file)
     let grown = try fixture.reader.read()
     XCTAssertEqual(grown.appendedEventCount, 1)
@@ -386,11 +401,11 @@ func testLocalTimelineProjectionReaderContinuesStatefulActionFromExactRoot() thr
             path: "work-exact-state", directoryHint: .isDirectory),
         namespaceID: grown.snapshot.namespaceID, journal: localReaderWorkJournal,
         sourceGeneration: grown.snapshot.source.sourceGeneration,
-        mapKind: "work-exact-v1")
+        mapKind: "work-exact-v2")
     let state = try PersistentWorkExactState(map: map, root: checkpoint.roots[0].root)
     let outcome = localReaderDetailedEvent(
-        sequence: 5, type: TimelineEventType.actionOutcome, previous: "w-4",
-        run: run, action: action,
+        sequence: 6, type: TimelineEventType.actionOutcome, previous: "w-5",
+        run: run, action: action, session: session, attachment: attachment,
         payload: .object(["state": .string("succeeded"),
                           "retry_safety": .string("idempotent")]))
     var continued = state
@@ -482,6 +497,213 @@ func testLocalTimelineProjectionReaderStreamsWorkAndSessionWithBoundedMetrics() 
     XCTAssertTrue(session.metrics.reducerReplayBytesRead <= session.metrics.bytesRead)
 }
 
+func testLocalTimelineProjectionReaderPublishesAndContinuesExactSessionState() throws {
+    let initial = [
+        localReaderEvent(
+            journal: localReaderSessionJournal, sequence: 1,
+            type: TimelineEventType.sessionCreated, session: localReaderSession),
+        localReaderEvent(
+            journal: localReaderSessionJournal, sequence: 2,
+            type: TimelineEventType.inputAccepted, session: localReaderSession,
+            text: "session reader private prefix"),
+    ]
+    let fixture = try LocalReaderFixture(
+        journal: localReaderSessionJournal, events: initial)
+    defer { fixture.remove() }
+    let cold = try fixture.reader.read()
+    let checkpoint = try XCTUnwrap(
+        try fixture.store.loadExactStateCheckpoint(proving: cold.snapshot.source))
+    XCTAssertEqual(checkpoint.roots.count, 1)
+    XCTAssertEqual(checkpoint.roots.first?.mapKind, "session-exact-v1")
+    XCTAssertEqual(checkpoint.cursor, cold.snapshot.cursor)
+    XCTAssertEqual(cold.reducerHead.session?.messageHistory.count, 1)
+    XCTAssertEqual(cold.reducerHead.session?.messageHistory.first?.text.byteCount,
+                   "session reader private prefix".utf8.count)
+    XCTAssertTrue(cold.reducerHead.session?.messageHistory.first?.text.digest.hasPrefix("sha256:") == true)
+
+    let appended = localReaderEvent(
+        journal: localReaderSessionJournal, sequence: 3,
+        type: TimelineEventType.messageCommitted, session: localReaderSession,
+        text: "session reader private suffix")
+    try localReaderAppend(try localReaderLine(appended), to: fixture.file)
+    let grown = try fixture.reader.read()
+    XCTAssertEqual(grown.appendedEventCount, 1)
+    XCTAssertTrue(grown.metrics.suffixBytesRead > 0)
+    XCTAssertEqual(grown.reducerHead.session?.messageHistory.count, 2)
+    XCTAssertEqual(grown.reducerHead.session?.messageHistory.last?.text.byteCount,
+                   "session reader private suffix".utf8.count)
+
+    let reopened = try LocalTimelineProjectionReader(
+        store: fixture.store, home: fixture.home).read()
+    XCTAssertTrue(reopened.metrics.cacheHit)
+    XCTAssertEqual(reopened.reducerHead.session?.messageHistory.count, 2)
+    XCTAssertTrue(reopened.metrics.exactStateValidationObjectsRead > 0)
+}
+
+func testLocalTimelineProjectionReaderLinearSessionGrowthBeyondExactPrefetchBound() throws {
+    let prefix = String(localReaderSessionJournal.stableKey.prefix(1))
+    var initial: [TimelineEvent] = [localReaderEvent(
+        journal: localReaderSessionJournal, sequence: 1,
+        type: TimelineEventType.sessionCreated, session: localReaderSession)]
+    for sequence in 2...260 {
+        let parent = sequence == 2 ? nil : EventRef(
+            journal: localReaderSessionJournal, eventID: "\(prefix)-\(sequence - 1)")
+        initial.append(localReaderEvent(
+            journal: localReaderSessionJournal, sequence: sequence,
+            type: sequence == 2 ? TimelineEventType.inputAccepted : TimelineEventType.messageCommitted,
+            session: localReaderSession,
+            text: sequence == 2 ? "linear-session-root" : "",
+            conversationParent: parent,
+            role: "assistant"))
+    }
+    let fixture = try LocalReaderFixture(
+        journal: localReaderSessionJournal, events: initial,
+        storeLimits: .init(maximumReducerHeadBytes: 512 * 1_024))
+    defer { fixture.remove() }
+    let cold = try fixture.reader.read()
+    XCTAssertEqual(cold.snapshot.cursor.sequence, 260)
+    XCTAssertEqual(cold.reducerHead.session?.messageHistory.count, 259)
+    XCTAssertNotNil(cold.snapshot.exactStateCheckpoint)
+
+    let appended = localReaderEvent(
+        journal: localReaderSessionJournal, sequence: 261,
+        type: TimelineEventType.messageCommitted, session: localReaderSession,
+        text: "",
+        conversationParent: EventRef(journal: localReaderSessionJournal, eventID: "\(prefix)-260"),
+        role: "assistant")
+    try localReaderAppend(try localReaderLine(appended), to: fixture.file)
+    let grown = try fixture.reader.read()
+    XCTAssertEqual(grown.snapshot.cursor.sequence, 261)
+    XCTAssertEqual(grown.appendedEventCount, 1)
+    XCTAssertTrue(grown.metrics.suffixBytesRead > 0)
+    XCTAssertEqual(grown.metrics.decodedEventCount, 1)
+    XCTAssertEqual(grown.metrics.reducerReplayBytesRead, grown.metrics.suffixBytesRead)
+    XCTAssertFalse(grown.metrics.reducerReplayedFromZero)
+    XCTAssertEqual(grown.reducerHead.session?.messageHistory.count, 260)
+
+    let reopened = try LocalTimelineProjectionReader(
+        store: fixture.store, home: fixture.home).read()
+    XCTAssertTrue(reopened.metrics.cacheHit)
+    XCTAssertEqual(reopened.reducerHead.session?.messageHistory.count, 260)
+
+    // The selected node is older than the physical tail. A cold reader reopen must authenticate
+    // that target from its exact SeenRecord/MessageRecord without walking the 259-message chain.
+    let olderTip = localReaderEvent(
+        journal: localReaderSessionJournal, sequence: 262,
+        type: TimelineEventType.sessionTipSelected, session: localReaderSession,
+        conversationParent: EventRef(journal: localReaderSessionJournal, eventID: "\(prefix)-259"))
+    try localReaderAppend(try localReaderLine(olderTip), to: fixture.file)
+    let tipped = try LocalTimelineProjectionReader(
+        store: fixture.store, home: fixture.home).read()
+    XCTAssertEqual(tipped.snapshot.cursor.sequence, 262)
+    XCTAssertEqual(tipped.appendedEventCount, 1)
+    XCTAssertEqual(tipped.metrics.decodedEventCount, 1)
+    XCTAssertEqual(tipped.reducerHead.session?.semanticTip?.eventID, "\(prefix)-259")
+}
+
+func testLocalTimelineProjectionReaderSessionGrowthScalesPrefixAuthNotSuffixReduction() throws {
+    let body = String(repeating: "SESSION-LARGE-BODY-", count: 5_000)
+    func receipt(prefixMessageCount: Int) throws -> (
+        sourceBytes: Int, suffixBytes: Int, replayBytes: Int, decodedEvents: Int,
+        peakRecentBytes: Int, prefixAuthBytes: Int, appended: Int, metadata: Data
+    ) {
+        let prefix = String(localReaderSessionJournal.stableKey.prefix(1))
+        var events: [TimelineEvent] = [localReaderEvent(
+            journal: localReaderSessionJournal, sequence: 1,
+            type: TimelineEventType.sessionCreated, session: localReaderSession)]
+        for sequence in 2...(prefixMessageCount + 1) {
+            let parent = sequence == 2 ? nil : EventRef(
+                journal: localReaderSessionJournal, eventID: "\(prefix)-\(sequence - 1)")
+            events.append(localReaderEvent(
+                journal: localReaderSessionJournal, sequence: sequence,
+                type: sequence == 2 ? TimelineEventType.inputAccepted : TimelineEventType.messageCommitted,
+                session: localReaderSession, text: body, conversationParent: parent,
+                role: "assistant"))
+        }
+        let fixture = try LocalReaderFixture(
+            journal: localReaderSessionJournal, events: events,
+            storeLimits: .init(maximumReducerHeadBytes: 2 * 1_024 * 1_024))
+        defer { fixture.remove() }
+        let cold = try fixture.reader.read()
+        let nextSequence = prefixMessageCount + 2
+        let suffix = localReaderEvent(
+            journal: localReaderSessionJournal, sequence: nextSequence,
+            type: TimelineEventType.messageCommitted, session: localReaderSession, text: body,
+            conversationParent: EventRef(
+                journal: localReaderSessionJournal, eventID: "\(prefix)-\(nextSequence - 1)"),
+            role: "assistant")
+        let suffixLine = try localReaderLine(suffix)
+        try localReaderAppend(suffixLine, to: fixture.file)
+        let grown = try fixture.reader.read()
+        let metadata = try XCTUnwrap(grown.reducerHead.session).encodedMetadata()
+        XCTAssertEqual(grown.appendedEventCount, 1)
+        XCTAssertEqual(grown.metrics.suffixBytesRead, suffixLine.count)
+        XCTAssertEqual(grown.reducerHead.session?.messageHistory.count, prefixMessageCount + 1)
+        XCTAssertFalse(String(decoding: metadata, as: UTF8.self).contains(body))
+        return (
+            cold.snapshot.source.sourceByteCount, grown.metrics.suffixBytesRead,
+            grown.metrics.reducerReplayBytesRead, grown.metrics.decodedEventCount,
+            grown.metrics.peakRecentEventBytes,
+            grown.metrics.prefixAuthenticationBytesRead, grown.appendedEventCount, metadata)
+    }
+
+    let n = try receipt(prefixMessageCount: 32)
+    let twoN = try receipt(prefixMessageCount: 64)
+    // Session growth authenticates the cached prefix through bounded lease evidence and decodes
+    // exactly one suffix event. The suffix line is identical-sized here; any prefix-related work
+    // is exposed separately rather than being counted as reducer replay.
+    XCTAssertEqual(n.suffixBytes, twoN.suffixBytes)
+    XCTAssertEqual(n.appended, 1)
+    XCTAssertEqual(twoN.appended, 1)
+    XCTAssertEqual(n.replayBytes, n.suffixBytes)
+    XCTAssertEqual(twoN.replayBytes, twoN.suffixBytes)
+    XCTAssertEqual(twoN.replayBytes, n.replayBytes)
+    XCTAssertEqual(n.decodedEvents, 1)
+    XCTAssertEqual(twoN.decodedEvents, 1)
+    XCTAssertEqual(twoN.peakRecentBytes, n.peakRecentBytes)
+    XCTAssertEqual(twoN.prefixAuthBytes, n.prefixAuthBytes)
+    XCTAssertTrue(n.prefixAuthBytes > 0)
+    XCTAssertTrue(twoN.sourceBytes > n.sourceBytes * 18 / 10)
+}
+
+func testLocalTimelineProjectionReaderStructuralSessionQuarantineReopens() throws {
+    let prefix = String(localReaderSessionJournal.stableKey.prefix(1))
+    let initial = [
+        localReaderEvent(
+            journal: localReaderSessionJournal, sequence: 1,
+            type: TimelineEventType.sessionCreated, session: localReaderSession),
+        // SessionReducerTransition quarantines this before stageSeenEvent, so the physical
+        // source cursor advances while the exact scalar cursor remains at sequence one.
+        localReaderEvent(
+            journal: localReaderSessionJournal, sequence: 2,
+            type: TimelineEventType.modelChanged, session: SessionRef("foreign")),
+    ]
+    let fixture = try LocalReaderFixture(
+        journal: localReaderSessionJournal, events: initial)
+    defer { fixture.remove() }
+    let cold = try fixture.reader.read()
+    XCTAssertEqual(cold.snapshot.cursor.sequence, 2)
+    XCTAssertEqual(cold.reducerHead.session?.lastSequence, 2)
+    XCTAssertEqual(cold.reducerHead.session?.coverage.corruptionCount, 1)
+    XCTAssertFalse(cold.reducerHead.session?.structuralIntegrityValid ?? true)
+    XCTAssertNotNil(cold.snapshot.exactStateCheckpoint)
+
+    let continued = localReaderEvent(
+        journal: localReaderSessionJournal, sequence: 3,
+        type: TimelineEventType.modelChanged, session: localReaderSession)
+    try localReaderAppend(try localReaderLine(continued), to: fixture.file)
+    let grown = try fixture.reader.read()
+    XCTAssertEqual(grown.snapshot.cursor.sequence, 3)
+    XCTAssertEqual(grown.reducerHead.session?.coverage.corruptionCount, 2)
+    XCTAssertFalse(grown.reducerHead.session?.structuralIntegrityValid ?? true)
+    let reopened = try LocalTimelineProjectionReader(
+        store: fixture.store, home: fixture.home).read()
+    XCTAssertTrue(reopened.metrics.cacheHit)
+    XCTAssertEqual(reopened.reducerHead.session?.lastSequence, 3)
+    XCTAssertEqual(reopened.reducerHead.session?.coverage.corruptionCount, 2)
+    XCTAssertEqual(reopened.reducerHead.session?.lastEventID, "\(prefix)-3")
+}
+
 func testLocalTimelineProjectionReaderCannotEraseExactStateWithRootlessHead() throws {
     let events = localReaderWorkEvents(count: 3)
     let fixture = try LocalReaderFixture(events: events)
@@ -548,6 +770,7 @@ func testLocalTimelineProjectionReaderFramesAndRetainsRecentRowsLinearly() throw
         try fixture.store.loadRecentPage(id: $0.pageID, proving: result.snapshot.source).events
     }
     XCTAssertEqual(recent.map(\.sequence), [17, 18, 19, 20])
+    XCTAssertTrue(result.snapshot.recentEventsOmitted)
 
     let bounded = try LocalReaderFixture(
         events: localReaderWorkEvents(count: 1),
@@ -569,6 +792,7 @@ func testLocalTimelineProjectionReaderEmptyWork() throws {
     XCTAssertNil(cold.snapshot.cursor.eventID)
     XCTAssertNil(cold.snapshot.currentBucket)
     XCTAssertTrue(cold.snapshot.recentPages.isEmpty)
+    XCTAssertFalse(cold.snapshot.recentEventsOmitted)
     XCTAssertNil(cold.snapshot.exactStateCheckpoint)
     XCTAssertTrue(try empty.reader.read().metrics.cacheHit)
 }
@@ -581,6 +805,7 @@ func testLocalTimelineProjectionReaderEmptySession() throws {
     XCTAssertNil(cold.snapshot.cursor.eventID)
     XCTAssertNil(cold.snapshot.currentBucket)
     XCTAssertTrue(cold.snapshot.recentPages.isEmpty)
+    XCTAssertFalse(cold.snapshot.recentEventsOmitted)
     XCTAssertNil(cold.snapshot.exactStateCheckpoint)
     XCTAssertTrue(try empty.reader.read().metrics.cacheHit)
 }
@@ -638,6 +863,7 @@ func testLocalTimelineProjectionReaderRecentRichEventsRespectByteBudget() throws
     XCTAssertTrue(retainedBytes <= byteBudget)
     XCTAssertEqual(recent.last?.sequence, 12)
     XCTAssertTrue(recent.count < events.count)
+    XCTAssertTrue(result.snapshot.recentEventsOmitted)
 }
 
 func testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState() throws {
@@ -651,7 +877,7 @@ func testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState() thro
     XCTAssertEqual(coldCheckpoint.prefixByteCount, cold.snapshot.source.prefixByteCount)
     XCTAssertEqual(coldCheckpoint.prefixDigest, cold.snapshot.source.prefixDigest)
     XCTAssertEqual(coldCheckpoint.roots.count, 1)
-    XCTAssertEqual(coldCheckpoint.roots[0].mapKind, "work-exact-v1")
+    XCTAssertEqual(coldCheckpoint.roots[0].mapKind, "work-exact-v2")
     XCTAssertEqual(coldCheckpoint.roots[0].namespaceID, cold.snapshot.namespaceID)
 
     let fourth = localReaderWorkEvents(count: 1, start: 4)[0]
@@ -673,7 +899,7 @@ func testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState() thro
         namespaceID: grown.snapshot.namespaceID,
         journal: localReaderWorkJournal,
         sourceGeneration: grown.snapshot.source.sourceGeneration,
-        mapKind: "work-exact-v1")
+        mapKind: "work-exact-v2")
     try map.validate(root: grownCheckpoint.roots[0].root)
     let state = try PersistentWorkExactState(
         map: map, root: grownCheckpoint.roots[0].root)
@@ -694,6 +920,7 @@ func testLocalTimelineProjectionReaderPersistsChildAndRecoveryAcrossGrowth() thr
             payload: .object(["child_id": .string("reader-child"), "state": .string("running")])),
         localReaderDetailedEvent(
             sequence: 4, type: TimelineEventType.runStarted, previous: "w-3", run: run,
+            session: session, attachment: attachment,
             payload: .object(["model_id": .string("reader-recovery-model")])),
         localReaderDetailedEvent(
             sequence: 5, type: TimelineEventType.recoveryCoverage, previous: "w-4", run: run,
@@ -762,6 +989,18 @@ let casesLocalTimelineProjectionReader: [Case] = [
     }),
     ("phase3 local projection reader: Work and Session bounded streaming parity", {
         try testLocalTimelineProjectionReaderStreamsWorkAndSessionWithBoundedMetrics()
+    }),
+    ("phase3 local projection reader: Session exact state publishes and continues", {
+        try testLocalTimelineProjectionReaderPublishesAndContinuesExactSessionState()
+    }),
+    ("phase3 local projection reader: linear Session growth and deep tips stay bounded", {
+        try testLocalTimelineProjectionReaderLinearSessionGrowthBeyondExactPrefetchBound()
+    }),
+    ("phase3 local projection reader: Session growth scales prefix auth separately from suffix", {
+        try testLocalTimelineProjectionReaderSessionGrowthScalesPrefixAuthNotSuffixReduction()
+    }),
+    ("phase3 local projection reader: structural Session quarantine reopens", {
+        try testLocalTimelineProjectionReaderStructuralSessionQuarantineReopens()
     }),
     ("phase3 local projection reader: exact state cannot be erased", {
         try testLocalTimelineProjectionReaderCannotEraseExactStateWithRootlessHead()

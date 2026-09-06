@@ -40,6 +40,12 @@ private func creationTestAppendEvent(_ event: TimelineEvent, to url: URL) throws
     line.append(0x0A)
     data.append(line)
     try data.write(to: url, options: .atomic)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+}
+
+private func creationTestWritePrivate(_ data: Data, to url: URL) throws {
+    try data.write(to: url, options: .atomic)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
 }
 
 private func creationTestWorkJournal(_ id: String = "work-journal") -> JournalRef {
@@ -425,6 +431,44 @@ func test_workHostControlCreationVerifierRequiresCanonicalMirroredSources() asyn
     XCTAssertEqual(verifiedProjection.state, .registered)
     XCTAssertTrue(verifiedProjection.responseIsReconstructable)
 
+    // A Work projection is disposable cache state. Missing or corrupt cache material must be
+    // rebuilt from the canonical journal before the registration proof is accepted.
+    let projectionDigest = AviarySHA256.hash(data: Data(idle.binding.workJournal.stableKey.utf8))
+        .map { String(format: "%02x", $0) }.joined()
+    let projectionDirectory = home.timelineV2Dir
+        .appending(path: "projections", directoryHint: .isDirectory)
+        .appending(path: "work-host-control", directoryHint: .isDirectory)
+        .appending(path: projectionDigest, directoryHint: .isDirectory)
+    try FileManager.default.removeItem(at: projectionDirectory)
+    let rebuilt = await control.verifiedCreationProjection(
+        client: client, commandID: request.command.commandID)
+    XCTAssertTrue(rebuilt.verification.isVerified)
+    XCTAssertEqual(rebuilt.projection?.state, .registered)
+    try Data("corrupt-head".utf8).write(
+        to: projectionDirectory.appending(path: "HEAD"), options: .atomic)
+    let repaired = await control.verifiedCreationProjection(
+        client: client, commandID: request.command.commandID)
+    XCTAssertTrue(repaired.verification.isVerified)
+    XCTAssertEqual(repaired.projection?.state, .registered)
+    let repairedStore = try DisposableTimelineProjectionStore(
+        directory: projectionDirectory, journal: idle.binding.workJournal)
+    let repairedReader = try LocalTimelineProjectionReader(
+        store: repairedStore, home: home,
+        limits: LocalTimelineProjectionReader.Limits(
+            maximumBootstrapSourceBytes: 256 * 1024 * 1024))
+    let repairedCacheHit = try repairedReader.read()
+    XCTAssertTrue(repairedCacheHit.metrics.cacheHit)
+    let cached = await control.verifiedCreationProjection(
+        client: client, commandID: request.command.commandID)
+    XCTAssertTrue(cached.verification.isVerified)
+    let cacheMetrics = await control.journalReadMetrics()
+    XCTAssertTrue(
+        cacheMetrics.projectedWorkCacheHits > 0,
+        "a repeated Work verification should use the persistent projection cache (calls=\(cacheMetrics.projectedWorkReadCalls), hits=\(cacheMetrics.projectedWorkCacheHits), bytes=\(cacheMetrics.projectedWorkBytesRead))")
+    XCTAssertTrue(
+        cacheMetrics.projectedSessionCacheHits > 0,
+        "a repeated Session verification should use the persistent projection cache (calls=\(cacheMetrics.projectedSessionReadCalls), hits=\(cacheMetrics.projectedSessionCacheHits), bytes=\(cacheMetrics.projectedSessionBytesRead))")
+
     // Close the control writer and create a later execution generation through the real paired
     // journal API. The registration cursor remains the idle genesis cursor; later canonical
     // Work/Session events are a valid suffix, not evidence that the original registration was
@@ -543,6 +587,22 @@ func test_workHostControlCreationVerifierRequiresCanonicalMirroredSources() asyn
     XCTAssertEqual(afterSuffix.verification.sessionSourceDigest, firstSessionDigest)
     XCTAssertEqual(afterSuffix.projection?.state, .registered)
     XCTAssertTrue(afterSuffix.projection?.responseIsReconstructable == true)
+    let projectedWorkMetrics = await reopened.journalReadMetrics()
+    XCTAssertTrue(projectedWorkMetrics.projectedWorkReadCalls >= 1)
+    XCTAssertTrue(
+        projectedWorkMetrics.projectedWorkSuffixBytesRead
+            <= projectedWorkMetrics.projectedWorkBytesRead)
+    XCTAssertTrue(
+        projectedWorkMetrics.projectedWorkBytesRead >= workDataWithSuffix.count,
+        "the total must include canonical source authentication and any exact-state replay")
+    XCTAssertTrue(projectedWorkMetrics.projectedSessionReadCalls >= 1)
+    XCTAssertTrue(projectedWorkMetrics.projectedSessionSuffixBytesRead >= 0)
+    XCTAssertTrue(
+        projectedWorkMetrics.projectedSessionSuffixBytesRead
+            <= projectedWorkMetrics.projectedSessionBytesRead)
+    XCTAssertTrue(
+        projectedWorkMetrics.projectedSessionBytesRead >= sessionDataWithSuffix.count,
+        "the Session total must report the deliberate byte-zero bounded-head/index replay")
 
     // A previously successful result is not a reusable capability. Deleting the source and then
     // replacing it with an unreadable body must make each fresh actor-owned projection truthful.
@@ -553,14 +613,34 @@ func test_workHostControlCreationVerifierRequiresCanonicalMirroredSources() asyn
     XCTAssertEqual(deleted.verification.failure, .sessionSourceMissing)
     XCTAssertFalse(deleted.verification.isVerified)
     XCTAssertEqual(deleted.projection?.state, .recoveryRequired)
-    try Data("replaced-source\n".utf8).write(to: sessionURL, options: .atomic)
+    try creationTestWritePrivate(Data("replaced-source\n".utf8), to: sessionURL)
     let replaced = await reopened.verifiedCreationProjection(
         client: client, commandID: request.command.commandID)
     XCTAssertEqual(replaced.verification.sourcePresence, .workOnly)
     XCTAssertEqual(replaced.verification.failure, .sessionSourceIncomplete)
     XCTAssertFalse(replaced.verification.isVerified)
     XCTAssertEqual(replaced.projection?.state, .recoveryRequired)
-    try sessionDataWithSuffix.write(to: sessionURL, options: .atomic)
+    try creationTestWritePrivate(sessionDataWithSuffix, to: sessionURL)
+
+    // The Session projection authenticates the complete suffix as strictly as the Work
+    // projection. An otherwise well-formed future Session event remains addressable but cannot
+    // silently certify the older registration prefix.
+    let lastSession = try XCTUnwrap(sessionReadWithSuffix.records.last?.event)
+    let unknownSessionSuffix = TimelineEvent(
+        eventID: "future-session-suffix", journal: idle.binding.sessionJournal,
+        sequence: lastSession.sequence + 1, previousEventID: lastSession.eventID,
+        session: binding.session, work: binding.work, workHost: host,
+        sessionAttachment: binding.sessionAttachment, actor: creationTestActor,
+        hostRecordedAt: Date(timeIntervalSince1970: 10), type: "future.session.event",
+        declaredDomains: [.session], payload: .object([:]))
+    try creationTestAppendEvent(unknownSessionSuffix, to: sessionURL)
+    let unknownSession = await reopened.verifiedCreationProjection(
+        client: client, commandID: request.command.commandID)
+    XCTAssertEqual(unknownSession.verification.sourcePresence, .workOnly)
+    XCTAssertEqual(unknownSession.verification.failure, .sessionSourceMismatch)
+    XCTAssertFalse(unknownSession.verification.isVerified)
+    XCTAssertEqual(unknownSession.projection?.state, .recoveryRequired)
+    try creationTestWritePrivate(sessionDataWithSuffix, to: sessionURL)
 
     // An unknown suffix is addressable but not source-verifiable: this verifier promises current
     // canonical event semantics, so an unrecognized event cannot silently become a trusted
@@ -583,7 +663,7 @@ func test_workHostControlCreationVerifierRequiresCanonicalMirroredSources() asyn
 
     // Restore the known suffix, then append a structurally foreign Work Host envelope. The
     // suffix may vary in Session/attachment identity, but it cannot claim another Work Host.
-    try workDataWithSuffix.write(to: workURL, options: .atomic)
+    try creationTestWritePrivate(workDataWithSuffix, to: workURL)
     let foreignSuffix = TimelineEvent(
         eventID: "foreign-work-host-suffix", journal: idle.binding.workJournal,
         sequence: lastWork.sequence + 1, previousEventID: lastWork.eventID,
@@ -603,7 +683,7 @@ func test_workHostControlCreationVerifierRequiresCanonicalMirroredSources() asyn
     // A known event with invalid reducer semantics is also not source-verifiable. In particular,
     // detaching an attachment that the Work reducer has never observed must not pass the manual
     // envelope checks merely because the event is otherwise well formed.
-    try workDataWithSuffix.write(to: workURL, options: .atomic)
+    try creationTestWritePrivate(workDataWithSuffix, to: workURL)
     let invalidDetach = TimelineEvent(
         eventID: "unknown-attachment-detach", journal: idle.binding.workJournal,
         sequence: lastWork.sequence + 1, previousEventID: lastWork.eventID,
@@ -621,10 +701,10 @@ func test_workHostControlCreationVerifierRequiresCanonicalMirroredSources() asyn
 
     // Restore the known suffix, then append a malformed line. A complete registered prefix does
     // not hide a quarantined tail.
-    try workDataWithSuffix.write(to: workURL, options: .atomic)
+    try creationTestWritePrivate(workDataWithSuffix, to: workURL)
     var corruptData = workDataWithSuffix
     corruptData.append(Data("not-json\n".utf8))
-    try corruptData.write(to: workURL, options: .atomic)
+    try creationTestWritePrivate(corruptData, to: workURL)
     let corrupt = await reopened.verifiedCreationProjection(
         client: client, commandID: request.command.commandID)
     XCTAssertEqual(corrupt.verification.sourcePresence, .sessionOnly)

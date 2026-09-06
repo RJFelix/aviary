@@ -122,6 +122,40 @@ public struct RunJournalBundleStatus: Hashable, Sendable {
     }
 }
 
+/// One actor-serialized canonical read of the paired native journals. The Work projection is
+/// always present; the Session projection is the exact Session/attachment owned by the bundle.
+/// Callers may use the Work half as authoritative evidence when the Work's creation Session is a
+/// different, cold Session.
+public struct RunJournalBundleCanonicalObservation: Hashable, Sendable {
+    public let binding: WorkBinding
+    public let work: TimelineJournalCanonicalRead
+    public let session: TimelineJournalCanonicalRead
+
+    public init(
+        binding: WorkBinding,
+        work: TimelineJournalCanonicalRead,
+        session: TimelineJournalCanonicalRead
+    ) throws {
+        guard work.journal == binding.workJournal,
+              session.journal == binding.sessionJournal,
+              case .work(let workHead) = work.projection,
+              case .session(let sessionHead) = session.projection,
+              workHead.work == binding.work,
+              workHead.workHost == binding.workHost,
+              sessionHead.session == binding.session else {
+            throw RunJournalBundleError.invalidConfiguration(
+                "canonical observation does not match its Work binding")
+        }
+        self.binding = binding
+        self.work = work
+        self.session = session
+    }
+
+    /// The Work half is intentionally available without exposing the cold creation Session.
+    /// This is the only form suitable for an alternate active Session binding.
+    public var workOnly: TimelineJournalCanonicalRead { work }
+}
+
 /// Canonical evidence for one exactly-once terminal Work transaction.
 public struct RunJournalBundleTerminalCommit: Hashable, Sendable {
     public let workEvent: TimelineEvent
@@ -2078,6 +2112,28 @@ public actor RunJournalBundle {
                 }()))
     }
 
+    /// Read both native journals through their already-held writer locks. The bundle actor
+    /// serializes this pair with every append/finish operation, while each writer fences its own
+    /// descriptor and path and builds a bounded reducer head from the same byte stream.
+    public func canonicalObservation(
+        limits: BoundedTimelineReducerProjectionLimits = .default,
+        maximumResidentRecords: Int = 1_000_000
+    ) async throws -> RunJournalBundleCanonicalObservation {
+        try await withSemanticGate {
+            let work = try await workWriter.readCanonicalProjection(
+                expectedWork: self.work, expectedWorkHost: self.workHost, limits: limits,
+                maximumResidentRecords: maximumResidentRecords)
+            let session = try await sessionWriter.readCanonicalProjection(
+                expectedSession: self.session, limits: limits,
+                maximumResidentRecords: maximumResidentRecords)
+            return try RunJournalBundleCanonicalObservation(
+                binding: WorkBinding(
+                    session: self.session, work: self.work, workHost: self.workHost,
+                    sessionAttachment: self.sessionAttachment),
+                work: work, session: session)
+        }
+    }
+
     public var latestSessionCursor: JournalCursor? { sessionCursor }
     public var latestWorkCursor: JournalCursor? { workCursor }
 
@@ -3229,8 +3285,9 @@ public actor RunJournalBundle {
         var outcomePayload: [String: JSONValue] = ["state": .string(outcome.rawValue)]
         if let detail, !detail.isEmpty { outcomePayload["detail"] = .string(detail) }
         let finished = try await appendWork(TimelineEventDraft(
-            hostSequence: nextHostOrder(), work: work, workHost: workHost,
-            run: activeRun, type: TimelineEventType.runFinished,
+            hostSequence: nextHostOrder(), session: session, work: work, workHost: workHost,
+            sessionAttachment: sessionAttachment, run: activeRun,
+            type: TimelineEventType.runFinished,
             declaredDomains: [.work], payload: .object(outcomePayload)))
         guard let cursor = workCursor else {
             throw RunJournalBundleError.invalidOperation("run.finished did not produce a Work cursor")
@@ -3866,8 +3923,9 @@ public actor RunJournalBundle {
         if let modelID { payload["model_id"] = .string(modelID) }
         let predecessor = workCursor
         _ = try await appendWork(TimelineEventDraft(
-            hostSequence: nextHostOrder(), work: work, workHost: workHost,
-            run: run, type: TimelineEventType.runStarted, declaredDomains: [.work],
+            hostSequence: nextHostOrder(), session: session, work: work, workHost: workHost,
+            sessionAttachment: sessionAttachment, run: run,
+            type: TimelineEventType.runStarted, declaredDomains: [.work, .session],
             payload: .object(payload)))
         runStartPredecessorCursor = predecessor
         activeRun = run

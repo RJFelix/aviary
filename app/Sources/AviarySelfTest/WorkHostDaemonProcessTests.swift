@@ -999,6 +999,15 @@ func test_aviarydSubprocessSurvivesClientExitAndSecondClientAttaches() async thr
     XCTAssertTrue(process.isRunning)
     let clientB = WorkServiceUnixSocketClient(
         endpoint: published.endpoint, client: ClientRef("daemon-client-b"), expectedHost: host)
+    func describeThroughClientB(_ stage: String) async throws -> WorkServiceWorkDescriptor {
+        do {
+            return try await clientB.describeWork(WorkServiceDescribeRequest(
+                work: create.work.work, journal: create.work.journal,
+                client: ClientRef("daemon-client-b")))
+        } catch {
+            throw UnwrapFailure(description: "daemon \(stage) descriptor was unavailable: \(error)")
+        }
+    }
     let handshakeB: WorkServiceHandshakeResponse
     do {
         handshakeB = try await clientB.connect(build: "process-test")
@@ -1040,19 +1049,30 @@ func test_aviarydSubprocessSurvivesClientExitAndSecondClientAttaches() async thr
     var assistantMessage: TimelineEvent?
     let completionDeadline = Date().addingTimeInterval(10)
     while Date() < completionDeadline && (turnFinished == nil || assistantMessage == nil) {
-        let workPage = try await clientB.eventsAfterCursor(WorkServiceEventsRequest(
-            work: create.work.work, journal: create.work.journal,
-            attachment: attachmentB.attachment, client: ClientRef("daemon-client-b"),
-            target: .work(journal: create.work.journal), afterCursor: workCursor))
+        let workPage: WorkServiceEventPage
+        do {
+            workPage = try await clientB.eventsAfterCursor(WorkServiceEventsRequest(
+                work: create.work.work, journal: create.work.journal,
+                attachment: attachmentB.attachment, client: ClientRef("daemon-client-b"),
+                target: .work(journal: create.work.journal), afterCursor: workCursor))
+        } catch {
+            throw UnwrapFailure(description:
+                "daemon Work completion page was unavailable: \(error)")
+        }
         if let served = workPage.servedCursor { workCursor = served }
         turnFinished = turnFinished ?? workPage.events.first {
             $0.type == TimelineEventType.turnFinished
         }
-        let sessionPage = try await clientB.eventsAfterCursor(WorkServiceEventsRequest(
-            work: create.work.work, journal: create.work.journal,
-            attachment: attachmentB.attachment, client: ClientRef("daemon-client-b"),
-            target: .session(session: create.session, journal: create.sessionJournal),
-            afterCursor: sessionCursor))
+        let sessionPage: WorkServiceEventPage
+        do {
+            sessionPage = try await clientB.eventsAfterCursor(WorkServiceEventsRequest(
+                work: create.work.work, journal: create.work.journal,
+                attachment: attachmentB.attachment, client: ClientRef("daemon-client-b"),
+                target: .session(session: create.session, journal: create.sessionJournal),
+                afterCursor: sessionCursor))
+        } catch {
+            throw UnwrapFailure(description: "daemon Session completion page was unavailable: \(error)")
+        }
         if let served = sessionPage.servedCursor { sessionCursor = served }
         assistantMessage = assistantMessage ?? sessionPage.events.first {
             $0.type == TimelineEventType.messageCommitted
@@ -1085,22 +1105,24 @@ func test_aviarydSubprocessSurvivesClientExitAndSecondClientAttaches() async thr
         client: ClientRef("daemon-client-b"), sessionAttachment: attachmentB.sessionAttachment,
         causalWorkCursor: endCursor, kind: .end))
     XCTAssertEqual(end.state, .accepted)
-    var endedDescriptor = try await clientB.describeWork(WorkServiceDescribeRequest(
-        work: create.work.work, journal: create.work.journal,
-        client: ClientRef("daemon-client-b")))
+    var endedDescriptor = try await describeThroughClientB("ended Run")
     let endedDeadline = Date().addingTimeInterval(20)
     while Date() < endedDeadline {
-        endedDescriptor = try await clientB.describeWork(WorkServiceDescribeRequest(
-            work: create.work.work, journal: create.work.journal,
-            client: ClientRef("daemon-client-b")))
+        endedDescriptor = try await describeThroughClientB("ended Run polling")
         if endedDescriptor.currentRun == nil { break }
         try await Task.sleep(nanoseconds: 100_000_000)
     }
     XCTAssertNil(endedDescriptor.currentRun)
-    let terminalWorkPage = try await clientB.eventsAfterCursor(WorkServiceEventsRequest(
-        work: create.work.work, journal: create.work.journal,
-        attachment: attachmentB.attachment, client: ClientRef("daemon-client-b"),
-        target: .work(journal: create.work.journal), afterCursor: endCursor))
+    let terminalWorkPage: WorkServiceEventPage
+    do {
+        terminalWorkPage = try await clientB.eventsAfterCursor(WorkServiceEventsRequest(
+            work: create.work.work, journal: create.work.journal,
+            attachment: attachmentB.attachment, client: ClientRef("daemon-client-b"),
+            target: .work(journal: create.work.journal), afterCursor: endCursor))
+    } catch {
+        throw UnwrapFailure(description:
+            "daemon terminal Work page was unavailable: \(error)")
+    }
     XCTAssertTrue(terminalWorkPage.events.contains { $0.type == TimelineEventType.runFinished })
 
     // End releases only the current actor. The Work remains reusable through the same daemon,
@@ -1117,14 +1139,10 @@ func test_aviarydSubprocessSurvivesClientExitAndSecondClientAttaches() async thr
         causalWorkCursor: replacementCursor, kind: .start, value: "replacement start"))
     XCTAssertEqual(replacement.state, .accepted)
     XCTAssertEqual(replacement.outcome, .started)
-    var replacementDescriptor = try await clientB.describeWork(WorkServiceDescribeRequest(
-        work: create.work.work, journal: create.work.journal,
-        client: ClientRef("daemon-client-b")))
+    var replacementDescriptor = try await describeThroughClientB("replacement Run")
     let replacementDeadline = Date().addingTimeInterval(20)
     while Date() < replacementDeadline {
-        replacementDescriptor = try await clientB.describeWork(WorkServiceDescribeRequest(
-            work: create.work.work, journal: create.work.journal,
-            client: ClientRef("daemon-client-b")))
+        replacementDescriptor = try await describeThroughClientB("replacement Run polling")
         if replacementDescriptor.currentRun != nil { break }
         try await Task.sleep(nanoseconds: 100_000_000)
     }
@@ -1224,11 +1242,17 @@ func test_aviarydSubprocessSurvivesClientExitAndSecondClientAttaches() async thr
     var replacementFinished = false
     let replacementEndDeadline = Date().addingTimeInterval(10)
     while Date() < replacementEndDeadline && !replacementFinished {
-        let page = try await clientB.eventsAfterCursor(WorkServiceEventsRequest(
-            work: create.work.work, journal: create.work.journal,
-            attachment: attachmentB.attachment, client: ClientRef("daemon-client-b"),
-            target: .work(journal: create.work.journal),
-            afterCursor: replacementWorkReadCursor))
+        let page: WorkServiceEventPage
+        do {
+            page = try await clientB.eventsAfterCursor(WorkServiceEventsRequest(
+                work: create.work.work, journal: create.work.journal,
+                attachment: attachmentB.attachment, client: ClientRef("daemon-client-b"),
+                target: .work(journal: create.work.journal),
+                afterCursor: replacementWorkReadCursor))
+        } catch {
+            throw UnwrapFailure(description:
+                "daemon replacement terminal page was unavailable: \(error)")
+        }
         if let served = page.servedCursor { replacementWorkReadCursor = served }
         replacementFinished = page.events.contains {
             $0.type == TimelineEventType.runFinished && $0.run == run2

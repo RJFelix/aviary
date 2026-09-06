@@ -4,6 +4,13 @@ import Foundation
 
 typealias Case = (String, () async throws -> Void)
 
+private func runLinuxCases(_ cases: [Case]) async throws {
+    for (name, body) in cases {
+        print("      running: \(name)")
+        try await body()
+    }
+}
+
 private func test_linuxSHA256KnownVectors() {
     let vectors: [(String, String)] = [
         ("", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
@@ -68,52 +75,43 @@ enum LinuxSelfTestMain {
                 try await test_linuxURLSessionStreamingBoundsAndCancellation()
             }),
             ("Linux platform: disposable projection store", {
-                for (_, body) in casesDisposableTimelineProjectionStore {
-                    try await body()
-                }
+                try await runLinuxCases(casesDisposableTimelineProjectionStore)
             }),
             ("Linux platform: local projection source lease", {
-                for (_, body) in casesLocalTimelineProjectionSource {
-                    try await body()
-                }
+                try await runLinuxCases(casesLocalTimelineProjectionSource)
             }),
             ("Linux platform: local Timeline projection reader", {
-                for (_, body) in casesLocalTimelineProjectionReader {
-                    try await body()
-                }
+                try await runLinuxCases(casesLocalTimelineProjectionReader)
             }),
             ("Linux platform: bounded Timeline reducer projection", {
-                for (_, body) in casesBoundedTimelineReducerProjection {
-                    try await body()
-                }
+                try await runLinuxCases(casesBoundedTimelineReducerProjection)
             }),
             ("Linux platform: persistent projection radix map", {
-                for (_, body) in casesPersistentProjectionRadixMap {
-                    try await body()
-                }
+                try await runLinuxCases(casesPersistentProjectionRadixMap)
             }),
             ("Linux platform: persistent Work exact state", {
-                for (_, body) in casesPersistentWorkExactState {
-                    try await body()
-                }
+                try await runLinuxCases(casesPersistentWorkExactState)
+            }),
+            ("Linux platform: persistent Session exact state", {
+                try await runLinuxCases(casesPersistentSessionExactState)
             }),
             ("Linux platform: Work reducer transition parity", {
-                for (_, body) in casesWorkReducerTransition {
-                    try await body()
-                }
+                try await runLinuxCases(casesWorkReducerTransition)
             }),
             ("Linux platform: Session reducer transition parity", {
-                for (_, body) in casesSessionReducerTransition {
-                    try await body()
-                }
+                try await runLinuxCases(casesSessionReducerTransition)
             }),
             ("Work service: transport handshake and read projection", {
                 try await test_workServiceTransportHandshakeAndReadProjection()
             }),
             ("Work service: create Session for existing Work", {
-                for (_, body) in casesWorkServiceCreateSession {
-                    try await body()
-                }
+                try await runLinuxCases(casesWorkServiceCreateSession)
+            }),
+            ("Work service: attachment-qualified client state", {
+                try await runLinuxCases(casesAttachmentQualifiedIdentity)
+            }),
+            ("Work service: GUI control policy", {
+                try await runLinuxCases(casesServiceBackedGUIControlPolicy)
             }),
             ("Work service: transport independent clients and ordered mutations", {
                 try await test_workServiceTransportSupportsIndependentClientsAndOrderedMutations()

@@ -418,6 +418,26 @@ func testLocalProjectionSourceFingerprintChangesForSameSizeMiddleMutation() thro
     XCTAssertEqual(changed.prefixByteCount, original.prefixByteCount)
 }
 
+func testLocalProjectionSourceCanonicalDigestOrdersDeclaredDomains() throws {
+    var event = TimelineEvent(
+        eventID: "canonical-multi-domain", journal: localProjectionSourceJournal, sequence: 1,
+        work: localProjectionSourceWork, workHost: localProjectionSourceHost,
+        actor: localProjectionSourceActor, hostRecordedAt: Date(timeIntervalSince1970: 1),
+        type: TimelineEventType.workCreated,
+        declaredDomains: [.runtime, .work, .externalEffects, .context, .session])
+    let expected = try DisposableTimelineProjectionStore.canonicalEventLineDigest(event)
+    for _ in 0..<128 {
+        let encoded = try DisposableTimelineProjectionStore.canonicalJSON(event)
+        let value = try XCTUnwrap(JSONValue.parse(encoded))
+        XCTAssertEqual(
+            value["declared_domains"]?.arrayValue?.compactMap(\.stringValue),
+            TimelineDomain.allCases.map(\.rawValue).sorted())
+        event = try JSONDecoder().decode(TimelineEvent.self, from: encoded)
+        XCTAssertEqual(
+            try DisposableTimelineProjectionStore.canonicalEventLineDigest(event), expected)
+    }
+}
+
 let casesLocalTimelineProjectionSource: [Case] = [
     ("phase3 local projection source validates unchanged and appended journal", {
         try testLocalProjectionSourceValidatesUnchangedAndAppendedJournal()
@@ -439,5 +459,8 @@ let casesLocalTimelineProjectionSource: [Case] = [
     }),
     ("phase3 local projection source fingerprint changes for same-size middle mutation", {
         try testLocalProjectionSourceFingerprintChangesForSameSizeMiddleMutation()
+    }),
+    ("phase3 local projection source canonical digest orders declared domains", {
+        try testLocalProjectionSourceCanonicalDigestOrdersDeclaredDomains()
     }),
 ]

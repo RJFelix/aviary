@@ -763,6 +763,17 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
             lastFailure: lastFailure)
     }
 
+    /// Return one live canonical Work/Session observation from the native bundle. The bundle's
+    /// writer actors hold their advisory locks for the full observation, so callers never fall
+    /// back to an unlocked source read while this Hosted actor owns the active Run.
+    public func canonicalObservation(
+        limits: BoundedTimelineReducerProjectionLimits = .default,
+        maximumResidentRecords: Int = 1_000_000
+    ) async throws -> RunJournalBundleCanonicalObservation {
+        try await bridge.nativeJournal.canonicalObservation(
+            limits: limits, maximumResidentRecords: maximumResidentRecords)
+    }
+
     public var observerCount: Int { subscriptions.count }
 
     // MARK: Work terminalization

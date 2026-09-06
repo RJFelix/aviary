@@ -152,38 +152,68 @@ struct LiveView: View {
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                             ForEach(model.localServiceCatalogWorks, id: \.work) { descriptor in
-                                let hasOwnAttachment = descriptor.attachments.contains {
-                                    $0.client == model.localWorkServiceClient
-                                }
-                                let canAttach = descriptor.attachments.contains {
-                                    $0.session != nil
-                                        && $0.sessionJournal != nil
-                                        && $0.sessionAttachment != nil
-                                }
-                                HStack(spacing: 8) {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(descriptor.work.workID)
-                                            .font(Design.mono(11))
-                                        Text(
-                                            "\(model.workspaceLabel(for: descriptor)) · "
-                                                + "\(descriptor.execution.rawValue)"
-                                        )
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.secondary)
+                                ForEach(model.serviceAttachTargets(for: descriptor), id: \.self) { target in
+                                    let hasOwnAttachment = descriptor.attachments.contains {
+                                        $0.client == model.localWorkServiceClient
+                                            && $0.session == target.session
+                                            && $0.sessionJournal == target.sessionJournal
+                                            && $0.sessionAttachment == target.sessionAttachment
                                     }
-                                    Spacer()
-                                    Button(hasOwnAttachment ? "Inspect" : "Attach") {
-                                        model.attachServiceWork(descriptor)
+                                    HStack(spacing: 8) {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(descriptor.work.workID)
+                                                .font(Design.mono(11))
+                                            Text(
+                                                "\(target.session.sessionID) · "
+                                                    + "\(model.workspaceLabel(for: descriptor)) · "
+                                                    + "\(descriptor.execution.rawValue)"
+                                            )
+                                                .font(.system(size: 10))
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        Button(hasOwnAttachment ? "Inspect" : "Attach") {
+                                            model.attachServiceWork(
+                                                descriptor,
+                                                targetSessionAttachment: target.sessionAttachment)
+                                        }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
+                                            .help(
+                                                hasOwnAttachment
+                                                    ? "Inspect this Session attachment without starting it"
+                                                    : "Attach this exact Session without starting it")
                                     }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
-                                        .disabled(!canAttach)
-                                        .help(
-                                            canAttach
-                                                ? (hasOwnAttachment
-                                                    ? "Inspect this terminal Work without starting it"
-                                                    : "Attach this Work without starting it")
-                                                : "No canonical Session attachment is available")
+                                }
+                                ForEach(
+                                    model.serviceSessionCreationAuthorizers(for: descriptor),
+                                    id: \.attachment
+                                ) { authorizer in
+                                    HStack(spacing: 8) {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("New conversation")
+                                                .font(.system(size: 11.5, weight: .medium))
+                                            Text(
+                                                "Create an independent Session on this Work"
+                                                    + (authorizer.session.map {
+                                                        " via \($0.sessionID)"
+                                                    } ?? "")
+                                            )
+                                                .font(.system(size: 10))
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                        }
+                                        Spacer()
+                                        Button("New Session") {
+                                            model.createServiceSession(
+                                                descriptor,
+                                                authorizingAttachment: authorizer.attachment)
+                                        }
+                                            .buttonStyle(.borderedProminent)
+                                            .controlSize(.small)
+                                            .help(
+                                                "Ask the Work Host to create and attach a new Session; this does not start a Run")
+                                    }
                                 }
                             }
                         }
@@ -409,7 +439,7 @@ struct RunPane: View {
                 .controlSize(.small)
                 .tint(Design.danger)
                 .accessibilityValue(run.isEnding ? "In progress" : "Available")
-                .disabled(run.isEnding)
+                .disabled(run.isEnding || !run.serviceControlsAvailable)
                 .help(
                     run.isServiceBacked
                         ? "Send an explicit End command to the Work Host"
@@ -1438,7 +1468,12 @@ private struct ServiceWorkCard: View {
                                 .controlSize(.small)
                                 .disabled(
                                     run.hasExited || run.isEnding
-                                        || pending.state == .awaitingCanonicalEvidence)
+                                        || pending.state == .awaitingCanonicalEvidence
+                                        || !run.serviceRetryAvailable)
+                                .help(
+                                    run.serviceRetryAvailable
+                                        ? "Retry the exact retained command"
+                                        : "Retry is disabled because this Session no longer owns the active Run")
                             if pending.state == .stale {
                                 Button("Abandon stale") {
                                     Task { _ = await run.abandonStaleServiceCommand() }

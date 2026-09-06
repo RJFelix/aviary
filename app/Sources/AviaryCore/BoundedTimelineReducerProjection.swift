@@ -645,7 +645,7 @@ public enum BoundedChildState: String, Codable, Hashable, Sendable {
 }
 
 public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
-    public static let schemaVersion = 1
+    public static let schemaVersion = 2
     public static let mediaType = "application/x-aviary-bounded-work-reducer-head"
 
     public let schemaVersion: Int
@@ -658,6 +658,11 @@ public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
     public let execution: WorkExecution
     public let executionEvent: BoundedReducerProjectionEvent?
     public let currentRun: BoundedReducerProjectionRun?
+    /// Exact owner envelope recorded by the canonical ``run.started`` marker. A client must
+    /// use this pair for control authorization; it is not inferred from the Work's first
+    /// attachment or from a launch template.
+    public let activeRunSession: SessionRef?
+    public let activeRunSessionAttachment: SessionAttachmentRef?
     public let currentTurn: BoundedReducerProjectionTurn?
     public let modelID: String?
     public let modelEvent: BoundedReducerProjectionEvent?
@@ -995,7 +1000,7 @@ public enum BoundedTimelineReducerProjection {
         return try accumulator.finalize(source: source)
     }
 
-    private static func makeIndexCoverage(
+    fileprivate static func makeIndexCoverage(
         _ index: BoundedReducerProjectionIndex,
         total: Int,
         retained: Int,
@@ -1017,7 +1022,7 @@ public enum BoundedTimelineReducerProjection {
             retainedCount: boundedRetained, omittedCount: omitted)
     }
 
-    private static func scalarState(
+    fileprivate static func scalarState(
         snapshotCausalOrderValid: Bool,
         snapshotStructuralIntegrityValid: Bool,
         snapshotSemanticProjectionValid: Bool,
@@ -1036,7 +1041,7 @@ public enum BoundedTimelineReducerProjection {
         return .complete
     }
 
-    private static func overallState(
+    fileprivate static func overallState(
         scalar: BoundedReducerProjectionState,
         indexes: [BoundedReducerProjectionIndexCoverage]
     ) -> BoundedReducerProjectionState {
@@ -1445,7 +1450,9 @@ public enum BoundedTimelineReducerProjection {
             source: source, coverage: coverage, work: snapshot.work, workHost: snapshot.workHost,
             lifecycle: snapshot.lifecycle, lifecycleEvent: trace.lifecycle,
             execution: snapshot.execution, executionEvent: trace.execution,
-            currentRun: currentRun, currentTurn: currentTurn, modelID: boundedOptional(
+            currentRun: currentRun, activeRunSession: snapshot.activeRunSession,
+            activeRunSessionAttachment: snapshot.activeRunSessionAttachment,
+            currentTurn: currentTurn, modelID: boundedOptional(
                 snapshot.modelID, maxBytes: limits.maximumIdentifierBytes), modelEvent: trace.model,
             activeActionIDs: Array(snapshot.activeActionIDs.sorted().prefix(limits.maximumActions)).map {
                 bounded($0, maxBytes: limits.maximumIdentifierBytes)
@@ -2399,6 +2406,29 @@ public enum BoundedTimelineReducerProjection {
             try validateIdentifierValue(run.run.runID, limits: limits)
             try validateProjectionEvent(run.sourceEvent, source: head.source, limits: limits)
         }
+        guard (head.activeRunSession == nil) == (head.activeRunSessionAttachment == nil),
+              (head.currentRun == nil) == (head.activeRunSession == nil) else {
+            throw BoundedTimelineReducerProjectionError.invalidIdentity
+        }
+        if let session = head.activeRunSession {
+            try validateIdentifierValue(session.sessionID, limits: limits)
+        }
+        if let attachment = head.activeRunSessionAttachment {
+            try validateIdentifierValue(attachment.attachmentID, limits: limits)
+        }
+        if let ownerSession = head.activeRunSession,
+           let ownerAttachment = head.activeRunSessionAttachment {
+            // A projected owner is actionable only when its exact attached relationship is in
+            // the bounded index. If the row was omitted or detached, callers must treat the
+            // head as invalid rather than infer ownership from a Run or template alone.
+            guard head.attachments.contains(where: {
+                $0.session == ownerSession
+                    && $0.attachment == ownerAttachment
+                    && $0.isAttached
+            }) else {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+        }
         if let turn = head.currentTurn {
             try validateIdentifierValue(turn.turn.turnID, limits: limits)
             try validateProjectionEvent(turn.sourceEvent, source: head.source, limits: limits)
@@ -2795,7 +2825,7 @@ public enum BoundedTimelineReducerProjection {
         [row.intentEvent, row.startedEvent, row.outcomeEvent].compactMap { $0 }
     }
 
-    private static func appendOmission(
+    fileprivate static func appendOmission(
         _ result: inout [BoundedReducerProjectionOmission],
         _ index: BoundedReducerProjectionIndex,
         _ total: Int,
@@ -3036,6 +3066,8 @@ private extension BoundedWorkReducerHead {
         execution: WorkExecution,
         executionEvent: BoundedReducerProjectionEvent?,
         currentRun: BoundedReducerProjectionRun?,
+        activeRunSession: SessionRef?,
+        activeRunSessionAttachment: SessionAttachmentRef?,
         currentTurn: BoundedReducerProjectionTurn?,
         modelID: String?,
         modelEvent: BoundedReducerProjectionEvent?,
@@ -3065,6 +3097,8 @@ private extension BoundedWorkReducerHead {
         self.execution = execution
         self.executionEvent = executionEvent
         self.currentRun = currentRun
+        self.activeRunSession = activeRunSession
+        self.activeRunSessionAttachment = activeRunSessionAttachment
         self.currentTurn = currentTurn
         self.modelID = modelID
         self.modelEvent = modelEvent
@@ -3206,6 +3240,10 @@ public struct BoundedWorkReducerAccumulator: Sendable {
         self.limits = limits
     }
 
+    /// The exact scalar reducer state produced by the same events as `finalize`. This is exposed
+    /// for canonical writer-owned reads so service adapters do not need a second unlocked replay.
+    public var snapshot: WorkSnapshot { reducer.snapshot }
+
     public mutating func append(_ event: TimelineEvent) {
         BoundedTimelineReducerProjection.consumeWorkEvent(
             event, reducer: &reducer, trace: &trace, limits: limits)
@@ -3235,6 +3273,10 @@ public struct BoundedSessionReducerAccumulator: Sendable {
         self.limits = limits
     }
 
+    /// The exact scalar reducer state produced by the same events as `finalize`. This is exposed
+    /// for canonical writer-owned reads so service adapters do not need a second unlocked replay.
+    public var snapshot: SessionSnapshot { reducer.snapshot }
+
     public mutating func append(_ event: TimelineEvent) {
         BoundedTimelineReducerProjection.consumeSessionEvent(
             event, reducer: &reducer, trace: &trace, limits: limits)
@@ -3248,5 +3290,525 @@ public struct BoundedSessionReducerAccumulator: Sendable {
             snapshot: reducer.snapshot, source: source, limits: limits, trace: trace)
         try head.validate(limits: limits)
         return head
+    }
+}
+
+/// The LocalTimelineProjectionReader's Session presentation lane. It consumes the exact-state
+/// event-local result, not ``SessionReducer``. Only bounded metadata rows and digests are retained;
+/// the exact map owns continuation and the source stream remains the body authority.
+internal struct BoundedSessionExactHeadAccumulator: Sendable {
+    private let limits: BoundedTimelineReducerProjectionLimits
+
+    private var session: SessionRef?
+    private var lifecycle: SessionLifecycle = .unknown
+    private var execution: WorkExecution = .idle
+    private var attention: SessionAttention = .none
+    private var attentionEvent: BoundedReducerProjectionEvent?
+    private var activeRun: RunRef?
+    private var activeTurn: TurnRef?
+    private var modelID: String?
+    private var semanticTip: EventRef?
+    private var causalOrderValid = true
+    private var structuralIntegrityValid = true
+    private var semanticProjectionValid = true
+    private var semanticSequence = 0
+
+    private var lifecycleEvent: BoundedReducerProjectionEvent?
+    private var currentRunEvent: BoundedReducerProjectionEvent?
+    private var currentTurnEvent: BoundedReducerProjectionEvent?
+    private var modelEvent: BoundedReducerProjectionEvent?
+    private var compactionEvent: BoundedReducerProjectionEvent?
+
+    private var attachments: [String: BoundedSessionAttachmentIndexRecord] = [:]
+    private var messageHistory: [BoundedMessageIndexRecord] = []
+    private var visibleMessages: [BoundedMessageIndexRecord] = []
+    private var context: [BoundedContextIndexRecord] = []
+    private var promptSources: [BoundedPromptSourceIndexRecord] = []
+    private var childStates: [String: BoundedChildIndexRecord] = [:]
+    private var recovery: [BoundedRecoveryIndexRecord] = []
+    private var unknowns: [BoundedUnknownIndexRecord] = []
+    private var corruption: [BoundedCorruptionIndexRecord] = []
+
+    private var contextManifestID: String?
+    private var contextRequestID: String?
+    private var contextModelID: String?
+    private var contextMeasuredBytes: Int?
+    private var contextDeliveredBytes: Int?
+    private var contextCumulativeDeliveredBytes: Int?
+    private var contextOmissionCount = 0
+    private var promptAssemblyID: String?
+    private var compaction: BoundedReducerProjectionDigest?
+    /// Tip selection never reconstructs a lifetime branch in this lane. Keep that omission
+    /// explicit even when the selected node itself remains in the bounded history window.
+    private var visibleBranchIncomplete = false
+
+    /// These totals are independent of retained rows. They make the omission contract truthful
+    /// when the suffix grows past an index cap without preserving a lifetime-sized dictionary.
+    private var messageTotal = 0
+    private var attachmentTotal = 0
+    private var contextTotal = 0
+    private var childTotal = 0
+    private var recoveryTotal = 0
+    private var unknownTotal = 0
+    private var corruptionTotal = 0
+    private var activeItemCount = 0
+    private var physicalEventID: String?
+    private var physicalSequence = 0
+
+    init(limits: BoundedTimelineReducerProjectionLimits) {
+        self.limits = limits
+    }
+
+    init(
+        head: BoundedSessionReducerHead,
+        limits: BoundedTimelineReducerProjectionLimits
+    ) {
+        self.limits = limits
+        session = head.session
+        lifecycle = head.lifecycle
+        execution = head.execution
+        attention = head.attention
+        attentionEvent = head.attentionEvent
+        activeRun = head.currentRun?.run
+        activeTurn = head.currentTurn?.turn
+        modelID = head.modelID
+        semanticTip = head.semanticTip
+        causalOrderValid = head.causalOrderValid
+        structuralIntegrityValid = head.structuralIntegrityValid
+        semanticProjectionValid = head.semanticProjectionValid
+        semanticSequence = head.source.cursor.sequence
+        lifecycleEvent = head.lifecycleEvent
+        currentRunEvent = head.currentRun?.sourceEvent
+        currentTurnEvent = head.currentTurn?.sourceEvent
+        modelEvent = head.modelEvent
+        compactionEvent = head.compactionEvent
+        attachments = Dictionary(uniqueKeysWithValues: head.attachments.map {
+            ($0.attachment.attachmentID, $0)
+        })
+        messageHistory = head.messageHistory
+        visibleMessages = head.visibleMessages
+        context = head.context
+        promptSources = head.promptSources
+        childStates = Dictionary(uniqueKeysWithValues: head.childStates.map { ($0.childID, $0) })
+        recovery = head.recovery
+        unknowns = head.unknowns
+        corruption = head.corruption
+        contextManifestID = head.contextManifestID
+        contextRequestID = head.contextRequestID
+        contextModelID = head.contextModelID
+        contextMeasuredBytes = head.contextMeasuredBytes
+        contextDeliveredBytes = head.contextDeliveredBytes
+        contextCumulativeDeliveredBytes = head.contextCumulativeDeliveredBytes
+        contextOmissionCount = head.contextOmissionCount
+        promptAssemblyID = head.promptAssemblyID
+        compaction = head.compaction
+        visibleBranchIncomplete = head.coverage.coverage(for: .messages)?.state == .sourceIncomplete
+        messageTotal = head.coverage.coverage(for: .messages)?.totalCount ??
+            head.messageHistory.count + head.visibleMessages.count
+        attachmentTotal = head.coverage.coverage(for: .attachments)?.totalCount ?? head.attachments.count
+        contextTotal = head.coverage.coverage(for: .context)?.totalCount ??
+            head.context.count + head.promptSources.count
+        childTotal = head.coverage.coverage(for: .children)?.totalCount ?? head.childStates.count
+        recoveryTotal = head.coverage.coverage(for: .recovery)?.totalCount ?? head.recovery.count
+        unknownTotal = head.coverage.unknownEventCount
+        corruptionTotal = head.coverage.corruptionCount
+        activeItemCount = head.coverage.activeItemCount
+        physicalEventID = head.source.cursor.eventID
+        physicalSequence = head.source.cursor.sequence
+    }
+
+    mutating func setPhysicalCursor(_ cursor: JournalCursor) {
+        physicalEventID = cursor.eventID
+        physicalSequence = cursor.sequence
+    }
+
+    mutating func append(
+        event: TimelineEvent,
+        result: PersistentSessionExactState.ApplyResult
+    ) throws {
+        physicalEventID = event.eventID
+        physicalSequence = event.sequence
+        let before = scalarSnapshot()
+        let after = result.eventLocalSnapshot
+        let source = BoundedTimelineReducerProjection.projectionEvent(event)
+        let quarantined = result.changedSlots.contains { $0.contains("/quarantine/") }
+        let accepted = after.lastSequence > semanticSequence
+
+        session = after.session
+        lifecycle = after.lifecycle
+        execution = after.execution
+        attention = after.attention
+        activeRun = after.activeRun
+        activeTurn = after.activeTurn
+        modelID = after.modelID
+        semanticTip = after.semanticTip
+        causalOrderValid = after.causalOrderValid
+        structuralIntegrityValid = after.structuralIntegrityValid
+        semanticProjectionValid = after.semanticProjectionValid
+        semanticSequence = after.lastSequence
+
+        if accepted && !quarantined {
+            if before.lifecycle != after.lifecycle { lifecycleEvent = source }
+            if before.activeRun != after.activeRun { currentRunEvent = source }
+            if before.activeTurn != after.activeTurn { currentTurnEvent = source }
+            if before.modelID != after.modelID { modelEvent = source }
+            if before.attention != after.attention { attentionEvent = source }
+        }
+
+        if result.changedSlots.contains(where: { $0.contains("/message/") }) {
+            try appendMessage(event: event, source: source)
+        }
+        if result.changedSlots.contains(where: { $0.contains("/attachment/") }) {
+            try appendAttachment(event: event, source: source)
+        }
+        if result.changedSlots.contains(where: { $0.hasSuffix("/context") }) {
+            try replaceContext(from: after, runID: event.run?.runID)
+        }
+        if result.changedSlots.contains(where: { $0.contains("/child/") }) {
+            try appendChild(event: event, source: source)
+        }
+        if result.changedSlots.contains(where: { $0.contains("/recovery/") }) {
+            try appendRecovery(event: event, source: source)
+        }
+        if result.changedSlots.contains(where: { $0.contains("/unknown/") }) {
+            try appendUnknown(event: event, source: source, snapshot: after)
+        }
+        if result.changedSlots.contains(where: { $0.contains("/quarantine/") }) {
+            // A pre-seen rejection leaves the semantic cursor unchanged. The exact scalar keeps
+            // that distinction, while this presentation row records the same structural fact.
+            appendCorruption(
+                event: event, source: source,
+                structural: !accepted || !after.structuralIntegrityValid)
+        }
+        if accepted && !quarantined, event.type == TimelineEventType.sessionTipSelected {
+            // The exact continuation intentionally does not reconstruct an old branch. Do not
+            // publish a lone target (or duplicate a row already in messageHistory) as though it
+            // were the complete visible branch; the canonical bounded head owns that richer
+            // presentation. An empty, explicitly incomplete view is safer than a misleading
+            // partial branch and keeps coverage counts stable across tip changes.
+            visibleMessages = []
+            visibleBranchIncomplete = true
+        }
+        if accepted && !quarantined, event.type == TimelineEventType.compaction {
+            compaction = BoundedTimelineReducerProjection.digestText(after.compactionSummary)
+            compactionEvent = source
+        }
+    }
+
+    func finalize(source: BoundedReducerProjectionSource) throws -> BoundedSessionReducerHead {
+        try BoundedTimelineReducerProjection.validateSource(source, limits: limits)
+        guard source.cursor.eventID == physicalEventID,
+              source.cursor.sequence == physicalSequence else {
+            throw BoundedTimelineReducerProjectionError.invalidCursor
+        }
+        let retainedAttachments = Array(attachments.values).sorted {
+            if $0.isAttached != $1.isAttached { return $0.isAttached }
+            let lhs = $0.sourceEvent?.sequence ?? -1
+            let rhs = $1.sourceEvent?.sequence ?? -1
+            return lhs == rhs ? $0.attachment.attachmentID < $1.attachment.attachmentID : lhs > rhs
+        }
+        let retainedChildren = Array(childStates.values).sorted { lhs, rhs in
+            let l = BoundedTimelineReducerProjection.classifyChildState(lhs.state.rawValue)
+            let r = BoundedTimelineReducerProjection.classifyChildState(rhs.state.rawValue)
+            if l != r { return l.rawValue < r.rawValue }
+            return lhs.childID < rhs.childID
+        }
+        let retainedRecovery = Array(recovery.suffix(limits.maximumRecoveryClaims))
+        let retainedUnknowns = Array(unknowns.suffix(limits.maximumUnknowns))
+        let retainedCorruption = Array(corruption.suffix(limits.maximumCorruptionRecords))
+        let retainedActive = retainedAttachments.filter(\.isAttached).count
+            + retainedChildren.filter {
+                BoundedTimelineReducerProjection.classifyChildState($0.state.rawValue) == .running
+                    || BoundedTimelineReducerProjection.classifyChildState($0.state.rawValue) == .unknown
+            }.count
+        let activeOmitted = retainedActive < activeItemCount
+        let missingSource = missingSourceEvidence(
+            attachments: retainedAttachments, history: messageHistory, visible: visibleMessages,
+            context: context, promptSources: promptSources, children: retainedChildren,
+            recovery: retainedRecovery, corruption: retainedCorruption)
+        var omissions: [BoundedReducerProjectionOmission] = []
+        BoundedTimelineReducerProjection.appendOmission(
+            &omissions, .attachments, attachmentTotal, retainedAttachments.count)
+        BoundedTimelineReducerProjection.appendOmission(
+            &omissions, .messages, messageTotal, messageHistory.count + visibleMessages.count)
+        BoundedTimelineReducerProjection.appendOmission(
+            &omissions, .context, contextTotal, context.count + promptSources.count)
+        BoundedTimelineReducerProjection.appendOmission(
+            &omissions, .children, childTotal, retainedChildren.count)
+        BoundedTimelineReducerProjection.appendOmission(
+            &omissions, .recovery, recoveryTotal, retainedRecovery.count)
+        BoundedTimelineReducerProjection.appendOmission(
+            &omissions, .unknowns, unknownTotal, retainedUnknowns.count)
+        BoundedTimelineReducerProjection.appendOmission(
+            &omissions, .corruption, corruptionTotal, retainedCorruption.count)
+        let indexes = [
+            BoundedTimelineReducerProjection.makeIndexCoverage(
+                .attachments, total: attachmentTotal, retained: retainedAttachments.count,
+                state: retainedAttachments.contains(where: { $0.sourceEvent == nil }) ? .sourceIncomplete : nil),
+            BoundedTimelineReducerProjection.makeIndexCoverage(
+                .messages, total: messageTotal,
+                retained: messageHistory.count + visibleMessages.count,
+                state: (visibleBranchIncomplete
+                    || (visibleMessages.isEmpty && semanticTip != nil)) ? .sourceIncomplete : nil),
+            BoundedTimelineReducerProjection.makeIndexCoverage(
+                .context, total: contextTotal, retained: context.count + promptSources.count,
+                state: context.contains(where: { $0.sourceProvenance == nil })
+                    || promptSources.contains(where: { $0.provenance == nil }) ? .sourceIncomplete : nil),
+            BoundedTimelineReducerProjection.makeIndexCoverage(
+                .children, total: childTotal, retained: retainedChildren.count),
+            BoundedTimelineReducerProjection.makeIndexCoverage(
+                .recovery, total: recoveryTotal, retained: retainedRecovery.count),
+            BoundedTimelineReducerProjection.makeIndexCoverage(
+                .unknowns, total: unknownTotal, retained: retainedUnknowns.count,
+                state: unknownTotal > 0 ? .sourceIncomplete : nil),
+            BoundedTimelineReducerProjection.makeIndexCoverage(
+                .corruption, total: corruptionTotal, retained: retainedCorruption.count,
+                state: corruptionTotal > 0 ? .requiresRebuild : nil),
+        ]
+        let scalarState = BoundedTimelineReducerProjection.scalarState(
+            snapshotCausalOrderValid: causalOrderValid,
+            snapshotStructuralIntegrityValid: structuralIntegrityValid,
+            snapshotSemanticProjectionValid: semanticProjectionValid,
+            corruptionCount: corruptionTotal, unknownCount: unknownTotal,
+            missingSourceEvidence: missingSource, activeItemsOmitted: activeOmitted)
+        let state = BoundedTimelineReducerProjection.overallState(scalar: scalarState, indexes: indexes)
+        let coverage = BoundedReducerProjectionCoverage(
+            state: state, scalarState: scalarState, indexCoverage: indexes, omissions: omissions,
+            unknownEventCount: unknownTotal, corruptionCount: corruptionTotal,
+            missingSourceEvidenceCount: missingSource, activeItemsOmitted: activeOmitted,
+            activeItemCount: max(activeItemCount, retainedActive),
+            retainedActiveItemCount: retainedActive, diagnostics: retainedCorruption.prefix(limits.maximumDiagnostics).map {
+                BoundedReducerProjectionDiagnostic(
+                    code: "reducer_corruption", reasonDigest: $0.reason.digest, sourceEvent: $0.event)
+            })
+        let currentRun = activeRun.map { BoundedReducerProjectionRun(run: $0, sourceEvent: currentRunEvent) }
+        let currentTurn = activeTurn.map { BoundedReducerProjectionTurn(turn: $0, sourceEvent: currentTurnEvent) }
+        let head = BoundedSessionReducerHead(
+            schemaVersion: BoundedSessionReducerHead.schemaVersion, source: source, coverage: coverage,
+            session: session, lifecycle: lifecycle, lifecycleEvent: lifecycleEvent,
+            execution: execution, attention: attention, attentionEvent: attentionEvent,
+            currentRun: currentRun, currentTurn: currentTurn,
+            modelID: modelID.map { BoundedTimelineReducerProjection.bounded(
+                $0, maxBytes: limits.maximumIdentifierBytes) }, modelEvent: modelEvent,
+            attachments: retainedAttachments, messageHistory: messageHistory,
+            visibleMessages: visibleMessages, context: Array(context.prefix(limits.maximumContextComponents)),
+            contextManifestID: contextManifestID, contextRequestID: contextRequestID,
+            contextModelID: contextModelID, contextMeasuredBytes: contextMeasuredBytes,
+            contextDeliveredBytes: contextDeliveredBytes,
+            contextCumulativeDeliveredBytes: contextCumulativeDeliveredBytes,
+            contextOmissionCount: contextOmissionCount, promptAssemblyID: promptAssemblyID,
+            promptSources: Array(promptSources.prefix(limits.maximumPromptSources)), compaction: compaction,
+            compactionEvent: compactionEvent, childStates: retainedChildren,
+            recovery: retainedRecovery, unknowns: retainedUnknowns, corruption: retainedCorruption,
+            semanticTip: semanticTip, lastEventID: source.cursor.eventID,
+            lastSequence: source.cursor.sequence, causalOrderValid: causalOrderValid,
+            structuralIntegrityValid: structuralIntegrityValid,
+            semanticProjectionValid: semanticProjectionValid)
+        try head.validate(limits: limits)
+        return head
+    }
+
+    private func scalarSnapshot() -> SessionSnapshot {
+        var result = SessionSnapshot()
+        result.session = session; result.lifecycle = lifecycle; result.execution = execution
+        result.attention = attention; result.activeRun = activeRun; result.activeTurn = activeTurn
+        result.modelID = modelID; result.semanticTip = semanticTip
+        result.lastSequence = semanticSequence
+        result.causalOrderValid = causalOrderValid
+        result.structuralIntegrityValid = structuralIntegrityValid
+        result.semanticProjectionValid = semanticProjectionValid
+        return result
+    }
+
+    private mutating func appendMessage(
+        event: TimelineEvent, source: BoundedReducerProjectionEvent
+    ) throws {
+        let role = event.type == TimelineEventType.inputAccepted
+            ? ChatRole.user.rawValue : event.payload["role"]?.stringValue ?? ChatRole.assistant.rawValue
+        guard let text = event.payload["text"]?.stringValue else { throw BoundedTimelineReducerProjectionError.invalidDigest }
+        let parent = event.conversationParent
+            ?? event.payload["conversation_parent"].flatMap { decodeTimelineValue($0) }
+        let visible = role != ChatRole.assistant.rawValue || !text.isEmpty
+        let row = BoundedMessageIndexRecord(
+            event: source, role: BoundedTimelineReducerProjection.bounded(role, maxBytes: 256),
+            text: BoundedTimelineReducerProjection.digestTextValueForRecord(text),
+            conversationParent: parent, run: event.run, turn: event.turn,
+            provenance: event.provenance, visible: visible)
+        messageHistory.append(row)
+        if messageHistory.count > limits.maximumMessages {
+            messageHistory.removeFirst(messageHistory.count - limits.maximumMessages)
+        }
+        messageTotal += 1
+        if visible {
+            visibleMessages.append(row)
+            if visibleMessages.count > limits.maximumMessages {
+                visibleMessages.removeFirst(visibleMessages.count - limits.maximumMessages)
+            }
+            messageTotal += 1
+        }
+    }
+
+    private mutating func appendAttachment(
+        event: TimelineEvent, source: BoundedReducerProjectionEvent
+    ) throws {
+        guard let attachment = event.sessionAttachment else { throw BoundedTimelineReducerProjectionError.invalidIdentity }
+        var value = attachments[attachment.attachmentID]
+        if event.type == TimelineEventType.sessionAttached {
+            guard let work = event.work else { throw BoundedTimelineReducerProjectionError.invalidIdentity }
+            value = BoundedSessionAttachmentIndexRecord(
+                attachment: attachment, work: work,
+                capabilities: event.payload["capabilities"]?.arrayValue?.compactMap(\.stringValue) ?? [],
+                isAttached: true, sourceEvent: source)
+        } else {
+            // An attachment may have been evicted from the bounded presentation index. Exact
+            // continuation still has the authoritative typed slot, so omission here is evidence
+            // of a bounded view rather than a reducer failure.
+            guard let prior = value else { return }
+            var cursor = prior.cursor
+            var capabilities = Set(prior.capabilities)
+            var attached = prior.isAttached
+            switch event.type {
+            case TimelineEventType.sessionDetached:
+                attached = false
+            case TimelineEventType.sessionAttachmentCapabilityChanged:
+                guard let values = event.payload["capabilities"]?.arrayValue?.compactMap(\.stringValue)
+                else { throw BoundedTimelineReducerProjectionError.invalidDigest }
+                capabilities = Set(values)
+            case TimelineEventType.sessionAttachmentCursorAdvanced:
+                guard let decoded: JournalCursor = event.payload["cursor"].flatMap({ decodeTimelineValue($0) })
+                else { throw BoundedTimelineReducerProjectionError.invalidDigest }
+                cursor = decoded
+            default: break
+            }
+            value = BoundedSessionAttachmentIndexRecord(
+                attachment: prior.attachment, work: prior.work, cursor: cursor,
+                capabilities: Array(capabilities), isAttached: attached, sourceEvent: source)
+        }
+        guard let value else { throw BoundedTimelineReducerProjectionError.invalidIdentity }
+        if attachments[value.attachment.attachmentID] == nil {
+            attachmentTotal += 1
+            if attachments.count >= limits.maximumAttachments {
+                if value.isAttached { activeItemCount += 1 }
+                return
+            }
+        }
+        attachments[value.attachment.attachmentID] = value
+        activeItemCount = max(activeItemCount, attachments.values.filter(\.isAttached).count)
+    }
+
+    private mutating func replaceContext(from snapshot: SessionSnapshot, runID: String?) throws {
+        context = snapshot.contextComponents.map {
+            BoundedContextIndexRecord(component: $0,
+                                      maximumIdentifierBytes: limits.maximumIdentifierBytes,
+                                      maximumTextBytes: limits.maximumTextBytes)
+        }.sorted { ($0.inclusionID, $0.componentID) < ($1.inclusionID, $1.componentID) }
+        promptSources = (snapshot.contextPromptSources ?? []).map {
+            BoundedPromptSourceIndexRecord(source: $0,
+                                           maximumIdentifierBytes: limits.maximumIdentifierBytes,
+                                           maximumTextBytes: limits.maximumTextBytes)
+        }.sorted { ($0.inclusionID, $0.sourceID) < ($1.inclusionID, $1.sourceID) }
+        contextTotal = context.count + promptSources.count
+        if let manifest = snapshot.contextManifest {
+            contextManifestID = manifest.manifestID; contextRequestID = manifest.requestID
+            contextModelID = manifest.modelID; contextMeasuredBytes = manifest.measuredBytes
+            contextDeliveredBytes = manifest.deliveredBytes
+            contextOmissionCount = manifest.omissions.count
+            // The cumulative counter is scoped by Run. Never select an arbitrary dictionary
+            // value when the event does not carry that identity; doing so would make a bounded
+            // presentation depend on map iteration order across independent Runs.
+            contextCumulativeDeliveredBytes = runID.flatMap {
+                snapshot.contextCumulativeDeliveredBytesByRun?[$0]
+            }
+        } else {
+            contextManifestID = nil; contextRequestID = nil; contextModelID = nil
+            contextMeasuredBytes = nil; contextDeliveredBytes = nil
+            contextCumulativeDeliveredBytes = nil; contextOmissionCount = 0
+        }
+        promptAssemblyID = snapshot.contextPromptAssemblyID
+    }
+
+    private mutating func appendChild(
+        event: TimelineEvent, source: BoundedReducerProjectionEvent
+    ) throws {
+        guard let id = event.payload["child_id"]?.stringValue,
+              let state = event.payload["state"]?.stringValue else {
+            throw BoundedTimelineReducerProjectionError.invalidIdentity
+        }
+        let row = BoundedChildIndexRecord(childID: id, state: state, sourceEvent: source)
+        if childStates[id] == nil {
+            childTotal += 1
+            if row.state == .running || row.state == .unknown { activeItemCount += 1 }
+            guard childStates.count < limits.maximumChildren else { return }
+        }
+        childStates[id] = row
+    }
+
+    private mutating func appendRecovery(
+        event: TimelineEvent, source: BoundedReducerProjectionEvent
+    ) throws {
+        guard let coverage = decodeRecoveryCoverage(event.payload) else {
+            throw BoundedTimelineReducerProjectionError.invalidDigest
+        }
+        recovery.append(BoundedRecoveryIndexRecord(coverage: coverage, sourceEvent: source, run: event.run))
+        recoveryTotal += 1
+        if recovery.count > limits.maximumRecoveryClaims {
+            recovery.removeFirst(recovery.count - limits.maximumRecoveryClaims)
+        }
+    }
+
+    private mutating func appendUnknown(
+        event: TimelineEvent, source: BoundedReducerProjectionEvent, snapshot: SessionSnapshot
+    ) throws {
+        guard let data = try? BoundedTimelineReducerProjection.canonicalJSON(event.payload) else {
+            throw BoundedTimelineReducerProjectionError.invalidDigest
+        }
+        let payload = BoundedReducerProjectionDigest(
+            byteCount: data.count,
+            digest: "sha256:" + AviarySHA256.hash(data: data).description)
+        unknowns.append(BoundedUnknownIndexRecord(
+            event: source, journalOffset: max(0, snapshot.lastSequence - 1), type: "unknown",
+            affectedDomains: Array(event.declaredDomains.isEmpty ? Set(TimelineDomain.allCases) : event.declaredDomains),
+            payload: payload))
+        unknownTotal += 1
+        if unknowns.count > limits.maximumUnknowns {
+            unknowns.removeFirst(unknowns.count - limits.maximumUnknowns)
+        }
+    }
+
+    private mutating func appendCorruption(
+        event: TimelineEvent, source: BoundedReducerProjectionEvent, structural: Bool
+    ) {
+        let eventEvidence = event.journal == source.reference.journal ? source : nil
+        let reason = BoundedTimelineReducerProjection.digestTextValueForRecord(
+            structural ? "structural" : "semantic")
+        corruption.append(BoundedCorruptionIndexRecord(event: eventEvidence, reason: reason))
+        corruptionTotal += 1
+        if corruption.count > limits.maximumCorruptionRecords {
+            corruption.removeFirst(corruption.count - limits.maximumCorruptionRecords)
+        }
+    }
+
+    private func missingSourceEvidence(
+        attachments: [BoundedSessionAttachmentIndexRecord],
+        history: [BoundedMessageIndexRecord], visible: [BoundedMessageIndexRecord],
+        context: [BoundedContextIndexRecord], promptSources: [BoundedPromptSourceIndexRecord],
+        children: [BoundedChildIndexRecord], recovery: [BoundedRecoveryIndexRecord],
+        corruption: [BoundedCorruptionIndexRecord]
+    ) -> Int {
+        var count = 0
+        if lifecycle != .unknown && lifecycleEvent == nil { count += 1 }
+        if activeRun != nil && currentRunEvent == nil { count += 1 }
+        if activeTurn != nil && currentTurnEvent == nil { count += 1 }
+        if modelID != nil && modelEvent == nil { count += 1 }
+        if attention != .none && attentionEvent == nil { count += 1 }
+        count += attachments.filter { $0.sourceEvent == nil }.count
+        count += history.filter { $0.event.reference.eventID.isEmpty }.count
+        count += visible.filter { $0.event.reference.eventID.isEmpty }.count
+        count += context.filter { $0.sourceProvenance == nil }.count
+        count += promptSources.filter { $0.provenance == nil }.count
+        count += children.filter { $0.sourceEvent == nil }.count
+        count += recovery.filter { $0.sourceEvent == nil }.count
+        count += corruption.filter { $0.event == nil }.count
+        return count
     }
 }

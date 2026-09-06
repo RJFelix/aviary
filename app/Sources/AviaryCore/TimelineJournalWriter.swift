@@ -100,6 +100,166 @@ public struct TimelineJournalCommit: Codable, Hashable, Sendable {
 
 }
 
+/// The bounded projection produced by a canonical writer-owned read.  This value is deliberately
+/// not a transport receipt: it is valid only for the actor call that produced it while that
+/// writer still owns its journal lock.
+public enum TimelineJournalCanonicalProjection: Hashable, Sendable {
+    case work(BoundedWorkReducerHead)
+    case session(BoundedSessionReducerHead)
+}
+
+public struct TimelineJournalCanonicalEventEvidence: Hashable, Sendable {
+    public let event: TimelineEvent
+    public let byteStart: Int
+    public let byteEnd: Int
+
+    public init(event: TimelineEvent, byteStart: Int, byteEnd: Int) {
+        self.event = event
+        self.byteStart = byteStart
+        self.byteEnd = byteEnd
+    }
+}
+
+/// File identity captured from the same descriptor as a writer-owned canonical read.  It is
+/// deliberately path-free: consumers may use it to fence a later bounded page read without
+/// leaking host-private filesystem locations into service state.
+public struct TimelineJournalCanonicalFileFingerprint: Hashable, Sendable {
+    public let device: UInt64
+    public let inode: UInt64
+    public let mode: UInt32
+    public let byteCount: Int
+    public let modificationSeconds: Int64
+    public let modificationNanoseconds: Int64
+    public let changeSeconds: Int64
+    public let changeNanoseconds: Int64
+    public let lastByte: UInt8?
+    public let prefixEvidence: String
+
+    public init(
+        device: UInt64, inode: UInt64, mode: UInt32, byteCount: Int,
+        modificationSeconds: Int64, modificationNanoseconds: Int64,
+        changeSeconds: Int64, changeNanoseconds: Int64,
+        lastByte: UInt8?, prefixEvidence: String
+    ) {
+        self.device = device
+        self.inode = inode
+        self.mode = mode
+        self.byteCount = byteCount
+        self.modificationSeconds = modificationSeconds
+        self.modificationNanoseconds = modificationNanoseconds
+        self.changeSeconds = changeSeconds
+        self.changeNanoseconds = changeNanoseconds
+        self.lastByte = lastByte
+        self.prefixEvidence = prefixEvidence
+    }
+}
+
+/// One bounded byte-addressable checkpoint from a live canonical scan.  Prefix digests use the
+/// Work service's namespaced digest-chain representation so an actor-owned nonresident journal
+/// can be paged later without fabricating a cold-reader cache identity.
+public struct TimelineJournalCanonicalRecordIndex: Hashable, Sendable {
+    public let eventID: String
+    public let sequence: Int
+    public let byteStart: Int
+    public let byteEnd: Int
+    public let previousEventID: String?
+    public let prefixDigestBefore: String
+    public let prefixDigest: String
+
+    public init(
+        eventID: String, sequence: Int, byteStart: Int, byteEnd: Int,
+        previousEventID: String?, prefixDigestBefore: String, prefixDigest: String
+    ) {
+        self.eventID = eventID
+        self.sequence = sequence
+        self.byteStart = byteStart
+        self.byteEnd = byteEnd
+        self.previousEventID = previousEventID
+        self.prefixDigestBefore = prefixDigestBefore
+        self.prefixDigest = prefixDigest
+    }
+}
+
+/// A live canonical journal observation.  The reducer head and exact snapshots are built from
+/// the same locked byte stream; no unlocked cache or projected HEAD is consulted.  `records` is
+/// retained only while it remains within the bounded resident envelope used by service reads.
+/// Large journals still return their head and terminal evidence, but never materialize an
+/// unbounded history value.
+public struct TimelineJournalCanonicalRead: Hashable, Sendable {
+    public let journal: JournalRef
+    public let source: BoundedReducerProjectionSource
+    public let projection: TimelineJournalCanonicalProjection
+    public let records: [TimelineJournalRecord]
+    /// The bounded canonical genesis prefix is retained even after the full resident record
+    /// array is dropped. Work Host registration verification needs only this immutable prefix.
+    public let prefixRecords: [TimelineJournalRecord]
+    public let fileFingerprint: TimelineJournalCanonicalFileFingerprint
+    public let sparseIndex: [TimelineJournalCanonicalRecordIndex]
+    public let pagePrefixSeed: String
+    public let pagePrefixDigest: String
+    public let terminalLineDigest: String
+    public let firstEvent: TimelineJournalCanonicalEventEvidence
+    public let penultimateEvent: TimelineJournalCanonicalEventEvidence?
+    public let lastEvent: TimelineJournalCanonicalEventEvidence
+    public let eventCount: Int
+    public let isFullyResident: Bool
+    public let workSnapshot: WorkSnapshot?
+    public let sessionSnapshot: SessionSnapshot?
+    public let latestRunStarted: RunRef?
+    public let latestRunFinished: RunRef?
+    public let latestRunFinishedEvent: TimelineEvent?
+    public let runStartedIDs: Set<String>
+    public let runFinishedIDs: Set<String>
+
+    public init(
+        journal: JournalRef,
+        source: BoundedReducerProjectionSource,
+        projection: TimelineJournalCanonicalProjection,
+        records: [TimelineJournalRecord],
+        prefixRecords: [TimelineJournalRecord],
+        fileFingerprint: TimelineJournalCanonicalFileFingerprint,
+        sparseIndex: [TimelineJournalCanonicalRecordIndex],
+        pagePrefixSeed: String,
+        pagePrefixDigest: String,
+        terminalLineDigest: String,
+        firstEvent: TimelineJournalCanonicalEventEvidence,
+        penultimateEvent: TimelineJournalCanonicalEventEvidence?,
+        lastEvent: TimelineJournalCanonicalEventEvidence,
+        eventCount: Int,
+        isFullyResident: Bool,
+        workSnapshot: WorkSnapshot?,
+        sessionSnapshot: SessionSnapshot?,
+        latestRunStarted: RunRef?,
+        latestRunFinished: RunRef?,
+        latestRunFinishedEvent: TimelineEvent?,
+        runStartedIDs: Set<String>,
+        runFinishedIDs: Set<String>
+    ) {
+        self.journal = journal
+        self.source = source
+        self.projection = projection
+        self.records = records
+        self.prefixRecords = prefixRecords
+        self.fileFingerprint = fileFingerprint
+        self.sparseIndex = sparseIndex
+        self.pagePrefixSeed = pagePrefixSeed
+        self.pagePrefixDigest = pagePrefixDigest
+        self.terminalLineDigest = terminalLineDigest
+        self.firstEvent = firstEvent
+        self.penultimateEvent = penultimateEvent
+        self.lastEvent = lastEvent
+        self.eventCount = max(0, eventCount)
+        self.isFullyResident = isFullyResident
+        self.workSnapshot = workSnapshot
+        self.sessionSnapshot = sessionSnapshot
+        self.latestRunStarted = latestRunStarted
+        self.latestRunFinished = latestRunFinished
+        self.latestRunFinishedEvent = latestRunFinishedEvent
+        self.runStartedIDs = runStartedIDs
+        self.runFinishedIDs = runFinishedIDs
+    }
+}
+
 /// One host-side writer for one Timeline v2 journal.
 ///
 /// The actor serializes callers in one process.  The advisory lock acquired during construction
@@ -466,6 +626,269 @@ public actor TimelineJournalWriter {
             throw WriterError.dataPathReplaced(path: fileURL.path)
         }
         return events
+    }
+
+    /// Build a bounded canonical projection through this writer's own actor and lock.  The
+    /// writer lock is held for the lifetime of the actor, so this read is serialized with every
+    /// append in this process and excludes every cooperating writer in another process.  The
+    /// returned source/head/snapshot tuple is one observation of the same stream and may be used
+    /// by a service without reopening the journal through an unlocked reader.
+    public func readCanonicalProjection(
+        expectedWork: WorkRef? = nil,
+        expectedWorkHost: WorkHostRef? = nil,
+        expectedSession: SessionRef? = nil,
+        limits: BoundedTimelineReducerProjectionLimits = .default,
+        maximumResidentRecords: Int = 1_000_000
+    ) throws -> TimelineJournalCanonicalRead {
+        try ensureReadable()
+        return try Self.readCanonicalProjectionLocked(
+            at: fileURL, journal: journal, actor: hostActor,
+            expectedWork: expectedWork, expectedWorkHost: expectedWorkHost,
+            expectedSession: expectedSession, limits: limits,
+            maximumResidentRecords: maximumResidentRecords)
+    }
+
+    private func ensureReadable() throws {
+        guard !isClosed, healthState == .healthy else {
+            if isClosed { throw WriterError.closed }
+            if case .failed(let reason) = healthState {
+                throw WriterError.unavailable(reason)
+            }
+            throw WriterError.unavailable("Timeline journal writer is unavailable")
+        }
+    }
+
+    private static func readCanonicalProjectionLocked(
+        at fileURL: URL,
+        journal: JournalRef,
+        actor: TimelineActor,
+        expectedWork: WorkRef?,
+        expectedWorkHost: WorkHostRef?,
+        expectedSession: SessionRef?,
+        limits: BoundedTimelineReducerProjectionLimits,
+        maximumResidentRecords: Int
+    ) throws -> TimelineJournalCanonicalRead {
+        let ownerWork: WorkRef?
+        let ownerSession: SessionRef?
+        switch journal.owner {
+        case .work(let work):
+            ownerWork = work
+            ownerSession = nil
+        case .session(let session):
+            ownerWork = nil
+            ownerSession = session
+        case .workHost:
+            throw WriterError.invalidJournal(reason: "a Work Host journal has no bounded Work/Session projection")
+        }
+        guard expectedWork == nil || expectedWork == ownerWork,
+              expectedSession == nil || expectedSession == ownerSession else {
+            throw WriterError.invalidJournal(reason: "canonical projection identity does not match journal owner")
+        }
+        if let expectedWorkHost, let ownerWork {
+            guard expectedWorkHost.workHostID == ownerWork.workHostID else {
+                throw WriterError.invalidJournal(reason: "canonical Work Host identity does not match Work owner")
+            }
+        } else if expectedWorkHost != nil {
+            throw WriterError.invalidJournal(reason: "a Session projection cannot carry a Work Host identity")
+        }
+
+        let descriptor = fileURL.path.withCString {
+            AviaryPOSIX.open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else { throw openError(fileURL, operation: "canonical projection read") }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        let before = try stableReadFingerprint(descriptor: descriptor, fileURL: fileURL)
+        var parser = TimelineJournalReaderState(
+            journal: journal, actor: actor, hostRecordedAt: Date(timeIntervalSince1970: 0))
+        var workAccumulator: BoundedWorkReducerAccumulator?
+        var sessionAccumulator: BoundedSessionReducerAccumulator?
+        switch journal.owner {
+        case .work:
+            workAccumulator = BoundedWorkReducerAccumulator(limits: limits)
+            sessionAccumulator = nil
+        case .session:
+            workAccumulator = nil
+            sessionAccumulator = BoundedSessionReducerAccumulator(limits: limits)
+        case .workHost:
+            workAccumulator = nil
+            sessionAccumulator = nil
+        }
+        var events: [TimelineJournalRecord] = []
+        var prefixRecords: [TimelineJournalRecord] = []
+        var fullyResident = true
+        let maximumResidentRecords = max(1, min(maximumResidentRecords, 1_000_000))
+        let maximumPrefixRecords = 256
+        let sparseStride = 256
+        let maximumSparseEntries = 4_000_000
+        var sparseIndex: [TimelineJournalCanonicalRecordIndex] = []
+        var eventIDs = Set<String>()
+        var eventCount = 0
+        var bytesRead = 0
+        var recordBytes = 0
+        var firstEvent: TimelineJournalCanonicalEventEvidence?
+        var penultimateEvent: TimelineJournalCanonicalEventEvidence?
+        var lastEvent: TimelineJournalCanonicalEventEvidence?
+        var prefixDigest = DisposableTimelineProjectionStore.canonicalPrefixSeed(for: journal)
+        let pagePrefixSeed = Self.pagePrefixSeed(for: journal)
+        var pagePrefixDigest = pagePrefixSeed
+        var terminalLineDigest: String?
+        var latestRunStarted: RunRef?
+        var latestRunFinished: RunRef?
+        var latestRunFinishedEvent: TimelineEvent?
+        var runStartedIDs = Set<String>()
+        var runFinishedIDs = Set<String>()
+        let chunkLimit = 64 * 1_024
+
+        func consume(_ result: TimelineJournalReadResult) throws {
+            guard result.quarantinedSuffix == nil else {
+                throw WriterError.invalidJournal(reason: "canonical projection contains malformed bytes")
+            }
+            for record in result.records {
+                let event = record.event
+                guard event.provenance == .native,
+                      event.schemaVersion == TimelineEvent.currentSchemaVersion,
+                      eventIDs.insert(event.eventID).inserted else {
+                    throw WriterError.invalidJournal(reason: "canonical projection event identity is invalid")
+                }
+                try validateEvent(event, for: journal)
+                if let ownerWork {
+                    guard event.work == nil || event.work == ownerWork,
+                          event.workHost == nil || event.workHost?.workHostID == ownerWork.workHostID else {
+                        throw WriterError.invalidJournal(reason: "canonical Work event identity is foreign")
+                    }
+                }
+                if let ownerSession {
+                    guard event.session == nil || event.session == ownerSession else {
+                        throw WriterError.invalidJournal(reason: "canonical Session event identity is foreign")
+                    }
+                }
+                let evidence = TimelineJournalCanonicalEventEvidence(
+                    event: event, byteStart: record.byteStart, byteEnd: record.byteEnd)
+                if firstEvent == nil { firstEvent = evidence }
+                penultimateEvent = lastEvent
+                lastEvent = evidence
+                eventCount += 1
+                prefixDigest = DisposableTimelineProjectionStore.advancePrefixDigest(
+                    prefixDigest,
+                    lineDigest: try DisposableTimelineProjectionStore.canonicalEventLineDigest(event))
+                let pagePrefixDigestBefore = pagePrefixDigest
+                pagePrefixDigest = try Self.advancePagePrefixDigest(
+                    pagePrefixDigestBefore, event: event)
+                terminalLineDigest = Self.namespacedDigest(record.rawLineBytes)
+                if sparseIndex.count < maximumSparseEntries,
+                   eventCount == 1 || (eventCount - 1) % sparseStride == 0 {
+                    sparseIndex.append(TimelineJournalCanonicalRecordIndex(
+                        eventID: event.eventID, sequence: event.sequence,
+                        byteStart: record.byteStart, byteEnd: record.byteEnd,
+                        previousEventID: event.previousEventID,
+                        prefixDigestBefore: pagePrefixDigestBefore,
+                        prefixDigest: pagePrefixDigest))
+                }
+                let compact = TimelineJournalRecord(
+                    event: event, rawLineBytes: Data(),
+                    byteStart: record.byteStart, byteEnd: record.byteEnd,
+                    legacyRawID: record.legacyRawID)
+                if prefixRecords.count < maximumPrefixRecords {
+                    prefixRecords.append(compact)
+                }
+                if fullyResident {
+                    if events.count < maximumResidentRecords {
+                        // Raw bytes are intentionally discarded. Consumers receive envelopes and
+                        // offsets while the canonical writer remains the byte authority.
+                        events.append(compact)
+                    } else {
+                        fullyResident = false
+                        events.removeAll(keepingCapacity: false)
+                    }
+                }
+                if event.type == TimelineEventType.runStarted, let run = event.run {
+                    latestRunStarted = run
+                    runStartedIDs.insert(run.runID)
+                }
+                if event.type == TimelineEventType.runFinished, let run = event.run {
+                    latestRunFinished = run
+                    latestRunFinishedEvent = event
+                    runFinishedIDs.insert(run.runID)
+                }
+                if workAccumulator != nil { workAccumulator!.append(event) }
+                if sessionAccumulator != nil { sessionAccumulator!.append(event) }
+            }
+        }
+
+        while let chunk = try handle.read(upToCount: chunkLimit), !chunk.isEmpty {
+            let (total, overflow) = bytesRead.addingReportingOverflow(chunk.count)
+            guard !overflow else { throw WriterError.invalidJournal(reason: "canonical byte count overflowed") }
+            bytesRead = total
+            for byte in chunk {
+                recordBytes += 1
+                guard recordBytes <= TimelineJournalWriter.maximumRecordBytes else {
+                    throw WriterError.invalidJournal(reason: "canonical event exceeds the maximum byte count")
+                }
+                if byte == UInt8(ascii: "\n") { recordBytes = 0 }
+            }
+            try consume(parser.append(chunk))
+        }
+        try consume(parser.append(Data(), final: true))
+        guard recordBytes == 0 else {
+            throw WriterError.invalidJournal(reason: "canonical projection source is empty or incomplete")
+        }
+        guard let firstEvent = firstEvent, let lastEvent = lastEvent else {
+            throw WriterError.invalidJournal(reason: "canonical projection source has no terminal event")
+        }
+        let after = try stableReadFingerprint(descriptor: descriptor, fileURL: fileURL)
+        guard before == after, bytesRead == before.size else {
+            throw WriterError.dataPathReplaced(path: fileURL.path)
+        }
+        let sourceFingerprint = try LocalTimelineProjectionSourceLease(
+            fileURL: fileURL, journal: journal).observe().source
+        guard sourceFingerprint.sourceByteCount == bytesRead else {
+            throw WriterError.dataPathReplaced(path: fileURL.path)
+        }
+        guard let terminalLineDigest else {
+            throw WriterError.invalidJournal(reason: "canonical projection has no terminal digest")
+        }
+        let fileFingerprint = try Self.canonicalFileFingerprint(
+            stable: after, descriptor: descriptor, handle: handle)
+        guard try stableReadFingerprint(descriptor: descriptor, fileURL: fileURL) == after else {
+            throw WriterError.dataPathReplaced(path: fileURL.path)
+        }
+        let cursor = JournalCursor(
+            journal: journal, eventID: lastEvent.event.eventID,
+            sequence: lastEvent.event.sequence)
+        let source = BoundedReducerProjectionSource(
+            journal: journal, cursor: cursor, sourceID: sourceFingerprint.sourceID,
+            sourceGeneration: sourceFingerprint.sourceGeneration,
+            sourceFingerprint: sourceFingerprint.fingerprint,
+            sourceByteCount: bytesRead, prefixByteCount: bytesRead,
+            prefixDigest: prefixDigest)
+        let projection: TimelineJournalCanonicalProjection
+        let workSnapshot: WorkSnapshot?
+        let sessionSnapshot: SessionSnapshot?
+        if workAccumulator != nil {
+            let head = try workAccumulator!.finalize(source: source)
+            projection = .work(head)
+            workSnapshot = workAccumulator!.snapshot
+            sessionSnapshot = nil
+        } else if sessionAccumulator != nil {
+            let head = try sessionAccumulator!.finalize(source: source)
+            projection = .session(head)
+            workSnapshot = nil
+            sessionSnapshot = sessionAccumulator!.snapshot
+        } else {
+            throw WriterError.invalidJournal(reason: "canonical projection kind is unsupported")
+        }
+        return TimelineJournalCanonicalRead(
+            journal: journal, source: source, projection: projection,
+            records: events, prefixRecords: prefixRecords,
+            fileFingerprint: fileFingerprint, sparseIndex: sparseIndex,
+            pagePrefixSeed: pagePrefixSeed, pagePrefixDigest: pagePrefixDigest,
+            terminalLineDigest: terminalLineDigest, firstEvent: firstEvent,
+            penultimateEvent: penultimateEvent, lastEvent: lastEvent,
+            eventCount: eventCount, isFullyResident: fullyResident,
+            workSnapshot: workSnapshot, sessionSnapshot: sessionSnapshot,
+            latestRunStarted: latestRunStarted, latestRunFinished: latestRunFinished,
+            latestRunFinishedEvent: latestRunFinishedEvent,
+            runStartedIDs: runStartedIDs, runFinishedIDs: runFinishedIDs)
     }
 
     public var health: WriterHealth { healthState }
@@ -1095,6 +1518,68 @@ public actor TimelineJournalWriter {
             modificationNanoseconds: modificationNanoseconds,
             changeSeconds: changeSeconds,
             changeNanoseconds: changeNanoseconds)
+    }
+
+    private static func namespacedDigest(_ data: Data) -> String {
+        "sha256:" + AviarySHA256.hash(data: data).description
+    }
+
+    private static func pagePrefixSeed(for journal: JournalRef) -> String {
+        namespacedDigest(Data("aviary-prefix-v1\u{0}seed\u{0}\(journal.stableKey)".utf8))
+    }
+
+    private static func advancePagePrefixDigest(
+        _ prefix: String, event: TimelineEvent
+    ) throws -> String {
+        let lineDigest = try DisposableTimelineProjectionStore.canonicalEventLineDigest(event)
+        var material = Data("aviary-prefix-v1\u{0}".utf8)
+        material.append(Data(prefix.utf8))
+        material.append(0)
+        material.append(Data(lineDigest.utf8))
+        return namespacedDigest(material)
+    }
+
+    private static func canonicalFileFingerprint(
+        stable: StableReadFingerprint, descriptor: Int32, handle: FileHandle
+    ) throws -> TimelineJournalCanonicalFileFingerprint {
+        func readRange(offset: Int, length: Int) throws -> Data {
+            guard offset >= 0, length >= 0 else {
+                throw WriterError.invalidJournal(reason: "canonical fingerprint range is invalid")
+            }
+            try handle.seek(toOffset: UInt64(offset))
+            let bytes = try handle.read(upToCount: length) ?? Data()
+            guard bytes.count == length else {
+                throw WriterError.invalidJournal(reason: "canonical fingerprint range is incomplete")
+            }
+            return bytes
+        }
+
+        let lastByte: UInt8?
+        if stable.size == 0 {
+            lastByte = nil
+        } else {
+            lastByte = try readRange(offset: stable.size - 1, length: 1).first
+        }
+        let sampleCount = min(4 * 1_024, stable.size)
+        let first = try readRange(offset: 0, length: sampleCount)
+        let evidence: Data
+        if stable.size <= sampleCount {
+            evidence = first
+        } else {
+            var combined = first
+            combined.append(try readRange(
+                offset: stable.size - sampleCount, length: sampleCount))
+            evidence = combined
+        }
+        _ = descriptor
+        return TimelineJournalCanonicalFileFingerprint(
+            device: stable.device, inode: stable.inode, mode: stable.mode,
+            byteCount: stable.size,
+            modificationSeconds: stable.modificationSeconds,
+            modificationNanoseconds: stable.modificationNanoseconds,
+            changeSeconds: stable.changeSeconds,
+            changeNanoseconds: stable.changeNanoseconds,
+            lastByte: lastByte, prefixEvidence: namespacedDigest(evidence))
     }
 
     private static func boundedRecordLimit(_ proposed: Int) -> Int {

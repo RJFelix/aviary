@@ -104,7 +104,9 @@ private struct LocalResolverFixture {
             commandID: "resolver-create",
             causalControlCursor: JournalCursor(
                 journal: .workHost(host), eventID: nil, sequence: 0))
-        let template = WorkLaunchWorkTemplate(binding: binding, draft: source, retentionKey: key)
+        let template = WorkLaunchWorkTemplate(
+            work: binding.work, workHost: binding.workHost,
+            draft: source, retentionKey: key)
         let bytes = try template.canonicalBytes()
         return (
             WorkLaunchWorkTemplateRecord(

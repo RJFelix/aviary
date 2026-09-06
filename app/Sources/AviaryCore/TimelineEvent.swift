@@ -954,6 +954,43 @@ public struct TimelineEvent: Codable, Hashable, Sendable {
         self.payload = payload
     }
 
+    /// Timeline envelopes participate in durable prefix digests, so every unordered value must
+    /// have one deterministic wire order. Swift's synthesized `Set` encoding does not promise
+    /// that property across separate encoder invocations or process lifetimes.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(eventID, forKey: .eventID)
+        try c.encode(journal, forKey: .journal)
+        try c.encode(sequence, forKey: .sequence)
+        try c.encodeIfPresent(hostSequence, forKey: .hostSequence)
+        try c.encodeIfPresent(idempotencyKey, forKey: .idempotencyKey)
+        try c.encodeIfPresent(command, forKey: .command)
+        try c.encodeIfPresent(previousEventID, forKey: .previousEventID)
+        try c.encodeIfPresent(causedByEventID, forKey: .causedByEventID)
+        try c.encodeIfPresent(parentActivityID, forKey: .parentActivityID)
+        try c.encodeIfPresent(conversationParent, forKey: .conversationParent)
+        try c.encodeIfPresent(session, forKey: .session)
+        try c.encodeIfPresent(work, forKey: .work)
+        try c.encodeIfPresent(workHost, forKey: .workHost)
+        try c.encodeIfPresent(client, forKey: .client)
+        try c.encodeIfPresent(sessionAttachment, forKey: .sessionAttachment)
+        try c.encodeIfPresent(clientAttachment, forKey: .clientAttachment)
+        try c.encodeIfPresent(run, forKey: .run)
+        try c.encodeIfPresent(turn, forKey: .turn)
+        try c.encodeIfPresent(action, forKey: .action)
+        try c.encodeIfPresent(handle, forKey: .handle)
+        try c.encode(actor, forKey: .actor)
+        try c.encode(hostRecordedAt, forKey: .hostRecordedAt)
+        try c.encodeIfPresent(clientTimestamp, forKey: .clientTimestamp)
+        try c.encode(schemaVersion, forKey: .schemaVersion)
+        try c.encode(payloadVersion, forKey: .payloadVersion)
+        try c.encode(type, forKey: .type)
+        try c.encode(declaredDomains.sorted { $0.rawValue < $1.rawValue }, forKey: .declaredDomains)
+        try c.encode(provenance, forKey: .provenance)
+        try c.encode(links, forKey: .links)
+        try c.encode(payload, forKey: .payload)
+    }
+
     public var isKnownType: Bool {
         Self.knownTypes.contains(type)
     }
@@ -1619,6 +1656,11 @@ public struct WorkSnapshot: Codable, Hashable, Sendable {
     public var attachedSessionIDs: Set<String> = []
     public var sessionAttachments: [String: WorkSessionAttachmentSnapshot] = [:]
     public var activeRun: RunRef?
+    /// The exact canonical Session attachment that owns ``activeRun``.  This is recorded by
+    /// ``run.started`` and is never inferred from Work creation or the first attached Session.
+    /// Both values are nil when no Run is active.
+    public var activeRunSession: SessionRef?
+    public var activeRunSessionAttachment: SessionAttachmentRef?
     /// Every Run identity admitted by a canonical `run.started` event. Current liveness remains
     /// `activeRun`; this history exists so later Session-owned recovery claims can prove which
     /// execution attempt they describe after that Run finishes.

@@ -27,7 +27,7 @@ import Glibc
 public struct DisposableTimelineProjectionStore: Sendable {
     // Adding exact-state root references changes the on-disk HEAD shape.  There is intentionally
     // no compatibility decoder for the pre-root schema; an old HEAD must be rebuilt.
-    public static let schemaVersion = 2
+    public static let schemaVersion = 3
     public static let bucketWidth = 256
 
     // MARK: Public bounds and records
@@ -601,6 +601,10 @@ public struct DisposableTimelineProjectionStore: Sendable {
         public let currentBucket: BucketDescriptor?
         public let anchors: [AnchorRecord]
         public let recentPages: [RecentEventPageDescriptor]
+        /// True when the retained pages are only a bounded suffix rather than every canonical
+        /// event after `prefixSeed`. Page bodies are optional cache material; this bit prevents
+        /// an empty or shortened page list from masquerading as a complete recent transcript.
+        public let recentEventsOmitted: Bool
         public let reducerHead: OpaquePayloadDescriptor?
         public let exactStateCheckpoint: ExactStateCheckpointDescriptor?
         public let pendingAcknowledgements: [PendingAcknowledgement]
@@ -619,6 +623,7 @@ public struct DisposableTimelineProjectionStore: Sendable {
             currentBucket: BucketDescriptor?,
             anchors: [AnchorRecord],
             recentPages: [RecentEventPageDescriptor],
+            recentEventsOmitted: Bool,
             reducerHead: OpaquePayloadDescriptor?,
             exactStateCheckpoint: ExactStateCheckpointDescriptor? = nil,
             pendingAcknowledgements: [PendingAcknowledgement] = [],
@@ -637,6 +642,7 @@ public struct DisposableTimelineProjectionStore: Sendable {
             self.currentBucket = currentBucket
             self.anchors = Array(anchors)
             self.recentPages = Array(recentPages)
+            self.recentEventsOmitted = recentEventsOmitted
             self.reducerHead = reducerHead
             self.exactStateCheckpoint = exactStateCheckpoint
             self.pendingAcknowledgements = Array(pendingAcknowledgements)
@@ -882,6 +888,14 @@ public struct DisposableTimelineProjectionStore: Sendable {
             let pageDescriptors = try commit.recentPages.map {
                 try writeRecentPageLocked($0, namespaceID: namespaceID, source: commit.source)
             }
+            let recentPagesCoverRetainedPrefix: Bool
+            if commit.cursor.sequence == commit.prefixSeed.sequence {
+                recentPagesCoverRetainedPrefix = commit.recentPages.isEmpty
+            } else {
+                recentPagesCoverRetainedPrefix =
+                    commit.recentPages.first?.sequenceStart == commit.prefixSeed.sequence + 1
+                    && commit.recentPages.last?.sequenceEnd == commit.cursor.sequence
+            }
             let reducerDescriptor: OpaquePayloadDescriptor?
             if let reducerHead = commit.reducerHead {
                 reducerDescriptor = try writeReducerHeadLocked(
@@ -905,6 +919,7 @@ public struct DisposableTimelineProjectionStore: Sendable {
                 currentBucket: currentDescriptor,
                 anchors: commit.anchors,
                 recentPages: pageDescriptors,
+                recentEventsOmitted: !recentPagesCoverRetainedPrefix,
                 reducerHead: reducerDescriptor,
                 exactStateCheckpoint: exactCheckpointDescriptor,
                 pendingAcknowledgements: commit.pendingAcknowledgements,
@@ -1750,7 +1765,8 @@ public struct DisposableTimelineProjectionStore: Sendable {
         guard pages.count <= limits.maximumRecentPages else {
             throw StoreError.invalidCommit(.oversize)
         }
-        var lastStart = 0
+        var previousPageEndSequence: Int?
+        var previousPageEndEventID: String?
         var pageIDs = Set<String>()
         var suppliedRows: [Int: BucketRow] = [:]
         for bucket in suppliedBuckets {
@@ -1762,15 +1778,21 @@ public struct DisposableTimelineProjectionStore: Sendable {
                   !page.events.isEmpty,
                   page.events.count <= Self.bucketWidth,
                   page.events.first?.sequence ?? 0 > (old?.prefixSeed.sequence ?? 0),
-                  page.events.last?.sequence ?? 0 <= cursor.sequence,
-                  page.events.first?.sequence ?? 0 >= lastStart else {
+                  page.events.last?.sequence ?? 0 <= cursor.sequence else {
                 throw StoreError.invalidCommit(.invalidPage)
+            }
+            if let previousPageEndSequence {
+                guard previousPageEndSequence < Int.max,
+                      page.events.first!.sequence == previousPageEndSequence + 1,
+                      page.events.first!.previousEventID == previousPageEndEventID else {
+                    throw StoreError.invalidCommit(.chainMismatch)
+                }
             }
             guard page.events.count <= limits.maximumRecentPageEvents else {
                 throw StoreError.invalidCommit(.oversize)
             }
             var expected = page.events.first!.sequence
-            var previous: String?
+            var previous = previousPageEndEventID
             for event in page.events {
                 let row: BucketRow?
                 if let supplied = suppliedRows[event.sequence] {
@@ -1803,7 +1825,7 @@ public struct DisposableTimelineProjectionStore: Sendable {
                 guard event.journal == journal,
                       event.sequence == expected,
                       validIdentity(event.eventID),
-                      event.previousEventID == previous || previous == nil,
+                      previous == nil || event.previousEventID == previous,
                       let row,
                       row.eventID == event.eventID,
                       row.previousEventID == event.previousEventID,
@@ -1811,9 +1833,13 @@ public struct DisposableTimelineProjectionStore: Sendable {
                     throw StoreError.invalidCommit(.chainMismatch)
                 }
                 previous = event.eventID
+                guard expected < Int.max else {
+                    throw StoreError.invalidCommit(.chainMismatch)
+                }
                 expected += 1
             }
-            lastStart = page.events.first!.sequence
+            previousPageEndSequence = page.events.last!.sequence
+            previousPageEndEventID = page.events.last!.eventID
             let encoded = try Self.canonicalJSON(page)
             guard encoded.count <= limits.maximumRecentPageBytes,
                   encoded.count <= limits.maximumObjectBytes else {
@@ -1858,8 +1884,10 @@ public struct DisposableTimelineProjectionStore: Sendable {
             previousEventID = row.eventID
             previousEnd = row.byteEnd
             previousPrefixDigest = row.prefixDigestAfter
+            guard expected < Int.max else {
+                throw StoreError.invalidCommit(.invalidBucket)
+            }
             expected += 1
-            guard expected > 0 else { throw StoreError.invalidCommit(.invalidBucket) }
         }
         guard let last = bucket.rows.last,
               last.sequence < Int.max,
@@ -2149,6 +2177,7 @@ public struct DisposableTimelineProjectionStore: Sendable {
             }
         }
         var pageIDs = Set<String>()
+        var previousPageEnd: Int?
         for page in snapshot.recentPages {
             guard validIdentity(page.pageID), pageIDs.insert(page.pageID).inserted,
                   page.sequenceStart > 0, page.sequenceEnd >= page.sequenceStart,
@@ -2158,6 +2187,24 @@ public struct DisposableTimelineProjectionStore: Sendable {
                   page.byteCount > 0, page.byteCount <= limits.maximumRecentPageBytes else {
                 throw StoreError.cacheUnavailable(.malformedHead)
             }
+            if let previousPageEnd {
+                guard previousPageEnd < Int.max,
+                      page.sequenceStart == previousPageEnd + 1 else {
+                    throw StoreError.cacheUnavailable(.malformedHead)
+                }
+            }
+            previousPageEnd = page.sequenceEnd
+        }
+        let recentPagesCoverRetainedPrefix: Bool
+        if snapshot.cursor.sequence == snapshot.prefixSeed.sequence {
+            recentPagesCoverRetainedPrefix = snapshot.recentPages.isEmpty
+        } else {
+            recentPagesCoverRetainedPrefix =
+                snapshot.recentPages.first?.sequenceStart == snapshot.prefixSeed.sequence + 1
+                && snapshot.recentPages.last?.sequenceEnd == snapshot.cursor.sequence
+        }
+        guard snapshot.recentEventsOmitted == !recentPagesCoverRetainedPrefix else {
+            throw StoreError.cacheUnavailable(.malformedHead)
         }
         if let reducer = snapshot.reducerHead {
             guard validMediaType(reducer.mediaType), reducer.schemaVersion > 0,

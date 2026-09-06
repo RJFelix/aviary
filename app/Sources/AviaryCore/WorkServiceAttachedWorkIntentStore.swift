@@ -5,6 +5,14 @@ import Darwin
 import Glibc
 #endif
 
+private struct WorkServiceIntentRecordCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int? = nil
+
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { self.stringValue = String(intValue) }
+}
+
 /// Host-private persistence for the one command whose outcome a GUI has not yet reconciled.
 ///
 /// The exact request is retained before transport dispatch so closing or crashing the GUI does
@@ -16,13 +24,17 @@ public struct WorkServiceAttachedWorkIntentStore: Sendable, Hashable {
     public static let maximumRecordBytes = 64 * 1_024
 
     struct Record: Codable, Hashable, Sendable {
-        static let currentSchemaVersion = 2
+        static let currentSchemaVersion = 3
 
         let schemaVersion: Int
         let request: WorkServiceCommandRequest
         let state: WorkServiceAttachedWorkPendingState
         let expectedResultingWorkCursor: JournalCursor?
         let expectedHostSequence: Int?
+
+        private enum CodingKeys: String, CodingKey, CaseIterable {
+            case schemaVersion, request, state, expectedResultingWorkCursor, expectedHostSequence
+        }
 
         init(request: WorkServiceCommandRequest, state: WorkServiceAttachedWorkPendingState,
              expectedResultingWorkCursor: JournalCursor? = nil,
@@ -33,27 +45,56 @@ public struct WorkServiceAttachedWorkIntentStore: Sendable, Hashable {
             self.expectedResultingWorkCursor = expectedResultingWorkCursor
             self.expectedHostSequence = expectedHostSequence
         }
+
+        init(from decoder: Decoder) throws {
+            let dynamic = try decoder.container(keyedBy: WorkServiceIntentRecordCodingKey.self)
+            let allowed = Set(CodingKeys.allCases.map(\.rawValue))
+            guard Set(dynamic.allKeys.map(\.stringValue)).subtracting(allowed).isEmpty else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "unknown WorkService intent record field"))
+            }
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+            self.request = try container.decode(WorkServiceCommandRequest.self, forKey: .request)
+            self.state = try container.decode(
+                WorkServiceAttachedWorkPendingState.self, forKey: .state)
+            self.expectedResultingWorkCursor = try container.decodeIfPresent(
+                JournalCursor.self, forKey: .expectedResultingWorkCursor)
+            self.expectedHostSequence = try container.decodeIfPresent(
+                Int.self, forKey: .expectedHostSequence)
+        }
     }
 
     public let url: URL
+    public let serviceAttachmentKey: ServiceAttachmentKey?
+    public var checkpointURL: URL {
+        url.deletingPathExtension().appendingPathExtension("checkpoint.json")
+    }
 
-    public init(url: URL) throws {
+    /// Test-only arbitrary storage injection. Production callers must use the keyed initializer.
+    init(url: URL) throws {
         guard url.isFileURL, !url.path.isEmpty,
               !url.path.unicodeScalars.contains(where: { $0.value == 0 }) else {
             throw WorkServiceAttachedWorkControllerError.invalidOptions
         }
         self.url = url
+        self.serviceAttachmentKey = nil
     }
 
-    /// Stable per-client/per-Work location under Aviary-owned state. Opaque digests keep remote
-    /// host/work labels out of local path names while the record itself remains exact and private.
-    public init(home: AgentHome, client: ClientRef, work: WorkRef) throws {
-        let identity = Data((client.clientID + "\u{0}" + work.workHostID + "\u{0}" + work.workID).utf8)
+    /// Stable per-client/per-attachment location under Aviary-owned state. Opaque digests keep
+    /// remote host/session labels out of local path names while the record remains exact/private.
+    public init(home: AgentHome, key: ServiceAttachmentKey) throws {
+        guard key.isValid else {
+            throw WorkServiceAttachedWorkControllerError.invalidOptions
+        }
+        let identity = try Self.identityData(key)
         let digest = AviarySHA256.hash(data: identity).map { String(format: "%02x", $0) }.joined()
-        try self.init(url: home.root
+        self.url = home.root
             .appending(path: "work-service-clients", directoryHint: .isDirectory)
             .appending(path: "pending-intents", directoryHint: .isDirectory)
-            .appending(path: digest + ".json", directoryHint: .notDirectory))
+            .appending(path: digest + ".json", directoryHint: .notDirectory)
+        self.serviceAttachmentKey = key
     }
 
     func load() throws -> Record? {
@@ -65,6 +106,9 @@ public struct WorkServiceAttachedWorkIntentStore: Sendable, Hashable {
                 state: WorkServiceAttachedWorkPendingState,
                 expectedResultingWorkCursor: JournalCursor? = nil,
                 expectedHostSequence: Int? = nil) throws {
+        guard Self.matches(request, key: serviceAttachmentKey) else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
         try prepareDirectory()
         try withLock {
             if let existing = try readLocked(), existing.request != request {
@@ -133,10 +177,32 @@ public struct WorkServiceAttachedWorkIntentStore: Sendable, Hashable {
               (record.request.value?.utf8.count ?? 0) <= WorkServiceBounds.maxCommandValueCharacters,
               record.request.command.client != nil,
               record.request.command.causalCursor == record.request.causalWorkCursor,
+              Self.matches(record.request, key: serviceAttachmentKey),
               Self.validEvidenceShape(record) else {
             throw WorkServiceAttachedWorkControllerError.sourceIncomplete
         }
         return record
+    }
+
+    private static func matches(
+        _ request: WorkServiceCommandRequest, key: ServiceAttachmentKey?
+    ) -> Bool {
+        guard let key else { return true }
+        guard key.isValid else { return false }
+        return request.work == key.workSession.work
+            && request.journal.owner == .work(key.workSession.work)
+            && request.journal.authority.authorityID == key.workSession.work.workHostID
+            && request.causalWorkCursor.journal == request.journal
+            && request.attachment == key.clientAttachment
+            && request.command.client == key.client
+            && request.command.sessionAttachment == key.workSession.sessionAttachment
+    }
+
+    private static func identityData(_ key: ServiceAttachmentKey) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        do { return try encoder.encode(key) }
+        catch { throw WorkServiceAttachedWorkControllerError.invalidOptions }
     }
 
     private static func validEvidenceShape(_ record: Record) -> Bool {

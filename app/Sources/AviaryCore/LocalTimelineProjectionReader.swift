@@ -12,7 +12,8 @@ import Foundation
 /// chunks, retain only the current line plus bounded index/page data, and publish one store
 /// generation after the source and typed reducer replay have both succeeded. Work growth performs
 /// one bounded zero-based index pass plus a separately metered exact-state suffix pass from a
-/// persisted proof; Session growth retains its two truthful zero-based passes.
+/// persisted proof; Session growth uses the same split while carrying its bounded presentation
+/// head forward from the exact-state checkpoint.
 public struct LocalTimelineProjectionReader: Sendable {
     public enum JournalKind: String, Codable, Hashable, Sendable {
         case work
@@ -28,9 +29,9 @@ public struct LocalTimelineProjectionReader: Sendable {
         public let maximumIndexedRows: Int
         public let maximumRecentPageEvents: Int
         public let maximumRecentEventBytes: Int
-        /// Until exact disk-backed continuation state is integrated, a rebuild uses the ordinary
-        /// in-memory reducer. This explicit source bound keeps that bootstrap path finite rather
-        /// than pretending count limits alone are a practical memory budget.
+        /// Cold bootstrap is source-bounded while the disposable index and exact map are
+        /// established. Session continuation carries exact scalar state and bounded presentation
+        /// rows instead of materializing historical reducer state.
         public let maximumBootstrapSourceBytes: Int
 
         public init(
@@ -114,9 +115,10 @@ public struct LocalTimelineProjectionReader: Sendable {
         }
     }
 
-    /// Index and reducer-replay costs are intentionally separate. Work growth reports the bounded
-    /// suffix read used by its persisted exact reducer state; the bounded index still rebuilds
-    /// from zero. Session growth remains zero-based and reports no suffix-only work.
+    /// Index and reducer-replay costs are intentionally separate. Growth reports exact semantic
+    /// reducer/presentation work from the bounded suffix; Session also reports the bounded source
+    /// lease bytes used to authenticate its cached prefix boundary. Cache material is carried
+    /// forward without replaying the historical source.
     public struct Metrics: Codable, Hashable, Sendable {
         public let cacheHit: Bool
         public let rebuiltIndex: Bool
@@ -124,18 +126,20 @@ public struct LocalTimelineProjectionReader: Sendable {
         public let readCalls: Int
         public let bytesRead: Int
         public let suffixBytesRead: Int
+        /// Bytes read by the source lease to authenticate the cached prefix boundary. This is
+        /// separate from suffix decoding/reduction and is bounded by the lease limits.
+        public let prefixAuthenticationBytesRead: Int
         public let reducerReplayBytesRead: Int
         public let peakBufferedBytes: Int
-        /// Bytes inspected while framing newline-delimited events during the index pass. Each
-        /// source byte is examined at most once, so this remains linear even for a long line that
-        /// spans many chunks.
+        /// Bytes inspected while framing newline-delimited events for the current build pass.
+        /// Cold/Work growth may include the source prefix; Session growth frames only its suffix.
         public let newlineBytesExamined: Int
         public let peakRecentEventBytes: Int
         public let decodedEventCount: Int
         public let indexedRowCount: Int
         public let sealedBucketCount: Int
         public let recentPageCount: Int
-        /// Exact Work cache validation authenticates the root and scalar continuation only.
+        /// Exact cache validation authenticates the root and scalar continuation only.
         /// Full typed-value availability is audited during publication or an explicit repair
         /// operation, while a bounded lookup authenticates any records needed for growth.
         public let exactStateValidationNodesVisited: Int
@@ -149,6 +153,7 @@ public struct LocalTimelineProjectionReader: Sendable {
             readCalls: Int = 0,
             bytesRead: Int = 0,
             suffixBytesRead: Int = 0,
+            prefixAuthenticationBytesRead: Int = 0,
             reducerReplayBytesRead: Int = 0,
             peakBufferedBytes: Int = 0,
             newlineBytesExamined: Int = 0,
@@ -167,6 +172,7 @@ public struct LocalTimelineProjectionReader: Sendable {
             self.readCalls = max(0, readCalls)
             self.bytesRead = max(0, bytesRead)
             self.suffixBytesRead = max(0, suffixBytesRead)
+            self.prefixAuthenticationBytesRead = max(0, prefixAuthenticationBytesRead)
             self.reducerReplayBytesRead = max(0, reducerReplayBytesRead)
             self.peakBufferedBytes = max(0, peakBufferedBytes)
             self.newlineBytesExamined = max(0, newlineBytesExamined)
@@ -264,12 +270,12 @@ public struct LocalTimelineProjectionReader: Sendable {
     }
 
     /// Read the current source. A missing HEAD performs a cold rebuild. A validated HEAD with
-    /// an append-only suffix performs a bounded, zero-based index rebuild followed by an exact
-    /// streaming reducer replay. A no-op cache hit performs only HEAD/terminal validation.
+    /// an append-only suffix continues its bounded index from the cached boundary and performs
+    /// exact streaming reducer work. A no-op cache hit performs only HEAD/terminal validation.
     ///
-    /// The zero-based index rebuild is intentional: the bounded reducer head remains only a query
-    /// projection. Work may additionally continue its semantic reducer from a persisted exact
-    /// checkpoint whose source boundary was proven above; Session has no such continuation path.
+    /// The bounded reducer head remains only a query projection. Cold reads establish the index
+    /// from zero; Work growth still rebuilds that bounded index from zero, while Session growth
+    /// carries its current bucket/recent pages forward and decodes only the proven suffix.
     public func read() throws -> Result {
         try TimelineJournalWriter.withAdvisoryOwnerLock(
             home: home, journal: journal, dataURL: fileURL
@@ -333,28 +339,44 @@ public struct LocalTimelineProjectionReader: Sendable {
                 throw ReaderError.sourceChanged
             }
             var exactValidation: PersistentProjectionRadixMap.Metrics?
-            if kind == .work {
-                if cached.snapshot.cursor.sequence > 0 {
-                    // A bounded reducer head is not sufficient evidence for Work. Validate the
-                    // content-addressed exact root even on a no-op cache hit; otherwise a corrupt
-                    // map could look healthy until the next append.
+            // A Work exact-state schema bump intentionally invalidates only the old typed
+            // continuation; the canonical journal remains authoritative and can rebuild it.
+            // Keep malformed current-version roots fail-closed below rather than treating every
+            // validation error as a migration.
+            if kind == .work, try isLegacyWorkExactCheckpoint(cached.snapshot) {
+                return try coldRebuild(
+                    validationMetrics: validationMetrics,
+                    expectedGeneration: cached.snapshot.generation,
+                    exactNamespaceID: cached.snapshot.namespaceID)
+            }
+            if cached.snapshot.cursor.sequence > 0 {
+                // A bounded reducer head is not sufficient evidence for either journal. Validate
+                // the content-addressed exact root even on a no-op cache hit; otherwise a corrupt
+                // map could look healthy until the next append.
+                switch kind {
+                case .work:
                     let loaded = try loadWorkExactState(
                         from: cached.snapshot, source: cached.snapshot.source)
                     exactValidation = loaded.validationMetrics
-                } else {
-                    // No canonical event means there is no semantic reducer state to persist.
-                    // This is the sole rootless Work exception; it must not be generalized to a
-                    // nonempty cache whose membership could have been omitted.
-                    guard cached.snapshot.exactStateCheckpoint == nil else {
-                        throw ReaderError.invalidCachedProjection
-                    }
+                case .session:
+                    let loaded = try loadSessionExactState(
+                        from: cached.snapshot, source: cached.snapshot.source)
+                    exactValidation = loaded.validationMetrics
+                }
+            } else {
+                // No canonical event means there is no semantic reducer state to persist.
+                // This is the sole rootless exception; it must not be generalized to a nonempty
+                // cache whose membership could have been omitted.
+                guard cached.snapshot.exactStateCheckpoint == nil else {
+                    throw ReaderError.invalidCachedProjection
                 }
             }
             let head = try decodeReducerHead(from: cached.snapshot)
             let metrics = Metrics(
                 cacheHit: true, rebuiltIndex: false, reducerReplayedFromZero: false,
                 readCalls: validationMetrics.readCalls, bytesRead: validationMetrics.bytesRead,
-                suffixBytesRead: 0, reducerReplayBytesRead: 0,
+                suffixBytesRead: 0, prefixAuthenticationBytesRead: validationMetrics.bytesRead,
+                reducerReplayBytesRead: 0,
                 peakBufferedBytes: validationMetrics.peakReadBytes,
                 newlineBytesExamined: 0,
                 peakRecentEventBytes: 0,
@@ -379,7 +401,9 @@ public struct LocalTimelineProjectionReader: Sendable {
     // MARK: Cold and growth operations
 
     private func coldRebuild(
-        validationMetrics: LocalTimelineProjectionSourceLease.Metrics
+        validationMetrics: LocalTimelineProjectionSourceLease.Metrics,
+        expectedGeneration: Int? = nil,
+        exactNamespaceID: String? = nil
     ) throws -> Result {
         let before = try observeSource()
         guard before.source.sourceByteCount >= 0 else { throw ReaderError.sourceChanged }
@@ -392,14 +416,24 @@ public struct LocalTimelineProjectionReader: Sendable {
         var index = IndexAccumulator(
             limits: limits, storeLimits: store.limits)
         var workAccumulator = BoundedWorkReducerAccumulator(limits: reducerLimits)
+        var sessionPresentation = BoundedSessionExactHeadAccumulator(limits: reducerLimits)
         var workMap: PersistentProjectionRadixMap?
         var workExactState: PersistentWorkExactState?
+        var sessionMap: PersistentProjectionRadixMap?
+        var sessionExactState: PersistentSessionExactState?
         if kind == .work {
             let prepared = try makeWorkExactState(
                 source: before.source,
-                namespaceID: defaultWorkExactNamespaceID(source: before.source))
+                namespaceID: exactNamespaceID
+                    ?? defaultWorkExactNamespaceID(source: before.source))
             workMap = prepared.map
             workExactState = prepared.state
+        } else {
+            let prepared = try makeSessionExactState(
+                source: before.source,
+                namespaceID: defaultSessionExactNamespaceID(source: before.source))
+            sessionMap = prepared.map
+            sessionExactState = prepared.state
         }
         let firstPass = try stream(
             startByte: 0, targetByteCount: before.source.sourceByteCount,
@@ -418,6 +452,17 @@ public struct LocalTimelineProjectionReader: Sendable {
                     throw mapExactStateError(error)
                 }
                 workExactState = exact
+            } else {
+                guard var exact = sessionExactState else {
+                    throw ReaderError.exactStateUnavailable
+                }
+                do {
+                    let result = try exact.apply(event)
+                    try sessionPresentation.append(event: event, result: result)
+                } catch {
+                    throw mapExactStateError(error)
+                }
+                sessionExactState = exact
             }
         }
         let afterIndex = try fencedSource(after: before)
@@ -457,10 +502,21 @@ public struct LocalTimelineProjectionReader: Sendable {
                     state: state, map: map, source: finalSource, cursor: cursor)
             }
         case .session:
-            head = try replayReducer(
-                targetByteCount: before.source.sourceByteCount,
-                source: projectionSource, initialPrefixSeed: prefixSeed)
-            exactCheckpoint = nil
+            do {
+                let bounded = try sessionPresentation.finalize(source: projectionSource)
+                head = ReplayResult(
+                    head: .session(bounded), opaque: try bounded.opaqueReducerHead(),
+                    replayBytes: firstPass.bytesRead)
+            } catch {
+                throw ReaderError.projectionFailed
+            }
+            if firstPass.eventCount > 0 {
+                guard let state = sessionExactState, let map = sessionMap else {
+                    throw ReaderError.exactStateUnavailable
+                }
+                exactCheckpoint = try makeSessionExactCheckpoint(
+                    state: state, map: map, source: finalSource, cursor: cursor)
+            }
         }
         let afterReplay = try fencedSource(after: afterIndex)
         guard afterReplay.source.sourceByteCount == before.source.sourceByteCount else {
@@ -468,10 +524,11 @@ public struct LocalTimelineProjectionReader: Sendable {
         }
         let commit = try index.makeCommit(
             source: finalSource, cursor: cursor, prefixSeed: prefixSeed,
-            reducerHead: head.opaque, expectedGeneration: nil,
+            reducerHead: head.opaque, expectedGeneration: expectedGeneration,
             recentPages: index.recentPages,
             exactStateCheckpoint: exactCheckpoint)
-        let snapshot = try commitStore(commit, exactStateMap: workMap)
+        let snapshot = try commitStore(
+            commit, exactStateMap: kind == .work ? workMap : sessionMap)
         let metrics = index.metrics(
             cacheHit: false, rebuiltIndex: true, reducerReplayedFromZero: true,
             replayBytes: head.replayBytes)
@@ -480,14 +537,13 @@ public struct LocalTimelineProjectionReader: Sendable {
             metrics: metrics, didRebuild: true, appendedEventCount: firstPass.eventCount)
     }
 
-    /// Rebuild the complete bounded index and typed query head when the source grew.
+    /// Rebuild the bounded index and typed query head when the source grew.
     ///
-    /// The bounded index intentionally reads from byte zero. The source lease's cooperating-owner
-    /// lock mode proves the append-only producer contract while this operation runs under the
-    /// canonical Timeline lock. For Work, the exact reducer overlay separately starts at a stored
-    /// boundary only after its source identity and cursor proof succeeds; Session remains full
-    /// replay. The commit only supplies the changed current/new buckets so immutable sealed cache
-    /// history remains reusable.
+    /// Work's bounded index intentionally reads from byte zero. Session uses the same owner-lock
+    /// and lease proof but carries its disposable current bucket/recent pages from the cached
+    /// boundary; its exact reducer and presentation lane decode only the append-only suffix. The
+    /// commit only supplies changed current/new buckets so immutable sealed cache history remains
+    /// reusable.
     private func rebuildAfterGrowth(
         cached: DisposableTimelineProjectionStore.Snapshot,
         observed: DisposableTimelineProjectionStore.SourceFingerprint,
@@ -511,8 +567,14 @@ public struct LocalTimelineProjectionReader: Sendable {
             // proof for rebuilding from it. Leave the old cache untouched.
             throw ReaderError.invalidCachedProjection
         }
-        // The bounded Work head is rebuilt from byte zero, but Work's exact reducer continuation
-        // can advance from the proven cached boundary. Session intentionally remains full replay.
+        if kind == .session {
+            return try rebuildSessionAfterGrowth(
+                cached: cached, observed: observed, before: before,
+                validationMetrics: validationMetrics)
+        }
+        guard kind == .work else { throw ReaderError.unsupportedJournal }
+        // The bounded Work index is rebuilt from byte zero, while its exact reducer state advances
+        // from the proven cached boundary.
         var workAccumulator = BoundedWorkReducerAccumulator(limits: reducerLimits)
         var workMap: PersistentProjectionRadixMap?
         var workExactState: PersistentWorkExactState?
@@ -521,8 +583,19 @@ public struct LocalTimelineProjectionReader: Sendable {
         let suffixStartSequence: Int
         let suffixPreviousEventID: String?
         let suffixPrefixDigest: String
-        if kind == .work {
-            if cached.exactStateCheckpoint != nil {
+        if cached.exactStateCheckpoint != nil {
+            if try isLegacyWorkExactCheckpoint(cached) {
+                let prepared = try makeWorkExactState(
+                    source: before.source,
+                    namespaceID: cached.namespaceID)
+                workMap = prepared.map
+                workExactState = prepared.state
+                suffixStartByte = 0
+                suffixStartSequence = 1
+                suffixPreviousEventID = nil
+                suffixPrefixDigest = DisposableTimelineProjectionStore.canonicalPrefixSeed(
+                    for: journal)
+            } else {
                 let loaded = try loadWorkExactState(from: cached, source: cached.source)
                 workMap = loaded.map
                 workExactState = loaded.state
@@ -537,27 +610,19 @@ public struct LocalTimelineProjectionReader: Sendable {
                 suffixStartSequence = cached.cursor.sequence + 1
                 suffixPreviousEventID = cached.cursor.eventID
                 suffixPrefixDigest = cached.source.prefixDigest
-            } else {
-                // Only an empty Work cache may be upgraded without a persisted exact root. A
-                // nonempty rootless cache would require guessing at omitted reducer membership.
-                guard cached.cursor.sequence == 0,
-                      cached.cursor.eventID == nil,
-                      cached.source.prefixByteCount == 0 else {
-                    throw ReaderError.invalidCachedProjection
-                }
-                let prepared = try makeWorkExactState(
-                    source: before.source, namespaceID: cached.namespaceID)
-                workMap = prepared.map
-                workExactState = prepared.state
-                suffixStartByte = 0
-                suffixStartSequence = 1
-                suffixPreviousEventID = nil
-                suffixPrefixDigest = DisposableTimelineProjectionStore.canonicalPrefixSeed(
-                    for: journal)
             }
         } else {
-            workMap = nil
-            workExactState = nil
+            // Only an empty Work cache may be upgraded without a persisted exact root. A
+            // nonempty rootless cache would require guessing at omitted reducer membership.
+            guard cached.cursor.sequence == 0,
+                  cached.cursor.eventID == nil,
+                  cached.source.prefixByteCount == 0 else {
+                throw ReaderError.invalidCachedProjection
+            }
+            let prepared = try makeWorkExactState(
+                source: before.source, namespaceID: cached.namespaceID)
+            workMap = prepared.map
+            workExactState = prepared.state
             suffixStartByte = 0
             suffixStartSequence = 1
             suffixPreviousEventID = nil
@@ -581,9 +646,7 @@ public struct LocalTimelineProjectionReader: Sendable {
                 cachedBoundaryMatched = true
             }
             try index.consume(event: event, row: row)
-            if kind == .work {
-                workAccumulator.append(event)
-            }
+            workAccumulator.append(event)
         }
         let afterIndex = try fencedSource(after: before)
         guard cachedBoundaryMatched,
@@ -599,58 +662,48 @@ public struct LocalTimelineProjectionReader: Sendable {
             journal: journal, eventID: full.lastEventID, sequence: full.lastSequence)
         let projectionSource = BoundedReducerProjectionSource(
             source: finalSource, cursor: cursor)
-        var suffix: StreamResult?
-        if kind == .work {
-            guard suffixStartByte <= observed.sourceByteCount,
-                  suffixStartSequence > 0, suffixStartSequence < Int.max,
-                  var exact = workExactState else {
-                throw ReaderError.invalidCachedProjection
-            }
-            let continuation = try stream(
-                startByte: suffixStartByte,
-                targetByteCount: observed.sourceByteCount,
-                startSequence: suffixStartSequence,
-                startPreviousEventID: suffixPreviousEventID,
-                startPrefixDigest: suffixPrefixDigest
-            ) { event, _ in
-                do {
-                    _ = try exact.apply(event)
-                } catch {
-                    throw mapExactStateError(error)
-                }
-            }
-            guard continuation.nextByteOffset == observed.sourceByteCount,
-                  continuation.nextPrefixDigest == full.nextPrefixDigest,
-                  continuation.lastEventID == full.lastEventID,
-                  continuation.lastSequence == full.lastSequence else {
-                throw ReaderError.sourceChanged
-            }
-            suffix = continuation
-            workExactState = exact
+        guard suffixStartByte <= observed.sourceByteCount,
+              suffixStartSequence > 0, suffixStartSequence < Int.max,
+              var exact = workExactState else {
+            throw ReaderError.invalidCachedProjection
         }
-        let head: ReplayResult
-        var exactCheckpoint: DisposableTimelineProjectionStore.ExactStateCheckpoint?
-        switch kind {
-        case .work:
+        let suffix = try stream(
+            startByte: suffixStartByte,
+            targetByteCount: observed.sourceByteCount,
+            startSequence: suffixStartSequence,
+            startPreviousEventID: suffixPreviousEventID,
+            startPrefixDigest: suffixPrefixDigest
+        ) { event, _ in
             do {
-                let bounded = try workAccumulator.finalize(source: projectionSource)
-                head = ReplayResult(
-                    head: .work(bounded), opaque: try bounded.opaqueReducerHead(),
-                    replayBytes: full.bytesRead)
+                _ = try exact.apply(event)
             } catch {
-                throw ReaderError.projectionFailed
+                throw mapExactStateError(error)
             }
-            guard let state = workExactState, let map = workMap else {
-                throw ReaderError.exactStateUnavailable
-            }
-            if full.eventCount > 0 {
-                exactCheckpoint = try makeWorkExactCheckpoint(
-                    state: state, map: map, source: finalSource, cursor: cursor)
-            }
-        case .session:
-            head = try replayReducer(
-                targetByteCount: observed.sourceByteCount,
-                source: projectionSource, initialPrefixSeed: prefixSeed)
+        }
+        guard suffix.nextByteOffset == observed.sourceByteCount,
+              suffix.nextPrefixDigest == full.nextPrefixDigest,
+              suffix.lastEventID == full.lastEventID,
+              suffix.lastSequence == full.lastSequence else {
+            throw ReaderError.sourceChanged
+        }
+        workExactState = exact
+        let bounded: BoundedWorkReducerHead
+        do {
+            bounded = try workAccumulator.finalize(source: projectionSource)
+        } catch {
+            throw ReaderError.projectionFailed
+        }
+        let head = ReplayResult(
+            head: .work(bounded), opaque: try bounded.opaqueReducerHead(),
+            replayBytes: suffix.bytesRead)
+        guard let state = workExactState, let map = workMap else {
+            throw ReaderError.exactStateUnavailable
+        }
+        let exactCheckpoint: DisposableTimelineProjectionStore.ExactStateCheckpoint?
+        if full.eventCount > 0 {
+            exactCheckpoint = try makeWorkExactCheckpoint(
+                state: state, map: map, source: finalSource, cursor: cursor)
+        } else {
             exactCheckpoint = nil
         }
         let afterReplay = try fencedSource(after: afterIndex)
@@ -672,68 +725,125 @@ public struct LocalTimelineProjectionReader: Sendable {
             oldSealedThroughSequence: cached.sealedThroughSequence,
             recentPages: index.recentPages,
             exactStateCheckpoint: exactCheckpoint)
-        let snapshot = try commitStore(commit, exactStateMap: workMap)
+        let snapshot = try commitStore(commit, exactStateMap: map)
         index.metrics = StreamMetrics(validationMetrics)
         index.metrics.merge(full.metrics)
-        if let suffix {
-            index.metrics.merge(suffix.metrics)
-        }
+        index.metrics.merge(suffix.metrics)
         let metrics = index.metrics(
             cacheHit: false, rebuiltIndex: true, reducerReplayedFromZero: true,
             replayBytes: head.replayBytes,
-            suffixBytes: suffix?.bytesRead ?? 0,
+            suffixBytes: suffix.bytesRead,
+            prefixAuthenticationBytes: validationMetrics.bytesRead,
             exactValidation: exactValidation)
         return Result(
             snapshot: snapshot, source: snapshot.source, reducerHead: head.head,
-            metrics: metrics, didRebuild: true,
-            appendedEventCount: suffix?.eventCount
-                ?? max(0, full.eventCount - cached.cursor.sequence))
+            metrics: metrics, didRebuild: true, appendedEventCount: suffix.eventCount)
     }
 
-    private func replayReducer(
-        targetByteCount: Int,
-        source: BoundedReducerProjectionSource,
-        initialPrefixSeed: DisposableTimelineProjectionStore.PrefixSeed
-    ) throws -> ReplayResult {
-        guard initialPrefixSeed.sequence == 0,
-              initialPrefixSeed.byteCount == 0,
-              initialPrefixSeed.previousEventID == nil,
-              initialPrefixSeed.digest
-                == DisposableTimelineProjectionStore.canonicalPrefixSeed(for: journal) else {
+    /// Continue a Session from its exact checkpoint without decoding the historical prefix.
+    ///
+    /// The store load performed by ``readLocked`` and the cooperating owner lock authenticate the
+    /// cached terminal row and prefix evidence. The exact root authenticates the semantic state;
+    /// the only source events decoded here are the append-only suffix. The old current bucket and
+    /// recent pages are bounded cache material and are carried forward as references/content, so
+    /// the replacement commit can extend the index without reconstructing historical rows.
+    private func rebuildSessionAfterGrowth(
+        cached: DisposableTimelineProjectionStore.Snapshot,
+        observed: DisposableTimelineProjectionStore.SourceFingerprint,
+        before: LocalTimelineProjectionSourceLease.Observation,
+        validationMetrics: LocalTimelineProjectionSourceLease.Metrics
+    ) throws -> Result {
+        guard cached.exactStateCheckpoint != nil,
+              cached.source.prefixByteCount == cached.source.sourceByteCount,
+              cached.cursor.sequence > 0,
+              cached.cursor.sequence < Int.max,
+              cached.cursor.eventID != nil else {
             throw ReaderError.invalidCachedProjection
         }
-        var work = BoundedWorkReducerAccumulator(limits: reducerLimits)
-        var session = BoundedSessionReducerAccumulator(limits: reducerLimits)
-        let replay = try stream(
-            startByte: initialPrefixSeed.byteCount, targetByteCount: targetByteCount,
-            startSequence: initialPrefixSeed.sequence + 1,
-            startPreviousEventID: initialPrefixSeed.previousEventID,
-            startPrefixDigest: initialPrefixSeed.digest
-        ) { event, _ in
-            switch kind {
-            case .work:
-                work.append(event)
-            case .session:
-                session.append(event)
+
+        let loaded = try loadSessionExactState(from: cached, source: cached.source)
+        var exact = loaded.state
+        let cachedHead: BoundedSessionReducerHead
+        switch try decodeReducerHead(from: cached) {
+        case .session(let value): cachedHead = value
+        case .work: throw ReaderError.invalidCachedProjection
+        }
+        var presentation = BoundedSessionExactHeadAccumulator(
+            head: cachedHead, limits: reducerLimits)
+        var index = IndexAccumulator(limits: limits, storeLimits: store.limits)
+        let oldCurrent: DisposableTimelineProjectionStore.Bucket?
+        if cached.currentBucket != nil {
+            oldCurrent = try store.loadBucket(
+                containingSequence: cached.cursor.sequence, proving: cached.source)
+        } else {
+            oldCurrent = nil
+        }
+        let oldRecentPages = try loadRecentPages(from: cached)
+        let suffixStartByte = cached.source.prefixByteCount
+        let suffixStartSequence = cached.cursor.sequence + 1
+        guard suffixStartSequence > 0, suffixStartSequence < Int.max else {
+            throw ReaderError.invalidCachedProjection
+        }
+        let suffix = try stream(
+            startByte: suffixStartByte,
+            targetByteCount: observed.sourceByteCount,
+            startSequence: suffixStartSequence,
+            startPreviousEventID: cached.cursor.eventID,
+            startPrefixDigest: cached.source.prefixDigest
+        ) { event, row in
+            try index.consume(event: event, row: row)
+            do {
+                let result = try exact.apply(event)
+                try presentation.append(event: event, result: result)
+            } catch {
+                throw mapExactStateError(error)
             }
         }
-        guard replay.nextByteOffset == targetByteCount else { throw ReaderError.sourceChanged }
+        let afterSuffix = try fencedSource(after: before)
+        guard sameObservation(afterSuffix.source, observed),
+              suffix.nextByteOffset == observed.sourceByteCount,
+              suffix.eventCount > 0 else {
+            throw ReaderError.sourceChanged
+        }
+        // `afterSuffix.source.prefixDigest` is intentionally still the lease's empty-prefix
+        // seed. The suffix stream is the proof for the new complete prefix.
+        let finalSource = makeSource(
+            observation: afterSuffix.source,
+            prefixByteCount: suffix.nextByteOffset,
+            prefixDigest: suffix.nextPrefixDigest)
+        let cursor = JournalCursor(
+            journal: journal, eventID: suffix.lastEventID, sequence: suffix.lastSequence)
+        var projection = presentation
+        projection.setPhysicalCursor(cursor)
+        let bounded: BoundedSessionReducerHead
         do {
-            switch kind {
-            case .work:
-                let head = try work.finalize(source: source)
-                return ReplayResult(
-                    head: .work(head), opaque: try head.opaqueReducerHead(),
-                    replayBytes: replay.bytesRead)
-            case .session:
-                let head = try session.finalize(source: source)
-                return ReplayResult(
-                    head: .session(head), opaque: try head.opaqueReducerHead(),
-                    replayBytes: replay.bytesRead)
-            }
+            bounded = try projection.finalize(
+                source: BoundedReducerProjectionSource(source: finalSource, cursor: cursor))
         } catch {
             throw ReaderError.projectionFailed
         }
+        let map = loaded.map
+        let exactCheckpoint = try makeSessionExactCheckpoint(
+            state: exact, map: map, source: finalSource, cursor: cursor)
+        let commit = try index.makeCommit(
+            source: finalSource, cursor: cursor, prefixSeed: cached.prefixSeed,
+            reducerHead: try bounded.opaqueReducerHead(), expectedGeneration: cached.generation,
+            oldCurrent: oldCurrent, oldAnchors: cached.anchors,
+            oldAcknowledgements: cached.pendingAcknowledgements,
+            oldSealedThroughSequence: cached.sealedThroughSequence,
+            recentPages: index.recentPagesAppending(oldRecentPages),
+            exactStateCheckpoint: exactCheckpoint)
+        let snapshot = try commitStore(commit, exactStateMap: map)
+        index.metrics = StreamMetrics(validationMetrics)
+        index.metrics.merge(suffix.metrics)
+        let metrics = index.metrics(
+            cacheHit: false, rebuiltIndex: true, reducerReplayedFromZero: false,
+            replayBytes: suffix.bytesRead, suffixBytes: suffix.bytesRead,
+            prefixAuthenticationBytes: validationMetrics.bytesRead,
+            exactValidation: loaded.validationMetrics)
+        return Result(
+            snapshot: snapshot, source: snapshot.source, reducerHead: .session(bounded),
+            metrics: metrics, didRebuild: true, appendedEventCount: suffix.eventCount)
     }
 
     private struct ReplayResult {
@@ -742,7 +852,9 @@ public struct LocalTimelineProjectionReader: Sendable {
         let replayBytes: Int
     }
 
-    private static let exactWorkMapKind = "work-exact-v1"
+    private static let exactWorkMapKind = "work-exact-v2"
+    private static let legacyWorkMapKind = "work-exact-v1"
+    private static let exactSessionMapKind = "session-exact-v1"
 
     /// The map is deliberately private to this projection store.  Its namespace is stable for a
     /// journal so a cold retry after a failed publication can reuse immutable orphan objects, while
@@ -767,8 +879,8 @@ public struct LocalTimelineProjectionReader: Sendable {
     private func defaultWorkExactNamespaceID(
         source: DisposableTimelineProjectionStore.SourceFingerprint
     ) -> String {
-        "work-exact-v1." + AviarySHA256.hash(data: Data(
-            "aviary-work-exact-namespace-v1\u{0}\(journal.stableKey)\u{0}"
+        "work-exact-v2." + AviarySHA256.hash(data: Data(
+            "aviary-work-exact-namespace-v2\u{0}\(journal.stableKey)\u{0}"
                 .appending(source.sourceGeneration)
                 .appending("\u{0}\(source.sourceByteCount)\u{0}")
                 .appending(source.fingerprint)
@@ -834,6 +946,19 @@ public struct LocalTimelineProjectionReader: Sendable {
         }
     }
 
+    private func isLegacyWorkExactCheckpoint(
+        _ snapshot: DisposableTimelineProjectionStore.Snapshot
+    ) throws -> Bool {
+        guard let checkpoint = try store.loadExactStateCheckpoint(proving: snapshot.source),
+              checkpoint.journal == journal,
+              checkpoint.namespaceID == snapshot.namespaceID,
+              checkpoint.roots.count == 1,
+              let descriptor = checkpoint.roots.first else {
+            return false
+        }
+        return descriptor.mapKind == Self.legacyWorkMapKind
+    }
+
     private func makeWorkExactCheckpoint(
         state: PersistentWorkExactState,
         map: PersistentProjectionRadixMap,
@@ -862,10 +987,136 @@ public struct LocalTimelineProjectionReader: Sendable {
             roots: [DisposableTimelineProjectionStore.ExactStateRootDescriptor(root: root)])
     }
 
+    private func makeSessionExactMap(
+        source: DisposableTimelineProjectionStore.SourceFingerprint,
+        namespaceID: String
+    ) throws -> PersistentProjectionRadixMap {
+        do {
+            return try PersistentProjectionRadixMap(
+                directory: store.directory.appending(
+                    path: "session-exact-state", directoryHint: .isDirectory),
+                namespaceID: namespaceID,
+                journal: journal,
+                sourceGeneration: source.sourceGeneration,
+                mapKind: Self.exactSessionMapKind)
+        } catch {
+            throw ReaderError.exactStateUnavailable
+        }
+    }
+
+    private func defaultSessionExactNamespaceID(
+        source: DisposableTimelineProjectionStore.SourceFingerprint
+    ) -> String {
+        "session-exact-v1." + AviarySHA256.hash(data: Data(
+            "aviary-session-exact-namespace-v1\u{0}\(journal.stableKey)\u{0}"
+                .appending(source.sourceGeneration)
+                .appending("\u{0}\(source.sourceByteCount)\u{0}")
+                .appending(source.fingerprint)
+                .utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func makeSessionExactState(
+        source: DisposableTimelineProjectionStore.SourceFingerprint,
+        namespaceID: String
+    ) throws -> (map: PersistentProjectionRadixMap, state: PersistentSessionExactState) {
+        let map = try makeSessionExactMap(source: source, namespaceID: namespaceID)
+        do {
+            return (map, try PersistentSessionExactState(map: map))
+        } catch {
+            throw ReaderError.exactStateUnavailable
+        }
+    }
+
+    private func loadSessionExactState(
+        from snapshot: DisposableTimelineProjectionStore.Snapshot,
+        source: DisposableTimelineProjectionStore.SourceFingerprint
+    ) throws -> (
+        map: PersistentProjectionRadixMap,
+        state: PersistentSessionExactState,
+        validationMetrics: PersistentProjectionRadixMap.Metrics
+    ) {
+        guard let checkpoint = try store.loadExactStateCheckpoint(proving: snapshot.source),
+              checkpoint.namespaceID == snapshot.namespaceID,
+              checkpoint.journal == journal,
+              checkpoint.sourceGeneration == source.sourceGeneration,
+              checkpoint.cursor == snapshot.cursor,
+              checkpoint.prefixByteCount == source.prefixByteCount,
+              checkpoint.prefixDigest == source.prefixDigest,
+              checkpoint.roots.count == 1,
+              let descriptor = checkpoint.roots.first,
+              descriptor.mapKind == Self.exactSessionMapKind,
+              descriptor.namespaceID == snapshot.namespaceID,
+              descriptor.journal == journal,
+              descriptor.sourceGeneration == source.sourceGeneration else {
+            throw ReaderError.invalidCachedProjection
+        }
+        let map = try makeSessionExactMap(
+            source: source, namespaceID: snapshot.namespaceID)
+        do {
+            let validationMetrics = try map.validate(root: descriptor.root)
+            let state = try PersistentSessionExactState(
+                map: map, root: descriptor.root)
+            let scalar = state.eventLocalSnapshot
+            guard state.currentRoot == descriptor.root,
+                  isValidSessionExactCursor(scalar, physical: snapshot.cursor) else {
+                throw ReaderError.invalidCachedProjection
+            }
+            return (map, state, validationMetrics)
+        } catch let error as ReaderError {
+            throw error
+        } catch {
+            throw ReaderError.invalidCachedProjection
+        }
+    }
+
+    private func makeSessionExactCheckpoint(
+        state: PersistentSessionExactState,
+        map: PersistentProjectionRadixMap,
+        source: DisposableTimelineProjectionStore.SourceFingerprint,
+        cursor: JournalCursor
+    ) throws -> DisposableTimelineProjectionStore.ExactStateCheckpoint {
+        guard let root = state.currentRoot,
+              root.journal == journal,
+              root.namespaceID == map.namespaceID,
+              root.sourceGeneration == source.sourceGeneration,
+              root.mapKind == Self.exactSessionMapKind else {
+            throw ReaderError.exactStateUnavailable
+        }
+        return DisposableTimelineProjectionStore.ExactStateCheckpoint(
+            namespaceID: map.namespaceID,
+            journal: journal,
+            sourceGeneration: source.sourceGeneration,
+            cursor: cursor,
+            prefixByteCount: source.prefixByteCount,
+            prefixDigest: source.prefixDigest,
+            roots: [DisposableTimelineProjectionStore.ExactStateRootDescriptor(root: root)])
+    }
+
+    /// SessionReducerTransition quarantines structural evidence before ``stageSeenEvent``. The
+    /// store cursor is therefore the physical source tail while the exact scalar cursor is the
+    /// last semantically admitted event. Equal cursors remain the common case; a shorter scalar
+    /// is valid only for a structurally invalid suffix and must never be treated as a continuation
+    /// of the quarantined event.
+    private func isValidSessionExactCursor(
+        _ scalar: SessionSnapshot,
+        physical: JournalCursor
+    ) -> Bool {
+        guard scalar.journal == journal,
+              scalar.lastSequence >= 0,
+              scalar.lastSequence <= physical.sequence else { return false }
+        if scalar.lastSequence == physical.sequence {
+            return scalar.lastEventID == physical.eventID
+        }
+        return !scalar.structuralIntegrityValid
+    }
+
     private func mapExactStateError(_ error: Error) -> ReaderError {
         if let error = error as? PersistentWorkExactState.Error,
            case .unsupportedEvent = error {
             return .exactStateUnavailable
+        }
+        if error is PersistentSessionExactState.Error {
+            return .projectionFailed
         }
         return .projectionFailed
     }
@@ -1123,6 +1374,12 @@ public struct LocalTimelineProjectionReader: Sendable {
                 recent.append(RecentEntry(event: event, byteCount: eventBytes))
                 recentByteCount += eventBytes
                 peakRecentByteCount = max(peakRecentByteCount, recentByteCount)
+            } else {
+                // Pages are a contiguous suffix. Once one event cannot be retained, earlier rich
+                // events cannot remain beside later events as though the middle were complete.
+                recent.removeAll(keepingCapacity: true)
+                recentStart = 0
+                recentByteCount = 0
             }
             // Release evicted rich events once tombstones occupy at least half the backing
             // buffer. This keeps retained backing storage within a small constant factor of the
@@ -1168,6 +1425,10 @@ public struct LocalTimelineProjectionReader: Sendable {
                    encoded.count <= storeLimits.maximumRecentPageBytes,
                    encoded.count <= storeLimits.maximumObjectBytes {
                     result.append(page)
+                } else {
+                    // Keep only a contiguous suffix after an unrepresentable page. The store
+                    // derives `recentEventsOmitted` from the surviving page boundary.
+                    result.removeAll(keepingCapacity: true)
                 }
                 index = end
             }
@@ -1246,6 +1507,7 @@ public struct LocalTimelineProjectionReader: Sendable {
             reducerReplayedFromZero: Bool,
             replayBytes: Int,
             suffixBytes: Int = 0,
+            prefixAuthenticationBytes: Int = 0,
             exactValidation: PersistentProjectionRadixMap.Metrics? = nil
         ) -> Metrics {
             Metrics(
@@ -1253,6 +1515,7 @@ public struct LocalTimelineProjectionReader: Sendable {
                 reducerReplayedFromZero: reducerReplayedFromZero,
                 readCalls: metrics.readCalls, bytesRead: metrics.bytesRead,
                 suffixBytesRead: suffixBytes,
+                prefixAuthenticationBytesRead: prefixAuthenticationBytes,
                 reducerReplayBytesRead: replayBytes,
                 peakBufferedBytes: metrics.peakBufferedBytes,
                 newlineBytesExamined: metrics.newlineBytesExamined,
@@ -1338,7 +1601,8 @@ public struct LocalTimelineProjectionReader: Sendable {
                     guard checkpoint.journal == self.journal,
                           checkpoint.roots.count == 1,
                           let descriptor = checkpoint.roots.first,
-                          descriptor.mapKind == Self.exactWorkMapKind,
+                          descriptor.mapKind == (self.kind == .work
+                              ? Self.exactWorkMapKind : Self.exactSessionMapKind),
                           descriptor.namespaceID == checkpoint.namespaceID,
                           descriptor.sourceGeneration == checkpoint.sourceGeneration else {
                         throw ReaderError.exactStateUnavailable
@@ -1352,13 +1616,24 @@ public struct LocalTimelineProjectionReader: Sendable {
                         }
                     }
                     try exactStateMap.validateReachable(root: descriptor.root)
-                    let state = try PersistentWorkExactState(
-                        map: exactStateMap, root: descriptor.root)
-                    guard state.currentRoot == descriptor.root,
-                          state.eventLocalSnapshot.journal == checkpoint.journal,
-                          state.eventLocalSnapshot.lastSequence == checkpoint.cursor.sequence,
-                          state.eventLocalSnapshot.lastEventID == checkpoint.cursor.eventID else {
-                        throw ReaderError.exactStateUnavailable
+                    switch self.kind {
+                    case .work:
+                        let state = try PersistentWorkExactState(
+                            map: exactStateMap, root: descriptor.root)
+                        guard state.currentRoot == descriptor.root,
+                              state.eventLocalSnapshot.journal == checkpoint.journal,
+                              state.eventLocalSnapshot.lastSequence == checkpoint.cursor.sequence,
+                              state.eventLocalSnapshot.lastEventID == checkpoint.cursor.eventID else {
+                            throw ReaderError.exactStateUnavailable
+                        }
+                    case .session:
+                        let state = try PersistentSessionExactState(
+                            map: exactStateMap, root: descriptor.root)
+                        guard state.currentRoot == descriptor.root,
+                              self.isValidSessionExactCursor(
+                                  state.eventLocalSnapshot, physical: checkpoint.cursor) else {
+                            throw ReaderError.exactStateUnavailable
+                        }
                     }
                 }
             } else {
