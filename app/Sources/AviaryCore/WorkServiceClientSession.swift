@@ -265,6 +265,13 @@ public actor WorkServiceClientSession: WorkServiceClient {
         return try await perform { try await $0.eventsAfterCursor(request) }
     }
 
+    public func historyBeforeCursor(
+        _ request: WorkServiceHistoryRequest
+    ) async throws -> WorkServiceHistoryPage {
+        try requireClient(request.client)
+        return try await perform { try await $0.historyBeforeCursor(request) }
+    }
+
     public func fetchArtifact(
         _ request: WorkServiceArtifactRequest
     ) async throws -> WorkServiceArtifactDescriptor {

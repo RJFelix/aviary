@@ -132,6 +132,12 @@ private actor ClientSessionObservedConnection: WorkServiceClientConnection {
         try await base.eventsAfterCursor(request)
     }
 
+    func historyBeforeCursor(
+        _ request: WorkServiceHistoryRequest
+    ) async throws -> WorkServiceHistoryPage {
+        try await base.historyBeforeCursor(request)
+    }
+
     func fetchArtifact(
         _ request: WorkServiceArtifactRequest
     ) async throws -> WorkServiceArtifactDescriptor {

@@ -1616,6 +1616,11 @@ private final class DelayedWorkService: WorkServiceClient, @unchecked Sendable {
         try await base.eventsAfterCursor(request)
     }
 
+    func historyBeforeCursor(_ request: WorkServiceHistoryRequest) async throws
+        -> WorkServiceHistoryPage {
+        try await base.historyBeforeCursor(request)
+    }
+
     func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws
         -> WorkServiceArtifactDescriptor {
         try await base.fetchArtifact(request)
@@ -2873,7 +2878,180 @@ private func test_workServiceDescriptorOwnerValidationDoesNotTrap() throws {
     }
 }
 
+func test_workServiceTransportHistoryPageCorrelationAndBoundaries() throws {
+    let session = SessionRef("history-session")
+    let sessionJournal = JournalRef.session(
+        session, journalID: "history-session-journal",
+        authority: TimelineAuthorityRef(transportHost.workHostID))
+    let target = WorkServiceReadTarget.session(session: session, journal: sessionJournal)
+    let event = TimelineEvent(
+        eventID: "history-message-1", journal: sessionJournal, sequence: 1,
+        session: session, client: transportClientA,
+        actor: TimelineActor(actorID: transportClientA.clientID, kind: "gui"),
+        hostRecordedAt: Date(), type: TimelineEventType.inputAccepted,
+        payload: .object(["text": .string("hello")]))
+    let cursor = JournalCursor(
+        journal: sessionJournal, eventID: event.eventID, sequence: event.sequence)
+    let workDescriptor = try WorkServiceWorkDescriptor(
+        work: transportWork, journal: transportJournal, recordedDisposition: .reusable,
+        execution: .idle, currentRun: nil, currentRunSession: nil,
+        currentRunSessionAttachment: nil, hostObservation: nil)
+    let digest = "sha256:" + String(repeating: "a", count: 64)
+    let attachment = ClientAttachmentRef("history-client-attachment")
+    let request = WorkServiceHistoryRequest(
+        work: transportWork, journal: transportJournal, attachment: attachment,
+        client: transportClientA, target: target, frozenTipCursor: cursor,
+        frozenTipDigest: digest, branchTip: EventRef(journal: sessionJournal, eventID: event.eventID),
+        limit: 2, maxBytes: WorkServiceBounds.maxEventPageBytes)
+    let pageDigest = try WorkServiceHistoryPageEvidence.digest(
+        events: [event], target: target, cursor: cursor)
+    let page = WorkServiceHistoryPage(
+        work: workDescriptor, events: [event], target: target,
+        lowerBoundaryCursor: cursor, upperBoundaryCursor: cursor,
+        nextBeforeCursor: nil, hasOlder: false, frozenTipCursor: cursor,
+        frozenTipDigest: digest, prefixDigest: pageDigest,
+        branchTip: EventRef(journal: sessionJournal, eventID: event.eventID))
+    let response = WorkServiceTransportResponseEnvelope(
+        id: "history-page", ok: true,
+        data: try transportEnvelopePayload(page),
+        hostInstance: WorkHostInstanceRef(
+            host: transportHost, instanceID: "transport-instance", startIdentity: "transport-start"))
+    let requestEnvelope = WorkServiceTransportRequestEnvelope(
+        id: "history-page", operation: .historyBeforeCursor, client: transportClientA,
+        payload: try transportEnvelopePayload(request))
+
+    try WorkServiceTransportCodec.validateResponseSemantics(
+        response, operation: .historyBeforeCursor)
+    try WorkServiceTransportCodec.validateResponseCorrelation(
+        response, request: requestEnvelope,
+        expectedHostInstance: WorkHostInstanceRef(
+            host: transportHost, instanceID: "transport-instance", startIdentity: "transport-start"))
+    XCTAssertEqual(WorkServiceTransportOperation.historyBeforeCursor.rawValue,
+                   "history_before_cursor")
+
+    let alternateBranch = EventRef(journal: sessionJournal, eventID: "history-message-other")
+    let staleBranchRequest = WorkServiceHistoryRequest(
+        work: transportWork, journal: transportJournal, attachment: attachment,
+        client: transportClientA, target: target, frozenTipCursor: cursor,
+        frozenTipDigest: digest, branchTip: alternateBranch,
+        limit: 2, maxBytes: WorkServiceBounds.maxEventPageBytes)
+    let staleBranchEnvelope = WorkServiceTransportRequestEnvelope(
+        id: "history-stale-branch", operation: .historyBeforeCursor,
+        client: transportClientA, payload: try transportEnvelopePayload(staleBranchRequest))
+    do {
+        try WorkServiceTransportCodec.validateResponseCorrelation(
+            response, request: staleBranchEnvelope, expectedHostInstance: response.hostInstance)
+        XCTFail("history transport accepted a response for a different semantic branch")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+
+    // A cursor at the same sequence but with a different event ID is a stale/foreign boundary,
+    // not an acceptable page for the same physical journal.
+    let wrongCursor = JournalCursor(
+        journal: sessionJournal, eventID: "history-message-other", sequence: event.sequence)
+    let wrongPage = WorkServiceHistoryPage(
+        work: workDescriptor, events: [event], target: target,
+        lowerBoundaryCursor: wrongCursor, upperBoundaryCursor: cursor,
+        nextBeforeCursor: nil, hasOlder: false, frozenTipCursor: cursor,
+        frozenTipDigest: digest, prefixDigest: digest,
+        branchTip: EventRef(journal: sessionJournal, eventID: event.eventID))
+    let wrongResponse = WorkServiceTransportResponseEnvelope(
+        id: "history-wrong-boundary", ok: true, data: try transportEnvelopePayload(wrongPage),
+        hostInstance: response.hostInstance)
+    do {
+        try WorkServiceTransportCodec.validateResponseCorrelation(
+            wrongResponse, request: requestEnvelope, expectedHostInstance: response.hostInstance)
+        XCTFail("history transport accepted a same-sequence boundary with the wrong event ID")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+
+    // Prefix digests include the canonical algorithm marker. A bare 64-character hex string is
+    // not a valid digest, even though its payload length looks plausible.
+    let badDigestPage = WorkServiceHistoryPage(
+        work: workDescriptor, events: [event], target: target,
+        lowerBoundaryCursor: cursor, upperBoundaryCursor: cursor,
+        nextBeforeCursor: nil, hasOlder: false, frozenTipCursor: cursor,
+        frozenTipDigest: String(repeating: "b", count: 64), prefixDigest: pageDigest,
+        branchTip: EventRef(journal: sessionJournal, eventID: event.eventID))
+    let badDigestResponse = WorkServiceTransportResponseEnvelope(
+        id: "history-bad-digest", ok: true,
+        data: try transportEnvelopePayload(badDigestPage), hostInstance: response.hostInstance)
+    do {
+        try WorkServiceTransportCodec.validateResponseSemantics(
+            badDigestResponse, operation: .historyBeforeCursor)
+        XCTFail("history transport accepted a digest without its sha256 marker")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+
+    // History is a message operation. Physical control events remain invalid even if they have
+    // otherwise valid envelope ownership and cursor fields.
+    let controlEvent = TimelineEvent(
+        eventID: "history-control", journal: sessionJournal, sequence: 1,
+        session: session, actor: TimelineActor(actorID: "host", kind: "host"),
+        hostRecordedAt: Date(), type: TimelineEventType.sessionAttached)
+    let controlPage = WorkServiceHistoryPage(
+        work: workDescriptor, events: [controlEvent], target: target,
+        lowerBoundaryCursor: JournalCursor(journal: sessionJournal, eventID: controlEvent.eventID, sequence: 1),
+        upperBoundaryCursor: JournalCursor(journal: sessionJournal, eventID: controlEvent.eventID, sequence: 1),
+        nextBeforeCursor: nil, hasOlder: false, frozenTipCursor: cursor,
+        frozenTipDigest: digest, prefixDigest: digest)
+    let controlResponse = WorkServiceTransportResponseEnvelope(
+        id: "history-control", ok: true,
+        data: try transportEnvelopePayload(controlPage), hostInstance: response.hostInstance)
+    do {
+        try WorkServiceTransportCodec.validateResponseCorrelation(
+            controlResponse, request: requestEnvelope, expectedHostInstance: response.hostInstance)
+        XCTFail("history transport exposed a non-message control event")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+}
+
+func test_workServiceHistoryInitialNilAndStaleBranchAreTruthful() async throws {
+    let service = InMemoryWorkService(
+        host: transportHost, instanceID: "history-service-instance",
+        startIdentity: "history-service-start", authorizer: transportAuthorizer())
+    let created = try await service.createWork(.init(
+        client: transportClientA, commandID: "history-create",
+        causalControlCursor: JournalCursor(journal: .workHost(transportHost), sequence: 0),
+        requestedCapabilities: transportCapabilities))
+    let session = try XCTUnwrap(created.session)
+    let sessionJournal = try XCTUnwrap(created.sessionJournal)
+    let attachment = try XCTUnwrap(created.attachment)
+    let target = WorkServiceReadTarget.session(session: session, journal: sessionJournal)
+    let initial = try await service.historyBeforeCursor(.init(
+        work: transportWork, journal: created.work.journal,
+        attachment: attachment.attachment, client: transportClientA, target: target))
+    XCTAssertTrue(initial.events.isEmpty)
+    XCTAssertFalse(initial.hasOlder)
+    XCTAssertNil(initial.lowerBoundaryCursor)
+    XCTAssertNil(initial.nextBeforeCursor)
+    XCTAssertNil(initial.branchTip)
+    XCTAssertEqual(initial.frozenTipCursor.journal, sessionJournal)
+    XCTAssertEqual(initial.frozenTipCursor.sequence, 3)
+
+    let staleBranch = WorkServiceHistoryRequest(
+        work: transportWork, journal: created.work.journal,
+        attachment: attachment.attachment, client: transportClientA, target: target,
+        branchTip: EventRef(journal: sessionJournal, eventID: "not-a-visible-message"))
+    do {
+        _ = try await service.historyBeforeCursor(staleBranch)
+        XCTFail("history accepted a branch tip not equal to the current Session semantic tip")
+    } catch WorkServiceProtocolError.staleCursor {
+        XCTAssertTrue(true)
+    }
+}
+
 let casesWorkServiceTransport: [Case] = [
+    ("phase3 Work service transport: history page boundaries and digest correlation", {
+        try test_workServiceTransportHistoryPageCorrelationAndBoundaries()
+    }),
+    ("phase3 Work service transport: initial history and stale branch semantics", {
+        try await test_workServiceHistoryInitialNilAndStaleBranchAreTruthful()
+    }),
     ("phase3 Work service transport: owner validation fails closed without trapping", {
         try test_workServiceDescriptorOwnerValidationDoesNotTrap()
     }),

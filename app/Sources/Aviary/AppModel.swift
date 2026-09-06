@@ -1025,6 +1025,7 @@ final class AppModel {
             let bridge = ServiceBackedRunBridge(
                 controller: controller,
                 projection: projection,
+                history: await controller.conversationHistory(),
                 serviceAttachmentKey: key,
                 workspaceLabel: workspaceLabel(for: descriptor),
                 modelLabel: [descriptor.configuration.providerID,
@@ -3162,6 +3163,7 @@ final class AppModel {
             }
             let bridge = ServiceBackedRunBridge(
                 controller: controller, projection: projection,
+                history: await controller.conversationHistory(),
                 serviceAttachmentKey: serviceAttachmentKey,
                 workspaceLabel: workspace.label ?? advertised.workspaceID.rawValue,
                 modelLabel: model.qualifiedID, thinkingLevel: thinkingLevel)
@@ -3650,6 +3652,12 @@ final class LiveRun: Identifiable {
     /// committed for them (for example, an unknown-effect crossing after a partial append).
     private(set) var serviceInputDeliveryAttention: [CanonicalInputDeliveryRow] = []
     private(set) var serviceInputDeliveryOmissions: [WorkServiceOmission] = []
+    /// One GUI's bounded presentation window. These flags never imply a Work mutation or a
+    /// shared read acknowledgement; every attached GUI may browse a different range.
+    private(set) var serviceHistoryHasEarlier = false
+    private(set) var serviceHistoryHasNewer = false
+    private(set) var serviceHistoryIsLoading = false
+    private(set) var serviceHistoryError: String?
     /// The last provider-bound context and the runtime's durable working state are intentionally
     /// separate. A context manifest is never evidence that a Python namespace is live.
     private(set) var recordedModelContext: RecordedModelContextProjection?
@@ -3800,11 +3808,16 @@ final class LiveRun: Identifiable {
         self.servicePendingInputs = bridge.pendingInputs
         self.serviceInputDeliveryAttention = bridge.inputDeliveryAttention
         self.serviceInputDeliveryOmissions = bridge.inputDeliveryProjection.omissions
+        self.serviceHistoryHasEarlier = bridge.history.hasEarlier
+        self.serviceHistoryHasNewer = bridge.history.hasNewer
+        self.serviceHistoryIsLoading = bridge.history.status == .loading
+        self.serviceHistoryError = bridge.historyError
         self.recordedModelContext = bridge.recordedModelContext
         self.canonicalWorkingState = bridge.canonicalWorkingState
         self.modelLabel = bridge.modelLabel
         self.thinkingLevel = bridge.thinkingLevel
         self.sessionID = bridge.sessionID
+        self.items = bridge.transcriptItems
         self.initialPromptDelivered = bridge.hasCanonicalInputDelivery
         // WorkSnapshot currently carries no canonical run.started timestamp.  Keep the local
         // initialization value private; the service UI uses `startedLabel`/`elapsedLabel` and
@@ -4304,11 +4317,40 @@ final class LiveRun: Identifiable {
         publish(
             serviceBridge.inputDeliveryProjection.omissions,
             to: \.serviceInputDeliveryOmissions)
+        publish(serviceBridge.history.hasEarlier, to: \.serviceHistoryHasEarlier)
+        publish(serviceBridge.history.hasNewer, to: \.serviceHistoryHasNewer)
+        publish(serviceBridge.history.status == .loading, to: \.serviceHistoryIsLoading)
+        publish(serviceBridge.historyError, to: \.serviceHistoryError)
         publish(serviceBridge.recordedModelContext, to: \.recordedModelContext)
         publish(serviceBridge.canonicalWorkingState, to: \.canonicalWorkingState)
         // This is canonical Session evidence (input.accepted/message history), not a Start
         // receipt. It remains true even when the visible transcript has bounded omissions.
         publish(serviceBridge.hasCanonicalInputDelivery, to: \.initialPromptDelivered)
+    }
+
+    /// Load one older page for this GUI only. Failure preserves the authenticated rows already
+    /// on screen and exposes a retry affordance; it never retries a command or acknowledges a
+    /// shared read cursor.
+    func loadEarlierServiceHistory() async {
+        guard let serviceBridge, !serviceHistoryIsLoading else { return }
+        publish(true, to: \.serviceHistoryIsLoading)
+        defer {
+            syncServiceState()
+            publish(false, to: \.serviceHistoryIsLoading)
+        }
+        do {
+            _ = try await serviceBridge.loadEarlierHistory()
+        } catch {
+            // The bridge stores bounded, non-sensitive presentation copy for the retry banner.
+        }
+    }
+
+    /// Explicitly leave historical browsing and return to the newest already-authenticated
+    /// Session projection. No network request or Work lifecycle action is involved.
+    func jumpServiceHistoryToLatest() async {
+        guard let serviceBridge else { return }
+        _ = await serviceBridge.jumpHistoryToLatest()
+        syncServiceState()
     }
 
     /// Begin observing an already-existing attachment without issuing Start or Attach.

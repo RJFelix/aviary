@@ -250,6 +250,115 @@ public struct WorkServiceAttachedWorkProjection: Sendable, Hashable {
     private static let maxDiagnostics = 32
 }
 
+public enum WorkServiceConversationHistoryStatus: String, Codable, Hashable, Sendable {
+    case ready
+    case loading
+    /// The last bounded page failed. Previously authenticated rows remain visible and retryable.
+    case unavailable
+    /// The Session selected another branch while this GUI was reading an older frozen window.
+    case staleBranch
+}
+
+/// Identity-only change classification for a bounded conversation window. Text mutations from
+/// streaming do not masquerade as new output, and a history prepend is disjoint from a tail
+/// append even when both arrive in one observable update.
+public enum WorkServiceConversationIdentityChange: Equatable, Sendable {
+    case unchanged
+    case prepended(count: Int, anchorID: String?)
+    case appended(count: Int)
+    case prependedAndAppended(prepended: Int, appended: Int, anchorID: String?)
+    case replaced
+
+    public static func classify(old: [String], new: [String]) -> Self {
+        guard old != new else { return .unchanged }
+        guard !old.isEmpty else { return new.isEmpty ? .unchanged : .appended(count: new.count) }
+        if let start = contiguousStart(of: old, in: new) {
+            let prepended = start
+            let appended = new.count - start - old.count
+            switch (prepended, appended) {
+            case (0, 0): return .unchanged
+            case (0, let tail): return .appended(count: tail)
+            case (let prefix, 0): return .prepended(count: prefix, anchorID: old.first)
+            case (let prefix, let tail):
+                return .prependedAndAppended(
+                    prepended: prefix, appended: tail, anchorID: old.first)
+            }
+        }
+        // A bounded window can release rows from the opposite edge in the same update. Preserve
+        // prepend/append semantics when the remaining rows form one exact contiguous overlap;
+        // otherwise a branch or Session replacement remains `.replaced`.
+        let maximumOverlap = min(old.count, new.count)
+        let oldIDs = Set(old)
+        if maximumOverlap > 0 {
+            for overlap in stride(from: maximumOverlap, through: 1, by: -1) {
+                if new.suffix(overlap).elementsEqual(old.prefix(overlap)),
+                   new.dropLast(overlap).allSatisfy({ !oldIDs.contains($0) }) {
+                    let prepended = new.count - overlap
+                    if prepended > 0 {
+                        return .prepended(count: prepended, anchorID: old.first)
+                    }
+                }
+                if old.suffix(overlap).elementsEqual(new.prefix(overlap)),
+                   new.dropFirst(overlap).allSatisfy({ !oldIDs.contains($0) }) {
+                    let appended = new.count - overlap
+                    if appended > 0 { return .appended(count: appended) }
+                }
+            }
+        }
+        return .replaced
+    }
+
+    private static func contiguousStart(of old: [String], in new: [String]) -> Int? {
+        guard old.count <= new.count else { return nil }
+        for start in 0...(new.count - old.count) {
+            if new[start..<(start + old.count)].elementsEqual(old) { return start }
+        }
+        return nil
+    }
+}
+
+/// One GUI's bounded, read-only window over the canonical selected Session conversation.
+///
+/// This cursor state is intentionally disjoint from reducer, acknowledgement, and command
+/// cursors. Loading or discarding presentation history cannot advance shared Work state, and two
+/// GUIs may hold different windows over the same durable Session without coordinating.
+public struct WorkServiceConversationHistoryWindow: Codable, Hashable, Sendable {
+    public let messages: [SessionMessageSnapshot]
+    public let frozenTipCursor: JournalCursor?
+    public let frozenTipDigest: String?
+    public let branchTip: EventRef?
+    public let nextBeforeCursor: JournalCursor?
+    public let hasEarlier: Bool
+    public let hasNewer: Bool
+    public let status: WorkServiceConversationHistoryStatus
+    public let omissions: [WorkServiceOmission]
+    public let generation: Int
+
+    public init(
+        messages: [SessionMessageSnapshot] = [],
+        frozenTipCursor: JournalCursor? = nil,
+        frozenTipDigest: String? = nil,
+        branchTip: EventRef? = nil,
+        nextBeforeCursor: JournalCursor? = nil,
+        hasEarlier: Bool = false,
+        hasNewer: Bool = false,
+        status: WorkServiceConversationHistoryStatus = .ready,
+        omissions: [WorkServiceOmission] = [],
+        generation: Int = 0
+    ) {
+        self.messages = messages
+        self.frozenTipCursor = frozenTipCursor
+        self.frozenTipDigest = frozenTipDigest
+        self.branchTip = branchTip
+        self.nextBeforeCursor = nextBeforeCursor
+        self.hasEarlier = hasEarlier
+        self.hasNewer = hasNewer
+        self.status = status
+        self.omissions = Array(omissions.prefix(WorkServiceAttachedWorkControllerBounds.maxOmissions))
+        self.generation = max(0, generation)
+    }
+}
+
 public enum WorkServiceAttachedWorkControllerError: Error, Equatable, Sendable {
     case invalidSeed
     case invalidOptions
@@ -402,6 +511,9 @@ public actor WorkServiceAttachedWorkController {
     private var requiredWorkCursorStorage: JournalCursor?
     private var requiresRefreshStorage = false
     private var refreshInProgress = false
+    private var historyStorage = WorkServiceConversationHistoryWindow()
+    private var historyReadInProgress = false
+    private var historyBrowsingOlderStorage = false
 
     /// Construct from any transport implementation. For a ``WorkServiceClientSession``, use the
     /// convenience initializer below so refresh can explicitly establish/re-establish its socket.
@@ -836,6 +948,9 @@ public actor WorkServiceAttachedWorkController {
             checkpointAwaitingHostValidationStorage = false
             requiredWorkCursorStorage = nil
             requiresRefreshStorage = false
+            reconcileConversationHistoryAfterRefresh(
+                snapshot: reducedSession, cursor: newSession.cursor,
+                prefixDigest: newSession.prefixDigest)
             _ = persistCheckpointIfPossible()
             return projection()
         } catch let error as WorkServiceAttachedWorkControllerError {
@@ -858,6 +973,345 @@ public actor WorkServiceAttachedWorkController {
             markReadFailure(.transportFailure)
             throw WorkServiceAttachedWorkControllerError.transportFailure
         }
+    }
+
+    /// Return this controller's presentation window. It is never persisted as canonical state;
+    /// another GUI reconstructs and pages its own independent window from the Work Host.
+    public func conversationHistory() -> WorkServiceConversationHistoryWindow {
+        historyStorage
+    }
+
+    /// Prepend one bounded page from the canonical selected Session branch.
+    ///
+    /// A failed read preserves all previously authenticated rows. This method never acknowledges
+    /// a read, changes a command cursor, or retries a mutation.
+    @discardableResult
+    public func loadEarlierConversationHistory(
+        limit: Int = 128,
+        maxBytes: Int = 128 * 1024
+    ) async throws -> WorkServiceConversationHistoryWindow {
+        guard !historyReadInProgress else { return historyStorage }
+        guard attachmentActionableStorage,
+              attachmentStorage.authorization.granted.contains(.observe),
+              workCompletenessStorage == .complete,
+              sessionCompletenessStorage == .complete,
+              !checkpointAwaitingHostValidationStorage else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        guard historyStorage.status != .staleBranch else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        guard historyStorage.hasEarlier else { return historyStorage }
+        guard limit > 0, limit <= WorkServiceBounds.maxEventsPerPage,
+              maxBytes > 0, maxBytes <= WorkServiceBounds.maxEventPageBytes else {
+            throw WorkServiceAttachedWorkControllerError.invalidOptions
+        }
+        guard let frozenTip = historyStorage.frozenTipCursor,
+              let frozenDigest = historyStorage.frozenTipDigest else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        // Enter historical-browsing mode before the transport suspension. A concurrent refresh
+        // may then mark newer output or a branch change, but it cannot replace the reader's
+        // window while this page is in flight.
+        historyBrowsingOlderStorage = true
+        historyReadInProgress = true
+        historyStorage = historyWindow(
+            messages: historyStorage.messages,
+            frozenTipCursor: frozenTip, frozenTipDigest: frozenDigest,
+            branchTip: historyStorage.branchTip,
+            nextBeforeCursor: historyStorage.nextBeforeCursor,
+            hasEarlier: historyStorage.hasEarlier, hasNewer: historyStorage.hasNewer,
+            status: .loading, omissions: historyStorage.omissions)
+        defer { historyReadInProgress = false }
+        let request = WorkServiceHistoryRequest(
+            work: work, journal: journal, attachment: attachmentStorage.attachment,
+            client: client, target: .session(session: session, journal: sessionJournal),
+            beforeCursor: historyStorage.nextBeforeCursor,
+            frozenTipCursor: frozenTip, frozenTipDigest: frozenDigest,
+            branchTip: historyStorage.branchTip, limit: limit, maxBytes: maxBytes)
+        do {
+            let page = try await service.historyBeforeCursor(request)
+            // Jump-to-latest explicitly supersedes an in-flight page. A branch change similarly
+            // leaves its truthful stale projection in place rather than merging an older result.
+            guard historyBrowsingOlderStorage,
+                  historyStorage.status != .staleBranch,
+                  historyStorage.frozenTipCursor == frozenTip,
+                  historyStorage.frozenTipDigest == frozenDigest else {
+                return historyStorage
+            }
+            let candidate = try mergeHistoryPage(page, request: request)
+            historyStorage = candidate
+            return candidate
+        } catch let error as WorkServiceAttachedWorkControllerError {
+            guard historyBrowsingOlderStorage,
+                  historyStorage.status != .staleBranch,
+                  historyStorage.frozenTipCursor == frozenTip,
+                  historyStorage.frozenTipDigest == frozenDigest else {
+                return historyStorage
+            }
+            historyStorage = historyWindow(
+                messages: historyStorage.messages,
+                frozenTipCursor: frozenTip, frozenTipDigest: frozenDigest,
+                branchTip: historyStorage.branchTip,
+                nextBeforeCursor: historyStorage.nextBeforeCursor,
+                hasEarlier: historyStorage.hasEarlier, hasNewer: historyStorage.hasNewer,
+                status: .unavailable, omissions: historyStorage.omissions)
+            throw error
+        } catch {
+            guard historyBrowsingOlderStorage,
+                  historyStorage.status != .staleBranch,
+                  historyStorage.frozenTipCursor == frozenTip,
+                  historyStorage.frozenTipDigest == frozenDigest else {
+                return historyStorage
+            }
+            historyStorage = historyWindow(
+                messages: historyStorage.messages,
+                frozenTipCursor: frozenTip, frozenTipDigest: frozenDigest,
+                branchTip: historyStorage.branchTip,
+                nextBeforeCursor: historyStorage.nextBeforeCursor,
+                hasEarlier: historyStorage.hasEarlier, hasNewer: historyStorage.hasNewer,
+                status: .unavailable, omissions: historyStorage.omissions)
+            throw Self.mapReadError(error)
+        }
+    }
+
+    /// Leave historical browsing and rebuild the newest bounded window from the already
+    /// authenticated reducer projection. No network or Work mutation is required.
+    public func jumpConversationHistoryToLatest() -> WorkServiceConversationHistoryWindow {
+        historyBrowsingOlderStorage = false
+        historyStorage = latestHistoryWindow(
+            snapshot: sessionSnapshotStorage, cursor: sessionCursorStorage,
+            prefixDigest: sessionPrefixDigestStorage,
+            generation: historyStorage.generation + 1)
+        return historyStorage
+    }
+
+    private func reconcileConversationHistoryAfterRefresh(
+        snapshot: SessionSnapshot,
+        cursor: JournalCursor,
+        prefixDigest: String?
+    ) {
+        guard historyBrowsingOlderStorage else {
+            historyStorage = latestHistoryWindow(
+                snapshot: snapshot, cursor: cursor, prefixDigest: prefixDigest,
+                generation: historyStorage.generation + 1)
+            return
+        }
+        var currentBranchTip = historyStorage.branchTip
+        if currentBranchTip != snapshot.semanticTip {
+            guard Self.selectedBranch(snapshot.messages, contains: historyStorage.messages) else {
+                historyStorage = historyWindow(
+                    messages: historyStorage.messages,
+                    frozenTipCursor: historyStorage.frozenTipCursor,
+                    frozenTipDigest: historyStorage.frozenTipDigest,
+                    branchTip: historyStorage.branchTip,
+                    nextBeforeCursor: nil, hasEarlier: false, hasNewer: true,
+                    status: .staleBranch,
+                    omissions: historyStorage.omissions + [WorkServiceOmission(
+                        category: "history_branch", count: 1,
+                        diagnostic: "the canonical Session selected another conversation branch")])
+                return
+            }
+            // The selected branch only extended (or made its existing implicit tip explicit).
+            // Adopt the new semantic tip for subsequent older-page requests while keeping the
+            // physical frozen tip/digest unchanged; newly appended tail rows remain outside the
+            // historical window until the user explicitly returns to latest.
+            currentBranchTip = snapshot.semanticTip
+        }
+        let hasNewer = historyStorage.hasNewer || historyStorage.frozenTipCursor != cursor
+        historyStorage = historyWindow(
+            messages: historyStorage.messages,
+            frozenTipCursor: historyStorage.frozenTipCursor,
+            frozenTipDigest: historyStorage.frozenTipDigest,
+            branchTip: currentBranchTip,
+            nextBeforeCursor: historyStorage.nextBeforeCursor,
+            hasEarlier: historyStorage.hasEarlier, hasNewer: hasNewer,
+            status: historyStorage.status == .loading ? .ready : historyStorage.status,
+            omissions: historyStorage.omissions)
+    }
+
+    private static func selectedBranch(
+        _ selected: [SessionMessageSnapshot], contains retained: [SessionMessageSnapshot]
+    ) -> Bool {
+        guard !retained.isEmpty else { return false }
+        var selectedIndex = 0
+        for message in retained {
+            guard let eventID = message.sourceEvent?.eventID else { return false }
+            while selectedIndex < selected.count,
+                  selected[selectedIndex].sourceEvent?.eventID != eventID {
+                selectedIndex += 1
+            }
+            guard selectedIndex < selected.count else { return false }
+            selectedIndex += 1
+        }
+        return true
+    }
+
+    private func latestHistoryWindow(
+        snapshot: SessionSnapshot,
+        cursor: JournalCursor,
+        prefixDigest: String?,
+        generation: Int
+    ) -> WorkServiceConversationHistoryWindow {
+        var retained: [SessionMessageSnapshot] = []
+        var bytes = 0
+        for message in snapshot.messages.reversed() {
+            let count = message.text.utf8.count
+            guard retained.count < WorkServiceAttachedWorkControllerBounds.historyWindowMessages,
+                  count <= WorkServiceAttachedWorkControllerBounds.historyWindowBytes - bytes else {
+                break
+            }
+            retained.insert(message, at: 0)
+            bytes += count
+        }
+        let hasEarlier = retained.count < snapshot.messages.count
+        let boundary = hasEarlier ? retained.first?.sourceCursor : nil
+        var omissions: [WorkServiceOmission] = []
+        var status: WorkServiceConversationHistoryStatus = .ready
+        if hasEarlier {
+            omissions.append(WorkServiceOmission(
+                category: "history", count: snapshot.messages.count - retained.count,
+                diagnostic: "earlier selected-branch messages are outside this GUI window"))
+            if boundary == nil {
+                status = .unavailable
+                omissions.append(WorkServiceOmission(
+                    category: "history_boundary", count: 1,
+                    diagnostic: "the oldest displayed message has no exact source cursor"))
+            }
+        }
+        if !Self.validPrefixDigest(prefixDigest) || prefixDigest == nil {
+            status = hasEarlier ? .unavailable : status
+        }
+        return WorkServiceConversationHistoryWindow(
+            messages: retained, frozenTipCursor: cursor, frozenTipDigest: prefixDigest,
+            branchTip: snapshot.semanticTip, nextBeforeCursor: boundary,
+            hasEarlier: hasEarlier && boundary != nil, hasNewer: false,
+            status: status, omissions: Self.boundedOmissions(omissions),
+            generation: generation)
+    }
+
+    private func mergeHistoryPage(
+        _ page: WorkServiceHistoryPage,
+        request: WorkServiceHistoryRequest
+    ) throws -> WorkServiceConversationHistoryWindow {
+        guard Self.validDescriptor(
+                  page.work, expected: work, expectedJournal: journal,
+                  expectedHostInstance: descriptorStorage.hostObservation?.instance),
+              page.target == request.target,
+              page.frozenTipCursor == request.frozenTipCursor,
+              page.frozenTipDigest == request.frozenTipDigest,
+              page.branchTip == request.branchTip,
+              Self.validPrefixDigest(page.frozenTipDigest),
+              Self.validPrefixDigest(page.prefixDigest),
+              page.events.count <= request.limit,
+              page.hasOlder == (page.nextBeforeCursor != nil) else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        var encodedBytes = 0
+        var pageMessages: [SessionMessageSnapshot] = []
+        var eventIDs: Set<String> = []
+        var priorSequence: Int?
+        for event in page.events {
+            guard event.journal == sessionJournal,
+                  event.session == session,
+                  event.sequence > 0,
+                  priorSequence.map({ event.sequence > $0 }) ?? true,
+                  eventIDs.insert(event.eventID).inserted,
+                  let message = SessionMessageSnapshot.canonicalMessage(from: event),
+                  message.isPresentationVisible,
+                  message.sourceCursor == JournalCursor(
+                    journal: sessionJournal, eventID: event.eventID,
+                    sequence: event.sequence) else {
+                throw WorkServiceAttachedWorkControllerError.malformedResponse
+            }
+            if let before = request.beforeCursor, event.sequence >= before.sequence {
+                throw WorkServiceAttachedWorkControllerError.malformedResponse
+            }
+            let size = try WorkServiceEventPageSizing.encodedByteCount(of: event)
+            guard size <= request.maxBytes - encodedBytes else {
+                throw WorkServiceAttachedWorkControllerError.malformedResponse
+            }
+            encodedBytes += size
+            priorSequence = event.sequence
+            pageMessages.append(message)
+        }
+        let lower = page.events.first.map {
+            JournalCursor(journal: sessionJournal, eventID: $0.eventID, sequence: $0.sequence)
+        }
+        let upper = page.events.last.map {
+            JournalCursor(journal: sessionJournal, eventID: $0.eventID, sequence: $0.sequence)
+        }
+        let evidenceCursor = upper ?? page.frozenTipCursor
+        let expectedPageDigest: String
+        do {
+            expectedPageDigest = try WorkServiceHistoryPageEvidence.digest(
+                events: page.events, target: page.target, cursor: evidenceCursor)
+        } catch {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        guard page.prefixDigest == expectedPageDigest else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        guard page.lowerBoundaryCursor == lower,
+              page.upperBoundaryCursor == upper,
+              (!page.hasOlder || page.nextBeforeCursor == lower),
+              (page.hasOlder || page.nextBeforeCursor == nil) else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        let existingIDs = Set(historyStorage.messages.compactMap { $0.sourceEvent?.eventID })
+        guard pageMessages.allSatisfy({ message in
+            guard let id = message.sourceEvent?.eventID else { return false }
+            return !existingIDs.contains(id)
+        }) else {
+            throw WorkServiceAttachedWorkControllerError.malformedResponse
+        }
+        var combined = pageMessages + historyStorage.messages
+        var combinedBytes = combined.reduce(into: 0) { total, message in
+            total += min(Int.max - total, message.text.utf8.count)
+        }
+        var droppedNewer = 0
+        while combined.count > WorkServiceAttachedWorkControllerBounds.historyWindowMessages
+            || combinedBytes > WorkServiceAttachedWorkControllerBounds.historyWindowBytes {
+            guard let removed = combined.popLast() else { break }
+            combinedBytes -= removed.text.utf8.count
+            droppedNewer += 1
+        }
+        var omissions = page.omissions
+        if droppedNewer > 0 {
+            omissions.append(WorkServiceOmission(
+                category: "history_window_newer", count: droppedNewer,
+                diagnostic: "newer rows were released to keep this GUI history window bounded"))
+        }
+        return WorkServiceConversationHistoryWindow(
+            messages: combined,
+            frozenTipCursor: page.frozenTipCursor,
+            frozenTipDigest: page.frozenTipDigest,
+            // A concurrent refresh may have proven that the selected branch only extended after
+            // the frozen physical tip. Preserve that newer semantic identity for the next page.
+            branchTip: historyStorage.branchTip,
+            nextBeforeCursor: page.nextBeforeCursor,
+            hasEarlier: page.hasOlder,
+            hasNewer: historyStorage.hasNewer || droppedNewer > 0,
+            status: .ready,
+            omissions: Self.boundedOmissions(omissions),
+            generation: historyStorage.generation + 1)
+    }
+
+    private func historyWindow(
+        messages: [SessionMessageSnapshot],
+        frozenTipCursor: JournalCursor?, frozenTipDigest: String?,
+        branchTip: EventRef?, nextBeforeCursor: JournalCursor?,
+        hasEarlier: Bool, hasNewer: Bool,
+        status: WorkServiceConversationHistoryStatus,
+        omissions: [WorkServiceOmission]
+    ) -> WorkServiceConversationHistoryWindow {
+        WorkServiceConversationHistoryWindow(
+            messages: messages, frozenTipCursor: frozenTipCursor,
+            frozenTipDigest: frozenTipDigest, branchTip: branchTip,
+            nextBeforeCursor: nextBeforeCursor, hasEarlier: hasEarlier,
+            hasNewer: hasNewer, status: status,
+            omissions: Self.boundedOmissions(omissions),
+            generation: historyStorage.generation + 1)
     }
 
     /// Construct and admit Start using the latest canonical Work cursor and exact Session
@@ -1952,7 +2406,12 @@ public actor WorkServiceAttachedWorkController {
         session: SessionRef,
         journal: JournalRef
     ) -> Bool {
-        snapshot.journal == journal
+        let exactMessages = snapshot.messageHistory.allSatisfy {
+            validCheckpointMessage($0, journal: journal)
+        } && snapshot.messages.allSatisfy {
+            validCheckpointMessage($0, journal: journal)
+        }
+        return snapshot.journal == journal
             && snapshot.session == session
             && snapshot.lastSequence == cursor.sequence
             && snapshot.lastEventID == cursor.eventID
@@ -1962,6 +2421,19 @@ public actor WorkServiceAttachedWorkController {
             && snapshot.semanticProjectionValid
             && snapshot.quarantinedEvents.isEmpty
             && snapshot.unknownEvents.isEmpty
+            && exactMessages
+    }
+
+    private static func validCheckpointMessage(
+        _ message: SessionMessageSnapshot, journal: JournalRef
+    ) -> Bool {
+        guard let source = message.sourceEvent,
+              let cursor = message.sourceCursor else { return false }
+        return message.eventID == source.eventID
+            && source.journal == journal
+            && cursor.journal == journal
+            && cursor.eventID == source.eventID
+            && cursor.sequence > 0
     }
 
     private static func checkpointDigestUsable(
@@ -2594,6 +3066,20 @@ public actor WorkServiceAttachedWorkController {
     private static func mapReadError(_ error: Error) -> WorkServiceAttachedWorkControllerError {
         if let error = error as? WorkServiceAttachedWorkControllerError { return error }
         if case WorkServiceProtocolError.sourceIncomplete = error { return .sourceIncomplete }
+        if case WorkServiceTransportError.remote(let code, _) = error {
+            switch code {
+            case .sourceIncomplete, .eventPageCannotProgress:
+                return .sourceIncomplete
+            case .staleCursor:
+                return .staleCursor
+            case .identityMismatch:
+                return .hostMismatch
+            case .capabilityDenied:
+                return .capabilityDenied(.observe)
+            default:
+                break
+            }
+        }
         return .transportFailure
     }
 
@@ -2621,4 +3107,6 @@ private enum WorkServiceAttachedWorkControllerBounds {
     static let maxPages = 256
     static let maxOmissions = 32
     static let maxDiagnostics = 32
+    static let historyWindowMessages = 768
+    static let historyWindowBytes = 512 * 1024
 }

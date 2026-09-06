@@ -48,6 +48,18 @@ private func localDaemonLauncherWaitForFile(
     return FileManager.default.fileExists(atPath: url.path)
 }
 
+private func localDaemonLauncherWaitForExit(
+    _ pid: Int32,
+    timeout: TimeInterval = 3
+) async throws -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if kill(pid, 0) != 0 { return true }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    return kill(pid, 0) != 0
+}
+
 private func localDaemonLauncherReadLines(_ url: URL) throws -> [String] {
     let data = try Data(contentsOf: url)
     guard let value = String(data: data, encoding: .utf8) else { return [] }
@@ -275,7 +287,8 @@ func testLocalAviaryDaemonLauncherSpawnsDetachedWithExactArguments() async throw
     _ = try? await launchTask.value
     XCTAssertTrue(try await localDaemonLauncherWaitForFile(doneLog, timeout: 3),
                   "child must survive launcher/client cancellation")
-    XCTAssertNotEqual(kill(pid, 0), 0, "fixture child must exit on its own")
+    XCTAssertTrue(try await localDaemonLauncherWaitForExit(pid),
+                  "fixture child must exit on its own")
 }
 
 let casesLocalAviaryDaemonLauncher: [Case] = [

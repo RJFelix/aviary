@@ -315,6 +315,16 @@ struct RunPane: View {
                     hideThinking: model.hideThinking,
                     isStreaming: run.isStreaming,
                     autoScroll: true,
+                    hasEarlierHistory: run.serviceHistoryHasEarlier,
+                    hasNewerHistory: run.serviceHistoryHasNewer,
+                    isLoadingEarlierHistory: run.serviceHistoryIsLoading,
+                    earlierHistoryError: run.serviceHistoryError,
+                    onLoadEarlierHistory: run.isServiceBacked ? {
+                        Task { await run.loadEarlierServiceHistory() }
+                    } : nil,
+                    onJumpToLatestHistory: run.isServiceBacked ? {
+                        await run.jumpServiceHistoryToLatest()
+                    } : nil,
                     onSelect: { selectedItem = $0 })
                 Divider()
                 composer

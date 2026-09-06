@@ -281,10 +281,10 @@ func test_workServiceHandshakeIsVersionedAndHostIdentityIsOpaque() async throws 
         XCTAssertEqual(version, 999)
     }
     do {
-        _ = try await service.handshake(.init(protocolVersion: 1, client: ClientRef("gui-a")))
-        XCTFail("protocol v1 must not survive the hard v2 cutover")
+        _ = try await service.handshake(.init(protocolVersion: 2, client: ClientRef("gui-a")))
+        XCTFail("protocol v2 must not survive the history-paging cutover")
     } catch WorkServiceProtocolError.unsupportedVersion(let version) {
-        XCTAssertEqual(version, 1)
+        XCTAssertEqual(version, 2)
     }
 
     // The advertised surface describes what this particular host instance can execute. A

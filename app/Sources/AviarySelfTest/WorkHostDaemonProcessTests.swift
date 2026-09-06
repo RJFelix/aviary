@@ -99,6 +99,11 @@ private actor HangingWorkService: WorkServiceClient {
         fatalError("unused hanging-service operation")
     }
 
+    func historyBeforeCursor(_ request: WorkServiceHistoryRequest) async throws
+        -> WorkServiceHistoryPage {
+        fatalError("unused hanging-service operation")
+    }
+
     func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws
         -> WorkServiceArtifactDescriptor {
         fatalError("unused hanging-service operation")
@@ -180,6 +185,11 @@ private actor HangingMutationWorkService: WorkServiceClient {
 
     func eventsAfterCursor(_ request: WorkServiceEventsRequest) async throws
         -> WorkServiceEventPage {
+        fatalError("unused hanging-mutation operation")
+    }
+
+    func historyBeforeCursor(_ request: WorkServiceHistoryRequest) async throws
+        -> WorkServiceHistoryPage {
         fatalError("unused hanging-mutation operation")
     }
 

@@ -70,11 +70,14 @@ final class ServiceBackedRunBridge {
 
     private(set) var projection: WorkServiceAttachedWorkProjection
     private(set) var inputDeliveryProjection: CanonicalInputDeliveryProjection
+    private(set) var history: WorkServiceConversationHistoryWindow
+    private(set) var historyError: String?
     private(set) var lastError: String?
 
     init(
         controller: WorkServiceAttachedWorkController,
         projection: WorkServiceAttachedWorkProjection,
+        history: WorkServiceConversationHistoryWindow,
         serviceAttachmentKey: ServiceAttachmentKey,
         workspaceLabel: String,
         modelLabel: String?,
@@ -82,6 +85,7 @@ final class ServiceBackedRunBridge {
     ) {
         self.controller = controller
         self.projection = projection
+        self.history = history
         self.work = projection.descriptor.work
         self.serviceAttachmentKey = serviceAttachmentKey
         self.sessionID = projection.attachment.session?.sessionID ?? ""
@@ -117,7 +121,7 @@ final class ServiceBackedRunBridge {
     var actionPresentations: [WorkActionPresentation] {
         WorkActionPresentation.project(projection.activities)
     }
-    var visibleMessages: [SessionMessageSnapshot] { projection.visibleMessages }
+    var visibleMessages: [SessionMessageSnapshot] { history.messages }
     /// Delivery evidence comes from the canonical Session reducer, not from a Start receipt.
     /// Read the full message history so a bounded visible-message projection cannot make an
     /// already-delivered Workshop request look undelivered after a long conversation.
@@ -304,16 +308,49 @@ final class ServiceBackedRunBridge {
         do {
             let next = try await controller.refresh()
             projection = next
+            history = await controller.conversationHistory()
+            if history.status == .ready || history.status == .staleBranch {
+                // A successful refresh either recovered the page or proved that the Session
+                // selected another branch. In the latter case Return to latest is the truthful
+                // action; retaining a dead Retry banner would only issue a request the controller
+                // must reject.
+                historyError = nil
+            }
             inputDeliveryProjection = Self.makeInputDeliveryProjection(from: next)
             lastError = next.readDiagnostics.last
             return next
         } catch {
             let observed = await controller.projection()
             projection = observed
+            history = await controller.conversationHistory()
             inputDeliveryProjection = Self.makeInputDeliveryProjection(from: observed)
             lastError = Self.message(for: error, projection: observed)
             return observed
         }
+    }
+
+    /// Prepend one authenticated, bounded page without changing the controller's canonical
+    /// reducer, read acknowledgement, or command cursors.
+    @discardableResult
+    func loadEarlierHistory() async throws -> WorkServiceConversationHistoryWindow {
+        do {
+            history = try await controller.loadEarlierConversationHistory()
+            historyError = nil
+            return history
+        } catch {
+            history = await controller.conversationHistory()
+            historyError = Self.historyMessage(for: error)
+            throw error
+        }
+    }
+
+    /// Release this GUI's historical window and return to its newest authenticated projection.
+    /// This is presentation state only and does not write to Work or Session.
+    @discardableResult
+    func jumpHistoryToLatest() async -> WorkServiceConversationHistoryWindow {
+        history = await controller.jumpConversationHistoryToLatest()
+        historyError = nil
+        return history
     }
 
     func start(_ prompt: String, commandID: String? = nil) async throws -> WorkServiceCommandReceipt {
@@ -438,5 +475,23 @@ final class ServiceBackedRunBridge {
             return "The Work Host connection is disconnected; Work remains durable and can be reattached."
         }
         return "The Work Host could not provide a complete canonical projection."
+    }
+
+    private static func historyMessage(for error: Error) -> String {
+        if let error = error as? WorkServiceAttachedWorkControllerError {
+            switch error {
+            case .sourceIncomplete, .recoveryRequired, .malformedResponse:
+                return "Earlier history could not be verified against the canonical Session."
+            case .capabilityDenied:
+                return "This attachment is not authorized to read earlier history."
+            case .hostMismatch:
+                return "The Work Host identity changed while earlier history was loading."
+            case .terminalWork:
+                return "Earlier history is unavailable from this completed Work projection."
+            default:
+                break
+            }
+        }
+        return "Earlier history is temporarily unavailable. Your current transcript is unchanged."
     }
 }

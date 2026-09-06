@@ -393,8 +393,46 @@ internal struct InMemorySessionTransitionState: SessionTransitionState, Sendable
     }
 }
 
+public extension SessionMessageSnapshot {
+    /// Decode the canonical presentation value for a Session message event.
+    ///
+    /// History paging and the full Session reducer must share this exact conversion. A second
+    /// ad-hoc decoder could otherwise assign a different role, parent, timestamp, or provenance
+    /// to the same durable event and still render a superficially plausible conversation.
+    static func canonicalMessage(from event: TimelineEvent) -> SessionMessageSnapshot? {
+        let role: String
+        switch event.type {
+        case TimelineEventType.inputAccepted:
+            role = ChatRole.user.rawValue
+        case TimelineEventType.messageCommitted:
+            role = event.payload["role"]?.stringValue ?? ChatRole.assistant.rawValue
+        default:
+            return nil
+        }
+        guard let text = event.payload["text"]?.stringValue else { return nil }
+        let parent = event.conversationParent
+            ?? event.payload["conversation_parent"].flatMap { decodeTimelineValue($0) }
+        if event.payload["conversation_parent"] != nil && parent == nil { return nil }
+        return SessionMessageSnapshot(
+            eventID: event.eventID, role: role, text: text, conversationParent: parent,
+            sourceEvent: EventRef(journal: event.journal, eventID: event.eventID),
+            sourceCursor: JournalCursor(
+                journal: event.journal, eventID: event.eventID, sequence: event.sequence),
+            hostRecordedAt: event.hostRecordedAt, clientTimestamp: event.clientTimestamp,
+            run: event.run, turn: event.turn, actor: event.actor,
+            client: event.client, sessionAttachment: event.sessionAttachment,
+            causedBy: event.causedByEventID, parentActivity: event.parentActivityID,
+            provenance: event.provenance, links: event.links)
+    }
+
+    /// Empty assistant fragments are canonical ancestry nodes but not conversation rows.
+    var isPresentationVisible: Bool {
+        role != ChatRole.assistant.rawValue || !text.isEmpty
+    }
+}
+
 private func sessionMessageIsPresentationVisible(_ message: SessionMessageSnapshot) -> Bool {
-    message.role != ChatRole.assistant.rawValue || !message.text.isEmpty
+    message.isPresentationVisible
 }
 
 // MARK: - Shared Session semantics
@@ -730,7 +768,7 @@ internal enum SessionReducerTransition {
     private static func appendMessage<State: SessionTransitionState>(
         _ event: TimelineEvent, role: String, state: inout State
     ) {
-        guard let text = event.payload["text"]?.stringValue else {
+        guard event.payload["text"]?.stringValue != nil else {
             quarantine(event, state: &state, reason: "message is missing text")
             return
         }
@@ -740,14 +778,17 @@ internal enum SessionReducerTransition {
             quarantine(event, state: &state, reason: "message conversation parent is malformed")
             return
         }
-        state.stageMessage(SessionMessageSnapshot(
-            eventID: event.eventID, role: role, text: text, conversationParent: parent,
-            sourceEvent: EventRef(journal: event.journal, eventID: event.eventID),
-            hostRecordedAt: event.hostRecordedAt, clientTimestamp: event.clientTimestamp,
-            run: event.run, turn: event.turn, actor: event.actor,
-            client: event.client, sessionAttachment: event.sessionAttachment,
-            causedBy: event.causedByEventID, parentActivity: event.parentActivityID,
-            provenance: event.provenance, links: event.links))
+        guard let message = SessionMessageSnapshot.canonicalMessage(from: event) else {
+            quarantine(event, state: &state, reason: "message could not be projected")
+            return
+        }
+        // `role` is retained in this private signature so the switch above remains an explicit
+        // reducer contract. The shared decoder independently derives and must agree with it.
+        guard message.role == role else {
+            quarantine(event, state: &state, reason: "message role is inconsistent")
+            return
+        }
+        state.stageMessage(message)
     }
 
     private static func rebuildVisibleMessages<State: SessionTransitionState>(

@@ -2303,6 +2303,60 @@ public actor JournalBackedWorkService: WorkServiceClient {
             prefixDigest: page.prefixDigest, omissions: page.omissions)
     }
 
+    public func historyBeforeCursor(
+        _ request: WorkServiceHistoryRequest
+    ) async throws -> WorkServiceHistoryPage {
+        try await ensureLoaded()
+        try validateClient(request.client)
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        let attachment = try await requireAttached(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            client: request.client, capability: .observe)
+        guard case .session(let session, let journal) = request.target else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "history paging requires a Session target")
+        }
+        try await validateReadableTarget(request.target, attachment: attachment, source: source)
+        let entry = try await records(for: request.target, source: source)
+        guard entry.isFullyResident else {
+            // A sparse resident cache can serve forward reducer pages, but reverse conversation
+            // paging requires branch membership. Until the store has persisted branch anchors,
+            // refusing is more truthful than presenting physical non-message events as chat.
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let records = entry.result.records
+        let sessionSnapshot: SessionSnapshot
+        if session == source.session {
+            sessionSnapshot = source.sessionState
+        } else {
+            var reducer = SessionReducer()
+            for record in entry.result.records { reducer.apply(record.event) }
+            sessionSnapshot = reducer.snapshot
+        }
+        let visibleIDs: Set<String> = Set(sessionSnapshot.messages.compactMap {
+            guard let ref = $0.sourceEvent, ref.journal == journal else { return nil }
+            return ref.eventID
+        })
+        let visible = records.filter { visibleIDs.contains($0.event.eventID) }
+        if let requestedBranchTip = request.branchTip,
+           requestedBranchTip != sessionSnapshot.semanticTip {
+            let actual = entry.lastRecord.map {
+                JournalCursor(journal: journal, eventID: $0.event.eventID,
+                              sequence: $0.event.sequence)
+            } ?? JournalCursor(journal: journal, sequence: 0)
+            throw WorkServiceProtocolError.staleCursor(
+                expected: request.frozenTipCursor ?? JournalCursor(journal: journal, sequence: 0),
+                actual: actual)
+        }
+        let branchTip = request.branchTip ?? sessionSnapshot.semanticTip
+        return try historyPage(
+            entry: entry, records: records, visible: visible, target: request.target,
+            before: request.beforeCursor, frozenTip: request.frozenTipCursor,
+            frozenDigest: request.frozenTipDigest, branchTip: branchTip,
+            journal: journal, work: try await descriptor(for: request.work, client: request.client),
+            limit: request.limit, maxBytes: request.maxBytes)
+    }
+
     public func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws
         -> WorkServiceArtifactDescriptor {
         try await ensureLoaded()
@@ -4561,6 +4615,96 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let basePrefixDigest: String?
         let prefixDigest: String?
         let omissions: [WorkServiceOmission]
+    }
+
+    private func historyPage(
+        entry: JournalReadCacheEntry, records: [TimelineJournalRecord],
+        visible: [TimelineJournalRecord], target: WorkServiceReadTarget,
+        before: JournalCursor?, frozenTip: JournalCursor?, frozenDigest: String?,
+        branchTip: EventRef?, journal: JournalRef, work: WorkServiceWorkDescriptor,
+        limit: Int, maxBytes: Int
+    ) throws -> WorkServiceHistoryPage {
+        guard limit > 0, limit <= WorkServiceBounds.maxEventsPerPage,
+              maxBytes > 0, maxBytes <= WorkServiceBounds.maxEventPageBytes else {
+            throw WorkServiceProtocolError.invalidRequest("history page bounds are invalid")
+        }
+        let currentTip = entry.lastRecord.map {
+            JournalCursor(journal: journal, eventID: $0.event.eventID, sequence: $0.event.sequence)
+        } ?? JournalCursor(journal: journal, sequence: 0)
+        let frozen = frozenTip ?? currentTip
+        guard frozen.journal == journal, frozen.sequence >= 0,
+              frozen.sequence <= currentTip.sequence else {
+            throw WorkServiceProtocolError.invalidRequest("history frozen tip is foreign or ahead")
+        }
+        let actualFrozenDigest = try prefixDigest(
+            for: frozen, entry: entry, records: records,
+            sequenceToIndex: entry.sequenceToIndex, journal: journal) ?? entry.prefixSeed
+        if let frozenDigest, frozenDigest != actualFrozenDigest {
+            throw WorkServiceProtocolError.staleCursor(expected: frozen, actual: currentTip)
+        }
+        if let branchTip {
+            guard branchTip.journal == journal,
+                  records.contains(where: { $0.event.eventID == branchTip.eventID }) else {
+                throw WorkServiceProtocolError.staleCursor(expected: frozen, actual: currentTip)
+            }
+        }
+        let branchVisible = visible.filter { $0.event.sequence <= frozen.sequence }
+        let cutoff: Int
+        if let before {
+            guard before.journal == journal, before.sequence >= 0,
+                  before.sequence <= frozen.sequence else {
+                throw WorkServiceProtocolError.invalidRequest("history boundary is foreign or ahead")
+            }
+            if before.sequence > 0 {
+                guard branchVisible.contains(where: {
+                    $0.event.sequence == before.sequence && $0.event.eventID == before.eventID
+                }) else {
+                    throw WorkServiceProtocolError.invalidRequest(
+                        "history boundary must identify a visible message")
+                }
+            } else if before.eventID != nil {
+                throw WorkServiceProtocolError.invalidRequest("history baseline has an event ID")
+            }
+            cutoff = before.sequence
+        } else { cutoff = Int.max }
+        let candidates = branchVisible.filter { $0.event.sequence < cutoff }
+        var selected: [TimelineEvent] = []
+        var bytes = 0
+        for record in candidates.reversed() {
+            guard selected.count < limit else { break }
+            let size = try WorkServiceEventPageSizing.encodedByteCount(of: record.event)
+            guard size <= maxBytes else {
+                if selected.isEmpty {
+                    throw WorkServiceProtocolError.eventPageCannotProgress(
+                        requiredBytes: size, maximumBytes: maxBytes)
+                }
+                break
+            }
+            guard bytes + size <= maxBytes else { break }
+            selected.append(record.event)
+            bytes += size
+        }
+        selected.reverse()
+        let lower = selected.first.map {
+            JournalCursor(journal: journal, eventID: $0.eventID, sequence: $0.sequence)
+        }
+        let upper = selected.last.map {
+            JournalCursor(journal: journal, eventID: $0.eventID, sequence: $0.sequence)
+        }
+        let hasOlder = candidates.count > selected.count
+        let pageDigest = try WorkServiceHistoryPageEvidence.digest(
+            events: selected, target: target, cursor: upper ?? frozen)
+        let omissions = hasOlder ? [WorkServiceOmission(
+            category: "history", count: min(candidates.count - selected.count,
+                                              WorkServiceBounds.maxOmissionCount),
+            diagnostic: "older visible messages remain")] : []
+        return WorkServiceHistoryPage(
+            work: work,
+            events: selected, target: target, lowerBoundaryCursor: lower,
+            upperBoundaryCursor: upper, nextBeforeCursor: hasOlder ? lower : nil,
+            hasOlder: hasOlder, frozenTipCursor: frozen,
+            frozenTipDigest: frozenDigest ?? actualFrozenDigest,
+            prefixDigest: pageDigest, branchTip: branchTip, omissions: omissions)
     }
 
     private func page(

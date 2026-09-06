@@ -1,6 +1,6 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; exact Work/Session continuation, production service/control-reader cutover, Session-qualified Run routing, and GUI new-Session-to-existing-Work composition have completed integrated macOS/Linux/cross-device verification; the first Phase 2 canonical workspace, explicit input-delivery, dual context/working-state inspector, and Phase 4A Action Lens slices are implemented
+Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; exact Work/Session continuation, production service/control-reader cutover, Session-qualified Run routing, and GUI new-Session-to-existing-Work composition have completed integrated macOS/Linux/cross-device verification; the first Phase 2 canonical workspace, explicit input-delivery, dual context/working-state inspector, paged service-backed conversation history, and Phase 4A Action Lens slices are implemented
 Date: 2026-09-06
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
@@ -210,6 +210,47 @@ defect after the malformed artifact producer/DTO/transport boundaries were align
 uninterrupted integrated run passes 956 cases / 13,640 assertions in 389.43 seconds; `just compile`
 and signed release-app assembly pass. The release fixture hashes are `ac797b96dc3e...06a6`,
 `0f44c6a28e40...9845`, and `4628581ac791...5fe1` respectively, identical across rerenders.
+
+Conversation-history paging checkpoint (2026-09-06): Work service protocol v3 adds an
+observe-authorized reverse Session-history operation with an exclusive message cursor, frozen
+physical journal tip and prefix digest, selected-branch identity, bounded canonical event envelopes,
+and a response-local evidence digest recomputable from exactly the delivered rows. Physical control
+events and off-branch messages are never relabeled as conversation. Appends after the frozen tip are
+safe; replacement, truncation, branch mismatch, foreign identities, forged boundaries/digests,
+oversized first events, and incomplete sources fail closed. Pre-v3 daemons fail the handshake rather
+than accepting a GUI operation they cannot decode.
+
+Each attached GUI owns an independent 768-message/512-KiB presentation window. Loading earlier rows
+does not advance canonical reducer cursors, read acknowledgements, control cursors, or Work commands;
+another GUI can remain at the latest window. Duplicate top triggers admit one read, a refresh racing
+the suspended page retains the reader's frozen rows and marks newer output, explicit Return to latest
+supersedes a late success or failure, and every rejected page leaves authenticated rows intact for an
+explicit retry. Branch replacement preserves the old window as stale evidence until Return to latest.
+The production transcript distinguishes bounded prepend, bounded tail rotation, streaming text
+mutation, and Session replacement by stable event-derived identity. Prepend reanchors the former
+first row; tail output follows only when already at bottom and otherwise produces an unread/Jump
+control. Wide and 520-point deterministic production-view fixtures keep Load earlier and Return to
+latest labeled, keyboard-reachable, and non-color-dependent. GUI checkpoint schema v5 deliberately
+invalidates disposable pre-cursor snapshots; persistent Session exact-state reconstruction now also
+restores the exact message source cursor.
+
+This is a bounded GUI and wire-page claim, not yet an arbitrary-scale storage claim. The journal-
+backed host currently serves reverse pages only while its canonical record cache is resident (up to
+one million records/256 MiB), and that cache still owns a lifetime-sized `SessionReducer` message
+projection. Nonresident reverse reads fail explicitly until a persistent selected-branch message
+index and authenticated sparse reverse anchors exist. Therefore the 100,000-event and O(window)
+resident-memory exit criteria remain open even though ordinary visible history is now incrementally
+pageable. Current focused receipts are history 14 cases / 157 assertions, attached controller 31 /
+288, persistent Session exact state 12 / 1,206, and protocol/daemon handshake 9 / 91. The signed
+release app builds, `just compile` passes, and the uninterrupted integrated suite passes 960 cases /
+13,718 assertions in 422.93 seconds. A scheduler-sensitive launcher fixture discovered by that run
+now waits for the child process's actual exit boundary and passes five consecutive isolated runs plus
+the integrated rerun. The final history fixtures are `conversation-history-fixture.png` (1600x1032,
+`5af49072fd40...86a`) and `conversation-history-narrow-fixture.png` (520x932,
+`570479e722f6...236`), both visually inspected cleanly; the narrow fixture is byte-identical across
+rerenders. Independent high-judgment review found no
+remaining P0/P1 issue after the page-digest, refresh-race, bounded-anchor, protocol-version,
+checkpoint-rollout, stale-retry, and persistent-source-cursor corrections.
 
 Phase 3C closure checkpoint (2026-09-04): accepted and duplicate service commands no longer
 become UI truth on the strength of a transport receipt. The client retains the exact command
@@ -637,8 +678,9 @@ The most important problems are cross-layer seams, not missing decoration.
   populated. The core agent supports the distinction, but the product surface currently does not.
 - **Abort** tears down the attached driver and runtime rather than canceling only the active turn.
 - Cancellation is only observed at agent-loop boundaries, so the label also overstates immediacy.
-- Auto-scroll follows new content unconditionally instead of preserving a reader's position and
-  offering a clear “Jump to latest” affordance.
+- **Implemented for service-backed conversations (2026-09-06):** bounded prepends preserve a
+  stable row anchor; new tail content follows only from the bottom and otherwise exposes unread /
+  Jump or Return to latest controls. Local/catalog history still needs the same shared paging seam.
 - The launcher exposes thinking, persistence, and context controls that are not passed consistently
   through the in-house start path. Payload recording also receives an unrelated identity, so the
   running session cannot reliably expose its own wire log.

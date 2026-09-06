@@ -164,6 +164,12 @@ public actor WorkHostDaemonAdmissionGate: WorkServiceClient {
         return try await service.eventsAfterCursor(request)
     }
 
+    public func historyBeforeCursor(_ request: WorkServiceHistoryRequest) async throws
+        -> WorkServiceHistoryPage {
+        try enter(); defer { leave() }
+        return try await service.historyBeforeCursor(request)
+    }
+
     public func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws
         -> WorkServiceArtifactDescriptor {
         try enter(); defer { leave() }

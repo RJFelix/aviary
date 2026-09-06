@@ -6,9 +6,12 @@ import Foundation
 /// in-memory reference service; a Unix-domain socket and a remote transport can encode these
 /// values without changing their meaning.
 public enum WorkServiceProtocol {
-    public static let currentVersion = 2
-    public static let minimumSupportedVersion = 2
-    public static let maximumSupportedVersion = 2
+    // Version 3 adds authenticated reverse conversation-history pages. There is deliberately no
+    // v2 compatibility path: an older daemon must fail the handshake instead of accepting a GUI
+    // whose history operation it cannot decode.
+    public static let currentVersion = 3
+    public static let minimumSupportedVersion = 3
+    public static let maximumSupportedVersion = 3
 }
 
 /// A bounded surface is intentional: protocol values must be safe to render even when a remote
@@ -1230,6 +1233,123 @@ public struct WorkServiceEventsRequest: Codable, Hashable, Sendable {
     }
 }
 
+/// A bounded reverse read for conversation history. It is deliberately separate from the
+/// reducer/read cursor: `beforeCursor` is an exclusive display-history boundary and may be
+/// advanced independently by several GUIs observing the same Session.
+public struct WorkServiceHistoryRequest: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let journal: JournalRef
+    public let attachment: ClientAttachmentRef
+    public let client: ClientRef
+    public let target: WorkServiceReadTarget
+    /// Exclusive upper boundary. Nil means the current canonical tip on the first request.
+    public let beforeCursor: JournalCursor?
+    /// Once established, continuation is pinned to this tip. Appends after it are allowed, but
+    /// replacement, truncation, or mutation of the frozen prefix must fail closed.
+    public let frozenTipCursor: JournalCursor?
+    public let frozenTipDigest: String?
+    /// Semantic branch identity from the Session reducer. A continuation must remain on this
+    /// branch; physical journal events outside it are never exposed as chat history.
+    public let branchTip: EventRef?
+    public let limit: Int
+    public let maxBytes: Int
+
+    public init(work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
+                client: ClientRef, target: WorkServiceReadTarget,
+                beforeCursor: JournalCursor? = nil,
+                frozenTipCursor: JournalCursor? = nil, frozenTipDigest: String? = nil,
+                branchTip: EventRef? = nil,
+                limit: Int = WorkServiceBounds.maxEventsPerPage,
+                maxBytes: Int = WorkServiceBounds.maxEventPageBytes) {
+        self.work = work
+        self.journal = journal
+        self.attachment = attachment
+        self.client = client
+        self.target = target
+        self.beforeCursor = beforeCursor
+        self.frozenTipCursor = frozenTipCursor
+        self.frozenTipDigest = frozenTipDigest
+        self.branchTip = branchTip
+        self.limit = limit
+        self.maxBytes = maxBytes
+    }
+}
+
+public struct WorkServiceHistoryPage: Codable, Hashable, Sendable {
+    public let work: WorkServiceWorkDescriptor
+    public let events: [TimelineEvent]
+    public let target: WorkServiceReadTarget
+    public let lowerBoundaryCursor: JournalCursor?
+    public let upperBoundaryCursor: JournalCursor?
+    public let nextBeforeCursor: JournalCursor?
+    public let hasOlder: Bool
+    public let frozenTipCursor: JournalCursor
+    public let frozenTipDigest: String
+    public let branchTip: EventRef?
+    /// Digest of the selected message sequence ending at the returned upper boundary. Physical
+    /// Session events can occur between messages, so this is intentionally not described as a
+    /// digest of the complete journal prefix; frozenTipDigest carries that separate evidence.
+    public let prefixDigest: String
+    public let omissions: [WorkServiceOmission]
+
+    public init(work: WorkServiceWorkDescriptor, events: [TimelineEvent], target: WorkServiceReadTarget,
+                lowerBoundaryCursor: JournalCursor?, upperBoundaryCursor: JournalCursor?,
+                nextBeforeCursor: JournalCursor?, hasOlder: Bool,
+                frozenTipCursor: JournalCursor, frozenTipDigest: String,
+                prefixDigest: String, branchTip: EventRef? = nil,
+                omissions: [WorkServiceOmission] = []) {
+        self.work = work
+        self.events = events
+        self.target = target
+        self.lowerBoundaryCursor = lowerBoundaryCursor
+        self.upperBoundaryCursor = upperBoundaryCursor
+        self.nextBeforeCursor = nextBeforeCursor
+        self.hasOlder = hasOlder
+        self.frozenTipCursor = frozenTipCursor
+        self.frozenTipDigest = frozenTipDigest
+        self.branchTip = branchTip
+        self.prefixDigest = prefixDigest
+        self.omissions = omissions
+    }
+}
+
+/// Deterministic, page-local evidence for reverse conversation history. This is intentionally
+/// distinct from ``frozenTipDigest``: the latter authenticates the complete physical journal
+/// prefix, while this digest is recomputable from the response's selected message envelopes.
+/// Including the target journal and exact page cursor prevents the same event bytes from being
+/// replayed as evidence for another Session or boundary.
+internal enum WorkServiceHistoryPageEvidence {
+    private static let version = "aviary-history-page-v1"
+
+    static func digest(
+        events: [TimelineEvent], target: WorkServiceReadTarget, cursor: JournalCursor
+    ) throws -> String {
+        guard cursor.journal == target.journal else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
+        var data = Data()
+        data.append(Data((version + "\u{0}" + target.journal.stableKey + "\u{0}").utf8))
+        switch target {
+        case .work:
+            data.append(Data("work\u{0}".utf8))
+        case .session(let session, _):
+            data.append(Data(("session\u{0}" + session.sessionID + "\u{0}").utf8))
+        }
+        data.append(Data((String(cursor.sequence) + "\u{0}" +
+                          (cursor.eventID ?? "") + "\u{0}").utf8))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        for event in events {
+            guard event.journal == target.journal else {
+                throw WorkServiceProtocolError.journalMismatch
+            }
+            data.append(try encoder.encode(event))
+            data.append(0)
+        }
+        return WorkServiceText.digest(data)
+    }
+}
+
 public struct WorkServiceUpdateCapabilitiesRequest: Codable, Hashable, Sendable {
     public let work: WorkRef
     public let journal: JournalRef
@@ -1949,6 +2069,8 @@ public protocol WorkServiceClient: Sendable {
         -> WorkServiceAcknowledgeReadResponse
     func snapshot(_ request: WorkServiceSnapshotRequest) async throws -> WorkServiceSnapshot
     func eventsAfterCursor(_ request: WorkServiceEventsRequest) async throws -> WorkServiceEventPage
+    func historyBeforeCursor(_ request: WorkServiceHistoryRequest) async throws
+        -> WorkServiceHistoryPage
     func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws
         -> WorkServiceArtifactDescriptor
     func fetchBody(_ request: WorkServiceBodyRequest) async throws -> WorkServiceBodyResponse
@@ -3283,6 +3405,42 @@ public actor InMemoryWorkService: WorkServiceClient {
                 : [])
     }
 
+    public func historyBeforeCursor(
+        _ request: WorkServiceHistoryRequest
+    ) async throws -> WorkServiceHistoryPage {
+        try requireReachable()
+        let state = try attachedState(work: request.work, journal: request.journal,
+                                      attachment: request.attachment, client: request.client,
+                                      requiring: .observe)
+        let target = try readTarget(request.target, for: state, attachment: request.attachment)
+        guard target.journal.kind == .session, request.target.session != nil else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "history paging requires a Session target")
+        }
+        var reducer = SessionReducer()
+        for event in target.events { reducer.apply(event) }
+        let projected = reducer.snapshot
+        let visibleIDs: Set<String> = Set(projected.messages.compactMap {
+            guard let source = $0.sourceEvent, source.journal == target.journal else { return nil }
+            return source.eventID
+        })
+        let all = target.events.filter { visibleIDs.contains($0.eventID) }
+        if let requestedBranchTip = request.branchTip,
+           requestedBranchTip != projected.semanticTip {
+            throw WorkServiceProtocolError.staleCursor(
+                expected: request.frozenTipCursor
+                    ?? JournalCursor(journal: target.journal, sequence: 0),
+                actual: target.cursor)
+        }
+        let effectiveBranchTip = request.branchTip ?? projected.semanticTip
+        return try historyPage(
+            events: target.events, visibleEvents: all, journal: target.journal, target: request.target,
+            before: request.beforeCursor, frozenTip: request.frozenTipCursor,
+            frozenDigest: request.frozenTipDigest, branchTip: effectiveBranchTip,
+            work: try requiredDescriptor(for: state.work, includeObservation: true),
+            limit: request.limit, maxBytes: request.maxBytes)
+    }
+
     public func updateCapabilities(
         _ request: WorkServiceUpdateCapabilitiesRequest
     ) async throws -> WorkServiceUpdateCapabilitiesResponse {
@@ -3958,6 +4116,120 @@ public actor InMemoryWorkService: WorkServiceClient {
             let events = record?.journal == journal ? (record?.events ?? []) : []
             return (journal, cursor, events)
         }
+    }
+
+    private func historyPage(
+        events: [TimelineEvent], visibleEvents: [TimelineEvent]? = nil,
+        journal: JournalRef, target: WorkServiceReadTarget,
+        before: JournalCursor?, frozenTip: JournalCursor?, frozenDigest: String?,
+        branchTip: EventRef?, work: WorkServiceWorkDescriptor,
+        limit: Int, maxBytes: Int
+    ) throws -> WorkServiceHistoryPage {
+        guard limit > 0, limit <= WorkServiceBounds.maxEventsPerPage,
+              maxBytes > 0, maxBytes <= WorkServiceBounds.maxEventPageBytes else {
+            throw WorkServiceProtocolError.invalidRequest("history page bounds are invalid")
+        }
+        let allEvents: [TimelineEvent]
+        switch target {
+        case .work: allEvents = events
+        case .session: allEvents = events
+        }
+        guard allEvents.allSatisfy({ $0.journal == journal }) else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let currentTip = allEvents.last.map {
+            JournalCursor(journal: journal, eventID: $0.eventID, sequence: $0.sequence)
+        } ?? JournalCursor(journal: journal, sequence: 0)
+        let frozen = frozenTip ?? currentTip
+        guard frozen.journal == journal, frozen.sequence >= 0,
+              frozen.sequence <= currentTip.sequence else {
+            throw WorkServiceProtocolError.invalidRequest("history frozen tip is foreign or ahead")
+        }
+        if frozen.sequence > 0 {
+            guard allEvents.contains(where: {
+                $0.sequence == frozen.sequence && $0.eventID == frozen.eventID
+            }) else { throw WorkServiceProtocolError.staleCursor(expected: frozen, actual: currentTip) }
+        } else if frozen.eventID != nil {
+            throw WorkServiceProtocolError.invalidRequest("history baseline tip has an event ID")
+        }
+        let actualFrozenDigest = prefixDigest(allEvents, cursor: frozen)
+        if let frozenDigest {
+            guard frozenDigest == actualFrozenDigest else {
+                throw WorkServiceProtocolError.staleCursor(expected: frozen, actual: currentTip)
+            }
+        }
+        let effectiveDigest = frozenDigest ?? actualFrozenDigest
+        guard effectiveDigest == actualFrozenDigest else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        if let branchTip {
+            guard branchTip.journal == journal,
+                  allEvents.contains(where: { $0.eventID == branchTip.eventID }) else {
+                throw WorkServiceProtocolError.staleCursor(expected: frozen, actual: currentTip)
+            }
+        }
+        let visible = (visibleEvents ?? allEvents).filter { $0.sequence <= frozen.sequence }
+        let cutoff: Int
+        if let before {
+            guard before.journal == journal, before.sequence >= 0,
+                  before.sequence <= frozen.sequence else {
+                throw WorkServiceProtocolError.invalidRequest("history boundary is foreign or ahead")
+            }
+            if before.sequence > 0 {
+                guard visible.contains(where: {
+                    $0.sequence == before.sequence && $0.eventID == before.eventID
+                }) else {
+                    throw WorkServiceProtocolError.invalidRequest(
+                        "history boundary must identify a visible message")
+                }
+            } else if before.eventID != nil {
+                throw WorkServiceProtocolError.invalidRequest("history baseline has an event ID")
+            }
+            cutoff = before.sequence
+        } else {
+            cutoff = Int.max
+        }
+        let candidates = visible.filter { $0.sequence < cutoff }
+        var selected: [TimelineEvent] = []
+        var bytes = 0
+        for event in candidates.reversed() {
+            guard selected.count < limit else { break }
+            let size = try WorkServiceEventPageSizing.encodedByteCount(of: event)
+            guard size <= maxBytes else {
+                if selected.isEmpty {
+                    throw WorkServiceProtocolError.eventPageCannotProgress(
+                        requiredBytes: size, maximumBytes: maxBytes)
+                }
+                break
+            }
+            guard bytes + size <= maxBytes else { break }
+            selected.append(event)
+            bytes += size
+        }
+        selected.reverse()
+        let lower = selected.first.map { JournalCursor(journal: journal, eventID: $0.eventID, sequence: $0.sequence) }
+        let upper = selected.last.map { JournalCursor(journal: journal, eventID: $0.eventID, sequence: $0.sequence) }
+        let hasOlder = candidates.count > selected.count
+        let nextBefore = hasOlder ? lower : nil
+        // The page contains only selected conversation messages, not physical control events.
+        // Hashing the selected sequence keeps this field recomputable from the response and does
+        // not imply that omitted physical events were delivered to the caller.
+        let pageDigest = try WorkServiceHistoryPageEvidence.digest(
+            events: selected, target: target, cursor: upper ?? frozen)
+        var omissions: [WorkServiceOmission] = []
+        if hasOlder {
+            omissions.append(WorkServiceOmission(
+                category: "history", count: min(candidates.count - selected.count,
+                                                  WorkServiceBounds.maxOmissionCount),
+                diagnostic: "older visible messages remain"))
+        }
+        return WorkServiceHistoryPage(
+            work: work,
+            events: selected, target: target, lowerBoundaryCursor: lower,
+            upperBoundaryCursor: upper, nextBeforeCursor: nextBefore,
+            hasOlder: hasOlder, frozenTipCursor: frozen,
+            frozenTipDigest: effectiveDigest, prefixDigest: pageDigest,
+            branchTip: branchTip, omissions: omissions)
     }
 
     private func validatedAfter(

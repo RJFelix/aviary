@@ -34,6 +34,7 @@ private actor CatalogTestConnection: WorkServiceClientConnection {
     func acknowledgeRead(_ request: WorkServiceAcknowledgeReadRequest) async throws -> WorkServiceAcknowledgeReadResponse { throw CatalogTestError.unsupported }
     func snapshot(_ request: WorkServiceSnapshotRequest) async throws -> WorkServiceSnapshot { throw CatalogTestError.unsupported }
     func eventsAfterCursor(_ request: WorkServiceEventsRequest) async throws -> WorkServiceEventPage { throw CatalogTestError.unsupported }
+    func historyBeforeCursor(_ request: WorkServiceHistoryRequest) async throws -> WorkServiceHistoryPage { throw CatalogTestError.unsupported }
     func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws -> WorkServiceArtifactDescriptor { throw CatalogTestError.unsupported }
     func fetchBody(_ request: WorkServiceBodyRequest) async throws -> WorkServiceBodyResponse { throw CatalogTestError.unsupported }
     func command(_ request: WorkServiceCommandRequest) async throws -> WorkServiceCommandReceipt { throw CatalogTestError.unsupported }

@@ -23,6 +23,7 @@ public enum WorkServiceTransportOperation: String, Codable, Hashable, Sendable {
     case acknowledgeRead = "acknowledge_read"
     case snapshot
     case eventsAfterCursor = "events_after_cursor"
+    case historyBeforeCursor = "history_before_cursor"
     case fetchArtifact = "fetch_artifact"
     case fetchBody = "fetch_body"
     case command
@@ -278,6 +279,20 @@ public enum WorkServiceTransportCodec {
                 try validateArray(data["omissions"], maxCount: WorkServiceBounds.maxOmissions)
                 try validatePrefixDigest(data["basePrefixDigest"])
                 try validatePrefixDigest(data["prefixDigest"])
+                for event in data["events"]?.arrayValue ?? [] {
+                    try validateTimelineEvent(event)
+                }
+            case .historyBeforeCursor:
+                try validateWorkDescriptor(data["work"] ?? .null)
+                try validateArray(data["events"], maxCount: WorkServiceBounds.maxEventsPerPage)
+                try validateArray(data["omissions"], maxCount: WorkServiceBounds.maxOmissions)
+                try validateCursor(data["lowerBoundaryCursor"])
+                try validateCursor(data["upperBoundaryCursor"])
+                try validateCursor(data["nextBeforeCursor"])
+                try validateCursor(data["frozenTipCursor"], required: true)
+                try validatePrefixDigest(data["frozenTipDigest"])
+                try validatePrefixDigest(data["prefixDigest"])
+                try validateEventRef(data["branchTip"])
                 for event in data["events"]?.arrayValue ?? [] {
                     try validateTimelineEvent(event)
                 }
@@ -907,6 +922,25 @@ public enum WorkServiceTransportCodec {
             try validateEventOwnership(
                 response.events, target: request.target, requestedWork: request.work,
                 expectedHostInstance: expectedHostInstance)
+        case .historyBeforeCursor:
+            let response: WorkServiceHistoryPage = try decodeResponseValue(
+                WorkServiceHistoryPage.self, from: data)
+            let request: WorkServiceHistoryRequest = try decodeRequestValue(
+                WorkServiceHistoryRequest.self, from: request.payload)
+            guard response.target == request.target,
+                  response.frozenTipCursor.journal == request.target.journal,
+                  response.frozenTipDigest.hasPrefix("sha256:"),
+                  response.frozenTipDigest.utf8.count == 71,
+                  response.events == response.events.sorted(by: { $0.sequence < $1.sequence }),
+                  response.events.map(\.eventID).count == Set(response.events.map(\.eventID)).count,
+                  response.hasOlder == (response.nextBeforeCursor != nil) else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+            if let expectedHostInstance {
+                try validateDescriptorHost(response.work, expected: expectedHostInstance)
+            }
+            try validateHistoryPage(
+                response, request: request, expectedHostInstance: expectedHostInstance)
         case .fetchArtifact:
             let response: WorkServiceArtifactDescriptor = try decodeResponseValue(
                 WorkServiceArtifactDescriptor.self, from: data)
@@ -1277,6 +1311,101 @@ public enum WorkServiceTransportCodec {
             }
         }
         try validateEventPageBytes(events, maxBytes: maxBytes)
+    }
+
+    private static func validateHistoryPage(
+        _ response: WorkServiceHistoryPage,
+        request: WorkServiceHistoryRequest,
+        expectedHostInstance: WorkHostInstanceRef?
+    ) throws {
+        guard response.work.work == request.work,
+              response.work.journal == request.journal,
+              request.target.journal == response.target.journal,
+              response.frozenTipCursor.journal == request.target.journal,
+              response.frozenTipDigest == request.frozenTipDigest
+                  || request.frozenTipDigest == nil,
+              response.branchTip == request.branchTip
+                  || request.branchTip == nil else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        if let expectedHostInstance {
+            try validateDescriptorHost(response.work, expected: expectedHostInstance)
+        }
+        let frozen = response.frozenTipCursor
+        guard frozen.sequence >= 0,
+              (frozen.sequence == 0 ? frozen.eventID == nil : frozen.eventID != nil) else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        if let before = request.beforeCursor {
+            guard before.journal == request.target.journal,
+                  before.sequence >= 0, before.sequence <= frozen.sequence else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
+        let lower = response.lowerBoundaryCursor
+        let upper = response.upperBoundaryCursor
+        if response.events.isEmpty {
+            guard lower == nil, upper == nil else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        } else {
+            guard let lower, let upper,
+                  lower.journal == request.target.journal,
+                  upper.journal == request.target.journal,
+                  lower == JournalCursor(
+                    journal: request.target.journal,
+                    eventID: response.events.first?.eventID,
+                    sequence: response.events.first?.sequence ?? -1),
+                  upper == JournalCursor(
+                    journal: request.target.journal,
+                    eventID: response.events.last?.eventID,
+                    sequence: response.events.last?.sequence ?? -1) else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
+        if let next = response.nextBeforeCursor {
+            guard response.hasOlder, next == lower else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        } else if response.hasOlder {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        if let before = request.beforeCursor, let first = response.events.first {
+            guard first.sequence < before.sequence else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
+        try validateEventPageBytes(response.events, maxBytes: request.maxBytes)
+        let evidenceCursor = response.upperBoundaryCursor ?? response.frozenTipCursor
+        do {
+            let expectedDigest = try WorkServiceHistoryPageEvidence.digest(
+                events: response.events, target: response.target, cursor: evidenceCursor)
+            guard response.prefixDigest == expectedDigest else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        } catch let error as WorkServiceTransportError {
+            throw error
+        } catch {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        try validateEventOwnership(
+            response.events, target: request.target, requestedWork: request.work,
+            expectedHostInstance: expectedHostInstance)
+        for event in response.events {
+            guard event.type == TimelineEventType.messageCommitted
+                    || event.type == TimelineEventType.inputAccepted else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
+    }
+
+    private static func validateEventRef(_ value: JSONValue?) throws {
+        guard let value else { return }
+        guard case .object(let object) = value else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        try validateJournalReference(object["journal"] ?? .null)
+        try validateIdentity(object["eventID"], required: true)
     }
 
     private static func validateEventOwnership(
@@ -3275,6 +3404,13 @@ public actor WorkServiceUnixSocketServer {
                 return try success(
                     id: envelope.id, value: try await service.eventsAfterCursor(request),
                     connectionID: connectionID)
+            case .historyBeforeCursor:
+                let request = try WorkServiceTransportCodec.decodePayload(
+                    WorkServiceHistoryRequest.self, from: envelope.payload)
+                guard request.client == client else { throw identityMismatch() }
+                return try success(
+                    id: envelope.id, value: try await service.historyBeforeCursor(request),
+                    connectionID: connectionID)
             case .fetchArtifact:
                 let request = try WorkServiceTransportCodec.decodePayload(
                     WorkServiceArtifactRequest.self, from: envelope.payload)
@@ -3560,6 +3696,12 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
         _ request: WorkServiceEventsRequest
     ) async throws -> WorkServiceEventPage {
         try await call(.eventsAfterCursor, request)
+    }
+
+    public func historyBeforeCursor(
+        _ request: WorkServiceHistoryRequest
+    ) async throws -> WorkServiceHistoryPage {
+        try await call(.historyBeforeCursor, request)
     }
 
     public func fetchArtifact(

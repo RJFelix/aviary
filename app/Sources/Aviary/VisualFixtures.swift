@@ -14,10 +14,13 @@ enum VisualFixtureRoute: String {
     case productionDelivery = "production-delivery-fixture"
     case productionDeliveryNarrow = "production-delivery-narrow-fixture"
     case productionInspectorNarrow = "production-inspector-narrow-fixture"
+    case conversationHistory = "conversation-history-fixture"
+    case conversationHistoryNarrow = "conversation-history-narrow-fixture"
 
     var isNarrow: Bool {
         self == .serviceChatNarrow || self == .productionDeliveryNarrow
             || self == .productionInspectorNarrow
+            || self == .conversationHistoryNarrow
     }
 }
 
@@ -34,7 +37,48 @@ struct VisualFixtureView: View {
             ProductionRunPaneFixture(narrow: route.isNarrow)
         case .productionInspectorNarrow:
             ProductionInspectorFixture()
+        case .conversationHistory, .conversationHistoryNarrow:
+            ConversationHistoryFixture(narrow: route.isNarrow)
         }
+    }
+}
+
+/// The production transcript surface in an explicitly partial history state: earlier rows are
+/// available above, newer canonical rows exist beyond this GUI's bounded window, and neither
+/// condition is confused with command delivery or Work lifecycle.
+private struct ConversationHistoryFixture: View {
+    let narrow: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "text.bubble")
+                    .foregroundStyle(Design.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Conversation history")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("This GUI is browsing a bounded canonical window")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(Design.gutter)
+            Divider()
+            TranscriptView(
+                items: FixtureData.historyTranscript,
+                hideThinking: false,
+                isStreaming: false,
+                autoScroll: false,
+                hasEarlierHistory: true,
+                hasNewerHistory: true,
+                onLoadEarlierHistory: {},
+                onJumpToLatestHistory: {})
+        }
+        .frame(minWidth: narrow ? 0 : 560, maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Paged canonical conversation history fixture")
     }
 }
 
@@ -84,6 +128,19 @@ private enum FixtureData {
     static let turn = TurnRef("turn-07")
     static let actor = TimelineActor(actorID: "work-host-linux-01", kind: "work-host")
     static let baseTime = Date(timeIntervalSince1970: 1_757_136_000)
+
+    static let historyTranscript: [TranscriptItem] = (0..<18).map { index in
+        var item = TranscriptItem(
+            id: "fixture-history-\(index)",
+            kind: index.isMultiple(of: 2) ? .user : .assistant,
+            timestamp: baseTime.addingTimeInterval(TimeInterval(index * 24)))
+        item.text = index.isMultiple(of: 2)
+            ? "Review checkpoint \(index / 2 + 1) and preserve my place while earlier history loads."
+            : "Checkpoint \(index / 2 + 1) is recorded. The next page can prepend without moving this row."
+        item.blocks = [.text(item.text)]
+        item.model = "claude-sonnet-4-5"
+        return item
+    }
 
     static func observation(_ id: String, sequence: Int, offset: TimeInterval) -> WorkActionObservation {
         WorkActionObservation(

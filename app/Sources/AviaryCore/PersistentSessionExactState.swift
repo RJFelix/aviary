@@ -745,6 +745,8 @@ public struct PersistentSessionExactState: Sendable {
             return SessionMessageSnapshot(
                 eventID: eventID, role: role, text: text,
                 conversationParent: conversationParent, sourceEvent: sourceEvent,
+                sourceCursor: JournalCursor(
+                    journal: sourceEvent.journal, eventID: eventID, sequence: sequence),
                 hostRecordedAt: hostRecordedAt, clientTimestamp: clientTimestamp,
                 run: run, turn: turn, actor: actor, client: client,
                 sessionAttachment: sessionAttachment, causedBy: causedBy,

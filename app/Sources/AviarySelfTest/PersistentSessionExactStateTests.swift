@@ -138,6 +138,8 @@ private func testPersistentSessionExactStateRetainsInputDeliveryJoinAcrossReopen
     XCTAssertEqual(message.run, run)
     XCTAssertEqual(message.causedBy, acceptance)
     XCTAssertEqual(message.text, "[redacted]")
+    XCTAssertEqual(message.sourceCursor, JournalCursor(
+        journal: persistentSessionJournal, eventID: input.eventID, sequence: input.sequence))
 }
 
 private func persistentSessionComponent() -> ContextComponent {
@@ -227,6 +229,11 @@ private func testPersistentSessionExactStateRepresentativeParity() throws {
         if event.type == TimelineEventType.messageCommitted {
             XCTAssertEqual(result.eventLocalSnapshot.messageHistory.map(\.text), [
                 "private user message", "private assistant reply"])
+            XCTAssertTrue(result.eventLocalSnapshot.messageHistory.allSatisfy {
+                $0.sourceCursor?.journal == persistentSessionJournal
+                    && $0.sourceCursor?.eventID == $0.eventID
+                    && ($0.sourceCursor?.sequence ?? 0) > 0
+            })
         }
         if event.type == TimelineEventType.childLifecycle {
             XCTAssertEqual(result.eventLocalSnapshot.childStates["child-exact"], "running")

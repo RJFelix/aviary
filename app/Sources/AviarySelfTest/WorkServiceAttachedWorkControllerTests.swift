@@ -6,6 +6,34 @@ private enum AttachedControllerTestError: Error {
     case transport
 }
 
+private actor AttachedControllerHistoryGate {
+    private var entered = false
+    private var released = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enter() async {
+        entered = true
+        let waiters = enteredWaiters
+        enteredWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { enteredWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
+
 private enum AttachedControllerServiceMode: Sendable {
     case normal
     case repeatedPage
@@ -14,6 +42,7 @@ private enum AttachedControllerServiceMode: Sendable {
     case transport
     case remoteStale
     case forgedAcceptedReceipt
+    case forgedHistoryPage
     case missingAttachment
     case omittedAttachment
 }
@@ -235,6 +264,8 @@ private actor AttachedControllerTestService: WorkServiceClient {
     var corruptPrefixDigests = false
     var snapshotAfterSequences: [Int] = []
     var pageAfterSequences: [Int] = []
+    var historyRequests: [WorkServiceHistoryRequest] = []
+    var historyGate: AttachedControllerHistoryGate?
 
     init(fixture: AttachedControllerFixture) {
         self.fixture = fixture
@@ -277,6 +308,8 @@ private actor AttachedControllerTestService: WorkServiceClient {
     func controlCursor() -> JournalCursor { controlCursorStorage }
     func snapshotRequestCursors() -> [Int] { snapshotAfterSequences }
     func pageRequestCursors() -> [Int] { pageAfterSequences }
+    func historyRequestCount() -> Int { historyRequests.count }
+    func setHistoryGate(_ gate: AttachedControllerHistoryGate?) { historyGate = gate }
 
     func handshake(_ request: WorkServiceHandshakeRequest) async throws -> WorkServiceHandshakeResponse {
         try responseHandshake()
@@ -440,6 +473,77 @@ private actor AttachedControllerTestService: WorkServiceClient {
             basePrefixDigest: prefixDigest(all, cursor: request.afterCursor),
             prefixDigest: prefixDigest(all, cursor: served),
             omissions: omissions)
+    }
+
+    func historyBeforeCursor(_ request: WorkServiceHistoryRequest) async throws
+        -> WorkServiceHistoryPage {
+        if mode == .transport { throw AttachedControllerTestError.transport }
+        historyRequests.append(request)
+        if let historyGate { await historyGate.enter() }
+        guard request.target == .session(
+            session: fixture.session, journal: fixture.sessionJournal)
+        else { throw AttachedControllerTestError.transport }
+        var reducer = SessionReducer()
+        for event in sessionEvents { reducer.apply(event) }
+        let visibleIDs = Set(reducer.snapshot.messages.compactMap(\.sourceEvent?.eventID))
+        let visible = sessionEvents.filter { visibleIDs.contains($0.eventID) }
+        let tip = sessionEvents.last.map {
+            JournalCursor(
+                journal: fixture.sessionJournal, eventID: $0.eventID,
+                sequence: $0.sequence)
+        } ?? JournalCursor(journal: fixture.sessionJournal, sequence: 0)
+        let frozen = request.frozenTipCursor ?? tip
+        let frozenDigest = prefixDigest(sessionEvents, cursor: frozen)
+        guard request.frozenTipDigest == nil || request.frozenTipDigest == frozenDigest,
+              request.branchTip == nil || request.branchTip == reducer.snapshot.semanticTip
+        else { throw AttachedControllerTestError.transport }
+        let cutoff = request.beforeCursor?.sequence ?? frozen.sequence + 1
+        let candidates = visible.filter {
+            $0.sequence <= frozen.sequence && $0.sequence < cutoff
+        }
+        var selected: [TimelineEvent] = []
+        var bytes = 0
+        for event in candidates.reversed() {
+            guard selected.count < request.limit else { break }
+            let size = try WorkServiceEventPageSizing.encodedByteCount(of: event)
+            guard size <= request.maxBytes - bytes else { break }
+            selected.append(event)
+            bytes += size
+        }
+        selected.reverse()
+        let canonicalLower = selected.first.map {
+            JournalCursor(
+                journal: fixture.sessionJournal, eventID: $0.eventID,
+                sequence: $0.sequence)
+        }
+        let canonicalUpper = selected.last.map {
+            JournalCursor(
+                journal: fixture.sessionJournal, eventID: $0.eventID,
+                sequence: $0.sequence)
+        }
+        let pageDigest = try WorkServiceHistoryPageEvidence.digest(
+            events: selected, target: request.target, cursor: canonicalUpper ?? frozen)
+        if mode == .forgedHistoryPage, let first = selected.first {
+            selected[0] = TimelineEvent(
+                eventID: first.eventID, journal: fixture.workJournal,
+                sequence: first.sequence, previousEventID: first.previousEventID,
+                session: first.session, work: first.work, workHost: first.workHost,
+                client: first.client, sessionAttachment: first.sessionAttachment,
+                actor: first.actor, hostRecordedAt: first.hostRecordedAt,
+                type: first.type, payload: first.payload)
+        }
+        let hasOlder = candidates.count > selected.count
+        return WorkServiceHistoryPage(
+            work: try currentDescriptor(), events: selected, target: request.target,
+            lowerBoundaryCursor: canonicalLower, upperBoundaryCursor: canonicalUpper,
+            nextBeforeCursor: hasOlder ? canonicalLower : nil, hasOlder: hasOlder,
+            frozenTipCursor: frozen, frozenTipDigest: frozenDigest,
+            prefixDigest: pageDigest,
+            branchTip: reducer.snapshot.semanticTip,
+            omissions: hasOlder
+                ? [WorkServiceOmission(
+                    category: "history", count: candidates.count - selected.count)]
+                : [])
     }
 
     func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws -> WorkServiceArtifactDescriptor {
@@ -658,6 +762,40 @@ private func makeAttachedController(
         service: service, seed: seed ?? .created(fixture.response), intentStore: store,
         pageLimit: pageLimit, pageBytes: pageBytes,
         connect: connect, checkpointStore: checkpointStore)
+}
+
+func testWorkServiceConversationIdentityChangeSeparatesPrependAndTail() {
+    XCTAssertEqual(
+        WorkServiceConversationIdentityChange.classify(old: [], new: ["a"]),
+        .appended(count: 1))
+    XCTAssertEqual(
+        WorkServiceConversationIdentityChange.classify(old: ["b", "c"], new: ["a", "b", "c"]),
+        .prepended(count: 1, anchorID: "b"))
+    XCTAssertEqual(
+        WorkServiceConversationIdentityChange.classify(
+            old: ["b", "c"], new: ["a", "b", "c", "d"]),
+        .prependedAndAppended(prepended: 1, appended: 1, anchorID: "b"))
+    XCTAssertEqual(
+        WorkServiceConversationIdentityChange.classify(old: ["a"], new: ["a", "b", "c"]),
+        .appended(count: 2))
+    XCTAssertEqual(
+        WorkServiceConversationIdentityChange.classify(
+            old: ["c", "d", "e", "f"], new: ["a", "b", "c", "d"]),
+        .prepended(count: 2, anchorID: "c"))
+    XCTAssertEqual(
+        WorkServiceConversationIdentityChange.classify(
+            old: ["a", "b", "c", "d"], new: ["c", "d", "e", "f"]),
+        .appended(count: 2))
+    XCTAssertEqual(
+        WorkServiceConversationIdentityChange.classify(
+            old: ["shared", "old"], new: ["shared", "new"]),
+        .replaced)
+    XCTAssertEqual(
+        WorkServiceConversationIdentityChange.classify(old: ["a", "b"], new: ["b", "a"]),
+        .replaced)
+    XCTAssertEqual(
+        WorkServiceConversationIdentityChange.classify(old: ["a", "b"], new: ["a", "b"]),
+        .unchanged)
 }
 
 func testWorkServiceAttachedControllerCreatesRefreshesAndProjectsVisibleConversation() async throws {
@@ -1256,6 +1394,179 @@ func testWorkServiceAttachedControllerBoundsCanonicalActivitiesAndMessagesExplic
     XCTAssertTrue(projection.projectionOmissions[2].diagnostic?.contains("UTF-8 bytes") == true)
 }
 
+func testWorkServiceAttachedControllerPagesHistoryWithoutMovingCanonicalCursors() async throws {
+    let fixture = try AttachedControllerFixture(workID: "history-window")
+    let service = AttachedControllerTestService(fixture: fixture)
+    var sessionEvents = Array(fixture.sessionEvents.prefix(2))
+    let actor = TimelineActor(actorID: "controller-history", kind: "test")
+    for index in 0..<820 {
+        let sequence = sessionEvents.count + 1
+        sessionEvents.append(TimelineEvent(
+            eventID: "history-message-\(index)", journal: fixture.sessionJournal,
+            sequence: sequence, hostSequence: sequence,
+            previousEventID: sessionEvents.last?.eventID,
+            session: fixture.session, work: fixture.work, workHost: fixture.host,
+            client: fixture.client, sessionAttachment: fixture.sessionAttachment,
+            actor: actor, hostRecordedAt: Date(timeIntervalSince1970: TimeInterval(sequence)),
+            type: TimelineEventType.messageCommitted, declaredDomains: [.session],
+            payload: .object([
+                "role": .string(index.isMultiple(of: 2) ? "user" : "assistant"),
+                "text": .string("history-\(index)")
+            ])))
+    }
+    await service.replaceSessionEvents(sessionEvents)
+    let controller = try makeAttachedController(
+        fixture: fixture, service: service, pageLimit: 128)
+    let canonicalBefore = try await controller.refresh()
+    let clientB = ClientRef("controller-client-b")
+    let controllerB = try makeAttachedController(
+        fixture: fixture, service: service,
+        seed: .existing(work: fixture.descriptor, attachment: fixture.attachment(for: clientB)),
+        pageLimit: 128)
+    _ = try await controllerB.refresh()
+    let independentInitial = await controllerB.conversationHistory()
+    let acknowledgementsBefore = await service.readAckRequests()
+    let commandsBefore = await service.commandCount()
+    let initial = await controller.conversationHistory()
+
+    XCTAssertEqual(initial.messages.count, 768)
+    XCTAssertEqual(initial.messages.first?.text, "history-52")
+    XCTAssertEqual(initial.messages.last?.text, "history-819")
+    XCTAssertTrue(initial.hasEarlier)
+    XCTAssertFalse(initial.hasNewer)
+    XCTAssertEqual(initial.status, .ready)
+
+    // SwiftUI can trigger the top sentinel more than once while a request is suspended. The
+    // controller admits one network page only; a concurrent duplicate sees the stable loading
+    // projection and cannot move a cursor, acknowledgement, or Work command.
+    let gate = AttachedControllerHistoryGate()
+    await service.setHistoryGate(gate)
+    let firstLoad = Task { try await controller.loadEarlierConversationHistory() }
+    await gate.waitUntilEntered()
+    let duplicateLoad = try await controller.loadEarlierConversationHistory()
+    XCTAssertEqual(duplicateLoad.status, .loading)
+    XCTAssertEqual(duplicateLoad.messages, initial.messages)
+    XCTAssertEqual(await service.historyRequestCount(), 1)
+
+    // Tail growth can race with the suspended reverse read. Refresh must advance only the
+    // canonical reducer/read state, retain the frozen historical rows, and mark newer content;
+    // the eventual page then merges against that retained window without creating a gap.
+    var prior = sessionEvents.last!
+    sessionEvents.append(TimelineEvent(
+        eventID: "history-message-820", journal: fixture.sessionJournal,
+        sequence: prior.sequence + 1, previousEventID: prior.eventID,
+        session: fixture.session, work: fixture.work, workHost: fixture.host,
+        client: fixture.client, sessionAttachment: fixture.sessionAttachment,
+        actor: actor, hostRecordedAt: Date(timeIntervalSince1970: 9_997),
+        type: TimelineEventType.messageCommitted, declaredDomains: [.session],
+        payload: .object(["role": .string("assistant"), "text": .string("history-820")])))
+    await service.replaceSessionEvents(sessionEvents)
+    let canonicalDuringLoad = try await controller.refresh()
+    let historyDuringLoad = await controller.conversationHistory()
+    XCTAssertEqual(historyDuringLoad.status, .ready)
+    XCTAssertTrue(historyDuringLoad.hasNewer)
+    XCTAssertEqual(historyDuringLoad.messages, initial.messages)
+    let acknowledgementsAfterConcurrentRefresh = await service.readAckRequests()
+    await gate.release()
+    let older = try await firstLoad.value
+    await service.setHistoryGate(nil)
+    let canonicalAfter = await controller.projection()
+    XCTAssertEqual(older.messages.count, 768)
+    XCTAssertEqual(older.messages.first?.text, "history-0")
+    XCTAssertEqual(older.messages.last?.text, "history-767")
+    XCTAssertFalse(older.hasEarlier)
+    XCTAssertTrue(older.hasNewer)
+    XCTAssertEqual(older.status, .ready)
+    XCTAssertEqual(canonicalAfter.workCursor, canonicalBefore.workCursor)
+    XCTAssertEqual(canonicalAfter.sessionCursor, canonicalDuringLoad.sessionCursor)
+    XCTAssertEqual(canonicalAfter.visibleMessages, canonicalDuringLoad.visibleMessages)
+    XCTAssertTrue(acknowledgementsAfterConcurrentRefresh.count > acknowledgementsBefore.count)
+    XCTAssertEqual(await service.readAckRequests(), acknowledgementsAfterConcurrentRefresh)
+    XCTAssertEqual(await service.historyRequestCount(), 1)
+    XCTAssertEqual(await service.commandCount(), commandsBefore)
+    XCTAssertEqual(await controllerB.conversationHistory(), independentInitial)
+
+    let latest = await controller.jumpConversationHistoryToLatest()
+    XCTAssertEqual(latest.messages.first?.text, "history-53")
+    XCTAssertEqual(latest.messages.last?.text, "history-820")
+    XCTAssertTrue(latest.hasEarlier)
+    XCTAssertFalse(latest.hasNewer)
+
+    // A user-selected jump supersedes an older read even if that suspended RPC later returns a
+    // malformed response. The late failure must not repaint the newest window as unavailable.
+    let supersededGate = AttachedControllerHistoryGate()
+    await service.setHistoryGate(supersededGate)
+    let supersededLoad = Task { try await controller.loadEarlierConversationHistory() }
+    await supersededGate.waitUntilEntered()
+    await service.setMode(.forgedHistoryPage)
+    let supersedingLatest = await controller.jumpConversationHistoryToLatest()
+    await supersededGate.release()
+    let lateResult = try await supersededLoad.value
+    await service.setHistoryGate(nil)
+    XCTAssertEqual(lateResult, supersedingLatest)
+    XCTAssertEqual(await controller.conversationHistory(), supersedingLatest)
+    XCTAssertEqual(supersedingLatest.status, .ready)
+
+    var rejected = false
+    do {
+        _ = try await controller.loadEarlierConversationHistory()
+    } catch WorkServiceAttachedWorkControllerError.malformedResponse {
+        rejected = true
+    }
+    XCTAssertTrue(rejected)
+    let preserved = await controller.conversationHistory()
+    XCTAssertEqual(preserved.messages, latest.messages)
+    XCTAssertEqual(preserved.status, .unavailable)
+    XCTAssertTrue(preserved.hasEarlier)
+    XCTAssertFalse(preserved.hasNewer)
+
+    // Retry is explicit and can recover the same frozen branch. A later canonical branch
+    // selection makes the historical window stale without replacing any authenticated rows.
+    await service.setMode(.normal)
+    _ = try await controller.loadEarlierConversationHistory()
+    prior = sessionEvents.last!
+    sessionEvents.append(TimelineEvent(
+        eventID: "history-message-821", journal: fixture.sessionJournal,
+        sequence: prior.sequence + 1, previousEventID: prior.eventID,
+        session: fixture.session, work: fixture.work, workHost: fixture.host,
+        client: fixture.client, sessionAttachment: fixture.sessionAttachment,
+        actor: actor, hostRecordedAt: Date(timeIntervalSince1970: 9_998),
+        type: TimelineEventType.messageCommitted, declaredDomains: [.session],
+        payload: .object(["role": .string("assistant"), "text": .string("history-821")])))
+    await service.replaceSessionEvents(sessionEvents)
+    _ = try await controller.refresh()
+    let appended = await controller.conversationHistory()
+    XCTAssertEqual(appended.status, .ready)
+    XCTAssertTrue(appended.hasNewer)
+    XCTAssertEqual(appended.messages.first?.text, "history-0")
+    XCTAssertEqual(appended.messages.last?.text, "history-767")
+
+    prior = sessionEvents.last!
+    sessionEvents.append(TimelineEvent(
+        eventID: "history-select-root", journal: fixture.sessionJournal,
+        sequence: prior.sequence + 1, previousEventID: prior.eventID,
+        conversationParent: EventRef(
+            journal: fixture.sessionJournal, eventID: "history-message-0"),
+        session: fixture.session, work: fixture.work, workHost: fixture.host,
+        client: fixture.client, sessionAttachment: fixture.sessionAttachment,
+        actor: actor, hostRecordedAt: Date(timeIntervalSince1970: 9_999),
+        type: TimelineEventType.sessionTipSelected, declaredDomains: [.session]))
+    await service.replaceSessionEvents(sessionEvents)
+    _ = try await controller.refresh()
+    let stale = await controller.conversationHistory()
+    XCTAssertEqual(stale.status, .staleBranch)
+    XCTAssertTrue(stale.hasNewer)
+    XCTAssertFalse(stale.hasEarlier)
+    XCTAssertEqual(stale.messages.first?.text, "history-0")
+    XCTAssertEqual(stale.messages.last?.text, "history-767")
+
+    let selectedLatest = await controller.jumpConversationHistoryToLatest()
+    XCTAssertEqual(selectedLatest.status, .ready)
+    XCTAssertEqual(selectedLatest.messages.map(\.text), ["history-0"])
+    XCTAssertFalse(selectedLatest.hasEarlier)
+    XCTAssertFalse(selectedLatest.hasNewer)
+}
+
 func testWorkServiceAttachedControllerAcknowledgesWorkAndSessionWithExactControlChain() async throws {
     let fixture = try AttachedControllerFixture()
     let service = AttachedControllerTestService(fixture: fixture)
@@ -1662,6 +1973,9 @@ func testWorkServiceAttachedControllerResumesMoreThan256PagesFromCheckpointCurso
 }
 
 let casesWorkServiceAttachedWorkController: [Case] = [
+    ("phase3 Work controller distinguishes history prepend from tail output", {
+        testWorkServiceConversationIdentityChangeSeparatesPrependAndTail()
+    }),
     ("phase3 Work controller creates and projects visible conversation", {
         try await testWorkServiceAttachedControllerCreatesRefreshesAndProjectsVisibleConversation()
     }),
@@ -1709,6 +2023,9 @@ let casesWorkServiceAttachedWorkController: [Case] = [
     }),
     ("phase3 Work controller bounds activities and messages explicitly", {
         try await testWorkServiceAttachedControllerBoundsCanonicalActivitiesAndMessagesExplicitly()
+    }),
+    ("phase3 Work controller pages history without moving canonical cursors", {
+        try await testWorkServiceAttachedControllerPagesHistoryWithoutMovingCanonicalCursors()
     }),
     ("phase3 Work controller acknowledges Work and Session with exact control chaining", {
         try await testWorkServiceAttachedControllerAcknowledgesWorkAndSessionWithExactControlChain()

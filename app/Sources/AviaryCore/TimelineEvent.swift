@@ -1874,6 +1874,9 @@ public struct SessionMessageSnapshot: Codable, Hashable, Sendable {
     /// The canonical event that supplied this message. Nil is reserved for synthetic
     /// non-journal summaries; reducer-produced messages always carry this reference.
     public let sourceEvent: EventRef?
+    /// Exact physical position of `sourceEvent`. Conversation history uses this as an exclusive
+    /// page boundary; it is never reused as a reducer acknowledgement or command cursor.
+    public let sourceCursor: JournalCursor?
     /// Host time copied from the canonical event. It is optional only for synthetic summaries;
     /// no neutral timestamp is invented when a source event is absent.
     public let hostRecordedAt: Date?
@@ -1891,7 +1894,8 @@ public struct SessionMessageSnapshot: Codable, Hashable, Sendable {
     public let links: [TimelineLink]
 
     private enum CodingKeys: String, CodingKey {
-        case eventID, role, text, conversationParent, sourceEvent, hostRecordedAt, clientTimestamp
+        case eventID, role, text, conversationParent, sourceEvent, sourceCursor
+        case hostRecordedAt, clientTimestamp
         case run, turn, actor, client, sessionAttachment, causedBy, parentActivity, provenance, links
     }
 
@@ -1901,6 +1905,7 @@ public struct SessionMessageSnapshot: Codable, Hashable, Sendable {
         text: String,
         conversationParent: EventRef? = nil,
         sourceEvent: EventRef? = nil,
+        sourceCursor: JournalCursor? = nil,
         hostRecordedAt: Date? = nil,
         clientTimestamp: Date? = nil,
         run: RunRef? = nil,
@@ -1918,6 +1923,7 @@ public struct SessionMessageSnapshot: Codable, Hashable, Sendable {
         self.text = text
         self.conversationParent = conversationParent
         self.sourceEvent = sourceEvent
+        self.sourceCursor = sourceCursor
         self.hostRecordedAt = hostRecordedAt
         self.clientTimestamp = clientTimestamp
         self.run = run

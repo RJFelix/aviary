@@ -23,6 +23,12 @@ struct TranscriptView: View {
     var hideThinking: Bool = false
     var isStreaming: Bool = false
     var autoScroll: Bool = true
+    var hasEarlierHistory: Bool = false
+    var hasNewerHistory: Bool = false
+    var isLoadingEarlierHistory: Bool = false
+    var earlierHistoryError: String?
+    var onLoadEarlierHistory: (() -> Void)?
+    var onJumpToLatestHistory: (() async -> Void)?
     var onSelect: ((TranscriptItem) -> Void)?
 
     @State private var scrollTarget: String?
@@ -30,6 +36,8 @@ struct TranscriptView: View {
     @State private var bottomPosition: CGFloat = 0
     @State private var isAtBottom = true
     @State private var unreadCount = 0
+    @State private var earlierRequestWasIssued = false
+    @State private var didFinishInitialPlacement = false
 
     private var visible: [TranscriptItem] {
         let q = searchQuery.trimmingCharacters(in: .whitespaces).lowercased()
@@ -47,6 +55,11 @@ struct TranscriptView: View {
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
+                        if hasEarlierHistory || isLoadingEarlierHistory || earlierHistoryError != nil {
+                            earlierHistoryControl
+                                .id("__earlier_history__")
+                                .onAppear { requestEarlierHistoryIfNeeded() }
+                        }
                         ForEach(visible) { item in
                             TranscriptRow(
                                 item: item,
@@ -60,7 +73,10 @@ struct TranscriptView: View {
                             StreamingIndicator()
                                 .id("__streaming_tail__")
                         }
-                        Color.clear.frame(height: 8)
+                        // When the bounded history window has released newer rows, reserve enough
+                        // scroll content for the floating return control. On narrow windows this
+                        // keeps the newest visible transcript row from sitting underneath it.
+                        Color.clear.frame(height: hasNewerHistory ? 44 : 8)
                             .id("__bottom__")
                             .background(GeometryReader { geometry in
                                 Color.clear.preference(
@@ -68,9 +84,11 @@ struct TranscriptView: View {
                                     value: geometry.frame(in: .named("AviaryTranscriptScroll")).maxY)
                             })
                     }
+                    .scrollTargetLayout()
                     .padding(.horizontal, Design.gutter)
                     .padding(.vertical, 14)
                 }
+                .scrollPosition(id: $scrollTarget, anchor: .top)
                 .coordinateSpace(name: "AviaryTranscriptScroll")
                 .background(GeometryReader { geometry in
                     Color.clear.preference(
@@ -78,19 +96,25 @@ struct TranscriptView: View {
                         value: geometry.size.height)
                 })
 
-                if !isAtBottom {
+                if !isAtBottom || hasNewerHistory {
                     Button {
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            proxy.scrollTo("__bottom__", anchor: .bottom)
+                        Task { @MainActor in
+                            if hasNewerHistory {
+                                await onJumpToLatestHistory?()
+                                await Task.yield()
+                            }
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                proxy.scrollTo("__bottom__", anchor: .bottom)
+                            }
+                            unreadCount = 0
                         }
-                        unreadCount = 0
                     } label: {
                         HStack(spacing: 6) {
                             Image(systemName: "arrow.down")
                             if unreadCount > 0 {
                                 Text("\(unreadCount) new")
                             }
-                            Text("Jump to latest")
+                            Text(hasNewerHistory ? "Return to latest" : "Jump to latest")
                         }
                         .font(.system(size: 11, weight: .semibold))
                         .padding(.horizontal, 10)
@@ -100,10 +124,10 @@ struct TranscriptView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(Design.accent)
-                    .accessibilityLabel(unreadCount > 0
-                        ? "Jump to latest, \(unreadCount) new transcript items"
-                        : "Jump to latest")
-                    .help("Jump to the latest transcript output")
+                    .accessibilityLabel(latestAccessibilityLabel)
+                    .help(hasNewerHistory
+                        ? "Release older rows and return to the newest canonical messages"
+                        : "Jump to the latest transcript output")
                     .padding(.trailing, Design.gutter)
                     .padding(.bottom, 12)
                 }
@@ -117,15 +141,27 @@ struct TranscriptView: View {
                 updateBottomState()
             }
             .onChange(of: items.count) { oldCount, newCount in
-                let added = max(0, newCount - oldCount)
-                guard added > 0 else { return }
-                if autoScroll && isAtBottom {
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        proxy.scrollTo("__bottom__", anchor: .bottom)
-                    }
-                    unreadCount = 0
-                } else {
-                    unreadCount += added
+                // Identity-aware handling below owns insertions. This count observer remains only
+                // to reset the top-sentinel gate after a page has actually changed the window.
+                if newCount != oldCount { earlierRequestWasIssued = false }
+            }
+            .onChange(of: items.map(\.id)) { oldIDs, newIDs in
+                switch WorkServiceConversationIdentityChange.classify(
+                    old: oldIDs, new: newIDs
+                ) {
+                case .unchanged:
+                    break
+                case .prepended(_, let anchorID):
+                    preservePrependAnchor(anchorID, proxy: proxy)
+                case .appended(let count):
+                    handleTailAppend(count, proxy: proxy)
+                case .prependedAndAppended(_, let appended, let anchorID):
+                    preservePrependAnchor(anchorID, proxy: proxy)
+                    handleTailAppend(appended, proxy: proxy)
+                case .replaced:
+                    // A branch/session replacement is neither unread tail output nor a history
+                    // prepend. Keep the user's current position instead of inventing an anchor.
+                    break
                 }
             }
             .onChange(of: visible.last?.plainText.count ?? 0) { _, _ in
@@ -139,7 +175,90 @@ struct TranscriptView: View {
                 if autoScroll {
                     proxy.scrollTo("__bottom__", anchor: .bottom)
                 }
+                DispatchQueue.main.async {
+                    didFinishInitialPlacement = true
+                }
             }
+            .onChange(of: isLoadingEarlierHistory) { _, loading in
+                if !loading { earlierRequestWasIssued = false }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var earlierHistoryControl: some View {
+        HStack(spacing: 8) {
+            if isLoadingEarlierHistory {
+                ProgressView().controlSize(.small)
+                Text("Loading earlier history…")
+            } else {
+                Button {
+                    requestEarlierHistoryIfNeeded(force: true)
+                } label: {
+                    Label(
+                        earlierHistoryError == nil ? "Load earlier history" : "Retry earlier history",
+                        systemImage: earlierHistoryError == nil
+                            ? "arrow.up.circle" : "arrow.clockwise.circle")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Design.accent)
+                .disabled(!hasEarlierHistory && earlierHistoryError == nil)
+            }
+            if let earlierHistoryError {
+                Text(earlierHistoryError)
+                    .foregroundStyle(Design.warning)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 10.5, weight: .medium))
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(earlierHistoryAccessibilityLabel)
+    }
+
+    private var earlierHistoryAccessibilityLabel: String {
+        if isLoadingEarlierHistory { return "Loading earlier conversation history" }
+        if let earlierHistoryError { return "Earlier conversation history unavailable. \(earlierHistoryError)" }
+        return "Load earlier conversation history"
+    }
+
+    private var latestAccessibilityLabel: String {
+        if hasNewerHistory { return "Return to the latest canonical conversation history" }
+        return unreadCount > 0
+            ? "Jump to latest, \(unreadCount) new transcript items"
+            : "Jump to latest"
+    }
+
+    private func requestEarlierHistoryIfNeeded(force: Bool = false) {
+        guard onLoadEarlierHistory != nil,
+              didFinishInitialPlacement,
+              !isLoadingEarlierHistory,
+              hasEarlierHistory || (force && earlierHistoryError != nil),
+              force || !earlierRequestWasIssued else { return }
+        earlierRequestWasIssued = true
+        onLoadEarlierHistory?()
+    }
+
+    private func preservePrependAnchor(_ anchorID: String?, proxy: ScrollViewProxy) {
+        guard let anchorID else { return }
+        // The exclusive history boundary is the old first row. Re-anchoring that stable durable
+        // identity after insertion keeps the content the reader was looking at in place; it also
+        // prevents a prepend from entering the unread-tail/autoscroll path.
+        DispatchQueue.main.async {
+            proxy.scrollTo(anchorID, anchor: .top)
+        }
+    }
+
+    private func handleTailAppend(_ count: Int, proxy: ScrollViewProxy) {
+        guard count > 0 else { return }
+        if autoScroll && isAtBottom {
+            withAnimation(.easeOut(duration: 0.2)) {
+                proxy.scrollTo("__bottom__", anchor: .bottom)
+            }
+            unreadCount = 0
+        } else {
+            unreadCount += count
         }
     }
 
