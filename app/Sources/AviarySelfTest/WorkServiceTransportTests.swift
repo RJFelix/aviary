@@ -1947,6 +1947,67 @@ func test_workServiceTransportResponseSemanticBounds() throws {
     } catch WorkServiceTransportError.invalidResponse {
         XCTAssertTrue(true)
     }
+
+    let validArtifact = WorkServiceArtifactDescriptor(
+        artifactID: "semantic-artifact", work: transportWork, label: "artifact")
+    let validDescriptor = try WorkServiceWorkDescriptor(
+        work: transportWork, journal: transportJournal, recordedDisposition: .reusable,
+        execution: .idle, currentRun: nil, currentRunSession: nil,
+        currentRunSessionAttachment: nil, hostObservation: nil,
+        artifacts: [validArtifact])
+    let foreignWork = WorkRef(workHostID: transportHost.workHostID, workID: "foreign-work")
+    guard case .object(var forgedDescriptor) = try transportEnvelopePayload(validDescriptor),
+          case .array(let artifactValues) = forgedDescriptor["artifacts"],
+          case .object(var forgedArtifact) = artifactValues.first else {
+        XCTFail("descriptor must encode its artifact list as objects")
+        return
+    }
+    forgedArtifact["work"] = try transportEnvelopePayload(foreignWork)
+    forgedDescriptor["artifacts"] = .array([.object(forgedArtifact)])
+    let forgedDescriptorValue = JSONValue.object(forgedDescriptor)
+    let forgedDescriptorEnvelope = WorkServiceTransportResponseEnvelope(
+        id: "semantic-foreign-artifact", ok: true, data: forgedDescriptorValue)
+    do {
+        try WorkServiceTransportCodec.validateResponseSemantics(
+            forgedDescriptorEnvelope, operation: .describeWork)
+        XCTFail("transport semantic validation accepted an artifact for another Work")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+    let describeRequest = WorkServiceDescribeRequest(
+        work: transportWork, journal: transportJournal, client: transportClientA)
+    let describeEnvelope = WorkServiceTransportRequestEnvelope(
+        id: "semantic-foreign-artifact", operation: .describeWork,
+        client: transportClientA, payload: try transportEnvelopePayload(describeRequest))
+    do {
+        try WorkServiceTransportCodec.validateResponseCorrelation(
+            forgedDescriptorEnvelope, request: describeEnvelope,
+            expectedHostInstance: WorkHostInstanceRef(
+                host: transportHost, instanceID: "transport-instance",
+                startIdentity: "transport-start"))
+        XCTFail("transport correlation accepted an artifact for another Work")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+    guard case .object(var duplicateDescriptor) = try transportEnvelopePayload(validDescriptor),
+          case .array(let originalArtifacts) = duplicateDescriptor["artifacts"],
+          case .object(var duplicateArtifact) = originalArtifacts.first else {
+        XCTFail("descriptor must retain an artifact for the duplicate mutant")
+        return
+    }
+    duplicateArtifact["label"] = .string("conflicting duplicate")
+    duplicateDescriptor["artifacts"] = .array(
+        originalArtifacts + [.object(duplicateArtifact)])
+    let duplicateArtifactEnvelope = WorkServiceTransportResponseEnvelope(
+        id: "semantic-duplicate-artifact", ok: true,
+        data: .object(duplicateDescriptor))
+    do {
+        try WorkServiceTransportCodec.validateResponseSemantics(
+            duplicateArtifactEnvelope, operation: .describeWork)
+        XCTFail("transport semantic validation accepted duplicate artifact identities")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
 }
 
 func test_workServiceTransportRejectsFalsePageProgressAndBodyEOFClaims() async throws {

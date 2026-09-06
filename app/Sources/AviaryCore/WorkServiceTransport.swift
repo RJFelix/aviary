@@ -1684,6 +1684,7 @@ public enum WorkServiceTransportCodec {
             throw WorkServiceTransportError.invalidResponse
         }
         let work = object["work"]
+        let descriptorWork = try decodeResponseValue(WorkRef.self, from: work ?? .null)
         try validateIdentity(work?["workHostID"], required: true)
         try validateIdentity(work?["workID"], required: true)
         try validateJournalReference(object["journal"] ?? .null)
@@ -1740,8 +1741,13 @@ public enum WorkServiceTransportCodec {
                 throw WorkServiceTransportError.invalidResponse
             }
         }
+        var artifactIDs: Set<String> = []
         for artifact in object["artifacts"]?.arrayValue ?? [] {
-            try validateArtifactDescriptor(artifact)
+            try validateArtifactDescriptor(artifact, expectedWork: descriptorWork)
+            guard let artifactID = artifact["artifactID"]?.stringValue,
+                  artifactIDs.insert(artifactID).inserted else {
+                throw WorkServiceTransportError.invalidResponse
+            }
         }
         for omission in object["omissions"]?.arrayValue ?? [] {
             try validateIdentity(omission["category"], required: true)
@@ -1758,18 +1764,28 @@ public enum WorkServiceTransportCodec {
         _ = try decodeResponseValue(WorkServiceWorkDescriptor.self, from: value)
     }
 
-    private static func validateArtifactDescriptor(_ value: JSONValue) throws {
+    private static func validateArtifactDescriptor(
+        _ value: JSONValue, expectedWork: WorkRef? = nil
+    ) throws {
         guard case .object(let object) = value else {
             throw WorkServiceTransportError.invalidResponse
         }
         try validateIdentity(object["artifactID"], required: true)
         try validateIdentity(object["work"]?["workHostID"], required: true)
         try validateIdentity(object["work"]?["workID"], required: true)
+        let artifactWork = try decodeResponseValue(
+            WorkRef.self, from: object["work"] ?? .null)
+        if let expectedWork, artifactWork != expectedWork {
+            throw WorkServiceTransportError.invalidResponse
+        }
         try validateDiagnostic(object["label"])
         try validateDiagnostic(object["mediaType"])
         try validateDiagnostic(object["digest"])
         try validateNonnegativeInteger(object["byteCount"])
         try validateBodyReference(object["bodyReference"])
+        if let truncated = object["metadataWasTruncated"], truncated.boolValue == nil {
+            throw WorkServiceTransportError.invalidResponse
+        }
     }
 
     private static func validateBodyResponse(_ value: JSONValue) throws {

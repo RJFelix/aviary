@@ -546,6 +546,25 @@ public struct WorkServiceWorkDescriptor: Codable, Hashable, Sendable {
                 sessionAttachments: [WorkServiceSessionAttachmentDescriptor] = [],
                 artifacts: [WorkServiceArtifactDescriptor] = [],
                 omissions: [WorkServiceOmission] = []) throws {
+        guard artifacts.allSatisfy({ $0.work == work }) else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "every artifact must belong to the descriptor's Work")
+        }
+        guard artifacts.allSatisfy({
+            WorkServiceText.valid($0.artifactID)
+                && $0.artifactID.utf8.count <= WorkServiceBounds.maxIdentityCharacters
+        }) else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "artifact identities must be nonblank and bounded")
+        }
+        guard artifacts.allSatisfy({ Self.validArtifactFields($0, journal: journal) }) else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "artifact metadata and body references must be canonical and bounded")
+        }
+        guard Set(artifacts.map(\.artifactID)).count == artifacts.count else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "artifact identities must be unique within a Work descriptor")
+        }
         guard (currentRun == nil) == (currentRunSession == nil),
               (currentRun == nil) == (currentRunSessionAttachment == nil) else {
             throw WorkServiceProtocolError.invalidRequest(
@@ -595,6 +614,20 @@ public struct WorkServiceWorkDescriptor: Codable, Hashable, Sendable {
         case artifacts, omissions
     }
 
+    private static func validArtifactFields(
+        _ artifact: WorkServiceArtifactDescriptor, journal: JournalRef
+    ) -> Bool {
+        guard artifact.byteCount.map({ $0 >= 0 }) ?? true else { return false }
+        guard let reference = artifact.bodyReference else { return true }
+        return reference.authority == journal
+            && WorkServiceText.valid(reference.referenceID)
+            && reference.referenceID.utf8.count <= WorkServiceBounds.maxIdentityCharacters
+            && (reference.mediaType?.utf8.count ?? 0)
+                <= WorkServiceBounds.maxDiagnosticCharacters
+            && (reference.byteCount.map { $0 >= 0 } ?? false)
+            && (reference.digest.map(ContextBodyStore.isValidDigest) ?? true)
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let currentRun = try container.decodeIfPresent(RunRef.self, forKey: .currentRun)
@@ -618,8 +651,10 @@ public struct WorkServiceWorkDescriptor: Codable, Hashable, Sendable {
                 forKey: .hostObservation, in: container,
                 debugDescription: "complete host observation owner differs from descriptor owner")
         }
-        self.work = try container.decode(WorkRef.self, forKey: .work)
-        self.journal = try container.decode(JournalRef.self, forKey: .journal)
+        let work = try container.decode(WorkRef.self, forKey: .work)
+        let journal = try container.decode(JournalRef.self, forKey: .journal)
+        self.work = work
+        self.journal = journal
         self.recordedDisposition = try container.decode(
             WorkServiceRecordedDisposition.self, forKey: .recordedDisposition)
         self.execution = try container.decode(WorkServiceExecutionState.self, forKey: .execution)
@@ -646,8 +681,33 @@ public struct WorkServiceWorkDescriptor: Codable, Hashable, Sendable {
                         "a current Run owner must be exactly one attached Session relationship")
             }
         }
-        self.artifacts = try container.decode(
+        let artifacts = try container.decode(
             [WorkServiceArtifactDescriptor].self, forKey: .artifacts)
+        guard artifacts.allSatisfy({ $0.work == work }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .artifacts, in: container,
+                debugDescription: "every artifact must belong to the descriptor's Work")
+        }
+        guard artifacts.allSatisfy({
+            WorkServiceText.valid($0.artifactID)
+                && $0.artifactID.utf8.count <= WorkServiceBounds.maxIdentityCharacters
+        }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .artifacts, in: container,
+                debugDescription: "artifact identities must be nonblank and bounded")
+        }
+        guard artifacts.allSatisfy({ Self.validArtifactFields($0, journal: journal) }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .artifacts, in: container,
+                debugDescription:
+                    "artifact metadata and body references must be canonical and bounded")
+        }
+        guard Set(artifacts.map(\.artifactID)).count == artifacts.count else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .artifacts, in: container,
+                debugDescription: "artifact identities must be unique within a Work descriptor")
+        }
+        self.artifacts = artifacts
         self.omissions = try container.decode([WorkServiceOmission].self, forKey: .omissions)
     }
 }
@@ -1372,14 +1432,15 @@ public struct WorkServiceArtifactDescriptor: Codable, Hashable, Sendable {
 
     public init(artifactID: String, work: WorkRef, label: String,
                 mediaType: String? = nil, byteCount: Int? = nil, digest: String? = nil,
-                available: Bool = true, bodyReference: TimelineBodyReference? = nil) {
+                available: Bool = true, bodyReference: TimelineBodyReference? = nil,
+                metadataWasTruncated: Bool = false) {
         self.artifactID = artifactID
         self.work = work
-        self.metadataWasTruncated = [label, mediaType, digest]
+        self.metadataWasTruncated = metadataWasTruncated || [label, mediaType, digest]
             .contains { ($0?.utf8.count ?? 0) > WorkServiceBounds.maxDiagnosticCharacters }
         self.label = WorkServiceText.bound(label) ?? "artifact"
         self.mediaType = WorkServiceText.bound(mediaType)
-        self.byteCount = byteCount.map { max(0, $0) }
+        self.byteCount = byteCount
         self.digest = WorkServiceText.bound(digest)
         self.available = available
         self.bodyReference = bodyReference
@@ -1396,7 +1457,9 @@ public struct WorkServiceArtifactDescriptor: Codable, Hashable, Sendable {
             digest: try values.decodeIfPresent(String.self, forKey: .digest),
             available: try values.decodeIfPresent(Bool.self, forKey: .available) ?? true,
             bodyReference: try values.decodeIfPresent(
-                TimelineBodyReference.self, forKey: .bodyReference))
+                TimelineBodyReference.self, forKey: .bodyReference),
+            metadataWasTruncated: try values.decodeIfPresent(
+                Bool.self, forKey: .metadataWasTruncated) ?? false)
     }
 
     public func encode(to encoder: Encoder) throws {

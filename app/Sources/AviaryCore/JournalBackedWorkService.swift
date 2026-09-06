@@ -1132,6 +1132,9 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let runFinishedIDs: Set<String>
         let runFinishedExists: Bool
         let artifactDescriptors: [WorkServiceArtifactDescriptor]
+        let artifactDescriptorCount: Int
+        let artifactDescriptorsComplete: Bool
+        let artifactDescriptorIdentityConflict: Bool
         let bodyReferences: Set<TimelineBodyReference>
         let bodyReferenceCount: Int
         let bodyReferencesComplete: Bool
@@ -2304,11 +2307,24 @@ public actor JournalBackedWorkService: WorkServiceClient {
         -> WorkServiceArtifactDescriptor {
         try await ensureLoaded()
         try validateClient(request.client)
+        guard validArtifactIdentity(request.artifactID) else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "artifact identity must be nonblank and bounded")
+        }
         let source = try await requireCanonical(work: request.work, journal: request.journal)
         try await requireAttached(
             work: request.work, journal: request.journal, attachment: request.attachment,
             client: request.client, capability: .inspectArtifacts)
-        guard let artifact = artifacts(in: source).first(where: { $0.artifactID == request.artifactID }) else {
+        let sourceArtifacts = try uniqueArtifacts(in: source)
+        guard let artifact = sourceArtifacts.first(where: {
+            $0.artifactID == request.artifactID
+        }) else {
+            // A bounded or unclassifiable artifact index cannot prove that the requested ID is
+            // absent. Never turn missing local cache coverage into a canonical not-found claim.
+            guard source.workCache.artifactDescriptorsComplete,
+                  source.workCache.artifactDescriptorCount == sourceArtifacts.count else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
             throw WorkServiceProtocolError.artifactNotFound
         }
         return artifact
@@ -2328,7 +2344,9 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 || request.reference.authority == attachment.sessionJournal else {
             throw WorkServiceProtocolError.journalMismatch
         }
-        if artifacts(in: source).contains(where: { $0.bodyReference == request.reference })
+        if try uniqueArtifacts(in: source).contains(where: {
+            $0.bodyReference == request.reference
+        })
                 && !attachment.authorization.allows(.inspectArtifacts) {
             throw WorkServiceProtocolError.capabilityDenied(.inspectArtifacts)
         }
@@ -3761,9 +3779,14 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let references = records.reduce(into: Set<TimelineBodyReference>()) { refs, record in
             refs.formUnion(collectBodyReferences(in: record.event.payload))
         }
-        let artifacts = records.compactMap {
+        let artifactEventCount = records.reduce(into: 0) { count, record in
+            if record.event.type == TimelineEventType.artifact { count += 1 }
+        }
+        let decodedArtifacts = records.compactMap {
             artifactDescriptor(from: $0.event, work: work)
         }
+        let decodedArtifactIDs = Set(decodedArtifacts.map(\.artifactID))
+        let artifacts = Array(decodedArtifacts.prefix(JournalReadLimits.maximumCachedArtifacts))
         let fingerprint = JournalFileFingerprint(
             identity: JournalFileIdentity(
                 device: live.fileFingerprint.device, inode: live.fileFingerprint.inode,
@@ -3827,7 +3850,13 @@ public actor JournalBackedWorkService: WorkServiceClient {
             latestRunFinishedEvent: live.latestRunFinishedEvent,
             runStartedIDs: live.runStartedIDs, runFinishedIDs: live.runFinishedIDs,
             runFinishedExists: !live.runFinishedIDs.isEmpty,
-            artifactDescriptors: artifacts, bodyReferences: references,
+            artifactDescriptors: artifacts,
+            artifactDescriptorCount: decodedArtifacts.count,
+            artifactDescriptorsComplete: live.isFullyResident
+                && artifactEventCount == decodedArtifacts.count,
+            artifactDescriptorIdentityConflict:
+                decodedArtifactIDs.count != decodedArtifacts.count,
+            bodyReferences: references,
             bodyReferenceCount: references.count,
             bodyReferencesComplete: live.isFullyResident)
     }
@@ -4010,6 +4039,29 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let omitted = allAttachments.filter {
             $0.work == work && $0.workJournal == source.workJournal && $0.isAttached
         }.count - attachments.count
+        let sourceArtifacts = try uniqueArtifacts(in: source)
+        var omissions: [WorkServiceOmission] = []
+        if omitted > 0 {
+            omissions.append(WorkServiceOmission(category: "attachments", count: omitted))
+        }
+        let artifactOmitted = max(
+            0, source.workCache.artifactDescriptorCount
+                - sourceArtifacts.count)
+        if artifactOmitted > 0 {
+            omissions.append(WorkServiceOmission(category: "artifacts", count: artifactOmitted))
+        }
+        if !source.workCache.artifactDescriptorsComplete {
+            // A live nonresident observation proves the Work reducer/cursor but intentionally
+            // does not retain the history needed to enumerate artifacts. Keep the exact state
+            // usable while making this independent index explicitly unknown.
+            omissions.append(WorkServiceOmission(category: "artifact_index", count: 1))
+        }
+        let truncatedArtifactMetadata = sourceArtifacts.filter(
+            \.metadataWasTruncated).count
+        if truncatedArtifactMetadata > 0 {
+            omissions.append(WorkServiceOmission(
+                category: "artifact_metadata", count: truncatedArtifactMetadata))
+        }
         guard let config = manifests[work]?.requestedConfiguration
             ?? manifests[work]?.template?.template.draft.configuration else {
             // A durable template without its exact request configuration is not a truthful
@@ -4031,8 +4083,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
             attachments: Array(attachments),
             sessionAttachments: try await sessionRelationships(
                 for: source, control: control),
-            artifacts: artifacts(in: source),
-            omissions: omitted > 0 ? [WorkServiceOmission(category: "attachments", count: omitted)] : [])
+            artifacts: sourceArtifacts,
+            omissions: omissions)
     }
 
     private func clientAttachment(
@@ -4838,6 +4890,9 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 runStartedIDs: scan.runStartedIDs, runFinishedIDs: scan.runFinishedIDs,
                 runFinishedExists: scan.runFinishedExists,
                 artifactDescriptors: scan.artifactDescriptors,
+                artifactDescriptorCount: scan.artifactDescriptorCount,
+                artifactDescriptorsComplete: scan.artifactDescriptorsComplete,
+                artifactDescriptorIdentityConflict: scan.artifactDescriptorIdentityConflict,
                 bodyReferences: scan.bodyReferences,
                 bodyReferenceCount: scan.bodyReferenceCount,
                 bodyReferencesComplete: scan.bodyReferencesComplete)
@@ -4894,6 +4949,9 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let runFinishedIDs: Set<String>
         let runFinishedExists: Bool
         let artifactDescriptors: [WorkServiceArtifactDescriptor]
+        let artifactDescriptorCount: Int
+        let artifactDescriptorsComplete: Bool
+        let artifactDescriptorIdentityConflict: Bool
         let bodyReferences: Set<TimelineBodyReference>
         let bodyReferenceCount: Int
         let bodyReferencesComplete: Bool
@@ -4953,6 +5011,11 @@ public actor JournalBackedWorkService: WorkServiceClient {
         var runFinishedIDs = previous?.runFinishedIDs ?? []
         var runFinishedExists = previous?.runFinishedExists ?? false
         var artifactDescriptors = previous?.artifactDescriptors ?? []
+        var artifactDescriptorCount = previous?.artifactDescriptorCount ?? 0
+        var artifactDescriptorsComplete = previous?.artifactDescriptorsComplete ?? true
+        var artifactDescriptorIdentityConflict =
+            previous?.artifactDescriptorIdentityConflict ?? false
+        var retainedArtifactIDs = Set(artifactDescriptors.map(\.artifactID))
         var cachedBodyReferences = previous?.bodyReferences ?? []
         var bodyReferenceCount = previous?.bodyReferenceCount ?? 0
         var bodyReferencesComplete = previous?.bodyReferencesComplete ?? true
@@ -5015,9 +5078,24 @@ public actor JournalBackedWorkService: WorkServiceClient {
                     }
                 }
                 if case .work(let artifactWork) = journal.owner,
-                   artifactDescriptors.count < JournalReadLimits.maximumCachedArtifacts,
-                   let artifact = artifactDescriptor(from: record.event, work: artifactWork) {
-                    artifactDescriptors.append(artifact)
+                   record.event.type == TimelineEventType.artifact {
+                    if let artifact = artifactDescriptor(from: record.event, work: artifactWork) {
+                        if retainedArtifactIDs.contains(artifact.artifactID) {
+                            artifactDescriptorIdentityConflict = true
+                        }
+                        let (nextArtifactCount, artifactCountOverflow) =
+                            artifactDescriptorCount.addingReportingOverflow(1)
+                        guard !artifactCountOverflow else {
+                            throw WorkServiceProtocolError.sourceIncomplete
+                        }
+                        artifactDescriptorCount = nextArtifactCount
+                        if artifactDescriptors.count < JournalReadLimits.maximumCachedArtifacts {
+                            artifactDescriptors.append(artifact)
+                            retainedArtifactIDs.insert(artifact.artifactID)
+                        }
+                    } else {
+                        artifactDescriptorsComplete = false
+                    }
                 }
 
                 // Keep a bounded sparse index even for nonresident sources. The first record and
@@ -5078,7 +5156,11 @@ public actor JournalBackedWorkService: WorkServiceClient {
             latestRunFinishedEvent: latestRunFinishedEvent,
             runStartedIDs: runStartedIDs, runFinishedIDs: runFinishedIDs,
             runFinishedExists: runFinishedExists,
-            artifactDescriptors: artifactDescriptors, bodyReferences: cachedBodyReferences,
+            artifactDescriptors: artifactDescriptors,
+            artifactDescriptorCount: artifactDescriptorCount,
+            artifactDescriptorsComplete: artifactDescriptorsComplete,
+            artifactDescriptorIdentityConflict: artifactDescriptorIdentityConflict,
+            bodyReferences: cachedBodyReferences,
             bodyReferenceCount: bodyReferenceCount,
             bodyReferencesComplete: bodyReferencesComplete)
     }
@@ -5302,6 +5384,17 @@ public actor JournalBackedWorkService: WorkServiceClient {
         source.workCache.artifactDescriptors
     }
 
+    private func uniqueArtifacts(
+        in source: CanonicalSource
+    ) throws -> [WorkServiceArtifactDescriptor] {
+        let values = artifacts(in: source)
+        guard !source.workCache.artifactDescriptorIdentityConflict,
+              Set(values.map(\.artifactID)).count == values.count else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return values
+    }
+
     private func artifactDescriptor(
         from event: TimelineEvent, work: WorkRef
     ) -> WorkServiceArtifactDescriptor? {
@@ -5311,18 +5404,75 @@ public actor JournalBackedWorkService: WorkServiceClient {
         guard event.type == TimelineEventType.artifact,
               let object = event.payload.objectValue,
               let id = object["artifact_id"]?.stringValue,
-              !id.isEmpty else { return nil }
-        let body: TimelineBodyReference? = object["body_reference"].flatMap { value in
-            guard let data = try? JSONEncoder().encode(value) else { return nil }
-            return try? JSONDecoder().decode(TimelineBodyReference.self, from: data)
+              validArtifactIdentity(id) else { return nil }
+        let label: String
+        if let value = object["label"] {
+            guard let decoded = value.stringValue else { return nil }
+            label = decoded
+        } else {
+            label = id
+        }
+        let mediaType: String?
+        if let value = object["media_type"] {
+            guard let decoded = value.stringValue else { return nil }
+            mediaType = decoded
+        } else {
+            mediaType = nil
+        }
+        let byteCount: Int?
+        if let value = object["byte_count"] {
+            guard let decoded = value.intValue, decoded >= 0 else { return nil }
+            byteCount = decoded
+        } else {
+            byteCount = nil
+        }
+        let contentDigest: String?
+        if let value = object["digest"] {
+            guard let decoded = value.stringValue else { return nil }
+            contentDigest = decoded
+        } else {
+            contentDigest = nil
+        }
+        let available: Bool
+        if let value = object["available"] {
+            guard let decoded = value.boolValue else { return nil }
+            available = decoded
+        } else {
+            available = true
+        }
+        let body: TimelineBodyReference?
+        if let value = object["body_reference"] {
+            guard let data = try? JSONEncoder().encode(value),
+                  let decoded = try? JSONDecoder().decode(
+                    TimelineBodyReference.self, from: data),
+                  validArtifactBodyReference(decoded, journal: event.journal) else {
+                return nil
+            }
+            body = decoded
+        } else {
+            body = nil
         }
         return WorkServiceArtifactDescriptor(
-            artifactID: id, work: work, label: object["label"]?.stringValue ?? id,
-            mediaType: object["media_type"]?.stringValue,
-            byteCount: object["byte_count"]?.intValue,
-            digest: object["digest"]?.stringValue,
-            available: body != nil || object["available"]?.boolValue != false,
+            artifactID: id, work: work, label: label,
+            mediaType: mediaType, byteCount: byteCount, digest: contentDigest,
+            available: body != nil || available,
             bodyReference: body)
+    }
+
+    private func validArtifactIdentity(_ value: String) -> Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && value.utf8.count <= WorkServiceBounds.maxIdentityCharacters
+    }
+
+    private func validArtifactBodyReference(
+        _ reference: TimelineBodyReference, journal: JournalRef
+    ) -> Bool {
+        reference.authority == journal
+            && validArtifactIdentity(reference.referenceID)
+            && (reference.mediaType?.utf8.count ?? 0)
+                <= WorkServiceBounds.maxDiagnosticCharacters
+            && (reference.byteCount.map { $0 >= 0 } ?? false)
+            && (reference.digest.map(ContextBodyStore.isValidDigest) ?? true)
     }
 
     private func collectBodyReferences(in value: JSONValue) -> Set<TimelineBodyReference> {

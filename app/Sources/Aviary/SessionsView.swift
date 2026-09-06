@@ -626,7 +626,7 @@ struct SessionInspector: View {
     private var wireCard: some View {
         if let request = shownRequest, let payload = request.payload {
             let analysis = WireLog.analyse(payload: payload)
-            Card("What was sent", symbol: "arrow.up.doc",
+            Card("Provider wire capture", symbol: "waveform.path.ecg",
                  accessory: AnyView(
                     HStack(spacing: 8) {
                         Button("Breakdown") { showBreakdown = true }
@@ -636,6 +636,9 @@ struct SessionInspector: View {
                     }))
             {
                 VStack(alignment: .leading, spacing: 6) {
+                    Text("Inferred from recorded provider payload bytes; not canonical source provenance.")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     if requestForSelection != nil {
                         Text("For the selected turn — request #\(request.seq).")
                             .font(.system(size: 10)).foregroundStyle(Design.accent)
@@ -668,7 +671,7 @@ struct SessionInspector: View {
             .sheet(isPresented: $showBreakdown) {
                 VStack(spacing: 0) {
                     HStack {
-                        Text("What was sent to the model")
+                        Text("Provider wire capture")
                             .font(.system(size: 13, weight: .semibold))
                         Spacer()
                         Button("Done") { showBreakdown = false }
@@ -688,12 +691,11 @@ struct SessionInspector: View {
                 RawPayloadSheet(records: model.selectedSessionWire)
             }
         } else if let session = model.selectedSession, !session.isCanonicalOnly {
-            Card("What was sent", symbol: "arrow.up.doc") {
+            Card("Provider wire capture", symbol: "waveform.path.ecg") {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("No provider payloads were recorded for this session, so its input "
-                        + "tokens can't be broken down. The transcript holds messages; the "
-                        + "system prompt, context files, skill catalogue and tool schemas "
-                        + "are assembled per request and stored nowhere.")
+                    Text("No provider wire payloads were recorded for this session, so this "
+                        + "diagnostic view cannot reconstruct its request bytes. Canonical native "
+                        + "context metadata, when present, remains a separate Session projection.")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

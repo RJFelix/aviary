@@ -95,6 +95,9 @@ enum LinuxSelfTestMain {
             ("Linux platform: persistent Session exact state", {
                 try await runLinuxCases(casesPersistentSessionExactState)
             }),
+            ("Linux platform: recorded model context and canonical working state", {
+                try await runLinuxCases(casesRecordedModelContextProjection)
+            }),
             ("Linux platform: Work reducer transition parity", {
                 try await runLinuxCases(casesWorkReducerTransition)
             }),

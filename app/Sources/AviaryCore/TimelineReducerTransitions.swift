@@ -669,6 +669,11 @@ internal enum WorkReducerTransition {
                 return
             }
             state.stageChildState(childState, for: childID)
+        case TimelineEventType.artifact:
+            // Artifact payloads are retained and indexed by their dedicated bounded service
+            // projection. They do not mutate Work scalar state, but they are a known native
+            // event and must not poison the Work domain as an unknown extension.
+            break
         case TimelineEventType.commandAccepted, TimelineEventType.commandRejected,
              TimelineEventType.commandDelivered, TimelineEventType.commandNotDelivered,
              TimelineEventType.commandDeliveryIndeterminate:

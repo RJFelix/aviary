@@ -245,6 +245,7 @@ struct RunPane: View {
     @State private var selectedAction: SelectedAction?
     @State private var confirmEndRun = false
     @State private var showInputDeliveryReview = false
+    @State private var showCockpitInspector = false
     @State private var composerDelivery: ComposerDelivery = .steerNext
 
     private enum ComposerDelivery: String, CaseIterable, Identifiable {
@@ -360,6 +361,12 @@ struct RunPane: View {
                 attention: run.serviceInputDeliveryAttention,
                 omissionSummary: run.serviceInputDeliveryOmissionSummary)
         }
+        .sheet(isPresented: $showCockpitInspector) {
+            RunInspector(run: run, selectedItem: $selectedItem)
+                .frame(minWidth: 360, idealWidth: 420, minHeight: 520, idealHeight: 720)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Run context and working state")
+        }
     }
 
     private var runHeader: some View {
@@ -388,6 +395,20 @@ struct RunPane: View {
                          tint: (run.exitCode ?? 0) == 0 ? .secondary : Design.danger)
                 }
                 Spacer()
+                if !showsInspector {
+                    Button {
+                        showCockpitInspector = true
+                    } label: {
+                        Image(systemName: "sidebar.right")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .keyboardShortcut("i", modifiers: [.command, .option])
+                    .help("Inspect recorded model context and canonical working state")
+                    .accessibilityLabel("Context and working state")
+                    .accessibilityHint(
+                        "Opens recorded provider context and current durable Work and Session evidence")
+                }
                 controls
             }
 
@@ -1702,6 +1723,14 @@ struct RunInspector: View {
                     ServiceWorkCard(run: run)
                 }
 
+                if let context = run.recordedModelContext {
+                    RecordedModelContextCard(projection: context)
+                }
+
+                if let workingState = run.canonicalWorkingState {
+                    CanonicalWorkingStateCard(projection: workingState)
+                }
+
                 Card("Tokens", symbol: "number") {
                     VStack(alignment: .leading, spacing: 7) {
                         HStack(spacing: 10) {
@@ -1763,7 +1792,9 @@ struct RunInspector: View {
                     }
                 }
 
-                contextCard
+                if run.recordedModelContext == nil {
+                    wireContextCard
+                }
 
                 Card("Launch command", symbol: "terminal") {
                     CodeBlock(text: run.launchCommand, maxLines: 8, tint: .secondary)
@@ -1775,7 +1806,7 @@ struct RunInspector: View {
             if let analysis = run.latestAnalysis {
                 VStack(spacing: 0) {
                     HStack {
-                        Text("What was sent to the model")
+                        Text("Provider wire capture")
                             .font(.system(size: 13, weight: .semibold))
                         Spacer()
                         Button("Done") { showBreakdown = false }
@@ -1798,10 +1829,10 @@ struct RunInspector: View {
     }
 
     @ViewBuilder
-    private var contextCard: some View {
+    private var wireContextCard: some View {
         if run.config.recordPayloads {
             Card(
-                "What was sent", symbol: "arrow.up.doc",
+                "Provider wire capture", symbol: "waveform.path.ecg",
                  accessory: AnyView(
                     HStack(spacing: 8) {
                         Button("Breakdown") { showBreakdown = true }
@@ -1814,6 +1845,13 @@ struct RunInspector: View {
             ) {
                 if let analysis = run.latestAnalysis {
                     VStack(alignment: .leading, spacing: 6) {
+                        Text(
+                            "Inferred from a recorded provider payload. This is diagnostic wire "
+                                + "evidence, not canonical source provenance."
+                        )
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         DetailRow(
                             label: "Payload",
                             value:
@@ -1841,7 +1879,7 @@ struct RunInspector: View {
                         }
                     }
                 } else {
-                    Text("Recording is on. The first provider request will appear here.")
+                    Text("Wire recording is on. The first provider request will appear here.")
                         .font(.system(size: 10.5)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }

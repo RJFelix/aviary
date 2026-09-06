@@ -1,6 +1,6 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; exact Work/Session continuation, production service/control-reader cutover, Session-qualified Run routing, and GUI new-Session-to-existing-Work composition have completed integrated macOS/Linux/cross-device verification; the first Phase 2 canonical workspace, explicit input-delivery, and Phase 4A Action Lens slices are implemented
+Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; exact Work/Session continuation, production service/control-reader cutover, Session-qualified Run routing, and GUI new-Session-to-existing-Work composition have completed integrated macOS/Linux/cross-device verification; the first Phase 2 canonical workspace, explicit input-delivery, dual context/working-state inspector, and Phase 4A Action Lens slices are implemented
 Date: 2026-09-06
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
@@ -175,6 +175,41 @@ widths. Core, SelfTest, GUI, daemon, and signed release-app assembly pass. Final
 found no remaining P0/P1/P2 issue in this slice, including after an adversarial 64-category omission
 mutant proved that locally derived input-attention disclosures cannot be crowded out by upstream
 diagnostics. The uninterrupted broad run passes 953 cases / 13,492 assertions in 377.45 seconds.
+
+Context/working-state inspector checkpoint (2026-09-06): the service-backed Run inspector now
+separates the last canonical provider-bound context crossing from the durable Work/Session state at
+the controller's exact cursors. The context card reports measured and cumulative delivery bytes,
+component/source counts, producer-side source status, body addressability, compaction presence, and
+bounded omissions without copying prompt text, source labels/paths, omission prose, or compaction
+content. It explicitly says the next request has not yet been assembled. The working-state card
+reports lifecycle/execution, cursor positions, active Run/Turn presence, bounded action/Handle/child/
+artifact counts, independent artifact/attachment index completeness, and the six-plane recovery
+matrix. Artifact rows expose fixed media categories and addressability only; aggregate omissions and
+per-row truncation flags both make metadata loss visible without double-counting. Malformed artifact
+records make the index explicitly unknown, and duplicate artifact identities make describe/fetch fail
+closed rather than selecting an arbitrary row. Remote Python namespace inspection is currently an
+explicit `not_exposed` state rather than an empty namespace or a claim that conversation recovery
+reconstructed memory. Invalid or source-incomplete projections retain only identity/cursor/source
+status and suppress derived lifecycle, model, action, Handle, artifact, recovery, and namespace facts.
+
+Reader Census and the production GUI now consume this one metadata-only Core projection; the older
+parallel Census context interface was removed instead of retained as a compatibility surface.
+Provider wire logs remain available as an explicitly inferred diagnostic view and no longer claim
+canonical source provenance or that unrecorded context was “stored nowhere.” Recovery evidence is
+bounded fairly across Work and Session journals, keeping the current Run and newest claims from each
+source. Compaction is reported only when it was part of the exact recorded provider crossing, never
+from a newer independent Session summary. Focused coverage is 2 cases / 108 assertions plus the
+20-case / 232-assertion prompt-provenance suite, 18-case / 350-assertion Reader Census suite,
+20-case / 385-assertion service suite, 27-case / 338-assertion transport suite, and a real
+journal-backed artifact loss/reopen fixture at 1 case / 22 assertions. The actual production RunPane
+and inspector have deterministic desktop and narrow fixture routes; narrow layouts reach the dual
+inspector through a compact sheet button and Option-Command-I instead of consuming conversation
+height. The final wide, narrow-chat, and narrow-inspector render hashes are recorded in the working
+receipts and were visually inspected cleanly. Final independent review found no remaining P0/P1/P2
+defect after the malformed artifact producer/DTO/transport boundaries were aligned. The
+uninterrupted integrated run passes 956 cases / 13,640 assertions in 389.43 seconds; `just compile`
+and signed release-app assembly pass. The release fixture hashes are `ac797b96dc3e...06a6`,
+`0f44c6a28e40...9845`, and `4628581ac791...5fe1` respectively, identical across rerenders.
 
 Phase 3C closure checkpoint (2026-09-04): accepted and duplicate service commands no longer
 become UI truth on the strength of a transport receipt. The client retains the exact command
@@ -1126,9 +1161,12 @@ Deliverables:
 - Add the editable pending-input tray and explicit delivery selector.
 - Preserve durable drafts per session, restore focus safely, and add attachment/context previews.
 - Make a goal/plan an optional first-class artifact with completion criteria and progress.
-- Show two separate truthful projections:
-  - **Next model context:** pinned instructions, selected history, context/compaction boundary,
-    summary, attachments, omissions, component identities, and delivered sizes;
+- Show separate truthful projections:
+  - **Recorded model context:** the last provider-bound crossing, including pinned instructions,
+    selected history, context/compaction boundary, summary presence, attachments, omissions,
+    component identities, and delivered sizes. It must not be labeled as the next request.
+  - **Next-request preview:** once a future request is deterministically assembled, show what will
+    cross next and invalidate the preview whenever selection/compaction/attachment state changes.
   - **Runtime working state:** cwd/environment identity, non-perturbing namespace metadata from
     `RuntimeHost.inspect`, pending Futures/Handles, relevant memories, and artifacts.
 - Do not persist or display raw namespace `repr` by default; it can contain credentials or large

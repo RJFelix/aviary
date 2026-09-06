@@ -58,12 +58,31 @@ func test_readerCensusNextModelContextIsMetadataOnlyAndBounded() throws {
             componentID: "component-stable", inclusionID: "component:0", sourceID: "message:0",
             mode: .history, deliveryMode: .truncated, measuredBytes: 20, includedBytes: 12,
             deliveredBytes: 12, fullByteCount: 20, bodyReference: body, digest: digest))
+    let expectedSummary = String(repeating: "summary ", count: 900)
+        + "credentials-token /private/secret/path"
+    let compactionDigest = promptProjectionDigest("d")
+    let compactionBody = TimelineBodyReference(
+        authority: promptProjectionSessionJournal, referenceID: compactionDigest,
+        mediaType: "application/json", byteCount: Data(expectedSummary.utf8).count,
+        digest: compactionDigest)
+    let compactionComponent = ContextComponent(
+        componentID: "compaction-component", inclusionID: "compaction:0",
+        sourceID: "compaction-summary",
+        sourceProvenance: EventRef(
+            journal: promptProjectionSessionJournal, eventID: "compact-for-request"),
+        mode: .compactionSummary, deliveryMode: .summary,
+        measuredBytes: Data(expectedSummary.utf8).count,
+        includedBytes: Data(expectedSummary.utf8).count,
+        deliveredBytes: Data(expectedSummary.utf8).count,
+        fullByteCount: Data(expectedSummary.utf8).count,
+        bodyReference: compactionBody, digest: compactionDigest)
     let manifest = ContextManifest(
         manifestID: "manifest-1", requestID: "request-1", modelID: "provider/model",
         components: [ContextComponent(
             componentID: "component-stable", inclusionID: "component:0", sourceID: "message:0",
             mode: .history, deliveryMode: .truncated, measuredBytes: 20, includedBytes: 12,
-            deliveredBytes: 12, fullByteCount: 20, bodyReference: body, digest: digest)],
+            deliveredBytes: 12, fullByteCount: 20, bodyReference: body, digest: digest),
+            compactionComponent],
         omissions: [ContextManifestOmission(
             omissionID: "omission-1", sourceID: "message:1", reason: "not selected",
             measuredBytes: 4)], systemPromptAssemblyID: "assembly-1",
@@ -74,33 +93,31 @@ func test_readerCensusNextModelContextIsMetadataOnlyAndBounded() throws {
         ], unknownReferenceIDs: ["missing-1"])
 
     let projection = report.recordedModelContext
-    XCTAssertEqual(projection.state, .observed)
-    XCTAssertEqual(projection.manifestID, "manifest-1")
-    XCTAssertEqual(projection.requestID, "request-1")
+    XCTAssertEqual(projection.availability, .observed)
+    XCTAssertTrue(projection.manifestID?.hasPrefix("context-manifest-sha256:") == true)
+    XCTAssertTrue(projection.requestID?.hasPrefix("context-request-sha256:") == true)
     XCTAssertEqual(projection.modelID, "provider/model")
-    XCTAssertEqual(projection.assemblyID, "assembly-1")
-    XCTAssertEqual(projection.contextBoundaryEventID, "context-boundary-1")
-    XCTAssertEqual(projection.compactionBoundaryEventID, "compact-1")
-    XCTAssertEqual(projection.promptSources?.count, 1)
-    let projectedSource = try XCTUnwrap(projection.promptSources?.first)
-    XCTAssertTrue(projectedSource.sourceID.hasPrefix("source-sha256:"))
-    XCTAssertTrue(projectedSource.inclusionID.hasPrefix("inclusion-sha256:"))
-    XCTAssertFalse(projectedSource.sourceID.contains("source-stable"))
+    XCTAssertTrue(projection.assemblyID?.hasPrefix("prompt-assembly-sha256:") == true)
+    XCTAssertTrue(projection.contextBoundaryEventID?.hasPrefix("context-boundary-sha256:") == true)
+    XCTAssertTrue(projection.compactionBoundaryEventID?.hasPrefix("compaction-boundary-sha256:") == true)
+    XCTAssertEqual(projection.sources?.count, 1)
+    let projectedSource = try XCTUnwrap(projection.sources?.first)
+    XCTAssertTrue(projectedSource.id.hasPrefix("prompt-source-sha256:"))
+    XCTAssertTrue(projectedSource.inclusionID.hasPrefix("prompt-inclusion-sha256:"))
+    XCTAssertFalse(projectedSource.id.contains("source-stable"))
     XCTAssertFalse(projectedSource.inclusionID.contains("prompt:0"))
     XCTAssertEqual(projectedSource.label, "Base instructions")
     XCTAssertEqual(projectedSource.fullByteCount, 20)
     XCTAssertEqual(projectedSource.deliveredByteCount, 12)
     XCTAssertEqual(projectedSource.renderedByteCount, 14)
     XCTAssertEqual(projectedSource.status, .truncated)
-    XCTAssertTrue(projectedSource.bodyAddressAvailable)
+    XCTAssertNotNil(projectedSource.deliveredBodyReference)
     XCTAssertEqual(projectedSource.provenance?.eventID, "observe-1")
-    XCTAssertEqual(projection.components.first?.componentID, "component-stable")
-    XCTAssertEqual(projection.components.first?.deliveryStatus, .truncated)
-    XCTAssertTrue(projection.components.first?.bodyAddressAvailable == true)
+    XCTAssertTrue(projection.components.first?.id.hasPrefix("context-component-sha256:") == true)
+    XCTAssertEqual(projection.components.first?.deliveryMode, .truncated)
+    XCTAssertNotNil(projection.components.first?.bodyReference)
     XCTAssertEqual(projection.omissionCount, 1)
-    XCTAssertEqual(projection.unknowns.referenceIDs, ["missing-1"])
-    let expectedSummary = String(repeating: "summary ", count: 900)
-        + "credentials-token /private/secret/path"
+    XCTAssertEqual(projection.unknowns.referenceCount, 1)
     XCTAssertEqual(
         projection.compactionSummaryByteCount, Data(expectedSummary.utf8).count)
     XCTAssertTrue(projection.compactionSummaryDigest?.hasPrefix("sha256:") == true)
@@ -116,7 +133,7 @@ func test_readerCensusNextModelContextIsMetadataOnlyAndBounded() throws {
     XCTAssertFalse(encoded.contains("credentials"))
 }
 
-func test_readerCensusNextModelContextPreservesCanonicalOrderAndLegacyUnknowns() throws {
+func test_readerCensusContextWithoutProviderManifestIsUnavailable() throws {
     let components = (0..<70).map { index in
         ReaderCensusContextComponent(component: ContextComponent(
             componentID: "component-\(index)", inclusionID: "include-\(index)",
@@ -128,27 +145,25 @@ func test_readerCensusNextModelContextPreservesCanonicalOrderAndLegacyUnknowns()
         unknownReferenceIDs: (0..<40).map { "missing-\($0)" })
     let projection = report.contextProjection
 
-    XCTAssertEqual(projection.state, .legacy)
+    XCTAssertEqual(projection.availability, .unavailable)
     XCTAssertNil(projection.manifestID)
     XCTAssertNil(projection.modelID)
-    // Without a provider-bound manifest there is no source-complete next-model context.
+    // Without a provider-bound manifest there is no source-complete recorded model context.
     XCTAssertNil(projection.assemblyID)
-    XCTAssertNil(projection.promptSources)
-    XCTAssertEqual(projection.componentCount, 70)
-    XCTAssertEqual(projection.components.count, ReaderCensusContextProjection.maxComponents)
-    XCTAssertEqual(projection.omittedComponentCount, 6)
-    XCTAssertEqual(projection.components[2].inclusionID, "include-2")
-    XCTAssertEqual(projection.unknowns.referenceIDs.count, ReaderCensusContextProjection.maxUnknowns)
-    XCTAssertEqual(projection.unknowns.referenceIDOmittedCount, 8)
-    XCTAssertTrue(projection.hasOmittedRecords)
+    XCTAssertNil(projection.sources)
+    XCTAssertEqual(projection.componentCount, 0)
+    XCTAssertEqual(projection.components.count, 0)
+    XCTAssertEqual(projection.omittedComponentCount, 0)
+    XCTAssertEqual(projection.unknowns.referenceCount, 40)
+    XCTAssertTrue(projection.hasOmissions)
 
     let empty = promptProjectionReport()
-    XCTAssertEqual(empty.recordedModelContext.state, .unknown)
-    XCTAssertNil(empty.recordedModelContext.promptSources)
+    XCTAssertEqual(empty.recordedModelContext.availability, .unavailable)
+    XCTAssertNil(empty.recordedModelContext.sources)
     XCTAssertNil(empty.recordedModelContext.modelID)
 }
 
-func test_readerCensusCompactionBoundaryComesFromLastAcceptedEvent() throws {
+func test_readerCensusDoesNotSpliceIndependentCompactionIntoRecordedCrossing() throws {
     let session = SessionRef("prompt-projection-session")
     let actor = TimelineActor(actorID: "prompt-projection-test", kind: "self-test")
     let created = TimelineEvent(
@@ -178,7 +193,7 @@ func test_readerCensusCompactionBoundaryComesFromLastAcceptedEvent() throws {
     XCTAssertFalse(report.sessionSemanticProjectionValid)
     XCTAssertEqual(report.compactionSummary, "accepted summary")
     XCTAssertEqual(report.compactionBoundaryEventID, accepted.eventID)
-    XCTAssertEqual(report.recordedModelContext.compactionBoundaryEventID, accepted.eventID)
-    XCTAssertNotEqual(
-        report.recordedModelContext.compactionBoundaryEventID, quarantined.eventID)
+    XCTAssertEqual(report.recordedModelContext.availability, .invalid)
+    XCTAssertNil(report.recordedModelContext.compactionBoundaryEventID)
+    XCTAssertNil(report.recordedModelContext.compactionSummaryByteCount)
 }

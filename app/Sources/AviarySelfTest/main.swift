@@ -6760,11 +6760,11 @@ let casesPromptProvenance: [Case] = [
     ("phase1 prompt provenance: Reader Census context is metadata only and bounded", {
         try test_readerCensusNextModelContextIsMetadataOnlyAndBounded()
     }),
-    ("phase1 prompt provenance: Reader Census preserves order and legacy unknowns", {
-        try test_readerCensusNextModelContextPreservesCanonicalOrderAndLegacyUnknowns()
+    ("phase1 prompt provenance: no provider manifest stays unavailable", {
+        try test_readerCensusContextWithoutProviderManifestIsUnavailable()
     }),
-    ("phase1 prompt provenance: Reader Census uses accepted compaction boundary", {
-        try test_readerCensusCompactionBoundaryComesFromLastAcceptedEvent()
+    ("phase1 prompt provenance: Reader Census keeps independent compaction out of crossing", {
+        try test_readerCensusDoesNotSpliceIndependentCompactionIntoRecordedCrossing()
     }),
     ("phase1 prompt provenance: cold resume uses retained source bodies", {
         try await test_promptProvenanceColdResumeUsesRetainedBodiesAfterSourceFilesChange()
@@ -7130,7 +7130,8 @@ await Harness.run(
         + casesPeers + casesMCPSurface
         + casesBackgroundSpawn + casesWebSearch + casesDispatched
         + casesCrossingLaws + casesPhase0SessionControl + casesPhase1Timeline
-        + casesContextManifest + casesPromptProvenance + casesNativeColdResume
+        + casesContextManifest + casesPromptProvenance + casesRecordedModelContextProjection
+        + casesNativeColdResume
         + casesCanonicalSessionSearch
         + casesLocalTimelineCatalog + casesCanonicalWorkRecoveryProjection
         + casesWorkService + casesWorkHostControlJournal + casesWorkHostControlCreation

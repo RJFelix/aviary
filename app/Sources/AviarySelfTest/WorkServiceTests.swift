@@ -1454,6 +1454,132 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
     XCTAssertEqual(artifact.artifactID, "artifact-1")
     XCTAssertEqual(artifact.byteCount, 12)
     XCTAssertFalse(artifact.digest?.contains("secret") == true)
+    let foreignWork = WorkRef(workHostID: serviceHost.workHostID, workID: "foreign-artifact-work")
+    let foreignArtifact = WorkServiceArtifactDescriptor(
+        artifactID: artifact.artifactID, work: foreignWork, label: artifact.label,
+        mediaType: artifact.mediaType, byteCount: artifact.byteCount,
+        digest: artifact.digest, available: artifact.available,
+        bodyReference: artifact.bodyReference)
+    do {
+        _ = try WorkServiceWorkDescriptor(
+            work: serviceWork, journal: serviceJournal, recordedDisposition: .reusable,
+            execution: .idle, currentRun: nil, currentRunSession: nil,
+            currentRunSessionAttachment: nil, hostObservation: nil,
+            artifacts: [foreignArtifact])
+        XCTFail("a descriptor accepted an artifact belonging to another Work")
+    } catch WorkServiceProtocolError.invalidRequest(let diagnostic) {
+        XCTAssertTrue(diagnostic.contains("artifact"))
+    }
+    let descriptor = try await service.describeWork(describeRequest())
+    let duplicateArtifact = WorkServiceArtifactDescriptor(
+        artifactID: artifact.artifactID, work: descriptor.work,
+        label: "conflicting duplicate", bodyReference: artifact.bodyReference)
+    do {
+        _ = try WorkServiceWorkDescriptor(
+            work: descriptor.work, journal: descriptor.journal,
+            recordedDisposition: descriptor.recordedDisposition,
+            execution: descriptor.execution, currentRun: descriptor.currentRun,
+            currentRunSession: descriptor.currentRunSession,
+            currentRunSessionAttachment: descriptor.currentRunSessionAttachment,
+            configuration: descriptor.configuration, hostObservation: descriptor.hostObservation,
+            attachments: descriptor.attachments,
+            sessionAttachments: descriptor.sessionAttachments,
+            artifacts: [artifact, duplicateArtifact], omissions: descriptor.omissions)
+        XCTFail("a descriptor accepted duplicate artifact identities")
+    } catch WorkServiceProtocolError.invalidRequest(let diagnostic) {
+        XCTAssertTrue(diagnostic.contains("unique"))
+    }
+    var descriptorObject = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: JSONEncoder().encode(descriptor)) as? [String: Any])
+    var artifactObjects = try XCTUnwrap(descriptorObject["artifacts"] as? [[String: Any]])
+    var duplicateDescriptorObject = descriptorObject
+    var conflictingArtifactObject = try XCTUnwrap(artifactObjects.first)
+    conflictingArtifactObject["label"] = "conflicting duplicate"
+    duplicateDescriptorObject["artifacts"] = artifactObjects + [conflictingArtifactObject]
+    do {
+        _ = try JSONDecoder().decode(
+            WorkServiceWorkDescriptor.self,
+            from: JSONSerialization.data(withJSONObject: duplicateDescriptorObject))
+        XCTFail("descriptor decoding accepted duplicate artifact identities")
+    } catch {
+        XCTAssertTrue(error is DecodingError)
+    }
+    for invalidID in [
+        "   ",
+        String(repeating: "a", count: WorkServiceBounds.maxIdentityCharacters + 1),
+    ] {
+        let invalidArtifact = WorkServiceArtifactDescriptor(
+            artifactID: invalidID, work: descriptor.work, label: "invalid identity")
+        do {
+            _ = try WorkServiceWorkDescriptor(
+                work: descriptor.work, journal: descriptor.journal,
+                recordedDisposition: descriptor.recordedDisposition,
+                execution: descriptor.execution, currentRun: descriptor.currentRun,
+                currentRunSession: descriptor.currentRunSession,
+                currentRunSessionAttachment: descriptor.currentRunSessionAttachment,
+                configuration: descriptor.configuration,
+                hostObservation: descriptor.hostObservation,
+                attachments: descriptor.attachments,
+                sessionAttachments: descriptor.sessionAttachments,
+                artifacts: [invalidArtifact], omissions: descriptor.omissions)
+            XCTFail("a descriptor accepted an invalid artifact identity")
+        } catch WorkServiceProtocolError.invalidRequest(let diagnostic) {
+            XCTAssertTrue(diagnostic.contains("bounded"))
+        }
+        var invalidIdentityObject = descriptorObject
+        var invalidIdentityArtifacts = artifactObjects
+        invalidIdentityArtifacts[0]["artifactID"] = invalidID
+        invalidIdentityObject["artifacts"] = invalidIdentityArtifacts
+        do {
+            _ = try JSONDecoder().decode(
+                WorkServiceWorkDescriptor.self,
+                from: JSONSerialization.data(withJSONObject: invalidIdentityObject))
+            XCTFail("descriptor decoding accepted an invalid artifact identity")
+        } catch {
+            XCTAssertTrue(error is DecodingError)
+        }
+    }
+    let invalidArtifactFields = [
+        WorkServiceArtifactDescriptor(
+            artifactID: "negative-byte-count", work: descriptor.work,
+            label: "negative byte count", byteCount: -1),
+        WorkServiceArtifactDescriptor(
+            artifactID: "invalid-body-reference", work: descriptor.work,
+            label: "invalid body reference",
+            bodyReference: TimelineBodyReference(
+                authority: descriptor.journal, referenceID: "body", mediaType: "text/plain",
+                byteCount: 1, digest: "not-a-sha256-digest")),
+    ]
+    for invalidArtifact in invalidArtifactFields {
+        do {
+            _ = try WorkServiceWorkDescriptor(
+                work: descriptor.work, journal: descriptor.journal,
+                recordedDisposition: descriptor.recordedDisposition,
+                execution: descriptor.execution, currentRun: descriptor.currentRun,
+                currentRunSession: descriptor.currentRunSession,
+                currentRunSessionAttachment: descriptor.currentRunSessionAttachment,
+                configuration: descriptor.configuration,
+                hostObservation: descriptor.hostObservation,
+                attachments: descriptor.attachments,
+                sessionAttachments: descriptor.sessionAttachments,
+                artifacts: [invalidArtifact], omissions: descriptor.omissions)
+            XCTFail("a descriptor accepted malformed artifact metadata")
+        } catch WorkServiceProtocolError.invalidRequest(let diagnostic) {
+            XCTAssertTrue(diagnostic.contains("canonical"))
+        }
+    }
+    let foreignWorkObject = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: JSONEncoder().encode(foreignWork)) as? [String: Any])
+    artifactObjects[0]["work"] = foreignWorkObject
+    descriptorObject["artifacts"] = artifactObjects
+    do {
+        _ = try JSONDecoder().decode(
+            WorkServiceWorkDescriptor.self,
+            from: JSONSerialization.data(withJSONObject: descriptorObject))
+        XCTFail("descriptor decoding accepted an artifact belonging to another Work")
+    } catch {
+        XCTAssertTrue(error is DecodingError)
+    }
     let bodyReference = try XCTUnwrap(artifact.bodyReference)
     let bodyPage = try await service.fetchBody(.init(
         work: serviceWork, journal: serviceJournal, attachment: attachment.attachment,
@@ -1554,6 +1680,13 @@ func test_workServiceRetainsSeedArtifactOverflowAsAnExplicitOmission() async thr
         repeating: "m", count: WorkServiceBounds.maxDiagnosticCharacters + 1)
     let encodedArtifact = try JSONEncoder().encode(WorkServiceArtifactDescriptor(
         artifactID: "decoded-artifact", work: work, label: "short"))
+    let explicitlyTruncatedArtifact = WorkServiceArtifactDescriptor(
+        artifactID: "explicitly-truncated", work: work, label: "short",
+        metadataWasTruncated: true)
+    let decodedExplicitlyTruncated = try JSONDecoder().decode(
+        WorkServiceArtifactDescriptor.self,
+        from: JSONEncoder().encode(explicitlyTruncatedArtifact))
+    XCTAssertTrue(decodedExplicitlyTruncated.metadataWasTruncated)
     var hostileArtifactJSON = try XCTUnwrap(
         JSONSerialization.jsonObject(with: encodedArtifact) as? [String: Any])
     hostileArtifactJSON["label"] = longLabel

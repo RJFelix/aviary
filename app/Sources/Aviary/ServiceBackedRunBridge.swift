@@ -100,6 +100,18 @@ final class ServiceBackedRunBridge {
     }
 
     var activities: [WorkActionSnapshot] { projection.activities }
+    /// The last provider-bound context accepted by the canonical Session reducer. This is a
+    /// historical crossing, not a prediction of the next request.
+    var recordedModelContext: RecordedModelContextProjection {
+        RecordedModelContextProjection(
+            projection.sessionSnapshot,
+            sourceCompleteness: projection.sessionSourceCompleteness)
+    }
+    /// Durable Work/Session state at the controller's exact cursors. Runtime namespace state is
+    /// explicitly not exposed until the Work service grows a capability-controlled inspect RPC.
+    var canonicalWorkingState: CanonicalWorkingStateProjection {
+        CanonicalWorkingStateProjection(projection: projection)
+    }
     /// Privacy-safe semantic action rows prepared in Core so every GUI uses the same titles,
     /// timing, retry guidance, provenance, and observation-boundary disclosures.
     var actionPresentations: [WorkActionPresentation] {

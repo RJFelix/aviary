@@ -1464,6 +1464,215 @@ func testJournalBackedWorkServiceCreateStaysIdleWithProductionManifest() async t
     await service.controlJournal.close()
 }
 
+func testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("artifact-index-client")
+    let store = JournalBackedTestManifestStore(productionCapable: true)
+    let policy = WorkServiceCapabilityPolicy(
+        grantsByClient: [client: journalBackedAllCapabilities()])
+    let service = try JournalBackedWorkService(
+        home: home, authorizer: policy, manifestStore: store)
+    let controlCursor = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "create-artifact-index",
+        causalControlCursor: controlCursor,
+        requestedCapabilities: journalBackedAllCapabilities()))
+
+    let writer = try TimelineJournalWriter(
+        reopening: home.timelineV2WorkJournalURL(created.work.work),
+        journal: created.work.journal,
+        actor: TimelineActor(actorID: "artifact-index-writer", kind: "self-test"), home: home)
+    let longLabel = String(
+        repeating: "m", count: WorkServiceBounds.maxDiagnosticCharacters + 1)
+    for index in 0...WorkServiceBounds.maxArtifactsPerWork {
+        _ = try await writer.append(TimelineEventDraft(
+            work: created.work.work,
+            workHost: WorkHostRef(created.work.work.workHostID),
+            type: TimelineEventType.artifact, declaredDomains: [.work],
+            payload: .object([
+                "artifact_id": .string("artifact-\(index)"),
+                "label": .string(index == 0 ? longLabel : "artifact \(index)"),
+                "media_type": .string("text/plain"),
+                "available": .bool(false),
+            ])))
+    }
+    try await writer.closeChecked()
+
+    func assertBoundedArtifactIndex(_ descriptor: WorkServiceWorkDescriptor) throws {
+        XCTAssertEqual(descriptor.artifacts.count, WorkServiceBounds.maxArtifactsPerWork)
+        XCTAssertEqual(
+            descriptor.omissions.first(where: { $0.category == "artifacts" })?.count, 1)
+        XCTAssertEqual(
+            descriptor.omissions.first(where: { $0.category == "artifact_metadata" })?.count,
+            1)
+        XCTAssertTrue(try XCTUnwrap(descriptor.artifacts.first).metadataWasTruncated)
+    }
+
+    try assertBoundedArtifactIndex(try await service.describeWork(.init(
+        work: created.work.work, journal: created.work.journal, client: client)))
+    await service.controlJournal.close()
+
+    let reopened = try JournalBackedWorkService(
+        home: home, instanceID: "artifact-index-reopen",
+        startIdentity: "artifact-index-reopen", authorizer: policy, manifestStore: store)
+    try assertBoundedArtifactIndex(try await reopened.describeWork(.init(
+        work: created.work.work, journal: created.work.journal, client: client)))
+
+    let malformedWriter = try TimelineJournalWriter(
+        reopening: home.timelineV2WorkJournalURL(created.work.work),
+        journal: created.work.journal,
+        actor: TimelineActor(actorID: "malformed-artifact-writer", kind: "self-test"),
+        home: home)
+    _ = try await malformedWriter.append(TimelineEventDraft(
+        work: created.work.work,
+        workHost: WorkHostRef(created.work.work.workHostID),
+        type: TimelineEventType.artifact, declaredDomains: [.work],
+        payload: .object([
+            "label": .string("missing identity"),
+            "available": .bool(false),
+        ])))
+    try await malformedWriter.closeChecked()
+    let malformedDescriptor = try await reopened.describeWork(.init(
+        work: created.work.work, journal: created.work.journal, client: client))
+    XCTAssertEqual(
+        malformedDescriptor.omissions.first(where: { $0.category == "artifacts" })?.count,
+        1)
+    XCTAssertEqual(
+        malformedDescriptor.omissions.first(where: { $0.category == "artifact_index" })?.count,
+        1)
+
+    let invalidIdentityWriter = try TimelineJournalWriter(
+        reopening: home.timelineV2WorkJournalURL(created.work.work),
+        journal: created.work.journal,
+        actor: TimelineActor(actorID: "invalid-artifact-writer", kind: "self-test"),
+        home: home)
+    let invalidArtifactIDs = [
+        "   ",
+        String(repeating: "a", count: WorkServiceBounds.maxIdentityCharacters + 1),
+    ]
+    for invalidID in invalidArtifactIDs {
+        _ = try await invalidIdentityWriter.append(TimelineEventDraft(
+            work: created.work.work,
+            workHost: WorkHostRef(created.work.work.workHostID),
+            type: TimelineEventType.artifact, declaredDomains: [.work],
+            payload: .object([
+                "artifact_id": .string(invalidID),
+                "label": .string("invalid identity"),
+                "available": .bool(false),
+            ])))
+    }
+    try await invalidIdentityWriter.closeChecked()
+    let invalidIdentityDescriptor = try await reopened.describeWork(.init(
+        work: created.work.work, journal: created.work.journal, client: client))
+    XCTAssertEqual(
+        invalidIdentityDescriptor.omissions.first(where: {
+            $0.category == "artifact_index"
+        })?.count,
+        1)
+    for invalidID in invalidArtifactIDs {
+        do {
+            _ = try await reopened.fetchArtifact(.init(
+                work: created.work.work, journal: created.work.journal,
+                attachment: created.attachment.attachment, client: client,
+                artifactID: invalidID))
+            XCTFail("an invalid artifact identity must not cross the lookup boundary")
+        } catch WorkServiceProtocolError.invalidRequest(let diagnostic) {
+            XCTAssertTrue(diagnostic.contains("bounded"))
+        }
+    }
+
+    let malformedFieldWriter = try TimelineJournalWriter(
+        reopening: home.timelineV2WorkJournalURL(created.work.work),
+        journal: created.work.journal,
+        actor: TimelineActor(actorID: "malformed-artifact-field-writer", kind: "self-test"),
+        home: home)
+    let invalidBodyReference = JSONValue.object([
+        "authority": .string("not-a-journal"),
+        "reference_id": .string("artifact-body"),
+    ])
+    let invalidDigestReference = try XCTUnwrap(JSONValue.parse(JSONEncoder().encode(
+        TimelineBodyReference(
+            authority: created.work.journal, referenceID: "artifact-body",
+            mediaType: "text/plain", byteCount: 1, digest: "not-a-sha256-digest"))))
+    let malformedFieldPayloads: [[String: JSONValue]] = [
+        [
+            "artifact_id": .string("undecodable-body-reference"),
+            "body_reference": invalidBodyReference,
+        ],
+        [
+            "artifact_id": .string("invalid-body-digest"),
+            "body_reference": invalidDigestReference,
+        ],
+        [
+            "artifact_id": .string("negative-byte-count"),
+            "byte_count": .number(-1),
+        ],
+    ]
+    for payload in malformedFieldPayloads {
+        _ = try await malformedFieldWriter.append(TimelineEventDraft(
+            work: created.work.work,
+            workHost: WorkHostRef(created.work.work.workHostID),
+            type: TimelineEventType.artifact, declaredDomains: [.work],
+            payload: .object(payload)))
+    }
+    try await malformedFieldWriter.closeChecked()
+    let malformedFieldDescriptor = try await reopened.describeWork(.init(
+        work: created.work.work, journal: created.work.journal, client: client))
+    XCTAssertEqual(
+        malformedFieldDescriptor.omissions.first(where: {
+            $0.category == "artifact_index"
+        })?.count,
+        1)
+    for artifactID in [
+        "undecodable-body-reference", "invalid-body-digest", "negative-byte-count",
+    ] {
+        do {
+            _ = try await reopened.fetchArtifact(.init(
+                work: created.work.work, journal: created.work.journal,
+                attachment: created.attachment.attachment, client: client,
+                artifactID: artifactID))
+            XCTFail("malformed artifact fields must not become an addressable artifact")
+        } catch WorkServiceProtocolError.sourceIncomplete {
+            XCTAssertTrue(true)
+        }
+    }
+
+    let duplicateWriter = try TimelineJournalWriter(
+        reopening: home.timelineV2WorkJournalURL(created.work.work),
+        journal: created.work.journal,
+        actor: TimelineActor(actorID: "duplicate-artifact-writer", kind: "self-test"),
+        home: home)
+    _ = try await duplicateWriter.append(TimelineEventDraft(
+        work: created.work.work,
+        workHost: WorkHostRef(created.work.work.workHostID),
+        type: TimelineEventType.artifact, declaredDomains: [.work],
+        payload: .object([
+            "artifact_id": .string("artifact-0"),
+            "label": .string("duplicate identity"),
+            "available": .bool(false),
+        ])))
+    try await duplicateWriter.closeChecked()
+    do {
+        _ = try await reopened.describeWork(.init(
+            work: created.work.work, journal: created.work.journal, client: client))
+        XCTFail("duplicate artifact identities must make the descriptor unavailable")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try await reopened.fetchArtifact(.init(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: client,
+            artifactID: "artifact-0"))
+        XCTFail("duplicate artifact identities must make artifact lookup unavailable")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    await reopened.controlJournal.close()
+}
+
 func testJournalBackedWorkServiceDoesNotProjectPreMarkerStartAsIdle() async throws {
     let (home, root) = try journalBackedHome()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -3466,6 +3675,9 @@ let casesJournalBackedWorkService: [Case] = [
     }),
     ("journal-backed service Create remains idle with production material", {
         try await testJournalBackedWorkServiceCreateStaysIdleWithProductionManifest()
+    }),
+    ("journal-backed service reports artifact index loss across reopen", {
+        try await testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen()
     }),
     ("journal-backed service publishes and reopens Create Session evidence", {
         try await testJournalBackedWorkServicePublishesCreateSessionAndReopensItsEvidence()

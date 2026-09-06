@@ -3650,6 +3650,10 @@ final class LiveRun: Identifiable {
     /// committed for them (for example, an unknown-effect crossing after a partial append).
     private(set) var serviceInputDeliveryAttention: [CanonicalInputDeliveryRow] = []
     private(set) var serviceInputDeliveryOmissions: [WorkServiceOmission] = []
+    /// The last provider-bound context and the runtime's durable working state are intentionally
+    /// separate. A context manifest is never evidence that a Python namespace is live.
+    private(set) var recordedModelContext: RecordedModelContextProjection?
+    private(set) var canonicalWorkingState: CanonicalWorkingStateProjection?
     /// Snapshot-only injection used to render the real RunPane with deterministic capabilities.
     /// Production runs always leave this nil and derive capabilities from their driver/host.
     private var visualFixtureCommandCapabilities: SessionCommandCapabilities?
@@ -3796,6 +3800,8 @@ final class LiveRun: Identifiable {
         self.servicePendingInputs = bridge.pendingInputs
         self.serviceInputDeliveryAttention = bridge.inputDeliveryAttention
         self.serviceInputDeliveryOmissions = bridge.inputDeliveryProjection.omissions
+        self.recordedModelContext = bridge.recordedModelContext
+        self.canonicalWorkingState = bridge.canonicalWorkingState
         self.modelLabel = bridge.modelLabel
         self.thinkingLevel = bridge.thinkingLevel
         self.sessionID = bridge.sessionID
@@ -4298,6 +4304,8 @@ final class LiveRun: Identifiable {
         publish(
             serviceBridge.inputDeliveryProjection.omissions,
             to: \.serviceInputDeliveryOmissions)
+        publish(serviceBridge.recordedModelContext, to: \.recordedModelContext)
+        publish(serviceBridge.canonicalWorkingState, to: \.canonicalWorkingState)
         // This is canonical Session evidence (input.accepted/message history), not a Start
         // receipt. It remains true even when the visible transcript has bounded omissions.
         publish(serviceBridge.hasCanonicalInputDelivery, to: \.initialPromptDelivered)
@@ -4446,6 +4454,8 @@ final class LiveRun: Identifiable {
         pendingInputs: [CanonicalInputDeliveryRow],
         deliveryAttention: [CanonicalInputDeliveryRow],
         actions: [WorkActionPresentation],
+        recordedModelContext: RecordedModelContextProjection? = nil,
+        canonicalWorkingState: CanonicalWorkingStateProjection? = nil,
         draft: String
     ) -> LiveRun {
         let run = LiveRun(
@@ -4472,6 +4482,8 @@ final class LiveRun: Identifiable {
         run.servicePendingInputs = pendingInputs
         run.serviceInputDeliveryAttention = deliveryAttention
         run.serviceActionPresentations = actions
+        run.recordedModelContext = recordedModelContext
+        run.canonicalWorkingState = canonicalWorkingState
         run.visualFixtureCommandCapabilities = SessionCommandCapabilities(
             supportsSteering: true, supportsQueuedFollowUps: true,
             cancellationScopes: [.agentLoop])

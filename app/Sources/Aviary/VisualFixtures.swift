@@ -13,9 +13,11 @@ enum VisualFixtureRoute: String {
     case serviceChatNarrow = "service-chat-narrow-fixture"
     case productionDelivery = "production-delivery-fixture"
     case productionDeliveryNarrow = "production-delivery-narrow-fixture"
+    case productionInspectorNarrow = "production-inspector-narrow-fixture"
 
     var isNarrow: Bool {
         self == .serviceChatNarrow || self == .productionDeliveryNarrow
+            || self == .productionInspectorNarrow
     }
 }
 
@@ -30,7 +32,43 @@ struct VisualFixtureView: View {
             FixtureServiceConversationView(narrow: route.isNarrow)
         case .productionDelivery, .productionDeliveryNarrow:
             ProductionRunPaneFixture(narrow: route.isNarrow)
+        case .productionInspectorNarrow:
+            ProductionInspectorFixture()
         }
+    }
+}
+
+/// The same inspector presented by Cockpit's Context and Working State button, rendered at the
+/// narrow-sheet width so its disclosure rows and six-plane recovery matrix stay reviewable.
+@MainActor
+private struct ProductionInspectorFixture: View {
+    @State private var selectedItem: TranscriptItem?
+    private let model: AppModel
+    private let run: LiveRun
+
+    init() {
+        let model = AppModel()
+        let run = LiveRun.productionRunPaneVisualFixture(
+            items: FixtureData.productionTranscriptNarrow,
+            pendingInputs: [FixtureData.waitingInput],
+            deliveryAttention: [FixtureData.uncertainInput],
+            actions: FixtureData.actions.map(WorkActionPresentation.init),
+            recordedModelContext: FixtureData.inspectorProjections.context,
+            canonicalWorkingState: FixtureData.inspectorProjections.working,
+            draft: "Check the current runtime namespace, then queue a separate summary for review.")
+        model.runs = [run]
+        model.focusedRunID = run.id
+        self.model = model
+        self.run = run
+    }
+
+    var body: some View {
+        RunInspector(run: run, selectedItem: $selectedItem)
+            .environment(model)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Cockpit run context and working state sheet")
     }
 }
 
@@ -42,6 +80,8 @@ private enum FixtureData {
     static let sessionJournal = JournalRef.session(
         session, authority: TimelineAuthorityRef(host.workHostID))
     static let attachment = SessionAttachmentRef("session-attachment-042")
+    static let run = RunRef("run-20260906-01")
+    static let turn = TurnRef("turn-07")
     static let actor = TimelineActor(actorID: "work-host-linux-01", kind: "work-host")
     static let baseTime = Date(timeIntervalSince1970: 1_757_136_000)
 
@@ -50,8 +90,8 @@ private enum FixtureData {
             sourceEvent: EventRef(journal: workJournal, eventID: id),
             sequence: sequence,
             hostSequence: sequence,
-            run: RunRef("run-20260906-01"),
-            turn: TurnRef("turn-07"),
+            run: run,
+            turn: turn,
             actor: actor,
             hostRecordedAt: baseTime.addingTimeInterval(offset),
             clientTimestamp: baseTime.addingTimeInterval(offset + 0.3),
@@ -82,6 +122,172 @@ private enum FixtureData {
         outcomeEvent: observation("event-action-outcome-000", sequence: 13, offset: 14))
 
     static let actions = [activeAction, completedAction]
+
+    static let inspectorProjections: (
+        context: RecordedModelContextProjection,
+        working: CanonicalWorkingStateProjection
+    ) = {
+        let systemBody = TimelineBodyReference(
+            authority: sessionJournal, referenceID: "fixture-system-body",
+            mediaType: "application/vnd.aviary.chat-message+json", byteCount: 9_840,
+            digest: "sha256:fixture-system")
+        let historyBody = TimelineBodyReference(
+            authority: sessionJournal, referenceID: "fixture-history-body",
+            mediaType: "application/vnd.aviary.chat-message+json", byteCount: 18_210,
+            digest: "sha256:fixture-history")
+        let components = [
+            ContextComponent(
+                componentID: "fixture-system", inclusionID: "fixture-system-include",
+                sourceID: "system-prompt", mode: .pinned,
+                measuredBytes: 9_840, includedBytes: 9_840, deliveredBytes: 9_840,
+                fullByteCount: 9_840, bodyReference: systemBody, digest: "sha256:fixture-system"),
+            ContextComponent(
+                componentID: "fixture-history", inclusionID: "fixture-history-include",
+                sourceID: "conversation-history", mode: .history,
+                deliveryMode: .truncated, measuredBytes: 25_400, includedBytes: 18_210,
+                deliveredBytes: 18_210, fullByteCount: 25_400,
+                bodyReference: historyBody, digest: "sha256:fixture-history"),
+            ContextComponent(
+                componentID: "fixture-tools", inclusionID: "fixture-tools-include",
+                sourceID: "tool-schema", mode: .instruction,
+                measuredBytes: 3_190, includedBytes: 3_190, deliveredBytes: 3_190,
+                fullByteCount: 3_190, digest: "sha256:fixture-tools"),
+            ContextComponent(
+                componentID: "fixture-compaction", inclusionID: "fixture-compaction-include",
+                sourceID: "compaction-summary",
+                sourceProvenance: EventRef(
+                    journal: sessionJournal, eventID: "fixture-compaction-event"),
+                mode: .compactionSummary, deliveryMode: .summary,
+                measuredBytes: 2_140, includedBytes: 2_140, deliveredBytes: 2_140,
+                fullByteCount: 2_140,
+                digest: "sha256:" + String(repeating: "a", count: 64)),
+        ]
+        let promptSources = [
+            ContextManifestSource(
+                sourceID: "base-instructions-v1", inclusionID: "source-base",
+                kind: .baseInstruction, status: .present, label: "unsafe fixture label",
+                fullByteCount: 4_120, fullDigest: "sha256:fixture-base",
+                deliveredByteCount: 4_120, deliveredDigest: "sha256:fixture-base",
+                renderedByteCount: 4_120, renderedDigest: "sha256:fixture-base"),
+            ContextManifestSource(
+                sourceID: "/private/fixture/AGENTS.md", inclusionID: "source-context",
+                kind: .contextFile, status: .truncated, label: "private fixture path",
+                fullByteCount: 10_400, fullDigest: "sha256:fixture-context-full",
+                deliveredByteCount: 4_096, deliveredDigest: "sha256:fixture-context-delivered",
+                renderedByteCount: 4_180, renderedDigest: "sha256:fixture-context-rendered"),
+            ContextManifestSource(
+                sourceID: "skill:repo-inspection", inclusionID: "source-skill",
+                kind: .skill, status: .present, label: "private skill description",
+                fullByteCount: 1_624, fullDigest: "sha256:fixture-skill",
+                deliveredByteCount: 1_624, deliveredDigest: "sha256:fixture-skill",
+                renderedByteCount: 1_680, renderedDigest: "sha256:fixture-skill-rendered"),
+        ]
+        let manifest = ContextManifest(
+            manifestID: "fixture-context-manifest", requestID: "fixture-request",
+            modelID: "claude-sonnet-4-5", components: components,
+            omissions: [ContextManifestOmission(
+                omissionID: "fixture-history-bound", sourceID: "conversation-history",
+                reason: "bounded history", measuredBytes: 7_190)],
+            cumulativeDeliveredBytes: 112_480,
+            systemPromptAssemblyID: "fixture-prompt-assembly",
+            systemPromptSources: promptSources)
+
+        let workCursor = JournalCursor(
+            journal: workJournal, eventID: "fixture-work-tip", sequence: 25)
+        let sessionCursor = JournalCursor(
+            journal: sessionJournal, eventID: "fixture-session-tip", sequence: 14)
+        var workSnapshot = WorkSnapshot()
+        workSnapshot.journal = workJournal
+        workSnapshot.work = work
+        workSnapshot.workHost = host
+        workSnapshot.lifecycle = .active
+        workSnapshot.execution = .running
+        workSnapshot.lastSequence = workCursor.sequence
+        workSnapshot.lastEventID = workCursor.eventID
+        workSnapshot.attachedSessionIDs = [session.sessionID]
+        workSnapshot.sessionAttachments[attachment.attachmentID] = WorkSessionAttachmentSnapshot(
+            attachment: attachment, session: session,
+            capabilities: ["observe", "control"])
+        workSnapshot.activeRun = run
+        workSnapshot.observedRunIDs = [run.runID]
+        workSnapshot.activeRunSession = session
+        workSnapshot.activeRunSessionAttachment = attachment
+        workSnapshot.modelID = "claude-sonnet-4-5"
+        workSnapshot.activeTurn = turn
+        workSnapshot.activeActionIDs = [activeAction.action.actionID]
+        workSnapshot.actions = Dictionary(uniqueKeysWithValues: actions.map { ($0.action.actionID, $0) })
+        workSnapshot.handles = [
+            "fixture-handle": WorkHandleSnapshot(handle: HandleRef("fixture-handle"), state: "running")
+        ]
+        workSnapshot.childStates = ["fixture-child": "done"]
+        let recoveryCoverage = RecoveryCoverage(
+            operation: .reattachLiveHost,
+            planes: [
+                .timeline: .preserved, .effectiveContext: .preserved,
+                .runtimeNamespace: .unknown, .backgroundWork: .referenced,
+                .memoriesArtifactsRepository: .referenced, .externalEffects: .unknown,
+            ])
+        workSnapshot.recovery = [recoveryCoverage]
+        workSnapshot.recordedRecovery = [RecordedRecoveryCoverage(
+            coverage: recoveryCoverage,
+            sourceEvent: EventRef(journal: workJournal, eventID: "fixture-recovery-event"),
+            session: session, work: work, workJournal: workJournal, workHost: host,
+            sessionAttachment: attachment, run: run)]
+
+        var sessionSnapshot = SessionSnapshot()
+        sessionSnapshot.journal = sessionJournal
+        sessionSnapshot.session = session
+        sessionSnapshot.lifecycle = .active
+        sessionSnapshot.lastSequence = sessionCursor.sequence
+        sessionSnapshot.lastEventID = sessionCursor.eventID
+        sessionSnapshot.attachments[attachment.attachmentID] = SessionAttachmentSnapshot(
+            attachment: attachment, work: work, cursor: workCursor,
+            capabilities: ["observe", "control"])
+        sessionSnapshot.activeRun = run
+        sessionSnapshot.activeTurn = turn
+        sessionSnapshot.modelID = "claude-sonnet-4-5"
+        sessionSnapshot.contextManifest = manifest
+        sessionSnapshot.contextComponents = components
+        sessionSnapshot.contextBoundaryEventID = "fixture-context-boundary"
+
+        let authorization = WorkServiceAuthorizationOutcome(
+            requested: [.observe, .control], granted: [.observe, .control], denied: [])
+        let clientAttachment = WorkServiceClientAttachment(
+            attachment: ClientAttachmentRef("fixture-client-attachment"),
+            client: ClientRef("fixture-client"), session: session,
+            sessionJournal: sessionJournal, sessionAttachment: attachment,
+            authorization: authorization)
+        let relationship = WorkServiceSessionAttachmentDescriptor(
+            session: session, sessionJournal: sessionJournal, sessionAttachment: attachment,
+            publication: .mirrored,
+            causalSessionCursor: JournalCursor(journal: sessionJournal, sequence: 1),
+            sessionCursor: sessionCursor,
+            causalWorkCursor: JournalCursor(journal: workJournal, sequence: 1),
+            resultingWorkCursor: JournalCursor(journal: workJournal, sequence: 2),
+            capabilities: [.observe, .control])
+        let descriptor = try! WorkServiceWorkDescriptor(
+            work: work, journal: workJournal, recordedDisposition: .reusable,
+            execution: .running, currentRun: run, currentRunSession: session,
+            currentRunSessionAttachment: attachment,
+            configuration: WorkServiceWorkConfiguration(
+                providerID: "anthropic", modelID: "claude-sonnet-4-5",
+                workspaceID: try! WorkHostWorkspaceID(
+                    "workspace-12345678-1234-1234-1234-123456789abc")),
+            hostObservation: nil, attachments: [clientAttachment],
+            sessionAttachments: [relationship],
+            artifacts: [WorkServiceArtifactDescriptor(
+                artifactID: "fixture-report", work: work, label: "Checkpoint report",
+                mediaType: "text/markdown", byteCount: 2_840,
+                digest: "sha256:fixture-report", available: true)],
+            omissions: [WorkServiceOmission(category: "artifact_metadata", count: 1)])
+        return (
+            RecordedModelContextProjection(sessionSnapshot),
+            CanonicalWorkingStateProjection(
+                descriptor: descriptor, attachment: clientAttachment,
+                workSnapshot: workSnapshot, sessionSnapshot: sessionSnapshot,
+                workCursor: workCursor, sessionCursor: sessionCursor,
+                workSourceCompleteness: .complete, sessionSourceCompleteness: .complete))
+    }()
 
     static func deliveryRow(
         id: String, sequence: Int, state: CanonicalInputDeliveryState,
@@ -210,6 +416,8 @@ private struct ProductionRunPaneFixture: View {
             pendingInputs: [FixtureData.waitingInput],
             deliveryAttention: [FixtureData.uncertainInput],
             actions: FixtureData.actions.map(WorkActionPresentation.init),
+            recordedModelContext: FixtureData.inspectorProjections.context,
+            canonicalWorkingState: FixtureData.inspectorProjections.working,
             draft: "Check the current runtime namespace, then queue a separate summary for review.")
         model.runs = [run]
         model.focusedRunID = run.id
