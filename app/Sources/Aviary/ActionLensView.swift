@@ -36,17 +36,12 @@ struct WorkActivityStrip: View {
                     .font(.system(size: 10.5))
             }
 
-            HStack(alignment: .top, spacing: 0) {
+            AdaptiveActivityStoryLayout() {
                 storyColumn("NOW", value: action.kindTitle, detail: action.timeAvailability)
-                Divider().padding(.horizontal, 10)
                 storyColumn(
-                    "WHY",
-                    value: action.intent ?? "Intent not recorded",
-                    detail: causeLabel)
-                Divider().padding(.horizontal, 10)
+                    "WHY", value: action.intent ?? "Intent not recorded", detail: causeLabel)
                 storyColumn(
-                    "NEXT",
-                    value: "Unknown",
+                    "NEXT", value: "Unknown",
                     detail: "The Work has not declared its next step")
             }
         }
@@ -62,15 +57,16 @@ struct WorkActivityStrip: View {
                 .foregroundStyle(.secondary)
             Text(value)
                 .font(.system(size: 11, weight: .medium))
-                .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
             Text(detail)
                 .font(.system(size: 9.5))
                 .foregroundStyle(.tertiary)
-                .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .help("\(value). \(detail)")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(label): \(value). \(detail)")
     }
 
     private var causeLabel: String {
@@ -91,6 +87,63 @@ struct WorkActivityStrip: View {
     }
 
     private var tint: Color { WorkActionVisuals.tint(for: action.state) }
+}
+
+/// A real width-sensitive layout avoids relying on text compression to decide whether the
+/// activity story fits. Wide panes get three columns; compact panes get three full-width rows.
+private struct AdaptiveActivityStoryLayout: Layout {
+    private let breakpoint: CGFloat = 600
+    private let spacing: CGFloat = 9
+
+    func sizeThatFits(
+        proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+    ) -> CGSize {
+        let width = proposal.width ?? breakpoint
+        guard !subviews.isEmpty else { return CGSize(width: width, height: 0) }
+        if width >= breakpoint {
+            let itemWidth = max(0, (width - spacing * CGFloat(subviews.count - 1))
+                / CGFloat(subviews.count))
+            let sizes = subviews.map {
+                $0.sizeThatFits(ProposedViewSize(width: itemWidth, height: nil))
+            }
+            return CGSize(width: width, height: sizes.map(\.height).max() ?? 0)
+        }
+        let sizes = subviews.map {
+            $0.sizeThatFits(ProposedViewSize(width: width, height: nil))
+        }
+        return CGSize(
+            width: width,
+            height: sizes.map(\.height).reduce(0, +)
+                + spacing * CGFloat(max(0, subviews.count - 1)))
+    }
+
+    func placeSubviews(
+        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+    ) {
+        guard !subviews.isEmpty else { return }
+        if bounds.width >= breakpoint {
+            let itemWidth = max(0, (bounds.width - spacing * CGFloat(subviews.count - 1))
+                / CGFloat(subviews.count))
+            for (index, subview) in subviews.enumerated() {
+                subview.place(
+                    at: CGPoint(
+                        x: bounds.minX + CGFloat(index) * (itemWidth + spacing),
+                        y: bounds.minY),
+                    anchor: .topLeading,
+                    proposal: ProposedViewSize(width: itemWidth, height: bounds.height))
+            }
+            return
+        }
+        var y = bounds.minY
+        for subview in subviews {
+            let size = subview.sizeThatFits(
+                ProposedViewSize(width: bounds.width, height: nil))
+            subview.place(
+                at: CGPoint(x: bounds.minX, y: y), anchor: .topLeading,
+                proposal: ProposedViewSize(width: bounds.width, height: size.height))
+            y += size.height + spacing
+        }
+    }
 }
 
 /// The inspector's action row keeps the semantic facts visible and the protocol evidence

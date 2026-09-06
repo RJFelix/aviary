@@ -886,7 +886,10 @@ internal enum WorkReducerTransition {
                 acceptanceEventRef: existing.acceptanceEventRef,
                 deliveryEventRef: EventRef(journal: event.journal, eventID: event.eventID),
                 deliveryActor: event.actor, deliveryHostSequence: hostSequence,
-                deliveryIdempotencyKey: event.idempotencyKey))
+                deliveryIdempotencyKey: event.idempotencyKey,
+                commandKind: existing.commandKind, deliveryMode: existing.deliveryMode,
+                acceptanceRun: existing.acceptanceRun,
+                carriesSessionInput: existing.carriesSessionInput))
             return
         } else if commandState == .delivered || commandState == .notDelivered || commandState == .indeterminate {
             quarantine(event, state: &state,
@@ -896,7 +899,11 @@ internal enum WorkReducerTransition {
         state.stageCommand(WorkCommandSnapshot(
             command: command, state: commandState, actor: event.actor,
             hostSequence: hostSequence, idempotencyKey: event.idempotencyKey,
-            acceptanceEventRef: EventRef(journal: event.journal, eventID: event.eventID)))
+            acceptanceEventRef: EventRef(journal: event.journal, eventID: event.eventID),
+            commandKind: event.payload["command_kind"]?.stringValue.flatMap { CanonicalCommandKind(rawValue: $0) },
+            deliveryMode: event.payload["delivery_mode"]?.stringValue.flatMap { RunInputDeliveryMode(rawValue: $0) },
+            acceptanceRun: event.run,
+            carriesSessionInput: event.payload["carries_session_input"]?.boolValue))
     }
 
     private static func legalActionTransition(

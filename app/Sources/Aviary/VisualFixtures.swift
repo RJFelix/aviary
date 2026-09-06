@@ -11,8 +11,12 @@ enum VisualFixtureRoute: String {
     case cockpit = "cockpit-fixture"
     case serviceChat = "service-chat-fixture"
     case serviceChatNarrow = "service-chat-narrow-fixture"
+    case productionDelivery = "production-delivery-fixture"
+    case productionDeliveryNarrow = "production-delivery-narrow-fixture"
 
-    var isNarrow: Bool { self == .serviceChatNarrow }
+    var isNarrow: Bool {
+        self == .serviceChatNarrow || self == .productionDeliveryNarrow
+    }
 }
 
 struct VisualFixtureView: View {
@@ -24,6 +28,8 @@ struct VisualFixtureView: View {
             FixtureCockpitView()
         case .serviceChat, .serviceChatNarrow:
             FixtureServiceConversationView(narrow: route.isNarrow)
+        case .productionDelivery, .productionDeliveryNarrow:
+            ProductionRunPaneFixture(narrow: route.isNarrow)
         }
     }
 }
@@ -77,6 +83,40 @@ private enum FixtureData {
 
     static let actions = [activeAction, completedAction]
 
+    static func deliveryRow(
+        id: String, sequence: Int, state: CanonicalInputDeliveryState,
+        issue: CanonicalInputDeliveryIssue? = nil, hasMessage: Bool = true,
+        kind: CanonicalCommandKind = .steer,
+        mode: RunInputDeliveryMode = .queued
+    ) -> CanonicalInputDeliveryRow {
+        CanonicalInputDeliveryRow(
+            id: id,
+            commandID: "command-\(id)",
+            messageEvent: hasMessage
+                ? EventRef(journal: sessionJournal, eventID: "message-\(id)") : nil,
+            acceptanceEvent: EventRef(journal: workJournal, eventID: "accepted-\(id)"),
+            deliveryEvent: state == .acceptedWaitingDelivery
+                ? nil : EventRef(journal: workJournal, eventID: "outcome-\(id)"),
+            hostSequence: sequence,
+            client: ClientRef("client-macbook-gui"),
+            sessionAttachment: attachment,
+            run: RunRef("run-20260906-01"),
+            commandKind: kind,
+            deliveryMode: mode,
+            state: state,
+            issue: issue)
+    }
+
+    static let deliveredInput = deliveryRow(
+        id: "delivered", sequence: 7, state: .delivered,
+        kind: .send, mode: .delivered)
+    static let waitingInput = deliveryRow(
+        id: "waiting", sequence: 24, state: .acceptedWaitingDelivery)
+    static let uncertainInput = deliveryRow(
+        id: "uncertain", sequence: 25, state: .indeterminateUnknownEffect,
+        issue: .missingSessionMessage, hasMessage: false,
+        kind: .queue, mode: .queued)
+
     static var transcript: [TranscriptItem] {
         var prompt = TranscriptItem(
             id: "fixture-message-user-001", kind: .user, timestamp: baseTime.addingTimeInterval(3))
@@ -116,6 +156,74 @@ private enum FixtureData {
         followup.provider = "Anthropic"
 
         return [prompt, assistant, tool, followup]
+    }
+
+    static var productionTranscript: [TranscriptItem] {
+        var rows = transcript
+        rows[0].inputDelivery = deliveredInput
+
+        var pending = TranscriptItem(
+            id: "fixture-message-user-waiting", kind: .user,
+            timestamp: baseTime.addingTimeInterval(26))
+        pending.blocks = [.text(
+            "Before the next model call, verify the remote checkpoint and report any missing delivery evidence.")]
+        pending.inputDelivery = waitingInput
+        rows.append(pending)
+        return rows
+    }
+
+    static var productionTranscriptNarrow: [TranscriptItem] {
+        var delivered = transcript[0]
+        delivered.blocks = [.text(
+            "Compare the local and remote Work state, then explain what this GUI can safely control.")]
+        delivered.inputDelivery = deliveredInput
+
+        var response = transcript[1]
+        response.blocks = [.text(
+            "The Work stays on `linux-01` if this window closes. I am checking its canonical action and delivery evidence now.")]
+
+        var pending = TranscriptItem(
+            id: "fixture-message-user-waiting", kind: .user,
+            timestamp: baseTime.addingTimeInterval(26))
+        pending.blocks = [.text(
+            "Before the next model call, verify the remote checkpoint.")]
+        pending.inputDelivery = waitingInput
+        return [delivered, response, pending]
+    }
+}
+
+/// A deterministic state injection around the actual production chat hierarchy. Unlike the
+/// design fixtures below, this route certifies layout and rendering through RunPane itself; it
+/// still does not claim that a Work Host or durable store produced the fixture data.
+@MainActor
+private struct ProductionRunPaneFixture: View {
+    let narrow: Bool
+    private let model: AppModel
+    private let run: LiveRun
+
+    init(narrow: Bool) {
+        self.narrow = narrow
+        let model = AppModel()
+        let run = LiveRun.productionRunPaneVisualFixture(
+            items: narrow
+                ? FixtureData.productionTranscriptNarrow : FixtureData.productionTranscript,
+            pendingInputs: [FixtureData.waitingInput],
+            deliveryAttention: [FixtureData.uncertainInput],
+            actions: FixtureData.actions.map(WorkActionPresentation.init),
+            draft: "Check the current runtime namespace, then queue a separate summary for review.")
+        model.runs = [run]
+        model.focusedRunID = run.id
+        model.showInspector = !narrow
+        model.hideThinking = false
+        self.model = model
+        self.run = run
+    }
+
+    var body: some View {
+        RunPane(run: run, showsInspector: !narrow)
+            .environment(model)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 

@@ -244,6 +244,27 @@ struct RunPane: View {
     @State private var selectedItem: TranscriptItem?
     @State private var selectedAction: SelectedAction?
     @State private var confirmEndRun = false
+    @State private var showInputDeliveryReview = false
+    @State private var composerDelivery: ComposerDelivery = .steerNext
+
+    private enum ComposerDelivery: String, CaseIterable, Identifiable {
+        case steerNext
+        case queueFollowUp
+
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .steerNext: "Steer next"
+            case .queueFollowUp: "Queue follow-up"
+            }
+        }
+        var detail: String {
+            switch self {
+            case .steerNext: "Deliver before the next model call"
+            case .queueFollowUp: "Start a distinct turn after current work"
+            }
+        }
+    }
 
     // Fixed trailing inspector column rather than `.inspector` or a conditional split
     // pane — see the note on SessionsView.body for why both of those misbehave.
@@ -269,6 +290,13 @@ struct RunPane: View {
                     NoticeBanner(
                         level: .info,
                         title: "Bounded canonical view",
+                        message: omissions)
+                        .padding(Design.gutter)
+                }
+                if let omissions = run.serviceInputDeliveryOmissionSummary {
+                    NoticeBanner(
+                        level: .warning,
+                        title: "Input delivery view incomplete",
                         message: omissions)
                         .padding(Design.gutter)
                 }
@@ -326,6 +354,12 @@ struct RunPane: View {
                 WorkActionUnavailableSheet(actionID: selection.id)
             }
         }
+        .sheet(isPresented: $showInputDeliveryReview) {
+            InputDeliveryReviewSheet(
+                pending: run.servicePendingInputs,
+                attention: run.serviceInputDeliveryAttention,
+                omissionSummary: run.serviceInputDeliveryOmissionSummary)
+        }
     }
 
     private var runHeader: some View {
@@ -357,6 +391,39 @@ struct RunPane: View {
                 controls
             }
 
+            runMetadata
+
+            if hasPendingInputs {
+                HStack(spacing: 6) {
+                    Image(systemName: "tray.full.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(
+                            run.serviceInputDeliveryAttention.isEmpty
+                                ? Design.warning : Design.danger)
+                    Text(queueSummary)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(
+                            run.serviceInputDeliveryAttention.isEmpty
+                                ? Design.warning : Design.danger)
+                    Spacer()
+                    if !run.servicePendingInputs.isEmpty
+                        || !run.serviceInputDeliveryAttention.isEmpty {
+                        Button("Review") { showInputDeliveryReview = true }
+                            .buttonStyle(.link)
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .accessibilityHint(
+                                "Shows canonical delivery evidence and host ordering")
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, Design.gutter)
+        .padding(.vertical, 9)
+        .background(.background.secondary)
+    }
+
+    private var runMetadata: some View {
+        ViewThatFits(in: .horizontal) {
             HStack(spacing: 5) {
                 Chip(text: run.projectName, symbol: "folder", tint: Design.accent)
                     .help(run.config.cwd)
@@ -392,35 +459,64 @@ struct RunPane: View {
                     }
                 }
             }
+            .fixedSize(horizontal: true, vertical: false)
 
-            if !run.queuedSteering.isEmpty || !run.queuedFollowUps.isEmpty {
-                HStack(spacing: 6) {
-                    Image(systemName: "tray.full.fill")
-                        .font(.system(size: 9)).foregroundStyle(Design.warning)
-                    Text(queueSummary)
-                        .font(.system(size: 10.5)).foregroundStyle(Design.warning)
-                    Spacer()
+            HStack(spacing: 5) {
+                Chip(text: run.projectName, symbol: "folder", tint: Design.accent)
+                    .help(run.config.cwd)
+                if let m = run.modelLabel, !m.isEmpty {
+                    Chip(text: m, symbol: "cpu", tint: Design.assistant)
+                }
+                Chip(text: run.elapsedLabel, symbol: "clock", tint: .secondary)
+                Spacer(minLength: 4)
+                if let share = run.contextShare {
+                    Chip(
+                        text: Fmt.percent(share), symbol: "rectangle.stack",
+                        tint: share > 0.85
+                            ? Design.danger
+                            : share > 0.65 ? Design.warning : Design.accent)
+                        .help("Share of the model context window currently in use")
                 }
             }
         }
-        .padding(.horizontal, Design.gutter)
-        .padding(.vertical, 9)
-        .background(.background.secondary)
     }
 
     private var queueSummary: String {
         var parts: [String] = []
+        if !run.servicePendingInputs.isEmpty {
+            parts.append(
+                "\(run.servicePendingInputs.count) host-accepted input"
+                    + (run.servicePendingInputs.count == 1 ? " waiting for delivery" : "s waiting for delivery"))
+        }
+        if !run.serviceInputDeliveryAttention.isEmpty {
+            parts.append(
+                "\(run.serviceInputDeliveryAttention.count) delivery outcome"
+                    + (run.serviceInputDeliveryAttention.count == 1 ? " needs review" : "s need review"))
+        }
         if !run.queuedSteering.isEmpty {
-            parts.append("\(run.queuedSteering.count) steering")
+            parts.append("\(run.queuedSteering.count) local steering")
         }
         if !run.queuedFollowUps.isEmpty {
-            parts.append("\(run.queuedFollowUps.count) follow-up")
+            parts.append("\(run.queuedFollowUps.count) local follow-up")
         }
         return "Pending: " + parts.joined(separator: ", ")
-            + " — steering lands before the next model call; follow-ups start a later turn"
+    }
+
+    private var hasPendingInputs: Bool {
+        !run.servicePendingInputs.isEmpty
+            || !run.serviceInputDeliveryAttention.isEmpty
+            || !run.queuedSteering.isEmpty
+            || !run.queuedFollowUps.isEmpty
     }
 
     private var controls: some View {
+        ViewThatFits(in: .horizontal) {
+            fullControls
+            compactControls
+        }
+    }
+
+    private var fullControls: some View {
         HStack(spacing: 6) {
                 Button {
                 if run.hasExited { model.closeRun(run) } else { model.detachRun(run) }
@@ -486,18 +582,70 @@ struct RunPane: View {
         }
     }
 
+    private var compactControls: some View {
+        HStack(spacing: 5) {
+            Button {
+                if run.hasExited { model.closeRun(run) } else { model.detachRun(run) }
+            } label: {
+                Image(systemName: run.hasExited ? "xmark" : "rectangle.on.rectangle.slash")
+                    .frame(width: 20, height: 20)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityLabel(run.hasExited ? "Close view" : "Detach view")
+            .help(
+                run.hasExited
+                    ? "Close this completed view"
+                    : "Hide this chat view without ending the run")
+
+            if !run.hasExited {
+                if run.commandCapabilities.supports(.agentLoop) && run.isStreaming {
+                    Button {
+                        Task { _ = await run.cancel(.agentLoop) }
+                    } label: {
+                        Image(systemName: "pause.circle")
+                            .frame(width: 20, height: 20)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(run.commandState == .canceling || run.isEnding)
+                    .accessibilityLabel("Cancel at boundary")
+                    .help("Stop the agent loop at its next safe boundary")
+                }
+                Button {
+                    confirmEndRun = true
+                } label: {
+                    Image(systemName: "stop.fill")
+                        .frame(width: 20, height: 20)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(Design.danger)
+                .disabled(run.isEnding || !run.serviceControlsAvailable)
+                .accessibilityLabel(run.isEnding ? "Ending run" : "End run")
+                .help(
+                    run.isServiceBacked
+                        ? "Send an explicit End command to the Work Host"
+                        : "Stop the agent and destroy this run's Python runtime")
+            }
+
+            RunOptionsMenu(
+                run: run,
+                models: model.pickerModels,
+                hasExited: run.hasExited,
+                isWorking: run.isStreaming,
+                isCanceling: run.commandState == .canceling,
+                cancellationScopes: run.commandCapabilities.cancellationScopes,
+                sessionFile: run.sessionFile)
+        }
+    }
+
     private var composer: some View {
         VStack(spacing: 0) {
             HStack(alignment: .bottom, spacing: 8) {
                 ZStack(alignment: .topLeading) {
                     if run.draft.isEmpty {
-                        Text(
-                            run.isStreaming
-                                ? (run.commandCapabilities.supportsSteering
-                            ? "Steer the run — lands after the current tool calls…"
-                                    : "This engine is working — steering is unavailable…")
-                                : "Ask for something…"
-                        )
+                        Text(composerPlaceholder)
                             .font(.system(size: 12.5))
                             .foregroundStyle(.tertiary)
                             .padding(.horizontal, 5)
@@ -513,13 +661,8 @@ struct RunPane: View {
                         .padding(.horizontal, 1)
                         // No focus state is mutated by streaming or delivery callbacks. This
                         // remains the same editor identity while the parent observes the run.
-                        .accessibilityLabel(
-                            run.isStreaming && run.commandCapabilities.supportsSteering
-                            ? "Steering message" : "Message composer")
-                        .accessibilityHint(
-                            run.isStreaming && run.commandCapabilities.supportsSteering
-                            ? "Delivered before the next model call"
-                            : "Type a message for the agent")
+                        .accessibilityLabel(composerAccessibilityLabel)
+                        .accessibilityHint(composerAccessibilityHint)
                 }
                 .padding(6)
                 .background(
@@ -545,65 +688,51 @@ struct RunPane: View {
                     .accessibilityValue(showMarkdownPreview ? "Visible" : "Hidden")
                     .help(showMarkdownPreview ? "Hide Markdown preview" : "Show Markdown preview")
 
-                    Button {
-                        send()
-                    } label: {
-                        Image(systemName: run.isStreaming ? "arrow.turn.down.right" : "arrow.up")
-                            .font(.system(size: 12, weight: .semibold))
-                            .frame(width: 26, height: 26)
+                    if run.isStreaming {
+                        HStack(spacing: 4) {
+                            Text("Delivery")
+                                .font(.system(size: 9.5))
+                                .foregroundStyle(.secondary)
+                            Picker(
+                                "Delivery mode",
+                                selection: Binding(
+                                    get: { effectiveComposerDelivery ?? .steerNext },
+                                    set: { composerDelivery = $0 })
+                            ) {
+                                ForEach(availableComposerDeliveries) { choice in
+                                    Text(choice.label).tag(choice)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .controlSize(.small)
+                            .disabled(availableComposerDeliveries.count < 2)
+                            .accessibilityLabel("Delivery mode")
+                            .accessibilityValue(
+                                effectiveComposerDelivery?.detail
+                                    ?? "No delivery mode available")
+                        }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(
-                        run.hasExited || !run.acceptsInput
-                            || run.draft.trimmingCharacters(in: .whitespaces).isEmpty
-                            || (run.isStreaming && !run.commandCapabilities.supportsSteering)
-                    )
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .accessibilityLabel(run.isStreaming ? "Steer message" : "Send message")
-                    .accessibilityValue(
-                        run.draft.trimmingCharacters(in: .whitespaces).isEmpty
-                        ? "Unavailable: message is empty" : "Ready")
-                    .accessibilityHint(
-                        run.isStreaming && run.commandCapabilities.supportsSteering
-                        ? "Sends with Command-Return before the next model call"
-                        : "Sends with Command-Return")
-                    .help(
-                        run.isStreaming && run.commandCapabilities.supportsSteering
-                        ? "Steer (⌘↵) — delivered before the next model call"
-                            : run.isStreaming
-                                ? "This engine does not support steering while working"
-                        : "Send (⌘↵)")
 
                     Button {
-                        let text = run.draft
-                        Task {
-                            let receipt = await run.queueFollowUp(
-                                text, fromComposer: true)
-                            if receipt.wasHandedOff, !run.isServiceBacked {
-                                await run.reconcileDraftAfterHandOff(text)
-                            }
-                        }
+                        submitComposer()
                     } label: {
-                        Image(systemName: "text.append")
-                            .font(.system(size: 10))
-                            .frame(width: 26, height: 20)
+                        Label(
+                            composerActionLabel,
+                            systemImage: composerActionSymbol)
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .frame(minWidth: 104, minHeight: 22)
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(
-                        run.hasExited || !run.acceptsInput || !run.isStreaming
-                            || !run.commandCapabilities.supportsQueuedFollowUps
-                            || run.draft.trimmingCharacters(in: .whitespaces).isEmpty
-                    )
-                    .accessibilityLabel("Queue follow-up")
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!composerCanSubmit)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .accessibilityLabel(composerActionLabel)
                     .accessibilityValue(
-                        run.commandCapabilities.supportsQueuedFollowUps
-                        ? "Available" : "Unavailable")
-                    .accessibilityHint(
-                        "Keeps this message for a distinct turn after current work")
-                    .help(
-                        run.commandCapabilities.supportsQueuedFollowUps
-                            ? "Queue as a distinct follow-up after the current turn"
-                            : "This engine does not support queued follow-ups")
+                        run.draft.trimmingCharacters(in: .whitespaces).isEmpty
+                            ? "Unavailable: message is empty"
+                            : composerCanSubmit ? "Ready" : "Unavailable")
+                    .accessibilityHint(composerActionDetail + ". Sends with Command-Return.")
+                    .help("\(composerActionDetail) (⌘↵)")
                 }
             }
             .padding(.horizontal, Design.gutter)
@@ -660,13 +789,244 @@ struct RunPane: View {
         .background(.bar)
     }
 
-    private func send() {
+    private var availableComposerDeliveries: [ComposerDelivery] {
+        guard run.isStreaming else { return [] }
+        var choices: [ComposerDelivery] = []
+        if run.commandCapabilities.supportsSteering { choices.append(.steerNext) }
+        if run.commandCapabilities.supportsQueuedFollowUps { choices.append(.queueFollowUp) }
+        return choices
+    }
+
+    private var effectiveComposerDelivery: ComposerDelivery? {
+        let choices = availableComposerDeliveries
+        if choices.contains(composerDelivery) { return composerDelivery }
+        return choices.first
+    }
+
+    private var composerActionLabel: String {
+        guard run.isStreaming else { return "Send now" }
+        return effectiveComposerDelivery?.label ?? "Working"
+    }
+
+    private var composerActionSymbol: String {
+        guard run.isStreaming else { return "arrow.up" }
+        return switch effectiveComposerDelivery {
+        case .steerNext: "arrow.turn.down.right"
+        case .queueFollowUp: "text.append"
+        case nil: "hourglass"
+        }
+    }
+
+    private var composerActionDetail: String {
+        guard run.isStreaming else { return "Send as the next user turn" }
+        return effectiveComposerDelivery?.detail
+            ?? "This Work advertises no input mode while it is working"
+    }
+
+    private var composerPlaceholder: String {
+        guard run.isStreaming else { return "Ask for something…" }
+        return switch effectiveComposerDelivery {
+        case .steerNext: "Steer the run — lands before the next model call…"
+        case .queueFollowUp: "Queue a distinct follow-up turn…"
+        case nil: "This Work is busy and advertises no input mode…"
+        }
+    }
+
+    private var composerAccessibilityLabel: String {
+        guard run.isStreaming else { return "Message composer" }
+        return switch effectiveComposerDelivery {
+        case .steerNext: "Steering message"
+        case .queueFollowUp: "Queued follow-up message"
+        case nil: "Unavailable message composer"
+        }
+    }
+
+    private var composerAccessibilityHint: String {
+        guard run.isStreaming else { return "Send as the next user turn" }
+        return effectiveComposerDelivery?.detail
+            ?? "This Work advertises no input mode while it is working"
+    }
+
+    private var composerCanSubmit: Bool {
+        !run.hasExited && run.acceptsInput
+            && !run.draft.trimmingCharacters(in: .whitespaces).isEmpty
+            && (!run.isStreaming || effectiveComposerDelivery != nil)
+    }
+
+    private func submitComposer() {
         let text = run.draft
+        let delivery: LiveRunComposerDelivery
+        if run.isStreaming {
+            switch effectiveComposerDelivery {
+            case .steerNext: delivery = .steerNext
+            case .queueFollowUp: delivery = .queueFollowUp
+            case nil: return
+            }
+        } else {
+            delivery = .sendNow
+        }
         Task {
-            let receipt = await run.send(text, fromComposer: true)
+            let receipt = await run.submitComposer(text, delivery: delivery)
             if receipt.wasHandedOff, !run.isServiceBacked {
                 await run.reconcileDraftAfterHandOff(text)
             }
+        }
+    }
+}
+
+private struct InputDeliveryReviewSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let pending: [CanonicalInputDeliveryRow]
+    let attention: [CanonicalInputDeliveryRow]
+    let omissionSummary: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Input delivery")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("Canonical Work evidence · input text remains in its Session")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(14)
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if let omissionSummary {
+                        NoticeBanner(
+                            level: .warning,
+                            title: "Bounded evidence",
+                            message: omissionSummary)
+                    }
+                    if !pending.isEmpty {
+                        deliverySection(
+                            "WAITING FOR RUNTIME DELIVERY", rows: pending,
+                            explanation: "Already owned by the Work Host. Do not resend while unresolved.")
+                    }
+                    if !attention.isEmpty {
+                        deliverySection(
+                            "NEEDS REVIEW", rows: attention,
+                            explanation: "Inspect Work before retrying; an uncertain input may have taken effect.")
+                    }
+                }
+                .padding(14)
+            }
+        }
+        .frame(minWidth: 440, idealWidth: 520, minHeight: 300, idealHeight: 440)
+    }
+
+    private func deliverySection(
+        _ title: String, rows: [CanonicalInputDeliveryRow], explanation: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title)
+                .font(Design.sectionTitle)
+                .foregroundStyle(.secondary)
+            Text(explanation)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+            ForEach(rows) { row in
+                InputDeliveryEvidenceRow(row: row)
+            }
+        }
+    }
+}
+
+private struct InputDeliveryEvidenceRow: View {
+    let row: CanonicalInputDeliveryRow
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(tint)
+                Text(detail)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                if let issue = row.issue {
+                    Text("Evidence: \(issue.rawValue.replacingOccurrences(of: "_", with: " "))")
+                        .font(Design.mono(9))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            Spacer(minLength: 6)
+            if let sequence = row.hostSequence {
+                Text("host #\(sequence)")
+                    .font(Design.numeric(9.5))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(10)
+        .background(tint.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(tint.opacity(0.22)))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(title)
+        .accessibilityValue(detail)
+        .accessibilityHint(hint)
+    }
+
+    private var title: String {
+        switch row.state {
+        case .acceptedWaitingDelivery: "Accepted by Work Host · waiting for delivery"
+        case .delivered: "Delivered to runtime"
+        case .notDelivered: "Not delivered to runtime"
+        case .indeterminateUnknownEffect: "Delivery outcome uncertain"
+        case .provenanceUnavailable: "Delivery evidence unavailable"
+        }
+    }
+
+    private var symbol: String {
+        switch row.state {
+        case .acceptedWaitingDelivery: "clock.badge.checkmark"
+        case .delivered: "checkmark.circle.fill"
+        case .notDelivered: "xmark.circle.fill"
+        case .indeterminateUnknownEffect: "exclamationmark.triangle.fill"
+        case .provenanceUnavailable: "questionmark.circle.fill"
+        }
+    }
+
+    private var tint: Color {
+        switch row.state {
+        case .acceptedWaitingDelivery, .indeterminateUnknownEffect: Design.warning
+        case .delivered: Design.success
+        case .notDelivered: Design.danger
+        case .provenanceUnavailable: .secondary
+        }
+    }
+
+    private var detail: String {
+        let kind = row.commandKind?.rawValue.replacingOccurrences(of: "_", with: " ")
+            ?? "input"
+        let mode = row.deliveryMode?.rawValue.replacingOccurrences(of: "_", with: " ")
+        return mode.map { "\(kind) · runtime crossing \($0)" } ?? kind
+    }
+
+    private var hint: String {
+        switch row.state {
+        case .acceptedWaitingDelivery:
+            "Do not resend while delivery is unresolved."
+        case .indeterminateUnknownEffect:
+            "Inspect Work before retrying; the input may have taken effect."
+        case .notDelivered:
+            "Review Work before deciding whether to send again."
+        case .delivered:
+            "No action is needed."
+        case .provenanceUnavailable:
+            "Refresh or inspect Work before inferring delivery."
         }
     }
 }
@@ -1368,14 +1728,20 @@ struct RunInspector: View {
                     }
                 }
 
-                if !run.queuedSteering.isEmpty || !run.queuedFollowUps.isEmpty {
-                    Card("Queued", symbol: "tray.full") {
+                if hasQueuedInspectorRows {
+                    Card("Input delivery", symbol: "tray.full") {
                         VStack(alignment: .leading, spacing: 6) {
+                            ForEach(run.servicePendingInputs) { row in
+                                canonicalInputRow(row)
+                            }
+                            ForEach(run.serviceInputDeliveryAttention) { row in
+                                canonicalInputRow(row)
+                            }
                             ForEach(Array(run.queuedSteering.enumerated()), id: \.offset) { _, m in
-                                queueItem(m, label: "steer", tint: Design.warning)
+                                queueItem(m, label: "local steer", tint: Design.warning)
                             }
                             ForEach(Array(run.queuedFollowUps.enumerated()), id: \.offset) { _, m in
-                                queueItem(m, label: "follow-up", tint: Design.accent)
+                                queueItem(m, label: "local follow-up", tint: Design.accent)
                             }
                         }
                     }
@@ -1489,6 +1855,72 @@ struct RunInspector: View {
             Text(text).font(.system(size: 10.5)).lineLimit(3)
             Spacer()
         }
+    }
+
+    private var hasQueuedInspectorRows: Bool {
+        !run.servicePendingInputs.isEmpty
+            || !run.serviceInputDeliveryAttention.isEmpty
+            || !run.queuedSteering.isEmpty
+            || !run.queuedFollowUps.isEmpty
+    }
+
+    private func canonicalInputRow(_ row: CanonicalInputDeliveryRow) -> some View {
+        let presentation = canonicalInputPresentation(row)
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Chip(text: presentation.label, tint: presentation.tint)
+                Spacer(minLength: 4)
+                if let sequence = row.hostSequence {
+                    Text("host #\(sequence)")
+                        .font(Design.numeric(9.5))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            Text(canonicalInputDetail(row))
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(presentation.accessibilityLabel)
+        .accessibilityHint(presentation.hint)
+        .help(presentation.hint)
+    }
+
+    private func canonicalInputPresentation(
+        _ row: CanonicalInputDeliveryRow
+    ) -> (label: String, tint: Color, accessibilityLabel: String, hint: String) {
+        switch row.state {
+        case .acceptedWaitingDelivery:
+            return (
+                "host accepted · waiting", Design.warning,
+                "Accepted by Work Host, waiting for delivery",
+                "Do not retry while runtime delivery remains unresolved.")
+        case .delivered:
+            return (
+                "delivered", Design.success, "Delivered to runtime",
+                "Canonical Work records prove delivery.")
+        case .notDelivered:
+            return (
+                "not delivered", Design.danger, "Not delivered to runtime",
+                "Review Work before choosing whether to send again.")
+        case .indeterminateUnknownEffect:
+            return (
+                "delivery uncertain", Design.warning, "Delivery outcome uncertain",
+                "Inspect Work before retrying; the input may have taken effect.")
+        case .provenanceUnavailable:
+            return (
+                "evidence unavailable", .secondary, "Delivery evidence unavailable",
+                "Refresh or inspect canonical Work before inferring delivery.")
+        }
+    }
+
+    private func canonicalInputDetail(_ row: CanonicalInputDeliveryRow) -> String {
+        let kind = row.commandKind?.rawValue.replacingOccurrences(of: "_", with: " ")
+            ?? "input"
+        let delivery = row.deliveryMode?.rawValue.replacingOccurrences(of: "_", with: " ")
+        if let delivery { return "\(kind) · \(delivery)" }
+        return kind
     }
 }
 

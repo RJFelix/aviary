@@ -1,7 +1,7 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; exact Work/Session continuation, production service/control-reader cutover, Session-qualified Run routing, and GUI new-Session-to-existing-Work composition have completed integrated macOS/Linux/cross-device verification; the first Phase 2 canonical workspace and Phase 4A Action Lens slices are implemented
-Date: 2026-09-05
+Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; exact Work/Session continuation, production service/control-reader cutover, Session-qualified Run routing, and GUI new-Session-to-existing-Work composition have completed integrated macOS/Linux/cross-device verification; the first Phase 2 canonical workspace, explicit input-delivery, and Phase 4A Action Lens slices are implemented
+Date: 2026-09-06
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
 Transactional projection foundation (2026-09-04): the first Darwin/Linux disposable projection
@@ -133,7 +133,8 @@ title bar, and repeated narrow renders are byte-identical. These are useful visu
 not production-path certification: they deliberately use in-memory presentation values and cannot
 prove `CockpitView` selection, `RunPane` synchronization, canonical queue delivery, notification
 routing, or persistence wiring. At least one populated route through the production view/model path
-remains required before calling this checkpoint visually certified. Focused verification covers action
+was therefore still required; the production routes below close that rendering gap without upgrading
+the fixtures into transport evidence. Focused verification covers action
 presentation (4 cases / 247 assertions), attention projection (10 / 441), controller bounds
 (1 / 16), evidence-link journal decoding (1 / 17), writer propagation/validation (2 / 28),
 transport page bounds (1 / 20), and service-backed draft storage/relaunch/tamper behavior
@@ -141,6 +142,39 @@ transport page bounds (1 / 20), and service-backed draft storage/relaunch/tamper
 suite). Core, SelfTest, and GUI targets build. A subsequent uninterrupted broad run completed
 950 cases / 13,420 assertions in 378.69 seconds; the earlier apparent Phase 1 bridge “hang” was the
 suite's long quiet service phase, not a deadlock, so no speculative synchronization was added.
+
+Input-delivery experience checkpoint (2026-09-06): the canonical Work command ledger and Session
+message projection now retain the typed command kind, runtime crossing mode, accepting Run, client,
+Session attachment, and exact cross-journal cause needed to answer whether a human input was merely
+accepted, delivered, proven not delivered, or left with unknown effect. The bounded pure join rejects
+foreign journals, duplicate identities, wrong client/attachment/Run tuples, and malformed delivery
+evidence; a crash between Work acceptance and Session append remains visible as a metadata-only
+host-owned row. Incomplete sources downgrade unresolved acceptance rather than creating a false
+pending or retry-safe claim. Persistent Session exact state retains the join metadata privately across
+reopen without retaining message bodies.
+
+The production conversation renders these states on the exact user row, and its host-owned pending
+and uncertain tray is distinct from the GUI draft, draft-handoff marker, transport mutation, and
+process-local steering/follow-up lists. Host-owned rows are inspection-only until a real queue-mutation
+protocol exists; the GUI does not fake edit/delete/reorder. While Work is active the composer has one
+labeled primary action and a capability-derived delivery selector for “Steer next” versus “Queue
+follow-up”; cancellation remains separate. Narrow layouts use compact but labeled lifecycle controls,
+keep delivery Review reachable without the inspector, and no longer let the Action Lens consume the
+conversation's vertical space.
+
+Two additional deterministic routes, `production-delivery-fixture` and
+`production-delivery-narrow-fixture`, render the actual `RunPane`, `TranscriptRow`, Action Lens,
+pending tray, inspector, and composer hierarchy at 1600×1000 and 520×900 content sizes. They close
+the production-view pixel-path gap above while still injecting deterministic presentation state; they
+do not certify that transport or persistence produced that state. Current focused receipts are the
+canonical join (2 cases / 61 assertions), native queued cancellation outcome (1 / 16), persistent
+Session join metadata across reopen (1 / 7), and attached controller reconstruction/recovery
+(29 / 228), plus Work service client ownership (5 / 24) and transport correlation (27 / 335).
+The production fixture renders are byte-stable on repetition and were visually inspected at both
+widths. Core, SelfTest, GUI, daemon, and signed release-app assembly pass. Final independent review
+found no remaining P0/P1/P2 issue in this slice, including after an adversarial 64-category omission
+mutant proved that locally derived input-attention disclosures cannot be crowded out by upstream
+diagnostics. The uninterrupted broad run passes 953 cases / 13,492 assertions in 377.45 seconds.
 
 Phase 3C closure checkpoint (2026-09-04): accepted and duplicate service commands no longer
 become UI truth on the strength of a transport receipt. The client retains the exact command

@@ -76,21 +76,68 @@ private func persistentSessionContextPayload(_ manifest: ContextManifest) -> JSO
 private func persistentSessionEvent(
     _ type: String, _ id: String, _ sequence: Int, previous: String? = nil,
     causedBy: EventRef? = nil,
+    command: CommandRef? = nil,
     work: WorkRef? = nil, workHost: WorkHostRef? = nil,
-    attachment: SessionAttachmentRef? = nil, run: RunRef? = nil,
+    client: ClientRef? = nil, attachment: SessionAttachmentRef? = nil, run: RunRef? = nil,
     turn: TurnRef? = nil, conversationParent: EventRef? = nil,
     declaredDomains: Set<TimelineDomain> = [], payload: JSONValue = .object([:]),
     session: SessionRef? = persistentSessionID
 ) -> TimelineEvent {
     TimelineEvent(
         eventID: id, journal: persistentSessionJournal, sequence: sequence,
-        command: nil, previousEventID: previous, causedByEventID: causedBy,
+        command: command, previousEventID: previous, causedByEventID: causedBy,
         parentActivityID: nil, conversationParent: conversationParent,
         session: session, work: work, workHost: workHost,
-        sessionAttachment: attachment, run: run, turn: turn,
+        client: client, sessionAttachment: attachment, run: run, turn: turn,
         actor: TimelineActor(actorID: "persistent-session-test", kind: "self-test"),
         hostRecordedAt: Date(timeIntervalSince1970: Double(sequence)),
         type: type, declaredDomains: declaredDomains, payload: payload)
+}
+
+private func testPersistentSessionExactStateRetainsInputDeliveryJoinAcrossReopen() throws {
+    let directory = try persistentSessionDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let map = try persistentSessionMap(at: directory)
+    var state = try PersistentSessionExactState(map: map)
+    let created = persistentSessionEvent(
+        TimelineEventType.sessionCreated, "delivery-reopen-1", 1)
+    let attachment = SessionAttachmentRef("delivery-reopen-attachment")
+    let attached = persistentSessionEvent(
+        TimelineEventType.sessionAttached, "delivery-reopen-2", 2,
+        previous: created.eventID, work: persistentSessionWork,
+        workHost: WorkHostRef(persistentSessionWork.workHostID),
+        attachment: attachment,
+        payload: .object(["capabilities": .array([.string("send")])]))
+    let client = ClientRef("delivery-reopen-client")
+    let workJournal = JournalRef.work(persistentSessionWork)
+    let acceptance = EventRef(journal: workJournal, eventID: "work-acceptance-7")
+    let run = RunRef("delivery-reopen-run")
+    let input = persistentSessionEvent(
+        TimelineEventType.inputAccepted, "delivery-reopen-3", 3,
+        previous: attached.eventID, causedBy: acceptance,
+        command: CommandRef(
+            commandID: "delivery-reopen-command", client: client,
+            sessionAttachment: attachment),
+        work: persistentSessionWork,
+        workHost: WorkHostRef(persistentSessionWork.workHostID),
+        client: client, attachment: attachment, run: run,
+        payload: .object(["text": .string("private delivery input")]))
+    for event in [created, attached, input] { _ = try state.apply(event) }
+
+    var reopened = try PersistentSessionExactState(
+        map: map, root: try XCTUnwrap(state.currentRoot))
+    let continued = try reopened.apply(persistentSessionEvent(
+        TimelineEventType.messageCommitted, "delivery-reopen-4", 4,
+        previous: input.eventID,
+        conversationParent: EventRef(
+            journal: persistentSessionJournal, eventID: input.eventID),
+        payload: .object(["role": .string("assistant"), "text": .string("safe")])))
+    let message = try XCTUnwrap(continued.eventLocalSnapshot.messageHistory.first)
+    XCTAssertEqual(message.client, client)
+    XCTAssertEqual(message.sessionAttachment, attachment)
+    XCTAssertEqual(message.run, run)
+    XCTAssertEqual(message.causedBy, acceptance)
+    XCTAssertEqual(message.text, "[redacted]")
 }
 
 private func persistentSessionComponent() -> ContextComponent {
@@ -679,5 +726,8 @@ let casesPersistentSessionExactState: [Case] = [
     }),
     ("phase3 persistent Session exact state preserves structural quarantine across reopen", {
         try testPersistentSessionExactStateStructuralQuarantineReopensAndContinues()
+    }),
+    ("phase3 persistent Session exact state retains input delivery join across reopen", {
+        try testPersistentSessionExactStateRetainsInputDeliveryJoinAcrossReopen()
     }),
 ]

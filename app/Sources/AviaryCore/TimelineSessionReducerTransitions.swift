@@ -745,6 +745,7 @@ internal enum SessionReducerTransition {
             sourceEvent: EventRef(journal: event.journal, eventID: event.eventID),
             hostRecordedAt: event.hostRecordedAt, clientTimestamp: event.clientTimestamp,
             run: event.run, turn: event.turn, actor: event.actor,
+            client: event.client, sessionAttachment: event.sessionAttachment,
             causedBy: event.causedByEventID, parentActivity: event.parentActivityID,
             provenance: event.provenance, links: event.links))
     }

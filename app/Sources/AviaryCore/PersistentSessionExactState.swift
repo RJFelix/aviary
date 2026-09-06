@@ -681,6 +681,8 @@ public struct PersistentSessionExactState: Sendable {
         let run: RunRef?
         let turn: TurnRef?
         let actor: TimelineActor?
+        let client: ClientRef?
+        let sessionAttachment: SessionAttachmentRef?
         let causedBy: EventRef?
         let parentActivity: EventRef?
         let provenance: TimelineEventProvenance?
@@ -708,6 +710,8 @@ public struct PersistentSessionExactState: Sendable {
             run = message.run
             turn = message.turn
             actor = message.actor
+            client = message.client
+            sessionAttachment = message.sessionAttachment
             causedBy = message.causedBy
             parentActivity = message.parentActivity
             provenance = message.provenance
@@ -724,6 +728,11 @@ public struct PersistentSessionExactState: Sendable {
                   links.count <= TimelineEvent.maxEvidenceLinks else {
                 throw Error.invalidRecord
             }
+            guard client.map({ !$0.clientID.isEmpty
+                    && $0.clientID.utf8.count <= PersistentSessionExactState.maximumIdentityBytes }) ?? true,
+                  sessionAttachment.map({ !$0.attachmentID.isEmpty
+                    && $0.attachmentID.utf8.count <= PersistentSessionExactState.maximumIdentityBytes }) ?? true
+            else { throw Error.invalidRecord }
             if let parent = conversationParent, parent.journal != expectedScope {
                 // Cross-journal ancestry is retained as an invalid message, not an authorization
                 // edge. The transition will refuse it as a semantic tip.
@@ -737,7 +746,8 @@ public struct PersistentSessionExactState: Sendable {
                 eventID: eventID, role: role, text: text,
                 conversationParent: conversationParent, sourceEvent: sourceEvent,
                 hostRecordedAt: hostRecordedAt, clientTimestamp: clientTimestamp,
-                run: run, turn: turn, actor: actor, causedBy: causedBy,
+                run: run, turn: turn, actor: actor, client: client,
+                sessionAttachment: sessionAttachment, causedBy: causedBy,
                 parentActivity: parentActivity, provenance: provenance, links: links)
         }
     }

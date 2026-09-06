@@ -111,6 +111,22 @@ public enum CommandDeliveryState: String, Codable, Hashable, Sendable {
     case indeterminate
 }
 
+/// The bounded vocabulary carried by an accepted command.  This is deliberately separate from
+/// the service request enum: Session-owned producers also have a `queue_follow_up` command,
+/// while the Work service calls that operation `queue`.
+public enum CanonicalCommandKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case start
+    case send
+    case steer
+    case queue
+    case queueFollowUp = "queue_follow_up"
+    case hold
+    case cancel
+    case end
+    case destroy
+    case complete
+}
+
 public struct WorkCommandSnapshot: Codable, Hashable, Sendable {
     public let command: CommandRef
     public var state: CommandDeliveryState
@@ -128,6 +144,15 @@ public struct WorkCommandSnapshot: Codable, Hashable, Sendable {
     public let deliveryActor: TimelineActor?
     public let deliveryHostSequence: Int?
     public let deliveryIdempotencyKey: String?
+    /// Typed producer facts copied from the acceptance record. Nil means the bounded snapshot
+    /// cannot establish command vocabulary, and is therefore not eligible for a canonical join.
+    public let commandKind: CanonicalCommandKind?
+    public let deliveryMode: RunInputDeliveryMode?
+    public let acceptanceRun: RunRef?
+    /// Whether this acceptance is known to carry a Session user input. Nil means the producer
+    /// fact is unavailable or malformed; the delivery projection fails closed on input-capable
+    /// nils.
+    public let carriesSessionInput: Bool?
 
     /// Compatibility projections for early consumers.
     public var acceptanceEvent: EventRef? { acceptanceEventRef }
@@ -136,11 +161,25 @@ public struct WorkCommandSnapshot: Codable, Hashable, Sendable {
     public var hostSequence: Int { deliveryHostSequence ?? acceptanceHostSequence }
     public var idempotencyKey: String? { deliveryIdempotencyKey ?? acceptanceIdempotencyKey }
 
+    private enum CodingKeys: String, CodingKey {
+        case command, state
+        case acceptanceEventRef, deliveryEventRef, acceptanceActor, acceptanceHostSequence
+        case acceptanceIdempotencyKey, deliveryActor, deliveryHostSequence, deliveryIdempotencyKey
+        case commandKind = "command_kind"
+        case deliveryMode = "delivery_mode"
+        case acceptanceRun = "acceptance_run"
+        case carriesSessionInput = "carries_session_input"
+    }
+
     public init(command: CommandRef, state: CommandDeliveryState, actor: TimelineActor,
                 hostSequence: Int, idempotencyKey: String? = nil,
                 acceptanceEventRef: EventRef? = nil, deliveryEventRef: EventRef? = nil,
                 deliveryActor: TimelineActor? = nil, deliveryHostSequence: Int? = nil,
-                deliveryIdempotencyKey: String? = nil) {
+                deliveryIdempotencyKey: String? = nil,
+                commandKind: CanonicalCommandKind? = nil,
+                deliveryMode: RunInputDeliveryMode? = nil,
+                acceptanceRun: RunRef? = nil,
+                carriesSessionInput: Bool? = nil) {
         self.command = command
         self.state = state
         self.acceptanceEventRef = acceptanceEventRef
@@ -151,6 +190,10 @@ public struct WorkCommandSnapshot: Codable, Hashable, Sendable {
         self.deliveryActor = deliveryActor
         self.deliveryHostSequence = deliveryHostSequence
         self.deliveryIdempotencyKey = deliveryIdempotencyKey
+        self.commandKind = commandKind
+        self.deliveryMode = deliveryMode
+        self.acceptanceRun = acceptanceRun
+        self.carriesSessionInput = carriesSessionInput
     }
 
     public init(command: CommandRef, state: CommandDeliveryState,
@@ -158,7 +201,11 @@ public struct WorkCommandSnapshot: Codable, Hashable, Sendable {
                 acceptanceIdempotencyKey: String? = nil,
                 acceptanceEventRef: EventRef? = nil, deliveryEventRef: EventRef? = nil,
                 deliveryActor: TimelineActor? = nil, deliveryHostSequence: Int? = nil,
-                deliveryIdempotencyKey: String? = nil) {
+                deliveryIdempotencyKey: String? = nil,
+                commandKind: CanonicalCommandKind? = nil,
+                deliveryMode: RunInputDeliveryMode? = nil,
+                acceptanceRun: RunRef? = nil,
+                carriesSessionInput: Bool? = nil) {
         self.command = command
         self.state = state
         self.acceptanceEventRef = acceptanceEventRef
@@ -169,6 +216,10 @@ public struct WorkCommandSnapshot: Codable, Hashable, Sendable {
         self.deliveryActor = deliveryActor
         self.deliveryHostSequence = deliveryHostSequence
         self.deliveryIdempotencyKey = deliveryIdempotencyKey
+        self.commandKind = commandKind
+        self.deliveryMode = deliveryMode
+        self.acceptanceRun = acceptanceRun
+        self.carriesSessionInput = carriesSessionInput
     }
 }
 
@@ -1832,10 +1883,17 @@ public struct SessionMessageSnapshot: Codable, Hashable, Sendable {
     public let run: RunRef?
     public let turn: TurnRef?
     public let actor: TimelineActor?
+    public let client: ClientRef?
+    public let sessionAttachment: SessionAttachmentRef?
     public let causedBy: EventRef?
     public let parentActivity: EventRef?
     public let provenance: TimelineEventProvenance?
     public let links: [TimelineLink]
+
+    private enum CodingKeys: String, CodingKey {
+        case eventID, role, text, conversationParent, sourceEvent, hostRecordedAt, clientTimestamp
+        case run, turn, actor, client, sessionAttachment, causedBy, parentActivity, provenance, links
+    }
 
     public init(
         eventID: String,
@@ -1848,6 +1906,8 @@ public struct SessionMessageSnapshot: Codable, Hashable, Sendable {
         run: RunRef? = nil,
         turn: TurnRef? = nil,
         actor: TimelineActor? = nil,
+        client: ClientRef? = nil,
+        sessionAttachment: SessionAttachmentRef? = nil,
         causedBy: EventRef? = nil,
         parentActivity: EventRef? = nil,
         provenance: TimelineEventProvenance? = nil,
@@ -1863,6 +1923,8 @@ public struct SessionMessageSnapshot: Codable, Hashable, Sendable {
         self.run = run
         self.turn = turn
         self.actor = actor
+        self.client = client
+        self.sessionAttachment = sessionAttachment
         self.causedBy = causedBy
         self.parentActivity = parentActivity
         self.provenance = provenance

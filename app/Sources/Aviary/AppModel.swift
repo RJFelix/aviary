@@ -3507,6 +3507,15 @@ enum LiveRunDraftPersistenceState: Equatable {
     case writeFailed
 }
 
+/// The semantic delivery choice the person made before the composer schedules asynchronous
+/// work. A later Run-state change may reject the command, but must never reinterpret Steer as
+/// Send (or the reverse).
+enum LiveRunComposerDelivery: Sendable {
+    case sendNow
+    case steerNext
+    case queueFollowUp
+}
+
 @Observable
 @MainActor
 final class LiveRun: Identifiable {
@@ -3575,6 +3584,7 @@ final class LiveRun: Identifiable {
     /// Capabilities are owned by the Work driver, not inferred by a GUI. This keeps every
     /// attached view truthful when a remote or driven Work has different command semantics.
     var commandCapabilities: SessionCommandCapabilities {
+        if let visualFixtureCommandCapabilities { return visualFixtureCommandCapabilities }
         if let serviceBridge { return serviceBridge.commandCapabilities }
         if let inHouse { return inHouse.commandCapabilities }
         if let claudeCode { return claudeCode.commandCapabilities }
@@ -3632,6 +3642,19 @@ final class LiveRun: Identifiable {
     /// Exact entity counts omitted from the bounded GUI projection. This is mirrored into the
     /// observable run because both Cockpit and Live must disclose omissions without an inspector.
     private(set) var serviceProjectionOmissions: [WorkServiceOmission] = []
+    /// Canonical inputs owned by Work whose runtime-delivery boundary is still unresolved.
+    /// This is intentionally separate from the GUI-owned composer draft and the controller's
+    /// single transport mutation so none of those states can clear another by accident.
+    private(set) var servicePendingInputs: [CanonicalInputDeliveryRow] = []
+    /// Canonical delivery outcomes that need human attention even when no Session message was
+    /// committed for them (for example, an unknown-effect crossing after a partial append).
+    private(set) var serviceInputDeliveryAttention: [CanonicalInputDeliveryRow] = []
+    private(set) var serviceInputDeliveryOmissions: [WorkServiceOmission] = []
+    /// Snapshot-only injection used to render the real RunPane with deterministic capabilities.
+    /// Production runs always leave this nil and derive capabilities from their driver/host.
+    private var visualFixtureCommandCapabilities: SessionCommandCapabilities?
+    private var visualFixtureElapsedLabel: String?
+    private var visualFixtureStartedLabel: String?
     var currentServiceActions: [WorkActionPresentation] {
         serviceActionPresentations.filter { !$0.state.isTerminal }
     }
@@ -3654,6 +3677,46 @@ final class LiveRun: Identifiable {
             + ". Full canonical records remain addressable "
             + "through the Work Host."
     }
+    var serviceInputDeliveryOmissionSummary: String? {
+        let deliveryOmissions = serviceInputDeliveryOmissions.filter {
+            $0.category.hasPrefix("canonical_input_delivery.")
+        }
+        guard !deliveryOmissions.isEmpty else { return nil }
+        var descriptions: [String] = []
+        if deliveryOmissions.contains(where: {
+            $0.category == "canonical_input_delivery.work_source"
+                || $0.category == "canonical_input_delivery.session_source"
+        }) {
+            descriptions.append("the current Work/Session read is incomplete")
+        }
+        if let omitted = deliveryOmissions.first(where: {
+            $0.category == "canonical_input_delivery.rows"
+        }), omitted.count > 0 {
+            descriptions.append(
+                "\(omitted.count) delivery row\(omitted.count == 1 ? "" : "s") omitted")
+        }
+        if let omitted = deliveryOmissions.first(where: {
+            $0.category == "canonical_input_delivery.unresolved_commands"
+        }), omitted.count > 0 {
+            descriptions.append(
+                "\(omitted.count) unresolved input\(omitted.count == 1 ? "" : "s") omitted")
+        }
+        if let omitted = deliveryOmissions.first(where: {
+            $0.category == "canonical_input_delivery.attention"
+        }), omitted.count > 0 {
+            descriptions.append(
+                "\(omitted.count) input outcome\(omitted.count == 1 ? "" : "s") needing review omitted")
+        }
+        if let omitted = deliveryOmissions.first(where: {
+            $0.category == "canonical_input_delivery.unattributed_inputs"
+        }), omitted.count > 0 {
+            descriptions.append(
+                "\(omitted.count) host-owned input\(omitted.count == 1 ? " has" : "s have") no provable Session relationship")
+        }
+        guard !descriptions.isEmpty else { return nil }
+        return descriptions.joined(separator: "; ")
+            + ". Do not infer delivery or retry safety from this bounded view."
+    }
     var serviceExecutionLabel: String? { serviceBridge?.executionLabel }
     var serviceWorkspaceLabel: String? { serviceBridge?.workspaceLabel }
     var hasCanonicalStartTime: Bool {
@@ -3661,11 +3724,13 @@ final class LiveRun: Identifiable {
     }
 
     var elapsedLabel: String {
-        hasCanonicalStartTime ? Fmt.duration(elapsed) : "time unknown"
+        if let visualFixtureElapsedLabel { return visualFixtureElapsedLabel }
+        return hasCanonicalStartTime ? Fmt.duration(elapsed) : "time unknown"
     }
 
     var startedLabel: String {
-        isServiceBacked ? "unknown" : Fmt.timestamp(startedAt)
+        if let visualFixtureStartedLabel { return visualFixtureStartedLabel }
+        return isServiceBacked ? "unknown" : Fmt.timestamp(startedAt)
     }
 
     init(
@@ -3728,6 +3793,9 @@ final class LiveRun: Identifiable {
         self.serviceAttachmentKey = bridge.serviceAttachmentKey
         self.serviceActionPresentations = bridge.actionPresentations
         self.serviceProjectionOmissions = bridge.projection.projectionOmissions
+        self.servicePendingInputs = bridge.pendingInputs
+        self.serviceInputDeliveryAttention = bridge.inputDeliveryAttention
+        self.serviceInputDeliveryOmissions = bridge.inputDeliveryProjection.omissions
         self.modelLabel = bridge.modelLabel
         self.thinkingLevel = bridge.thinkingLevel
         self.sessionID = bridge.sessionID
@@ -4225,6 +4293,11 @@ final class LiveRun: Identifiable {
         publish(serviceBridge.thinkingLevel, to: \.thinkingLevel)
         publish(serviceBridge.actionPresentations, to: \.serviceActionPresentations)
         publish(serviceBridge.projection.projectionOmissions, to: \.serviceProjectionOmissions)
+        publish(serviceBridge.pendingInputs, to: \.servicePendingInputs)
+        publish(serviceBridge.inputDeliveryAttention, to: \.serviceInputDeliveryAttention)
+        publish(
+            serviceBridge.inputDeliveryProjection.omissions,
+            to: \.serviceInputDeliveryOmissions)
         // This is canonical Session evidence (input.accepted/message history), not a Start
         // receipt. It remains true even when the visible transcript has bounded omissions.
         publish(serviceBridge.hasCanonicalInputDelivery, to: \.initialPromptDelivered)
@@ -4365,6 +4438,50 @@ final class LiveRun: Identifiable {
         self.thinkingLevel = config.thinkingLevel
     }
 
+    /// Build deterministic presentation state for the offscreen screenshot harness while using
+    /// the actual production RunPane and TranscriptRow implementations. This never constructs a
+    /// service attachment and must not be treated as persistence or transport certification.
+    static func productionRunPaneVisualFixture(
+        items: [TranscriptItem],
+        pendingInputs: [CanonicalInputDeliveryRow],
+        deliveryAttention: [CanonicalInputDeliveryRow],
+        actions: [WorkActionPresentation],
+        draft: String
+    ) -> LiveRun {
+        let run = LiveRun(
+            engine: EngineLocation(
+                kind: .fork, path: "aviaryd-fixture", version: "presentation",
+                note: "Production RunPane visual fixture"),
+            config: RunConfiguration(
+                cwd: "/remote/workspaces/aviary",
+                provider: "anthropic", model: "claude-sonnet-4-5",
+                thinkingLevel: "high"))
+        run.title = "Canonical input delivery"
+        run.items = items
+        run.commandState = .running
+        run.isStreaming = true
+        run.modelLabel = "claude-sonnet-4-5"
+        run.contextTokens = 31_240
+        run.contextWindow = 200_000
+        var usage = Usage()
+        usage.input = 3_842
+        usage.output = 286
+        usage.cacheRead = 2_910
+        usage.totalTokens = 7_038
+        run.usage = usage
+        run.servicePendingInputs = pendingInputs
+        run.serviceInputDeliveryAttention = deliveryAttention
+        run.serviceActionPresentations = actions
+        run.visualFixtureCommandCapabilities = SessionCommandCapabilities(
+            supportsSteering: true, supportsQueuedFollowUps: true,
+            cancellationScopes: [.agentLoop])
+        run.visualFixtureElapsedLabel = "time unknown"
+        run.visualFixtureStartedLabel = "unknown"
+        run.launchCommand = "aviaryd · workspace workspace-aviary"
+        run.draft = draft
+        return run
+    }
+
     var projectName: String {
         if let serviceWorkspaceLabel, !serviceWorkspaceLabel.isEmpty {
             return serviceWorkspaceLabel
@@ -4418,8 +4535,27 @@ final class LiveRun: Identifiable {
         return inputs.last
     }
 
-    func send(
-        _ text: String, fromComposer: Bool = false
+    func send(_ text: String) async -> LiveRunCommandResult {
+        await send(text, fromComposer: false, requiredDelivery: nil)
+    }
+
+    /// Submit the exact composer action captured at the click/key-command boundary. Work may
+    /// advance while the durable draft handoff is written; that can yield a typed rejection, but
+    /// this method never changes the requested command kind to accommodate the newer state.
+    func submitComposer(
+        _ text: String, delivery: LiveRunComposerDelivery
+    ) async -> LiveRunCommandResult {
+        switch delivery {
+        case .queueFollowUp:
+            return await queueFollowUp(text, fromComposer: true, requireActiveRun: true)
+        case .sendNow, .steerNext:
+            return await send(text, fromComposer: true, requiredDelivery: delivery)
+        }
+    }
+
+    private func send(
+        _ text: String, fromComposer: Bool,
+        requiredDelivery: LiveRunComposerDelivery?
     ) async -> LiveRunCommandResult {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
             commandNotice = .warning("Could not send: empty input.")
@@ -4444,6 +4580,11 @@ final class LiveRun: Identifiable {
                 return .rejected("exact Session owner unavailable")
             }
             if serviceBridge.requiresStartForNextInput {
+                guard requiredDelivery != .steerNext else {
+                    commandNotice = .warning(
+                        "The Work settled before this steering message crossed. The draft was preserved.")
+                    return .rejected("steering state changed")
+                }
                 let commandID = fromComposer ? UUID().uuidString.lowercased() : nil
                 if let commandID {
                     guard await beginDraftHandoff(
@@ -4456,20 +4597,41 @@ final class LiveRun: Identifiable {
                 return result
             }
             let kind: WorkServiceCommandKind
-            if serviceBridge.isStreaming {
+            if requiredDelivery == .sendNow {
+                guard !serviceBridge.isStreaming else {
+                    commandNotice = .warning(
+                        "The Work started running before this Send crossed. The draft was preserved.")
+                    return .rejected("send state changed")
+                }
+                kind = .send
+            } else if requiredDelivery == .steerNext {
+                guard serviceBridge.isStreaming else {
+                    commandNotice = .warning(
+                        "The Work settled before this steering message crossed. The draft was preserved.")
+                    return .rejected("steering state changed")
+                }
                 guard serviceBridge.commandCapabilities.supportsSteering else {
-                    if serviceBridge.commandCapabilities.supportsQueuedFollowUps {
-                        commandNotice = .warning(
-                            "This Work is busy; use Queue follow-up for the next turn.")
-                    } else {
-                        commandNotice = .warning(
-                            "This Work is busy and does not advertise steering.")
-                    }
+                    commandNotice = .warning(
+                        "This Work does not advertise steering. The draft was preserved.")
                     return .rejected("steering unavailable")
                 }
                 kind = .steer
             } else {
-                kind = .send
+                if serviceBridge.isStreaming {
+                    guard serviceBridge.commandCapabilities.supportsSteering else {
+                        if serviceBridge.commandCapabilities.supportsQueuedFollowUps {
+                            commandNotice = .warning(
+                                "This Work is busy; use Queue follow-up for the next turn.")
+                        } else {
+                            commandNotice = .warning(
+                                "This Work is busy and does not advertise steering.")
+                        }
+                        return .rejected("steering unavailable")
+                    }
+                    kind = .steer
+                } else {
+                    kind = .send
+                }
             }
             let commandID = fromComposer ? UUID().uuidString.lowercased() : nil
             if let commandID {
@@ -4514,7 +4676,7 @@ final class LiveRun: Identifiable {
             // No steering. Claude Code owns the turn boundary and will not take an injection
             // mid-turn, so a message sent now would either be lost or arrive as a second
             // conversation. Refusing plainly beats a queue that quietly reorders the session.
-            guard !claudeCode.isStreaming else {
+            guard requiredDelivery != .steerNext, !claudeCode.isStreaming else {
                 commandNotice = .warning(
                     "Claude Code is mid-turn, and it does not accept steering — the turn "
                         + "boundary is its own. Wait for it to finish.")
@@ -4525,6 +4687,26 @@ final class LiveRun: Identifiable {
             return .session(receipt)
         }
         if let inHouse {
+            if requiredDelivery == .sendNow {
+                guard !inHouse.isStreaming else {
+                    commandNotice = .warning(
+                        "The run started working before this Send crossed. The draft was preserved.")
+                    return .rejected("send state changed")
+                }
+                let receipt = await inHouse.send(text)
+                if receipt.wasHandedOff, title == "New run" { title = String(text.prefix(60)) }
+                return .session(receipt)
+            }
+            if requiredDelivery == .steerNext {
+                guard inHouse.isStreaming else {
+                    commandNotice = .warning(
+                        "The run settled before this steering message crossed. The draft was preserved.")
+                    return .rejected("steering state changed")
+                }
+                let receipt = await inHouse.steer(text)
+                queuedSteering = inHouse.pendingSteering
+                return .session(receipt)
+            }
             if inHouse.isStreaming {
                 // Steer rather than refuse: the composer should stay usable while the agent
                 // works, and the message lands at the next turn boundary where the
@@ -4547,7 +4729,8 @@ final class LiveRun: Identifiable {
     /// the message lands at the next turn boundary, which is the same guarantee without a
     /// second place for a message to sit unacknowledged.
     func queueFollowUp(
-        _ text: String, fromComposer: Bool = false
+        _ text: String, fromComposer: Bool = false,
+        requireActiveRun: Bool = false
     ) async -> LiveRunCommandResult {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
             commandNotice = .warning("Could not queue: empty input.")
@@ -4567,6 +4750,11 @@ final class LiveRun: Identifiable {
                 return .rejected("composer command unavailable")
             }
             defer { finishServiceCommandOperation() }
+            guard !requireActiveRun || serviceBridge.isStreaming else {
+                commandNotice = .warning(
+                    "The Work settled before this follow-up crossed. The draft was preserved.")
+                return .rejected("queue state changed")
+            }
             guard serviceBridge.commandCapabilities.supportsQueuedFollowUps else {
                 commandNotice = .warning("This Work does not advertise queued follow-ups.")
                 return .rejected("queued follow-ups unavailable")
@@ -4605,6 +4793,11 @@ final class LiveRun: Identifiable {
         guard let inHouse else {
             commandNotice = .warning("Claude Code does not support queued follow-ups.")
             return .rejected("queued follow-ups unavailable")
+        }
+        guard !requireActiveRun || inHouse.isStreaming else {
+            commandNotice = .warning(
+                "The run settled before this follow-up crossed. The draft was preserved.")
+            return .rejected("queue state changed")
         }
         let receipt = await inHouse.queueFollowUp(text)
         queuedFollowUps = inHouse.pendingFollowUps

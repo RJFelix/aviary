@@ -69,6 +69,7 @@ final class ServiceBackedRunBridge {
     let thinkingLevel: String?
 
     private(set) var projection: WorkServiceAttachedWorkProjection
+    private(set) var inputDeliveryProjection: CanonicalInputDeliveryProjection
     private(set) var lastError: String?
 
     init(
@@ -88,6 +89,7 @@ final class ServiceBackedRunBridge {
         self.workspaceLabel = workspaceLabel
         self.modelLabel = modelLabel
         self.thinkingLevel = thinkingLevel
+        self.inputDeliveryProjection = Self.makeInputDeliveryProjection(from: projection)
     }
 
     var isConnected: Bool {
@@ -127,6 +129,18 @@ final class ServiceBackedRunBridge {
     }
     var pendingCommand: WorkServiceAttachedWorkPendingCommand? {
         projection.pendingCommand
+    }
+
+    /// Inputs the Work Host owns but has not yet proven delivered to the runtime. These are
+    /// distinct from both unsent GUI drafts and the controller's single in-flight mutation.
+    var pendingInputs: [CanonicalInputDeliveryRow] {
+        inputDeliveryProjection.unresolvedAcceptedCommands
+    }
+
+    /// Unknown-effect delivery outcomes remain visible even when the paired Session append was
+    /// interrupted and there is therefore no transcript row to carry their warning.
+    var inputDeliveryAttention: [CanonicalInputDeliveryRow] {
+        inputDeliveryProjection.rows.filter(\.requiresHumanReview)
     }
 
     private var controlPolicy: ServiceBackedGUIControlPolicy {
@@ -240,7 +254,12 @@ final class ServiceBackedRunBridge {
     /// is preferred and missing host time remains an explicit distant-past sentinel rather than
     /// using the GUI's clock to invent ordering or completion time.
     var transcriptItems: [TranscriptItem] {
-        visibleMessages.map { message in
+        var deliveryByMessage: [EventRef: CanonicalInputDeliveryRow] = [:]
+        for row in inputDeliveryProjection.rows {
+            guard let event = row.messageEvent, deliveryByMessage[event] == nil else { continue }
+            deliveryByMessage[event] = row
+        }
+        return visibleMessages.map { message in
             let role = message.role.lowercased()
             let kind: TranscriptItem.Kind = switch role {
             case "user": .user
@@ -259,6 +278,9 @@ final class ServiceBackedRunBridge {
             if !message.text.isEmpty { item.blocks = [.text(message.text)] }
             item.model = projection.workSnapshot.modelID ?? modelLabel
             item.customType = message.role
+            if let source = message.sourceEvent {
+                item.inputDelivery = deliveryByMessage[source]
+            }
             return item
         }
     }
@@ -270,11 +292,13 @@ final class ServiceBackedRunBridge {
         do {
             let next = try await controller.refresh()
             projection = next
+            inputDeliveryProjection = Self.makeInputDeliveryProjection(from: next)
             lastError = next.readDiagnostics.last
             return next
         } catch {
             let observed = await controller.projection()
             projection = observed
+            inputDeliveryProjection = Self.makeInputDeliveryProjection(from: observed)
             lastError = Self.message(for: error, projection: observed)
             return observed
         }
@@ -328,6 +352,18 @@ final class ServiceBackedRunBridge {
         guard hasExactRunOwner else {
             throw WorkServiceAttachedWorkControllerError.recoveryRequired
         }
+    }
+
+    private static func makeInputDeliveryProjection(
+        from projection: WorkServiceAttachedWorkProjection
+    ) -> CanonicalInputDeliveryProjection {
+        CanonicalInputDeliveryProjection(
+            workSnapshot: projection.workSnapshot,
+            sessionSnapshot: projection.sessionSnapshot,
+            workSourceCompleteness: projection.workSourceCompleteness,
+            sessionSourceCompleteness: projection.sessionSourceCompleteness,
+            workOmissions: projection.workOmissions,
+            sessionOmissions: projection.sessionOmissions)
     }
 
     /// Retry the controller's one explicitly retained command, preserving its original command

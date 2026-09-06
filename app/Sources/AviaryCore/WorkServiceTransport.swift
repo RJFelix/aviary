@@ -1747,6 +1747,10 @@ public enum WorkServiceTransportCodec {
             try validateIdentity(omission["category"], required: true)
             try validateDiagnostic(omission["diagnostic"])
             try validateNonnegativeInteger(omission["count"], required: true)
+            guard let count = omission["count"]?.intValue,
+                  count <= WorkServiceBounds.maxOmissionCount else {
+                throw WorkServiceTransportError.invalidResponse
+            }
         }
         // Decode the complete DTO after the bounded wire walk. This enforces the cross-field
         // owner envelope and complete host-observation agreement at the transport boundary too,

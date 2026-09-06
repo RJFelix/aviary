@@ -231,6 +231,10 @@ public struct TranscriptItem: Sendable, Identifiable, Equatable {
     public var senderName: String?
     /// Plain text for one-line rows (state changes, notes).
     public var text: String = ""
+    /// Exact Work-command delivery evidence for a canonical user message. Nil means this
+    /// transcript source does not participate in the Work/Session delivery join; it must not be
+    /// interpreted as either delivered or pending.
+    public var inputDelivery: CanonicalInputDeliveryRow?
     /// The raw entry, for the inspector.
     public var raw: JSONValue?
 

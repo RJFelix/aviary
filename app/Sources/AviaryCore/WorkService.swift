@@ -32,6 +32,7 @@ public enum WorkServiceBounds {
     /// Keep this independently bounded so descriptor reconstruction cannot grow without limit.
     public static let maxReadAcknowledgementsPerAttachment = 2
     public static let maxOmissions = 32
+    public static let maxOmissionCount = 1_000_000
 }
 
 /// The single protocol byte metric for a Work event page. Keeping this outside any transport or
@@ -342,8 +343,23 @@ public struct WorkServiceOmission: Codable, Hashable, Sendable {
 
     public init(category: String, count: Int, diagnostic: String? = nil) {
         self.category = WorkServiceText.bound(category) ?? "unknown"
-        self.count = max(0, count)
+        self.count = min(WorkServiceBounds.maxOmissionCount, max(0, count))
         self.diagnostic = WorkServiceText.bound(diagnostic)
+    }
+
+    private enum CodingKeys: String, CodingKey { case category, count, diagnostic }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let count = try container.decode(Int.self, forKey: .count)
+        guard count >= 0, count <= WorkServiceBounds.maxOmissionCount else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .count, in: container,
+                debugDescription: "Work service omission count exceeds the protocol bound")
+        }
+        self.init(
+            category: try container.decode(String.self, forKey: .category), count: count,
+            diagnostic: try container.decodeIfPresent(String.self, forKey: .diagnostic))
     }
 }
 
@@ -3745,6 +3761,9 @@ public actor InMemoryWorkService: WorkServiceClient {
             command: canonicalCommand, body: request.value, hostSequence: hostSequence,
             session: commandSession,
             sessionAttachment: commandSessionAttachment,
+            commandKind: CanonicalCommandKind(rawValue: request.kind.rawValue),
+            deliveryMode: .queued,
+            carriesSessionInput: Self.commandCarriesSessionInput(request.kind, value: request.value),
             state: &state)
         let receipt = WorkServiceCommandReceipt(
             work: state.work, commandID: request.command.commandID, state: .accepted,
@@ -4439,6 +4458,9 @@ public actor InMemoryWorkService: WorkServiceClient {
                              body: String? = nil, hostSequence: Int? = nil,
                              session: SessionRef? = nil,
                              sessionAttachment: SessionAttachmentRef? = nil,
+                             commandKind: CanonicalCommandKind? = nil,
+                             deliveryMode: RunInputDeliveryMode? = nil,
+                             carriesSessionInput: Bool? = nil,
                              state: inout WorkState) -> JournalCursor {
         let sequence = state.nextEventSequence
         state.nextEventSequence += 1
@@ -4458,20 +4480,24 @@ public actor InMemoryWorkService: WorkServiceClient {
         }
         state.cursor = cursor
         let payload: JSONValue
+        var payloadFields: [String: JSONValue] = [:]
+        if let commandKind { payloadFields["command_kind"] = .string(commandKind.rawValue) }
+        if let deliveryMode { payloadFields["delivery_mode"] = .string(deliveryMode.rawValue) }
+        if let carriesSessionInput { payloadFields["carries_session_input"] = .bool(carriesSessionInput) }
         if let bodyReference,
            let encoded = try? JSONEncoder().encode(bodyReference),
            let referenceValue = JSONValue.parse(encoded) {
             // Keep sensitive/large command text in the retained body store only. The canonical
             // event envelope carries the authority-bearing reference so a reader can fetch the
             // exact bytes without retaining a second raw copy in the timeline page.
-            payload = .object(["body_reference": referenceValue])
+            payloadFields["body_reference"] = referenceValue
+            payload = .object(payloadFields)
         } else {
             // Never copy the body into the event as a serialization fallback.  The body store
             // remains the only place where command text is retained; an unexpected reference
             // encoding failure is represented by a bounded marker instead of leaking raw text.
-            payload = body == nil
-                ? .object([:])
-                : .object(["body_reference_unavailable": .bool(true)])
+            if body != nil { payloadFields["body_reference_unavailable"] = .bool(true) }
+            payload = .object(payloadFields)
         }
         state.events.append(TimelineEvent(
             eventID: eventID, journal: state.journal, sequence: sequence,
@@ -4487,6 +4513,16 @@ public actor InMemoryWorkService: WorkServiceClient {
             hostRecordedAt: Date(), type: WorkServiceText.bound(kind) ?? "unknown",
             payload: payload))
         return cursor
+    }
+
+    private static func commandCarriesSessionInput(
+        _ kind: WorkServiceCommandKind, value: String?
+    ) -> Bool {
+        guard let value, !value.isEmpty else { return false }
+        switch kind {
+        case .start, .send, .steer, .queue: return true
+        case .hold, .cancel, .end, .destroy, .complete: return false
+        }
     }
 
     private func appendSessionEvent(kind: String, commandID: String?, command: CommandRef? = nil,

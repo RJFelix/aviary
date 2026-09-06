@@ -231,7 +231,9 @@ struct TranscriptRow: View {
 
     private var userRow: some View {
         VStack(alignment: .leading, spacing: 6) {
-            header("You", tint: Design.user, symbol: "person.fill")
+            header(
+                "You", tint: Design.user, symbol: "person.fill",
+                trailing: inputDeliveryBadge)
             ForEach(item.blocks) { block in
                 if case .text(let text) = block {
                     // A hook-injected context block is real context the model saw, but it
@@ -255,6 +257,60 @@ struct TranscriptRow: View {
             Rectangle().fill(Design.user.opacity(0.5)).frame(width: 2.5)
         }
         .onTapGesture { onSelect?(item) }
+    }
+
+    private var inputDeliveryBadge: AnyView? {
+        guard let delivery = item.inputDelivery else { return nil }
+        let presentation = inputDeliveryPresentation(delivery)
+        return AnyView(
+            Chip(
+                text: presentation.label,
+                symbol: presentation.symbol,
+                tint: presentation.tint)
+                .accessibilityLabel(presentation.accessibilityLabel)
+                .accessibilityValue(presentation.detail)
+                .accessibilityHint(presentation.hint)
+                .help(presentation.detail))
+    }
+
+    private func inputDeliveryPresentation(
+        _ delivery: CanonicalInputDeliveryRow
+    ) -> (
+        label: String, symbol: String, tint: Color,
+        accessibilityLabel: String, detail: String, hint: String
+    ) {
+        switch delivery.state {
+        case .acceptedWaitingDelivery:
+            return (
+                "Accepted · waiting", "clock.badge.checkmark", Design.warning,
+                "Accepted by Work Host, waiting for delivery",
+                "The Work Host durably accepted this input, but the runtime has not yet recorded delivery.",
+                "Do not resend while delivery is unresolved.")
+        case .delivered:
+            return (
+                "Delivered", "checkmark.circle.fill", Design.success,
+                "Delivered to the runtime",
+                "Canonical Work records prove this input crossed into the runtime.",
+                "No action is needed.")
+        case .notDelivered:
+            return (
+                "Not delivered", "xmark.circle.fill", Design.danger,
+                "Not delivered to the runtime",
+                "Canonical Work records prove this input did not cross into the runtime.",
+                "Review Work before deciding whether to send again.")
+        case .indeterminateUnknownEffect:
+            return (
+                "Delivery uncertain", "exclamationmark.triangle.fill", Design.warning,
+                "Delivery outcome uncertain",
+                "The Work Host could not prove whether this input crossed into the runtime.",
+                "Inspect Work before retrying; the original input may have taken effect.")
+        case .provenanceUnavailable:
+            return (
+                "Evidence unavailable", "questionmark.circle.fill", .secondary,
+                "Delivery evidence unavailable",
+                "This bounded view cannot join the Session message to exact Work delivery evidence.",
+                "Refresh or inspect the canonical Work before inferring delivery.")
+        }
     }
 
     private var assistantRow: some View {

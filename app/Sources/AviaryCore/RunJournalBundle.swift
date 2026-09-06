@@ -2286,6 +2286,7 @@ public actor RunJournalBundle {
     ) async throws -> [TimelineJournalCommit] {
         let accepted = try await acceptCommandLocked(
             command, deliveryMode: deliveryMode, payload: metadata,
+            carriesSessionInput: true,
             initialStartPredecessor: initialStartPredecessor)
         let normalized = accepted.command
         var commits = accepted.commits
@@ -2382,6 +2383,7 @@ public actor RunJournalBundle {
         payload["command_kind"] = .string(label)
         return try await acceptCommandLocked(
             command, deliveryMode: deliveryMode, payload: payload,
+            carriesSessionInput: false,
             initialStartPredecessor: initialStartPredecessor).commits
     }
 
@@ -2452,7 +2454,10 @@ public actor RunJournalBundle {
                 command: normalized, state: .rejected, actor: self.actor,
                 hostSequence: hostOrder,
                 idempotencyKey: "\(command.commandID):rejected",
-                acceptanceEventRef: commit.eventRef)
+                acceptanceEventRef: commit.eventRef,
+                commandKind: payload["command_kind"]?.stringValue.flatMap { CanonicalCommandKind(rawValue: $0) },
+                deliveryMode: payload["delivery_mode"]?.stringValue.flatMap { RunInputDeliveryMode(rawValue: $0) },
+                acceptanceRun: self.activeRun, carriesSessionInput: false)
             return commit
         }
     }
@@ -2461,6 +2466,7 @@ public actor RunJournalBundle {
         _ command: CommandRef,
         deliveryMode: RunInputDeliveryMode,
         payload extraPayload: [String: JSONValue],
+        carriesSessionInput: Bool,
         initialStartPredecessor: JournalCursor? = nil
     ) async throws -> (command: CommandRef, commits: [TimelineJournalCommit]) {
         try ensureUsable()
@@ -2500,6 +2506,7 @@ public actor RunJournalBundle {
         let acceptedHostOrder = nextHostOrder()
         var payload = extraPayload
         payload["delivery_mode"] = .string(deliveryMode.rawValue)
+        payload["carries_session_input"] = .bool(carriesSessionInput)
         let accepted = try await appendWork(TimelineEventDraft(
             hostSequence: acceptedHostOrder, idempotencyKey: "\(command.commandID):accepted",
             command: normalized,
@@ -2512,7 +2519,10 @@ public actor RunJournalBundle {
             command: normalized, state: .accepted, actor: actor,
             hostSequence: acceptedHostOrder,
             idempotencyKey: "\(command.commandID):accepted",
-            acceptanceEventRef: accepted.eventRef)
+            acceptanceEventRef: accepted.eventRef,
+            commandKind: payload["command_kind"]?.stringValue.flatMap { CanonicalCommandKind(rawValue: $0) },
+            deliveryMode: deliveryMode,
+            acceptanceRun: self.activeRun, carriesSessionInput: carriesSessionInput)
         commandAcceptedRefs[normalized.commandID] = accepted.eventRef
         var commits = [accepted]
         if deliveryMode == .delivered {
@@ -2574,7 +2584,10 @@ public actor RunJournalBundle {
             acceptanceEventRef: existing.acceptanceEventRef,
             deliveryEventRef: receipt.eventRef,
             deliveryActor: actor, deliveryHostSequence: deliveryHostOrder,
-            deliveryIdempotencyKey: "\(commandID):delivered")
+            deliveryIdempotencyKey: "\(commandID):delivered",
+            commandKind: existing.commandKind, deliveryMode: existing.deliveryMode,
+            acceptanceRun: existing.acceptanceRun,
+            carriesSessionInput: existing.carriesSessionInput)
         return receipt
     }
 
@@ -2652,7 +2665,10 @@ public actor RunJournalBundle {
             acceptanceEventRef: existing.acceptanceEventRef,
             deliveryEventRef: commit.eventRef,
             deliveryActor: actor, deliveryHostSequence: hostOrder,
-            deliveryIdempotencyKey: "\(commandID):\(state.rawValue)")
+            deliveryIdempotencyKey: "\(commandID):\(state.rawValue)",
+            commandKind: existing.commandKind, deliveryMode: existing.deliveryMode,
+            acceptanceRun: existing.acceptanceRun,
+            carriesSessionInput: existing.carriesSessionInput)
         return commit
     }
 
