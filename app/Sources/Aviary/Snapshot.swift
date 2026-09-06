@@ -21,7 +21,7 @@ enum Snapshot {
         guard let flagIndex = args.firstIndex(of: "--snapshot"),
               args.count > flagIndex + 1
         else {
-            FileHandle.standardError.write(Data("usage: Aviary --snapshot <dir>\n".utf8))
+            FileHandle.standardError.write(Data("usage: Aviary --snapshot <dir> [--fixture <route>]\n".utf8))
             exit(2)
         }
         let outDir = URL(fileURLWithPath: args[flagIndex + 1], isDirectory: true)
@@ -34,12 +34,23 @@ enum Snapshot {
         let bare = args.contains("--bare")
         // Render with a specific session selected, rather than the largest one.
         let sessionID = stringValue(of: "--session", in: args)
+        let fixtureValue = stringValue(of: "--fixture", in: args)
 
         // AppKit has to be alive for CoreAnimation-backed rendering, but the run loop must
         // not start — so initialise the shared application and never call run().
         NSApplication.shared.setActivationPolicy(.accessory)
 
         try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+
+        if let fixtureValue {
+            guard let fixture = VisualFixtureRoute(rawValue: fixtureValue) else {
+                FileHandle.standardError.write(
+                    Data("unknown fixture route: \(fixtureValue)\n".utf8))
+                exit(2)
+            }
+            runFixture(fixture, outDir: outDir, width: width, height: height)
+            return
+        }
 
         // The work has to run on the main actor (SwiftUI, ImageRenderer, AppKit), and
         // nothing drains the main-actor queue unless the main run loop turns. So pump it
@@ -55,6 +66,45 @@ enum Snapshot {
             RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
             if Date() > deadline {
                 FileHandle.standardError.write(Data("snapshot timed out\n".utf8))
+                exit(1)
+            }
+        }
+        exit(state.failures == 0 ? 0 : 1)
+    }
+
+    /// Render a deterministic, in-memory scene without reading the user's agent directory.
+    /// This is useful for visual review of states that are rare or timing-sensitive in a real
+    /// Work Host: an active action, two attachments, and a durable draft crossing in progress.
+    /// The route is intentionally explicit rather than being mixed into normal `--shots` output.
+    private static func runFixture(
+        _ route: VisualFixtureRoute, outDir: URL, width: Int, height: Int
+    ) {
+        let state = Progress()
+        Task { @MainActor in
+            let stage = OffscreenWindow(width: CGFloat(width), height: CGFloat(height))
+            defer { stage.close() }
+            stage.present(
+                VisualFixtureView(route: route)
+                    .frame(width: CGFloat(width), height: CGFloat(height))
+                    .environment(\.staticRendering, true))
+            for _ in 0..<4 {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                stage.forceDraw()
+            }
+            let path = outDir.appending(path: "\(route.rawValue).png")
+            if let png = await stage.capture(), (try? png.write(to: path)) != nil {
+                log("wrote \(path.lastPathComponent) (\(Fmt.bytes(png.count)))")
+                state.finish(failures: 0)
+            } else {
+                log("FAILED \(route.rawValue)")
+                state.finish(failures: 1)
+            }
+        }
+        let deadline = Date().addingTimeInterval(120)
+        while !state.finished {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+            if Date() > deadline {
+                FileHandle.standardError.write(Data("fixture snapshot timed out\n".utf8))
                 exit(1)
             }
         }

@@ -124,9 +124,16 @@ Likewise, the bounded 32-row store still needs an explicit enumerate/prune repai
 orphaned drafts from permanently removed attachments can be reclaimed. Both are instrumented,
 bounded residuals rather than claims hidden behind “draft saved.”
 
-The bare Cockpit snapshot route builds and renders, but the available real catalog was empty during
-this checkpoint; populated, multi-Work, narrow-layout, and Action Lens visual certification still
-require deterministic snapshot fixtures or an interactive run. Focused verification covers action
+The snapshot harness now has three explicit deterministic design-fixture routes: a populated
+multi-Work Cockpit, a wide service-backed conversation with Action Lens and unresolved durable
+draft handoff, and a 520-point narrow conversation with a compact action summary. Their current
+composited captures are `cockpit-fixture.png` (1600x1032), `service-chat-fixture.png` (1600x1032),
+and `service-chat-narrow-fixture.png` (520x932); the extra 32 pixels are the captured native window
+title bar, and repeated narrow renders are byte-identical. These are useful visual-design fixtures,
+not production-path certification: they deliberately use in-memory presentation values and cannot
+prove `CockpitView` selection, `RunPane` synchronization, canonical queue delivery, notification
+routing, or persistence wiring. At least one populated route through the production view/model path
+remains required before calling this checkpoint visually certified. Focused verification covers action
 presentation (4 cases / 247 assertions), attention projection (10 / 441), controller bounds
 (1 / 16), evidence-link journal decoding (1 / 17), writer propagation/validation (2 / 28),
 transport page bounds (1 / 20), and service-backed draft storage/relaunch/tamper behavior
