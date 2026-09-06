@@ -506,7 +506,7 @@ struct RunPane: View {
                     }
                     TextEditor(text: Binding(
                         get: { run.draft },
-                        set: { run.draft = $0 }))
+                        set: { run.setDraft($0) }))
                         .font(.system(size: 12.5))
                         .scrollContentBackground(.hidden)
                         .frame(minHeight: 34, maxHeight: 130)
@@ -577,8 +577,11 @@ struct RunPane: View {
                     Button {
                         let text = run.draft
                         Task {
-                            let receipt = await run.queueFollowUp(text)
-                            if receipt.wasHandedOff, run.draft == text { run.draft = "" }
+                            let receipt = await run.queueFollowUp(
+                                text, fromComposer: true)
+                            if receipt.wasHandedOff, !run.isServiceBacked {
+                                await run.reconcileDraftAfterHandOff(text)
+                            }
                         }
                     } label: {
                         Image(systemName: "text.append")
@@ -606,6 +609,38 @@ struct RunPane: View {
             .padding(.horizontal, Design.gutter)
             .padding(.vertical, 9)
 
+            if let notice = run.draftPersistenceNotice {
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(notice, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityLabel("Draft storage requires attention")
+                        .accessibilityHint(notice)
+                    if run.draftHandoffRecoveryAvailable {
+                        HStack(spacing: 6) {
+                            Button("Check Work again") {
+                                Task { await run.refreshService() }
+                            }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            Button("Return to composer") {
+                                Task { _ = await run.returnUnresolvedDraftToComposer() }
+                            }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .tint(Design.warning)
+                                .help(
+                                    "Remove the local handoff guard after reviewing Work; "
+                                        + "sending again remains a separate action")
+                        }
+                    }
+                }
+                .padding(.horizontal, Design.gutter)
+                .padding(.vertical, 6)
+            }
+
             if showMarkdownPreview, !run.draft.isEmpty {
                 Divider()
                 VStack(alignment: .leading, spacing: 5) {
@@ -628,8 +663,10 @@ struct RunPane: View {
     private func send() {
         let text = run.draft
         Task {
-            let receipt = await run.send(text)
-            if receipt.wasHandedOff, run.draft == text { run.draft = "" }
+            let receipt = await run.send(text, fromComposer: true)
+            if receipt.wasHandedOff, !run.isServiceBacked {
+                await run.reconcileDraftAfterHandOff(text)
+            }
         }
     }
 }

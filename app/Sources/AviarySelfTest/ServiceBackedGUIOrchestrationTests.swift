@@ -127,6 +127,65 @@ func testServiceBackedGUIOrchestrationPassivePollDoesNotStealFocus() throws {
     XCTAssertFalse(reconciliation.shouldIssueCreateSession)
 }
 
+func testServiceBackedGUIOrchestrationStartKeepsBodyAndCommandIdentityTogether() throws {
+    let key = try guiOrchestrationSessionKey(
+        sessionID: "start-session", sessionAttachmentID: "start-session-attachment",
+        clientAttachmentID: "start-client-attachment")
+    let retained = try ServiceBackedStartIntent(
+        client: key.client,
+        work: key.workSession.work,
+        session: key.workSession.session,
+        sessionJournal: key.workSession.sessionJournal,
+        sessionAttachment: key.workSession.sessionAttachment,
+        clientAttachment: key.clientAttachment,
+        causalWorkCursor: JournalCursor(
+            journal: guiOrchestrationWorkJournal, eventID: "start-cursor", sequence: 1),
+        commandID: "retained-start-command",
+        prompt: "retained prompt bytes")
+
+    let automatic = try XCTUnwrap(ServiceBackedGUIOrchestration.startCommand(
+        prompt: retained.prompt, commandID: nil, retained: retained))
+    XCTAssertEqual(automatic.prompt, retained.prompt)
+    XCTAssertEqual(automatic.commandID, retained.commandID)
+
+    XCTAssertNil(ServiceBackedGUIOrchestration.startCommand(
+        prompt: "new composer bytes", commandID: "new-composer-command", retained: retained))
+    XCTAssertNil(ServiceBackedGUIOrchestration.startCommand(
+        prompt: "different bytes", commandID: retained.commandID, retained: retained))
+    XCTAssertNil(ServiceBackedGUIOrchestration.startCommand(
+        prompt: "different bytes", commandID: nil, retained: retained))
+
+    let fresh = try XCTUnwrap(ServiceBackedGUIOrchestration.startCommand(
+        prompt: "new composer bytes", commandID: "new-composer-command", retained: nil))
+    XCTAssertEqual(fresh.prompt, "new composer bytes")
+    XCTAssertEqual(fresh.commandID, "new-composer-command")
+}
+
+func testServiceBackedGUIOrchestrationRetryBlocksRecoveryAndShutdownJoinsIt() {
+    var barrier = ServiceBackedGUIOrchestration.CommandBarrier()
+    XCTAssertTrue(barrier.canResolveUnresolvedDraft(
+        hasUnresolvedDraft: true, isEnding: false))
+    XCTAssertTrue(barrier.begin(
+        hasUnresolvedDraft: true, allowingUnresolvedDraft: true))
+    XCTAssertEqual(barrier.operationsInFlight, 1)
+    XCTAssertFalse(barrier.canResolveUnresolvedDraft(
+        hasUnresolvedDraft: true, isEnding: false))
+    XCTAssertFalse(barrier.begin(
+        hasUnresolvedDraft: true, allowingUnresolvedDraft: true))
+
+    barrier.freeze()
+    XCTAssertTrue(barrier.admissionFrozen)
+    XCTAssertEqual(barrier.operationsInFlight, 1)
+    XCTAssertTrue(barrier.finish())
+    XCTAssertEqual(barrier.operationsInFlight, 0)
+    XCTAssertFalse(barrier.begin(
+        hasUnresolvedDraft: false, allowingUnresolvedDraft: false))
+    barrier.resume()
+    XCTAssertTrue(barrier.begin(
+        hasUnresolvedDraft: false, allowingUnresolvedDraft: false))
+    XCTAssertTrue(barrier.finish())
+}
+
 func testServiceBackedGUIOrchestrationExplicitRecoveredClickDoesNotCreateAgain() throws {
     let request = guiOrchestrationRequest(commandID: "click-recover")
     let key = try guiOrchestrationSessionKey(
@@ -237,6 +296,12 @@ func testServiceBackedGUIOrchestrationInspectRejectsAmbiguousRelationship() thro
 }
 
 let casesServiceBackedGUIOrchestration: [Case] = [
+    ("phase3 GUI orchestration: Start keeps exact body and command identity paired", {
+        try testServiceBackedGUIOrchestrationStartKeepsBodyAndCommandIdentityTogether()
+    }),
+    ("phase3 GUI orchestration: retry blocks recovery and shutdown joins it", {
+        testServiceBackedGUIOrchestrationRetryBlocksRecoveryAndShutdownJoinsIt()
+    }),
     ("phase3 GUI orchestration: passive recovery preserves selection and focus", {
         try testServiceBackedGUIOrchestrationPassivePollDoesNotStealFocus()
     }),

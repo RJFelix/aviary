@@ -7146,6 +7146,7 @@ await Harness.run(
         + casesLocalAviaryDaemonLauncher
         + casesAttachmentQualifiedIdentity
         + casesServiceBackedIntentStores
+        + casesServiceBackedDraftStore
         + casesServiceBackedGUIOrchestration
         + casesServiceBackedGUIControlPolicy
         + casesWorkServiceAttachedWorkController

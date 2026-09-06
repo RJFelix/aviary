@@ -928,6 +928,16 @@ extension AppModel {
     /// `Reloader.relaunch` terminates the application synchronously, so launching detached
     /// cleanup tasks here would orphan exactly the runtime children this path promises to end.
     private func reloadAfterStoppingWork() async {
+        guard await stopAllWork() else {
+            reloadInProgress = false
+            acceptsNewWork = true
+            toast = Toast(
+                message: "Reload was canceled because an unsent draft is not durable. "
+                    + "Copy or repair the marked draft, then try again.",
+                isError: true)
+            return
+        }
+
         let defaults = UserDefaults.standard
         defaults.set(section.rawValue, forKey: Restore.section)
         defaults.set(selectedRequestID, forKey: Restore.request)
@@ -936,14 +946,9 @@ extension AppModel {
         defaults.set(workshopRun != nil, forKey: Restore.attach)
         defaults.set(Date().timeIntervalSince1970, forKey: Restore.stamp)
 
-        // Runs are stopped rather than left to die with the process, so each one closes its
-        // session file and its runtime host exits cleanly. A killed host leaves a kernel
-        // process behind and a transcript with no final entry.
-        await stopAllWork()
-
         if !reloader.relaunch() {
             reloadInProgress = false
-            acceptsNewWork = true
+            await resumeAfterFailedRelaunch()
             toast = Toast(
                 message: "Could not work out how to relaunch this copy of Aviary. "
                     + "Rebuild with `just build` and reopen.",

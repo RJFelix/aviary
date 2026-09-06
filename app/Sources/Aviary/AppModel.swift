@@ -14,6 +14,14 @@ enum CanonicalNotificationPlatform {
     }
 }
 
+/// Fixed, non-sensitive reason a service draft could not be restored. The distinction matters:
+/// an unreadable record is known to remain on disk, while failure to construct the store proves
+/// no such thing and must not claim that it does.
+enum ServiceDraftRestorationFailure: Equatable, Sendable {
+    case storeUnavailable
+    case recordUnreadable
+}
+
 /// One in-memory, bounded transcript page for Cockpit. The catalog may retain more canonical
 /// messages for other readers; the main actor never remaps that lifetime-sized history per frame.
 struct CanonicalWorkspaceTranscriptPage: Equatable {
@@ -302,6 +310,11 @@ final class AppModel {
     /// Work rows after the first page of attached runs from being starved forever.
     private var servicePollOffset = 0
     private var serviceCreateInFlight = false
+    /// Process-level service work that can publish or mutate a GUI attachment. Shutdown closes
+    /// admission and drains this set before taking its final `workRuns` snapshot, so an adoption
+    /// cannot materialize behind that snapshot and escape draft/command quiescence.
+    private var serviceLifecycleOperationsInFlight = 0
+    private var serviceLifecycleOperationWaiters: [CheckedContinuation<Void, Never>] = []
     /// Create Session is independently serialized per Work. The exact request is retained on
     /// disk before transport, so this flag is only presentation/admission backpressure rather
     /// than the durability boundary.
@@ -336,28 +349,96 @@ final class AppModel {
     /// return early, and let the process disappear while the original cleanup is still waiting
     /// on Claude Code or its runtime child. Window close does not call this; it merely removes
     /// the GUI attachment and leaves Work alive in this process.
-    private var workShutdownTask: Task<Void, Never>?
+    private var workShutdownTask: Task<Bool, Never>?
     var reloadInProgress = false
     var acceptsNewWork = true
 
-    func stopAllWork() async {
+    @discardableResult
+    func stopAllWork() async -> Bool {
         acceptsNewWork = false
         if let workShutdownTask {
-            await workShutdownTask.value
-            return
+            return await workShutdownTask.value
         }
-        let processOwnedWork = workRuns.filter { !$0.isServiceBacked }
         let task = Task { @MainActor in
+            self.stopPolling()
+            await self.waitForServiceLifecycleOperations()
+            // No new service lifecycle operation can enter after `acceptsNewWork = false`, and
+            // every prior one is now settled. This snapshot is therefore the complete set of
+            // GUI-owned rows whose drafts and command barriers must cross shutdown.
+            let processOwnedWork = self.workRuns.filter { !$0.isServiceBacked }
+            let serviceBackedWork = self.workRuns.filter(\.isServiceBacked)
+            // Freeze new GUI-originated command admission, then join commands already beyond
+            // that boundary. Their host outcome and draft reconciliation must settle before
+            // the final draft flush can truthfully precede disconnect.
+            for run in serviceBackedWork { run.freezeServiceComposerAdmission() }
+            for run in serviceBackedWork { await run.waitForServiceComposerCommands() }
+            // A draft is GUI-owned state, unlike the canonical conversation, and therefore
+            // has to cross the process boundary before this GUI drops its service sessions.
+            // Every run serializes this flush behind any already-started background save.
+            var draftsAreDurable = true
+            for run in serviceBackedWork {
+                if !(await run.flushDraftPersistence(freezeEdits: true)) {
+                    draftsAreDurable = false
+                }
+            }
+            guard draftsAreDurable else {
+                // Do not turn a disk failure into silent data loss. Nothing has been stopped or
+                // disconnected yet; restore editing and let AppDelegate cancel termination.
+                for run in serviceBackedWork { run.resumeAfterAbortedShutdown() }
+                self.acceptsNewWork = true
+                self.startPolling()
+                self.localWorkServiceError =
+                    "Quit or reload was canceled because an unsent draft could not be saved. Copy or repair the marked draft, then try again."
+                return false
+            }
             // Claude Code and the old in-process path still have an explicit process-owned
             // teardown.  A Work-service run is different: disconnecting this GUI must not
             // synthesize End or make the Work Host depend on this process.
             for run in processOwnedWork { await run.stop() }
-            for run in workRuns where run.isServiceBacked { await run.disconnect() }
+            for run in serviceBackedWork { await run.disconnect() }
             await self.disconnectLocalWorkService()
+            return true
         }
         workShutdownTask = task
-        await task.value
+        let completed = await task.value
         workShutdownTask = nil
+        return completed
+    }
+
+    private func beginServiceLifecycleOperation() -> Bool {
+        guard acceptsNewWork else { return false }
+        serviceLifecycleOperationsInFlight += 1
+        return true
+    }
+
+    private func finishServiceLifecycleOperation() {
+        precondition(serviceLifecycleOperationsInFlight > 0)
+        serviceLifecycleOperationsInFlight -= 1
+        guard serviceLifecycleOperationsInFlight == 0 else { return }
+        let waiters = serviceLifecycleOperationWaiters
+        serviceLifecycleOperationWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func waitForServiceLifecycleOperations() async {
+        guard serviceLifecycleOperationsInFlight > 0 else { return }
+        await withCheckedContinuation { continuation in
+            serviceLifecycleOperationWaiters.append(continuation)
+        }
+    }
+
+    /// A reload may fail after the ordinary shutdown path has already disconnected this GUI.
+    /// Reopen every local admission gate and restart the single polling owner, then reconnect
+    /// immediately instead of leaving an apparently-live app with frozen service projections.
+    func resumeAfterFailedRelaunch() async {
+        acceptsNewWork = true
+        for run in workRuns { run.resumeAfterAbortedShutdown() }
+        startPolling()
+        if localWorkService == nil {
+            await bootstrapLocalWorkService()
+        } else {
+            await refreshServiceWork()
+        }
     }
 
     /// Which engine a new run uses.
@@ -583,11 +664,15 @@ final class AppModel {
     /// ClientRef is read before constructing any controller and is shared across GUI relaunches;
     /// it is never regenerated merely because a window or process disappeared.
     func bootstrapLocalWorkService() async {
-        guard !isPreview, localWorkService == nil, !localWorkServiceBootstrapInFlight else {
+        guard !isPreview, localWorkService == nil, !localWorkServiceBootstrapInFlight,
+              beginServiceLifecycleOperation() else {
             return
         }
         localWorkServiceBootstrapInFlight = true
-        defer { localWorkServiceBootstrapInFlight = false }
+        defer {
+            localWorkServiceBootstrapInFlight = false
+            finishServiceLifecycleOperation()
+        }
         do {
             let workHost = try home.requirePersistedWorkHost()
             let identityStore = try WorkServiceClientIdentityStore(
@@ -770,6 +855,89 @@ final class AppModel {
         }
     }
 
+    private struct ServiceDraftRestoration: Sendable {
+        let store: ServiceBackedDraftStore?
+        let snapshot: ServiceBackedDraftSnapshot?
+        let failure: ServiceDraftRestorationFailure?
+    }
+
+    /// Draft files contain raw user text, so even their small bounded reads stay off the main
+    /// actor. Failure is deliberately reduced to a fixed state here: paths and decoder details
+    /// can expose private attachment metadata and do not belong in the GUI.
+    private nonisolated static func readServiceDraft(
+        home: AgentHome, key: ServiceAttachmentKey
+    ) -> ServiceDraftRestoration {
+        let store: ServiceBackedDraftStore
+        do {
+            store = try ServiceBackedDraftStore(home: home, key: key)
+        } catch {
+            return ServiceDraftRestoration(
+                store: nil, snapshot: nil, failure: .storeUnavailable)
+        }
+        do {
+            return ServiceDraftRestoration(
+                store: store, snapshot: try store.load(), failure: nil)
+        } catch {
+            // Retain a successfully constructed store so a later explicit edit can replace a
+            // damaged record atomically and recover persistence without relaunching again.
+            return ServiceDraftRestoration(
+                store: store, snapshot: nil, failure: .recordUnreadable)
+        }
+    }
+
+    private static func restoreServiceDraft(
+        home: AgentHome, key: ServiceAttachmentKey
+    ) async -> ServiceDraftRestoration {
+        await Task.detached(priority: .utility) {
+            Self.readServiceDraft(home: home, key: key)
+        }.value
+    }
+
+    /// Reconcile a crash-time handoff before constructing the composer. Accepted evidence clears
+    /// only byte-identical submitted text; definitive rejection preserves it. Any source or
+    /// persistence failure keeps the marker and blocks a second automatic submission.
+    private static func reconcileServiceDraft(
+        _ restoration: ServiceDraftRestoration,
+        key: ServiceAttachmentKey,
+        projection: WorkServiceAttachedWorkProjection
+    ) async -> ServiceDraftRestoration {
+        guard let store = restoration.store,
+              let startingSnapshot = restoration.snapshot,
+              let handoff = startingSnapshot.handoff else {
+            return restoration
+        }
+        let disposition = ServiceBackedDraftHandoffDisposition.classify(
+            handoff, key: key, projection: projection)
+        guard disposition != .unresolved else { return restoration }
+        return await Task.detached(priority: .utility) {
+            do {
+                let snapshot = try store.resolveHandoff(
+                    commandID: handoff.commandID,
+                    accepted: disposition == .accepted,
+                    currentText: startingSnapshot.text,
+                    expectedGeneration: startingSnapshot.generation)
+                return ServiceDraftRestoration(
+                    store: store, snapshot: snapshot, failure: nil)
+            } catch ServiceBackedDraftError.conflict {
+                // Another GUI using the same durable client attachment won the CAS. Adopt its
+                // latest private draft state without issuing or resolving any Work command;
+                // the LiveRun actor will carry that generation into every later mutation.
+                do {
+                    return ServiceDraftRestoration(
+                        store: store, snapshot: try store.load(), failure: nil)
+                } catch {
+                    return ServiceDraftRestoration(
+                        store: store, snapshot: restoration.snapshot,
+                        failure: .recordUnreadable)
+                }
+            } catch {
+                return ServiceDraftRestoration(
+                    store: store, snapshot: restoration.snapshot,
+                    failure: .recordUnreadable)
+            }
+        }.value
+    }
+
     @discardableResult
     private func adoptServiceAttachment(
         descriptor: WorkServiceWorkDescriptor,
@@ -819,6 +987,7 @@ final class AppModel {
             return nil
         }
         do {
+            var restoredDraft = await Self.restoreServiceDraft(home: home, key: key)
             let intentStore = try WorkServiceAttachedWorkIntentStore(
                 home: home, key: key)
             let startIntentStore = try ServiceBackedStartIntentStore(
@@ -836,6 +1005,8 @@ final class AppModel {
                 // is a recovery/unavailable state, never a reason to drop completed history.
                 projection = await controller.projection()
             }
+            restoredDraft = await Self.reconcileServiceDraft(
+                restoredDraft, key: key, projection: projection)
             var unresolvedInitialStart = initialStart
             if let initialStart, Self.hasCanonicalStartEvidence(
                 initialStart, projection: projection) {
@@ -862,7 +1033,28 @@ final class AppModel {
                 thinkingLevel: descriptor.configuration.thinkingLevel)
             let run = LiveRun(
                 service: bridge, initialStart: unresolvedInitialStart,
-                initialStartStore: startIntentStore)
+                initialStartStore: startIntentStore,
+                draftStore: restoredDraft.store,
+                restoredDraft: restoredDraft.snapshot,
+                draftRestorationFailure: restoredDraft.failure)
+            // A central restore and an explicit Attach/Create may have started from the same
+            // catalog generation. Recheck after every suspension; only one exact attachment
+            // becomes a GUI row/controller, and an explicit focusing caller reuses that winner.
+            if let existing = workRuns.first(where: { $0.serviceAttachmentKey == key }) {
+                if focus {
+                    if detachedRuns.contains(where: { $0.id == existing.id }) {
+                        reattachRun(existing, destination: destination)
+                    } else {
+                        focusedRunID = existing.id
+                        section = destination
+                    }
+                }
+                return nil
+            }
+            // Shutdown may have closed admission while the read/controller work above was in
+            // flight. Canonical Work remains on its host and will be restored next launch; do
+            // not create an in-memory row behind shutdown's final snapshot.
+            guard acceptsNewWork else { return nil }
             runs.append(run)
             if focus {
                 focusedRunID = run.id
@@ -1353,7 +1545,8 @@ final class AppModel {
         targetSessionAttachment: SessionAttachmentRef,
         destination: Section = .live
     ) {
-        guard let client = localWorkServiceClient, localWorkService != nil else {
+        guard acceptsNewWork,
+              let client = localWorkServiceClient, localWorkService != nil else {
             localWorkServiceError = "The local Work Host is not connected."
             return
         }
@@ -1380,7 +1573,8 @@ final class AppModel {
         client: ClientRef,
         destination: Section
     ) async {
-        guard localWorkService != nil else { return }
+        guard localWorkService != nil, beginServiceLifecycleOperation() else { return }
+        defer { finishServiceLifecycleOperation() }
         do {
             // Attach is a mutation too: fence the shared socket and fresh cursor to one exact
             // Work Host instance before reading or dispatching against the catalog. A locator
@@ -1549,7 +1743,8 @@ final class AppModel {
         _ descriptor: WorkServiceWorkDescriptor,
         authorizingAttachment: ClientAttachmentRef
     ) {
-        guard let client = localWorkServiceClient, localWorkService != nil else {
+        guard acceptsNewWork,
+              let client = localWorkServiceClient, localWorkService != nil else {
             localWorkServiceError = "The local Work Host is not connected."
             return
         }
@@ -1564,6 +1759,8 @@ final class AppModel {
         authorizingAttachment: ClientAttachmentRef,
         client: ClientRef
     ) async {
+        guard beginServiceLifecycleOperation() else { return }
+        defer { finishServiceLifecycleOperation() }
         guard !serviceSessionCreationsInFlight.contains(requested.work) else {
             localWorkServiceError =
                 "A Session creation is already in progress for this Work."
@@ -1708,9 +1905,13 @@ final class AppModel {
     func refreshServiceWork() async {
         guard !serviceRefreshInFlight,
               let bootstrap = localWorkService,
-              let client = localWorkServiceClient else { return }
+              let client = localWorkServiceClient,
+              beginServiceLifecycleOperation() else { return }
         serviceRefreshInFlight = true
-        defer { serviceRefreshInFlight = false }
+        defer {
+            serviceRefreshInFlight = false
+            finishServiceLifecycleOperation()
+        }
         do {
             let session = try await bootstrap.connect()
             // Polling is the single central observation owner. A fresh auxiliary connection is
@@ -2327,6 +2528,7 @@ final class AppModel {
     }
 
     private func startPolling() {
+        guard acceptsNewWork else { return }
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -2839,6 +3041,8 @@ final class AppModel {
             show(localWorkServiceError ?? "The local Work Host is unavailable.", isError: true)
             return
         }
+        guard beginServiceLifecycleOperation() else { return }
+        defer { finishServiceLifecycleOperation() }
         do {
             // This is the one path-bearing operation in the GUI service flow.  The returned
             // descriptor is reduced immediately to its opaque host-minted workspace ID.
@@ -2926,6 +3130,8 @@ final class AppModel {
                 work: response.work.work, attachment: response.attachment) else {
                 throw ServiceBackedStartIntentError.invalid
             }
+            var restoredDraft = await Self.restoreServiceDraft(
+                home: home, key: serviceAttachmentKey)
             let startIntentStore = try ServiceBackedStartIntentStore(
                 home: home, key: serviceAttachmentKey)
             guard let retainedStart = try startIntentStore.load() else {
@@ -2941,6 +3147,8 @@ final class AppModel {
             } catch {
                 projection = await controller.projection()
             }
+            restoredDraft = await Self.reconcileServiceDraft(
+                restoredDraft, key: serviceAttachmentKey, projection: projection)
             var unresolvedRetainedStart: ServiceBackedStartIntent? = retainedStart
             if Self.hasCanonicalStartEvidence(retainedStart, projection: projection) {
                 do {
@@ -2959,11 +3167,18 @@ final class AppModel {
                 modelLabel: model.qualifiedID, thinkingLevel: thinkingLevel)
             let run = LiveRun(
                 service: bridge, cwd: cwd, title: title,
-                initialStart: unresolvedRetainedStart, initialStartStore: startIntentStore)
+                initialStart: unresolvedRetainedStart, initialStartStore: startIntentStore,
+                draftStore: restoredDraft.store,
+                restoredDraft: restoredDraft.snapshot,
+                draftRestorationFailure: restoredDraft.failure)
             run.config = RunConfiguration(
                 cwd: cwd, provider: providerSpec.id, model: model.id,
                 thinkingLevel: thinkingLevel, noContextFiles: noContextFiles,
                 recordPayloads: recordPayloads)
+            // Create and its Start seed are already durable. If application shutdown closed GUI
+            // admission during the host round-trip, leave the idle Work for next-launch catalog
+            // reconstruction instead of publishing a row after shutdown's drain.
+            guard acceptsNewWork else { return }
             runs.append(run)
             focusedRunID = run.id
             section = .live
@@ -3096,6 +3311,23 @@ final class AppModel {
             detachRun(run)
             return
         }
+        if run.isServiceBacked, !run.draft.isEmpty,
+           run.draftPersistenceState != .saved
+        {
+            // Do not drop the only strong UI owner while its newest draft is still in flight.
+            // A failed write gets one explicit retry; if it remains unavailable, keep the pane
+            // open with its existing warning so the user can copy or discard the text.
+            Task { @MainActor in
+                if await run.flushDraftPersistence() {
+                    self.closeRun(run)
+                } else {
+                    self.show(
+                        "This completed Work was kept open because its unsent draft is not saved.",
+                        isError: true)
+                }
+            }
+            return
+        }
         if let serviceKey = run.serviceAttachmentKey {
             hiddenServiceAttachmentKeys.insert(serviceKey)
         }
@@ -3206,6 +3438,75 @@ struct PeerBridge: Agent.PeerDelegate, Agent.SelfDelegate {
     }
 }
 
+private enum LiveRunDraftSaveResult: Sendable {
+    case saved
+    case canceled
+    case failed
+}
+
+/// Serializes draft writes for one attachment. A canceled debounce can be overtaken, while an
+/// already-started file transaction finishes before the next value is written; older text can
+/// therefore never land after newer text.
+private actor LiveRunDraftPersistence {
+    private let store: ServiceBackedDraftStore
+    private var snapshot: ServiceBackedDraftSnapshot?
+
+    init(store: ServiceBackedDraftStore, snapshot: ServiceBackedDraftSnapshot?) {
+        self.store = store
+        self.snapshot = snapshot
+    }
+
+    func replace(_ text: String, debounceNanoseconds: UInt64?) async -> LiveRunDraftSaveResult {
+        if let debounceNanoseconds {
+            do {
+                try await Task.sleep(nanoseconds: debounceNanoseconds)
+            } catch {
+                return .canceled
+            }
+        }
+        guard !Task.isCancelled else { return .canceled }
+        do {
+            snapshot = try store.replace(
+                text, expectedGeneration: snapshot?.generation)
+            return .saved
+        } catch {
+            return .failed
+        }
+    }
+
+    func beginHandoff(
+        text: String, kind: WorkServiceCommandKind, commandID: String
+    ) throws -> ServiceBackedDraftSnapshot {
+        let next = try store.beginHandoff(
+            text: text, kind: kind, commandID: commandID,
+            expectedGeneration: snapshot?.generation)
+        snapshot = next
+        return next
+    }
+
+    func resolveHandoff(
+        commandID: String, accepted: Bool, currentText: String
+    ) throws -> ServiceBackedDraftSnapshot? {
+        guard let generation = snapshot?.generation else {
+            throw ServiceBackedDraftError.conflict
+        }
+        let next = try store.resolveHandoff(
+            commandID: commandID, accepted: accepted, currentText: currentText,
+            expectedGeneration: generation)
+        snapshot = next
+        return next
+    }
+}
+
+enum LiveRunDraftPersistenceState: Equatable {
+    case memoryOnly
+    case saving
+    case saved
+    case loadFailed
+    case unavailable
+    case writeFailed
+}
+
 @Observable
 @MainActor
 final class LiveRun: Identifiable {
@@ -3223,11 +3524,29 @@ final class LiveRun: Identifiable {
     var usage = Usage()
     var queuedSteering: [String] = []
     var queuedFollowUps: [String] = []
-    /// Unsent composer text belongs to the GUI's durable Work attachment, not to one ephemeral
-    /// SwiftUI view instance. Keeping it here preserves the draft while navigating between
-    /// Cockpit, Live, and Sessions or while detaching and reattaching this view. A later
-    /// private draft store will extend the same identity across GUI process relaunch.
-    var draft = ""
+    /// Unsent composer text belongs to the GUI's exact Work/Session/client attachment, not to
+    /// one ephemeral SwiftUI view. Service-backed runs persist it privately across GUI process
+    /// relaunch; process-owned engines retain the same navigation-safe in-memory behavior.
+    private(set) var draft = ""
+    /// A durable marker means this exact text may already have crossed into Work. It disables
+    /// further submission until canonical evidence or an explicit user decision resolves it.
+    private(set) var draftHandoff: ServiceBackedDraftHandoff?
+    private(set) var draftPersistenceState: LiveRunDraftPersistenceState = .memoryOnly
+    var draftPersistenceNotice: String? {
+        if draftHandoff != nil {
+            return "This draft has an unresolved Work Host handoff. Aviary will not resend it until exact canonical evidence resolves the command."
+        }
+        switch draftPersistenceState {
+        case .loadFailed:
+            return "A saved draft for this attachment could not be read. It remains on disk; edit the composer to replace it."
+        case .unavailable:
+            return "Private draft storage is unavailable. Current composer text exists only in this GUI."
+        case .writeFailed:
+            return "This draft could not be saved privately and currently exists only in this GUI."
+        case .memoryOnly, .saving, .saved:
+            return nil
+        }
+    }
     var sessionID: String?
     var sessionFile: String?
     /// True only after the first admitted prompt crossed the driver's durable delivery seam.
@@ -3265,7 +3584,7 @@ final class LiveRun: Identifiable {
     var acceptsInput: Bool {
         guard errorBanner == nil, !hasExited, !isEnding else { return false }
         if let serviceBridge {
-            return serviceBridge.canSubmitText
+            return initialStart == nil && draftHandoff == nil && serviceBridge.canSubmitText
         }
         switch commandState {
         case .idle: return true
@@ -3283,7 +3602,14 @@ final class LiveRun: Identifiable {
     }
 
     var serviceRetryAvailable: Bool {
-        serviceBridge?.canRetryPendingCommand ?? false
+        (serviceBridge?.canRetryPendingCommand ?? false)
+            && serviceCommandBarrier.operationsInFlight == 0
+            && !serviceCommandBarrier.admissionFrozen
+    }
+
+    var draftHandoffRecoveryAvailable: Bool {
+        isServiceBacked && serviceCommandBarrier.canResolveUnresolvedDraft(
+            hasUnresolvedDraft: draftHandoff != nil, isEnding: isEnding)
     }
 
     /// Set when Claude Code is driving this run instead of Aviary.
@@ -3385,7 +3711,10 @@ final class LiveRun: Identifiable {
         cwd: String = "",
         title: String? = nil,
         initialStart: ServiceBackedStartIntent? = nil,
-        initialStartStore: ServiceBackedStartIntentStore? = nil
+        initialStartStore: ServiceBackedStartIntentStore? = nil,
+        draftStore: ServiceBackedDraftStore? = nil,
+        restoredDraft: ServiceBackedDraftSnapshot? = nil,
+        draftRestorationFailure: ServiceDraftRestorationFailure? = nil
     ) {
         self.engine = EngineLocation(
             kind: .fork, path: "aviaryd", version: "work-service",
@@ -3414,6 +3743,287 @@ final class LiveRun: Identifiable {
         self.errorBanner = bridge.errorBanner
         self.initialStart = initialStart
         self.initialStartStore = initialStartStore
+        self.draft = restoredDraft?.text ?? ""
+        self.draftHandoff = restoredDraft?.handoff
+        if let draftStore {
+            self.draftPersistence = LiveRunDraftPersistence(
+                store: draftStore, snapshot: restoredDraft)
+            self.draftPersistenceState = draftRestorationFailure == .recordUnreadable
+                ? .loadFailed : .saved
+        } else if draftRestorationFailure == .storeUnavailable {
+            self.draftPersistenceState = .unavailable
+        }
+    }
+
+    /// Update the in-memory composer immediately and queue one bounded private save. Repeated
+    /// keystrokes cancel only the debounce; an I/O operation already underway remains ordered
+    /// before the newer value by `LiveRunDraftPersistence`.
+    func setDraft(_ text: String) {
+        guard !draftPersistenceFrozen else { return }
+        guard draft != text else { return }
+        draft = text
+        guard let draftPersistence else { return }
+        draftRequiresPersistence = true
+        draftContentRevision &+= 1
+        // While the submission marker is being made durable, retain edits in memory but do not
+        // race a plain replacement ahead of that transaction. The handoff path flushes this
+        // newer revision immediately before crossing the service boundary.
+        if draftHandoffPreparationInProgress {
+            draftPersistenceState = .saving
+            return
+        }
+        let revision = draftContentRevision
+        draftPersistenceTask?.cancel()
+        draftPersistenceState = .saving
+        draftPersistenceTask = Task { [weak self, draftPersistence] in
+            let result = await draftPersistence.replace(
+                text,
+                // Once a command is handed off, the old draft must disappear durably without
+                // a crash window. Manual deletion benefits from the same immediate behavior.
+                debounceNanoseconds:
+                    text.isEmpty
+                        || (self?.serviceCommandBarrier.operationsInFlight ?? 0) > 0
+                        ? nil : 175_000_000)
+            guard let self, self.draftContentRevision == revision else { return }
+            switch result {
+            case .saved:
+                self.draftPersistenceState = .saved
+                self.draftRequiresPersistence = false
+                self.draftPersistenceTask = nil
+            case .failed:
+                self.draftPersistenceState = .writeFailed
+                self.draftPersistenceTask = nil
+            case .canceled:
+                break
+            }
+        }
+    }
+
+    /// Flush the exact latest draft before a GUI process disconnects from the Work Host. This
+    /// never sends a Work command and never changes canonical conversation state.
+    @discardableResult
+    func flushDraftPersistence(freezeEdits: Bool = false) async -> Bool {
+        if freezeEdits { draftPersistenceFrozen = true }
+        guard let draftPersistence else {
+            // A corrupt/unavailable store with no in-memory text has no newest draft to lose.
+            // Keep its diagnostic for the next attach, but do not make an empty composer an
+            // unquittable application. Nonempty memory-only service text still blocks exit.
+            return draft.isEmpty
+        }
+        // A failed load may represent recoverable bytes. Normal quit must not reinterpret an
+        // empty in-memory editor as user intent to delete them. The first edit makes replacement
+        // explicit and enters the ordinary save path.
+        if draftPersistenceState == .loadFailed, !draftRequiresPersistence {
+            return draft.isEmpty
+        }
+        while true {
+            // Flush callers may overlap (delivery, close, quit). Only a content edit advances
+            // this revision, so concurrent idempotent writes cannot invalidate each other.
+            let revision = draftContentRevision
+            let text = draft
+            draftPersistenceTask?.cancel()
+            draftPersistenceTask = nil
+            draftPersistenceState = .saving
+            let result = await draftPersistence.replace(text, debounceNanoseconds: nil)
+            // An ordinary close or post-handoff flush does not freeze the editor. If a new
+            // edit arrived across the actor hop, loop and make that latest value durable too.
+            guard draftContentRevision == revision else { continue }
+            switch result {
+            case .saved:
+                draftPersistenceState = .saved
+                draftRequiresPersistence = false
+                return true
+            case .failed, .canceled:
+                draftPersistenceState = .writeFailed
+                return false
+            }
+        }
+    }
+
+    /// Resolve the composer only after the host accepted delivery. If the editor is unchanged,
+    /// clear it; if the user already typed the next message, keep that text. Either way, await an
+    /// immediate durable write so a crash cannot resurrect the submitted draft.
+    func reconcileDraftAfterHandOff(_ submittedText: String) async {
+        if draft == submittedText { setDraft("") }
+        _ = await flushDraftPersistence()
+    }
+
+    /// Make the submission identity durable before invoking the controller. If the user edits
+    /// while this file transaction is in flight, persist that next draft behind the marker
+    /// before the service call begins. A failed marker/write proves no service call happened.
+    private func beginDraftHandoff(
+        text: String, kind: WorkServiceCommandKind, commandID: String
+    ) async -> Bool {
+        guard draft == text, draftHandoff == nil, let draftPersistence else {
+            commandNotice = .warning(
+                draftHandoff == nil
+                    ? "The current draft is not durably ready to send."
+                    : "A prior draft handoff still needs explicit reconciliation.")
+            return false
+        }
+        let submittedRevision = draftContentRevision
+        draftPersistenceTask?.cancel()
+        draftPersistenceTask = nil
+        draftHandoffPreparationInProgress = true
+        draftPersistenceState = .saving
+        do {
+            let snapshot = try await draftPersistence.beginHandoff(
+                text: text, kind: kind, commandID: commandID)
+            draftHandoff = snapshot.handoff
+            draftHandoffPreparationInProgress = false
+            draftPersistenceState = .saved
+            draftRequiresPersistence = draftContentRevision != submittedRevision
+            var newerDraftSaved = true
+            if draftRequiresPersistence {
+                newerDraftSaved = await flushDraftPersistence()
+            }
+            if !newerDraftSaved {
+                // The service has not been called. Clear the marker as a proven rejection while
+                // preserving both the on-disk submitted text and the newer in-memory edit.
+                do {
+                    let resolved = try await draftPersistence.resolveHandoff(
+                        commandID: commandID, accepted: false, currentText: draft)
+                    draftHandoff = resolved?.handoff
+                    draftPersistenceState = .saved
+                    draftRequiresPersistence = false
+                    commandNotice = .warning(
+                        "Nothing was sent; the newer text was returned to the composer.")
+                } catch {
+                    // Keep the in-memory marker if the store could not prove its removal.
+                    draftPersistenceState = .writeFailed
+                    commandNotice = .warning(
+                        "The newer draft could not be saved, so nothing was sent.")
+                }
+                return false
+            }
+            return true
+        } catch {
+            draftHandoffPreparationInProgress = false
+            draftPersistenceState = .writeFailed
+            commandNotice = .warning(
+                "The draft handoff could not be saved privately, so nothing was sent.")
+            return false
+        }
+    }
+
+    /// Apply one exact command outcome to the durable marker. Core persistence decides whether
+    /// accepted delivery may clear the text by comparing its submitted digest; newer edits are
+    /// retained and immediately made durable after the marker is removed.
+    @discardableResult
+    private func resolveDraftHandoff(commandID: String, accepted: Bool) async -> Bool {
+        guard draftHandoff?.commandID == commandID,
+              let draftPersistence else { return draftHandoff == nil }
+        let resolutionRevision = draftContentRevision
+        let currentText = draft
+        draftPersistenceTask?.cancel()
+        draftPersistenceTask = nil
+        draftPersistenceState = .saving
+        do {
+            let snapshot = try await draftPersistence.resolveHandoff(
+                commandID: commandID, accepted: accepted, currentText: currentText)
+            draftHandoff = snapshot?.handoff
+            if draftContentRevision == resolutionRevision {
+                let resolvedText = snapshot?.text ?? ""
+                if draft != resolvedText {
+                    draft = resolvedText
+                    draftContentRevision &+= 1
+                }
+            }
+            let storedText = snapshot?.text ?? ""
+            draftRequiresPersistence = draft != storedText
+            draftPersistenceState = .saved
+            if draftRequiresPersistence {
+                return await flushDraftPersistence()
+            }
+            return true
+        } catch {
+            draftPersistenceState = .writeFailed
+            commandNotice = .warning(
+                "The Work command outcome is known, but its local draft marker could not be resolved.")
+            return false
+        }
+    }
+
+    private func commandWasDefinitivelyRejected(
+        commandID: String, error: Error
+    ) async -> Bool {
+        if error is ServiceBackedRunBridgeError { return true }
+        guard let pending = await serviceBridge?.controller.pendingCommand(),
+              pending.commandID == commandID else { return false }
+        return pending.state == .stale
+    }
+
+    /// Polling is read-only, but an exact canonical command can settle the local handoff marker.
+    /// Unknown/indeterminate evidence leaves it intact and therefore keeps submission disabled.
+    private func reconcileDraftHandoffFromProjection() async {
+        // The request/retry that owns this marker resolves it. A timer refresh may observe the
+        // same canonical event while that operation is suspended, but must not race a second
+        // local CAS and turn successful resolution into a spurious write failure.
+        guard serviceCommandBarrier.operationsInFlight == 0,
+              !draftHandoffPreparationInProgress else { return }
+        guard let handoff = draftHandoff, let serviceAttachmentKey,
+              let projection = serviceBridge?.projection else { return }
+        switch ServiceBackedDraftHandoffDisposition.classify(
+            handoff, key: serviceAttachmentKey, projection: projection) {
+        case .accepted:
+            guard beginServiceCommandOperation(allowingUnresolvedDraft: true) else { return }
+            defer { finishServiceCommandOperation() }
+            _ = await resolveDraftHandoff(commandID: handoff.commandID, accepted: true)
+        case .rejected:
+            guard beginServiceCommandOperation(allowingUnresolvedDraft: true) else { return }
+            defer { finishServiceCommandOperation() }
+            _ = await resolveDraftHandoff(commandID: handoff.commandID, accepted: false)
+        case .unresolved:
+            break
+        }
+    }
+
+    /// Explicitly return an unresolved submitted value to the composer. This is the only escape
+    /// hatch when a crash happened after the marker write but before any canonical command was
+    /// observed; Aviary never performs this potentially duplicating choice automatically.
+    func returnUnresolvedDraftToComposer() async -> Bool {
+        guard let handoff = draftHandoff else { return true }
+        guard beginServiceCommandOperation(allowingUnresolvedDraft: true) else { return false }
+        defer { finishServiceCommandOperation() }
+        let resolved = await resolveDraftHandoff(
+            commandID: handoff.commandID, accepted: false)
+        if resolved {
+            commandNotice = .warning(
+                "The unresolved handoff was returned to the composer. Review Work before sending it again.")
+        }
+        return resolved
+    }
+
+    func freezeServiceComposerAdmission() {
+        serviceCommandBarrier.freeze()
+    }
+
+    func waitForServiceComposerCommands() async {
+        guard serviceCommandBarrier.operationsInFlight > 0 else { return }
+        await withCheckedContinuation { continuation in
+            serviceComposerCommandWaiters.append(continuation)
+        }
+    }
+
+    func resumeAfterAbortedShutdown() {
+        draftPersistenceFrozen = false
+        serviceCommandBarrier.resume()
+    }
+
+    private func beginServiceCommandOperation(
+        allowingUnresolvedDraft: Bool = false
+    ) -> Bool {
+        serviceCommandBarrier.begin(
+            hasUnresolvedDraft: draftHandoff != nil,
+            allowingUnresolvedDraft: allowingUnresolvedDraft)
+    }
+
+    private func finishServiceCommandOperation() {
+        precondition(serviceCommandBarrier.operationsInFlight > 0)
+        guard serviceCommandBarrier.finish() else { return }
+        let waiters = serviceComposerCommandWaiters
+        serviceComposerCommandWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 
     /// Publish a value only when it actually differs.
@@ -3493,16 +4103,48 @@ final class LiveRun: Identifiable {
     /// durable Create/Start admission.
     @discardableResult
     func startService(
-        prompt: String, commandID: String? = nil
+        prompt: String, commandID: String? = nil,
+        operationAlreadyAdmitted: Bool = false
     ) async -> LiveRunCommandResult {
         guard let serviceBridge else { return .rejected("not a Work-service run") }
-        let effectivePrompt = initialStart?.prompt ?? prompt
-        let effectiveCommandID = commandID ?? initialStart?.commandID
+        let ownsOperation: Bool
+        if operationAlreadyAdmitted {
+            ownsOperation = false
+        } else {
+            guard beginServiceCommandOperation() else {
+                commandNotice = .warning(
+                    serviceCommandBarrier.operationsInFlight > 0
+                        ? "Another Work command is already in progress."
+                        : "This GUI cannot start Work while it is disconnecting or reconciling a draft.")
+                return .rejected("Start admission unavailable")
+            }
+            ownsOperation = true
+        }
+        defer {
+            if ownsOperation { finishServiceCommandOperation() }
+        }
+        guard let start = ServiceBackedGUIOrchestration.startCommand(
+            prompt: prompt, commandID: commandID, retained: initialStart) else {
+            if let commandID, draftHandoff?.commandID == commandID {
+                _ = await resolveDraftHandoff(commandID: commandID, accepted: false)
+            }
+            commandNotice = .warning(
+                "A prior Start is still unresolved; these newer prompt bytes were not sent.")
+            return .rejected("Start command identity does not match prompt")
+        }
+        let effectivePrompt = start.prompt
+        let effectiveCommandID = start.commandID
         if !effectivePrompt.isEmpty, title == "New run" {
             title = String(effectivePrompt.prefix(60))
         }
         do {
             let receipt = try await serviceBridge.start(effectivePrompt, commandID: effectiveCommandID)
+            var draftMarkerResolved = true
+            if let effectiveCommandID,
+               draftHandoff?.commandID == effectiveCommandID {
+                draftMarkerResolved = await resolveDraftHandoff(
+                    commandID: effectiveCommandID, accepted: true)
+            }
             var retainedMarkerWarning: String?
             if let initialStart {
                 if serviceBridge.hasCanonicalStartEvidence(for: initialStart) {
@@ -3525,14 +4167,23 @@ final class LiveRun: Identifiable {
                 }
             }
             syncServiceState()
-            if let retainedMarkerWarning {
-                commandNotice = .warning(retainedMarkerWarning)
-            } else {
-                commandNotice = .success(
-                    "Start accepted by the Work Host; canonical state is catching up.")
+            if draftMarkerResolved {
+                if let retainedMarkerWarning {
+                    commandNotice = .warning(retainedMarkerWarning)
+                } else {
+                    commandNotice = .success(
+                        "Start accepted by the Work Host; canonical state is catching up.")
+                }
             }
             return .service(receipt)
         } catch {
+            if let effectiveCommandID,
+               draftHandoff?.commandID == effectiveCommandID,
+               await commandWasDefinitivelyRejected(
+                   commandID: effectiveCommandID, error: error) {
+                _ = await resolveDraftHandoff(
+                    commandID: effectiveCommandID, accepted: false)
+            }
             if let initialStart {
                 let pending = await serviceBridge.controller.pendingCommand()
                 let definitiveRejection = error is ServiceBackedRunBridgeError
@@ -3589,6 +4240,7 @@ final class LiveRun: Identifiable {
         guard let serviceBridge else { return }
         _ = await serviceBridge.refresh()
         syncServiceState()
+        await reconcileDraftHandoffFromProjection()
         var startResolvedByEvidence = false
         if let initialStart,
            serviceBridge.hasCanonicalStartEvidence(for: initialStart) {
@@ -3609,6 +4261,7 @@ final class LiveRun: Identifiable {
         // persisted Start only after the pair is canonical. A command that already crossed the
         // boundary remains in the controller's durable pending record and is never auto-replayed.
         if !startResolvedByEvidence, let initialStart,
+           serviceCommandBarrier.operationsInFlight == 0,
            serviceBridge.projection.isCanonical,
            serviceBridge.hasMatchingStartAttachment(for: initialStart),
            serviceBridge.commandState == .idle,
@@ -3621,13 +4274,37 @@ final class LiveRun: Identifiable {
     /// User-directed repair of a command whose durable outcome was not yet safely known.
     func retryServiceCommand() async -> LiveRunCommandResult {
         guard let serviceBridge else { return .rejected("not a Work-service run") }
+        guard beginServiceCommandOperation(allowingUnresolvedDraft: true) else {
+            commandNotice = .warning(
+                serviceCommandBarrier.operationsInFlight > 0
+                    ? "Another Work command reconciliation is already in progress."
+                    : "Aviary is disconnecting this GUI; the pending command was not retried.")
+            return .rejected("command reconciliation unavailable")
+        }
+        defer { finishServiceCommandOperation() }
+        let pending = await serviceBridge.controller.pendingCommand()
         do {
             let receipt = try await serviceBridge.retryPendingCommand()
-            commandNotice = .success(
-                "The exact pending command was accepted; canonical state is catching up.")
+            let markerResolved: Bool
+            if let pending, draftHandoff?.commandID == pending.commandID {
+                markerResolved = await resolveDraftHandoff(
+                    commandID: pending.commandID, accepted: true)
+            } else {
+                markerResolved = true
+            }
+            if markerResolved {
+                commandNotice = .success(
+                    "The exact pending command was accepted; canonical state is catching up.")
+            }
             syncServiceState()
             return .service(receipt)
         } catch {
+            if let pending, draftHandoff?.commandID == pending.commandID,
+               await commandWasDefinitivelyRejected(
+                   commandID: pending.commandID, error: error) {
+                _ = await resolveDraftHandoff(
+                    commandID: pending.commandID, accepted: false)
+            }
             syncServiceState()
             let detail = serviceBridge.errorBanner ?? error.localizedDescription
             commandNotice = .warning(detail)
@@ -3638,8 +4315,18 @@ final class LiveRun: Identifiable {
     /// Remove a stale command intent after the current canonical state has been reviewed.
     func abandonStaleServiceCommand() async -> Bool {
         guard let serviceBridge else { return false }
+        guard beginServiceCommandOperation(allowingUnresolvedDraft: true) else { return false }
+        defer { finishServiceCommandOperation() }
+        let pending = await serviceBridge.controller.pendingCommand()
         do {
             try await serviceBridge.abandonStaleCommand()
+            if let pending, draftHandoff?.commandID == pending.commandID {
+                guard await resolveDraftHandoff(
+                    commandID: pending.commandID, accepted: false) else {
+                    syncServiceState()
+                    return false
+                }
+            }
             syncServiceState()
             return true
         } catch {
@@ -3652,6 +4339,14 @@ final class LiveRun: Identifiable {
     private var mirror: Task<Void, Never>?
     private var initialStart: ServiceBackedStartIntent?
     private var initialStartStore: ServiceBackedStartIntentStore?
+    private var draftPersistence: LiveRunDraftPersistence?
+    private var draftPersistenceTask: Task<Void, Never>?
+    private var draftContentRevision: UInt64 = 0
+    private var draftRequiresPersistence = false
+    private var draftPersistenceFrozen = false
+    private var draftHandoffPreparationInProgress = false
+    private var serviceCommandBarrier = ServiceBackedGUIOrchestration.CommandBarrier()
+    private var serviceComposerCommandWaiters: [CheckedContinuation<Void, Never>] = []
     /// End, Quit, and Reload all join this same teardown. `isEnding` is presentation state,
     /// not proof that cleanup finished.
     private var stopTask: Task<Void, Never>?
@@ -3723,44 +4418,93 @@ final class LiveRun: Identifiable {
         return inputs.last
     }
 
-    func send(_ text: String) async -> LiveRunCommandResult {
+    func send(
+        _ text: String, fromComposer: Bool = false
+    ) async -> LiveRunCommandResult {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
             commandNotice = .warning("Could not send: empty input.")
             return .rejected("empty input")
         }
         if let serviceBridge {
+            guard beginServiceCommandOperation() else {
+                if draftHandoff != nil {
+                    commandNotice = .warning(
+                        "A prior draft handoff still needs explicit reconciliation.")
+                    return .rejected("draft handoff unresolved")
+                }
+                commandNotice = .warning(
+                    serviceCommandBarrier.operationsInFlight > 0
+                        ? "Another composer command is already crossing into Work."
+                        : "Aviary is disconnecting this GUI; this message was not sent.")
+                return .rejected("composer command unavailable")
+            }
+            defer { finishServiceCommandOperation() }
             guard serviceBridge.hasExactRunOwner, serviceBridge.projection.isCanonical else {
                 commandNotice = .warning("This Work's active Session owner is unavailable.")
                 return .rejected("exact Session owner unavailable")
             }
             if serviceBridge.requiresStartForNextInput {
-                return await startService(prompt: text)
+                let commandID = fromComposer ? UUID().uuidString.lowercased() : nil
+                if let commandID {
+                    guard await beginDraftHandoff(
+                        text: text, kind: .start, commandID: commandID) else {
+                        return .rejected("draft handoff unavailable")
+                    }
+                }
+                let result = await startService(
+                    prompt: text, commandID: commandID, operationAlreadyAdmitted: true)
+                return result
+            }
+            let kind: WorkServiceCommandKind
+            if serviceBridge.isStreaming {
+                guard serviceBridge.commandCapabilities.supportsSteering else {
+                    if serviceBridge.commandCapabilities.supportsQueuedFollowUps {
+                        commandNotice = .warning(
+                            "This Work is busy; use Queue follow-up for the next turn.")
+                    } else {
+                        commandNotice = .warning(
+                            "This Work is busy and does not advertise steering.")
+                    }
+                    return .rejected("steering unavailable")
+                }
+                kind = .steer
+            } else {
+                kind = .send
+            }
+            let commandID = fromComposer ? UUID().uuidString.lowercased() : nil
+            if let commandID {
+                guard await beginDraftHandoff(
+                    text: text, kind: kind, commandID: commandID) else {
+                    return .rejected("draft handoff unavailable")
+                }
             }
             do {
                 let receipt: WorkServiceCommandReceipt
-                if serviceBridge.isStreaming {
-                    guard serviceBridge.commandCapabilities.supportsSteering else {
-                        if serviceBridge.commandCapabilities.supportsQueuedFollowUps {
-                            commandNotice = .warning(
-                                "This Work is busy; use Queue follow-up for the next turn.")
-                        } else {
-                            commandNotice = .warning(
-                                "This Work is busy and does not advertise steering.")
-                        }
-                        return .rejected("steering unavailable")
-                    }
-                    receipt = try await serviceBridge.steer(text)
+                if kind == .steer {
+                    receipt = try await serviceBridge.steer(text, commandID: commandID)
                 } else {
-                    receipt = try await serviceBridge.send(text)
+                    receipt = try await serviceBridge.send(text, commandID: commandID)
+                }
+                let markerResolved = if let commandID {
+                    await resolveDraftHandoff(commandID: commandID, accepted: true)
+                } else {
+                    true
                 }
                 if receipt.state == .accepted || receipt.state == .duplicate {
                     if title == "New run" { title = String(text.prefix(60)) }
-                    commandNotice = .success(
-                        "Command accepted by the Work Host; canonical state is catching up.")
+                    if markerResolved {
+                        commandNotice = .success(
+                            "Command accepted by the Work Host; canonical state is catching up.")
+                    }
                 }
                 syncServiceState()
                 return .service(receipt)
             } catch {
+                if let commandID, await commandWasDefinitivelyRejected(
+                    commandID: commandID, error: error) {
+                    _ = await resolveDraftHandoff(
+                        commandID: commandID, accepted: false)
+                }
                 syncServiceState()
                 commandNotice = .warning(serviceBridge.errorBanner ?? "The Work Host did not accept that command.")
                 return .rejected(serviceBridge.errorBanner ?? "Work service unavailable")
@@ -3802,19 +4546,57 @@ final class LiveRun: Identifiable {
     /// The harness had a server-side queue for this. Aviary's own engine steers instead —
     /// the message lands at the next turn boundary, which is the same guarantee without a
     /// second place for a message to sit unacknowledged.
-    func queueFollowUp(_ text: String) async -> LiveRunCommandResult {
+    func queueFollowUp(
+        _ text: String, fromComposer: Bool = false
+    ) async -> LiveRunCommandResult {
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
+            commandNotice = .warning("Could not queue: empty input.")
+            return .rejected("empty input")
+        }
         if let serviceBridge {
+            guard beginServiceCommandOperation() else {
+                if draftHandoff != nil {
+                    commandNotice = .warning(
+                        "A prior draft handoff still needs explicit reconciliation.")
+                    return .rejected("draft handoff unresolved")
+                }
+                commandNotice = .warning(
+                    serviceCommandBarrier.operationsInFlight > 0
+                        ? "Another composer command is already crossing into Work."
+                        : "Aviary is disconnecting this GUI; this follow-up was not queued.")
+                return .rejected("composer command unavailable")
+            }
+            defer { finishServiceCommandOperation() }
             guard serviceBridge.commandCapabilities.supportsQueuedFollowUps else {
                 commandNotice = .warning("This Work does not advertise queued follow-ups.")
                 return .rejected("queued follow-ups unavailable")
             }
+            let commandID = fromComposer ? UUID().uuidString.lowercased() : nil
+            if let commandID {
+                guard await beginDraftHandoff(
+                    text: text, kind: .queue, commandID: commandID) else {
+                    return .rejected("draft handoff unavailable")
+                }
+            }
             do {
-                let receipt = try await serviceBridge.queue(text)
-                commandNotice = .success(
-                    "Follow-up accepted by the Work Host; canonical state is catching up.")
+                let receipt = try await serviceBridge.queue(text, commandID: commandID)
+                let markerResolved = if let commandID {
+                    await resolveDraftHandoff(commandID: commandID, accepted: true)
+                } else {
+                    true
+                }
+                if markerResolved {
+                    commandNotice = .success(
+                        "Follow-up accepted by the Work Host; canonical state is catching up.")
+                }
                 syncServiceState()
                 return .service(receipt)
             } catch {
+                if let commandID, await commandWasDefinitivelyRejected(
+                    commandID: commandID, error: error) {
+                    _ = await resolveDraftHandoff(
+                        commandID: commandID, accepted: false)
+                }
                 syncServiceState()
                 commandNotice = .warning(serviceBridge.errorBanner ?? "The Work Host did not accept that follow-up.")
                 return .rejected(serviceBridge.errorBanner ?? "Work service unavailable")

@@ -7,6 +7,77 @@ import Foundation
 /// Keeping those decisions here makes the passive/explicit distinction executable without
 /// importing SwiftUI or depending on a live Work Host.
 public enum ServiceBackedGUIOrchestration {
+    /// The exact prompt/command pair that may cross the Work-service Start boundary.
+    public struct StartCommand: Hashable, Sendable {
+        public let prompt: String
+        public let commandID: String?
+
+        public init(prompt: String, commandID: String?) {
+            self.prompt = prompt
+            self.commandID = commandID
+        }
+    }
+
+    /// Resolve a Start without ever borrowing the body from one intent and the identity from
+    /// another. While a bootstrap Start is retained, it is the only Start that may cross: a
+    /// fresh composer command cannot safely prove the earlier Start stayed outside Work.
+    public static func startCommand(
+        prompt: String,
+        commandID: String?,
+        retained: ServiceBackedStartIntent?
+    ) -> StartCommand? {
+        guard let retained else {
+            return StartCommand(prompt: prompt, commandID: commandID)
+        }
+        guard prompt == retained.prompt,
+              commandID == nil || commandID == retained.commandID else { return nil }
+        return StartCommand(prompt: prompt, commandID: retained.commandID)
+    }
+
+    /// Main-actor command admission reduced to a value type so retry/recovery/quit interleavings
+    /// can be tested without importing the SwiftUI executable. All operations that can resolve a
+    /// durable handoff participate in the same counter as new composer submissions.
+    public struct CommandBarrier: Hashable, Sendable {
+        public private(set) var admissionFrozen = false
+        public private(set) var operationsInFlight = 0
+
+        public init() {}
+
+        public mutating func begin(
+            hasUnresolvedDraft: Bool,
+            allowingUnresolvedDraft: Bool = false
+        ) -> Bool {
+            guard !admissionFrozen,
+                  operationsInFlight == 0,
+                  allowingUnresolvedDraft || !hasUnresolvedDraft else { return false }
+            operationsInFlight += 1
+            return true
+        }
+
+        /// Returns true when every admitted operation has settled.
+        @discardableResult
+        public mutating func finish() -> Bool {
+            guard operationsInFlight > 0 else { return false }
+            operationsInFlight -= 1
+            return operationsInFlight == 0
+        }
+
+        public mutating func freeze() {
+            admissionFrozen = true
+        }
+
+        public mutating func resume() {
+            admissionFrozen = false
+        }
+
+        public func canResolveUnresolvedDraft(
+            hasUnresolvedDraft: Bool,
+            isEnding: Bool
+        ) -> Bool {
+            hasUnresolvedDraft && !isEnding && operationsInFlight == 0
+        }
+    }
+
     public enum ReconciliationMode: Hashable, Sendable {
         case passivePolling
         case explicitCreate

@@ -288,18 +288,27 @@ final class ServiceBackedRunBridge {
         return try await issue { try await self.controller.start(prompt) }
     }
 
-    func send(_ prompt: String) async throws -> WorkServiceCommandReceipt {
+    func send(_ prompt: String, commandID: String? = nil) async throws -> WorkServiceCommandReceipt {
         try requireExactRunOwner()
+        if let commandID {
+            return try await issue { try await self.controller.send(prompt, commandID: commandID) }
+        }
         return try await issue { try await self.controller.send(prompt) }
     }
 
-    func steer(_ text: String) async throws -> WorkServiceCommandReceipt {
+    func steer(_ text: String, commandID: String? = nil) async throws -> WorkServiceCommandReceipt {
         try requireExactRunOwner()
+        if let commandID {
+            return try await issue { try await self.controller.steer(text, commandID: commandID) }
+        }
         return try await issue { try await self.controller.steer(text) }
     }
 
-    func queue(_ text: String) async throws -> WorkServiceCommandReceipt {
+    func queue(_ text: String, commandID: String? = nil) async throws -> WorkServiceCommandReceipt {
         try requireExactRunOwner()
+        if let commandID {
+            return try await issue { try await self.controller.queue(text, commandID: commandID) }
+        }
         return try await issue { try await self.controller.queue(text) }
     }
 

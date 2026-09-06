@@ -75,7 +75,7 @@ struct AviaryApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private static let maximumQueuedNotificationRoutes = 32
-    var prepareForTermination: (() async -> Void)?
+    var prepareForTermination: (() async -> Bool)?
     var handleNotification: ((CanonicalNotificationRoute) -> Void)? {
         didSet {
             guard let handleNotification else { return }
@@ -142,14 +142,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// AppKit's terminate request is synchronous, while process-owned Claude Code cleanup is
     /// not. Returning `terminateLater` keeps the process alive until those resources quiesce;
     /// `AppModel.stopAllWork()` only disconnects service-backed GUI attachments, so quitting
-    /// never sends End or stops durable Work on a Work Host. This is intentionally not invoked
-    /// for last-window close: that event has no user intent to end Work.
+    /// never sends End or stops durable Work on a Work Host. A nonempty draft that cannot be
+    /// flushed cancels termination instead of silently becoming memory loss. This is intentionally
+    /// not invoked for last-window close: that event has no user intent to end Work.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let prepareForTermination else { return .terminateNow }
         guard terminationTask == nil else { return .terminateLater }
         terminationTask = Task { @MainActor in
-            await prepareForTermination()
-            sender.reply(toApplicationShouldTerminate: true)
+            let draftsAndWorkAreReady = await prepareForTermination()
+            terminationTask = nil
+            sender.reply(toApplicationShouldTerminate: draftsAndWorkAreReady)
         }
         return .terminateLater
     }

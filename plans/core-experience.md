@@ -94,17 +94,46 @@ in-process constructors and validated at native draft/writer, decode, journal, l
 Work Host control, and transport crossings; saturated counts render as lower bounds rather than
 false exact values.
 
-Unsent text now belongs to the attached in-memory `LiveRun`, so navigation and detach/reattach no
-longer destroy a draft. Durable private draft storage across GUI process relaunch remains an open
-Phase 2 item. The bare Cockpit snapshot route builds and renders, but the available real catalog was
-empty during this checkpoint; populated, multi-Work, narrow-layout, and Action Lens visual
-certification still require deterministic snapshot fixtures or an interactive run. Focused
-verification covers action presentation (4 cases / 247 assertions), attention projection (10 / 441),
-controller bounds (1 / 16), evidence-link journal decoding (1 / 17), writer propagation/validation
-(2 / 28), and transport page bounds (1 / 20); Core, SelfTest, and GUI targets build. One broad suite
-attempt was stopped after an order-dependent wait immediately after the Phase 1 bridge cases; the
-individual following bridge cases and the context-manifest group pass in isolation, so the broad
-run is not claimed as a completed receipt.
+Unsent text belongs to the exact attached `LiveRun`, so navigation and detach/reattach do not
+destroy a draft. Service-backed drafts now also survive GUI process relaunch in a private,
+attachment-qualified store: filenames reveal only a digest; records and directories enforce owner
+and mode; reads are bounded and row-local; explicit edits may repair disposable malformed records;
+symlinks and insecure files fail closed. Typing persists through a serialized off-main-actor
+debounce, accepted delivery clears immediately, and normal quit/reload flushes the latest value
+before disconnecting from the Work Host. A nonempty flush failure cancels quit/reload before any
+Work teardown, restores editing, and remains visible beside the composer rather than silently
+claiming durability. Composer submission first persists an exact command-id/kind/body-digest
+handoff marker; an accepted/delivered canonical command or correlated receipt clears only the
+submitted bytes, a rejected/not-delivered/stale command returns them to the composer, and absent or
+indeterminate evidence blocks resubmission until another exact read or an explicit “Return to
+composer” decision. Every store mutation uses a generation compare-and-swap, so a stale GUI process
+cannot overwrite an existing newer process draft for the same durable client attachment. A retained
+bootstrap Start also blocks any newer Start: only its exact command ID and prompt bytes may cross
+until canonical evidence resolves it. Retry, abandon, explicit return-to-composer, polling
+resolution, and direct/automatic Start all share the same operation barrier as composer commands,
+so marker mutation is exclusive in both interleaving orders and quit waits for the owner. Quit
+freezes new admission, joins commands already crossing the Work Host boundary, settles their
+marker, then flushes and disconnects without synthesizing `End`. Process-owned engines retain only
+the in-memory behavior because their Work does not yet survive this GUI process.
+
+The current generation token deliberately scopes its cross-process guarantee to existing rows.
+Absent-row creation/deletion is not yet linearizable: a durable per-key tombstone/watermark would be
+needed to prevent an absent-row ABA across simultaneous GUI processes. Such an ABA can at worst
+resurrect GUI-owned draft text; it cannot mutate canonical Work or automatically resubmit a command.
+Likewise, the bounded 32-row store still needs an explicit enumerate/prune repair surface before
+orphaned drafts from permanently removed attachments can be reclaimed. Both are instrumented,
+bounded residuals rather than claims hidden behind “draft saved.”
+
+The bare Cockpit snapshot route builds and renders, but the available real catalog was empty during
+this checkpoint; populated, multi-Work, narrow-layout, and Action Lens visual certification still
+require deterministic snapshot fixtures or an interactive run. Focused verification covers action
+presentation (4 cases / 247 assertions), attention projection (10 / 441), controller bounds
+(1 / 16), evidence-link journal decoding (1 / 17), writer propagation/validation (2 / 28),
+transport page bounds (1 / 20), and service-backed draft storage/relaunch/tamper behavior
+(12 / 193), plus pure GUI command-pairing/barrier behavior (7 / 69 across the GUI-orchestration
+suite). Core, SelfTest, and GUI targets build. A subsequent uninterrupted broad run completed
+950 cases / 13,420 assertions in 378.69 seconds; the earlier apparent Phase 1 bridge “hang” was the
+suite's long quiet service phase, not a deadlock, so no speculative synchronization was added.
 
 Phase 3C closure checkpoint (2026-09-04): accepted and duplicate service commands no longer
 become UI truth on the strength of a transport receipt. The client retains the exact command
