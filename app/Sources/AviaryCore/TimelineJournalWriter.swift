@@ -33,6 +33,9 @@ public struct TimelineEventDraft: Codable, Hashable, Sendable {
     public let type: String
     public let declaredDomains: Set<TimelineDomain>
     public let links: [TimelineLink]
+    /// Exact upstream link-record omissions. Zero and out-of-bound counts are invalid rather than
+    /// aliases for absence, so journal producers cannot silently erase incomplete provenance.
+    public let omittedEvidenceLinkCount: Int?
     public let payload: JSONValue
 
     public init(
@@ -57,6 +60,7 @@ public struct TimelineEventDraft: Codable, Hashable, Sendable {
         type: String,
         declaredDomains: Set<TimelineDomain> = [],
         links: [TimelineLink] = [],
+        omittedEvidenceLinkCount: Int? = nil,
         payload: JSONValue = .object([:])
     ) {
         self.hostSequence = hostSequence
@@ -80,6 +84,7 @@ public struct TimelineEventDraft: Codable, Hashable, Sendable {
         self.type = type
         self.declaredDomains = declaredDomains
         self.links = links
+        self.omittedEvidenceLinkCount = omittedEvidenceLinkCount
         self.payload = payload
     }
 
@@ -538,8 +543,10 @@ public actor TimelineJournalWriter {
 
     /// Validate caller-controlled envelope fields without opening a file.
     public static func validate(_ draft: TimelineEventDraft, for journal: JournalRef) throws {
-        try validateEnvelope(type: draft.type, links: draft.links, session: draft.session,
-                             work: draft.work, workHost: draft.workHost, journal: journal)
+        try validateEnvelope(
+            type: draft.type, links: draft.links,
+            omittedEvidenceLinkCount: draft.omittedEvidenceLinkCount,
+            session: draft.session, work: draft.work, workHost: draft.workHost, journal: journal)
     }
 
     /// Read one stable native journal snapshot through a no-follow descriptor. Bytes are parsed
@@ -970,6 +977,7 @@ public actor TimelineJournalWriter {
             declaredDomains: draft.declaredDomains,
             provenance: .native,
             links: draft.links,
+            omittedEvidenceLinkCount: draft.omittedEvidenceLinkCount,
             payload: draft.payload)
 
         let bytes: Data
@@ -1607,11 +1615,12 @@ public actor TimelineJournalWriter {
         guard event.type.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
             throw WriterError.invalidJournal(reason: "event type is empty")
         }
-        guard event.links.count <= TimelineEvent.maxEvidenceLinks else {
-            throw WriterError.invalidJournal(reason: "event has too many evidence links")
+        guard event.evidenceLinkBoundsAreValid else {
+            throw WriterError.invalidJournal(reason: "event has invalid evidence-link bounds")
         }
         if let reason = envelopeValidationReason(
-            type: event.type, links: event.links, session: event.session,
+            type: event.type, links: event.links,
+            omittedEvidenceLinkCount: event.omittedEvidenceLinkCount, session: event.session,
             work: event.work, workHost: event.workHost, journal: journal) {
             throw WriterError.invalidJournal(reason: reason)
         }
@@ -1620,13 +1629,15 @@ public actor TimelineJournalWriter {
     private static func validateEnvelope(
         type: String,
         links: [TimelineLink],
+        omittedEvidenceLinkCount: Int?,
         session: SessionRef?,
         work: WorkRef?,
         workHost: WorkHostRef?,
         journal: JournalRef
     ) throws {
         if let reason = envelopeValidationReason(
-            type: type, links: links, session: session, work: work,
+            type: type, links: links, omittedEvidenceLinkCount: omittedEvidenceLinkCount,
+            session: session, work: work,
             workHost: workHost, journal: journal) {
             throw WriterError.invalidDraft(reason: reason)
         }
@@ -1635,6 +1646,7 @@ public actor TimelineJournalWriter {
     private static func envelopeValidationReason(
         type: String,
         links: [TimelineLink],
+        omittedEvidenceLinkCount: Int?,
         session: SessionRef?,
         work: WorkRef?,
         workHost: WorkHostRef?,
@@ -1643,8 +1655,9 @@ public actor TimelineJournalWriter {
         guard !type.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return "event type must not be empty"
         }
-        guard links.count <= TimelineEvent.maxEvidenceLinks else {
-            return "event has too many evidence links"
+        guard TimelineEvent.evidenceLinkBoundsAreValid(
+            links: links, omittedCount: omittedEvidenceLinkCount) else {
+            return "event has invalid evidence-link bounds"
         }
 
         if let work, let workHost, work.workHostID != workHost.workHostID {

@@ -1147,6 +1147,21 @@ func testWorkServiceAttachedControllerBoundsCanonicalActivitiesAndMessagesExplic
         "activity-turn", 4, runStarted.eventID, TimelineEventType.turnStarted,
         run: actionRun, turn: actionTurn)
     workEvents.append(turnStarted)
+    let activeAction = ActionRef("active-before-terminal-history")
+    let activeIntent = workEvent(
+        "activity-active-intent", 5, turnStarted.eventID, TimelineEventType.actionIntent,
+        run: actionRun, turn: actionTurn, action: activeAction,
+        payload: .object([
+            "state": .string("proposed"), "kind": .string(ActionKind.python.rawValue),
+            "intent": .string("remain visible while later actions finish")
+        ]))
+    workEvents.append(activeIntent)
+    workEvents.append(workEvent(
+        "activity-active-started", 6, activeIntent.eventID, TimelineEventType.actionStarted,
+        run: actionRun, turn: actionTurn, action: activeAction,
+        payload: .object([
+            "state": .string("running"), "kind": .string(ActionKind.python.rawValue)
+        ])))
     for index in 0..<260 {
         // The final event intentionally has the lexically earliest ID. The GUI projection must
         // follow canonical intent sequence, not sort by action identity.
@@ -1218,22 +1233,24 @@ func testWorkServiceAttachedControllerBoundsCanonicalActivitiesAndMessagesExplic
     let projection = try await controller.refresh()
 
     // The source is complete and the reducer is healthy, but the GUI-facing view is deliberately
-    // bounded. Newest records are retained in canonical journal order and every omitted category
-    // is explicit; no message or action text is rewritten to fit the display budget.
+    // bounded. Unsettled records outrank resolved history, then terminal records are newest-first;
+    // every omitted category is explicit and no action text is rewritten to fit the display budget.
     XCTAssertFalse(projection.projectionComplete)
     XCTAssertTrue(projection.isCanonical)
     XCTAssertFalse(projection.needsRecovery)
     XCTAssertEqual(projection.activities.count, 256)
-    XCTAssertEqual(projection.activities.first?.action.actionID, "a-action-004")
-    XCTAssertEqual(projection.activities.last?.action.actionID, "a-action-000")
-    XCTAssertEqual(projection.activities.first?.intentEvent?.sequence, 17)
-    XCTAssertTrue(projection.activities.last?.metadataWasTruncated == true)
+    XCTAssertEqual(projection.activities.first?.action.actionID, "active-before-terminal-history")
+    XCTAssertEqual(projection.activities.last?.action.actionID, "a-action-005")
+    XCTAssertEqual(projection.activities.first?.intentEvent?.sequence, 5)
+    XCTAssertTrue(projection.activities.contains {
+        $0.action.actionID == "a-action-000" && $0.metadataWasTruncated
+    })
     XCTAssertEqual(projection.visibleMessages.count, 512)
     XCTAssertEqual(projection.visibleMessages.first?.text, "message-1")
     XCTAssertEqual(projection.visibleMessages.last?.text, "message-512")
     XCTAssertEqual(projection.projectionOmissions.map(\.category),
                    ["activities", "activity_metadata", "messages"])
-    XCTAssertEqual(projection.projectionOmissions[0].count, 4)
+    XCTAssertEqual(projection.projectionOmissions[0].count, 5)
     XCTAssertEqual(projection.projectionOmissions[1].count, 1)
     XCTAssertEqual(projection.projectionOmissions[2].count, 1)
     XCTAssertTrue(projection.projectionOmissions[2].diagnostic?.contains("UTF-8 bytes") == true)

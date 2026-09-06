@@ -14,6 +14,55 @@ enum CanonicalNotificationPlatform {
     }
 }
 
+/// One in-memory, bounded transcript page for Cockpit. The catalog may retain more canonical
+/// messages for other readers; the main actor never remaps that lifetime-sized history per frame.
+struct CanonicalWorkspaceTranscriptPage: Equatable {
+    static let maximumMessageCount = 512
+    static let maximumUTF8Bytes = 256 * 1024
+
+    let items: [TranscriptItem]
+    let omittedMessageCount: Int
+    let retainedUTF8Bytes: Int
+    let sourceCursor: JournalCursor?
+
+    init(summary: CanonicalSessionCatalogSummary) {
+        var reverseRetained: [SessionMessageSnapshot] = []
+        var retainedBytes = 0
+        for message in summary.visibleMessages.reversed() {
+            let bytes = message.text.utf8.count
+            guard reverseRetained.count < Self.maximumMessageCount,
+                  bytes <= Self.maximumUTF8Bytes - retainedBytes else { break }
+            reverseRetained.append(message)
+            retainedBytes += bytes
+        }
+        let retained = reverseRetained.reversed()
+        self.retainedUTF8Bytes = retainedBytes
+        self.omittedMessageCount = summary.visibleMessages.count - retained.count
+        self.sourceCursor = summary.sessionSnapshotCursor
+        self.items = retained.map { message in
+            let role = message.role.lowercased()
+            let kind: TranscriptItem.Kind = switch role {
+            case "user": .user
+            case "assistant", "model": .assistant
+            // A canonical text snapshot is not a paired ToolCall/result; `.tool` would hide its
+            // text and falsely display TranscriptView's running-tool treatment.
+            case "tool", "action": .custom
+            case "system": .stateChange
+            default: .custom
+            }
+            var item = TranscriptItem(
+                id: "canonical:\(summary.journal.stableKey):\(message.eventID)",
+                kind: kind,
+                timestamp: message.hostRecordedAt ?? .distantPast)
+            item.text = message.text
+            if !message.text.isEmpty { item.blocks = [.text(message.text)] }
+            item.model = summary.sessionModelID
+            item.customType = message.role
+            return item
+        }
+    }
+}
+
 /// Top-level navigation destinations.
 enum Section: String, CaseIterable, Identifiable, Hashable {
     case cockpit, live, sessions, workshop, flock, models, usage, library, health
@@ -118,6 +167,12 @@ final class AppModel {
     /// these values rather than repeatedly joining every Work to every Session during rendering.
     var canonicalFlockInventory: [CanonicalFlockCatalogProjection] = []
     var canonicalAttentionInbox = CanonicalAttentionInboxProjection(summaries: [])
+    /// The Cockpit rail is a canonical Session workspace projection, not a list of whatever
+    /// `LiveRun` objects this GUI happens to retain. It remains bounded and authority-qualified;
+    /// GUI attachment/control capability is joined only at the user-action boundary.
+    var canonicalWorkspaceRail = CanonicalSessionWorkspaceRailProjection(
+        inbox: CanonicalAttentionInboxProjection(summaries: []), summaries: [])
+    var canonicalWorkspaceTranscripts: [String: CanonicalWorkspaceTranscriptPage] = [:]
     /// Native notification candidates are built from the same exact canonical summaries as the
     /// attention inbox, but keep an independent bound so a display page cannot hide a transition.
     var canonicalNotificationProjection = CanonicalNotificationProjection(summaries: [])
@@ -251,6 +306,10 @@ final class AppModel {
     /// disk before transport, so this flag is only presentation/admission backpressure rather
     /// than the durability boundary.
     private var serviceSessionCreationsInFlight: Set<WorkRef> = []
+    /// Presentation-only admission guard for an explicit Attach/Inspect gesture. Durable retry
+    /// identity still lives in `pendingServiceAttaches`; this set only prevents duplicate clicks
+    /// while one exact target is being reconciled.
+    private var serviceAttachesInFlight: Set<WorkSessionKey> = []
     private enum CreateSessionReconciliationOutcome: Equatable {
         case clear
         case recovered
@@ -717,7 +776,8 @@ final class AppModel {
         attachment: WorkServiceClientAttachment,
         session: WorkServiceClientSession,
         client: ClientRef,
-        focus: Bool
+        focus: Bool,
+        destination: Section = .live
     ) async -> String? {
         guard attachment.session != nil,
               attachment.sessionJournal != nil,
@@ -750,10 +810,10 @@ final class AppModel {
         if let existing = workRuns.first(where: { $0.serviceAttachmentKey == key }) {
             if focus {
                 if detachedRuns.contains(where: { $0.id == existing.id }) {
-                    reattachRun(existing)
+                    reattachRun(existing, destination: destination)
                 } else {
                     focusedRunID = existing.id
-                    section = .live
+                    section = destination
                 }
             }
             return nil
@@ -806,7 +866,7 @@ final class AppModel {
             runs.append(run)
             if focus {
                 focusedRunID = run.id
-                section = .live
+                section = destination
             }
             run.observeService()
             // A Create may have been durably accepted just before the previous GUI disappeared.
@@ -1284,24 +1344,41 @@ final class AppModel {
         descriptor.attachmentQualifiedSessionTargets
     }
 
+    func serviceAttachIsInFlight(_ target: WorkSessionKey) -> Bool {
+        serviceAttachesInFlight.contains(target)
+    }
+
     func attachServiceWork(
         _ descriptor: WorkServiceWorkDescriptor,
-        targetSessionAttachment: SessionAttachmentRef
+        targetSessionAttachment: SessionAttachmentRef,
+        destination: Section = .live
     ) {
         guard let client = localWorkServiceClient, localWorkService != nil else {
             localWorkServiceError = "The local Work Host is not connected."
             return
         }
+        guard let target = descriptor.exactAttachmentQualifiedSessionTarget(
+            targetSessionAttachment) else {
+            localWorkServiceError =
+                "This Work does not expose one exact Session relationship for Attach."
+            return
+        }
+        guard serviceAttachesInFlight.insert(target).inserted else { return }
+        localWorkServiceError = nil
         Task { @MainActor [weak self] in
-            await self?.attachServiceWorkNow(
-                descriptor, targetSessionAttachment: targetSessionAttachment, client: client)
+            guard let self else { return }
+            defer { self.serviceAttachesInFlight.remove(target) }
+            await self.attachServiceWorkNow(
+                descriptor, targetSessionAttachment: targetSessionAttachment, client: client,
+                destination: destination)
         }
     }
 
     private func attachServiceWorkNow(
         _ requested: WorkServiceWorkDescriptor,
         targetSessionAttachment: SessionAttachmentRef,
-        client: ClientRef
+        client: ClientRef,
+        destination: Section
     ) async {
         guard localWorkService != nil else { return }
         do {
@@ -1348,7 +1425,8 @@ final class AppModel {
             if let existing = inspectDecision.existingAttachment {
                 await adoptServiceAttachment(
                     descriptor: descriptor, attachment: existing,
-                    session: session, client: client, focus: inspectDecision.shouldFocus)
+                    session: session, client: client, focus: inspectDecision.shouldFocus,
+                    destination: destination)
                 return
             }
             let requestedCapabilities: Set<WorkServiceCapability> = [
@@ -1425,7 +1503,8 @@ final class AppModel {
             pendingServiceAttaches.removeValue(forKey: targetKey)
             await adoptServiceAttachment(
                 descriptor: response.work, attachment: attachment,
-                session: session, client: client, focus: inspectDecision.shouldFocus)
+                session: session, client: client, focus: inspectDecision.shouldFocus,
+                destination: destination)
             if let index = localServiceCatalogWorks.firstIndex(where: { $0.work == descriptor.work }) {
                 // Keep the Work row: its other Session relationships remain independently
                 // attachable/inspectable after this client attaches one exact target.
@@ -1765,6 +1844,30 @@ final class AppModel {
         canonicalFlockInventory = CanonicalFlockCatalogProjection.project(
             sessions: nativeSummaries, works: result.workInventory)
         canonicalAttentionInbox = CanonicalAttentionInboxProjection(summaries: nativeSummaries)
+        canonicalWorkspaceRail = canonicalAttentionInbox.workspaceRail(
+            summaries: nativeSummaries,
+            sourceComplete: result.canonicalNotificationSourceComplete)
+        let priorTranscriptPages = canonicalWorkspaceTranscripts
+        var transcriptPages: [String: CanonicalWorkspaceTranscriptPage] = [:]
+        var duplicateTranscriptIDs: Set<String> = []
+        for summary in nativeSummaries {
+            let key = CanonicalAttentionIdentity.sessionRow(journal: summary.journal)
+            if transcriptPages[key] == nil, !duplicateTranscriptIDs.contains(key) {
+                // An exact append-only cursor identifies the same visible Session projection.
+                // Reuse its already-mapped page on unchanged polls; a new cursor rebuilds once.
+                if let cursor = summary.sessionSnapshotCursor,
+                   let prior = priorTranscriptPages[key],
+                   prior.sourceCursor == cursor {
+                    transcriptPages[key] = prior
+                } else {
+                    transcriptPages[key] = CanonicalWorkspaceTranscriptPage(summary: summary)
+                }
+            } else {
+                transcriptPages.removeValue(forKey: key)
+                duplicateTranscriptIDs.insert(key)
+            }
+        }
+        canonicalWorkspaceTranscripts = transcriptPages
         let notifications = CanonicalNotificationProjection(
             summaries: nativeSummaries,
             sourceComplete: result.canonicalNotificationSourceComplete)
@@ -3017,12 +3120,12 @@ final class AppModel {
         show("Detached the view; the run is still \(run.isStreaming ? "working" : "available").")
     }
 
-    func reattachRun(_ run: LiveRun) {
+    func reattachRun(_ run: LiveRun, destination: Section = .live) {
         guard detachedRuns.contains(where: { $0.id == run.id }) else { return }
         detachedRuns.removeAll { $0.id == run.id }
         if !runs.contains(where: { $0.id == run.id }) { runs.append(run) }
         focusedRunID = run.id
-        section = .live
+        section = destination
     }
 
     /// A sensible default working directory: the most recent session's, else home.
@@ -3120,6 +3223,11 @@ final class LiveRun: Identifiable {
     var usage = Usage()
     var queuedSteering: [String] = []
     var queuedFollowUps: [String] = []
+    /// Unsent composer text belongs to the GUI's durable Work attachment, not to one ephemeral
+    /// SwiftUI view instance. Keeping it here preserves the draft while navigating between
+    /// Cockpit, Live, and Sessions or while detaching and reattaching this view. A later
+    /// private draft store will extend the same identity across GUI process relaunch.
+    var draft = ""
     var sessionID: String?
     var sessionFile: String?
     /// True only after the first admitted prompt crossed the driver's durable delivery seam.
@@ -3192,6 +3300,34 @@ final class LiveRun: Identifiable {
     private(set) var serviceAttachmentKey: ServiceAttachmentKey?
     var serviceProjection: WorkServiceAttachedWorkProjection? { serviceBridge?.projection }
     var serviceActivities: [WorkActionSnapshot] { serviceBridge?.activities ?? [] }
+    /// Mirrored from the non-observable service bridge so an open action sheet tracks canonical
+    /// lifecycle changes instead of freezing the value that happened to be selected.
+    private(set) var serviceActionPresentations: [WorkActionPresentation] = []
+    /// Exact entity counts omitted from the bounded GUI projection. This is mirrored into the
+    /// observable run because both Cockpit and Live must disclose omissions without an inspector.
+    private(set) var serviceProjectionOmissions: [WorkServiceOmission] = []
+    var currentServiceActions: [WorkActionPresentation] {
+        serviceActionPresentations.filter { !$0.state.isTerminal }
+    }
+    var serviceProjectionOmissionSummary: String? {
+        guard !serviceProjectionOmissions.isEmpty else { return nil }
+        let parts = serviceProjectionOmissions.map { omission -> String in
+            if omission.category == "activity_metadata" {
+                let verb = omission.count == 1 ? "has" : "have"
+                return "\(omission.count) action\(omission.count == 1 ? "" : "s") \(verb) truncated metadata"
+            }
+            let label: String = switch omission.category {
+            case "messages": "message"
+            case "active_activities": "current action"
+            case "activities": "resolved action"
+            default: omission.category.replacingOccurrences(of: "_", with: " ") + " item"
+            }
+            return "\(omission.count) \(label)\(omission.count == 1 ? "" : "s") omitted from this bounded view"
+        }
+        return parts.joined(separator: "; ")
+            + ". Full canonical records remain addressable "
+            + "through the Work Host."
+    }
     var serviceExecutionLabel: String? { serviceBridge?.executionLabel }
     var serviceWorkspaceLabel: String? { serviceBridge?.workspaceLabel }
     var hasCanonicalStartTime: Bool {
@@ -3261,6 +3397,8 @@ final class LiveRun: Identifiable {
             thinkingLevel: bridge.thinkingLevel)
         self.serviceBridge = bridge
         self.serviceAttachmentKey = bridge.serviceAttachmentKey
+        self.serviceActionPresentations = bridge.actionPresentations
+        self.serviceProjectionOmissions = bridge.projection.projectionOmissions
         self.modelLabel = bridge.modelLabel
         self.thinkingLevel = bridge.thinkingLevel
         self.sessionID = bridge.sessionID
@@ -3434,6 +3572,8 @@ final class LiveRun: Identifiable {
         publish(serviceBridge.errorBanner, to: \.errorBanner)
         publish(serviceBridge.modelLabel, to: \.modelLabel)
         publish(serviceBridge.thinkingLevel, to: \.thinkingLevel)
+        publish(serviceBridge.actionPresentations, to: \.serviceActionPresentations)
+        publish(serviceBridge.projection.projectionOmissions, to: \.serviceProjectionOmissions)
         // This is canonical Session evidence (input.accepted/message history), not a Start
         // receipt. It remains true even when the visible transcript has bounded omissions.
         publish(serviceBridge.hasCanonicalInputDelivery, to: \.initialPromptDelivered)

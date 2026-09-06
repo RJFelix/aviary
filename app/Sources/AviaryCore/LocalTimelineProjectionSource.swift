@@ -555,7 +555,8 @@ public struct LocalTimelineProjectionSourceLease: Sendable {
               event.sequence == row.sequence,
               event.eventID == row.eventID,
               event.previousEventID == row.previousEventID,
-              !event.eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+              !event.eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              event.evidenceLinkBoundsAreValid else {
             throw Error.invalidTerminal
         }
         guard let lineDigest = try? DisposableTimelineProjectionStore.canonicalEventLineDigest(event),

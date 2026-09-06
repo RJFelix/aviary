@@ -1,6 +1,6 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; exact Work/Session continuation, production service/control-reader cutover, Session-qualified Run routing, and GUI new-Session-to-existing-Work composition have completed integrated macOS/Linux/cross-device verification
+Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; exact Work/Session continuation, production service/control-reader cutover, Session-qualified Run routing, and GUI new-Session-to-existing-Work composition have completed integrated macOS/Linux/cross-device verification; the first Phase 2 canonical workspace and Phase 4A Action Lens slices are implemented
 Date: 2026-09-05
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
@@ -73,6 +73,38 @@ service restart preserves Work identity, changes only the explicit Run owner tup
 fresh model context for the newly selected Session unless an exact same-Session cold-resume proof
 exists. End acknowledgement and actor teardown remain deliberately distinct observable boundaries;
 replacement does not race an accepted receipt as though it proved teardown was complete.
+
+Phase 2/4A visible-experience checkpoint (2026-09-05): Cockpit now projects the bounded canonical
+attention inventory instead of treating this GUI's live objects as the workspace. NEEDS YOU, local
+attachments, working, ready-for-review, and other rows remain authority-qualified by Work Host,
+Work, Session journal, and exact attachment. A selected row opens the conversation and composer in
+place; multi-Work Sessions keep an explicit relationship selector; Attach/Inspect remains a
+distinct capability-checked operation. Transcript pages are prepared once per canonical cursor
+under count and byte bounds, missing canonical time renders as unknown, row-local corruption does
+not erase unrelated healthy Work, and every bounded omission is stated in the primary experience.
+
+The same conversation surface now has a canonical Now/Why/Next Action Lens. All typed action kinds
+share one privacy-safe presentation with host timing, state, bounded intent/target/scope, failure
+kind, retry safety, provenance, source event, and typed evidence links. Unsettled actions outrank
+resolved history at the projection cap; concurrent current actions remain selectable; an open
+sheet resolves the latest canonical state instead of freezing a stale copy. The boundary text says
+plainly that Python is a trusted full-capability runtime whose direct file/process/socket/network
+effects may be unobserved and are not contained by hooks. Evidence omission counts are bounded at
+in-process constructors and validated at native draft/writer, decode, journal, local projection,
+Work Host control, and transport crossings; saturated counts render as lower bounds rather than
+false exact values.
+
+Unsent text now belongs to the attached in-memory `LiveRun`, so navigation and detach/reattach no
+longer destroy a draft. Durable private draft storage across GUI process relaunch remains an open
+Phase 2 item. The bare Cockpit snapshot route builds and renders, but the available real catalog was
+empty during this checkpoint; populated, multi-Work, narrow-layout, and Action Lens visual
+certification still require deterministic snapshot fixtures or an interactive run. Focused
+verification covers action presentation (4 cases / 247 assertions), attention projection (10 / 441),
+controller bounds (1 / 16), evidence-link journal decoding (1 / 17), writer propagation/validation
+(2 / 28), and transport page bounds (1 / 20); Core, SelfTest, and GUI targets build. One broad suite
+attempt was stopped after an order-dependent wait immediately after the Phase 1 bridge cases; the
+individual following bridge cases and the context-manifest group pass in isolation, so the broad
+run is not claimed as a completed receipt.
 
 Phase 3C closure checkpoint (2026-09-04): accepted and duplicate service commands no longer
 become UI truth on the strength of a transport receipt. The client retains the exact command

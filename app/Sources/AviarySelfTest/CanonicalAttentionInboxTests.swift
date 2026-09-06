@@ -180,6 +180,118 @@ func test_canonicalAttentionInboxUsesQualifiedSessionIdentity() throws {
     XCTAssertTrue(row.attachments[0].id.contains("attention-attachment"))
     XCTAssertEqual(row.sessionUnknownDomains, [])
     XCTAssertEqual(row.attachments[0].unknownDomains, [])
+
+    // Keep the rail checks on the already-registered canonical-attention case. The rail is a
+    // pure Core projection, so it does not need another package or main.swift registration.
+    try testCanonicalSessionWorkspaceRailOrdersByStateThenIdentity()
+    try testCanonicalSessionWorkspaceRailPreservesJoinFailures()
+    try testCanonicalSessionWorkspaceRailKeepsAuthoritiesDistinct()
+    try testCanonicalSessionWorkspaceRailBoundsEvidenceAndRows()
+}
+
+private func testCanonicalSessionWorkspaceRailOrdersByStateThenIdentity() throws {
+    let failed = try attentionSessionOnlySummary(
+        authorityID: "rail-failed", attention: .error, attentionEventID: "failed")
+    let needsInput = try attentionSessionOnlySummary(
+        authorityID: "rail-input", attention: .input, attentionEventID: "input")
+    let completed = try attentionSessionOnlySummary(
+        authorityID: "rail-completed", attention: .none, attentionEventID: "completed",
+        lifecycle: .completed)
+    let archived = try attentionSessionOnlySummary(
+        authorityID: "rail-archived", attention: .none, attentionEventID: "archived",
+        lifecycle: .archived)
+    let idle = try attentionSessionOnlySummary(
+        authorityID: "rail-idle", attention: .none, attentionEventID: "idle")
+    let working = try attentionSummary(
+        attention: .none,
+        workRead: attentionRead(journal: attentionWorkJournal, eventID: "w1", sequence: 1))
+    let summaries = [completed, working, idle, failed, archived, needsInput]
+    let inbox = CanonicalAttentionInboxProjection(summaries: summaries, maxRows: 16)
+    let rail = inbox.workspaceRail(summaries: summaries, maxEntries: 16)
+
+    XCTAssertEqual(rail.entries.map(\.state), [
+        .failed, .needsInput, .working, .idle, .completed, .archived
+    ])
+    XCTAssertEqual(rail.entries.map(\.priority), [0, 2, 4, 5, 6, 7])
+    XCTAssertEqual(rail.entries.map(\.id), rail.entries.sorted { lhs, rhs in
+        lhs.priority == rhs.priority ? lhs.id < rhs.id : lhs.priority < rhs.priority
+    }.map(\.id))
+    XCTAssertTrue(rail.entries.allSatisfy { $0.isKnown && $0.join == .exact })
+}
+
+private func testCanonicalSessionWorkspaceRailPreservesJoinFailures() throws {
+    let summary = try attentionSessionOnlySummary(
+        authorityID: "rail-join", attention: .review, attentionEventID: "join")
+    let inbox = CanonicalAttentionInboxProjection(summaries: [summary])
+
+    let missing = inbox.workspaceRail(summaries: [])
+    let missingEntry = try XCTUnwrap(missing.entries.first)
+    XCTAssertEqual(missingEntry.join, .missingSummary)
+    XCTAssertEqual(missingEntry.state, .unknown)
+    XCTAssertFalse(missingEntry.isKnown)
+    XCTAssertEqual(missingEntry.title, "Session unavailable")
+
+    let duplicate = inbox.workspaceRail(summaries: [summary, summary])
+    let duplicateEntry = try XCTUnwrap(duplicate.entries.first)
+    XCTAssertEqual(duplicateEntry.join, .duplicateSummary)
+    XCTAssertEqual(duplicateEntry.state, .unknown)
+    XCTAssertFalse(duplicateEntry.isKnown)
+
+    let incomplete = inbox.workspaceRail(summaries: [summary], sourceComplete: false)
+    let incompleteEntry = try XCTUnwrap(incomplete.entries.first)
+    XCTAssertEqual(incompleteEntry.join, .incomplete)
+    XCTAssertEqual(incompleteEntry.state, .unknown)
+    XCTAssertFalse(incomplete.isComplete)
+
+    let unknownCanonical = try attentionSummary(
+        sessionUnknownDomains: [.session],
+        workRead: attentionRead(journal: attentionWorkJournal, eventID: "w1", sequence: 1))
+    let unknownRail = CanonicalAttentionInboxProjection(summaries: [unknownCanonical])
+        .workspaceRail(summaries: [unknownCanonical])
+    XCTAssertEqual(unknownRail.entries.first?.state, .unknown)
+}
+
+private func testCanonicalSessionWorkspaceRailKeepsAuthoritiesDistinct() throws {
+    let first = try attentionSessionOnlySummary(
+        authorityID: "rail-authority-a", attention: .review, attentionEventID: "a",
+        modelID: "model-a")
+    let second = try attentionSessionOnlySummary(
+        authorityID: "rail-authority-b", attention: .review, attentionEventID: "b")
+    let inbox = CanonicalAttentionInboxProjection(summaries: [second, first], maxRows: 8)
+    let rail = inbox.workspaceRail(summaries: [second, first], maxEntries: 8)
+
+    XCTAssertEqual(rail.entries.count, 2)
+    XCTAssertNotEqual(rail.entries[0].id, rail.entries[1].id)
+    XCTAssertEqual(Set(rail.entries.map(\.authorityID)), ["rail-authority-a", "rail-authority-b"])
+    XCTAssertEqual(Set(rail.entries.map(\.session)), [attentionSession])
+    XCTAssertEqual(rail.entries.map(\.id), rail.entries.map(\.id).sorted())
+    XCTAssertEqual(rail.entries.first(where: { $0.authorityID == "rail-authority-a" })?.model, "model-a")
+}
+
+private func testCanonicalSessionWorkspaceRailBoundsEvidenceAndRows() throws {
+    let manyAttachments = try attentionSummary(
+        attachmentIDs: (0..<140).map { "rail-attachment-\($0)" },
+        workRead: attentionRead(journal: attentionWorkJournal, eventID: "w1", sequence: 1))
+    let evidenceInbox = CanonicalAttentionInboxProjection(
+        summaries: [manyAttachments], maxRows: 8, maxAttachments: 128)
+    let evidenceRail = evidenceInbox.workspaceRail(
+        summaries: [manyAttachments], maxEntries: 8, maxWorkEvidence: 2)
+    let evidenceEntry = try XCTUnwrap(evidenceRail.entries.first)
+    XCTAssertEqual(evidenceEntry.workEvidence.count, 2)
+    XCTAssertEqual(evidenceEntry.omittedWorkEvidenceCount, 138)
+    XCTAssertTrue(evidenceEntry.workEvidence.allSatisfy { $0.id.utf8.count <= 512 })
+
+    let summaries = try (0..<140).map {
+        try attentionSessionOnlySummary(
+            authorityID: "rail-bound-\($0)", attention: .none, attentionEventID: "e-\($0)")
+    }
+    let boundedInbox = CanonicalAttentionInboxProjection(summaries: summaries)
+    let boundedRail = boundedInbox.workspaceRail(summaries: summaries, maxEntries: 2)
+    XCTAssertEqual(boundedRail.entries.count, 2)
+    XCTAssertEqual(boundedRail.omittedEntryCount, 138)
+    XCTAssertFalse(boundedRail.isComplete)
+    XCTAssertTrue(boundedRail.entries.allSatisfy(\.isKnown))
+    XCTAssertEqual(boundedRail.entries.map(\.id), boundedRail.entries.map(\.id).sorted())
 }
 
 func test_canonicalAttentionInboxReportsNoAttentionSeparatelyFromUnknown() throws {
@@ -299,15 +411,17 @@ func test_canonicalAttentionInboxQualifiesRowsByAttachmentIdentity() throws {
 
 private func attentionSessionOnlySummary(
     authorityID: String, attention: SessionAttention = .input,
-    attentionEventID: String? = nil
+    attentionEventID: String? = nil, lifecycle: SessionLifecycle = .active,
+    modelID: String? = nil
 ) throws -> CanonicalSessionCatalogSummary {
     let journal = JournalRef.session(
         attentionSession, journalID: "session-journal", authority: TimelineAuthorityRef(authorityID))
     var session = SessionSnapshot()
     session.session = attentionSession
     session.journal = journal
-    session.lifecycle = .active
+    session.lifecycle = lifecycle
     session.attention = attention
+    session.modelID = modelID
     let sourceID = attentionEventID ?? "s1"
     session.lastEventID = sourceID
     session.lastSequence = 1
@@ -335,6 +449,22 @@ func test_canonicalAttentionInboxBoundsAcrossSessionsAndKeepsAuthoritiesDistinct
     XCTAssertEqual(bounded.rows.count, 1)
     XCTAssertEqual(bounded.omittedRowCount, 1)
     XCTAssertTrue(bounded.isTruncated)
+
+    let ordinary = try (0..<CanonicalAttentionInboxProjection.maximumRowCount).map { index in
+        try attentionSessionOnlySummary(
+            authorityID: "ordinary-\(String(format: "%03d", index))",
+            attention: .none,
+            attentionEventID: "ordinary-event-\(index)",
+            lifecycle: .completed)
+    }
+    let urgent = try attentionSessionOnlySummary(
+        authorityID: "zzzz-urgent", attention: .input,
+        attentionEventID: "urgent-input")
+    let prioritized = CanonicalAttentionInboxProjection(summaries: ordinary + [urgent])
+    XCTAssertEqual(prioritized.rows.count, CanonicalAttentionInboxProjection.maximumRowCount)
+    XCTAssertEqual(prioritized.omittedRowCount, 1)
+    XCTAssertTrue(prioritized.rows.contains { $0.sessionJournal == urgent.journal })
+    XCTAssertEqual(prioritized.rows.first?.effectiveAttention, .input)
 }
 
 func test_canonicalAttentionInboxIsBoundedDeterministicAndAuthorityQualified() throws {

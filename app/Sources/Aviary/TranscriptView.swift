@@ -161,6 +161,12 @@ struct TranscriptRow: View {
 
     @State private var showRaw = false
 
+    /// Canonical projections use `.distantPast` only as an explicit missing-time sentinel. Never
+    /// format it as though the host recorded a real wall-clock value.
+    private var timestampLabel: String {
+        item.timestamp == .distantPast ? "time unknown" : Fmt.clock(item.timestamp)
+    }
+
     var body: some View {
         switch item.kind {
         case .user: userRow
@@ -190,7 +196,7 @@ struct TranscriptRow: View {
             Text(label)
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundStyle(tint)
-            Text(Fmt.clock(item.timestamp))
+            Text(timestampLabel)
                 .font(Design.mono(9.5))
                 .foregroundStyle(.tertiary)
             Spacer(minLength: 6)
@@ -510,7 +516,7 @@ struct TranscriptRow: View {
                         .font(.system(size: 10))
                 }
                 Spacer()
-                Text(Fmt.clock(item.timestamp)).font(Design.mono(9.5))
+                Text(timestampLabel).font(Design.mono(9.5))
             }
             .foregroundStyle(Design.warning)
 
@@ -540,7 +546,7 @@ struct TranscriptRow: View {
                 .font(.system(size: 10.5))
                 .textSelection(.enabled)
             Spacer(minLength: 4)
-            Text(Fmt.clock(item.timestamp)).font(Design.mono(9))
+            Text(timestampLabel).font(Design.mono(9))
         }
         .foregroundStyle(.tertiary)
         .padding(.leading, 12)

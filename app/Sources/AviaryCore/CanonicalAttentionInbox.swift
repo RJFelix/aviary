@@ -294,19 +294,296 @@ public struct CanonicalAttentionInboxProjection: Codable, Hashable, Sendable {
         maxAttachments: Int = CanonicalAttentionInboxProjection.maximumAttachmentCount
     ) {
         let grouped = Dictionary(grouping: summaries, by: \.journal)
-        let sorted = grouped.values.sorted {
-            CanonicalAttentionIdentity.journal($0[0].journal)
-                < CanonicalAttentionIdentity.journal($1[0].journal)
+        // Build the truthful row before applying the global bound. Otherwise a lexically late
+        // failure or request for input can disappear behind 128 earlier idle Sessions.
+        let projected = grouped.values.map { summaries in
+            if summaries.count == 1 {
+                return CanonicalAttentionInboxRow(
+                    summary: summaries[0], maxAttachments: maxAttachments)
+            }
+            return CanonicalAttentionInboxRow(conflictingSummaries: summaries)
+        }
+        let sorted = projected.sorted {
+            let lhsPriority = Self.priority($0)
+            let rhsPriority = Self.priority($1)
+            if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+            return $0.id < $1.id
         }
         let boundedCount = min(max(0, maxRows), Self.maximumRowCount)
         let kept = Array(sorted.prefix(boundedCount))
         self.omittedRowCount = sorted.count - kept.count
-        self.rows = kept.map {
-            if $0.count == 1 {
-                return CanonicalAttentionInboxRow(
-                    summary: $0[0], maxAttachments: maxAttachments)
-            }
-            return CanonicalAttentionInboxRow(conflictingSummaries: $0)
+        self.rows = kept
+    }
+
+    private static func priority(_ row: CanonicalAttentionInboxRow) -> Int {
+        switch row.effectiveAttention {
+        case .some(.error): return 0
+        case .some(.confirmation): return 1
+        case .some(.input): return 2
+        case .some(.review): return 3
+        case .some(.none): return 4
+        case nil: return 5
         }
+    }
+}
+
+/// The state a Session occupies in the canonical workspace rail.
+///
+/// The ordering is presentation priority, not recency. In particular, no timestamp from one
+/// journal is compared with a timestamp from another journal. `unknown` is deliberately a real
+/// state: an unavailable or conflicting row remains selectable for diagnosis without becoming a
+/// falsely idle Session.
+public enum CanonicalSessionWorkspaceRailState: String, Codable, Hashable, Sendable {
+    case needsInput = "needs_input"
+    case needsConfirmation = "needs_confirmation"
+    case failed
+    case working
+    case readyForReview = "ready_for_review"
+    case idle
+    case completed
+    case archived
+    case unknown
+
+    /// Lower values are shown first. Attention is more actionable than ordinary work; unknown
+    /// state is last because it cannot safely be treated as either active or settled.
+    public var priority: Int {
+        switch self {
+        case .failed: return 0
+        case .needsConfirmation: return 1
+        case .needsInput: return 2
+        case .readyForReview: return 3
+        case .working: return 4
+        case .idle: return 5
+        case .completed: return 6
+        case .archived: return 7
+        case .unknown: return 8
+        }
+    }
+}
+
+/// Why a rail entry is or is not backed by exactly one catalog summary.
+public enum CanonicalSessionWorkspaceRailJoin: String, Codable, Hashable, Sendable {
+    case exact
+    case missingSummary = "missing_summary"
+    case duplicateSummary = "duplicate_summary"
+    case incomplete
+}
+
+/// One bounded, authority-qualified entry in the Session workspace rail.
+public struct CanonicalSessionWorkspaceRailEntry: Codable, Hashable, Sendable, Identifiable {
+    public let id: String
+    public let session: SessionRef
+    public let sessionJournal: JournalRef
+    public let authorityID: String
+    public let title: String
+    public let modelID: String?
+    public let state: CanonicalSessionWorkspaceRailState
+    public let priority: Int
+    public let workEvidence: [CanonicalAttentionAttachmentEvidence]
+    public let omittedWorkEvidenceCount: Int
+    public let join: CanonicalSessionWorkspaceRailJoin
+    public let isKnown: Bool
+
+    /// Short name for consumers that render a model column; this is the Session-selected model,
+    /// never a model inferred from an attached Work or from a GUI capability.
+    public var model: String? { modelID }
+
+    fileprivate init(
+        row: CanonicalAttentionInboxRow,
+        summary: CanonicalSessionCatalogSummary?,
+        join: CanonicalSessionWorkspaceRailJoin,
+        workEvidence: [CanonicalAttentionAttachmentEvidence],
+        omittedWorkEvidenceCount: Int,
+        state: CanonicalSessionWorkspaceRailState,
+        isKnown: Bool
+    ) {
+        self.id = CanonicalAttentionIdentity.sessionRow(journal: row.sessionJournal)
+        self.session = row.session
+        self.sessionJournal = row.sessionJournal
+        self.authorityID = row.sessionJournal.authority.authorityID
+        let summaryTitle = summary?.title ?? ""
+        self.title = isKnown
+            ? (summaryTitle.isEmpty ? "Untitled session" : summaryTitle)
+            : "Session unavailable"
+        self.modelID = isKnown ? summary?.sessionModelID : nil
+        self.state = state
+        self.priority = state.priority
+        self.workEvidence = workEvidence
+        self.omittedWorkEvidenceCount = max(0, omittedWorkEvidenceCount)
+        self.join = join
+        self.isKnown = isKnown
+    }
+}
+
+/// A deterministic, bounded Session-workspace rail assembled from the attention projection and
+/// the canonical Session catalog.
+///
+/// The inbox is the set of rows to display; the catalog is the authority for title, model,
+/// lifecycle, and exact Work evidence. A row is known only when exactly one summary has the same
+/// JournalRef and the row's identity agrees with it. This intentionally does not merge summaries
+/// by bare SessionRef: two authorities may legitimately host the same Session ID.
+public struct CanonicalSessionWorkspaceRailProjection: Codable, Hashable, Sendable {
+    public static let maximumEntryCount = CanonicalAttentionInboxProjection.maximumRowCount
+    public static let maximumWorkEvidenceCount =
+        CanonicalAttentionInboxProjection.maximumAttachmentCount
+
+    public let entries: [CanonicalSessionWorkspaceRailEntry]
+    public let omittedEntryCount: Int
+    public let sourceComplete: Bool
+
+    public var isComplete: Bool {
+        sourceComplete && omittedEntryCount == 0 && entries.allSatisfy { $0.isKnown }
+    }
+
+    public init(
+        inbox: CanonicalAttentionInboxProjection,
+        summaries: [CanonicalSessionCatalogSummary],
+        maxEntries: Int = CanonicalSessionWorkspaceRailProjection.maximumEntryCount,
+        maxWorkEvidence: Int = CanonicalSessionWorkspaceRailProjection.maximumWorkEvidenceCount,
+        sourceComplete: Bool = true
+    ) {
+        let grouped = Dictionary(grouping: summaries, by: \.journal)
+        let entryLimit = min(max(0, maxEntries), Self.maximumEntryCount)
+        let evidenceLimit = min(max(0, maxWorkEvidence), Self.maximumWorkEvidenceCount)
+        let boundedRows = Array(inbox.rows.prefix(entryLimit))
+        self.omittedEntryCount = inbox.rows.count - boundedRows.count + inbox.omittedRowCount
+        // Page truncation says only that additional Session rows exist outside this rail. It
+        // does not invalidate the exact retained rows. Source-scan incompleteness still does.
+        self.sourceComplete = sourceComplete
+
+        var result: [CanonicalSessionWorkspaceRailEntry] = []
+        result.reserveCapacity(boundedRows.count)
+        for row in boundedRows {
+            let matches = grouped[row.sessionJournal] ?? []
+            guard matches.count == 1, let summary = matches.first,
+                  row.session == summary.session,
+                  Self.summaryIdentityIsCanonical(summary),
+                  row.id == CanonicalAttentionIdentity.sessionRow(journal: summary.journal),
+                  row.qualifiedSessionID == CanonicalAttentionIdentity.journal(summary.journal),
+                  row.duplicateSummaryCount == 1,
+                  Self.inboxRowMatchesCanonicalSummary(row, summary: summary),
+                  sourceComplete
+            else {
+                let join: CanonicalSessionWorkspaceRailJoin = matches.isEmpty
+                    ? .missingSummary : matches.count > 1 ? .duplicateSummary : .incomplete
+                let evidence = Array(row.attachments.prefix(evidenceLimit))
+                result.append(CanonicalSessionWorkspaceRailEntry(
+                    row: row, summary: nil, join: join, workEvidence: evidence,
+                    omittedWorkEvidenceCount: row.omittedAttachmentCount
+                        + max(0, row.attachments.count - evidence.count), state: .unknown,
+                    isKnown: false))
+                continue
+            }
+
+            // Rebuild the bounded evidence from the joined canonical summary. The inbox row is
+            // validated as the selector, while the catalog remains the source of rail facts.
+            let canonicalRow = CanonicalAttentionInboxRow(
+                summary: summary, maxAttachments: evidenceLimit)
+            let evidence = canonicalRow.attachments
+            let attachedCount = summary.work.filter(\.isAttached).count
+            let state = Self.state(summary: summary, row: canonicalRow)
+            result.append(CanonicalSessionWorkspaceRailEntry(
+                row: row, summary: summary, join: .exact, workEvidence: evidence,
+                omittedWorkEvidenceCount: max(0, attachedCount - evidence.count), state: state,
+                isKnown: state != .unknown))
+        }
+        self.entries = result.sorted {
+            if $0.priority != $1.priority { return $0.priority < $1.priority }
+            return $0.id < $1.id
+        }
+    }
+
+    public init(
+        inbox: CanonicalAttentionInboxProjection,
+        catalog: [CanonicalSessionCatalogSummary],
+        maxEntries: Int = CanonicalSessionWorkspaceRailProjection.maximumEntryCount,
+        maxWorkEvidence: Int = CanonicalSessionWorkspaceRailProjection.maximumWorkEvidenceCount,
+        sourceComplete: Bool = true
+    ) {
+        self.init(
+            inbox: inbox, summaries: catalog, maxEntries: maxEntries,
+            maxWorkEvidence: maxWorkEvidence, sourceComplete: sourceComplete)
+    }
+
+    private static func state(
+        summary: CanonicalSessionCatalogSummary,
+        row: CanonicalAttentionInboxRow
+    ) -> CanonicalSessionWorkspaceRailState {
+        guard row.attentionRequirement != .unknown, let attention = row.effectiveAttention else {
+            return .unknown
+        }
+        switch attention {
+        case .input: return .needsInput
+        case .confirmation: return .needsConfirmation
+        case .error: return .failed
+        case .review: return .readyForReview
+        case .none:
+            if summary.work.contains(where: { work in
+                work.isAttached && [.preparing, .running, .canceling].contains(work.execution)
+            }) {
+                return .working
+            }
+            switch summary.lifecycle {
+            case .active: return .idle
+            case .completed: return .completed
+            case .archived: return .archived
+            case .unknown: return .unknown
+            }
+        }
+    }
+
+    private static func summaryIdentityIsCanonical(
+        _ summary: CanonicalSessionCatalogSummary
+    ) -> Bool {
+        guard summary.id == summary.journal.stableKey,
+              case .session(let owner) = summary.journal.owner,
+              owner == summary.session else { return false }
+        return true
+    }
+
+    private static func inboxRowMatchesCanonicalSummary(
+        _ row: CanonicalAttentionInboxRow,
+        summary: CanonicalSessionCatalogSummary
+    ) -> Bool {
+        let full = CanonicalAttentionInboxRow(
+            summary: summary,
+            maxAttachments: CanonicalAttentionInboxProjection.maximumAttachmentCount)
+        guard row.authoredAttention == full.authoredAttention,
+              row.effectiveAttention == full.effectiveAttention,
+              row.attentionRequirement == full.attentionRequirement,
+              row.sessionSourceCursor == full.sessionSourceCursor,
+              row.sessionSnapshotCursor == full.sessionSnapshotCursor,
+              row.sessionCursorAlignment == full.sessionCursorAlignment,
+              row.sessionIntegrityValid == full.sessionIntegrityValid,
+              row.sessionStructuralIntegrityValid == full.sessionStructuralIntegrityValid,
+              row.sessionSemanticProjectionValid == full.sessionSemanticProjectionValid,
+              row.sessionTailBytes == full.sessionTailBytes,
+              row.sessionUnknownDomains == full.sessionUnknownDomains,
+              row.sessionUnknownEventRefs == full.sessionUnknownEventRefs,
+              row.omittedSessionUnknownEventRefCount == full.omittedSessionUnknownEventRefCount,
+              row.corruptionReasons == full.corruptionReasons,
+              row.omittedCorruptionReasonCount == full.omittedCorruptionReasonCount,
+              row.truncatedCorruptionReasonCount == full.truncatedCorruptionReasonCount
+        else { return false }
+        let attachedCount = summary.work.filter(\.isAttached).count
+        guard row.omittedAttachmentCount + row.attachments.count == attachedCount,
+              row.attachments.allSatisfy({ full.attachments.contains($0) })
+        else { return false }
+        return true
+    }
+}
+
+public extension CanonicalAttentionInboxProjection {
+    /// Assemble the canonical Session workspace rail without giving the rail a second source of
+    /// attention truth.
+    func workspaceRail(
+        summaries: [CanonicalSessionCatalogSummary],
+        maxEntries: Int = CanonicalSessionWorkspaceRailProjection.maximumEntryCount,
+        maxWorkEvidence: Int = CanonicalSessionWorkspaceRailProjection.maximumWorkEvidenceCount,
+        sourceComplete: Bool = true
+    ) -> CanonicalSessionWorkspaceRailProjection {
+        CanonicalSessionWorkspaceRailProjection(
+            inbox: self, summaries: summaries, maxEntries: maxEntries,
+            maxWorkEvidence: maxWorkEvidence, sourceComplete: sourceComplete)
     }
 }

@@ -3280,6 +3280,7 @@ public actor WorkHostControlJournal {
                   event.provenance == .native,
                   event.schemaVersion == TimelineEvent.currentSchemaVersion,
                   event.payloadVersion <= 1,
+                  event.evidenceLinkBoundsAreValid,
                   controlBoundedIdentity(event.eventID),
                   eventIDs.insert(event.eventID).inserted,
                   expectedSequence < Int.max else {
@@ -4048,6 +4049,7 @@ public actor WorkHostControlJournal {
             action: draft.action, handle: draft.handle,
             clientTimestamp: draft.clientTimestamp, payloadVersion: draft.payloadVersion,
             type: draft.type, declaredDomains: draft.declaredDomains, links: draft.links,
+            omittedEvidenceLinkCount: draft.omittedEvidenceLinkCount,
             payload: draft.payload)
         let commit: TimelineJournalCommit
         do {

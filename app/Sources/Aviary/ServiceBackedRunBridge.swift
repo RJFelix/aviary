@@ -98,6 +98,11 @@ final class ServiceBackedRunBridge {
     }
 
     var activities: [WorkActionSnapshot] { projection.activities }
+    /// Privacy-safe semantic action rows prepared in Core so every GUI uses the same titles,
+    /// timing, retry guidance, provenance, and observation-boundary disclosures.
+    var actionPresentations: [WorkActionPresentation] {
+        WorkActionPresentation.project(projection.activities)
+    }
     var visibleMessages: [SessionMessageSnapshot] { projection.visibleMessages }
     /// Delivery evidence comes from the canonical Session reducer, not from a Start receipt.
     /// Read the full message history so a bounded visible-message projection cannot make an
@@ -240,7 +245,9 @@ final class ServiceBackedRunBridge {
             let kind: TranscriptItem.Kind = switch role {
             case "user": .user
             case "assistant", "model": .assistant
-            case "tool", "action": .tool
+            // A canonical message snapshot has text and provenance, not a paired ToolCall/result.
+            // Mapping it to `.tool` would hide the text and falsely label the row as running.
+            case "tool", "action": .custom
             case "system": .stateChange
             default: .custom
             }

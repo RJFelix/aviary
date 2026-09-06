@@ -54,11 +54,12 @@ private func writerDraft(
     work: WorkRef? = nil,
     workHost: WorkHostRef? = nil,
     links: [TimelineLink] = [],
+    omittedEvidenceLinkCount: Int? = nil,
     payload: JSONValue = .object([:])
 ) -> TimelineEventDraft {
     TimelineEventDraft(
         session: session, work: work, workHost: workHost, type: type,
-        links: links, payload: payload)
+        links: links, omittedEvidenceLinkCount: omittedEvidenceLinkCount, payload: payload)
 }
 
 private func writerData(_ url: URL) throws -> Data {
@@ -171,7 +172,8 @@ func test_timelineJournalWriterFreshBatchReopenAndReducer() async throws {
     let first = writerDraft(
         TimelineEventType.workCreated, work: writerTestWork,
         workHost: WorkHostRef(writerTestWork.workHostID))
-    let second = writerDraft(payload: .object(["n": .number(2)]))
+    let second = writerDraft(
+        omittedEvidenceLinkCount: 3, payload: .object(["n": .number(2)]))
     let commits = try await writer.appendBatch([first, second])
     XCTAssertEqual(commits.map(\.cursor.sequence), [1, 2])
     XCTAssertEqual(await writer.synchronizeCallCount, 2)
@@ -189,6 +191,7 @@ func test_timelineJournalWriterFreshBatchReopenAndReducer() async throws {
     XCTAssertEqual(events.map(\.hostRecordedAt), [fixedDate, fixedDate])
     XCTAssertEqual(events.map(\.schemaVersion), [2, 2])
     XCTAssertEqual(events.map(\.provenance), [.native, .native])
+    XCTAssertEqual(events[1].omittedEvidenceLinkCount, 3)
 
     // The bytes are exactly the encoded native events plus one newline each, not a best-effort
     // text rendering. This also proves the reader can consume the fresh output.
@@ -235,8 +238,14 @@ func test_timelineJournalWriterValidatesIdentityAndEvidenceBeforeWriting() async
     let evidence = TimelineLink(
         kind: .supports, target: EventRef(journal: writerTestSessionJournal, eventID: "e"))
     let tooManyLinks = writerDraft(links: Array(repeating: evidence, count: TimelineEvent.maxEvidenceLinks + 1))
+    let zeroOmissions = writerDraft(omittedEvidenceLinkCount: 0)
+    let excessiveOmissions = writerDraft(
+        omittedEvidenceLinkCount: TimelineEvent.maxOmittedEvidenceLinkCount + 1)
     let invalidType = writerDraft(" \n\t")
-    for draft in [invalidWork, invalidHost, invalidHostWithoutWork, tooManyLinks, invalidType] {
+    for draft in [
+        invalidWork, invalidHost, invalidHostWithoutWork, tooManyLinks,
+        zeroOmissions, excessiveOmissions, invalidType,
+    ] {
         do {
             _ = try await workWriter.append(draft)
             XCTFail("invalid draft should be rejected")

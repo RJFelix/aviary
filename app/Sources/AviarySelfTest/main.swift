@@ -7149,6 +7149,7 @@ await Harness.run(
         + casesServiceBackedGUIOrchestration
         + casesServiceBackedGUIControlPolicy
         + casesWorkServiceAttachedWorkController
+        + casesWorkActionPresentation
         + casesDisposableTimelineProjectionStore
         + casesLocalTimelineProjectionSource
         + casesLocalTimelineProjectionReader

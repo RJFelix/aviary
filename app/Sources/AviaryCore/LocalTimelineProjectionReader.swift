@@ -1261,7 +1261,7 @@ public struct LocalTimelineProjectionReader: Sendable {
                       !event.eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                       event.eventID.utf8.count <= reducerLimits.maximumIdentifierBytes,
                       !event.type.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                      event.links.count <= TimelineEvent.maxEvidenceLinks else {
+                      event.evidenceLinkBoundsAreValid else {
                     throw ReaderError.malformedLine
                 }
                 guard seenEventIDs.count < limits.maximumSeenEventIDs else {

@@ -1,14 +1,19 @@
 import SwiftUI
 import AviaryCore
 
-/// The landing screen is a working set, not a second analytics dashboard. The rail is every
-/// run Aviary currently owns; selecting one keeps its shared transcript and composer in view.
+/// The landing screen is the Session workspace, not a second analytics dashboard. The rail joins
+/// this GUI's live attachments with the canonical attention inbox, so Work remains visible when
+/// it belongs to another GUI or has already completed.
 struct CockpitView: View {
     @Environment(AppModel.self) private var model
     /// Selected like a run, not sheet-presented: the New Session card lives in the same rail
     /// as every other run, and choosing it fills the same detail pane a run's chat would use
     /// rather than opening a modal over it. See `NewSessionPane`.
     @State private var composingNewSession = false
+    @State private var selectedCanonicalEntryID: String?
+    /// Selecting a Session does not select one of its Works. This exact key is set only by the
+    /// relationship card in the Session pane, so several attached Works never collapse by order.
+    @State private var selectedCanonicalWorkTarget: WorkSessionKey?
 
     var body: some View {
         GeometryReader { geo in
@@ -29,13 +34,49 @@ struct CockpitView: View {
         model.runs.filter { !$0.hasExited }
     }
 
+    /// Live attachments without a canonical Session row remain visible as an explicit fallback.
+    /// When a canonical row exists it owns the rail card and routes to the richer live pane.
+    private var unrepresentedRuns: [LiveRun] {
+        ongoingRuns.filter { run in
+            !canonicalEntries.contains { entry in
+                matchingRuns(for: entry).contains { $0.id == run.id }
+            }
+        }
+    }
+
     private var selectedRun: LiveRun? {
+        if let entry = selectedCanonicalEntry {
+            return selectedMatchingRun(for: entry, target: selectedCanonicalWorkTarget)
+        }
         if let focused = model.focusedRunID,
-           let run = ongoingRuns.first(where: { $0.id == focused })
+           let run = unrepresentedRuns.first(where: { $0.id == focused })
         {
             return run
         }
-        return ongoingRuns.first
+        return unrepresentedRuns.first
+    }
+
+    /// The canonical projection owns every authority-qualified Session row. Bare Session IDs are
+    /// never used to collapse authorities; live attachments are joined only by their exact key.
+    private var canonicalEntries: [CanonicalSessionWorkspaceRailEntry] {
+        model.canonicalWorkspaceRail.entries
+    }
+
+    private var selectedCanonicalEntry: CanonicalSessionWorkspaceRailEntry? {
+        if let selectedCanonicalEntryID,
+           let entry = canonicalEntries.first(where: { $0.id == selectedCanonicalEntryID }) {
+            return entry
+        }
+        if let focused = model.focusedRunID,
+           ongoingRuns.contains(where: { $0.id == focused }) {
+            return canonicalEntries.first(where: { entry in
+                matchingRuns(for: entry).contains { $0.id == focused }
+            })
+        }
+        if let firstAttached = canonicalEntries.first(where: { !matchingRuns(for: $0).isEmpty }) {
+            return firstAttached
+        }
+        return canonicalEntries.first
     }
 
     /// A run card reads as selected only when it is actually what's showing in the detail
@@ -49,25 +90,62 @@ struct CockpitView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text("ONGOING")
+                    Text("SESSION WORKSPACE")
                         .font(Design.sectionTitle).tracking(0.6)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Text("\(ongoingRuns.count)")
+                    Text("\(unrepresentedRuns.count + canonicalEntries.count)")
                         .font(Design.numeric(10, weight: .semibold))
                         .foregroundStyle(.tertiary)
                 }
                 .padding(.horizontal, 12).padding(.top, 12)
 
-                ForEach(ongoingRuns) { run in
+                if !needsAttentionEntries.isEmpty {
+                    railHeading("NEEDS YOU")
+                    ForEach(needsAttentionEntries) { entry in workspaceCard(entry) }
+                }
+
+                if !unrepresentedRuns.isEmpty {
+                    railHeading("LOCAL ATTACHMENTS")
+                }
+                ForEach(unrepresentedRuns) { run in
                     RunRailCard(run: run, selected: isShowing(run)) {
                         model.focusedRunID = run.id
+                        selectedCanonicalEntryID = nil
+                        selectedCanonicalWorkTarget = nil
                         composingNewSession = false
                     }
                 }
 
+                if !workingEntries.isEmpty {
+                    railHeading("WORKING")
+                    ForEach(workingEntries) { entry in workspaceCard(entry) }
+                }
+
+                if !reviewEntries.isEmpty {
+                    railHeading("READY FOR REVIEW")
+                    ForEach(reviewEntries) { entry in workspaceCard(entry) }
+                }
+
+                if !otherEntries.isEmpty {
+                    railHeading("OTHER SESSIONS")
+                    ForEach(otherEntries) { entry in workspaceCard(entry) }
+                }
+
                 NewRunRailCard(selected: composingNewSession) {
                     composingNewSession = true
+                    selectedCanonicalEntryID = nil
+                    selectedCanonicalWorkTarget = nil
+                }
+
+                if model.canonicalWorkspaceRail.omittedEntryCount > 0 {
+                    Label(
+                        "\(model.canonicalWorkspaceRail.omittedEntryCount) more canonical "
+                            + "Session row(s) are outside this bounded page.",
+                        systemImage: "ellipsis.circle")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
                 }
             }
             .padding(.horizontal, 9)
@@ -81,9 +159,28 @@ struct CockpitView: View {
         if composingNewSession {
             NewSessionPane(onStart: { composingNewSession = false },
                             onCancel: { composingNewSession = false })
+        } else if let entry = selectedCanonicalEntry,
+                  entry.workEvidence.count + entry.omittedWorkEvidenceCount > 1 {
+            // Keep the Session's Work relationship selector visible even after one relationship
+            // resolves to a local LiveRun. Otherwise that live attachment hides its peers.
+            CanonicalSessionWorkspacePane(
+                entry: entry,
+                attachedRun: selectedMatchingRun(
+                    for: entry, target: selectedCanonicalWorkTarget),
+                selectedWorkTarget: selectedCanonicalWorkTarget
+            ) { target in
+                selectedCanonicalWorkTarget = target
+            }
         } else if let run = selectedRun {
             // Live keeps its optional diagnostics inspector. Cockpit promises chat space.
             RunPane(run: run, showsInspector: false)
+        } else if let entry = selectedCanonicalEntry {
+            CanonicalSessionWorkspacePane(
+                entry: entry, attachedRun: nil,
+                selectedWorkTarget: selectedCanonicalWorkTarget
+            ) { target in
+                selectedCanonicalWorkTarget = target
+            }
         } else {
             EmptyStateView(
                 symbol: "plus.bubble",
@@ -91,6 +188,90 @@ struct CockpitView: View {
                 message: "Your ongoing sessions appear in the left rail. Start one here, then "
                     + "its chat and Markdown-aware composer stay on this page.")
         }
+    }
+
+    private var needsAttentionEntries: [CanonicalSessionWorkspaceRailEntry] {
+        canonicalEntries.filter {
+            [.needsInput, .needsConfirmation, .failed].contains($0.state)
+        }
+    }
+
+    private var workingEntries: [CanonicalSessionWorkspaceRailEntry] {
+        canonicalEntries.filter { $0.state == .working }
+    }
+
+    private var reviewEntries: [CanonicalSessionWorkspaceRailEntry] {
+        canonicalEntries.filter { $0.state == .readyForReview }
+    }
+
+    private var otherEntries: [CanonicalSessionWorkspaceRailEntry] {
+        canonicalEntries.filter {
+            ![.needsInput, .needsConfirmation, .failed, .working, .readyForReview]
+                .contains($0.state)
+        }
+    }
+
+    private func matchingRuns(for entry: CanonicalSessionWorkspaceRailEntry) -> [LiveRun] {
+        ongoingRuns.filter { run in
+            if let key = run.serviceAttachmentKey?.workSession {
+                return entryContains(key, in: entry)
+            }
+            return false
+        }
+    }
+
+    private func entryContains(
+        _ key: WorkSessionKey, in entry: CanonicalSessionWorkspaceRailEntry
+    ) -> Bool {
+        key.session == entry.session
+            && key.sessionJournal == entry.sessionJournal
+            && entry.workEvidence.contains {
+                $0.work == key.work && $0.attachment == key.sessionAttachment
+            }
+    }
+
+    /// One Session may be attached to several Works. Use the already-focused exact attachment or
+    /// the sole match; otherwise keep the Session pane read-only until the user chooses a Work.
+    private func selectedMatchingRun(
+        for entry: CanonicalSessionWorkspaceRailEntry,
+        target: WorkSessionKey? = nil
+    ) -> LiveRun? {
+        let matches = matchingRuns(for: entry)
+        if let target,
+           entryContains(target, in: entry) {
+            let exact = matches.filter { $0.serviceAttachmentKey?.workSession == target }
+            if let focused = model.focusedRunID,
+               let run = exact.first(where: { $0.id == focused }) { return run }
+            guard exact.count == 1 else { return nil }
+            return exact[0]
+        }
+        if entry.workEvidence.count + entry.omittedWorkEvidenceCount > 1 { return nil }
+        if let focused = model.focusedRunID,
+           let exact = matches.first(where: { $0.id == focused }) { return exact }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
+    }
+
+    @ViewBuilder
+    private func workspaceCard(_ entry: CanonicalSessionWorkspaceRailEntry) -> some View {
+        CanonicalWorkspaceRailCard(
+            entry: entry,
+            isAttachedHere: !matchingRuns(for: entry).isEmpty,
+            selected: !composingNewSession && selectedCanonicalEntry?.id == entry.id
+        ) {
+            selectedCanonicalEntryID = entry.id
+            selectedCanonicalWorkTarget = nil
+            composingNewSession = false
+        }
+    }
+
+    private func railHeading(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 9, weight: .semibold))
+            .tracking(0.5)
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 4)
+            .padding(.top, 5)
     }
 }
 
@@ -168,6 +349,415 @@ private struct RunRailCard: View {
                         lineWidth: 1))
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct CanonicalWorkspaceRailCard: View {
+    let entry: CanonicalSessionWorkspaceRailEntry
+    let isAttachedHere: Bool
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: entry.state.symbol)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(entry.state.tint)
+                    Text(entry.title)
+                        .font(.system(size: 12, weight: .semibold))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                    Spacer(minLength: 0)
+                }
+                HStack(spacing: 5) {
+                    Text(entry.state.label)
+                        .foregroundStyle(entry.state.tint)
+                    if isAttachedHere {
+                        Text("attached here")
+                            .foregroundStyle(Design.accent)
+                    }
+                    if let model = entry.modelID, !model.isEmpty {
+                        Text(model).lineLimit(1).truncationMode(.middle)
+                    }
+                }
+                .font(.system(size: 9.5, weight: .medium))
+                HStack(spacing: 5) {
+                    Text(entry.authorityID)
+                        .lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Text(
+                        "\(entry.workEvidence.count) Work"
+                            + (entry.omittedWorkEvidenceCount > 0
+                                ? " +\(entry.omittedWorkEvidenceCount)" : ""))
+                }
+                .font(Design.mono(9))
+                .foregroundStyle(.secondary)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(selected ? AnyShapeStyle(Design.accentSoft) : AnyShapeStyle(.background)))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(
+                        selected ? AnyShapeStyle(Design.accent.opacity(0.7))
+                            : AnyShapeStyle(.separator.opacity(0.55)),
+                        lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            "\(entry.title), \(entry.state.label), authority \(entry.authorityID)")
+        .accessibilityValue(
+            entry.isKnown
+                ? "Canonical Session, \(entry.workEvidence.count) retained Work"
+                    + (entry.omittedWorkEvidenceCount > 0
+                        ? ", \(entry.omittedWorkEvidenceCount) Work omitted from this page" : "")
+                    + (isAttachedHere ? ", attached to this GUI" : ", not attached to this GUI")
+                : "Attention and state unknown")
+        .accessibilityHint("Opens this Session workspace")
+    }
+}
+
+/// A canonical Session that this GUI has not attached is still a real conversation. Its
+/// transcript is readable from the catalog, while controls appear only for one exact advertised
+/// Work/Session/attachment relationship. This is intentionally not a synthetic `LiveRun`.
+private struct CanonicalSessionWorkspacePane: View {
+    @Environment(AppModel.self) private var model
+    let entry: CanonicalSessionWorkspaceRailEntry
+    let attachedRun: LiveRun?
+    let selectedWorkTarget: WorkSessionKey?
+    let onSelectWork: (WorkSessionKey) -> Void
+
+    private var transcriptPage: CanonicalWorkspaceTranscriptPage? {
+        model.canonicalWorkspaceTranscripts[entry.id]
+    }
+
+    private var transcriptItems: [TranscriptItem] {
+        guard entry.isKnown else { return [] }
+        return transcriptPage?.items ?? []
+    }
+
+    private var hasOmittedTranscriptMessages: Bool {
+        (transcriptPage?.omittedMessageCount ?? 0) > 0
+    }
+
+    private var hasSelectedWorkRelationship: Bool {
+        guard let selectedWorkTarget else { return false }
+        return entry.workEvidence.contains {
+            $0.work == selectedWorkTarget.work
+                && $0.attachment == selectedWorkTarget.sessionAttachment
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            if let error = model.localWorkServiceError {
+                NoticeBanner(level: .warning, title: "Work Host status", message: error)
+                Divider()
+            }
+            if !entry.isKnown || transcriptPage == nil {
+                unavailablePane
+            } else {
+                if attachedRun == nil,
+                   entry.workEvidence.count + entry.omittedWorkEvidenceCount > 1,
+                   !hasSelectedWorkRelationship {
+                    NoticeBanner(
+                        level: .warning,
+                        title: "Choose a Work attachment",
+                        message: "This Session is attached to more than one Work. Choose an "
+                            + "exact relationship below before sending or controlling it.")
+                    Divider()
+                }
+                attachmentBar
+                Divider()
+                if let attachedRun {
+                    VStack(spacing: 0) {
+                        if let target = attachedRun.serviceAttachmentKey?.workSession {
+                            HStack(spacing: 7) {
+                                Label("Controlling Work", systemImage: "point.3.connected.trianglepath.dotted")
+                                    .font(.system(size: 10, weight: .semibold))
+                                Text("\(target.work.workHostID) / \(target.work.workID)")
+                                    .font(Design.mono(10))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Text("attachment \(target.sessionAttachment.attachmentID)")
+                                    .font(Design.mono(9))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer()
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(Design.accentSoft.opacity(0.55))
+                            Divider()
+                        }
+                        RunPane(run: attachedRun, showsInspector: false)
+                    }
+                } else {
+                    VStack(spacing: 0) {
+                        if let transcriptPage, transcriptPage.omittedMessageCount > 0 {
+                            Label(
+                                "\(transcriptPage.omittedMessageCount) earlier or oversized "
+                                    + "message\(transcriptPage.omittedMessageCount == 1 ? "" : "s") "
+                                    + "outside this bounded transcript page.",
+                                systemImage: "ellipsis.circle")
+                                .font(.system(size: 9.5))
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 7)
+                            Divider()
+                        }
+                        if transcriptItems.isEmpty {
+                            EmptyStateView(
+                                symbol: "bubble.left.and.exclamationmark.bubble.right",
+                                title: hasOmittedTranscriptMessages
+                                    ? "Messages outside this page" : "No canonical messages",
+                                message: hasOmittedTranscriptMessages
+                                    ? "Every recorded message is outside this bounded transcript "
+                                        + "page. Aviary will not substitute or truncate a body."
+                                    : "This canonical Session has no recorded message body. "
+                                        + "Aviary will not substitute a local transcript.")
+                        } else {
+                            TranscriptView(items: transcriptItems, autoScroll: false)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: entry.state.symbol)
+                    .foregroundStyle(entry.state.tint)
+                Text(entry.title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .lineLimit(2)
+                Chip(text: entry.state.label, tint: entry.state.tint)
+                Spacer()
+            }
+            HStack(spacing: 7) {
+                Text(entry.authorityID)
+                Text("Session \(entry.session.sessionID)")
+                if let model = entry.modelID, !model.isEmpty { Text(model) }
+            }
+            .font(Design.mono(9.5))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+        }
+        .padding(14)
+    }
+
+    @ViewBuilder
+    private var attachmentBar: some View {
+        if entry.workEvidence.isEmpty {
+            HStack(spacing: 8) {
+                Image(systemName: "rectangle.stack.badge.minus")
+                    .foregroundStyle(.secondary)
+                Text("No attached Work is recorded. This Session is available for inspection.")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+        } else {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(entry.workEvidence) { evidence in
+                        workAttachmentCard(evidence)
+                    }
+                    if entry.omittedWorkEvidenceCount > 0 {
+                        Text("+\(entry.omittedWorkEvidenceCount) Work omitted")
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+            }
+            .background(.background.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private func workAttachmentCard(
+        _ evidence: CanonicalAttentionAttachmentEvidence
+    ) -> some View {
+        let match = exactAttachMatch(for: evidence)
+        let isSelected = match?.target == selectedWorkTarget
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(evidence.work.workID)
+                    .font(Design.mono(10))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("host \(evidence.work.workHostID)")
+                    .font(Design.mono(9))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("attachment \(evidence.attachment.attachmentID)")
+                    .font(Design.mono(9))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(workEvidenceLabel(evidence, match: match))
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(match == nil ? Design.warning : .secondary)
+            }
+            .frame(width: 190, alignment: .leading)
+            if let match {
+                Button(
+                    match.isInFlight ? "Opening…"
+                        : isSelected ? "Selected"
+                        : match.hasOwnAttachment ? "Inspect" : "Attach"
+                ) {
+                    onSelectWork(match.target)
+                    model.attachServiceWork(
+                        match.descriptor,
+                        targetSessionAttachment: match.target.sessionAttachment,
+                        destination: .cockpit)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(match.isInFlight)
+                .help(
+                    match.hasOwnAttachment
+                        ? "Open this exact Session attachment without starting Work"
+                        : "Attach this GUI to this exact Session without starting Work")
+            }
+        }
+        .padding(8)
+        .background(
+            isSelected ? Design.accentSoft : Color(nsColor: .windowBackgroundColor),
+            in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(
+                    isSelected
+                        ? AnyShapeStyle(Design.accent.opacity(0.8))
+                        : AnyShapeStyle(.separator.opacity(0.55)),
+                    lineWidth: isSelected ? 1.5 : 1))
+        .accessibilityValue(
+            "Work \(evidence.work.workID) on host \(evidence.work.workHostID), attachment "
+                + "\(evidence.attachment.attachmentID), "
+                + (isSelected ? "selected relationship" : "relationship not selected"))
+    }
+
+    private var unavailablePane: some View {
+        EmptyStateView(
+            symbol: "exclamationmark.triangle",
+            title: "Canonical Session unavailable",
+            message: unavailableMessage)
+    }
+
+    private var unavailableMessage: String {
+        switch entry.join {
+        case .exact:
+            return "The Session was discovered, but its current state is incomplete. Controls "
+                + "are withheld until an exact catalog refresh succeeds."
+        case .missingSummary:
+            return "The attention row has no matching authority-qualified Session summary."
+        case .duplicateSummary:
+            return "More than one Session summary claims this canonical identity. Aviary will "
+                + "not select an arbitrary copy."
+        case .incomplete:
+            return "The Session identity or source scan is incomplete. Controls are withheld."
+        }
+    }
+
+    private struct AttachMatch {
+        let descriptor: WorkServiceWorkDescriptor
+        let target: WorkSessionKey
+        let hasOwnAttachment: Bool
+        let isInFlight: Bool
+    }
+
+    private func exactAttachMatch(
+        for evidence: CanonicalAttentionAttachmentEvidence
+    ) -> AttachMatch? {
+        let descriptors = model.localServiceCatalogWorks.filter {
+            $0.work == evidence.work
+                && (evidence.workJournal == nil || $0.journal == evidence.workJournal)
+        }
+        guard descriptors.count == 1, let descriptor = descriptors.first else { return nil }
+        let targets = descriptor.attachmentQualifiedSessionTargets.filter {
+            $0.session == entry.session
+                && $0.sessionJournal == entry.sessionJournal
+                && $0.sessionAttachment == evidence.attachment
+        }
+        guard targets.count == 1, let target = targets.first else { return nil }
+        guard let client = model.localWorkServiceClient,
+              let decision = ServiceBackedGUIOrchestration.inspect(
+                  descriptor: descriptor, client: client,
+                  targetSessionAttachment: target.sessionAttachment),
+              decision.target.workSession == target else { return nil }
+        return AttachMatch(
+            descriptor: descriptor, target: target,
+            hasOwnAttachment: decision.existingAttachment != nil,
+            isInFlight: model.serviceAttachIsInFlight(target))
+    }
+
+    private func workEvidenceLabel(
+        _ evidence: CanonicalAttentionAttachmentEvidence,
+        match: AttachMatch?
+    ) -> String {
+        if match != nil { return "Exact host relationship available" }
+        if evidence.integrityValid == false || !evidence.structuralIntegrityValid
+            || !evidence.semanticProjectionValid {
+            return "Canonical Work evidence unavailable"
+        }
+        return "Work Host is not connected or no exact relationship was advertised"
+    }
+}
+
+private extension CanonicalSessionWorkspaceRailState {
+    var label: String {
+        switch self {
+        case .needsInput: return "Needs input"
+        case .needsConfirmation: return "Needs confirmation"
+        case .failed: return "Failed"
+        case .working: return "Working"
+        case .readyForReview: return "Ready for review"
+        case .idle: return "Idle"
+        case .completed: return "Completed"
+        case .archived: return "Archived"
+        case .unknown: return "State unknown"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .needsInput: return "text.bubble.fill"
+        case .needsConfirmation: return "checkmark.shield.fill"
+        case .failed: return "exclamationmark.triangle.fill"
+        case .working: return "bolt.horizontal.circle.fill"
+        case .readyForReview: return "checkmark.circle.fill"
+        case .idle: return "pause.circle"
+        case .completed: return "checkmark.seal"
+        case .archived: return "archivebox"
+        case .unknown: return "questionmark.diamond"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .failed: return Design.danger
+        case .needsConfirmation, .needsInput: return Design.warning
+        case .working: return Design.accent
+        case .readyForReview, .completed: return Design.success
+        case .idle, .archived, .unknown: return .secondary
+        }
     }
 }
 

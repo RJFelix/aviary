@@ -855,6 +855,9 @@ public struct ContextComponent: Codable, Hashable, Sendable {
 public struct TimelineEvent: Codable, Hashable, Sendable {
     public static let currentSchemaVersion = 2
     public static let maxEvidenceLinks = 32
+    /// A producer may report that it bounded a larger upstream evidence set, but the count itself
+    /// is bounded so forged metadata cannot create pathological UI/state arithmetic.
+    public static let maxOmittedEvidenceLinkCount = 1_000_000
 
     public let eventID: String
     public let journal: JournalRef
@@ -887,6 +890,10 @@ public struct TimelineEvent: Codable, Hashable, Sendable {
     public let type: String
     public let declaredDomains: Set<TimelineDomain>
     public let provenance: TimelineEventProvenance
+    /// Present only when the in-memory constructor had to bound caller-supplied evidence links.
+    /// Journal drafts reject overflow before append; this preserves truthful diagnostics for
+    /// other producers instead of silently presenting the retained prefix as complete.
+    public let omittedEvidenceLinkCount: Int?
     public let links: [TimelineLink]
     public let payload: JSONValue
 
@@ -920,6 +927,7 @@ public struct TimelineEvent: Codable, Hashable, Sendable {
         declaredDomains: Set<TimelineDomain> = [],
         provenance: TimelineEventProvenance = .native,
         links: [TimelineLink] = [],
+        omittedEvidenceLinkCount: Int? = nil,
         payload: JSONValue = .object([:])
     ) {
         self.eventID = eventID
@@ -950,8 +958,27 @@ public struct TimelineEvent: Codable, Hashable, Sendable {
         self.type = type
         self.declaredDomains = declaredDomains
         self.provenance = provenance
+        let suppliedOmissions = min(
+            Self.maxOmittedEvidenceLinkCount, max(0, omittedEvidenceLinkCount ?? 0))
+        let localOmissions = max(0, links.count - Self.maxEvidenceLinks)
+        let omittedLinks = suppliedOmissions
+            + min(Self.maxOmittedEvidenceLinkCount - suppliedOmissions, localOmissions)
+        self.omittedEvidenceLinkCount = omittedLinks > 0 ? omittedLinks : nil
         self.links = Array(links.prefix(Self.maxEvidenceLinks))
         self.payload = payload
+    }
+
+    /// Semantic bound required at every decoded event crossing.
+    public var evidenceLinkBoundsAreValid: Bool {
+        Self.evidenceLinkBoundsAreValid(
+            links: links, omittedCount: omittedEvidenceLinkCount)
+    }
+
+    public static func evidenceLinkBoundsAreValid(
+        links: [TimelineLink], omittedCount: Int?
+    ) -> Bool {
+        links.count <= maxEvidenceLinks
+            && omittedCount.map { $0 > 0 && $0 <= maxOmittedEvidenceLinkCount } ?? true
     }
 
     /// Timeline envelopes participate in durable prefix digests, so every unordered value must
@@ -987,8 +1014,54 @@ public struct TimelineEvent: Codable, Hashable, Sendable {
         try c.encode(type, forKey: .type)
         try c.encode(declaredDomains.sorted { $0.rawValue < $1.rawValue }, forKey: .declaredDomains)
         try c.encode(provenance, forKey: .provenance)
+        try c.encodeIfPresent(omittedEvidenceLinkCount, forKey: .omittedEvidenceLinkCount)
         try c.encode(links, forKey: .links)
         try c.encode(payload, forKey: .payload)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let links = try c.decodeIfPresent([TimelineLink].self, forKey: .links) ?? []
+        let omitted = try c.decodeIfPresent(Int.self, forKey: .omittedEvidenceLinkCount)
+        guard Self.evidenceLinkBoundsAreValid(links: links, omittedCount: omitted) else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath,
+                      debugDescription: "invalid Timeline evidence-link bounds"))
+        }
+        self.init(
+            eventID: try c.decode(String.self, forKey: .eventID),
+            journal: try c.decode(JournalRef.self, forKey: .journal),
+            sequence: try c.decode(Int.self, forKey: .sequence),
+            hostSequence: try c.decodeIfPresent(Int.self, forKey: .hostSequence),
+            idempotencyKey: try c.decodeIfPresent(String.self, forKey: .idempotencyKey),
+            command: try c.decodeIfPresent(CommandRef.self, forKey: .command),
+            previousEventID: try c.decodeIfPresent(String.self, forKey: .previousEventID),
+            causedByEventID: try c.decodeIfPresent(EventRef.self, forKey: .causedByEventID),
+            parentActivityID: try c.decodeIfPresent(EventRef.self, forKey: .parentActivityID),
+            conversationParent: try c.decodeIfPresent(EventRef.self, forKey: .conversationParent),
+            session: try c.decodeIfPresent(SessionRef.self, forKey: .session),
+            work: try c.decodeIfPresent(WorkRef.self, forKey: .work),
+            workHost: try c.decodeIfPresent(WorkHostRef.self, forKey: .workHost),
+            client: try c.decodeIfPresent(ClientRef.self, forKey: .client),
+            sessionAttachment: try c.decodeIfPresent(
+                SessionAttachmentRef.self, forKey: .sessionAttachment),
+            clientAttachment: try c.decodeIfPresent(
+                ClientAttachmentRef.self, forKey: .clientAttachment),
+            run: try c.decodeIfPresent(RunRef.self, forKey: .run),
+            turn: try c.decodeIfPresent(TurnRef.self, forKey: .turn),
+            action: try c.decodeIfPresent(ActionRef.self, forKey: .action),
+            handle: try c.decodeIfPresent(HandleRef.self, forKey: .handle),
+            actor: try c.decode(TimelineActor.self, forKey: .actor),
+            hostRecordedAt: try c.decode(Date.self, forKey: .hostRecordedAt),
+            clientTimestamp: try c.decodeIfPresent(Date.self, forKey: .clientTimestamp),
+            schemaVersion: try c.decode(Int.self, forKey: .schemaVersion),
+            payloadVersion: try c.decode(Int.self, forKey: .payloadVersion),
+            type: try c.decode(String.self, forKey: .type),
+            declaredDomains: try c.decode(Set<TimelineDomain>.self, forKey: .declaredDomains),
+            provenance: try c.decode(TimelineEventProvenance.self, forKey: .provenance),
+            links: links,
+            omittedEvidenceLinkCount: omitted,
+            payload: try c.decode(JSONValue.self, forKey: .payload))
     }
 
     public var isKnownType: Bool {
@@ -1056,6 +1129,7 @@ public struct TimelineEvent: Codable, Hashable, Sendable {
         case type
         case declaredDomains = "declared_domains"
         case provenance
+        case omittedEvidenceLinkCount = "omitted_evidence_link_count"
         case links
         case payload
     }
@@ -1145,7 +1219,8 @@ public enum TimelineJournalReader {
                 let expectedPrevious = records.last?.event.eventID ?? initialPreviousEventID
                 guard event.journal == journal,
                       event.sequence == expectedSequence,
-                      event.previousEventID == expectedPrevious
+                      event.previousEventID == expectedPrevious,
+                      event.evidenceLinkBoundsAreValid
                 else {
                     return TimelineJournalReadResult(
                         records: records,
@@ -1312,6 +1387,8 @@ public struct WorkActionObservation: Codable, Hashable, Sendable {
     public let causedBy: EventRef?
     public let parentActivity: EventRef?
     public let provenance: TimelineEventProvenance
+    /// Link entries omitted at this observation boundary before presentation-level merging.
+    public let omittedEvidenceLinkCount: Int?
     public let links: [TimelineLink]
 
     public init(
@@ -1326,6 +1403,7 @@ public struct WorkActionObservation: Codable, Hashable, Sendable {
         causedBy: EventRef? = nil,
         parentActivity: EventRef? = nil,
         provenance: TimelineEventProvenance = .native,
+        omittedEvidenceLinkCount: Int? = nil,
         links: [TimelineLink] = []
     ) {
         self.sourceEvent = sourceEvent
@@ -1339,6 +1417,12 @@ public struct WorkActionObservation: Codable, Hashable, Sendable {
         self.causedBy = causedBy
         self.parentActivity = parentActivity
         self.provenance = provenance
+        let sourceOmitted = min(
+            TimelineEvent.maxOmittedEvidenceLinkCount, max(0, omittedEvidenceLinkCount ?? 0))
+        let locallyOmitted = max(0, links.count - TimelineEvent.maxEvidenceLinks)
+        let omitted = sourceOmitted + min(
+            TimelineEvent.maxOmittedEvidenceLinkCount - sourceOmitted, locallyOmitted)
+        self.omittedEvidenceLinkCount = omitted > 0 ? omitted : nil
         self.links = Array(links.prefix(TimelineEvent.maxEvidenceLinks))
     }
 
@@ -1350,7 +1434,43 @@ public struct WorkActionObservation: Codable, Hashable, Sendable {
             run: event.run, turn: event.turn, actor: event.actor,
             hostRecordedAt: event.hostRecordedAt, clientTimestamp: event.clientTimestamp,
             causedBy: event.causedByEventID, parentActivity: event.parentActivityID,
-            provenance: event.provenance, links: event.links)
+            provenance: event.provenance,
+            omittedEvidenceLinkCount: event.omittedEvidenceLinkCount,
+            links: event.links)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sourceEvent, sequence, hostSequence, run, turn, actor, hostRecordedAt
+        case clientTimestamp, causedBy, parentActivity, provenance
+        case omittedEvidenceLinkCount, links
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let links = try c.decodeIfPresent([TimelineLink].self, forKey: .links) ?? []
+        let omitted = try c.decodeIfPresent(Int.self, forKey: .omittedEvidenceLinkCount)
+        guard links.count <= TimelineEvent.maxEvidenceLinks,
+              omitted.map({
+                  $0 > 0 && $0 <= TimelineEvent.maxOmittedEvidenceLinkCount
+              }) ?? true else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath,
+                      debugDescription: "invalid Work action evidence-link bounds"))
+        }
+        self.init(
+            sourceEvent: try c.decode(EventRef.self, forKey: .sourceEvent),
+            sequence: try c.decodeIfPresent(Int.self, forKey: .sequence),
+            hostSequence: try c.decodeIfPresent(Int.self, forKey: .hostSequence),
+            run: try c.decodeIfPresent(RunRef.self, forKey: .run),
+            turn: try c.decodeIfPresent(TurnRef.self, forKey: .turn),
+            actor: try c.decode(TimelineActor.self, forKey: .actor),
+            hostRecordedAt: try c.decode(Date.self, forKey: .hostRecordedAt),
+            clientTimestamp: try c.decodeIfPresent(Date.self, forKey: .clientTimestamp),
+            causedBy: try c.decodeIfPresent(EventRef.self, forKey: .causedBy),
+            parentActivity: try c.decodeIfPresent(EventRef.self, forKey: .parentActivity),
+            provenance: try c.decode(TimelineEventProvenance.self, forKey: .provenance),
+            omittedEvidenceLinkCount: omitted,
+            links: links)
     }
 
 }

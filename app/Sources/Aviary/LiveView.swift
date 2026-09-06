@@ -229,16 +229,20 @@ struct LiveView: View {
 // MARK: - Run pane
 
 struct RunPane: View {
+    private struct SelectedAction: Identifiable, Hashable {
+        let id: String
+    }
+
     @Environment(AppModel.self) private var model
     var run: LiveRun
     /// Cockpit owns its two-column layout, so it reuses the chat/composer without a third
     /// technical column. Live keeps the detailed inspector.
     var showsInspector = true
 
-    @State private var draft = ""
     @State private var showMarkdownPreview = true
     @State private var showLaunchDetails = false
     @State private var selectedItem: TranscriptItem?
+    @State private var selectedAction: SelectedAction?
     @State private var confirmEndRun = false
 
     // Fixed trailing inspector column rather than `.inspector` or a conditional split
@@ -260,6 +264,22 @@ struct RunPane: View {
                         message: notice.message
                     )
                         .padding(Design.gutter)
+                }
+                if let omissions = run.serviceProjectionOmissionSummary {
+                    NoticeBanner(
+                        level: .info,
+                        title: "Bounded canonical view",
+                        message: omissions)
+                        .padding(Design.gutter)
+                }
+                if let action = run.currentServiceActions.first {
+                    WorkActivityStrip(
+                        action: action,
+                        concurrentActions: run.currentServiceActions,
+                        onInspect: {
+                            selectedAction = SelectedAction(id: $0.id)
+                        })
+                    Divider()
                 }
                 TranscriptView(
                     items: run.items,
@@ -296,6 +316,15 @@ struct RunPane: View {
                         + "without ending it, and the transcript remains available."
                     : "This stops the agent and destroys its current Python runtime. "
                         + "The transcript remains available.")
+        }
+        .sheet(item: $selectedAction) { selection in
+            if let action = run.serviceActionPresentations.first(where: {
+                $0.id == selection.id
+            }) {
+                WorkActionDetailSheet(action: action)
+            } else {
+                WorkActionUnavailableSheet(actionID: selection.id)
+            }
         }
     }
 
@@ -461,7 +490,7 @@ struct RunPane: View {
         VStack(spacing: 0) {
             HStack(alignment: .bottom, spacing: 8) {
                 ZStack(alignment: .topLeading) {
-                    if draft.isEmpty {
+                    if run.draft.isEmpty {
                         Text(
                             run.isStreaming
                                 ? (run.commandCapabilities.supportsSteering
@@ -475,7 +504,9 @@ struct RunPane: View {
                             .padding(.vertical, 6)
                             .allowsHitTesting(false)
                     }
-                    TextEditor(text: $draft)
+                    TextEditor(text: Binding(
+                        get: { run.draft },
+                        set: { run.draft = $0 }))
                         .font(.system(size: 12.5))
                         .scrollContentBackground(.hidden)
                         .frame(minHeight: 34, maxHeight: 130)
@@ -508,7 +539,7 @@ struct RunPane: View {
                             .frame(width: 26, height: 20)
                     }
                     .buttonStyle(.bordered)
-                    .disabled(draft.isEmpty)
+                    .disabled(run.draft.isEmpty)
                     .accessibilityLabel(
                         showMarkdownPreview ? "Hide Markdown preview" : "Show Markdown preview")
                     .accessibilityValue(showMarkdownPreview ? "Visible" : "Hidden")
@@ -524,13 +555,13 @@ struct RunPane: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(
                         run.hasExited || !run.acceptsInput
-                            || draft.trimmingCharacters(in: .whitespaces).isEmpty
+                            || run.draft.trimmingCharacters(in: .whitespaces).isEmpty
                             || (run.isStreaming && !run.commandCapabilities.supportsSteering)
                     )
                     .keyboardShortcut(.return, modifiers: .command)
                     .accessibilityLabel(run.isStreaming ? "Steer message" : "Send message")
                     .accessibilityValue(
-                        draft.trimmingCharacters(in: .whitespaces).isEmpty
+                        run.draft.trimmingCharacters(in: .whitespaces).isEmpty
                         ? "Unavailable: message is empty" : "Ready")
                     .accessibilityHint(
                         run.isStreaming && run.commandCapabilities.supportsSteering
@@ -544,10 +575,10 @@ struct RunPane: View {
                         : "Send (⌘↵)")
 
                     Button {
-                        let text = draft
+                        let text = run.draft
                         Task {
                             let receipt = await run.queueFollowUp(text)
-                            if receipt.wasHandedOff, draft == text { draft = "" }
+                            if receipt.wasHandedOff, run.draft == text { run.draft = "" }
                         }
                     } label: {
                         Image(systemName: "text.append")
@@ -558,7 +589,7 @@ struct RunPane: View {
                     .disabled(
                         run.hasExited || !run.acceptsInput || !run.isStreaming
                             || !run.commandCapabilities.supportsQueuedFollowUps
-                            || draft.trimmingCharacters(in: .whitespaces).isEmpty
+                            || run.draft.trimmingCharacters(in: .whitespaces).isEmpty
                     )
                     .accessibilityLabel("Queue follow-up")
                     .accessibilityValue(
@@ -575,13 +606,13 @@ struct RunPane: View {
             .padding(.horizontal, Design.gutter)
             .padding(.vertical, 9)
 
-            if showMarkdownPreview, !draft.isEmpty {
+            if showMarkdownPreview, !run.draft.isEmpty {
                 Divider()
                 VStack(alignment: .leading, spacing: 5) {
                     Text("MARKDOWN PREVIEW")
                         .font(Design.sectionTitle).foregroundStyle(.secondary)
                     ScrollView {
-                        MarkdownText(text: draft)
+                        MarkdownText(text: run.draft)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxHeight: 130)
@@ -595,10 +626,10 @@ struct RunPane: View {
     }
 
     private func send() {
-        let text = draft
+        let text = run.draft
         Task {
             let receipt = await run.send(text)
-            if receipt.wasHandedOff, draft == text { draft = "" }
+            if receipt.wasHandedOff, run.draft == text { run.draft = "" }
         }
     }
 }
@@ -1486,13 +1517,10 @@ private struct ServiceWorkCard: View {
                         }
                     }
 
-                    if !projection.projectionOmissions.isEmpty {
+                    if let omissions = run.serviceProjectionOmissionSummary {
                         Divider().opacity(0.5)
                         Label(
-                            "Display is bounded: \(projection.projectionOmissions.count) "
-                                + "omission record\(projection.projectionOmissions.count == 1 ? "" : "s"). "
-                                + "Full canonical records remain addressable through the Work Host; "
-                                + "this does not disable healthy commands.",
+                            omissions + " This does not disable healthy commands.",
                             systemImage: "ellipsis.circle"
                         )
                             .font(.system(size: 10))
@@ -1512,16 +1540,26 @@ private struct ServiceWorkCard: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
-                    if !run.serviceActivities.isEmpty {
+                    if !run.serviceActionPresentations.isEmpty {
                         Divider().opacity(0.5)
-                        Text("RECENT ACTIONS")
-                            .font(Design.sectionTitle)
-                            .foregroundStyle(.secondary)
-                        ForEach(
-                            Array(run.serviceActivities.suffix(8)),
-                            id: \.action.actionID
-                        ) { action in
-                            ServiceActionRow(action: action)
+                        let current = run.serviceActionPresentations.filter { !$0.state.isTerminal }
+                        let recent = run.serviceActionPresentations.filter(\.state.isTerminal)
+                        if !current.isEmpty {
+                            Text("CURRENT ACTIONS")
+                                .font(Design.sectionTitle)
+                                .foregroundStyle(.secondary)
+                            ForEach(current) { action in
+                                WorkActionLensRow(action: action)
+                            }
+                        }
+                        if !recent.isEmpty {
+                            Text("RECENT OUTCOMES")
+                                .font(Design.sectionTitle)
+                                .foregroundStyle(.secondary)
+                                .padding(.top, current.isEmpty ? 0 : 3)
+                            ForEach(Array(recent.prefix(8))) { action in
+                                WorkActionLensRow(action: action)
+                            }
                         }
                     } else {
                         Text("No canonical actions recorded yet.")
@@ -1543,58 +1581,6 @@ private struct ServiceWorkCard: View {
         case .unavailable: return "unavailable"
         case .incompatible: return "incompatible"
         case .disconnected: return "disconnected"
-        }
-    }
-}
-
-private struct ServiceActionRow: View {
-    let action: WorkActionSnapshot
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Circle()
-                .fill(tint)
-                .frame(width: 6, height: 6)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 5) {
-                    Text(action.kind.rawValue)
-                        .font(Design.mono(10))
-                    Text(action.state.rawValue.replacingOccurrences(of: "_", with: " "))
-                        .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(tint)
-                }
-                if let intent = action.intent, !intent.isEmpty {
-                    Text(intent)
-                        .font(.system(size: 10))
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else if let target = action.target, !target.isEmpty {
-                    Text(target)
-                        .font(Design.mono(9.5))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .foregroundStyle(.secondary)
-                }
-                if let failure = action.failureKind {
-                    Text(
-                        "failure: \(failure.rawValue)"
-                            + (action.retrySafety.map { " · retry \($0.rawValue)" } ?? "")
-                    )
-                        .font(.system(size: 9))
-                        .foregroundStyle(Design.warning)
-                }
-            }
-            Spacer(minLength: 2)
-        }
-    }
-
-    private var tint: Color {
-        switch action.state {
-        case .succeeded: return Design.success
-        case .failed, .indeterminateEffect: return Design.danger
-        case .canceled, .cancelRequested: return Design.warning
-        case .running, .queued: return Design.accent
-        case .proposed, .unknown: return .secondary
         }
     }
 }

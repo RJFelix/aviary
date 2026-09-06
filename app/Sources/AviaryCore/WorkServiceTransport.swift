@@ -1463,6 +1463,18 @@ public enum WorkServiceTransportCodec {
         }
     }
 
+    private static func validatePositiveBoundedInteger(
+        _ value: JSONValue?, maximum: Int, required: Bool = false
+    ) throws {
+        guard let value else {
+            if required { throw WorkServiceTransportError.invalidResponse }
+            return
+        }
+        guard let integer = value.intValue, integer > 0, integer <= maximum else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+    }
+
     private static func validateReadTarget(_ value: JSONValue) throws {
         guard case .object(let object) = value else {
             throw WorkServiceTransportError.invalidResponse
@@ -1888,6 +1900,9 @@ public enum WorkServiceTransportCodec {
         try validateArray(object["declared_domains"], maxCount: TimelineDomain.allCases.count)
         try validateDiagnostic(object["provenance"])
         try validateArray(object["links"], maxCount: TimelineEvent.maxEvidenceLinks)
+        try validatePositiveBoundedInteger(
+            object["omitted_evidence_link_count"],
+            maximum: TimelineEvent.maxOmittedEvidenceLinkCount)
         try validateJSONSemantics(object["payload"] ?? .object([:]))
     }
 

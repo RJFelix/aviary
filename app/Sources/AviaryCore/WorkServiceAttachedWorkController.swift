@@ -162,9 +162,11 @@ public struct WorkServiceAttachedWorkProjection: Sendable, Hashable {
             if lhsSequence != rhsSequence { return lhsSequence < rhsSequence }
             return lhs.action.actionID < rhs.action.actionID
         }
+        let activityProjection = WorkActionPresentation.projectWithOmissions(orderedActivities)
         let activityLimit = Self.maxActivities
         let messageLimit = Self.maxMessages
-        self.activities = Array(orderedActivities.suffix(activityLimit))
+        self.activities = WorkActionPresentation.retainedSnapshots(
+            orderedActivities, limit: activityLimit)
         var retainedMessages: [SessionMessageSnapshot] = []
         var retainedMessageBytes = 0
         for message in sessionSnapshot.messages.reversed() {
@@ -178,10 +180,15 @@ public struct WorkServiceAttachedWorkProjection: Sendable, Hashable {
         }
         self.visibleMessages = retainedMessages
         var localOmissions: [WorkServiceOmission] = []
-        if orderedActivities.count > activityLimit {
+        if activityProjection.omittedUnsettledCount > 0 {
             localOmissions.append(WorkServiceOmission(
-                category: "activities", count: orderedActivities.count - activityLimit,
-                diagnostic: "activity projection is bounded; retained activities are addressable through the canonical journal"))
+                category: "active_activities", count: activityProjection.omittedUnsettledCount,
+                diagnostic: "active activity count exceeded the display bound; omitted activities remain addressable through the canonical journal"))
+        }
+        if activityProjection.omittedTerminalCount > 0 {
+            localOmissions.append(WorkServiceOmission(
+                category: "activities", count: activityProjection.omittedTerminalCount,
+                diagnostic: "resolved activity history is bounded; omitted activities remain addressable through the canonical journal"))
         }
         let truncatedActivities = orderedActivities.filter(\.metadataWasTruncated).count
         if truncatedActivities > 0 {

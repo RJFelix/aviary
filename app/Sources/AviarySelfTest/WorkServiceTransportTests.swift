@@ -1979,6 +1979,27 @@ func test_workServiceTransportRejectsFalsePageProgressAndBodyEOFClaims() async t
         hostInstance: instance)
     try WorkServiceTransportCodec.validateResponseCorrelation(
         goodEnvelope, request: envelope, expectedHostInstance: instance)
+    guard case .object(let validPageObject) = try transportEnvelopePayload(good),
+          case .array(let validEvents) = validPageObject["events"],
+          case .object(let validFirstEvent) = validEvents.first else {
+        XCTFail("event page must encode native Timeline events")
+        return
+    }
+    for invalidCount in [-1, 0, TimelineEvent.maxOmittedEvidenceLinkCount + 1] {
+        var forgedEvent = validFirstEvent
+        forgedEvent["omitted_evidence_link_count"] = .number(Double(invalidCount))
+        var forgedPage = validPageObject
+        forgedPage["events"] = .array([.object(forgedEvent), validEvents[1]])
+        let forgedEnvelope = WorkServiceTransportResponseEnvelope(
+            id: envelope.id, ok: true, data: .object(forgedPage), hostInstance: instance)
+        do {
+            try WorkServiceTransportCodec.validateResponseCorrelation(
+                forgedEnvelope, request: envelope, expectedHostInstance: instance)
+            XCTFail("transport accepted invalid omitted evidence-link metadata")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+    }
     let missingEnvelopeInstance = WorkServiceTransportResponseEnvelope(
         id: envelope.id, ok: true, data: try JSONValue.parse(JSONEncoder().encode(good)))
     do {

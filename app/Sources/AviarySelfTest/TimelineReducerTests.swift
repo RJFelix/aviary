@@ -132,6 +132,32 @@ func test_timelineReducerTracksCausalOrderAndBoundsLinks() throws {
     reducer.apply(second)
     XCTAssertTrue(reducer.snapshot.causalOrderValid)
     XCTAssertEqual(second.links.count, TimelineEvent.maxEvidenceLinks)
+    XCTAssertEqual(second.omittedEvidenceLinkCount, 8)
+    let roundTripped = try JSONDecoder().decode(
+        TimelineEvent.self, from: JSONEncoder().encode(second))
+    XCTAssertEqual(roundTripped.links.count, TimelineEvent.maxEvidenceLinks)
+    XCTAssertEqual(roundTripped.omittedEvidenceLinkCount, 8)
+    guard case .object(let encodedObject) = reducerJSON(second) else {
+        XCTFail("Timeline event must encode as an object")
+        return
+    }
+    for invalidCount in [-1, 0, TimelineEvent.maxOmittedEvidenceLinkCount + 1] {
+        var forgedObject = encodedObject
+        forgedObject["omitted_evidence_link_count"] = .number(Double(invalidCount))
+        let forgedData = try JSONEncoder().encode(JSONValue.object(forgedObject))
+        do {
+            _ = try JSONDecoder().decode(TimelineEvent.self, from: forgedData)
+            XCTFail("Timeline event accepted invalid omitted evidence-link count")
+        } catch { }
+        var journalLine = forgedData
+        journalLine.append(UInt8(ascii: "\n"))
+        let rejected = TimelineJournalReader.read(
+            journalLine, journal: reducerWorkJournal,
+            actor: TimelineActor(actorID: "self-test", kind: "test"),
+            hostRecordedAt: Date(timeIntervalSince1970: 1))
+        XCTAssertTrue(rejected.records.isEmpty)
+        XCTAssertNotNil(rejected.quarantinedSuffix)
+    }
     XCTAssertEqual(second.causedByEventID?.journal, reducerSessionJournal)
     XCTAssertEqual(second.parentActivityID?.eventID, "s-parent")
 
