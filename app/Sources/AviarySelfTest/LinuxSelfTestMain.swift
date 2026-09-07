@@ -71,6 +71,12 @@ enum LinuxSelfTestMain {
             ("Linux platform: ISO-8601 memory date parsing", {
                 test_linuxISO8601DateParsing()
             }),
+            ("Linux platform: observed repository review", {
+                try await runLinuxCases(casesObservedRepositoryReview)
+            }),
+            ("Linux platform: repository review turn integration", {
+                try await runLinuxCases(casesObservedRepositoryReviewAgent)
+            }),
             ("Linux platform: bounded URLSession streaming and cancellation", {
                 try await test_linuxURLSessionStreamingBoundsAndCancellation()
             }),

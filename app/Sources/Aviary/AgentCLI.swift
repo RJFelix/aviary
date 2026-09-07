@@ -463,7 +463,8 @@ enum AgentCLI {
                     : nil,
                 hookPaths: HookDiscovery.paths(repoRoot: repoRoot),
                 resume: resume, identity: identity, writer: writer,
-                nativeJournal: nativeJournal, nativeResumeSeed: nativeResumeSeed))
+                nativeJournal: nativeJournal, nativeResumeSeed: nativeResumeSeed,
+                repositoryReviewer: ObservedRepositoryReviewer()))
 
         await runner.observe { event in
             switch event {

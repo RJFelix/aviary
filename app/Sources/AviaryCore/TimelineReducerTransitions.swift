@@ -83,6 +83,7 @@ internal protocol WorkTransitionStateAccess {
     func eventSequence(for eventID: String) -> Int?
     func hasObservedRun(_ runID: String) -> Bool
     func action(for actionID: String) -> WorkActionSnapshot?
+    func isActionActive(_ actionID: String) -> Bool
     func handle(for handleID: String) -> WorkHandleSnapshot?
     func sessionAttachment(for attachmentID: String) -> WorkSessionAttachmentSnapshot?
     func activeSessionAttachmentCount(for session: SessionRef) -> Int
@@ -170,6 +171,10 @@ internal struct InMemoryWorkTransitionState: WorkTransitionState, Sendable {
 
     func action(for actionID: String) -> WorkActionSnapshot? {
         storedSnapshot.actions[actionID]
+    }
+
+    func isActionActive(_ actionID: String) -> Bool {
+        storedSnapshot.activeActionIDs.contains(actionID)
     }
 
     func handle(for handleID: String) -> WorkHandleSnapshot? {
@@ -564,9 +569,11 @@ internal enum WorkReducerTransition {
             guard let run = event.run, run == state.scalar.activeRun,
                   let turn = event.turn,
                   !turn.turnID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  turn == state.scalar.activeTurn else {
+                  turn == state.scalar.activeTurn,
+                  let outcome = event.payload["outcome"]?.stringValue,
+                  RunTurnOutcome(rawValue: outcome) != nil else {
                 quarantine(event, state: &state,
-                           reason: "turn finish must match the active Run and active turn")
+                           reason: "turn finish must match the active Run and active turn with a valid outcome")
                 return
             }
             let activeActionCount = state.activeActionCount
@@ -670,9 +677,13 @@ internal enum WorkReducerTransition {
             state.stageChildState(childState, for: childID)
         case TimelineEventType.artifact:
             // Artifact payloads are retained and indexed by their dedicated bounded service
-            // projection. They do not mutate Work scalar state, but they are a known native
-            // event and must not poison the Work domain as an unknown extension.
-            break
+            // projection. They do not mutate Work scalar state, but their producer envelope and
+            // descriptor must still be exact before the known event is admitted to the prefix.
+            guard validArtifactEvent(event, state: state) else {
+                quarantine(event, state: &state,
+                           reason: "artifact has an invalid active execution envelope or descriptor")
+                return
+            }
         case TimelineEventType.commandAccepted, TimelineEventType.commandRejected,
              TimelineEventType.commandDelivered, TimelineEventType.commandNotDelivered,
              TimelineEventType.commandDeliveryIndeterminate:
@@ -924,6 +935,165 @@ internal enum WorkReducerTransition {
         default:
             return false
         }
+    }
+
+    private static let maximumArtifactBodyBytes = 8 * 1024 * 1024
+    private static let artifactPayloadKeys: Set<String> = [
+        "artifact_id", "label", "media_type", "byte_count", "digest", "available",
+        "body_reference",
+    ]
+
+    private static func validArtifactText(_ value: String, maximumBytes: Int) -> Bool {
+        !value.isEmpty
+            && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value.utf8.count <= maximumBytes
+            && value.unicodeScalars.allSatisfy { scalar in
+                scalar.value > 0x1F
+                    && !(0x7F...0x9F).contains(scalar.value)
+                    && scalar.value != 0x2028
+                    && scalar.value != 0x2029
+            }
+    }
+
+    private static func validArtifactBodyReference(
+        _ reference: TimelineBodyReference, journal: JournalRef
+    ) -> Bool {
+        guard reference.authority == journal,
+              validArtifactText(
+                  reference.referenceID, maximumBytes: WorkServiceBounds.maxIdentityCharacters),
+              let byteCount = reference.byteCount,
+              (0...maximumArtifactBodyBytes).contains(byteCount),
+              let digest = reference.digest,
+              ContextBodyStore.isValidDigest(digest),
+              reference.referenceID == digest else {
+            return false
+        }
+        return reference.mediaType.map {
+            validArtifactText($0, maximumBytes: WorkServiceBounds.maxDiagnosticCharacters)
+        } ?? true
+    }
+
+    private static func validArtifactEvent<State: WorkTransitionState>(
+        _ event: TimelineEvent, state: State
+    ) -> Bool {
+        guard let expectedWork = state.scalar.work,
+              let expectedHost = state.scalar.workHost,
+              let eventWork = event.work,
+              eventWork == expectedWork,
+              let eventHost = event.workHost,
+              eventHost == expectedHost,
+              eventHost.workHostID == eventWork.workHostID,
+              let activeRun = state.scalar.activeRun,
+              event.run == activeRun,
+              let activeSession = state.scalar.activeRunSession,
+              let activeAttachment = state.scalar.activeRunSessionAttachment,
+              event.session == activeSession,
+              event.sessionAttachment == activeAttachment,
+              let attached = state.sessionAttachment(for: activeAttachment.attachmentID),
+              attached.session == activeSession,
+              attached.isAttached,
+              event.turn == state.scalar.activeTurn else {
+            return false
+        }
+
+        if let action = event.action {
+            guard validArtifactText(
+                      action.actionID, maximumBytes: WorkServiceBounds.maxIdentityCharacters),
+                  let actionSnapshot = state.action(for: action.actionID),
+                  state.isActionActive(action.actionID),
+                  let startedEvent = actionSnapshot.startedEvent?.sourceEvent,
+                  event.causedByEventID == startedEvent else {
+                return false
+            }
+        }
+        guard validArtifactPayload(event.payload, journal: event.journal) else {
+            return false
+        }
+
+        if event.payload["media_type"]?.stringValue == ObservedRepositoryReviewFormat.mediaType {
+            guard let turn = event.turn,
+                  turn == state.scalar.activeTurn,
+                  let action = event.action,
+                  let actionSnapshot = state.action(for: action.actionID),
+                  state.isActionActive(action.actionID),
+                  let startedEvent = actionSnapshot.startedEvent?.sourceEvent,
+                  event.causedByEventID == startedEvent else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func validArtifactPayload(
+        _ payload: JSONValue, journal: JournalRef
+    ) -> Bool {
+        guard let object = payload.objectValue,
+              object.keys.allSatisfy({ artifactPayloadKeys.contains($0) }),
+              let artifactID = object["artifact_id"]?.stringValue,
+              validArtifactText(
+                  artifactID, maximumBytes: WorkServiceBounds.maxIdentityCharacters),
+              let label = object["label"]?.stringValue,
+              validArtifactText(label, maximumBytes: WorkServiceBounds.maxDiagnosticCharacters),
+              let available = object["available"]?.boolValue else {
+            return false
+        }
+
+        let mediaType: String?
+        if let value = object["media_type"] {
+            guard let decoded = value.stringValue,
+                  validArtifactText(
+                      decoded, maximumBytes: WorkServiceBounds.maxDiagnosticCharacters) else {
+                return false
+            }
+            mediaType = decoded
+        } else {
+            mediaType = nil
+        }
+
+        let byteCount: Int?
+        if let value = object["byte_count"] {
+            guard let decoded = value.intValue,
+                  (0...maximumArtifactBodyBytes).contains(decoded) else {
+                return false
+            }
+            byteCount = decoded
+        } else {
+            byteCount = nil
+        }
+
+        let digest: String?
+        if let value = object["digest"] {
+            guard let decoded = value.stringValue,
+                  ContextBodyStore.isValidDigest(decoded) else {
+                return false
+            }
+            digest = decoded
+        } else {
+            digest = nil
+        }
+
+        let bodyReference: TimelineBodyReference?
+        if let value = object["body_reference"] {
+            guard let data = try? JSONEncoder().encode(value),
+                  let decoded = try? JSONDecoder().decode(
+                      TimelineBodyReference.self, from: data),
+                  validArtifactBodyReference(decoded, journal: journal) else {
+                return false
+            }
+            bodyReference = decoded
+        } else {
+            bodyReference = nil
+        }
+
+        guard available == (bodyReference != nil) else { return false }
+        if let bodyReference {
+            return bodyReference.mediaType == mediaType
+                && bodyReference.byteCount == byteCount
+                && bodyReference.digest == digest
+                && byteCount != nil
+                && digest != nil
+        }
+        return byteCount == nil && digest == nil
     }
 
     /// Action lifecycle records use a typed vocabulary where present. Omitting optional intent

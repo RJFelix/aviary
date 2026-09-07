@@ -79,10 +79,15 @@ private func transportFixture(
     try await service.register(.init(
         work: transportWork, journal: transportJournal, cursor: cursor,
         configuration: .init(modelID: "transport-model"),
-        artifacts: [WorkServiceArtifactDescriptor(
+        artifacts: [try WorkServiceArtifactDescriptor(
             artifactID: "artifact-1", work: transportWork, label: "transport artifact",
             mediaType: "text/plain", byteCount: body.data.count,
-            digest: body.reference.digest, bodyReference: body.reference)],
+            digest: body.reference.digest, available: true,
+            bodyReference: body.reference,
+            sourceEvent: EventRef(journal: transportJournal, eventID: "transport-artifact-event"),
+            session: SessionRef("transport-artifact-session"),
+            sessionAttachment: SessionAttachmentRef("transport-artifact-attachment"),
+            run: RunRef("transport-artifact-run"))],
         bodies: [body.reference: body.data]))
     let server = WorkServiceUnixSocketServer(
         endpoint: WorkServiceTransportEndpoint(path: path), service: service,
@@ -1953,8 +1958,12 @@ func test_workServiceTransportResponseSemanticBounds() throws {
         XCTAssertTrue(true)
     }
 
-    let validArtifact = WorkServiceArtifactDescriptor(
-        artifactID: "semantic-artifact", work: transportWork, label: "artifact")
+    let validArtifact = try WorkServiceArtifactDescriptor(
+        artifactID: "semantic-artifact", work: transportWork, label: "artifact",
+        sourceEvent: EventRef(journal: transportJournal, eventID: "semantic-artifact-event"),
+        session: SessionRef("semantic-artifact-session"),
+        sessionAttachment: SessionAttachmentRef("semantic-artifact-attachment"),
+        run: RunRef("semantic-artifact-run"))
     let validDescriptor = try WorkServiceWorkDescriptor(
         work: transportWork, journal: transportJournal, recordedDisposition: .reusable,
         execution: .idle, currentRun: nil, currentRunSession: nil,

@@ -76,6 +76,10 @@ public actor Agent {
         /// must equal the retained schema exactly. A code/MCP capability drift is a recovery
         /// boundary, not permission to send a subtly different request under a “resumed” label.
         public var expectedResumeTools: [ChatTool]?
+        /// Optional post-turn observer installed by native Work launches. Keeping this explicit
+        /// lets focused engine tests avoid consulting the caller's repository while production
+        /// runs can publish one bounded, attributable-to-neither-party review artifact.
+        public var repositoryReviewer: ObservedRepositoryReviewer?
 
         public init(
             model: ModelSpec, cwd: String, systemPrompt: String,
@@ -83,7 +87,8 @@ public actor Agent {
             maxIterations: Int = 40, maxTokens: Int? = nil, reasoningEffort: String? = nil,
             compactAtContextShare: Double = 0.7, maxDepth: Int = 3, depth: Int = 0,
             goal: Goal? = nil, resumedHistory: [ChatMessage] = [],
-            expectedResumeTools: [ChatTool]? = nil
+            expectedResumeTools: [ChatTool]? = nil,
+            repositoryReviewer: ObservedRepositoryReviewer? = nil
         ) {
             self.model = model
             self.cwd = cwd
@@ -98,6 +103,7 @@ public actor Agent {
             self.goal = goal
             self.resumedHistory = resumedHistory
             self.expectedResumeTools = expectedResumeTools
+            self.repositoryReviewer = repositoryReviewer
         }
     }
 
@@ -125,8 +131,8 @@ public actor Agent {
         case modelChanged(provider: String, model: String)
         /// The run would have finished, but is holding for work it asked to be told about.
         case awaitingDispatched(count: Int)
-        /// The loop stopped. `reason` is why, in words, because "it stopped" is never enough
-        /// to act on.
+        /// The loop stopped, including any post-model observation and native Turn commit.
+        /// `reason` explains why. A native Turn emits one terminal event after it settles.
         case finished(reason: String)
         case failed(String)
     }
@@ -160,6 +166,14 @@ public actor Agent {
     private var messages: [ChatMessage] = []
     private var observer: Observer?
     private var cancelled = false
+    /// The post-turn repository observation is part of the active agent loop even though it runs
+    /// outside the provider/runtime. Retaining its Task lets accepted Cancel and explicit End
+    /// interrupt bounded Git work instead of waiting for the observer deadline.
+    private var repositoryReviewTask: Task<ObservedRepositoryReview, Never>?
+    /// Model-loop completion is provisional until post-model actions and the native Turn settle.
+    /// Keep terminal presentation events here while all nonterminal streaming events flow through.
+    private var defersNativeTerminalEvent = false
+    private var deferredNativeTerminalEvent: Event?
     /// A cancellation can arrive in the hand-off window after the driver admits a turn but
     /// before `send` has entered this actor. Preserve it for that next send instead of losing
     /// it when the normal per-send reset runs.
@@ -836,6 +850,7 @@ public actor Agent {
 
     public func cancel() {
         cancelled = true
+        repositoryReviewTask?.cancel()
     }
 
     /// Request the narrow cancellation scope this agent can actually provide.
@@ -846,7 +861,10 @@ public actor Agent {
     @discardableResult
     public func requestCancellation(_ scope: SessionCancellationScope) -> Bool {
         guard Self.supportedCancellationScopes.contains(scope) else { return false }
-        if activeSendCount > 0 { cancelled = true }
+        if activeSendCount > 0 {
+            cancelled = true
+            repositoryReviewTask?.cancel()
+        }
         else if firstPrompt == nil { cancelNextSend = true }
         else { return false }
         return true
@@ -1077,15 +1095,31 @@ public actor Agent {
         _ operation: () async -> SendOutcome
     ) async -> SendOutcome {
         guard let nativeJournal else { return await operation() }
+        defersNativeTerminalEvent = true
+        deferredNativeTerminalEvent = nil
         let turn = TurnRef(UUID().uuidString.lowercased())
         do {
             _ = try await nativeJournal.startTurn(turn)
         } catch {
             latchNativeJournalFailure("the turn start", error)
-            return .failed(journalFailureDetail ?? error.localizedDescription)
+            return publishNativeTerminalOutcome(
+                .failed(journalFailureDetail ?? error.localizedDescription))
         }
 
-        let outcome = await operation()
+        var outcome = await operation()
+        if case .completed = outcome {
+            if cancelled || Task.isCancelled {
+                await recordPostWorkCancellation()
+                outcome = .cancelled
+            } else if !(await recordObservedRepositoryReview(turn: turn)) {
+                let detail = journalFailureDetail
+                    ?? "The observed repository review could not be recorded."
+                outcome = .failed(detail)
+            } else if cancelled || Task.isCancelled {
+                await recordPostWorkCancellation()
+                outcome = .cancelled
+            }
+        }
         switch outcome {
         case .completed:
             break
@@ -1104,9 +1138,105 @@ public actor Agent {
             _ = try await nativeJournal.finishTurn(turn, outcome: turnOutcome)
         } catch {
             latchNativeJournalFailure("the turn outcome", error)
-            return .failed(journalFailureDetail ?? error.localizedDescription)
+            return publishNativeTerminalOutcome(
+                .failed(journalFailureDetail ?? error.localizedDescription))
+        }
+        return publishNativeTerminalOutcome(outcome)
+    }
+
+    private func publishNativeTerminalOutcome(_ outcome: SendOutcome) -> SendOutcome {
+        let provisional = deferredNativeTerminalEvent
+        deferredNativeTerminalEvent = nil
+        defersNativeTerminalEvent = false
+        switch outcome {
+        case .completed:
+            if case .finished(let reason) = provisional {
+                emit(.finished(reason: reason))
+            } else {
+                emit(.finished(reason: "stopped"))
+            }
+        case .cancelled:
+            emit(.finished(reason: "cancelled"))
+        case .failed(let detail):
+            emit(.failed(detail))
         }
         return outcome
+    }
+
+    /// Observe the current Git working tree while the exact Run and Turn are still active, then
+    /// retain the typed result as an artifact. This is deliberately an observation of current
+    /// repository state—not attribution to the turn, not a checkpoint, and not a containment
+    /// boundary. A truthful timeout/conflict/failure artifact completes its action with the
+    /// matching outcome; only a journal failure prevents the enclosing turn from completing.
+    private func recordObservedRepositoryReview(turn: TurnRef) async -> Bool {
+        guard let nativeJournal, let reviewer = config.repositoryReviewer else { return true }
+        let permit = await beginNativeAction(
+            kind: .artifact,
+            intent: "Observe the current repository working tree for review",
+            target: "git-working-tree",
+            metadata: ["media_type": .string(ObservedRepositoryReview.mediaType)])
+        guard let permit else { return false }
+
+        let reviewTask = Task {
+            await reviewer.observe(
+                cwd: URL(fileURLWithPath: config.cwd, isDirectory: true),
+                runID: nativeJournal.run.runID,
+                turnID: turn.turnID)
+        }
+        repositoryReviewTask = reviewTask
+        let review = await withTaskCancellationHandler(operation: {
+            await reviewTask.value
+        }, onCancel: {
+            reviewTask.cancel()
+        })
+        repositoryReviewTask = nil
+        do {
+            let identity = Data(
+                "aviary.repository-review-v2\u{0}\(nativeJournal.run.runID)\u{0}\(turn.turnID)".utf8)
+            let artifactID = "repository-review-v2."
+                + AviarySHA256.hash(data: identity).description
+            _ = try await nativeJournal.recordArtifact(
+                artifactID: artifactID,
+                label: "Observed repository review",
+                mediaType: ObservedRepositoryReview.mediaType,
+                body: try review.encoded(),
+                action: permit.action,
+                provenance: permit.startedCommit.eventRef)
+        } catch {
+            _ = await finishNativeAction(
+                permit, state: .failed, retrySafety: .safe,
+                failureKind: .infrastructure)
+            latchNativeJournalFailure("the observed repository review artifact", error)
+            return false
+        }
+
+        switch review.status {
+        case .timedOut:
+            return await finishNativeAction(
+                permit, state: .failed, retrySafety: .safe, failureKind: .timeout)
+        case .cancelled:
+            return await finishNativeAction(
+                permit, state: .canceled, retrySafety: .safe, failureKind: .cancellation)
+        case .failed:
+            return await finishNativeAction(
+                permit, state: .failed, retrySafety: .safe,
+                failureKind: .infrastructure)
+        case .unstableConflict:
+            return await finishNativeAction(
+                permit, state: .failed, retrySafety: .safe, failureKind: .task)
+        case .clean, .changes, .notRepository, .bounded:
+            return await finishNativeAction(
+                permit, state: .succeeded, retrySafety: .safe)
+        }
+    }
+
+    /// The model may finish immediately before an accepted Cancel reaches this actor. The
+    /// repository observer is still an action boundary inside the durable Turn, so cancellation
+    /// there must produce the same legacy outcome evidence as cancellation between tool actions.
+    private func recordPostWorkCancellation() async {
+        _ = await appendJournalNote("Stopped at your request.")
+        await recordOutcome(.cancelled, detail: "Stopped at your request.")
+        emit(.finished(reason: "cancelled"))
     }
 
     private func refusePendingInputs(reason: String) async {
@@ -2142,6 +2272,15 @@ public actor Agent {
     private var recordedRequests = 0
 
     private func emit(_ event: Event) {
+        if defersNativeTerminalEvent {
+            switch event {
+            case .finished, .failed:
+                deferredNativeTerminalEvent = event
+                return
+            default:
+                break
+            }
+        }
         observer?(event)
     }
 }

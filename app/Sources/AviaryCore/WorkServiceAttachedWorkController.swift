@@ -359,6 +359,39 @@ public struct WorkServiceConversationHistoryWindow: Codable, Hashable, Sendable 
     }
 }
 
+/// The result of one authenticated, bounded artifact-body read.  The descriptor and reference
+/// are retained alongside the bytes so a caller cannot accidentally present bytes without the
+/// exact metadata that was authenticated for them.
+public struct WorkServiceFetchedArtifact: Hashable, Sendable {
+    public let descriptor: WorkServiceArtifactDescriptor
+    public let reference: TimelineBodyReference
+    public let data: Data
+
+    public init(descriptor: WorkServiceArtifactDescriptor,
+                reference: TimelineBodyReference, data: Data) {
+        self.descriptor = descriptor
+        self.reference = reference
+        self.data = data
+    }
+
+    public var artifactID: String { descriptor.artifactID }
+    public var label: String { descriptor.label }
+    public var mediaType: String? { descriptor.mediaType }
+}
+
+/// Deliberately coarse, local-only outcomes for an on-demand artifact read.  Remote diagnostics
+/// are never surfaced here: a caller gets a useful distinction without receiving host paths,
+/// storage details, or untrusted error text.
+public enum WorkServiceAttachedArtifactLoadError: Error, Equatable, Sendable {
+    case omitted
+    case incomplete
+    case notFound
+    case tooLarge
+    case malformed
+    case capabilityDenied(WorkServiceCapability)
+    case invalidOptions
+}
+
 public enum WorkServiceAttachedWorkControllerError: Error, Equatable, Sendable {
     case invalidSeed
     case invalidOptions
@@ -394,6 +427,20 @@ public actor WorkServiceAttachedWorkController {
         let omissions: [WorkServiceOmission]
         let basePrefixDigest: String?
         let prefixDigest: String?
+    }
+
+    private struct ArtifactProjectionFence: Hashable, Sendable {
+        let descriptor: WorkServiceWorkDescriptor
+        let attachment: WorkServiceClientAttachment
+        let actionable: Bool
+        let workCompleteness: WorkServiceSourceCompleteness
+        let sessionCompleteness: WorkServiceSourceCompleteness
+        let checkpointAwaitingHostValidation: Bool
+        let requiresRefresh: Bool
+
+        var capabilities: Set<WorkServiceCapability> {
+            actionable ? attachment.authorization.granted : []
+        }
     }
 
     private enum StagedSnapshot: Sendable {
@@ -716,6 +763,166 @@ public actor WorkServiceAttachedWorkController {
             connectivity: connectivityStorage,
             pendingCommand: pendingStorage?.projection, lastReceipt: lastReceiptStorage,
             requiresRefresh: requiresRefreshStorage)
+    }
+
+    /// Fetch the newest descriptor in the current bounded projection whose media type exactly
+    /// matches `mediaType`, then resolve its retained body in bounded chunks.  The descriptor
+    /// order is the host's publication order. Selection requires a complete artifact index;
+    /// an omitted window cannot prove that a matching retained row is the newest.
+    public func fetchArtifactBody(
+        mediaType: String,
+        maxTotalBytes: Int = 16 * 1024 * 1024
+    ) async throws -> WorkServiceFetchedArtifact {
+        guard !mediaType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              mediaType.utf8.count <= WorkServiceBounds.maxDiagnosticCharacters,
+              mediaType.utf8.allSatisfy({ $0 >= 0x20 && $0 != 0x7f }),
+              mediaType.unicodeScalars.allSatisfy({
+                  $0.value != 0x2028 && $0.value != 0x2029
+              }),
+              maxTotalBytes > 0,
+              maxTotalBytes <= WorkServiceAttachedWorkControllerBounds.maxArtifactBodyBytes else {
+            throw WorkServiceAttachedArtifactLoadError.invalidOptions
+        }
+
+        let fence = try currentArtifactProjectionFence()
+        // The wire contract does not promise whether an omitted window retained its newest or
+        // oldest rows. A retained media match therefore cannot establish the latest review.
+        guard !descriptorStorage.omissions.contains(where: Self.isArtifactIndexOmission) else {
+            throw WorkServiceAttachedArtifactLoadError.omitted
+        }
+        guard let selected = descriptorStorage.artifacts.last(where: {
+            $0.mediaType == mediaType
+        }) else {
+            throw WorkServiceAttachedArtifactLoadError.notFound
+        }
+        guard Self.validArtifactProvenance(
+            selected, work: work, journal: journal) else {
+            throw WorkServiceAttachedArtifactLoadError.malformed
+        }
+        guard selected.available else {
+            throw WorkServiceAttachedArtifactLoadError.omitted
+        }
+        guard let selectedReference = selected.bodyReference else {
+            throw WorkServiceAttachedArtifactLoadError.omitted
+        }
+        guard selectedReference.authority == journal,
+              selectedReference.mediaType == selected.mediaType,
+              selectedReference.byteCount == selected.byteCount,
+              selectedReference.digest == selected.digest,
+              let expectedByteCount = selected.byteCount,
+              let expectedDigest = selected.digest,
+              expectedByteCount >= 0 else {
+            throw WorkServiceAttachedArtifactLoadError.malformed
+        }
+        guard expectedByteCount <= maxTotalBytes else {
+            throw WorkServiceAttachedArtifactLoadError.tooLarge
+        }
+        guard Self.validDigest(expectedDigest) else {
+            throw WorkServiceAttachedArtifactLoadError.malformed
+        }
+
+        let request = WorkServiceArtifactRequest(
+            work: work, journal: journal, attachment: attachmentStorage.attachment,
+            client: client, artifactID: selected.artifactID)
+        let fetched: WorkServiceArtifactDescriptor
+        do {
+            fetched = try await service.fetchArtifact(request)
+        } catch {
+            try validateArtifactProjectionFence(fence)
+            throw Self.mapArtifactLoadError(error)
+        }
+        try validateArtifactProjectionFence(fence)
+        guard fetched == selected,
+              fetched.work == work,
+              fetched.artifactID == selected.artifactID,
+              fetched.available,
+              fetched.bodyReference == selectedReference,
+              fetched.bodyReference?.authority == journal,
+              fetched.mediaType == selected.mediaType,
+              fetched.byteCount == selected.byteCount,
+              fetched.digest == selected.digest else {
+            throw WorkServiceAttachedArtifactLoadError.malformed
+        }
+
+        var offset = 0
+        var body = Data()
+        while true {
+            guard offset <= expectedByteCount, offset <= maxTotalBytes else {
+                throw WorkServiceAttachedArtifactLoadError.tooLarge
+            }
+            let remaining = maxTotalBytes - offset
+            guard remaining > 0 || expectedByteCount == offset else {
+                throw WorkServiceAttachedArtifactLoadError.tooLarge
+            }
+            let limit = min(WorkServiceBounds.maxBodyChunkBytes, max(1, remaining))
+            let bodyRequest = WorkServiceBodyRequest(
+                work: work, journal: journal, attachment: attachmentStorage.attachment,
+                client: client, reference: selectedReference, offset: offset, limit: limit)
+            let response: WorkServiceBodyResponse
+            do {
+                response = try await service.fetchBody(bodyRequest)
+            } catch {
+                try validateArtifactProjectionFence(fence)
+                throw Self.mapArtifactLoadError(error)
+            }
+            try validateArtifactProjectionFence(fence)
+            guard response.reference == selectedReference,
+                  response.reference.authority == journal,
+                  response.reference.mediaType == selected.mediaType,
+                  response.reference.byteCount == selected.byteCount,
+                  response.reference.digest == selected.digest,
+                  response.offset == offset else {
+                throw WorkServiceAttachedArtifactLoadError.malformed
+            }
+            if response.status == .unavailable {
+                guard response.data == nil, response.nextOffset == nil else {
+                    throw WorkServiceAttachedArtifactLoadError.malformed
+                }
+                throw WorkServiceAttachedArtifactLoadError.omitted
+            }
+            guard response.status == .retained,
+                  let chunk = response.data,
+                  chunk.count <= WorkServiceBounds.maxBodyChunkBytes,
+                  chunk.count <= limit else {
+                throw WorkServiceAttachedArtifactLoadError.malformed
+            }
+            let (next, overflow) = offset.addingReportingOverflow(chunk.count)
+            guard !overflow else { throw WorkServiceAttachedArtifactLoadError.malformed }
+            guard next <= expectedByteCount else {
+                throw WorkServiceAttachedArtifactLoadError.malformed
+            }
+            let expectedNextOffset: Int?
+            if next < expectedByteCount {
+                guard chunk.count > 0 else {
+                    throw WorkServiceAttachedArtifactLoadError.malformed
+                }
+                expectedNextOffset = next
+            } else {
+                expectedNextOffset = nil
+            }
+            guard response.nextOffset == expectedNextOffset else {
+                throw WorkServiceAttachedArtifactLoadError.malformed
+            }
+            if chunk.isEmpty && expectedByteCount != 0 {
+                throw WorkServiceAttachedArtifactLoadError.malformed
+            }
+            if body.count > maxTotalBytes - chunk.count {
+                throw WorkServiceAttachedArtifactLoadError.tooLarge
+            }
+            body.append(chunk)
+            guard let nextOffset = response.nextOffset else { break }
+            guard nextOffset > offset else {
+                throw WorkServiceAttachedArtifactLoadError.malformed
+            }
+            offset = nextOffset
+        }
+
+        guard body.count == expectedByteCount,
+              Self.digest(body) == expectedDigest else {
+            throw WorkServiceAttachedArtifactLoadError.malformed
+        }
+        try validateArtifactProjectionFence(fence)
+        return WorkServiceFetchedArtifact(descriptor: fetched, reference: selectedReference, data: body)
     }
 
     /// Read and atomically publish the newest complete pair of Work and Session projections.
@@ -3146,6 +3353,126 @@ public actor WorkServiceAttachedWorkController {
         return .transportFailure
     }
 
+    private func currentArtifactProjectionFence()
+        throws -> ArtifactProjectionFence {
+        guard attachmentActionableStorage else {
+            throw WorkServiceAttachedArtifactLoadError.incomplete
+        }
+        guard descriptorStorage.work == work,
+              descriptorStorage.journal == journal,
+              let listed = descriptorStorage.attachments.first(where: {
+                  $0.attachment == attachmentStorage.attachment
+              }),
+              listed == attachmentStorage else {
+            throw WorkServiceAttachedArtifactLoadError.incomplete
+        }
+        guard attachmentStorage.authorization.granted.contains(.inspectArtifacts) else {
+            throw WorkServiceAttachedArtifactLoadError.capabilityDenied(.inspectArtifacts)
+        }
+        guard workCompletenessStorage == .complete,
+              sessionCompletenessStorage == .complete,
+              !checkpointAwaitingHostValidationStorage,
+              !requiresRefreshStorage,
+              projection().isCanonical else {
+            throw WorkServiceAttachedArtifactLoadError.incomplete
+        }
+        return ArtifactProjectionFence(
+            descriptor: descriptorStorage, attachment: attachmentStorage,
+            actionable: attachmentActionableStorage,
+            workCompleteness: workCompletenessStorage,
+            sessionCompleteness: sessionCompletenessStorage,
+            checkpointAwaitingHostValidation: checkpointAwaitingHostValidationStorage,
+            requiresRefresh: requiresRefreshStorage)
+    }
+
+    private func validateArtifactProjectionFence(_ fence: ArtifactProjectionFence) throws {
+        let current = try currentArtifactProjectionFence()
+        guard current == fence else {
+            throw WorkServiceAttachedArtifactLoadError.incomplete
+        }
+    }
+
+    private static func isArtifactIndexOmission(_ omission: WorkServiceOmission) -> Bool {
+        omission.category == "artifacts" || omission.category == "artifact_index"
+            || omission.category == "artifact_identity_scope"
+    }
+
+    private static func mapArtifactLoadError(_ error: Error)
+        -> WorkServiceAttachedArtifactLoadError {
+        if let error = error as? WorkServiceAttachedArtifactLoadError { return error }
+        if case WorkServiceProtocolError.invalidRequest = error { return .malformed }
+        if case WorkServiceProtocolError.artifactNotFound = error { return .notFound }
+        if case WorkServiceProtocolError.sourceIncomplete = error { return .incomplete }
+        if case WorkServiceProtocolError.attachmentNotFound = error { return .incomplete }
+        if case WorkServiceProtocolError.capabilityDenied(let capability) = error {
+            return .capabilityDenied(capability)
+        }
+        if case WorkServiceTransportError.remote(let code, _) = error {
+            switch code {
+            case .artifactNotFound: return .notFound
+            case .invalidRequest: return .malformed
+            case .sourceIncomplete: return .incomplete
+            case .attachmentNotFound: return .incomplete
+            case .capabilityDenied: return .capabilityDenied(.inspectArtifacts)
+            default: return .incomplete
+            }
+        }
+        return .incomplete
+    }
+
+    private static func validDigest(_ digest: String) -> Bool {
+        guard digest.hasPrefix("sha256:") else { return false }
+        let hex = digest.dropFirst("sha256:".count)
+        guard hex.count == 64 else { return false }
+        return hex.allSatisfy { $0.isNumber || ("a"..."f").contains($0) }
+    }
+
+    private static func validArtifactProvenance(
+        _ artifact: WorkServiceArtifactDescriptor,
+        work: WorkRef,
+        journal: JournalRef
+    ) -> Bool {
+        guard artifact.work == work,
+              artifact.sourceEvent.journal == journal,
+              artifact.sourceEvent.journal.owner == .work(work),
+              !artifact.sourceEvent.eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !artifact.session.sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !artifact.sessionAttachment.attachmentID
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !artifact.run.runID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              artifact.available == (artifact.bodyReference != nil) else {
+            return false
+        }
+        if let reference = artifact.bodyReference {
+            guard reference.authority == journal,
+                  reference.mediaType == artifact.mediaType,
+                  reference.byteCount == artifact.byteCount,
+                  reference.digest == artifact.digest,
+                  let count = reference.byteCount, count >= 0,
+                  let digest = reference.digest, validDigest(digest) else {
+                return false
+            }
+        } else if artifact.byteCount != nil || artifact.digest != nil {
+            return false
+        }
+        if artifact.mediaType == ObservedRepositoryReviewFormat.mediaType {
+            guard artifact.turn != nil, artifact.action != nil,
+                  let cause = artifact.causedByEventID,
+                  cause.journal == journal else { return false }
+        }
+        if artifact.action != nil {
+            guard let cause = artifact.causedByEventID,
+                  cause.journal == journal else { return false }
+        }
+        return true
+    }
+
+    private static func digest(_ data: Data) -> String {
+        "sha256:" + AviarySHA256.hash(data: data).map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+
     private static func valueDigest(_ value: String?) -> String? {
         guard let value else { return nil }
         let digest = AviarySHA256.hash(data: Data(value.utf8))
@@ -3170,6 +3497,7 @@ private enum WorkServiceAttachedWorkControllerBounds {
     static let maxPages = 256
     static let maxOmissions = 32
     static let maxDiagnostics = 32
+    static let maxArtifactBodyBytes = 16 * 1024 * 1024
     static let historyWindowMessages = 768
     static let historyWindowBytes = 512 * 1024
 }

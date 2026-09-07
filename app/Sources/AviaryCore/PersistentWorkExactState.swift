@@ -539,6 +539,7 @@ public struct PersistentWorkExactState: Sendable {
         func eventSequence(for id: String) -> Int? { seen[id]?.sequence }
         func hasObservedRun(_ id: String) -> Bool { runs[id] != nil }
         func action(for id: String) -> WorkActionSnapshot? { actions[id]?.action }
+        func isActionActive(_ id: String) -> Bool { actions[id]?.isActive == true }
         func handle(for id: String) -> WorkHandleSnapshot? { handles[id]?.handle }
         func sessionAttachment(for id: String) -> WorkSessionAttachmentSnapshot? { attachments[id]?.attachment }
         func activeSessionAttachmentCount(for session: SessionRef) -> Int { attachmentCounts[session.sessionID]?.count ?? 0 }

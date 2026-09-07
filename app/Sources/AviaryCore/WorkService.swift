@@ -620,15 +620,57 @@ public struct WorkServiceWorkDescriptor: Codable, Hashable, Sendable {
     private static func validArtifactFields(
         _ artifact: WorkServiceArtifactDescriptor, journal: JournalRef
     ) -> Bool {
-        guard artifact.byteCount.map({ $0 >= 0 }) ?? true else { return false }
-        guard let reference = artifact.bodyReference else { return true }
+        guard WorkServiceText.valid(artifact.sourceEvent.eventID),
+              artifact.sourceEvent.eventID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
+              artifact.sourceEvent.journal == journal,
+              WorkServiceText.valid(artifact.session.sessionID),
+              artifact.session.sessionID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
+              WorkServiceText.valid(artifact.sessionAttachment.attachmentID),
+              artifact.sessionAttachment.attachmentID.utf8.count
+                <= WorkServiceBounds.maxIdentityCharacters,
+              WorkServiceText.valid(artifact.run.runID),
+              artifact.run.runID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
+              artifact.turn.map({
+                  WorkServiceText.valid($0.turnID)
+                      && $0.turnID.utf8.count <= WorkServiceBounds.maxIdentityCharacters
+              }) ?? true,
+              artifact.action.map({
+                  WorkServiceText.valid($0.actionID)
+                      && $0.actionID.utf8.count <= WorkServiceBounds.maxIdentityCharacters
+              }) ?? true,
+              artifact.causedByEventID.map({
+                  WorkServiceText.valid($0.eventID)
+                      && $0.eventID.utf8.count <= WorkServiceBounds.maxIdentityCharacters
+                      && ($0.journal == journal
+                          || ($0.journal.kind == .session
+                              && $0.journal.owner == .session(artifact.session)
+                              && $0.journal.authority.authorityID == journal.authority.authorityID))
+              }) ?? true,
+              artifact.available == (artifact.bodyReference != nil) else { return false }
+        if artifact.action != nil {
+            guard let cause = artifact.causedByEventID, cause.journal == journal else {
+                return false
+            }
+        }
+        if artifact.mediaType == ObservedRepositoryReviewFormat.mediaType {
+            guard artifact.turn != nil, artifact.action != nil,
+                  let cause = artifact.causedByEventID, cause.journal == journal else {
+                return false
+            }
+        }
+        guard let reference = artifact.bodyReference else {
+            return artifact.byteCount == nil && artifact.digest == nil
+        }
         return reference.authority == journal
             && WorkServiceText.valid(reference.referenceID)
             && reference.referenceID.utf8.count <= WorkServiceBounds.maxIdentityCharacters
             && (reference.mediaType?.utf8.count ?? 0)
                 <= WorkServiceBounds.maxDiagnosticCharacters
+            && artifact.mediaType == reference.mediaType
+            && artifact.byteCount == reference.byteCount
+            && artifact.digest == reference.digest
             && (reference.byteCount.map { $0 >= 0 } ?? false)
-            && (reference.digest.map(ContextBodyStore.isValidDigest) ?? true)
+            && (reference.digest.map(ContextBodyStore.isValidDigest) ?? false)
     }
 
     public init(from decoder: Decoder) throws {
@@ -1590,6 +1632,7 @@ public struct WorkServiceArtifactDescriptor: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case artifactID, work, label, mediaType, byteCount, digest, available
         case bodyReference, metadataWasTruncated
+        case sourceEvent, session, sessionAttachment, run, turn, action, causedByEventID
     }
 
     public let artifactID: String
@@ -1603,37 +1646,204 @@ public struct WorkServiceArtifactDescriptor: Codable, Hashable, Sendable {
     public let bodyReference: TimelineBodyReference?
     /// Display metadata may be shortened, but the loss is never implicit.
     public let metadataWasTruncated: Bool
+    /// The exact Work-journal event that published this artifact descriptor.
+    public let sourceEvent: EventRef
+    /// The Session and Session attachment carried by the publishing event envelope.
+    public let session: SessionRef
+    public let sessionAttachment: SessionAttachmentRef
+    /// The exact Run carried by the publishing event envelope.
+    public let run: RunRef
+    /// Optional turn/action envelope identities. Repository reviews require both.
+    public let turn: TurnRef?
+    public let action: ActionRef?
+    /// The exact causal event carried by the publishing event envelope, if any.
+    public let causedByEventID: EventRef?
 
     public init(artifactID: String, work: WorkRef, label: String,
                 mediaType: String? = nil, byteCount: Int? = nil, digest: String? = nil,
-                available: Bool = true, bodyReference: TimelineBodyReference? = nil,
-                metadataWasTruncated: Bool = false) {
+                available: Bool = false, bodyReference: TimelineBodyReference? = nil,
+                metadataWasTruncated: Bool = false,
+                sourceEvent: EventRef,
+                session: SessionRef,
+                sessionAttachment: SessionAttachmentRef,
+                run: RunRef,
+                turn: TurnRef? = nil,
+                action: ActionRef? = nil,
+                causedByEventID: EventRef? = nil) throws {
+        func valid(_ value: String, maximumBytes: Int) -> Bool {
+            WorkServiceText.valid(value)
+                && value.utf8.count <= maximumBytes
+                && value.unicodeScalars.allSatisfy { scalar in
+                    scalar.value > 0x1F
+                        && !(0x7F...0x9F).contains(scalar.value)
+                        && scalar.value != 0x2028
+                        && scalar.value != 0x2029
+                }
+        }
+        let validCause = causedByEventID.map { cause in
+            guard valid(cause.eventID, maximumBytes: WorkServiceBounds.maxIdentityCharacters)
+            else { return false }
+            if cause.journal == sourceEvent.journal { return true }
+            return cause.journal.kind == .session
+                && cause.journal.owner == .session(session)
+                && cause.journal.authority.authorityID == work.workHostID
+        } ?? true
+        var invalidReasons: [String] = []
+        if !valid(artifactID, maximumBytes: WorkServiceBounds.maxIdentityCharacters) {
+            invalidReasons.append("artifactID")
+        }
+        if !valid(work.workHostID, maximumBytes: WorkServiceBounds.maxIdentityCharacters) {
+            invalidReasons.append("workHostID")
+        }
+        if !valid(work.workID, maximumBytes: WorkServiceBounds.maxIdentityCharacters) {
+            invalidReasons.append("workID")
+        }
+        if !valid(label, maximumBytes: WorkServiceBounds.maxDiagnosticCharacters) {
+            invalidReasons.append("label")
+        }
+        if mediaType.map({ valid($0, maximumBytes: WorkServiceBounds.maxDiagnosticCharacters) }) == false {
+            invalidReasons.append("mediaType")
+        }
+        if digest.map(ContextBodyStore.isValidDigest) == false {
+            invalidReasons.append("digest")
+        }
+        if !valid(sourceEvent.eventID, maximumBytes: WorkServiceBounds.maxIdentityCharacters) {
+            invalidReasons.append("sourceEvent")
+        }
+        if sourceEvent.journal.owner != .work(work) {
+            invalidReasons.append("sourceEvent.work")
+        }
+        if sourceEvent.journal.authority.authorityID != work.workHostID {
+            invalidReasons.append("sourceEvent.authority")
+        }
+        if !valid(session.sessionID, maximumBytes: WorkServiceBounds.maxIdentityCharacters) {
+            invalidReasons.append("session")
+        }
+        if !valid(sessionAttachment.attachmentID,
+                  maximumBytes: WorkServiceBounds.maxIdentityCharacters) {
+            invalidReasons.append("sessionAttachment")
+        }
+        if !valid(run.runID, maximumBytes: WorkServiceBounds.maxIdentityCharacters) {
+            invalidReasons.append("run")
+        }
+        if turn.map({ valid($0.turnID, maximumBytes: WorkServiceBounds.maxIdentityCharacters) }) == false {
+            invalidReasons.append("turn")
+        }
+        if action.map({ valid($0.actionID, maximumBytes: WorkServiceBounds.maxIdentityCharacters) }) == false {
+            invalidReasons.append("action")
+        }
+        if !validCause { invalidReasons.append("cause") }
+        if available != (bodyReference != nil) { invalidReasons.append("availability") }
+        guard invalidReasons.isEmpty else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "artifact provenance, identity, and availability must be canonical: "
+                    + invalidReasons.joined(separator: ","))
+        }
+        if let bodyReference {
+            guard bodyReference.authority == sourceEvent.journal,
+                  valid(bodyReference.referenceID,
+                        maximumBytes: WorkServiceBounds.maxIdentityCharacters),
+                  bodyReference.mediaType == mediaType,
+                  bodyReference.byteCount == byteCount,
+                  bodyReference.digest == digest,
+                  let bodyByteCount = bodyReference.byteCount,
+                  bodyByteCount >= 0,
+                  let bodyDigest = bodyReference.digest,
+                  ContextBodyStore.isValidDigest(bodyDigest) else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "artifact body metadata must exactly match bodyReference")
+            }
+        } else {
+            guard byteCount == nil, digest == nil else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "unavailable artifacts cannot carry byteCount or digest")
+            }
+        }
+        if action != nil {
+            guard let cause = causedByEventID, cause.journal == sourceEvent.journal else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "an artifact Action requires an exact Work causedByEventID")
+            }
+        }
+        if mediaType == ObservedRepositoryReviewFormat.mediaType {
+            guard turn != nil, action != nil,
+                  let cause = causedByEventID, cause.journal == sourceEvent.journal else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "repository-review artifacts require Turn, Action, and Work cause")
+            }
+        }
         self.artifactID = artifactID
         self.work = work
-        self.metadataWasTruncated = metadataWasTruncated || [label, mediaType, digest]
-            .contains { ($0?.utf8.count ?? 0) > WorkServiceBounds.maxDiagnosticCharacters }
-        self.label = WorkServiceText.bound(label) ?? "artifact"
-        self.mediaType = WorkServiceText.bound(mediaType)
+        self.metadataWasTruncated = metadataWasTruncated
+        self.label = label
+        self.mediaType = mediaType
         self.byteCount = byteCount
-        self.digest = WorkServiceText.bound(digest)
+        self.digest = digest
         self.available = available
         self.bodyReference = bodyReference
+        self.sourceEvent = sourceEvent
+        self.session = session
+        self.sessionAttachment = sessionAttachment
+        self.run = run
+        self.turn = turn
+        self.action = action
+        self.causedByEventID = causedByEventID
     }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(
-            artifactID: try values.decode(String.self, forKey: .artifactID),
-            work: try values.decode(WorkRef.self, forKey: .work),
-            label: try values.decode(String.self, forKey: .label),
-            mediaType: try values.decodeIfPresent(String.self, forKey: .mediaType),
-            byteCount: try values.decodeIfPresent(Int.self, forKey: .byteCount),
-            digest: try values.decodeIfPresent(String.self, forKey: .digest),
-            available: try values.decodeIfPresent(Bool.self, forKey: .available) ?? true,
-            bodyReference: try values.decodeIfPresent(
-                TimelineBodyReference.self, forKey: .bodyReference),
-            metadataWasTruncated: try values.decodeIfPresent(
-                Bool.self, forKey: .metadataWasTruncated) ?? false)
+        let available = try values.decode(Bool.self, forKey: .available)
+        let bodyReference = try values.decodeIfPresent(
+            TimelineBodyReference.self, forKey: .bodyReference)
+        guard available == (bodyReference != nil) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .available, in: values,
+                debugDescription: "artifact availability must exactly match bodyReference")
+        }
+        let byteCount = try values.decodeIfPresent(Int.self, forKey: .byteCount)
+        let digest = try values.decodeIfPresent(String.self, forKey: .digest)
+        let mediaType = try values.decodeIfPresent(String.self, forKey: .mediaType)
+        if let bodyReference {
+            guard mediaType == bodyReference.mediaType,
+                  byteCount == bodyReference.byteCount,
+                  digest == bodyReference.digest else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .bodyReference, in: values,
+                    debugDescription: "artifact metadata must exactly match bodyReference")
+            }
+        } else {
+            guard byteCount == nil, digest == nil else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .bodyReference, in: values,
+                    debugDescription: "unavailable artifacts cannot carry byteCount or digest")
+            }
+        }
+        do {
+            try self.init(
+                artifactID: try values.decode(String.self, forKey: .artifactID),
+                work: try values.decode(WorkRef.self, forKey: .work),
+                label: try values.decode(String.self, forKey: .label),
+                mediaType: mediaType,
+                byteCount: byteCount,
+                digest: digest,
+                available: available,
+                bodyReference: bodyReference,
+                metadataWasTruncated: try values.decodeIfPresent(
+                    Bool.self, forKey: .metadataWasTruncated) ?? false,
+                sourceEvent: try values.decode(EventRef.self, forKey: .sourceEvent),
+                session: try values.decode(SessionRef.self, forKey: .session),
+                sessionAttachment: try values.decode(
+                    SessionAttachmentRef.self, forKey: .sessionAttachment),
+                run: try values.decode(RunRef.self, forKey: .run),
+                turn: try values.decodeIfPresent(TurnRef.self, forKey: .turn),
+                action: try values.decodeIfPresent(ActionRef.self, forKey: .action),
+                causedByEventID: try values.decodeIfPresent(
+                    EventRef.self, forKey: .causedByEventID))
+        } catch {
+            throw DecodingError.dataCorruptedError(
+                forKey: .artifactID, in: values,
+                debugDescription: "artifact descriptor failed canonical provenance validation")
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1647,6 +1857,13 @@ public struct WorkServiceArtifactDescriptor: Codable, Hashable, Sendable {
         try values.encode(available, forKey: .available)
         try values.encodeIfPresent(bodyReference, forKey: .bodyReference)
         try values.encode(metadataWasTruncated, forKey: .metadataWasTruncated)
+        try values.encode(sourceEvent, forKey: .sourceEvent)
+        try values.encode(session, forKey: .session)
+        try values.encode(sessionAttachment, forKey: .sessionAttachment)
+        try values.encode(run, forKey: .run)
+        try values.encodeIfPresent(turn, forKey: .turn)
+        try values.encodeIfPresent(action, forKey: .action)
+        try values.encodeIfPresent(causedByEventID, forKey: .causedByEventID)
     }
 }
 

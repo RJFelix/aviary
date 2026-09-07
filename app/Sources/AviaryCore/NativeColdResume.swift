@@ -210,10 +210,6 @@ public enum NativeColdResume {
             let unexplainedActivity = postBoundaryActivity.filter {
                 $0.action != boundaryAction
             }
-            if !unexplainedActivity.isEmpty {
-                throw NativeColdResumeError.workStateUnavailable(
-                    "post-context action activity has no later effective context manifest")
-            }
             let crossingEvents = postBoundaryActivity.filter { $0.action == boundaryAction }
             guard crossingEvents.count == 3,
                   let intent = crossingEvents.first(where: {
@@ -243,6 +239,16 @@ public enum NativeColdResume {
                }) {
                 throw NativeColdResumeError.workStateUnavailable(
                     "the successful context provider action has no reconstructable assistant response")
+            }
+            if !unexplainedActivity.isEmpty,
+               !isSettledObservedRepositoryReviewAction(
+                   unexplainedActivity,
+                   workEvents: workEvents,
+                   workSnapshot: workSnapshot,
+                   workJournal: workJournal,
+                   run: boundaryRun) {
+                throw NativeColdResumeError.workStateUnavailable(
+                    "post-context action activity has no later effective context manifest")
             }
 
         guard !sessionEvents.contains(where: {
@@ -715,6 +721,149 @@ public enum NativeColdResume {
         event.type == TimelineEventType.actionIntent
             || event.type == TimelineEventType.actionStarted
             || event.type == TimelineEventType.actionOutcome
+    }
+
+    /// A repository review is the one post-model action that does not change the effective model
+    /// context or claim that a runtime/external effect can be reconstructed. Keep this exemption
+    /// tied to the complete producer shape: an arbitrary artifact action, a spoofed media marker,
+    /// or a partial/mutated outcome remains an unreconstructable post-context effect.
+    private static func isSettledObservedRepositoryReviewAction(
+        _ actionEvents: [TimelineEvent],
+        workEvents: [TimelineEvent],
+        workSnapshot: WorkSnapshot,
+        workJournal: JournalRef,
+        run: RunRef
+    ) -> Bool {
+        guard actionEvents.count == 3,
+              let action = actionEvents.first?.action,
+              actionEvents.allSatisfy({ $0.action == action && $0.run == run }),
+              let intent = actionEvents.first(where: {
+                  $0.type == TimelineEventType.actionIntent
+              }),
+              let started = actionEvents.first(where: {
+                  $0.type == TimelineEventType.actionStarted
+              }),
+              let outcome = actionEvents.first(where: {
+                  $0.type == TimelineEventType.actionOutcome
+              }),
+              let turn = intent.turn,
+              started.turn == turn,
+              outcome.turn == turn,
+              intent.actor == started.actor,
+              started.actor == outcome.actor,
+              intent.causedByEventID == nil,
+              intent.parentActivityID == nil,
+              started.causedByEventID == EventRef(
+                  journal: workJournal, eventID: intent.eventID),
+              started.parentActivityID == EventRef(
+                  journal: workJournal, eventID: intent.eventID),
+              outcome.causedByEventID == EventRef(
+                  journal: workJournal, eventID: started.eventID),
+              outcome.parentActivityID == EventRef(
+                  journal: workJournal, eventID: started.eventID),
+              intent.sequence < started.sequence,
+              started.sequence < outcome.sequence,
+              let intentHostSequence = intent.hostSequence,
+              let startedHostSequence = started.hostSequence,
+              let outcomeHostSequence = outcome.hostSequence,
+              intentHostSequence < startedHostSequence,
+              startedHostSequence < outcomeHostSequence,
+              intent.declaredDomains == [.work, .externalEffects],
+              started.declaredDomains == [.work, .externalEffects],
+              outcome.declaredDomains == [.work, .externalEffects],
+              let intentPayload = intent.payload.objectValue,
+              Set(intentPayload.keys)
+                == ["state", "kind", "intent", "target", "scope", "metadata"],
+              intentPayload["state"]?.stringValue == ActionExecutionState.proposed.rawValue,
+              intentPayload["kind"]?.stringValue == ActionKind.artifact.rawValue,
+              intentPayload["intent"]?.stringValue
+                == "Observe the current repository working tree for review",
+              intentPayload["target"]?.stringValue == "git-working-tree",
+              intentPayload["scope"]?.stringValue == "run",
+              intentPayload["metadata"]?.objectValue == [
+                  "media_type": .string(ObservedRepositoryReviewFormat.mediaType)
+              ],
+              let startedPayload = started.payload.objectValue,
+              Set(startedPayload.keys) == ["state", "kind"],
+              startedPayload["state"]?.stringValue == ActionExecutionState.running.rawValue,
+              startedPayload["kind"]?.stringValue == ActionKind.artifact.rawValue,
+              let outcomePayload = outcome.payload.objectValue,
+              outcomePayload["kind"]?.stringValue == ActionKind.artifact.rawValue,
+              outcomePayload["retry_safety"]?.stringValue == ActionRetrySafety.safe.rawValue,
+              let outcomeState = outcomePayload["state"]?.stringValue.flatMap(
+                  ActionExecutionState.init(rawValue:)),
+              [.succeeded, .failed, .canceled].contains(outcomeState),
+              let projected = workSnapshot.actions[action.actionID],
+              projected.kind == .artifact,
+              projected.intent == "Observe the current repository working tree for review",
+              projected.target == "git-working-tree",
+              projected.scope == "run",
+              projected.metadata == [
+                  "media_type": .string(ObservedRepositoryReviewFormat.mediaType)
+              ],
+              !projected.metadataWasTruncated,
+              projected.state == outcomeState,
+              projected.state.isTerminal,
+              projected.retrySafety == .safe,
+              projected.intentEvent?.sourceEvent == EventRef(
+                  journal: workJournal, eventID: intent.eventID),
+              projected.startedEvent?.sourceEvent == EventRef(
+                  journal: workJournal, eventID: started.eventID),
+              projected.outcomeEvent?.sourceEvent == EventRef(
+                  journal: workJournal, eventID: outcome.eventID) else {
+            return false
+        }
+
+        let expectedOutcomeKeys: Set<String>
+        switch outcomeState {
+        case .succeeded:
+            guard projected.failureKind == nil else { return false }
+            expectedOutcomeKeys = ["state", "retry_safety", "kind"]
+        case .failed:
+            guard let failureKind = outcomePayload["failure_kind"]?.stringValue.flatMap(
+                      ActionFailureKind.init(rawValue:)),
+                  [.timeout, .infrastructure, .task].contains(failureKind),
+                  projected.failureKind == failureKind else {
+                return false
+            }
+            expectedOutcomeKeys = ["state", "retry_safety", "kind", "failure_kind"]
+        case .canceled:
+            guard outcomePayload["failure_kind"]?.stringValue
+                    == ActionFailureKind.cancellation.rawValue,
+                  projected.failureKind == .cancellation else {
+                return false
+            }
+            expectedOutcomeKeys = ["state", "retry_safety", "kind", "failure_kind"]
+        default:
+            return false
+        }
+        guard Set(outcomePayload.keys) == expectedOutcomeKeys else { return false }
+
+        let scopedEvents = workEvents.filter { $0.run == run && $0.action == action }
+        guard scopedEvents.count == 4,
+              let artifact = scopedEvents.first(where: {
+                  $0.type == TimelineEventType.artifact
+              }),
+              artifact.turn == turn,
+              artifact.sequence > started.sequence,
+              artifact.sequence < outcome.sequence,
+              let artifactHostSequence = artifact.hostSequence,
+              artifactHostSequence > startedHostSequence,
+              artifactHostSequence < outcomeHostSequence,
+              artifact.causedByEventID == EventRef(
+                  journal: workJournal, eventID: started.eventID),
+              artifact.declaredDomains == [.work],
+              artifact.payload["label"]?.stringValue == "Observed repository review",
+              artifact.payload["media_type"]?.stringValue
+                == ObservedRepositoryReviewFormat.mediaType,
+              artifact.payload["available"]?.boolValue == true,
+              artifact.payload["body_reference"] != nil else {
+            return false
+        }
+        let artifactIdentity = Data(
+            "aviary.repository-review-v2\u{0}\(run.runID)\u{0}\(turn.turnID)".utf8)
+        return artifact.payload["artifact_id"]?.stringValue
+            == "repository-review-v2." + AviarySHA256.hash(data: artifactIdentity).description
     }
 
     /// The provider must never receive an orphaned result or an unanswered call manufactured by

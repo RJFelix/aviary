@@ -1963,11 +1963,71 @@ public enum WorkServiceTransportCodec {
         if let expectedWork, artifactWork != expectedWork {
             throw WorkServiceTransportError.invalidResponse
         }
+        let sourceEvent = try decodeResponseValue(
+            EventRef.self, from: object["sourceEvent"] ?? .null)
+        guard sourceEvent.journal.owner == .work(artifactWork),
+              sourceEvent.journal.authority.authorityID == artifactWork.workHostID else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        try validateIdentity(object["session"]?["sessionID"], required: true)
+        try validateIdentity(object["sessionAttachment"]?["attachmentID"], required: true)
+        try validateIdentity(object["run"]?["runID"], required: true)
+        try validateIdentity(object["turn"]?["turnID"])
+        try validateIdentity(object["action"]?["actionID"])
+        try validateEventRef(object["causedByEventID"])
+        if let causeValue = object["causedByEventID"], !causeValue.isNull {
+            let cause = try decodeResponseValue(EventRef.self, from: causeValue)
+            let session = try decodeResponseValue(
+                SessionRef.self, from: object["session"] ?? .null)
+            guard cause.journal == sourceEvent.journal
+                    || (cause.journal.kind == .session
+                        && cause.journal.owner == .session(session)
+                        && cause.journal.authority.authorityID == artifactWork.workHostID) else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
+        if let actionValue = object["action"], !actionValue.isNull {
+            guard let causeValue = object["causedByEventID"], !causeValue.isNull,
+                  (try? decodeResponseValue(EventRef.self, from: causeValue))?.journal
+                    == sourceEvent.journal else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
         try validateDiagnostic(object["label"])
         try validateDiagnostic(object["mediaType"])
         try validateDiagnostic(object["digest"])
         try validateNonnegativeInteger(object["byteCount"])
         try validateBodyReference(object["bodyReference"])
+        guard let available = object["available"]?.boolValue else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        if let referenceValue = object["bodyReference"], !referenceValue.isNull {
+            let reference = try decodeResponseValue(
+                TimelineBodyReference.self, from: referenceValue)
+            guard available,
+                  reference.authority == sourceEvent.journal,
+                  object["mediaType"]?.stringValue == reference.mediaType,
+                  object["byteCount"]?.intValue == reference.byteCount,
+                  object["digest"]?.stringValue == reference.digest,
+                  reference.byteCount != nil,
+                  reference.digest.map(ContextBodyStore.isValidDigest) == true else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        } else {
+            guard !available,
+                  object["byteCount"] == nil || object["byteCount"]?.isNull == true,
+                  object["digest"] == nil || object["digest"]?.isNull == true else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
+        if object["mediaType"]?.stringValue == ObservedRepositoryReviewFormat.mediaType {
+            guard object["turn"] != nil, object["action"] != nil,
+                  let causeValue = object["causedByEventID"], !causeValue.isNull,
+                  (try? decodeResponseValue(EventRef.self, from: causeValue))?.journal
+                    == sourceEvent.journal else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+        }
         if let truncated = object["metadataWasTruncated"], truncated.boolValue == nil {
             throw WorkServiceTransportError.invalidResponse
         }

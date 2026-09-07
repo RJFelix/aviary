@@ -385,7 +385,8 @@ private func testPersistentWorkExactStateReopenPreservesActiveRunOwner() throws 
     state = try PersistentWorkExactState(map: map, root: turned.root)
     let turnFinished = try state.apply(persistentEvent(
         TimelineEventType.turnFinished, "owner-6", 6, previous: "owner-5", run: run,
-        turn: turn))
+        turn: turn,
+        payload: .object(["outcome": .string(RunTurnOutcome.completed.rawValue)])))
     state = try PersistentWorkExactState(map: map, root: turnFinished.root)
     let finished = try state.apply(persistentEvent(
         TimelineEventType.runFinished, "owner-7", 7, previous: "owner-6", run: run,

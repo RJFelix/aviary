@@ -246,6 +246,7 @@ struct RunPane: View {
     @State private var confirmEndRun = false
     @State private var showInputDeliveryReview = false
     @State private var showCockpitInspector = false
+    @State private var showRepositoryReview = false
     @State private var composerDelivery: ComposerDelivery = .steerNext
 
     private enum ComposerDelivery: String, CaseIterable, Identifiable {
@@ -377,6 +378,10 @@ struct RunPane: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Run context and working state")
         }
+        .sheet(isPresented: $showRepositoryReview) {
+            RepositoryReviewView(run: run)
+                .frame(minWidth: 560, idealWidth: 760, minHeight: 620, idealHeight: 780)
+        }
     }
 
     private var runHeader: some View {
@@ -405,6 +410,28 @@ struct RunPane: View {
                          tint: (run.exitCode ?? 0) == 0 ? .secondary : Design.danger)
                 }
                 Spacer()
+                if run.canLoadServiceRepositoryReview {
+                    ViewThatFits(in: .horizontal) {
+                        Button {
+                            showRepositoryReview = true
+                        } label: {
+                            Label("Review changes", systemImage: "doc.text.magnifyingglass")
+                        }
+                        Button {
+                            showRepositoryReview = true
+                        } label: {
+                            Image(systemName: "doc.text.magnifyingglass")
+                                .frame(width: 20, height: 20)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .accessibilityLabel("Review changes")
+                    .accessibilityHint(
+                        "Opens the bounded current working-tree observation for this Work")
+                    .help("Review current working-tree changes")
+                }
                 if !showsInspector {
                     Button {
                         showCockpitInspector = true

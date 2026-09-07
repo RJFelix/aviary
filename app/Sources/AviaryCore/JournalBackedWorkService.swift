@@ -1085,6 +1085,8 @@ enum JournalBackedWorkServiceCommandEvidence {
 public actor JournalBackedWorkService: WorkServiceClient {
     public typealias LaunchManifestStore = JournalBackedWorkServiceLaunchManifestStore
 
+    private static let maximumArtifactBodyBytes = 8 * 1024 * 1024
+
     public let home: AgentHome
     public let host: WorkHostRef
     public let hostInstance: WorkHostInstanceRef
@@ -2511,15 +2513,26 @@ public actor JournalBackedWorkService: WorkServiceClient {
             work: request.work, journal: request.journal, attachment: request.attachment,
             client: request.client, capability: .inspectArtifacts)
         let sourceArtifacts = try uniqueArtifacts(in: source)
+        let artifactIndexOmitted = !source.workCache.artifactDescriptorsComplete
+            || source.workCache.artifactDescriptorCount != sourceArtifacts.count
+        if artifactIndexOmitted {
+            // Even a matching row in the newest bounded window is not an exact identity proof:
+            // the same ID may have appeared before that row was retained.  Scan the canonical
+            // stream for this requested ID and fail closed on a duplicate.
+            guard let artifact = try streamFindArtifact(
+                entry: source.workCache,
+                journal: source.workJournal,
+                expectedURL: home.timelineV2WorkJournalURL(request.work),
+                work: request.work,
+                artifactID: request.artifactID) else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            return artifact
+        }
         guard let artifact = sourceArtifacts.first(where: {
             $0.artifactID == request.artifactID
         }) else {
-            // A bounded or unclassifiable artifact index cannot prove that the requested ID is
-            // absent. Never turn missing local cache coverage into a canonical not-found claim.
-            guard source.workCache.artifactDescriptorsComplete,
-                  source.workCache.artifactDescriptorCount == sourceArtifacts.count else {
-                throw WorkServiceProtocolError.sourceIncomplete
-            }
+            // A complete descriptor index proves that this identity is absent.
             throw WorkServiceProtocolError.artifactNotFound
         }
         return artifact
@@ -2539,16 +2552,22 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 || request.reference.authority == attachment.sessionJournal else {
             throw WorkServiceProtocolError.journalMismatch
         }
-        if try uniqueArtifacts(in: source).contains(where: {
-            $0.bodyReference == request.reference
-        })
-                && !attachment.authorization.allows(.inspectArtifacts) {
-            throw WorkServiceProtocolError.capabilityDenied(.inspectArtifacts)
-        }
-        guard try sourceContainsBodyReference(source, request.reference) else {
+        switch try classifyBodyReference(source, request.reference) {
+        case .artifact:
+            guard attachment.authorization.allows(.inspectArtifacts) else {
+                throw WorkServiceProtocolError.capabilityDenied(.inspectArtifacts)
+            }
+        case .context:
+            break
+        case .absent:
             return WorkServiceBodyResponse(reference: request.reference, status: .unavailable,
                                            offset: request.offset,
                                            diagnostic: "body reference is not present in canonical journals")
+        case .unknown:
+            // A Work-journal body is sensitive by default.  Do not turn a reference embedded in
+            // an event shape outside the narrow producer vocabulary into either observe access
+            // or an inspect-artifacts success.
+            throw WorkServiceProtocolError.sourceIncomplete
         }
         let store = ContextBodyStore(home: home)
         guard let body = try? store.read(request.reference) else {
@@ -4582,11 +4601,24 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let artifactEventCount = records.reduce(into: 0) { count, record in
             if record.event.type == TimelineEventType.artifact { count += 1 }
         }
-        let decodedArtifacts = records.compactMap {
-            artifactDescriptor(from: $0.event, work: work)
+        var artifacts: [WorkServiceArtifactDescriptor] = []
+        var retainedArtifactIDs: Set<String> = []
+        var artifactIdentityConflict = false
+        var decodedArtifactCount = 0
+        for record in records {
+            guard let artifact = artifactDescriptor(from: record.event, work: work) else { continue }
+            decodedArtifactCount += 1
+            if retainedArtifactIDs.contains(artifact.artifactID) {
+                artifactIdentityConflict = true
+            }
+            if artifacts.count >= JournalReadLimits.maximumCachedArtifacts,
+               let evicted = artifacts.first {
+                artifacts.removeFirst()
+                retainedArtifactIDs.remove(evicted.artifactID)
+            }
+            artifacts.append(artifact)
+            retainedArtifactIDs.insert(artifact.artifactID)
         }
-        let decodedArtifactIDs = Set(decodedArtifacts.map(\.artifactID))
-        let artifacts = Array(decodedArtifacts.prefix(JournalReadLimits.maximumCachedArtifacts))
         let fingerprint = JournalFileFingerprint(
             identity: JournalFileIdentity(
                 device: live.fileFingerprint.device, inode: live.fileFingerprint.inode,
@@ -4651,11 +4683,10 @@ public actor JournalBackedWorkService: WorkServiceClient {
             runStartedIDs: live.runStartedIDs, runFinishedIDs: live.runFinishedIDs,
             runFinishedExists: !live.runFinishedIDs.isEmpty,
             artifactDescriptors: artifacts,
-            artifactDescriptorCount: decodedArtifacts.count,
+            artifactDescriptorCount: decodedArtifactCount,
             artifactDescriptorsComplete: live.isFullyResident
-                && artifactEventCount == decodedArtifacts.count,
-            artifactDescriptorIdentityConflict:
-                decodedArtifactIDs.count != decodedArtifacts.count,
+                && artifactEventCount == decodedArtifactCount,
+            artifactDescriptorIdentityConflict: artifactIdentityConflict,
             bodyReferences: references,
             bodyReferenceCount: references.count,
             bodyReferencesComplete: live.isFullyResident)
@@ -4849,6 +4880,10 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 - sourceArtifacts.count)
         if artifactOmitted > 0 {
             omissions.append(WorkServiceOmission(category: "artifacts", count: artifactOmitted))
+            // The bounded display window proves only local identity uniqueness. Exact lookup
+            // scans the full canonical source for the requested ID before returning a descriptor.
+            omissions.append(WorkServiceOmission(
+                category: "artifact_identity_scope", count: artifactOmitted))
         }
         if !source.workCache.artifactDescriptorsComplete {
             // A live nonresident observation proves the Work reducer/cursor but intentionally
@@ -5886,7 +5921,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 }
                 if case .work(let artifactWork) = journal.owner,
                    record.event.type == TimelineEventType.artifact {
-                    if let artifact = artifactDescriptor(from: record.event, work: artifactWork) {
+                    if let artifact = artifactDescriptor(
+                        from: record.event, work: artifactWork) {
                         if retainedArtifactIDs.contains(artifact.artifactID) {
                             artifactDescriptorIdentityConflict = true
                         }
@@ -5896,10 +5932,14 @@ public actor JournalBackedWorkService: WorkServiceClient {
                             throw WorkServiceProtocolError.sourceIncomplete
                         }
                         artifactDescriptorCount = nextArtifactCount
-                        if artifactDescriptors.count < JournalReadLimits.maximumCachedArtifacts {
-                            artifactDescriptors.append(artifact)
-                            retainedArtifactIDs.insert(artifact.artifactID)
+                        if artifactDescriptors.count >= JournalReadLimits.maximumCachedArtifacts {
+                            if let evicted = artifactDescriptors.first {
+                                retainedArtifactIDs.remove(evicted.artifactID)
+                            }
+                            artifactDescriptors.removeFirst()
                         }
+                        artifactDescriptors.append(artifact)
+                        retainedArtifactIDs.insert(artifact.artifactID)
                     } else {
                         artifactDescriptorsComplete = false
                     }
@@ -6262,48 +6302,59 @@ public actor JournalBackedWorkService: WorkServiceClient {
     private func artifactDescriptor(
         from event: TimelineEvent, work: WorkRef
     ) -> WorkServiceArtifactDescriptor? {
-        // Artifact payloads have intentionally remained an opaque producer contract. Expose only
-        // references that decode as the bounded service descriptor, and never synthesize one
-        // from a filename or local path.
+        // Callers first authenticate the canonical Work reduction, which verifies the active
+        // Run owner and exact action-start cause for artifact events. Do not maintain a second
+        // action-history authority here: it diverges between resident and streamed reads.
+        // This projection validates the bounded wire shape, never a filename or local path.
         guard event.type == TimelineEventType.artifact,
+              event.journal.owner == .work(work),
+              event.work == work,
+              event.workHost == WorkHostRef(work.workHostID),
+              let session = event.session,
+              let sessionAttachment = event.sessionAttachment,
+              let run = event.run,
               let object = event.payload.objectValue,
               let id = object["artifact_id"]?.stringValue,
-              validArtifactIdentity(id) else { return nil }
-        let label: String
-        if let value = object["label"] {
-            guard let decoded = value.stringValue else { return nil }
-            label = decoded
-        } else {
-            label = id
+              validArtifactIdentity(id),
+              validArtifactIdentity(session.sessionID),
+              validArtifactIdentity(sessionAttachment.attachmentID),
+              validArtifactIdentity(run.runID),
+              event.turn.map({ validArtifactIdentity($0.turnID) }) ?? true,
+              event.action.map({ validArtifactIdentity($0.actionID) }) ?? true,
+              event.causedByEventID.map({ validArtifactCause($0, event: event) }) ?? true,
+              let label = object["label"]?.stringValue,
+              validArtifactLabel(label) else { return nil }
+        if event.action != nil {
+            guard let cause = event.causedByEventID, cause.journal == event.journal else {
+                return nil
+            }
         }
         let mediaType: String?
         if let value = object["media_type"] {
-            guard let decoded = value.stringValue else { return nil }
+            guard let decoded = value.stringValue, validArtifactMediaType(decoded) else {
+                return nil
+            }
             mediaType = decoded
         } else {
             mediaType = nil
         }
         let byteCount: Int?
         if let value = object["byte_count"] {
-            guard let decoded = value.intValue, decoded >= 0 else { return nil }
+            guard let decoded = value.intValue,
+                  (0...Self.maximumArtifactBodyBytes).contains(decoded) else { return nil }
             byteCount = decoded
         } else {
             byteCount = nil
         }
         let contentDigest: String?
         if let value = object["digest"] {
-            guard let decoded = value.stringValue else { return nil }
+            guard let decoded = value.stringValue,
+                  ContextBodyStore.isValidDigest(decoded) else { return nil }
             contentDigest = decoded
         } else {
             contentDigest = nil
         }
-        let available: Bool
-        if let value = object["available"] {
-            guard let decoded = value.boolValue else { return nil }
-            available = decoded
-        } else {
-            available = true
-        }
+        guard let available = object["available"]?.boolValue else { return nil }
         let body: TimelineBodyReference?
         if let value = object["body_reference"] {
             guard let data = try? JSONEncoder().encode(value),
@@ -6316,16 +6367,69 @@ public actor JournalBackedWorkService: WorkServiceClient {
         } else {
             body = nil
         }
-        return WorkServiceArtifactDescriptor(
+        if available != (body != nil) {
+            return nil
+        }
+        if let body {
+            guard body.byteCount == byteCount,
+                  body.digest == contentDigest,
+                  body.mediaType == mediaType,
+                  body.byteCount != nil,
+                  body.digest != nil else { return nil }
+        } else {
+            guard byteCount == nil, contentDigest == nil else { return nil }
+        }
+        if mediaType == ObservedRepositoryReviewFormat.mediaType {
+            guard event.turn != nil, event.action != nil,
+                  let cause = event.causedByEventID,
+                  cause.journal == event.journal else { return nil }
+        }
+        return try? WorkServiceArtifactDescriptor(
             artifactID: id, work: work, label: label,
             mediaType: mediaType, byteCount: byteCount, digest: contentDigest,
-            available: body != nil || available,
-            bodyReference: body)
+            available: body != nil,
+            bodyReference: body,
+            sourceEvent: EventRef(journal: event.journal, eventID: event.eventID),
+            session: session, sessionAttachment: sessionAttachment, run: run,
+            turn: event.turn, action: event.action,
+            causedByEventID: event.causedByEventID)
+    }
+
+    private func validArtifactCause(_ cause: EventRef, event: TimelineEvent) -> Bool {
+        guard validArtifactIdentity(cause.eventID) else { return false }
+        guard cause.journal == event.journal else {
+            guard cause.journal.kind == .session,
+                  cause.journal.owner == .session(event.session ?? SessionRef("")),
+                  cause.journal.authority.authorityID == event.work?.workHostID else {
+                return false
+            }
+            return true
+        }
+        return true
     }
 
     private func validArtifactIdentity(_ value: String) -> Bool {
-        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && value.utf8.count <= WorkServiceBounds.maxIdentityCharacters
+        validArtifactText(value, maximumBytes: WorkServiceBounds.maxIdentityCharacters)
+    }
+
+    private func validArtifactLabel(_ value: String) -> Bool {
+        validArtifactText(value, maximumBytes: WorkServiceBounds.maxDiagnosticCharacters)
+    }
+
+    private func validArtifactMediaType(_ value: String) -> Bool {
+        validArtifactText(value, maximumBytes: WorkServiceBounds.maxDiagnosticCharacters)
+    }
+
+    private func validArtifactText(_ value: String, maximumBytes: Int) -> Bool {
+        !value.isEmpty
+            && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value.utf8.count <= maximumBytes
+            && value.unicodeScalars.allSatisfy { scalar in
+                scalar.value > 0x1F
+                    && !(0x7F...0x9F).contains(scalar.value)
+                    && scalar.value != 0x2028
+                    && scalar.value != 0x2029
+            }
     }
 
     private func validArtifactBodyReference(
@@ -6333,10 +6437,10 @@ public actor JournalBackedWorkService: WorkServiceClient {
     ) -> Bool {
         reference.authority == journal
             && validArtifactIdentity(reference.referenceID)
-            && (reference.mediaType?.utf8.count ?? 0)
-                <= WorkServiceBounds.maxDiagnosticCharacters
-            && (reference.byteCount.map { $0 >= 0 } ?? false)
-            && (reference.digest.map(ContextBodyStore.isValidDigest) ?? true)
+            && (reference.mediaType.map(validArtifactMediaType) ?? true)
+            && (reference.byteCount.map { (0...Self.maximumArtifactBodyBytes).contains($0) } ?? false)
+            && (reference.digest.map(ContextBodyStore.isValidDigest) ?? false)
+            && (reference.digest.map { reference.referenceID == $0 } ?? false)
     }
 
     private func collectBodyReferences(in value: JSONValue) -> Set<TimelineBodyReference> {
@@ -6354,6 +6458,100 @@ public actor JournalBackedWorkService: WorkServiceClient {
         }
         visit(value)
         return result
+    }
+
+    /// Work journals have two body-bearing producer shapes.  Artifact bodies must come from a
+    /// valid bounded artifact descriptor; observe-only command bodies must be direct references
+    /// on a recognized input command that explicitly carries session input.  A reference in any
+    /// other Work event is intentionally unknown, even when the retained body itself exists.
+    private func workBodyReferenceKind(
+        in event: TimelineEvent, work: WorkRef, reference: TimelineBodyReference
+    ) -> CanonicalBodyReferenceKind? {
+        guard collectBodyReferences(in: event.payload).contains(reference) else { return nil }
+        if event.type == TimelineEventType.artifact {
+            guard artifactDescriptor(
+                from: event, work: work
+            )?.bodyReference == reference else {
+                return .unknown
+            }
+            return .artifact
+        }
+        guard event.type == TimelineEventType.commandAccepted,
+              let object = event.payload.objectValue,
+              let encoded = object["body_reference"],
+              let data = try? JSONEncoder().encode(encoded),
+              let direct = try? JSONDecoder().decode(
+                  TimelineBodyReference.self, from: data),
+              direct == reference,
+              object["carries_session_input"]?.boolValue == true,
+              let commandKind = object["command_kind"]?.stringValue.flatMap(
+                  CanonicalCommandKind.init(rawValue:)),
+              [.start, .send, .steer, .queue, .queueFollowUp].contains(commandKind)
+        else {
+            return .unknown
+        }
+        return .context
+    }
+
+    private enum CanonicalBodyReferenceKind {
+        case artifact
+        case context
+        case absent
+        case unknown
+    }
+
+    /// Classify a body reference from canonical event evidence, rather than from the bounded
+    /// descriptor cache.  In particular, an artifact beyond the 128-row display window must
+    /// still be recognized as an artifact before ``fetchBody`` authorizes its bytes.  Nonresident
+    /// journals are scanned incrementally through the already fingerprinted descriptor; this
+    /// never materializes the complete JSONL source in an auxiliary array.
+    private func classifyBodyReference(
+        _ source: CanonicalSource, _ reference: TimelineBodyReference
+    ) throws -> CanonicalBodyReferenceKind {
+        if reference.authority == source.workJournal {
+            let cache = source.workCache
+            if cache.isFullyResident {
+                var sawArtifact = false
+                var sawContext = false
+                var sawUnknown = false
+                for record in cache.result.records {
+                    guard let kind = workBodyReferenceKind(
+                        in: record.event, work: source.registration.reservation.work,
+                        reference: reference) else { continue }
+                    switch kind {
+                    case .artifact:
+                        // Content-addressed body bytes may be shared by multiple distinct
+                        // artifact descriptors.  Each descriptor keeps its own provenance;
+                        // only mixing artifact and context producers remains ambiguous.
+                        sawArtifact = true
+                    case .context: sawContext = true
+                    case .unknown: sawUnknown = true
+                    case .absent: break
+                    }
+                }
+                if sawUnknown || (sawArtifact && sawContext) { return .unknown }
+                if sawArtifact { return .artifact }
+                return sawContext ? .context : .absent
+            }
+            // A bounded cache can prove absence only when it retained every body reference.
+            // Otherwise reread the exact canonical stream and classify the event type there.
+            if !cache.bodyReferences.contains(reference), cache.bodyReferencesComplete {
+                return .absent
+            }
+            return try streamClassifyBodyReference(
+                entry: cache,
+                journal: source.workJournal,
+                expectedURL: home.timelineV2WorkJournalURL(
+                    source.registration.reservation.work),
+                work: source.registration.reservation.work,
+                reference: reference)
+        }
+
+        // Artifact records belong to the Work journal. Session-owned references therefore retain
+        // the existing observe-only context/conversation policy while still requiring exact
+        // canonical evidence before any retained bytes are served.
+        guard try sourceContainsBodyReference(source, reference) else { return .absent }
+        return .context
     }
 
     private func sourceContainsBodyReference(
@@ -6437,6 +6635,115 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let after = try journalFileFingerprint(descriptor: descriptor, path: expectedURL, handle: handle)
         guard before == after else { throw WorkServiceProtocolError.sourceIncomplete }
         return found
+    }
+
+    private func streamClassifyBodyReference(
+        entry: JournalReadCacheEntry, journal: JournalRef, expectedURL: URL,
+        work: WorkRef,
+        reference: TimelineBodyReference
+    ) throws -> CanonicalBodyReferenceKind {
+        let path = expectedURL.standardizedFileURL.path
+        let descriptor = path.withCString {
+            AviaryPOSIX.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else { throw WorkServiceProtocolError.sourceIncomplete }
+        defer { _ = AviaryPOSIX.close(descriptor) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        let before = try journalFileFingerprint(descriptor: descriptor, path: expectedURL, handle: handle)
+        guard before == entry.fingerprint else { throw WorkServiceProtocolError.sourceIncomplete }
+        var sawContext = false
+        var sawArtifact = false
+        var sawUnknown = false
+        var offset = 0
+        var parser = TimelineJournalReaderState(
+            journal: journal, actor: actor, hostRecordedAt: Date())
+        while offset < before.byteCount {
+            let requested = min(JournalReadLimits.chunkBytes, before.byteCount - offset)
+            try handle.seek(toOffset: UInt64(offset))
+            guard let chunk = try handle.read(upToCount: requested), chunk.count == requested else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let final = offset + requested == before.byteCount
+            let parsed = parser.append(chunk, final: final)
+            guard parsed.quarantinedSuffix == nil,
+                  parsed.truncatedTail == nil || !final else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            for record in parsed.records {
+                guard let kind = workBodyReferenceKind(
+                    in: record.event,
+                    work: work,
+                    reference: reference) else { continue }
+                switch kind {
+                case .artifact:
+                    sawArtifact = true
+                case .context: sawContext = true
+                case .unknown: sawUnknown = true
+                case .absent: break
+                }
+            }
+            offset += requested
+        }
+        let after = try journalFileFingerprint(descriptor: descriptor, path: expectedURL, handle: handle)
+        guard before == after else { throw WorkServiceProtocolError.sourceIncomplete }
+        if sawUnknown || (sawArtifact && sawContext) { return .unknown }
+        if sawArtifact { return .artifact }
+        return sawContext ? .context : .absent
+    }
+
+    private func streamFindArtifact(
+        entry: JournalReadCacheEntry, journal: JournalRef, expectedURL: URL,
+        work: WorkRef, artifactID: String
+    ) throws -> WorkServiceArtifactDescriptor? {
+        let path = expectedURL.standardizedFileURL.path
+        let descriptor = path.withCString {
+            AviaryPOSIX.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else { throw WorkServiceProtocolError.sourceIncomplete }
+        defer { _ = AviaryPOSIX.close(descriptor) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        let before = try journalFileFingerprint(descriptor: descriptor, path: expectedURL, handle: handle)
+        guard before == entry.fingerprint else { throw WorkServiceProtocolError.sourceIncomplete }
+        var candidate: WorkServiceArtifactDescriptor?
+        var duplicate = false
+        var malformedMatch = false
+        var offset = 0
+        var parser = TimelineJournalReaderState(
+            journal: journal, actor: actor, hostRecordedAt: Date())
+        while offset < before.byteCount {
+            let requested = min(JournalReadLimits.chunkBytes, before.byteCount - offset)
+            try handle.seek(toOffset: UInt64(offset))
+            guard let chunk = try handle.read(upToCount: requested), chunk.count == requested else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let final = offset + requested == before.byteCount
+            let parsed = parser.append(chunk, final: final)
+            guard parsed.quarantinedSuffix == nil,
+                  parsed.truncatedTail == nil || !final else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            for record in parsed.records {
+                guard record.event.type == TimelineEventType.artifact else { continue }
+                guard let object = record.event.payload.objectValue,
+                      object["artifact_id"]?.stringValue == artifactID else { continue }
+                guard let artifact = artifactDescriptor(
+                    from: record.event, work: work
+                ) else {
+                    malformedMatch = true
+                    continue
+                }
+                if candidate == nil {
+                    candidate = artifact
+                } else {
+                    duplicate = true
+                }
+            }
+            offset += requested
+        }
+        let after = try journalFileFingerprint(descriptor: descriptor, path: expectedURL, handle: handle)
+        guard before == after else { throw WorkServiceProtocolError.sourceIncomplete }
+        guard !duplicate, !malformedMatch else { throw WorkServiceProtocolError.sourceIncomplete }
+        return candidate
     }
 
     private func terminalCommand(

@@ -334,7 +334,8 @@ final class InHouseDriver {
                 peerDelegate: peerDelegate,
                 selfDelegate: peerDelegate as? Agent.SelfDelegate,
                 identity: identity, reasoningEffort: reasoningEffort, writer: writer,
-                nativeJournal: nativeJournal, nativeResumeSeed: nativeResumeSeed))
+                nativeJournal: nativeJournal, nativeResumeSeed: nativeResumeSeed,
+                repositoryReviewer: ObservedRepositoryReviewer()))
         self.runner = runner
 
         let (events, eventContinuation) = AsyncStream<Agent.Event>.makeStream(

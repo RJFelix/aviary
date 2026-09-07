@@ -215,6 +215,33 @@ public struct WorkRunBinding: Codable, Hashable, Sendable {
     }
 }
 
+/// A receipt for one durably published artifact.  The envelope fields are repeated here so a
+/// producer can retain the exact Run/Turn/action/provenance association without rereading the
+/// Work journal merely to interpret a successful append.
+public struct RunJournalArtifactReceipt: Codable, Hashable, Sendable {
+    public let descriptor: WorkServiceArtifactDescriptor
+    public let commit: TimelineJournalCommit
+    public let run: RunRef
+    public let turn: TurnRef?
+    public let action: ActionRef?
+    public let provenance: EventRef?
+    public let links: [TimelineLink]
+
+    public init(
+        descriptor: WorkServiceArtifactDescriptor, commit: TimelineJournalCommit,
+        run: RunRef, turn: TurnRef?, action: ActionRef?, provenance: EventRef?,
+        links: [TimelineLink]
+    ) {
+        self.descriptor = descriptor
+        self.commit = commit
+        self.run = run
+        self.turn = turn
+        self.action = action
+        self.provenance = provenance
+        self.links = links
+    }
+}
+
 /// Exact genesis receipts for an idle Work. Both writers are closed before this value is
 /// returned, so a service can durably register the pair without retaining execution ownership.
 public struct IdleWorkCreation: Codable, Hashable, Sendable {
@@ -360,6 +387,32 @@ public enum RunJournalBundleError: LocalizedError, Equatable, Sendable {
 /// this process, but does not pretend that two files form a transaction. Every method keeps the
 /// latest known cursor for each file so partial prefixes remain inspectable after a failure.
 public actor RunJournalBundle {
+    private static let maximumArtifactBodyBytes = 8 * 1024 * 1024
+
+    private static func validArtifactText(
+        _ value: String, maximumBytes: Int
+    ) -> Bool {
+        !value.isEmpty
+            && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value.utf8.count <= maximumBytes
+            && value.unicodeScalars.allSatisfy { scalar in
+                scalar.value > 0x1F
+                    && !(0x7F...0x9F).contains(scalar.value)
+                    && scalar.value != 0x2028
+                    && scalar.value != 0x2029
+            }
+    }
+
+    private static func artifactIdentity(from event: TimelineEvent) -> String? {
+        guard event.type == TimelineEventType.artifact,
+              let object = event.payload.objectValue,
+              let artifactID = object["artifact_id"]?.stringValue,
+              validArtifactText(
+                  artifactID, maximumBytes: WorkServiceBounds.maxIdentityCharacters)
+        else { return nil }
+        return artifactID
+    }
+
     public nonisolated let session: SessionRef
     public nonisolated let work: WorkRef
     public nonisolated let workHost: WorkHostRef
@@ -380,6 +433,9 @@ public actor RunJournalBundle {
     private var activeActionIDs: Set<String>
     /// Action identities are single-use, including after a terminal outcome.
     private var seenActionIDs: Set<String>
+    /// Producer artifact identities are single-use across a Work journal, including after a cold
+    /// reopen.  The set is reconstructed from the already-read canonical Work prefix.
+    private var seenArtifactIDs: Set<String>
     private var commands: [String: WorkCommandSnapshot]
     private var commandAcceptedRefs: [String: EventRef]
     private var permits: [String: EffectPermit]
@@ -415,6 +471,7 @@ public actor RunJournalBundle {
         sessionCursor: JournalCursor?, workCursor: JournalCursor?,
         sessionEventCount: Int, workEventCount: Int, hostOrder: Int,
         activeActionIDs: Set<String> = [], seenActionIDs: Set<String> = [],
+        seenArtifactIDs: Set<String> = [],
         commands: [String: WorkCommandSnapshot] = [:],
         commandAcceptedRefs: [String: EventRef] = [:], permits: [String: EffectPermit] = [:],
         activeTurn: TurnRef? = nil, activeRun: RunRef? = nil,
@@ -442,6 +499,7 @@ public actor RunJournalBundle {
         self.hostOrder = hostOrder
         self.activeActionIDs = activeActionIDs
         self.seenActionIDs = seenActionIDs
+        self.seenArtifactIDs = seenArtifactIDs
         self.commands = commands
         self.commandAcceptedRefs = commandAcceptedRefs
         self.permits = permits
@@ -2062,7 +2120,9 @@ public actor RunJournalBundle {
                 sessionCursor: sessionCursor, workCursor: workCursor,
                 sessionEventCount: sessionEvents.count, workEventCount: workEvents.count,
                 hostOrder: hostOrder,
-                seenActionIDs: Set(workState.actions.keys), commands: workState.commands,
+                seenActionIDs: Set(workState.actions.keys),
+                seenArtifactIDs: Set(workEvents.compactMap(Self.artifactIdentity(from:))),
+                commands: workState.commands,
                 commandAcceptedRefs: workEvents.reduce(into: [String: EventRef]()) { refs, event in
                     guard event.type == TimelineEventType.commandAccepted,
                           let command = event.command,
@@ -2447,7 +2507,7 @@ public actor RunJournalBundle {
                 causedByEventID: EventRef(journal: self.workJournal, eventID: causalEventID),
                 work: self.work, workHost: self.workHost,
                 client: command.client, sessionAttachment: self.sessionAttachment,
-                run: self.activeRun,
+                run: self.run,
                 type: TimelineEventType.commandRejected,
                 declaredDomains: [.work], payload: .object(payload)))
             self.commands[normalized.commandID] = WorkCommandSnapshot(
@@ -2714,7 +2774,9 @@ public actor RunJournalBundle {
         let commit = try await appendWork(TimelineEventDraft(
             hostSequence: nextHostOrder(), work: work, workHost: workHost,
             run: activeRun, turn: turn, type: TimelineEventType.turnFinished,
-            declaredDomains: [.work]))
+            declaredDomains: [.work], payload: .object([
+                "outcome": .string(outcome.rawValue),
+            ])))
         guard let cursor = workCursor else {
             throw RunJournalBundleError.invalidOperation(
                 "turn.finished did not produce a Work cursor")
@@ -2966,6 +3028,157 @@ public actor RunJournalBundle {
                     "parent_session_id": .string(self.session.sessionID),
                     "parent_run_id": .string(activeRun.runID),
                 ])))
+        }
+    }
+
+    /// Retain one artifact body before publishing its bounded Work-journal descriptor.  The
+    /// body store is content addressed and authoritative to this Work journal; the event itself
+    /// carries only identity, measured metadata, and the device-independent body reference.
+    /// Passing no body records an explicitly unavailable artifact.  A receipt repeats the exact
+    /// envelope association so callers do not infer Run/Turn ownership from a later projection.
+    public func recordArtifact(
+        artifactID: String,
+        label: String,
+        mediaType: String? = nil,
+        body: Data? = nil,
+        action: ActionRef? = nil,
+        provenance: EventRef? = nil,
+        links: [TimelineLink] = []
+    ) async throws -> RunJournalArtifactReceipt {
+        try await withSemanticGate {
+            try self.ensureUsable()
+            try self.ensureRunActive()
+            guard Self.validArtifactText(
+                      artifactID, maximumBytes: WorkServiceBounds.maxIdentityCharacters) else {
+                throw RunJournalBundleError.invalidOperation(
+                    "artifact identity must be nonblank and bounded")
+            }
+            guard Self.validArtifactText(
+                      label, maximumBytes: WorkServiceBounds.maxDiagnosticCharacters) else {
+                throw RunJournalBundleError.invalidOperation(
+                    "artifact label must be nonblank and bounded")
+            }
+            guard !self.seenArtifactIDs.contains(artifactID) else {
+                throw RunJournalBundleError.invalidOperation(
+                    "artifact identity has already been recorded")
+            }
+            if let mediaType {
+                guard Self.validArtifactText(
+                          mediaType, maximumBytes: WorkServiceBounds.maxDiagnosticCharacters) else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "artifact media type must be nonblank and bounded")
+                }
+            }
+            if let body, body.count > Self.maximumArtifactBodyBytes {
+                throw RunJournalBundleError.invalidOperation(
+                    "artifact body exceeds the bounded size")
+            }
+            guard links.count <= TimelineEvent.maxEvidenceLinks else {
+                throw RunJournalBundleError.invalidOperation(
+                    "artifact evidence links exceed the bounded limit")
+            }
+            if let action {
+                guard !action.actionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      action.actionID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
+                      self.activeActionIDs.contains(action.actionID),
+                      let permit = self.permits[action.actionID],
+                      let provenance,
+                      provenance == permit.startedCommit.eventRef else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "artifact action must cite its exact active start event")
+                }
+            } else if let provenance {
+                guard !provenance.eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      provenance.eventID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
+                      provenance.journal == self.workJournal
+                        || provenance.journal == self.sessionJournal else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "artifact provenance is not a bundle journal event")
+                }
+            }
+            if mediaType == ObservedRepositoryReviewFormat.mediaType {
+                guard self.activeTurn != nil, action != nil, provenance != nil else {
+                    throw RunJournalBundleError.invalidOperation(
+                        "repository-review artifacts require an active Turn, Action, and cause")
+                }
+            }
+
+            // This is deliberately the first side effect.  If the journal append later fails,
+            // the durable body remains an honest orphan rather than an event advertising bytes
+            // which were never retained.
+            let bodyReference: TimelineBodyReference?
+            if let body {
+                bodyReference = try self.contextBodyStore.retain(
+                    body, authority: self.workJournal,
+                    mediaType: mediaType ?? "application/octet-stream")
+            } else {
+                bodyReference = nil
+            }
+            if mediaType == ObservedRepositoryReviewFormat.mediaType {
+                guard let body, let turn = self.activeTurn,
+                      let review = try? ObservedRepositoryReview.decode(body),
+                      review.matchesCanonicalSource(run: self.run, turn: turn) else {
+                    // The body was intentionally retained before this validation.  A failed
+                    // producer attempt may leave an orphan, but it must never publish a Work
+                    // descriptor whose review bytes belong to another Run/Turn.
+                    throw RunJournalBundleError.invalidOperation(
+                        "repository-review body provenance does not match the active Run and Turn")
+                }
+            }
+            let descriptorMediaType = bodyReference?.mediaType ?? mediaType
+            let descriptorByteCount = bodyReference?.byteCount
+            let descriptorDigest = bodyReference?.digest
+            var payload: [String: JSONValue] = [
+                "artifact_id": .string(artifactID),
+                "label": .string(label),
+                "available": .bool(bodyReference != nil),
+            ]
+            if let mediaType = descriptorMediaType {
+                payload["media_type"] = .string(mediaType)
+            }
+            if let byteCount = descriptorByteCount {
+                payload["byte_count"] = .number(Double(byteCount))
+            }
+            if let digest = descriptorDigest {
+                payload["digest"] = .string(digest)
+            }
+            if let bodyReference {
+                payload["body_reference"] = encodeTimelineValue(bodyReference)
+            }
+            let commit = try await self.appendWork(TimelineEventDraft(
+                hostSequence: self.nextHostOrder(),
+                causedByEventID: provenance,
+                session: self.session, work: self.work, workHost: self.workHost,
+                sessionAttachment: self.sessionAttachment, run: self.activeRun,
+                turn: self.activeTurn, action: action,
+                type: TimelineEventType.artifact,
+                declaredDomains: [.work], links: links,
+                payload: .object(payload)))
+            self.seenArtifactIDs.insert(artifactID)
+            // The source event does not exist until appendWork commits it. Build the descriptor
+            // from that exact commit and the same envelope values/payload metadata, so a receipt
+            // cannot accidentally describe a pre-commit or inferred event.
+            let descriptor = try WorkServiceArtifactDescriptor(
+                artifactID: artifactID,
+                work: self.work,
+                label: label,
+                mediaType: descriptorMediaType,
+                byteCount: descriptorByteCount,
+                digest: descriptorDigest,
+                available: bodyReference != nil,
+                bodyReference: bodyReference,
+                metadataWasTruncated: false,
+                sourceEvent: commit.eventRef,
+                session: self.session,
+                sessionAttachment: self.sessionAttachment,
+                run: self.run,
+                turn: self.activeTurn,
+                action: action,
+                causedByEventID: provenance)
+            return RunJournalArtifactReceipt(
+                descriptor: descriptor, commit: commit, run: self.run,
+                turn: self.activeTurn, action: action, provenance: provenance,
+                links: links)
         }
     }
 

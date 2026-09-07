@@ -52,6 +52,9 @@ public actor AgentRunner {
         /// Supplying a native journal for a cold resume without this seed is an error; the
         /// runner must never reread a later tip containing the new prompt or fall back to legacy.
         public var nativeResumeSeed: NativeColdResumeResult?
+        /// A native run may publish a bounded read-only repository review after each completed
+        /// turn. Nil is useful for isolated engine tests and non-native adapters.
+        public var repositoryReviewer: ObservedRepositoryReviewer?
 
         /// Who else is running, supplied by the app. Nil in a CLI run, where the two peer
         /// builtins are then not bound at all — which is right: there is nobody else there.
@@ -72,7 +75,8 @@ public actor AgentRunner {
             reasoningEffort: String? = nil,
             writer: SessionWriter? = nil,
             nativeJournal: RunJournalBundle? = nil,
-            nativeResumeSeed: NativeColdResumeResult? = nil
+            nativeResumeSeed: NativeColdResumeResult? = nil,
+            repositoryReviewer: ObservedRepositoryReviewer? = nil
         ) {
             self.peerDelegate = peerDelegate
             self.selfDelegate = selfDelegate
@@ -94,6 +98,7 @@ public actor AgentRunner {
             self.writer = writer
             self.nativeJournal = nativeJournal
             self.nativeResumeSeed = nativeResumeSeed
+            self.repositoryReviewer = repositoryReviewer
         }
     }
 
@@ -397,7 +402,8 @@ public actor AgentRunner {
                     reasoningEffort: settings.reasoningEffort,
                 maxDepth: settings.maxDepth, depth: 0, goal: settings.goal,
                 resumedHistory: replay.messages,
-                expectedResumeTools: expectedResumeTools),
+                expectedResumeTools: expectedResumeTools,
+                repositoryReviewer: settings.repositoryReviewer),
             nativeJournal: settings.nativeJournal,
             contextBodyStore: ContextBodyStore(home: settings.home))
 

@@ -141,7 +141,7 @@ struct HealthView: View {
                             .lineLimit(1).truncationMode(.middle)
                     }
                 }
-                Text("No daemon and no Node, so no version conflict. python3 isolates each "
+                Text("The Work Host owns the Python runtime. python3 isolates each "
                     + "session in its own interpreter; python3-shared trades that for numpy "
                     + "and pandas.")
                     .font(.system(size: 10)).foregroundStyle(.tertiary)

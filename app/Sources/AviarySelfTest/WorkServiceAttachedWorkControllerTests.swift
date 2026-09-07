@@ -45,6 +45,15 @@ private enum AttachedControllerServiceMode: Sendable {
     case forgedHistoryPage
     case missingAttachment
     case omittedAttachment
+    case artifactZeroProgress
+    case artifactMalformed
+    case artifactDigestMismatch
+    case artifactIdentityMismatch
+    case artifactUnavailable
+    case artifactOmitted
+    case artifactChunkTooLarge
+    case artifactProducerRelationshipOmitted
+    case artifactProducerRelationshipDetached
 }
 
 private func semanticTipDescends(
@@ -113,7 +122,8 @@ private struct AttachedControllerFixture: Sendable {
     init(
         workID: String = "controller-work",
         clientID: String = "controller-client",
-        disposition: WorkServiceRecordedDisposition = .reusable
+        disposition: WorkServiceRecordedDisposition = .reusable,
+        artifacts: [WorkServiceArtifactDescriptor] = []
     ) throws {
         host = WorkHostRef("controller-host")
         instance = WorkHostInstanceRef(
@@ -221,11 +231,28 @@ private struct AttachedControllerFixture: Sendable {
             resultingWorkCursor: JournalCursor(
                 journal: workJournal, eventID: w2.eventID, sequence: w2.sequence),
             capabilities: [.observe, .control])
+        var relationships = [relationship]
+        for artifact in artifacts
+        where artifact.session != session || artifact.sessionAttachment != sessionAttachment {
+            let producerJournal = JournalRef.session(
+                artifact.session,
+                journalID: "controller-producer-session-journal-\(artifact.session.sessionID)",
+                authority: TimelineAuthorityRef(host.workHostID))
+            relationships.append(WorkServiceSessionAttachmentDescriptor(
+                session: artifact.session, sessionJournal: producerJournal,
+                sessionAttachment: artifact.sessionAttachment, publication: .mirrored,
+                causalSessionCursor: JournalCursor(journal: producerJournal, sequence: 0),
+                sessionCursor: JournalCursor(journal: producerJournal, sequence: 0),
+                causalWorkCursor: JournalCursor(journal: workJournal, sequence: 0),
+                resultingWorkCursor: JournalCursor(journal: workJournal, sequence: 0),
+                capabilities: [.observe]))
+        }
         descriptor = try WorkServiceWorkDescriptor(
             work: work, journal: workJournal, recordedDisposition: disposition,
             execution: .idle, currentRun: nil, currentRunSession: nil,
             currentRunSessionAttachment: nil, hostObservation: observation,
-            attachments: [attachment, secondAttachment], sessionAttachments: [relationship])
+            attachments: [attachment, secondAttachment], sessionAttachments: relationships,
+            artifacts: artifacts)
         let controlJournal = JournalRef.workHost(host)
         let controlCursor = JournalCursor(
             journal: controlJournal, eventID: "control-1", sequence: 1)
@@ -271,6 +298,11 @@ private func attachedControllerPrefixDigest(
 private actor AttachedControllerTestService: WorkServiceClient {
     let fixture: AttachedControllerFixture
     var mode: AttachedControllerServiceMode = .normal
+    var artifactDescriptors: [WorkServiceArtifactDescriptor]
+    var artifactBodies: [TimelineBodyReference: Data] = [:]
+    var artifactBodyGate: AttachedControllerHistoryGate?
+    var attachmentAuthorization: WorkServiceAuthorizationOutcome
+    var artifactBodyRequests: [WorkServiceBodyRequest] = []
     var commandRequests: [WorkServiceCommandRequest] = []
     var commandFailuresRemaining = 0
     var loseAcceptedResponsesRemaining = 0
@@ -296,6 +328,8 @@ private actor AttachedControllerTestService: WorkServiceClient {
 
     init(fixture: AttachedControllerFixture) {
         self.fixture = fixture
+        self.artifactDescriptors = fixture.descriptor.artifacts
+        self.attachmentAuthorization = fixture.authorization
         self.workEvents = fixture.workEvents
         self.sessionEvents = fixture.sessionEvents
         self.controlCursorStorage = fixture.response.controlCursor
@@ -303,6 +337,17 @@ private actor AttachedControllerTestService: WorkServiceClient {
     }
 
     func setMode(_ mode: AttachedControllerServiceMode) { self.mode = mode }
+    func setArtifactDescriptors(_ descriptors: [WorkServiceArtifactDescriptor]) {
+        artifactDescriptors = descriptors
+    }
+    func setArtifactBody(_ body: Data, for reference: TimelineBodyReference) {
+        artifactBodies[reference] = body
+    }
+    func setArtifactBodyGate(_ gate: AttachedControllerHistoryGate?) { artifactBodyGate = gate }
+    func setAttachmentAuthorization(_ authorization: WorkServiceAuthorizationOutcome) {
+        attachmentAuthorization = authorization
+    }
+    func artifactBodyRequestCount() -> Int { artifactBodyRequests.count }
     func failNextCommand() { commandFailuresRemaining += 1 }
     func loseNextAcceptedResponse() { loseAcceptedResponsesRemaining += 1 }
     func commandCount() -> Int { commandRequests.count }
@@ -580,11 +625,72 @@ private actor AttachedControllerTestService: WorkServiceClient {
     }
 
     func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws -> WorkServiceArtifactDescriptor {
-        throw AttachedControllerTestError.unsupported
+        guard request.work == fixture.work,
+              request.journal == fixture.workJournal,
+              request.client == fixture.client else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
+        guard let artifact = artifactDescriptors.first(where: {
+            $0.artifactID == request.artifactID
+        }) else {
+            throw WorkServiceProtocolError.artifactNotFound
+        }
+        if mode == .artifactIdentityMismatch {
+            return try WorkServiceArtifactDescriptor(
+                artifactID: artifact.artifactID, work: WorkRef(
+                    workHostID: fixture.host.workHostID, workID: "foreign-work"),
+                label: artifact.label, mediaType: artifact.mediaType,
+                byteCount: artifact.byteCount, digest: artifact.digest,
+                available: artifact.available, bodyReference: artifact.bodyReference,
+                sourceEvent: EventRef(
+                    journal: .work(
+                        WorkRef(workHostID: fixture.host.workHostID, workID: "foreign-work"),
+                        journalID: "foreign-artifact-journal"),
+                    eventID: "foreign-artifact-event"),
+                session: artifact.session, sessionAttachment: artifact.sessionAttachment,
+                run: artifact.run)
+        }
+        return artifact
     }
 
     func fetchBody(_ request: WorkServiceBodyRequest) async throws -> WorkServiceBodyResponse {
-        throw AttachedControllerTestError.unsupported
+        artifactBodyRequests.append(request)
+        if let artifactBodyGate { await artifactBodyGate.enter() }
+        guard let body = artifactBodies[request.reference] else {
+            return WorkServiceBodyResponse(
+                reference: request.reference, status: .unavailable, offset: request.offset)
+        }
+        if mode == .artifactUnavailable {
+            return WorkServiceBodyResponse(
+                reference: request.reference, status: .unavailable, offset: request.offset)
+        }
+        if mode == .artifactZeroProgress {
+            return WorkServiceBodyResponse(
+                reference: request.reference, status: .retained, offset: request.offset,
+                data: Data(), nextOffset: request.offset)
+        }
+        let end = min(body.count, request.offset + request.limit)
+        let malformedEnd = min(body.count, request.offset + request.limit + 1)
+        let chunkEnd = mode == .artifactChunkTooLarge ? malformedEnd : end
+        let chunk = body.subdata(in: request.offset..<chunkEnd)
+        let next = end < body.count ? end : nil
+        if mode == .artifactMalformed {
+            return WorkServiceBodyResponse(
+                reference: request.reference, status: .retained, offset: request.offset,
+                data: chunk, nextOffset: next.map { $0 + 1 } ?? (end + 1))
+        }
+        if mode == .artifactDigestMismatch {
+            let mismatched = TimelineBodyReference(
+                authority: request.reference.authority, referenceID: request.reference.referenceID,
+                mediaType: request.reference.mediaType, byteCount: request.reference.byteCount,
+                digest: "sha256:" + String(repeating: "0", count: 64))
+            return WorkServiceBodyResponse(
+                reference: mismatched, status: .retained, offset: request.offset,
+                data: chunk, nextOffset: next)
+        }
+        return WorkServiceBodyResponse(
+            reference: request.reference, status: .retained, offset: request.offset,
+            data: chunk, nextOffset: next)
     }
 
     func command(_ request: WorkServiceCommandRequest) async throws -> WorkServiceCommandReceipt {
@@ -724,7 +830,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
                 sourceCompleteness: $0.sourceCompleteness)
         }
         let listedAttachments: [WorkServiceClientAttachment]
-        let listedOmissions: [WorkServiceOmission]
+        var listedOmissions: [WorkServiceOmission]
         switch mode {
         case .missingAttachment:
             listedAttachments = []
@@ -740,12 +846,16 @@ private actor AttachedControllerTestService: WorkServiceClient {
                     attachment: attachment.attachment, client: attachment.client,
                     session: attachment.session, sessionJournal: attachment.sessionJournal,
                     sessionAttachment: attachment.sessionAttachment,
-                    authorization: attachment.authorization,
+                    authorization: attachment.attachment == fixture.clientAttachment
+                        ? attachmentAuthorization : attachment.authorization,
                     readAcknowledgements: readAcknowledgements.map {
                         WorkServiceReadAcknowledgement(target: $0.key, cursor: $0.value)
                     })
             }
             listedOmissions = fixture.descriptor.omissions
+        }
+        if mode == .artifactOmitted {
+            listedOmissions.append(WorkServiceOmission(category: "artifacts", count: 1))
         }
         return try WorkServiceWorkDescriptor(
             work: fixture.descriptor.work, journal: fixture.descriptor.journal,
@@ -754,8 +864,38 @@ private actor AttachedControllerTestService: WorkServiceClient {
             currentRunSession: reduced.activeRunSession,
             currentRunSessionAttachment: reduced.activeRunSessionAttachment,
             configuration: fixture.descriptor.configuration, hostObservation: observation,
-            attachments: listedAttachments, sessionAttachments: fixture.descriptor.sessionAttachments,
-            artifacts: fixture.descriptor.artifacts,
+            attachments: listedAttachments,
+            sessionAttachments: {
+                switch mode {
+                case .artifactProducerRelationshipOmitted:
+                    return fixture.descriptor.sessionAttachments.filter { relationship in
+                        !artifactDescriptors.contains {
+                            $0.session == relationship.session
+                                && $0.sessionAttachment == relationship.sessionAttachment
+                        }
+                    }
+                case .artifactProducerRelationshipDetached:
+                    return fixture.descriptor.sessionAttachments.map { relationship in
+                        let isProducer = artifactDescriptors.contains {
+                            $0.session == relationship.session
+                                && $0.sessionAttachment == relationship.sessionAttachment
+                        }
+                        return WorkServiceSessionAttachmentDescriptor(
+                            session: relationship.session, sessionJournal: relationship.sessionJournal,
+                            sessionAttachment: relationship.sessionAttachment,
+                            publication: relationship.publication,
+                            causalSessionCursor: relationship.causalSessionCursor,
+                            sessionCursor: relationship.sessionCursor,
+                            causalWorkCursor: relationship.causalWorkCursor,
+                            resultingWorkCursor: relationship.resultingWorkCursor,
+                            capabilities: relationship.capabilities,
+                            isAttached: isProducer ? false : relationship.isAttached)
+                    }
+                default:
+                    return fixture.descriptor.sessionAttachments
+                }
+            }(),
+            artifacts: artifactDescriptors,
             omissions: listedOmissions)
     }
 
@@ -795,6 +935,295 @@ private func makeAttachedController(
         service: service, seed: seed ?? .created(fixture.response), intentStore: store,
         pageLimit: pageLimit, pageBytes: pageBytes,
         connect: connect, checkpointStore: checkpointStore)
+}
+
+private func attachedArtifactDigest(_ data: Data) -> String {
+    "sha256:" + AviarySHA256.hash(data: data).map {
+        String(format: "%02x", $0)
+    }.joined()
+}
+
+private func attachedArtifact(
+    fixture: AttachedControllerFixture, id: String, mediaType: String, body: Data
+) -> (WorkServiceArtifactDescriptor, TimelineBodyReference) {
+    let digest = attachedArtifactDigest(body)
+    let reference = TimelineBodyReference(
+        authority: fixture.workJournal, referenceID: digest, mediaType: mediaType,
+        byteCount: body.count, digest: digest)
+    return (try! WorkServiceArtifactDescriptor(
+        artifactID: id, work: fixture.work, label: id, mediaType: mediaType,
+        byteCount: body.count, digest: digest, available: true,
+        bodyReference: reference,
+        sourceEvent: EventRef(journal: fixture.workJournal, eventID: "\(id)-event"),
+        session: fixture.session, sessionAttachment: fixture.sessionAttachment,
+        run: RunRef("controller-artifact-run")), reference)
+}
+
+private func configureAttachedArtifact(
+    fixture: AttachedControllerFixture, service: AttachedControllerTestService,
+    artifact: WorkServiceArtifactDescriptor, reference: TimelineBodyReference, body: Data
+) async {
+    await service.setArtifactDescriptors([artifact])
+    await service.setArtifactBody(body, for: reference)
+}
+
+func testWorkServiceAttachedControllerFetchesLatestAuthorizedArtifactInChunks() async throws {
+    let fixture = try AttachedControllerFixture()
+    let service = AttachedControllerTestService(fixture: fixture)
+    let body = Data(repeating: 0x61, count: WorkServiceBounds.maxBodyChunkBytes + 17)
+    let (older, olderReference) = attachedArtifact(
+        fixture: fixture, id: "older", mediaType: "text/plain", body: Data("old".utf8))
+    let (latest, latestReference) = attachedArtifact(
+        fixture: fixture, id: "latest", mediaType: "text/plain", body: body)
+    await service.setArtifactDescriptors([older, latest])
+    await service.setArtifactBody(Data("old".utf8), for: olderReference)
+    await service.setArtifactBody(body, for: latestReference)
+    let controller = try makeAttachedController(fixture: fixture, service: service)
+    _ = try await controller.refresh()
+
+    let fetched = try await controller.fetchArtifactBody(mediaType: "text/plain")
+    XCTAssertEqual(fetched.artifactID, "latest")
+    XCTAssertEqual(fetched.reference, latestReference)
+    XCTAssertEqual(fetched.data, body)
+    XCTAssertEqual(await service.artifactBodyRequestCount(), 2)
+}
+
+func testWorkServiceAttachedControllerRejectsArtifactProgressAndMetadataFailures() async throws {
+    let fixture = try AttachedControllerFixture()
+    let body = Data("artifact body".utf8)
+    let (artifact, reference) = attachedArtifact(
+        fixture: fixture, id: "artifact", mediaType: "application/json", body: body)
+    for (modeIndex, mode) in [AttachedControllerServiceMode.artifactZeroProgress,
+                 .artifactMalformed, .artifactDigestMismatch, .artifactIdentityMismatch].enumerated() {
+        let service = AttachedControllerTestService(fixture: fixture)
+        await configureAttachedArtifact(
+            fixture: fixture, service: service, artifact: artifact,
+            reference: reference, body: body)
+        let controller = try makeAttachedController(fixture: fixture, service: service)
+        _ = try await controller.refresh()
+        await service.setMode(mode)
+        do {
+            _ = try await controller.fetchArtifactBody(mediaType: "application/json")
+            XCTFail("malformed artifact response must fail closed (mode \(modeIndex))")
+        } catch WorkServiceAttachedArtifactLoadError.malformed {
+            XCTAssertTrue(true)
+        }
+    }
+
+    let mediaService = AttachedControllerTestService(fixture: fixture)
+    await configureAttachedArtifact(
+        fixture: fixture, service: mediaService, artifact: artifact,
+        reference: reference, body: body)
+    let mediaController = try makeAttachedController(fixture: fixture, service: mediaService)
+    _ = try await mediaController.refresh()
+    do {
+        _ = try await mediaController.fetchArtifactBody(mediaType: "application/\njson")
+        XCTFail("control bytes in media types must be rejected")
+    } catch WorkServiceAttachedArtifactLoadError.invalidOptions {
+        XCTAssertTrue(true)
+    }
+
+    let largeBody = Data(repeating: 0x62, count: WorkServiceBounds.maxBodyChunkBytes + 1)
+    let (largeArtifact, largeReference) = attachedArtifact(
+        fixture: fixture, id: "large", mediaType: "application/octet-stream", body: largeBody)
+    let chunkService = AttachedControllerTestService(fixture: fixture)
+    await configureAttachedArtifact(
+        fixture: fixture, service: chunkService, artifact: largeArtifact,
+        reference: largeReference, body: largeBody)
+    let chunkController = try makeAttachedController(fixture: fixture, service: chunkService)
+    _ = try await chunkController.refresh()
+    await chunkService.setMode(.artifactChunkTooLarge)
+    do {
+        _ = try await chunkController.fetchArtifactBody(mediaType: "application/octet-stream")
+        XCTFail("a chunk larger than the requested limit must be malformed")
+    } catch WorkServiceAttachedArtifactLoadError.malformed {
+        XCTAssertTrue(true)
+    }
+}
+
+func testWorkServiceAttachedControllerDistinguishesArtifactOmittedUnavailableAndTooLarge() async throws {
+    let fixture = try AttachedControllerFixture()
+    let body = Data("artifact body".utf8)
+    let (artifact, reference) = attachedArtifact(
+        fixture: fixture, id: "artifact", mediaType: "application/octet-stream", body: body)
+
+    let omittedService = AttachedControllerTestService(fixture: fixture)
+    await configureAttachedArtifact(
+        fixture: fixture, service: omittedService, artifact: artifact,
+        reference: reference, body: body)
+    let omittedController = try makeAttachedController(
+        fixture: fixture, service: omittedService)
+    _ = try await omittedController.refresh()
+    await omittedService.setMode(.artifactOmitted)
+    _ = try await omittedController.refresh()
+    XCTAssertEqual((await omittedController.projection()).descriptor.artifacts.last, artifact)
+    do {
+        _ = try await omittedController.fetchArtifactBody(mediaType: "application/octet-stream")
+        XCTFail("a retained match in an omitted index cannot prove the latest artifact")
+    } catch WorkServiceAttachedArtifactLoadError.omitted {
+        XCTAssertTrue(true)
+    }
+    await omittedService.setArtifactDescriptors([])
+    _ = try await omittedController.refresh()
+    do {
+        _ = try await omittedController.fetchArtifactBody(mediaType: "application/octet-stream")
+        XCTFail("an omitted artifact index must not be treated as not found")
+    } catch WorkServiceAttachedArtifactLoadError.omitted {
+        XCTAssertTrue(true)
+    }
+
+    let unavailableService = AttachedControllerTestService(fixture: fixture)
+    await configureAttachedArtifact(
+        fixture: fixture, service: unavailableService, artifact: artifact,
+        reference: reference, body: body)
+    let unavailableController = try makeAttachedController(
+        fixture: fixture, service: unavailableService)
+    _ = try await unavailableController.refresh()
+    await unavailableService.setMode(.artifactUnavailable)
+    do {
+        _ = try await unavailableController.fetchArtifactBody(mediaType: "application/octet-stream")
+        XCTFail("an unavailable body must be explicit")
+    } catch WorkServiceAttachedArtifactLoadError.omitted {
+        XCTAssertTrue(true)
+    }
+
+    let tooLargeController = try makeAttachedController(
+        fixture: fixture, service: unavailableService)
+    _ = try await tooLargeController.refresh()
+    do {
+        _ = try await tooLargeController.fetchArtifactBody(
+            mediaType: "application/octet-stream", maxTotalBytes: body.count - 1)
+        XCTFail("the descriptor byte count exceeds the caller bound")
+    } catch WorkServiceAttachedArtifactLoadError.tooLarge {
+        XCTAssertTrue(true)
+    }
+
+    let missingService = AttachedControllerTestService(fixture: fixture)
+    let missingController = try makeAttachedController(
+        fixture: fixture, service: missingService)
+    _ = try await missingController.refresh()
+    do {
+        _ = try await missingController.fetchArtifactBody(mediaType: "application/octet-stream")
+        XCTFail("a complete index with no matching artifact is not found")
+    } catch WorkServiceAttachedArtifactLoadError.notFound {
+        XCTAssertTrue(true)
+    }
+}
+
+func testWorkServiceAttachedControllerFailsArtifactReadOnAttachmentOrCapabilityDrift() async throws {
+    let fixture = try AttachedControllerFixture()
+    let body = Data("artifact body".utf8)
+    let (artifact, reference) = attachedArtifact(
+        fixture: fixture, id: "artifact", mediaType: "text/plain", body: body)
+
+    let detachService = AttachedControllerTestService(fixture: fixture)
+    await configureAttachedArtifact(
+        fixture: fixture, service: detachService, artifact: artifact,
+        reference: reference, body: body)
+    let detachController = try makeAttachedController(fixture: fixture, service: detachService)
+    _ = try await detachController.refresh()
+    let detachGate = AttachedControllerHistoryGate()
+    await detachService.setArtifactBodyGate(detachGate)
+    let detachTask = Task {
+        try await detachController.fetchArtifactBody(mediaType: "text/plain")
+    }
+    await detachGate.waitUntilEntered()
+    await detachService.setMode(.missingAttachment)
+    _ = try await detachController.refresh()
+    await detachGate.release()
+    do {
+        _ = try await detachTask.value
+        XCTFail("detachment during body fetch must fail closed")
+    } catch WorkServiceAttachedArtifactLoadError.incomplete {
+        XCTAssertTrue(true)
+    }
+
+    let capabilityService = AttachedControllerTestService(fixture: fixture)
+    await configureAttachedArtifact(
+        fixture: fixture, service: capabilityService, artifact: artifact,
+        reference: reference, body: body)
+    let capabilityController = try makeAttachedController(
+        fixture: fixture, service: capabilityService)
+    _ = try await capabilityController.refresh()
+    let capabilityGate = AttachedControllerHistoryGate()
+    await capabilityService.setArtifactBodyGate(capabilityGate)
+    let capabilityTask = Task {
+        try await capabilityController.fetchArtifactBody(mediaType: "text/plain")
+    }
+    await capabilityGate.waitUntilEntered()
+    let denied = WorkServiceAuthorizationOutcome(
+        requested: Set(WorkServiceCapability.allCases), granted: [.observe], denied: [.inspectArtifacts])
+    await capabilityService.setAttachmentAuthorization(denied)
+    _ = try await capabilityController.refresh()
+    await capabilityGate.release()
+    do {
+        _ = try await capabilityTask.value
+        XCTFail("capability mutation during body fetch must fail closed")
+    } catch WorkServiceAttachedArtifactLoadError.capabilityDenied(.inspectArtifacts) {
+        XCTAssertTrue(true)
+    }
+}
+
+func testWorkServiceAttachedControllerReadsArtifactFromTerminalWork() async throws {
+    let fixture = try AttachedControllerFixture(disposition: .completed)
+    let body = Data("terminal artifact".utf8)
+    let (artifact, reference) = attachedArtifact(
+        fixture: fixture, id: "terminal-artifact", mediaType: "text/plain", body: body)
+    let service = AttachedControllerTestService(fixture: fixture)
+    await configureAttachedArtifact(
+        fixture: fixture, service: service, artifact: artifact,
+        reference: reference, body: body)
+    let controller = try makeAttachedController(fixture: fixture, service: service)
+    let projection = try await controller.refresh()
+    XCTAssertEqual(projection.descriptor.recordedDisposition, .completed)
+    XCTAssertEqual(try await controller.fetchArtifactBody(mediaType: "text/plain").data, body)
+}
+
+func testWorkServiceAttachedControllerAllowsSessionBToInspectSessionAReviewAfterProducerDetach() async throws {
+    let base = try AttachedControllerFixture(workID: "cross-session-artifact")
+    let producer = SessionRef("producer-session-a")
+    let producerAttachment = SessionAttachmentRef("producer-attachment-a")
+    let review = await ObservedRepositoryReviewer(commandRunner: { _, _, _ in
+        ObservedRepositoryGitCommandResult(exitCode: 128)
+    }).observe(
+        cwd: FileManager.default.temporaryDirectory,
+        runID: "producer-run-a", turnID: "producer-turn-a",
+        observedAt: Date(timeIntervalSince1970: 1_700_000_000))
+    let body = try review.encoded()
+    let digest = attachedArtifactDigest(body)
+    let reference = TimelineBodyReference(
+        authority: base.workJournal, referenceID: digest,
+        mediaType: ObservedRepositoryReviewFormat.mediaType,
+        byteCount: body.count, digest: digest)
+    let artifact = try WorkServiceArtifactDescriptor(
+        artifactID: "producer-a-review", work: base.work, label: "producer review",
+        mediaType: ObservedRepositoryReviewFormat.mediaType,
+        byteCount: body.count, digest: digest, available: true,
+        bodyReference: reference,
+        sourceEvent: EventRef(journal: base.workJournal, eventID: "producer-a-artifact"),
+        session: producer, sessionAttachment: producerAttachment,
+        run: RunRef("producer-run-a"), turn: TurnRef("producer-turn-a"),
+        action: ActionRef("producer-action-a"),
+        causedByEventID: EventRef(journal: base.workJournal, eventID: "producer-a-action-start"))
+
+    for mode in [
+        AttachedControllerServiceMode.artifactProducerRelationshipOmitted,
+        .artifactProducerRelationshipDetached,
+    ] {
+        let fixture = try AttachedControllerFixture(
+            workID: "cross-session-artifact", artifacts: [artifact])
+        let service = AttachedControllerTestService(fixture: fixture)
+        await configureAttachedArtifact(
+            fixture: fixture, service: service, artifact: artifact,
+            reference: reference, body: body)
+        await service.setMode(mode)
+        let controller = try makeAttachedController(fixture: fixture, service: service)
+        _ = try await controller.refresh()
+        let fetched = try await controller.fetchArtifactBody(
+            mediaType: ObservedRepositoryReviewFormat.mediaType)
+        XCTAssertEqual(fetched.artifactID, artifact.artifactID)
+        XCTAssertEqual(fetched.data, body)
+    }
 }
 
 func testWorkServiceConversationIdentityChangeSeparatesPrependAndTail() {
@@ -2134,6 +2563,24 @@ func testWorkServiceAttachedControllerResumesMoreThan256PagesFromCheckpointCurso
 }
 
 let casesWorkServiceAttachedWorkController: [Case] = [
+    ("phase4b Work controller fetches latest authorized artifact in chunks", {
+        try await testWorkServiceAttachedControllerFetchesLatestAuthorizedArtifactInChunks()
+    }),
+    ("phase4b Work controller rejects artifact progress and metadata failures", {
+        try await testWorkServiceAttachedControllerRejectsArtifactProgressAndMetadataFailures()
+    }),
+    ("phase4b Work controller distinguishes artifact omission, unavailable, and size", {
+        try await testWorkServiceAttachedControllerDistinguishesArtifactOmittedUnavailableAndTooLarge()
+    }),
+    ("phase4b Work controller fences attachment and capability drift during artifact reads", {
+        try await testWorkServiceAttachedControllerFailsArtifactReadOnAttachmentOrCapabilityDrift()
+    }),
+    ("phase4b Work controller allows Session B to inspect Session A review after producer detach", {
+        try await testWorkServiceAttachedControllerAllowsSessionBToInspectSessionAReviewAfterProducerDetach()
+    }),
+    ("phase4b Work controller reads artifacts from terminal Work", {
+        try await testWorkServiceAttachedControllerReadsArtifactFromTerminalWork()
+    }),
     ("phase3 Work controller distinguishes history prepend from tail output", {
         testWorkServiceConversationIdentityChangeSeparatesPrependAndTail()
     }),

@@ -234,7 +234,7 @@ private func serviceFixture(
     let body = Data("hello world!".utf8)
     let bodyDigest = "sha256:" + AviarySHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
     let bodyReference = TimelineBodyReference(
-        authority: serviceJournal, referenceID: "artifact-body", mediaType: "text/plain", byteCount: 12,
+        authority: serviceJournal, referenceID: bodyDigest, mediaType: "text/plain", byteCount: 12,
         digest: bodyDigest)
     let mismatchReference = TimelineBodyReference(
         authority: serviceJournal, referenceID: "artifact-body-mismatch", mediaType: "text/plain", byteCount: 12,
@@ -243,9 +243,14 @@ private func serviceFixture(
         work: serviceWork, journal: serviceJournal, disposition: disposition, cursor: cursor,
         sourceCompleteness: source,
         artifacts: [
-            WorkServiceArtifactDescriptor(
+            try WorkServiceArtifactDescriptor(
                 artifactID: "artifact-1", work: serviceWork, label: "diff", mediaType: "text/plain",
-                byteCount: 12, digest: "sha256:fixture", bodyReference: bodyReference),
+                byteCount: 12, digest: bodyDigest, available: true,
+                bodyReference: bodyReference,
+                sourceEvent: EventRef(journal: serviceJournal, eventID: "artifact-1-event"),
+                session: SessionRef("service-artifact-session"),
+                sessionAttachment: SessionAttachmentRef("service-artifact-attachment"),
+                run: RunRef("service-artifact-run")),
         ], bodies: [bodyReference: body, mismatchReference: body]))
     return (service, cursor)
 }
@@ -1455,11 +1460,14 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
     XCTAssertEqual(artifact.byteCount, 12)
     XCTAssertFalse(artifact.digest?.contains("secret") == true)
     let foreignWork = WorkRef(workHostID: serviceHost.workHostID, workID: "foreign-artifact-work")
-    let foreignArtifact = WorkServiceArtifactDescriptor(
+    let foreignArtifact = try WorkServiceArtifactDescriptor(
         artifactID: artifact.artifactID, work: foreignWork, label: artifact.label,
-        mediaType: artifact.mediaType, byteCount: artifact.byteCount,
-        digest: artifact.digest, available: artifact.available,
-        bodyReference: artifact.bodyReference)
+        mediaType: nil,
+        sourceEvent: EventRef(
+            journal: .work(foreignWork, journalID: "foreign-artifact-journal"),
+            eventID: "foreign-artifact-event"),
+        session: artifact.session, sessionAttachment: artifact.sessionAttachment,
+        run: artifact.run)
     do {
         _ = try WorkServiceWorkDescriptor(
             work: serviceWork, journal: serviceJournal, recordedDisposition: .reusable,
@@ -1471,9 +1479,14 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
         XCTAssertTrue(diagnostic.contains("artifact"))
     }
     let descriptor = try await service.describeWork(describeRequest())
-    let duplicateArtifact = WorkServiceArtifactDescriptor(
+    let duplicateArtifact = try WorkServiceArtifactDescriptor(
         artifactID: artifact.artifactID, work: descriptor.work,
-        label: "conflicting duplicate", bodyReference: artifact.bodyReference)
+        label: "conflicting duplicate", mediaType: artifact.mediaType,
+        byteCount: artifact.byteCount, digest: artifact.digest,
+        available: artifact.available, bodyReference: artifact.bodyReference,
+        sourceEvent: EventRef(journal: descriptor.journal, eventID: "duplicate-artifact-event"),
+        session: artifact.session, sessionAttachment: artifact.sessionAttachment,
+        run: artifact.run)
     do {
         _ = try WorkServiceWorkDescriptor(
             work: descriptor.work, journal: descriptor.journal,
@@ -1508,9 +1521,14 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
         "   ",
         String(repeating: "a", count: WorkServiceBounds.maxIdentityCharacters + 1),
     ] {
-        let invalidArtifact = WorkServiceArtifactDescriptor(
-            artifactID: invalidID, work: descriptor.work, label: "invalid identity")
-        do {
+        let invalidArtifact = try? WorkServiceArtifactDescriptor(
+            artifactID: invalidID, work: descriptor.work, label: "invalid identity",
+            sourceEvent: EventRef(journal: descriptor.journal, eventID: "invalid-event"),
+            session: artifact.session, sessionAttachment: artifact.sessionAttachment,
+            run: artifact.run)
+        XCTAssertNil(invalidArtifact)
+        if let invalidArtifact {
+            do {
             _ = try WorkServiceWorkDescriptor(
                 work: descriptor.work, journal: descriptor.journal,
                 recordedDisposition: descriptor.recordedDisposition,
@@ -1523,8 +1541,9 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
                 sessionAttachments: descriptor.sessionAttachments,
                 artifacts: [invalidArtifact], omissions: descriptor.omissions)
             XCTFail("a descriptor accepted an invalid artifact identity")
-        } catch WorkServiceProtocolError.invalidRequest(let diagnostic) {
-            XCTAssertTrue(diagnostic.contains("bounded"))
+            } catch WorkServiceProtocolError.invalidRequest(let diagnostic) {
+                XCTAssertTrue(diagnostic.contains("bounded"))
+            }
         }
         var invalidIdentityObject = descriptorObject
         var invalidIdentityArtifacts = artifactObjects
@@ -1539,34 +1558,57 @@ func test_workServiceEventsAndArtifactsAreBoundedDescriptors() async throws {
             XCTAssertTrue(error is DecodingError)
         }
     }
-    let invalidArtifactFields = [
-        WorkServiceArtifactDescriptor(
-            artifactID: "negative-byte-count", work: descriptor.work,
-            label: "negative byte count", byteCount: -1),
-        WorkServiceArtifactDescriptor(
-            artifactID: "invalid-body-reference", work: descriptor.work,
-            label: "invalid body reference",
-            bodyReference: TimelineBodyReference(
-                authority: descriptor.journal, referenceID: "body", mediaType: "text/plain",
-                byteCount: 1, digest: "not-a-sha256-digest")),
-    ]
-    for invalidArtifact in invalidArtifactFields {
-        do {
-            _ = try WorkServiceWorkDescriptor(
-                work: descriptor.work, journal: descriptor.journal,
-                recordedDisposition: descriptor.recordedDisposition,
-                execution: descriptor.execution, currentRun: descriptor.currentRun,
-                currentRunSession: descriptor.currentRunSession,
-                currentRunSessionAttachment: descriptor.currentRunSessionAttachment,
-                configuration: descriptor.configuration,
-                hostObservation: descriptor.hostObservation,
-                attachments: descriptor.attachments,
-                sessionAttachments: descriptor.sessionAttachments,
-                artifacts: [invalidArtifact], omissions: descriptor.omissions)
-            XCTFail("a descriptor accepted malformed artifact metadata")
-        } catch WorkServiceProtocolError.invalidRequest(let diagnostic) {
-            XCTAssertTrue(diagnostic.contains("canonical"))
-        }
+    XCTAssertNil(try? WorkServiceArtifactDescriptor(
+        artifactID: "negative-byte-count", work: descriptor.work,
+        label: "negative byte count", byteCount: -1,
+        sourceEvent: EventRef(journal: descriptor.journal, eventID: "negative-event"),
+        session: artifact.session, sessionAttachment: artifact.sessionAttachment,
+        run: artifact.run))
+    XCTAssertNil(try? WorkServiceArtifactDescriptor(
+        artifactID: "invalid-body-reference", work: descriptor.work,
+        label: "invalid body reference",
+        bodyReference: TimelineBodyReference(
+            authority: descriptor.journal, referenceID: "body", mediaType: "text/plain",
+            byteCount: 1, digest: "not-a-sha256-digest"),
+        sourceEvent: EventRef(journal: descriptor.journal, eventID: "invalid-body-event"),
+        session: artifact.session, sessionAttachment: artifact.sessionAttachment,
+        run: artifact.run))
+    let action = ActionRef("artifact-action-cause")
+    XCTAssertNil(try? WorkServiceArtifactDescriptor(
+        artifactID: "action-without-cause", work: descriptor.work,
+        label: "action without cause",
+        sourceEvent: EventRef(journal: descriptor.journal, eventID: "action-event"),
+        session: artifact.session, sessionAttachment: artifact.sessionAttachment,
+        run: artifact.run, action: action))
+    let sessionCause = EventRef(
+        journal: JournalRef.session(
+            artifact.session, journalID: "artifact-session-journal",
+            authority: TimelineAuthorityRef(serviceHost.workHostID)),
+        eventID: "session-cause")
+    XCTAssertNil(try? WorkServiceArtifactDescriptor(
+        artifactID: "action-with-session-cause", work: descriptor.work,
+        label: "action with session cause",
+        sourceEvent: EventRef(journal: descriptor.journal, eventID: "action-session-event"),
+        session: artifact.session, sessionAttachment: artifact.sessionAttachment,
+        run: artifact.run, action: action, causedByEventID: sessionCause))
+    let validActionDescriptor = try WorkServiceArtifactDescriptor(
+        artifactID: "action-with-work-cause", work: descriptor.work,
+        label: "action with work cause",
+        sourceEvent: EventRef(journal: descriptor.journal, eventID: "action-valid-event"),
+        session: artifact.session, sessionAttachment: artifact.sessionAttachment,
+        run: artifact.run, action: action,
+        causedByEventID: EventRef(journal: descriptor.journal, eventID: "action-start"))
+    var actionObject = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: JSONEncoder().encode(validActionDescriptor))
+            as? [String: Any])
+    actionObject.removeValue(forKey: "causedByEventID")
+    do {
+        _ = try JSONDecoder().decode(
+            WorkServiceArtifactDescriptor.self,
+            from: JSONSerialization.data(withJSONObject: actionObject))
+        XCTFail("descriptor decoding accepted an action without causedByEventID")
+    } catch {
+        XCTAssertTrue(error is DecodingError)
     }
     let foreignWorkObject = try XCTUnwrap(
         JSONSerialization.jsonObject(with: JSONEncoder().encode(foreignWork)) as? [String: Any])
@@ -1678,11 +1720,19 @@ func test_workServiceRetainsSeedArtifactOverflowAsAnExplicitOmission() async thr
     let service = InMemoryWorkService(host: host, authorizer: permissiveServiceAuthorizer())
     let longLabel = String(
         repeating: "m", count: WorkServiceBounds.maxDiagnosticCharacters + 1)
-    let encodedArtifact = try JSONEncoder().encode(WorkServiceArtifactDescriptor(
-        artifactID: "decoded-artifact", work: work, label: "short"))
-    let explicitlyTruncatedArtifact = WorkServiceArtifactDescriptor(
+    let encodedArtifact = try JSONEncoder().encode(try WorkServiceArtifactDescriptor(
+        artifactID: "decoded-artifact", work: work, label: "short",
+        sourceEvent: EventRef(journal: journal, eventID: "decoded-event"),
+        session: SessionRef("overflow-session"),
+        sessionAttachment: SessionAttachmentRef("overflow-attachment"),
+        run: RunRef("overflow-run")))
+    let explicitlyTruncatedArtifact = try WorkServiceArtifactDescriptor(
         artifactID: "explicitly-truncated", work: work, label: "short",
-        metadataWasTruncated: true)
+        metadataWasTruncated: true,
+        sourceEvent: EventRef(journal: journal, eventID: "truncated-event"),
+        session: SessionRef("overflow-session"),
+        sessionAttachment: SessionAttachmentRef("overflow-attachment"),
+        run: RunRef("overflow-run"))
     let decodedExplicitlyTruncated = try JSONDecoder().decode(
         WorkServiceArtifactDescriptor.self,
         from: JSONEncoder().encode(explicitlyTruncatedArtifact))
@@ -1691,15 +1741,18 @@ func test_workServiceRetainsSeedArtifactOverflowAsAnExplicitOmission() async thr
         JSONSerialization.jsonObject(with: encodedArtifact) as? [String: Any])
     hostileArtifactJSON["label"] = longLabel
     hostileArtifactJSON["metadataWasTruncated"] = false
-    let decodedArtifact = try JSONDecoder().decode(
+    XCTAssertNil(try? JSONDecoder().decode(
         WorkServiceArtifactDescriptor.self,
-        from: JSONSerialization.data(withJSONObject: hostileArtifactJSON))
-    XCTAssertTrue(decodedArtifact.metadataWasTruncated)
-    XCTAssertEqual(decodedArtifact.label.count, WorkServiceBounds.maxDiagnosticCharacters)
+        from: JSONSerialization.data(withJSONObject: hostileArtifactJSON)),
+        "the descriptor decoder must reject overlong metadata rather than normalize it")
     let artifacts = (0...WorkServiceBounds.maxArtifactsPerWork).map { index in
-        WorkServiceArtifactDescriptor(
+        try! WorkServiceArtifactDescriptor(
             artifactID: "artifact-\(index)", work: work,
-            label: index == 0 ? longLabel : "artifact \(index)")
+            label: "artifact \(index)",
+            sourceEvent: EventRef(journal: journal, eventID: "artifact-\(index)-event"),
+            session: SessionRef("overflow-session"),
+            sessionAttachment: SessionAttachmentRef("overflow-attachment"),
+            run: RunRef("overflow-run"))
     }
     try await service.register(.init(work: work, journal: journal, artifacts: artifacts))
     let descriptor = try await service.describeWork(describeRequest(work: work, journal: journal))
@@ -1707,10 +1760,9 @@ func test_workServiceRetainsSeedArtifactOverflowAsAnExplicitOmission() async thr
     XCTAssertEqual(
         descriptor.omissions.first(where: { $0.category == "artifacts" })?.count, 1)
     let firstArtifact = try XCTUnwrap(descriptor.artifacts.first)
-    XCTAssertTrue(firstArtifact.metadataWasTruncated)
-    XCTAssertEqual(firstArtifact.label.count, WorkServiceBounds.maxDiagnosticCharacters)
-    XCTAssertEqual(
-        descriptor.omissions.first(where: { $0.category == "artifact_metadata" })?.count, 1)
+    XCTAssertFalse(firstArtifact.metadataWasTruncated)
+    XCTAssertEqual(firstArtifact.label, "artifact 0")
+    XCTAssertNil(descriptor.omissions.first(where: { $0.category == "artifact_metadata" }))
     let page = try await service.listWorks(listRequest(pageSize: 1))
     XCTAssertEqual(page.works.first?.omissions.first(where: { $0.category == "artifacts" })?.count, 1)
 }

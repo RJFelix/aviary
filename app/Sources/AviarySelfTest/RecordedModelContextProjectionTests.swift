@@ -117,10 +117,11 @@ func testCanonicalWorkingStateProjectionIsBoundedAndPrivate() throws {
         causalWorkCursor: JournalCursor(journal: projectionTestWorkJournal, sequence: 1),
         resultingWorkCursor: workCursor, capabilities: [])
     let currentRun = RunRef("run-current")
-    let artifact = WorkServiceArtifactDescriptor(
+    let artifact = try WorkServiceArtifactDescriptor(
         artifactID: "artifact-secret-name", work: projectionTestWork,
-        label: "private artifact label", mediaType: "text/private-secret", byteCount: 12,
-        digest: "private-artifact-digest", available: true)
+        label: "private artifact label", mediaType: "text/private-secret",
+        sourceEvent: EventRef(journal: projectionTestWorkJournal, eventID: "artifact-source"),
+        session: projectionTestSession, sessionAttachment: attachment, run: currentRun)
     let descriptor = try WorkServiceWorkDescriptor(
         work: projectionTestWork, journal: projectionTestWorkJournal,
         recordedDisposition: .reusable, execution: .running, currentRun: currentRun,
@@ -285,9 +286,11 @@ func testCanonicalWorkingStateProjectionIsBoundedAndPrivate() throws {
     XCTAssertEqual(artifactPartial.omittedArtifactCount, 2)
     XCTAssertEqual(artifactPartial.omittedArtifactMetadataCount, 3)
 
-    let rowTruncatedArtifact = WorkServiceArtifactDescriptor(
+    let rowTruncatedArtifact = try WorkServiceArtifactDescriptor(
         artifactID: "artifact-row-truncated", work: projectionTestWork,
-        label: "artifact", available: false, metadataWasTruncated: true)
+        label: "artifact", available: false, metadataWasTruncated: true,
+        sourceEvent: EventRef(journal: projectionTestWorkJournal, eventID: "row-source"),
+        session: projectionTestSession, sessionAttachment: attachment, run: currentRun)
     let rowTruncatedDescriptor = try WorkServiceWorkDescriptor(
         work: projectionTestWork, journal: projectionTestWorkJournal,
         recordedDisposition: .reusable, execution: .running, currentRun: currentRun,

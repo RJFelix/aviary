@@ -1508,6 +1508,52 @@ func testJournalBackedWorkServiceCreateStaysIdleWithProductionManifest() async t
     await service.controlJournal.close()
 }
 
+private struct CanonicalArtifactFixtureContext {
+    let run: RunRef
+    let turn: TurnRef
+    let action: ActionRef
+    let startedEvent: EventRef
+}
+
+private func appendCanonicalArtifactFixturePrefix(
+    _ writer: TimelineJournalWriter,
+    created: WorkServiceCreateWorkResponse,
+    suffix: String
+) async throws -> CanonicalArtifactFixtureContext {
+    let work = created.work.work
+    let workHost = WorkHostRef(work.workHostID)
+    let run = RunRef("artifact-run-\(suffix)")
+    let turn = TurnRef("artifact-turn-\(suffix)")
+    let action = ActionRef("artifact-action-\(suffix)")
+    _ = try await writer.append(TimelineEventDraft(
+        session: created.session, work: work, workHost: workHost,
+        sessionAttachment: created.sessionAttachment, run: run,
+        type: TimelineEventType.runStarted, declaredDomains: [.work], payload: .object([
+            "model_id": .string("artifact-fixture-model"),
+        ])))
+    _ = try await writer.append(TimelineEventDraft(
+        work: work, workHost: workHost, run: run, turn: turn,
+        type: TimelineEventType.turnStarted, declaredDomains: [.work]))
+    let intent = try await writer.append(TimelineEventDraft(
+        work: work, workHost: workHost, run: run, turn: turn, action: action,
+        type: TimelineEventType.actionIntent, declaredDomains: [.work, .externalEffects],
+        payload: .object([
+            "state": .string(ActionExecutionState.proposed.rawValue),
+            "kind": .string(ActionKind.artifact.rawValue),
+            "intent": .string("publish artifact fixture"),
+        ])))
+    let started = try await writer.append(TimelineEventDraft(
+        causedByEventID: intent.eventRef, parentActivityID: intent.eventRef,
+        work: work, workHost: workHost, run: run, turn: turn, action: action,
+        type: TimelineEventType.actionStarted, declaredDomains: [.work, .externalEffects],
+        payload: .object([
+            "state": .string(ActionExecutionState.running.rawValue),
+            "kind": .string(ActionKind.artifact.rawValue),
+        ])))
+    return CanonicalArtifactFixtureContext(
+        run: run, turn: turn, action: action, startedEvent: started.eventRef)
+}
+
 func testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen() async throws {
     let (home, root) = try journalBackedHome()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -1528,16 +1574,19 @@ func testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen() async th
         reopening: home.timelineV2WorkJournalURL(created.work.work),
         journal: created.work.journal,
         actor: TimelineActor(actorID: "artifact-index-writer", kind: "self-test"), home: home)
-    let longLabel = String(
-        repeating: "m", count: WorkServiceBounds.maxDiagnosticCharacters + 1)
+    let fixture = try await appendCanonicalArtifactFixturePrefix(
+        writer, created: created, suffix: "index")
     for index in 0...WorkServiceBounds.maxArtifactsPerWork {
         _ = try await writer.append(TimelineEventDraft(
-            work: created.work.work,
+            causedByEventID: fixture.startedEvent,
+            session: created.session, work: created.work.work,
             workHost: WorkHostRef(created.work.work.workHostID),
+            sessionAttachment: created.sessionAttachment, run: fixture.run, turn: fixture.turn,
+            action: fixture.action,
             type: TimelineEventType.artifact, declaredDomains: [.work],
             payload: .object([
                 "artifact_id": .string("artifact-\(index)"),
-                "label": .string(index == 0 ? longLabel : "artifact \(index)"),
+                "label": .string("artifact \(index)"),
                 "media_type": .string("text/plain"),
                 "available": .bool(false),
             ])))
@@ -1549,9 +1598,12 @@ func testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen() async th
         XCTAssertEqual(
             descriptor.omissions.first(where: { $0.category == "artifacts" })?.count, 1)
         XCTAssertEqual(
+            descriptor.omissions.first(where: { $0.category == "artifact_index" })?.count, nil)
+        XCTAssertEqual(
             descriptor.omissions.first(where: { $0.category == "artifact_metadata" })?.count,
-            1)
-        XCTAssertTrue(try XCTUnwrap(descriptor.artifacts.first).metadataWasTruncated)
+            nil)
+        XCTAssertEqual(try XCTUnwrap(descriptor.artifacts.first).artifactID, "artifact-1")
+        XCTAssertFalse(try XCTUnwrap(descriptor.artifacts.first).metadataWasTruncated)
     }
 
     try assertBoundedArtifactIndex(try await service.describeWork(.init(
@@ -1570,22 +1622,24 @@ func testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen() async th
         actor: TimelineActor(actorID: "malformed-artifact-writer", kind: "self-test"),
         home: home)
     _ = try await malformedWriter.append(TimelineEventDraft(
-        work: created.work.work,
+        causedByEventID: fixture.startedEvent,
+        session: created.session, work: created.work.work,
         workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment, run: fixture.run, turn: fixture.turn,
+        action: fixture.action,
         type: TimelineEventType.artifact, declaredDomains: [.work],
         payload: .object([
             "label": .string("missing identity"),
             "available": .bool(false),
         ])))
     try await malformedWriter.closeChecked()
-    let malformedDescriptor = try await reopened.describeWork(.init(
-        work: created.work.work, journal: created.work.journal, client: client))
-    XCTAssertEqual(
-        malformedDescriptor.omissions.first(where: { $0.category == "artifacts" })?.count,
-        1)
-    XCTAssertEqual(
-        malformedDescriptor.omissions.first(where: { $0.category == "artifact_index" })?.count,
-        1)
+    do {
+        _ = try await reopened.describeWork(.init(
+            work: created.work.work, journal: created.work.journal, client: client))
+        XCTFail("a malformed known artifact event must fail closed")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
 
     let invalidIdentityWriter = try TimelineJournalWriter(
         reopening: home.timelineV2WorkJournalURL(created.work.work),
@@ -1598,8 +1652,11 @@ func testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen() async th
     ]
     for invalidID in invalidArtifactIDs {
         _ = try await invalidIdentityWriter.append(TimelineEventDraft(
-            work: created.work.work,
+            causedByEventID: fixture.startedEvent,
+            session: created.session, work: created.work.work,
             workHost: WorkHostRef(created.work.work.workHostID),
+            sessionAttachment: created.sessionAttachment, run: fixture.run, turn: fixture.turn,
+            action: fixture.action,
             type: TimelineEventType.artifact, declaredDomains: [.work],
             payload: .object([
                 "artifact_id": .string(invalidID),
@@ -1608,13 +1665,13 @@ func testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen() async th
             ])))
     }
     try await invalidIdentityWriter.closeChecked()
-    let invalidIdentityDescriptor = try await reopened.describeWork(.init(
-        work: created.work.work, journal: created.work.journal, client: client))
-    XCTAssertEqual(
-        invalidIdentityDescriptor.omissions.first(where: {
-            $0.category == "artifact_index"
-        })?.count,
-        1)
+    do {
+        _ = try await reopened.describeWork(.init(
+            work: created.work.work, journal: created.work.journal, client: client))
+        XCTFail("an invalid artifact identity must fail closed")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
     for invalidID in invalidArtifactIDs {
         do {
             _ = try await reopened.fetchArtifact(.init(
@@ -1640,6 +1697,7 @@ func testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen() async th
         TimelineBodyReference(
             authority: created.work.journal, referenceID: "artifact-body",
             mediaType: "text/plain", byteCount: 1, digest: "not-a-sha256-digest"))))
+    let validDigest = "sha256:" + String(repeating: "0", count: 64)
     let malformedFieldPayloads: [[String: JSONValue]] = [
         [
             "artifact_id": .string("undecodable-body-reference"),
@@ -1653,24 +1711,46 @@ func testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen() async th
             "artifact_id": .string("negative-byte-count"),
             "byte_count": .number(-1),
         ],
+        [
+            "artifact_id": .string("bodyless-metadata"),
+            "label": .string("bodyless metadata"),
+            "available": .bool(false),
+            "byte_count": .number(0),
+            "digest": .string(validDigest),
+        ],
+        [
+            "artifact_id": .string("unicode-label"),
+            "label": .string("bad\u{2028}label"),
+            "available": .bool(false),
+        ],
+        [
+            "artifact_id": .string("unicode-media"),
+            "label": .string("unicode media"),
+            "media_type": .string("text/\u{2029}plain"),
+            "available": .bool(false),
+        ],
     ]
     for payload in malformedFieldPayloads {
         _ = try await malformedFieldWriter.append(TimelineEventDraft(
-            work: created.work.work,
+            causedByEventID: fixture.startedEvent,
+            session: created.session, work: created.work.work,
             workHost: WorkHostRef(created.work.work.workHostID),
+            sessionAttachment: created.sessionAttachment, run: fixture.run, turn: fixture.turn,
+            action: fixture.action,
             type: TimelineEventType.artifact, declaredDomains: [.work],
             payload: .object(payload)))
     }
     try await malformedFieldWriter.closeChecked()
-    let malformedFieldDescriptor = try await reopened.describeWork(.init(
-        work: created.work.work, journal: created.work.journal, client: client))
-    XCTAssertEqual(
-        malformedFieldDescriptor.omissions.first(where: {
-            $0.category == "artifact_index"
-        })?.count,
-        1)
+    do {
+        _ = try await reopened.describeWork(.init(
+            work: created.work.work, journal: created.work.journal, client: client))
+        XCTFail("malformed artifact fields must fail closed")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
     for artifactID in [
         "undecodable-body-reference", "invalid-body-digest", "negative-byte-count",
+        "bodyless-metadata", "unicode-label", "unicode-media",
     ] {
         do {
             _ = try await reopened.fetchArtifact(.init(
@@ -1689,11 +1769,14 @@ func testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen() async th
         actor: TimelineActor(actorID: "duplicate-artifact-writer", kind: "self-test"),
         home: home)
     _ = try await duplicateWriter.append(TimelineEventDraft(
-        work: created.work.work,
+        causedByEventID: fixture.startedEvent,
+        session: created.session, work: created.work.work,
         workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment, run: fixture.run, turn: fixture.turn,
+        action: fixture.action,
         type: TimelineEventType.artifact, declaredDomains: [.work],
         payload: .object([
-            "artifact_id": .string("artifact-0"),
+            "artifact_id": .string("artifact-128"),
             "label": .string("duplicate identity"),
             "available": .bool(false),
         ])))
@@ -1709,8 +1792,293 @@ func testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen() async th
         _ = try await reopened.fetchArtifact(.init(
             work: created.work.work, journal: created.work.journal,
             attachment: created.attachment.attachment, client: client,
-            artifactID: "artifact-0"))
+            artifactID: "artifact-128"))
         XCTFail("duplicate artifact identities must make artifact lookup unavailable")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    await reopened.controlJournal.close()
+}
+
+/// An artifact descriptor window is intentionally bounded, but body authorization must be
+/// derived from the canonical artifact event rather than from whichever descriptors happened to
+/// fit in that window.  This is the adversarial shape: the requested body belongs to artifact 0,
+/// while the cold reader retains only the newest 128 descriptors.
+func testJournalBackedWorkServiceArtifactBodiesRequireInspectionBeyondBoundedWindow() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let creator = ClientRef("artifact-producer")
+    let observer = ClientRef("artifact-observer")
+    let policy = WorkServiceCapabilityPolicy(grantsByClient: [
+        creator: journalBackedAllCapabilities(), observer: [.observe],
+    ])
+    let store = JournalBackedTestManifestStore(productionCapable: true)
+    let service = try JournalBackedWorkService(
+        home: home, authorizer: policy, manifestStore: store)
+    let control = try await service.handshake(.init(client: creator)).controlCursor
+    let created = try await service.createWork(.init(
+        client: creator, commandID: "artifact-body-create", causalControlCursor: control,
+        requestedCapabilities: journalBackedAllCapabilities()))
+
+    let bodyStore = ContextBodyStore(home: home)
+    let artifactWriter = try TimelineJournalWriter(
+        reopening: home.timelineV2WorkJournalURL(created.work.work), journal: created.work.journal,
+        actor: TimelineActor(actorID: "artifact-body-writer", kind: "self-test"), home: home)
+    let fixture = try await appendCanonicalArtifactFixturePrefix(
+        artifactWriter, created: created, suffix: "body")
+    // Keep more than the historical active-start bound live at the same time. The descriptor and
+    // body reads below must derive authorization from canonical reducer state rather than from an
+    // arbitrary prefix of these still-active actions.
+    var concurrentActionStarts: [(action: ActionRef, startedEvent: EventRef)] = []
+    for index in 0..<40 {
+        let activeAction = ActionRef("concurrent-action-\(index)")
+        let intent = try await artifactWriter.append(TimelineEventDraft(
+            causedByEventID: fixture.startedEvent,
+            work: created.work.work, workHost: WorkHostRef(created.work.work.workHostID),
+            run: fixture.run, turn: fixture.turn, action: activeAction,
+            type: TimelineEventType.actionIntent,
+            declaredDomains: [.work, .externalEffects], payload: .object([
+                "state": .string(ActionExecutionState.proposed.rawValue),
+                "kind": .string(ActionKind.artifact.rawValue),
+                "intent": .string("completed action bound test"),
+            ])))
+        let started = try await artifactWriter.append(TimelineEventDraft(
+            causedByEventID: intent.eventRef,
+            work: created.work.work, workHost: WorkHostRef(created.work.work.workHostID),
+            run: fixture.run, turn: fixture.turn, action: activeAction,
+            type: TimelineEventType.actionStarted,
+            declaredDomains: [.work, .externalEffects], payload: .object([
+                "state": .string(ActionExecutionState.running.rawValue),
+                "kind": .string(ActionKind.artifact.rawValue),
+            ])))
+        concurrentActionStarts.append((action: activeAction, startedEvent: started.eventRef))
+    }
+    var references: [TimelineBodyReference] = []
+    for index in 0...WorkServiceBounds.maxArtifactsPerWork {
+        let body = Data("artifact-body-\(index)".utf8)
+        let reference = try bodyStore.retain(
+            body, authority: created.work.journal, mediaType: "text/plain")
+        references.append(reference)
+        _ = try await artifactWriter.append(TimelineEventDraft(
+            causedByEventID: fixture.startedEvent,
+            session: created.session, work: created.work.work,
+            workHost: WorkHostRef(created.work.work.workHostID),
+            sessionAttachment: created.sessionAttachment, run: fixture.run, turn: fixture.turn,
+            action: fixture.action,
+            type: TimelineEventType.artifact, declaredDomains: [.work], payload: .object([
+                "artifact_id": .string("artifact-\(index)"),
+                "label": .string("artifact \(index)"),
+                "media_type": .string("text/plain"),
+                "byte_count": .number(Double(body.count)),
+                "digest": .string(try XCTUnwrap(reference.digest)),
+                "available": .bool(true),
+                "body_reference": try XCTUnwrap(
+                    JSONValue.parse(JSONEncoder().encode(reference))),
+            ])))
+    }
+    try await artifactWriter.closeChecked()
+
+    // Keep one ordinary Session body in the same fixture.  It must remain observable without
+    // inspect_artifacts, preserving the existing conversation/context body policy.
+    let sessionBody = Data("conversation-body".utf8)
+    let sessionReference = try bodyStore.retain(
+        sessionBody, authority: created.sessionJournal, mediaType: "text/plain")
+    let sessionWriter = try TimelineJournalWriter(
+        reopening: home.timelineV2SessionJournalURL(created.session),
+        journal: created.sessionJournal,
+        actor: TimelineActor(actorID: "conversation-body-writer", kind: "self-test"), home: home)
+    _ = try await sessionWriter.append(TimelineEventDraft(
+        session: created.session, work: created.work.work,
+        sessionAttachment: created.sessionAttachment,
+        type: TimelineEventType.messageCommitted, declaredDomains: [.session], payload: .object([
+            "role": .string(ChatRole.assistant.rawValue),
+            "text": .string("conversation"),
+            "message_body_ref": try XCTUnwrap(
+                JSONValue.parse(JSONEncoder().encode(sessionReference))),
+        ])));
+    try await sessionWriter.closeChecked()
+    await service.controlJournal.close()
+
+    let reopened = try JournalBackedWorkService(
+        home: home, instanceID: "artifact-body-reopen", startIdentity: "artifact-body-reopen",
+        authorizer: policy, manifestStore: store)
+    let descriptor = try await reopened.describeWork(.init(
+        work: created.work.work, journal: created.work.journal, client: creator))
+    XCTAssertEqual(descriptor.artifacts.count, WorkServiceBounds.maxArtifactsPerWork)
+    XCTAssertEqual(descriptor.artifacts.first?.artifactID, "artifact-1")
+    XCTAssertEqual(
+        descriptor.artifacts.last?.artifactID,
+        "artifact-\(WorkServiceBounds.maxArtifactsPerWork)")
+
+    let observerControl = try await reopened.handshake(.init(client: observer)).controlCursor
+    let observerAttachment = try await reopened.attach(.init(
+        work: created.work.work, journal: created.work.journal, client: observer,
+        commandID: "artifact-body-observer-attach", causalControlCursor: observerControl,
+        requestedCapabilities: [.observe])).attachment
+    let observerAttachmentValue = try XCTUnwrap(observerAttachment)
+    do {
+        _ = try await reopened.fetchBody(.init(
+            work: created.work.work, journal: created.work.journal,
+            attachment: observerAttachmentValue.attachment, client: observer,
+            reference: references[0]))
+        XCTFail("an omitted artifact descriptor must still require inspect_artifacts")
+    } catch WorkServiceProtocolError.capabilityDenied(.inspectArtifacts) {
+        XCTAssertTrue(true)
+    }
+
+    let retained = try await reopened.fetchBody(.init(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: creator,
+        reference: references[0]))
+    XCTAssertEqual(retained.status, .retained)
+    XCTAssertEqual(retained.data, Data("artifact-body-0".utf8))
+
+    let conversation = try await reopened.fetchBody(.init(
+        work: created.work.work, journal: created.work.journal,
+        attachment: observerAttachmentValue.attachment, client: observer,
+        reference: sessionReference))
+    XCTAssertEqual(conversation.status, .retained)
+    XCTAssertEqual(conversation.data, sessionBody)
+
+    // The rolling descriptor window has now evicted artifact-0.  Repeating that identity at the
+    // tail is an adversarial duplicate that only an exact requested-ID stream scan can catch.
+    let duplicateWriter = try TimelineJournalWriter(
+        reopening: home.timelineV2WorkJournalURL(created.work.work),
+        journal: created.work.journal,
+        actor: TimelineActor(actorID: "artifact-body-duplicate-writer", kind: "self-test"),
+        home: home)
+    let duplicateBody = references[0]
+    // Finish the actions only after the descriptor/body reads above. This leaves >32 valid
+    // concurrent starts in the canonical prefix while it is being inspected, without allowing
+    // unfinished actions to cross the enclosing turn/run terminal markers.
+    for active in concurrentActionStarts {
+        _ = try await duplicateWriter.append(TimelineEventDraft(
+            causedByEventID: active.startedEvent,
+            work: created.work.work, workHost: WorkHostRef(created.work.work.workHostID),
+            run: fixture.run, turn: fixture.turn, action: active.action,
+            type: TimelineEventType.actionOutcome,
+            declaredDomains: [.work, .externalEffects], payload: .object([
+                "state": .string(ActionExecutionState.succeeded.rawValue),
+                "retry_safety": .string(ActionRetrySafety.safe.rawValue),
+            ])))
+    }
+    _ = try await duplicateWriter.append(TimelineEventDraft(
+        work: created.work.work, workHost: WorkHostRef(created.work.work.workHostID),
+        run: fixture.run, turn: fixture.turn, action: fixture.action,
+        type: TimelineEventType.actionOutcome, declaredDomains: [.work, .externalEffects],
+        payload: .object([
+            "state": .string(ActionExecutionState.succeeded.rawValue),
+            "retry_safety": .string(ActionRetrySafety.idempotent.rawValue),
+        ])))
+    _ = try await duplicateWriter.append(TimelineEventDraft(
+        work: created.work.work, workHost: WorkHostRef(created.work.work.workHostID),
+        run: fixture.run, turn: fixture.turn,
+        type: TimelineEventType.turnFinished, declaredDomains: [.work], payload: .object([
+            "outcome": .string(RunTurnOutcome.completed.rawValue),
+        ])))
+    _ = try await duplicateWriter.append(TimelineEventDraft(
+        session: created.session, work: created.work.work,
+        workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment, run: fixture.run,
+        type: TimelineEventType.runFinished, declaredDomains: [.work], payload: .object([
+            "state": .string(RunTerminalOutcome.completed.rawValue),
+        ])))
+    let secondFixture = try await appendCanonicalArtifactFixturePrefix(
+        duplicateWriter, created: created, suffix: "body-r2")
+    // R2/T2 is still active, and a distinct generic artifact is intentionally allowed to share
+    // the same content-addressed bytes.  The body reference authorizes canonical bytes; it does
+    // not turn one artifact identity into another.
+    _ = try await duplicateWriter.append(TimelineEventDraft(
+        causedByEventID: secondFixture.startedEvent,
+        session: created.session, work: created.work.work,
+        workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment, run: secondFixture.run,
+        turn: secondFixture.turn, action: secondFixture.action,
+        type: TimelineEventType.artifact, declaredDomains: [.work], payload: .object([
+            "artifact_id": .string("artifact-r2-reuses-r1-body"),
+            "label": .string("cross-generation reuse"),
+            "media_type": .string("text/plain"),
+            "byte_count": .number(Double(duplicateBody.byteCount ?? 0)),
+            "digest": .string(try XCTUnwrap(duplicateBody.digest)),
+            "available": .bool(true),
+            "body_reference": try XCTUnwrap(
+                JSONValue.parse(JSONEncoder().encode(duplicateBody))),
+        ])))
+    try await duplicateWriter.closeChecked()
+    let reusedDescriptor = try await reopened.fetchArtifact(.init(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: creator,
+        artifactID: "artifact-r2-reuses-r1-body"))
+    XCTAssertEqual(reusedDescriptor.bodyReference, duplicateBody)
+    let reusedBody = try await reopened.fetchBody(.init(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: creator,
+        reference: duplicateBody))
+    XCTAssertEqual(reusedBody.status, .retained)
+    XCTAssertEqual(reusedBody.data, Data("artifact-body-0".utf8))
+
+    // The rolling descriptor window has now evicted artifact-0.  Repeating that identity in the
+    // next active Run is an adversarial duplicate that only an exact requested-ID stream scan can
+    // catch without making the reducer prefix malformed.
+    let identityDuplicateWriter = try TimelineJournalWriter(
+        reopening: home.timelineV2WorkJournalURL(created.work.work),
+        journal: created.work.journal,
+        actor: TimelineActor(actorID: "artifact-body-identity-duplicate-writer", kind: "self-test"),
+        home: home)
+    _ = try await identityDuplicateWriter.append(TimelineEventDraft(
+        causedByEventID: secondFixture.startedEvent,
+        session: created.session, work: created.work.work,
+        workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment, run: secondFixture.run, turn: secondFixture.turn,
+        action: secondFixture.action,
+        type: TimelineEventType.artifact, declaredDomains: [.work], payload: .object([
+            "artifact_id": .string("artifact-0"),
+            "label": .string("duplicate artifact"),
+            "media_type": .string("text/plain"),
+            "byte_count": .number(Double(duplicateBody.byteCount ?? 0)),
+            "digest": .string(try XCTUnwrap(duplicateBody.digest)),
+            "available": .bool(true),
+            "body_reference": try XCTUnwrap(
+                JSONValue.parse(JSONEncoder().encode(duplicateBody))),
+        ])))
+    try await identityDuplicateWriter.closeChecked()
+    do {
+        _ = try await reopened.fetchArtifact(.init(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: creator,
+            artifactID: "artifact-0"))
+        XCTFail("an omitted duplicate artifact identity must fail closed")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+
+    // A retained Work-journal body with no canonical event is never a fetch capability.
+    let orphan = try bodyStore.retain(
+        Data("orphan-body".utf8), authority: created.work.journal, mediaType: "text/plain")
+    let unknown = try await reopened.fetchBody(.init(
+        work: created.work.work, journal: created.work.journal,
+        attachment: observerAttachmentValue.attachment, client: observer, reference: orphan))
+    XCTAssertEqual(unknown.status, .unavailable)
+
+    let unknownWorkBody = try bodyStore.retain(
+        Data("unknown-work-body".utf8), authority: created.work.journal, mediaType: "text/plain")
+    let unknownWriter = try TimelineJournalWriter(
+        reopening: home.timelineV2WorkJournalURL(created.work.work),
+        journal: created.work.journal,
+        actor: TimelineActor(actorID: "unknown-body-writer", kind: "self-test"), home: home)
+    _ = try await unknownWriter.append(TimelineEventDraft(
+        work: created.work.work, workHost: WorkHostRef(created.work.work.workHostID),
+        type: "work.unknown.body", declaredDomains: [.work], payload: .object([
+            "body_reference": try XCTUnwrap(
+                JSONValue.parse(JSONEncoder().encode(unknownWorkBody))),
+        ])))
+    try await unknownWriter.closeChecked()
+    do {
+        _ = try await reopened.fetchBody(.init(
+            work: created.work.work, journal: created.work.journal,
+            attachment: observerAttachmentValue.attachment, client: observer,
+            reference: unknownWorkBody))
+        XCTFail("an unknown Work body event must fail closed")
     } catch WorkServiceProtocolError.sourceIncomplete {
         XCTAssertTrue(true)
     }
@@ -4606,6 +4974,9 @@ let casesJournalBackedWorkService: [Case] = [
     }),
     ("journal-backed service reports artifact index loss across reopen", {
         try await testJournalBackedWorkServiceReportsArtifactIndexLossAcrossReopen()
+    }),
+    ("journal-backed service protects omitted artifact bodies", {
+        try await testJournalBackedWorkServiceArtifactBodiesRequireInspectionBeyondBoundedWindow()
     }),
     ("journal-backed service publishes and reopens Create Session evidence", {
         try await testJournalBackedWorkServicePublishesCreateSessionAndReopensItsEvidence()

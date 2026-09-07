@@ -50,6 +50,14 @@ enum ServiceBackedRunBridgeError: Error, LocalizedError, Sendable {
     }
 }
 
+/// Presentation-safe outcomes for the on-demand repository review read. The GUI deliberately
+/// does not expose transport diagnostics, host paths, or storage details from the Work service.
+enum RepositoryReviewLoadError: Error, Equatable, Sendable {
+    case stale
+    case unavailable
+    case bounded
+}
+
 /// The GUI projection of one attached Work-service controller.
 ///
 /// This is deliberately an adapter rather than another Work implementation.  The controller
@@ -151,6 +159,68 @@ final class ServiceBackedRunBridge {
     /// distinct from both unsent GUI drafts and the controller's single in-flight mutation.
     var pendingInputs: [CanonicalInputDeliveryRow] {
         inputDeliveryProjection.unresolvedAcceptedCommands
+    }
+
+    /// The newest repository-review descriptor in the current authenticated Work projection.
+    /// Artifact publication order is the only ordering contract available here; keeping the
+    /// last exact media-type match makes the selection deterministic without inventing a clock.
+    var latestRepositoryReviewDescriptor: WorkServiceArtifactDescriptor? {
+        guard !projection.descriptor.omissions.contains(where: {
+            ["artifacts", "artifact_index", "artifact_identity_scope"].contains($0.category)
+        }) else { return nil }
+        return projection.descriptor.artifacts.last {
+            $0.mediaType == ObservedRepositoryReviewFormat.mediaType
+        }
+    }
+
+    /// Resolve and parse the selected review only after a person explicitly asks to load it.
+    /// ``WorkServiceAttachedWorkController`` revalidates the descriptor, body reference, fence,
+    /// byte count, and digest during the read. A changed identity is never returned as stale
+    /// content.
+    func loadLatestRepositoryReview(
+        expectedDescriptor: WorkServiceArtifactDescriptor,
+        maxTotalBytes: Int = ObservedRepositoryReviewLimits.default.totalArtifactBytes
+    ) async -> Result<ObservedRepositoryReview, RepositoryReviewLoadError> {
+        guard let selected = latestRepositoryReviewDescriptor,
+              selected == expectedDescriptor else {
+            return .failure(.unavailable)
+        }
+        do {
+            let fetched = try await controller.fetchArtifactBody(
+                mediaType: ObservedRepositoryReviewFormat.mediaType,
+                maxTotalBytes: maxTotalBytes)
+            guard fetched.descriptor == selected,
+                  latestRepositoryReviewDescriptor == selected else {
+                return .failure(.unavailable)
+            }
+            guard fetched.data.count <= maxTotalBytes else {
+                return .failure(.bounded)
+            }
+            do {
+                let review = try ObservedRepositoryReview.decode(fetched.data)
+                guard review.matchesCanonicalSource(of: selected) else {
+                    return .failure(.unavailable)
+                }
+                return .success(review)
+            } catch {
+                // Invalid review bytes are not actionable GUI evidence. Keep the distinction
+                // intentionally coarse and never surface the decoder's remote payload detail.
+                return .failure(.unavailable)
+            }
+        } catch let error as WorkServiceAttachedArtifactLoadError {
+            switch error {
+            case .tooLarge:
+                return .failure(.bounded)
+            case .incomplete:
+                // If the selected descriptor is still present, the canonical projection was
+                // changing or incomplete during the read; do not present the partial result.
+                return .failure(latestRepositoryReviewDescriptor == selected ? .stale : .unavailable)
+            case .omitted, .notFound, .malformed, .capabilityDenied, .invalidOptions:
+                return .failure(.unavailable)
+            }
+        } catch {
+            return .failure(.unavailable)
+        }
     }
 
     /// Unknown-effect delivery outcomes remain visible even when the paired Session append was

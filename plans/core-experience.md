@@ -1,6 +1,6 @@
 # Aviary core experience: durable sessions, truthful actions, and calm control
 
-Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; exact Work/Session continuation, production service/control-reader cutover, Session-qualified Run routing, and GUI new-Session-to-existing-Work composition have completed integrated macOS/Linux/cross-device verification; the first Phase 2 canonical workspace, explicit input-delivery, dual context/working-state inspector, paged service-backed conversation history, and Phase 4A Action Lens slices are implemented
+Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C durable Work Host checkpoint are implemented; exact Work/Session continuation, production service/control-reader cutover, Session-qualified Run routing, and GUI new-Session-to-existing-Work composition have completed integrated macOS/Linux/cross-device verification; the first Phase 2 canonical workspace, explicit input-delivery, dual context/working-state inspector, paged service-backed conversation history, Phase 4A Action Lens, and Phase 4B observed-repository-review slices are implemented
 Date: 2026-09-06
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
@@ -186,8 +186,11 @@ reports lifecycle/execution, cursor positions, active Run/Turn presence, bounded
 artifact counts, independent artifact/attachment index completeness, and the six-plane recovery
 matrix. Artifact rows expose fixed media categories and addressability only; aggregate omissions and
 per-row truncation flags both make metadata loss visible without double-counting. Malformed artifact
-records make the index explicitly unknown, and duplicate artifact identities make describe/fetch fail
-closed rather than selecting an arbitrary row. Remote Python namespace inspection is currently an
+records make the index explicitly unknown, and duplicate artifact identities within the retained
+window make describe/fetch fail closed rather than selecting an arbitrary row. An omitted artifact
+window explicitly lacks whole-history identity proof; fetching any selected identity scans the
+canonical source and rejects duplicates even outside that window. Remote Python namespace inspection
+is currently an
 explicit `not_exposed` state rather than an empty namespace or a claim that conversation recovery
 reconstructed memory. Invalid or source-incomplete projections retain only identity/cursor/source
 status and suppress derived lifecycle, model, action, Handle, artifact, recovery, and namespace facts.
@@ -273,6 +276,58 @@ assertions and real-daemon round trips pass 3 cases / 70 assertions. A macOS Swi
 completed a handshake through SSH streamlocal forwarding to that Linux daemon. These are capability
 and transport proofs for the private same-user Unix-socket/SSH path, not a claim of remote principal
 authentication, sandboxing, or hostile-host containment.
+
+Observed repository-review checkpoint (2026-09-07): after a successful native model turn and while
+that exact Run and Turn are still active, the Work Host performs one bounded Git observation of the
+current working tree relative to HEAD. The observation is a typed artifact action, and its retained
+body is published before a metadata-only `artifact.recorded` event and before `turn.finished`.
+Artifact identity, source event, Run, Turn, action-start cause, Session owner, body authority, byte
+count, media type, and digest remain joined through the service projection. Exact body bytes require
+the separate `inspect_artifacts` capability and are fetched only when a person opens the review.
+Cancellation during observation cancels the action and Turn; a truthful observer timeout, conflict,
+or failure remains reviewable evidence and does not retroactively fail otherwise completed model
+work. Turn completion now records its typed completed, failed, or canceled outcome instead of relying
+on Session attention as an indirect clue. The visible terminal event is deferred until observation
+and the durable Turn outcome settle, so cancellation or journal failure cannot follow an already
+announced successful finish.
+
+Exact cold resume recognizes only the complete, settled host-only review producer chain after the
+last provider crossing. Its action, artifact, causal links, terminal outcome, and Run/Turn must
+agree; generic artifacts, runtime/tool activity, missing evidence, and altered outcomes still refuse
+resume. This restores effective conversation context only: Python namespace and background work
+remain lost on cold resume, and repository/external-effect recovery coverage remains unknown.
+
+The observer uses literal-argument, bounded process execution with one aggregate deadline and
+before/after HEAD, status, and diff-content fences. It retains repository-relative structured file
+names, staged and unstaged text diffs for tracked text files, and explicit omissions. Untracked and
+ignored bodies, binary diff bodies, and submodule bodies are excluded. If any command, file list,
+omission list, or artifact envelope reaches a bound, the record says so and does not present a
+partial diff as complete. Tracked diff text is intentionally unfiltered file content and may itself
+contain credentials or host paths, which is why it is not observe-readable by default. This is an
+observation of current state, not attribution to the Turn: pre-existing, manual, background, and
+other-agent edits may all be present. Invoking configured local Git is not a sandbox or a promise of
+zero incidental Git metadata/helper effects, though optional index locking is disabled. The slice
+does not stage, revert, commit, checkpoint, restore, or claim containment.
+
+The conversation header exposes Review changes only when the authenticated projection contains a
+matching artifact in a complete artifact index. An omitted window cannot prove which matching
+review is latest, so it does not enable latest-review selection. The sheet loads on demand,
+rejects a body whose canonical descriptor changes,
+labels bounded/conflicting/unavailable evidence, and can place explicitly bounded revision feedback
+into the existing durable composer without sending it. A review selected while the sheet is open
+tracks later canonical artifact selection rather than silently presenting an older body as current.
+Checkpoint/restore and write-capable review controls remain later Phase 4B work.
+
+Final checkpoint verification: the uninterrupted macOS suite passes 1,008 cases / 14,518
+assertions in 520.67 seconds. The fresh Ubuntu 24.04 x86_64 / Swift 6.3.3 snapshot builds
+`aviaryd` and `AviarySelfTest` and passes all 35 selected headless groups / 4,195 assertions in
+288.37 seconds, including real daemon reconnect and replacement. `just compile`, `just build`,
+and `just shots` pass; the signed app includes its signed daemon helper, all nine screen routes
+render, and five repository-review fixtures cover wide, narrow, stale, and near/full feedback
+capacity states. These fixtures were visually inspected, separately from the production runtime,
+controller, and daemon tests. The current macOS probe also handshakes the exact Linux daemon
+through SSH streamlocal forwarding; this proves the private transport path, not remote principal
+authentication or full Linux GUI/provider parity. Probe processes were stopped after verification.
 
 Phase 3C closure checkpoint (2026-09-04): accepted and duplicate service commands no longer
 become UI truth on the strength of a transport receipt. The client retains the exact command

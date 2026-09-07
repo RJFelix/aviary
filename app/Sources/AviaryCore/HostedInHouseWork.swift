@@ -1035,7 +1035,8 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
                     reasoningEffort: configuration.reasoningEffort,
                     writer: bridge.legacyProjection,
                     nativeJournal: bridge.nativeJournal,
-                    nativeResumeSeed: bridge.resumeSeed))
+                    nativeResumeSeed: bridge.resumeSeed,
+                    repositoryReviewer: ObservedRepositoryReviewer()))
             self.runner = runner
             await runner.observe { [weak self] event in
                 guard let self else { return }

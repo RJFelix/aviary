@@ -53,6 +53,27 @@ private func reducerJSON<T: Encodable>(_ value: T) -> JSONValue {
     JSONValue.parse(try! JSONEncoder().encode(value))!
 }
 
+private func reducerArtifactPayload(
+    artifactID: String = "reducer-artifact",
+    label: String = "artifact",
+    mediaType: String? = "text/plain",
+    byteCount: Int? = nil,
+    digest: String? = nil,
+    available: Bool = false,
+    bodyReference: TimelineBodyReference? = nil
+) -> JSONValue {
+    var object: [String: JSONValue] = [
+        "artifact_id": .string(artifactID),
+        "label": .string(label),
+        "available": .bool(available),
+    ]
+    if let mediaType { object["media_type"] = .string(mediaType) }
+    if let byteCount { object["byte_count"] = .number(Double(byteCount)) }
+    if let digest { object["digest"] = .string(digest) }
+    if let bodyReference { object["body_reference"] = reducerJSON(bodyReference) }
+    return .object(object)
+}
+
 func test_timelineReducersLinkSessionsAndWork() throws {
     let sessionAttachment = SessionAttachmentRef("session-attachment")
     let run = RunRef("run-test")
@@ -612,13 +633,15 @@ func test_timelineReducerRejectsInvalidTurnAndHandleActivityEnvelopes() throws {
                      run: run, turn: otherTurn),
         reducerEvent(TimelineEventType.turnFinished, id: "envelope-turn-8", sequence: 9,
                      journal: reducerWorkJournal, previous: "envelope-turn-7", work: reducerWork,
-                     run: run),
+                     run: run, turn: turn),
         reducerEvent(TimelineEventType.turnFinished, id: "envelope-turn-9", sequence: 10,
                      journal: reducerWorkJournal, previous: "envelope-turn-8", work: reducerWork,
-                     run: foreignRun, turn: turn),
+                     run: foreignRun, turn: turn,
+                     payload: .object(["outcome": .string(RunTurnOutcome.completed.rawValue)])),
         reducerEvent(TimelineEventType.turnFinished, id: "envelope-turn-10", sequence: 11,
                      journal: reducerWorkJournal, previous: "envelope-turn-9", work: reducerWork,
-                     run: run, turn: otherTurn),
+                     run: run, turn: otherTurn,
+                     payload: .object(["outcome": .string(RunTurnOutcome.completed.rawValue)])),
         // A mismatched turn finish must not clear the turn, so finishing the Run remains
         // inadmissible until the matching turn finish arrives.
         reducerEvent(TimelineEventType.runFinished, id: "envelope-turn-11", sequence: 12,
@@ -627,7 +650,8 @@ func test_timelineReducerRejectsInvalidTurnAndHandleActivityEnvelopes() throws {
                      sessionAttachment: attachment, run: run),
         reducerEvent(TimelineEventType.turnFinished, id: "envelope-turn-12", sequence: 13,
                      journal: reducerWorkJournal, previous: "envelope-turn-11", work: reducerWork,
-                     run: run, turn: turn),
+                     run: run, turn: turn,
+                     payload: .object(["outcome": .string(RunTurnOutcome.completed.rawValue)])),
         reducerEvent(TimelineEventType.runFinished, id: "envelope-turn-13", sequence: 14,
                      journal: reducerWorkJournal, previous: "envelope-turn-12",
                      session: reducerSession, work: reducerWork,
@@ -719,6 +743,159 @@ func test_timelineReducerRejectsInvalidTurnAndHandleActivityEnvelopes() throws {
     ])
     XCTAssertTrue(handles.structuralIntegrityValid)
     XCTAssertFalse(handles.semanticProjectionValid)
+}
+
+func test_timelineReducerRejectsInvalidArtifactExecutionAndDescriptorEvidence() throws {
+    let workHost = WorkHostRef(reducerWork.workHostID)
+    let attachment = SessionAttachmentRef("artifact-attachment")
+    let run = RunRef("artifact-run")
+    let foreignRun = RunRef("artifact-foreign-run")
+    let turn = TurnRef("artifact-turn")
+    let foreignTurn = TurnRef("artifact-foreign-turn")
+    let action = ActionRef("artifact-action")
+
+    let valid = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-valid", sequence: 7,
+        journal: reducerWorkJournal, previous: "artifact-action-started", session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run, turn: turn,
+        action: action,
+        causedBy: EventRef(journal: reducerWorkJournal, eventID: "artifact-action-started"),
+        payload: reducerArtifactPayload())
+    let ownerless = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-ownerless", sequence: 8,
+        journal: reducerWorkJournal, previous: valid.eventID,
+        work: reducerWork, workHost: workHost, run: run, turn: turn,
+        payload: reducerArtifactPayload(artifactID: "ownerless"))
+    let missingCause = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-missing-cause", sequence: 9,
+        journal: reducerWorkJournal, previous: ownerless.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run, turn: turn,
+        action: action, payload: reducerArtifactPayload(artifactID: "missing-cause"))
+    let unrelatedCause = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-unrelated-cause", sequence: 10,
+        journal: reducerWorkJournal, previous: missingCause.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run, turn: turn,
+        action: action,
+        causedBy: EventRef(journal: reducerWorkJournal, eventID: "unrelated-start"),
+        payload: reducerArtifactPayload(artifactID: "unrelated-cause"))
+    let wrongRun = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-wrong-run", sequence: 11,
+        journal: reducerWorkJournal, previous: unrelatedCause.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: foreignRun,
+        turn: turn, payload: reducerArtifactPayload(artifactID: "wrong-run"))
+    let wrongTurn = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-wrong-turn", sequence: 12,
+        journal: reducerWorkJournal, previous: wrongRun.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run,
+        turn: foreignTurn, payload: reducerArtifactPayload(artifactID: "wrong-turn"))
+    let reviewMissingAction = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-review-missing-action", sequence: 13,
+        journal: reducerWorkJournal, previous: wrongTurn.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run, turn: turn,
+        payload: reducerArtifactPayload(
+            artifactID: "review-missing-action", mediaType: ObservedRepositoryReviewFormat.mediaType))
+    let reviewMissingTurn = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-review-missing-turn", sequence: 14,
+        journal: reducerWorkJournal, previous: reviewMissingAction.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run,
+        action: action,
+        causedBy: EventRef(journal: reducerWorkJournal, eventID: "artifact-action-started"),
+        payload: reducerArtifactPayload(
+            artifactID: "review-missing-turn", mediaType: ObservedRepositoryReviewFormat.mediaType))
+    let reviewMissingCause = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-review-missing-cause", sequence: 15,
+        journal: reducerWorkJournal, previous: reviewMissingTurn.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run, turn: turn,
+        action: action,
+        payload: reducerArtifactPayload(
+            artifactID: "review-missing-cause", mediaType: ObservedRepositoryReviewFormat.mediaType))
+    let turnFinished = reducerEvent(
+        TimelineEventType.turnFinished, id: "artifact-turn-finished", sequence: 16,
+        journal: reducerWorkJournal, previous: reviewMissingCause.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run, turn: turn,
+        payload: .object(["outcome": .string(RunTurnOutcome.completed.rawValue)]))
+    let postTurn = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-post-turn", sequence: 17,
+        journal: reducerWorkJournal, previous: turnFinished.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run, turn: turn,
+        payload: reducerArtifactPayload(artifactID: "post-turn"))
+    let bodylessMetadata = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-bodyless-metadata", sequence: 18,
+        journal: reducerWorkJournal, previous: postTurn.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run,
+        payload: .object([
+            "artifact_id": .string("bodyless-metadata"),
+            "label": .string("bodyless metadata"),
+            "media_type": .string("text/plain"),
+            "byte_count": .number(0),
+            "digest": .string("sha256:" + String(repeating: "0", count: 64)),
+            "available": .bool(false),
+        ]))
+    let hostileLabel = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-hostile-label", sequence: 19,
+        journal: reducerWorkJournal, previous: bodylessMetadata.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run,
+        payload: reducerArtifactPayload(artifactID: "hostile-label", label: "bad\u{2028}label"))
+    let foreignAttachment = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-foreign-attachment", sequence: 20,
+        journal: reducerWorkJournal, previous: hostileLabel.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost,
+        sessionAttachment: SessionAttachmentRef("foreign-attachment"), run: run,
+        payload: reducerArtifactPayload(artifactID: "foreign-attachment"))
+    let genericWithoutAction = reducerEvent(
+        TimelineEventType.artifact, id: "artifact-generic-without-action", sequence: 21,
+        journal: reducerWorkJournal, previous: foreignAttachment.eventID, session: reducerSession,
+        work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run,
+        payload: reducerArtifactPayload(artifactID: "generic-without-action"))
+
+    let actionIntent = reducerEvent(
+        TimelineEventType.actionIntent, id: "artifact-action-intent", sequence: 5,
+        journal: reducerWorkJournal, previous: "artifact-turn-started", work: reducerWork,
+        workHost: workHost, run: run, turn: turn, action: action,
+        payload: .object([
+            "state": .string(ActionExecutionState.proposed.rawValue),
+            "kind": .string(ActionKind.artifact.rawValue),
+            "intent": .string("publish artifact"),
+        ]))
+    let actionStarted = reducerEvent(
+        TimelineEventType.actionStarted, id: "artifact-action-started", sequence: 6,
+        journal: reducerWorkJournal, previous: actionIntent.eventID, work: reducerWork,
+        workHost: workHost, run: run, turn: turn, action: action,
+        payload: .object([
+            "state": .string(ActionExecutionState.running.rawValue),
+            "kind": .string(ActionKind.artifact.rawValue),
+        ]))
+    let events = [
+        reducerEvent(TimelineEventType.workCreated, id: "artifact-work-created", sequence: 1,
+                     journal: reducerWorkJournal, work: reducerWork, workHost: workHost),
+        reducerEvent(TimelineEventType.sessionAttached, id: "artifact-attached", sequence: 2,
+                     journal: reducerWorkJournal, previous: "artifact-work-created",
+                     session: reducerSession, work: reducerWork, workHost: workHost,
+                     sessionAttachment: attachment),
+        reducerEvent(TimelineEventType.runStarted, id: "artifact-run-started", sequence: 3,
+                     journal: reducerWorkJournal, previous: "artifact-attached", session: reducerSession,
+                     work: reducerWork, workHost: workHost, sessionAttachment: attachment, run: run),
+        reducerEvent(TimelineEventType.turnStarted, id: "artifact-turn-started", sequence: 4,
+                     journal: reducerWorkJournal, previous: "artifact-run-started", work: reducerWork,
+                     workHost: workHost, run: run, turn: turn),
+        actionIntent, actionStarted, valid, ownerless, missingCause, unrelatedCause, wrongRun,
+        wrongTurn, reviewMissingAction, reviewMissingTurn, reviewMissingCause,
+        turnFinished, postTurn,
+        bodylessMetadata, hostileLabel, foreignAttachment, genericWithoutAction,
+    ]
+
+    let reduced = WorkReducer.reduce(events)
+    XCTAssertEqual(reduced.quarantinedEvents.map(\.eventID), [
+        "artifact-ownerless", "artifact-missing-cause", "artifact-unrelated-cause",
+        "artifact-wrong-run", "artifact-wrong-turn", "artifact-review-missing-action",
+        "artifact-review-missing-turn", "artifact-review-missing-cause", "artifact-post-turn",
+        "artifact-bodyless-metadata", "artifact-hostile-label", "artifact-foreign-attachment",
+    ])
+    XCTAssertTrue(reduced.structuralIntegrityValid)
+    XCTAssertFalse(reduced.semanticProjectionValid)
+    XCTAssertEqual(reduced.activeRun, run)
+    XCTAssertNil(reduced.activeTurn)
+    XCTAssertEqual(reduced.actions[action.actionID]?.state, .running)
 }
 
 func test_sessionAttentionMalformedPayloadIsUnknownNotNone() throws {

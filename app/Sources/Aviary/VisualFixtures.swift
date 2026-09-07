@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 import AviaryCore
 
 /// Deterministic, in-memory scenes used by the screenshot harness.
@@ -16,11 +17,17 @@ enum VisualFixtureRoute: String {
     case productionInspectorNarrow = "production-inspector-narrow-fixture"
     case conversationHistory = "conversation-history-fixture"
     case conversationHistoryNarrow = "conversation-history-narrow-fixture"
+    case repositoryReview = "repository-review-fixture"
+    case repositoryReviewNarrow = "repository-review-narrow-fixture"
+    case repositoryReviewStale = "repository-review-stale-fixture"
+    case repositoryReviewFeedbackNearFull = "repository-review-feedback-near-full-fixture"
+    case repositoryReviewFeedbackFull = "repository-review-feedback-full-fixture"
 
     var isNarrow: Bool {
         self == .serviceChatNarrow || self == .productionDeliveryNarrow
             || self == .productionInspectorNarrow
             || self == .conversationHistoryNarrow
+            || self == .repositoryReviewNarrow
     }
 }
 
@@ -39,7 +46,50 @@ struct VisualFixtureView: View {
             ProductionInspectorFixture()
         case .conversationHistory, .conversationHistoryNarrow:
             ConversationHistoryFixture(narrow: route.isNarrow)
+        case .repositoryReview, .repositoryReviewNarrow:
+            RepositoryReviewFixtureView(narrow: route.isNarrow)
+        case .repositoryReviewStale:
+            RepositoryReviewStaleFixtureView()
+        case .repositoryReviewFeedbackNearFull:
+            RepositoryReviewFeedbackFixtureView(draftCount: 3_995)
+        case .repositoryReviewFeedbackFull:
+            RepositoryReviewFeedbackFixtureView(draftCount: 4_000)
         }
+    }
+}
+
+/// The production repository review sheet content, with an in-memory bounded artifact so the
+/// wide and narrow fixture routes are deterministic and do not need a Work Host.
+private struct RepositoryReviewFixtureView: View {
+    let narrow: Bool
+
+    var body: some View {
+        RepositoryReviewView(fixtureReview: FixtureData.repositoryReview)
+            .frame(minWidth: narrow ? 0 : 560, maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+/// The production failure/retry copy for a descriptor that changed while its body was open.
+private struct RepositoryReviewStaleFixtureView: View {
+    var body: some View {
+        RepositoryReviewView(fixtureError: .unavailable, allowsRetry: true)
+            .frame(minWidth: 560, maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+/// Near-full and full composer bounds exercise the exact remaining-capacity copy without
+/// sending anything or depending on a service attachment.
+private struct RepositoryReviewFeedbackFixtureView: View {
+    let draftCount: Int
+
+    var body: some View {
+        RepositoryReviewView(
+            fixtureReview: FixtureData.repositoryReview,
+            fixtureDraft: String(repeating: "d", count: draftCount))
+            .frame(minWidth: 560, maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
@@ -332,10 +382,11 @@ private enum FixtureData {
                     "workspace-12345678-1234-1234-1234-123456789abc")),
             hostObservation: nil, attachments: [clientAttachment],
             sessionAttachments: [relationship],
-            artifacts: [WorkServiceArtifactDescriptor(
+            artifacts: [try! WorkServiceArtifactDescriptor(
                 artifactID: "fixture-report", work: work, label: "Checkpoint report",
-                mediaType: "text/markdown", byteCount: 2_840,
-                digest: "sha256:fixture-report", available: true)],
+                mediaType: "text/markdown",
+                sourceEvent: EventRef(journal: workJournal, eventID: "fixture-report-event"),
+                session: session, sessionAttachment: attachment, run: run)],
             omissions: [WorkServiceOmission(category: "artifact_metadata", count: 1)])
         return (
             RecordedModelContextProjection(sessionSnapshot),
@@ -344,6 +395,140 @@ private enum FixtureData {
                 workSnapshot: workSnapshot, sessionSnapshot: sessionSnapshot,
                 workCursor: workCursor, sessionCursor: sessionCursor,
                 workSourceCompleteness: .complete, sessionSourceCompleteness: .complete))
+    }()
+
+    static let repositoryReview: ObservedRepositoryReview = {
+        // Keep this fixture's omission contract in lockstep with the producer. The first
+        // exclusion is deliberately explicit: structured names are relative, while tracked
+        // diff text remains unfiltered file content.
+        let expectedExclusions = [
+            "structured file metadata uses repository-relative paths; tracked diff text is unfiltered file content",
+            "untracked and ignored file bodies are never read",
+            "binary and submodule diff bodies are never retained",
+            "this artifact is observation only; it cannot stage, revert, commit, checkpoint, or restore",
+        ]
+        let json = """
+        {
+          "attribution": "not_attributed",
+          "coverage": {
+            "binaryBodiesExcluded": true,
+            "bounded": false,
+            "ignoredNamesOnly": true,
+            "stagedDiffObserved": true,
+            "statusObserved": true,
+            "submoduleBodiesExcluded": true,
+            "untrackedNamesOnly": true,
+            "unstagedDiffObserved": true
+          },
+          "diffs": [
+            {
+              "byteCount": 114,
+              "kind": "staged",
+              "retainedSectionCount": 1,
+              "text": "diff --git a/Sources/review.swift b/Sources/review.swift\\n@@ -1,2 +1,3 @@\\n let current = true\\n+let observed = true\\n",
+              "truncated": false
+            },
+            {
+              "byteCount": 71,
+              "kind": "unstaged",
+              "retainedSectionCount": 1,
+              "text": "diff --git a/README.md b/README.md\\n@@ -4,1 +4,1 @@\\n-old note\\n+new note\\n",
+              "truncated": false
+            }
+          ],
+          "exclusions": [
+            "structured file metadata uses repository-relative paths; tracked diff text is unfiltered file content",
+            "untracked and ignored file bodies are never read",
+            "binary and submodule diff bodies are never retained",
+            "this artifact is observation only; it cannot stage, revert, commit, checkpoint, or restore"
+          ],
+          "files": [
+            {
+              "indexStatus": "M",
+              "isBinary": false,
+              "isIgnored": false,
+              "isSubmodule": false,
+              "isUntracked": false,
+              "kind": "tracked",
+              "path": "01-README.md",
+              "workTreeStatus": "."
+            },
+            {
+              "indexStatus": ".",
+              "isBinary": false,
+              "isIgnored": false,
+              "isSubmodule": false,
+              "isUntracked": true,
+              "kind": "untracked",
+              "path": "02-review-notes.swift",
+              "workTreeStatus": "."
+            },
+            {
+              "indexStatus": ".",
+              "isBinary": true,
+              "isIgnored": false,
+              "isSubmodule": false,
+              "isUntracked": false,
+              "kind": "tracked",
+              "path": "03-icon.bin",
+              "workTreeStatus": "M"
+            }
+          ],
+          "fenceAfter": {
+            "head": {
+              "detached": false,
+              "oid": "0123456789abcdef0123456789abcdef01234567",
+              "ref": "feature/review-ui"
+            },
+            "contentDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "statusDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "statusEntryCount": 3,
+            "statusTruncated": false
+          },
+          "fenceBefore": {
+            "head": {
+              "detached": false,
+              "oid": "0123456789abcdef0123456789abcdef01234567",
+              "ref": "feature/review-ui"
+            },
+            "contentDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "statusDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "statusEntryCount": 3,
+            "statusTruncated": false
+          },
+          "head": {
+            "detached": false,
+            "oid": "0123456789abcdef0123456789abcdef01234567",
+            "ref": "feature/review-ui"
+          },
+          "mediaType": "application/vnd.aviary.repository-review+json",
+          "observedAt": "2026-09-06T18:00:00Z",
+          "omissions": [
+            {
+              "detail": "untracked file name and status retained; body was not read",
+              "kind": "untracked_body",
+              "path": "02-review-notes.swift"
+            },
+            {
+              "detail": "binary diff body was excluded; only the file status is retained",
+              "kind": "binary",
+              "path": "03-icon.bin"
+            }
+          ],
+          "repositoryIdentityDigest": "sha256:\(String(repeating: "a", count: 64))",
+          "runID": "run-review-fixture",
+          "schema": "aviary.repository-review",
+          "scope": "current_working_tree",
+          "status": "changes",
+          "turnID": "turn-review-fixture",
+          "version": 2
+        }
+        """
+        let review = try! ObservedRepositoryReview.decode(Data(json.utf8))
+        precondition(
+            review.exclusions == expectedExclusions,
+            "repository review fixture exclusions drifted from the production observation contract")
+        return review
     }()
 
     static func deliveryRow(

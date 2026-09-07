@@ -6412,6 +6412,9 @@ let casesPhase1Timeline: [Case] = [
     ("phase1: turn and Handle activity envelopes fail closed", {
         try test_timelineReducerRejectsInvalidTurnAndHandleActivityEnvelopes()
     }),
+    ("phase4b: artifact envelopes and descriptors fail closed", {
+        try test_timelineReducerRejectsInvalidArtifactExecutionAndDescriptorEvidence()
+    }),
     ("phase1: malformed Session attention stays unknown", {
         try test_sessionAttentionMalformedPayloadIsUnknownNotNone()
     }),
@@ -7060,6 +7063,9 @@ let casesRunJournalBundle: [Case] = [
     ("phase1 bundle: reopen retains single-use action identities", {
         try await test_runJournalBundleReopenRetainsSingleUseActionIdentities()
     }),
+    ("phase4b bundle: artifact publication retains bounded descriptor and body", {
+        try await test_runJournalBundleRecordsBoundedArtifactAndRetainsBodyBeforeEvent()
+    }),
     ("phase1 bundle: semantic gate serializes concurrent mutations", {
         try await test_runJournalBundleSemanticGateSerializesConcurrentMutations()
     }),
@@ -7167,6 +7173,7 @@ await Harness.run(
         + casesTimelineWriter + casesRunJournalBundle + casesNativeExecutionIntegration
         + casesNativeEffectFailure + casesNativeLaunchJournal
         + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel
+        + casesObservedRepositoryReview + casesObservedRepositoryReviewAgent
         + casesNativeIndeterminateEffects + casesChildLifecycle
         + casesCommandDeliveryOutcome + casesRuntimeHostParentLifetime
         + casesRuntimeHostAdoption)

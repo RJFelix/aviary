@@ -533,6 +533,131 @@ func test_runJournalBundleReopenRetainsSingleUseActionIdentities() async throws 
     try await reopened.closeChecked()
 }
 
+func test_runJournalBundleRecordsBoundedArtifactAndRetainsBodyBeforeEvent() async throws {
+    let home = try bundleTestHome()
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let bundle = try await makeBundle(home: home)
+    _ = try await bundle.startTurn(TurnRef("artifact-turn"))
+    let permit = try await bundle.beginAction(
+        action: ActionRef("artifact-action"), kind: .artifact,
+        intent: "publish a completed-turn artifact")
+    let body = Data("artifact bytes must stay out of the journal".utf8)
+    do {
+        _ = try await bundle.recordArtifact(
+            artifactID: "artifact-missing-provenance", label: "label", body: nil,
+            action: permit.action, provenance: nil)
+        XCTFail("an action-bearing artifact must cite its active action start")
+    } catch RunJournalBundleError.invalidOperation { }
+    do {
+        _ = try await bundle.recordArtifact(
+            artifactID: "artifact-unrelated-provenance", label: "label", body: nil,
+            action: permit.action,
+            provenance: EventRef(journal: bundle.workJournal, eventID: "unrelated-start"))
+        XCTFail("an action-bearing artifact must reject an unrelated same-journal cause")
+    } catch RunJournalBundleError.invalidOperation { }
+    let foreignReview = await ObservedRepositoryReview.observe(
+        cwd: home.root, runID: "foreign-run", turnID: "foreign-turn")
+    let foreignReviewBody = try foreignReview.encoded()
+    do {
+        _ = try await bundle.recordArtifact(
+            artifactID: "artifact-foreign-review", label: "review.json",
+            mediaType: ObservedRepositoryReviewFormat.mediaType,
+            body: foreignReviewBody, action: permit.action,
+            provenance: permit.startedCommit.eventRef)
+        XCTFail("a repository-review body from another Run/Turn must be rejected")
+    } catch RunJournalBundleError.invalidOperation { }
+    let receipt = try await bundle.recordArtifact(
+        artifactID: "artifact-1", label: "review.json", mediaType: "application/json",
+        body: body, action: permit.action, provenance: permit.startedCommit.eventRef,
+        links: [TimelineLink(kind: .produced, target: permit.startedCommit.eventRef)])
+
+    XCTAssertEqual(receipt.descriptor.artifactID, "artifact-1")
+    XCTAssertEqual(receipt.descriptor.work, bundle.work)
+    XCTAssertEqual(receipt.descriptor.label, "review.json")
+    XCTAssertFalse(receipt.descriptor.metadataWasTruncated)
+    XCTAssertEqual(receipt.descriptor.mediaType, "application/json")
+    XCTAssertEqual(receipt.descriptor.byteCount, body.count)
+    XCTAssertEqual(receipt.descriptor.bodyReference?.authority, bundle.workJournal)
+    XCTAssertEqual(receipt.descriptor.bodyReference?.byteCount, body.count)
+    XCTAssertEqual(receipt.descriptor.bodyReference?.digest, receipt.descriptor.digest)
+    XCTAssertEqual(try ContextBodyStore(home: home).read(
+        try XCTUnwrap(receipt.descriptor.bodyReference)), body)
+
+    let finishedAction = try await bundle.beginAction(
+        action: ActionRef("inactive-artifact-action"), kind: .artifact,
+        intent: "prove artifact provenance requires a live action")
+    _ = try await bundle.finishAction(finishedAction, state: .succeeded, retrySafety: .safe)
+    do {
+        _ = try await bundle.recordArtifact(
+            artifactID: "inactive-action-artifact", label: "label", body: nil,
+            action: finishedAction.action)
+        XCTFail("an artifact cannot cite a terminal action as its active producer")
+    } catch RunJournalBundleError.invalidOperation { }
+
+    let workEvents = try bundleEvents(
+        home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
+    let artifactEvent = try XCTUnwrap(
+        workEvents.first(where: { $0.eventID == receipt.commit.eventRef.eventID }))
+    let serialized = String(
+        decoding: try JSONEncoder().encode(artifactEvent), as: UTF8.self)
+    XCTAssertTrue(serialized.contains("artifact-1"))
+    XCTAssertTrue(serialized.contains("body_reference"))
+    XCTAssertFalse(serialized.contains(String(decoding: body, as: UTF8.self)))
+    XCTAssertFalse(serialized.contains(home.root.path))
+    XCTAssertEqual(artifactEvent.run, bundle.run)
+    XCTAssertEqual(artifactEvent.turn, TurnRef("artifact-turn"))
+    XCTAssertEqual(artifactEvent.action, permit.action)
+    XCTAssertEqual(artifactEvent.causedByEventID, permit.startedCommit.eventRef)
+    XCTAssertEqual(artifactEvent.links, receipt.links)
+
+    do {
+        _ = try await bundle.recordArtifact(
+            artifactID: " artifact-duplicate", label: "label", body: nil)
+        XCTFail("leading whitespace in an artifact identity must be rejected")
+    } catch RunJournalBundleError.invalidOperation { }
+    do {
+        _ = try await bundle.recordArtifact(
+            artifactID: "artifact-control", label: "bad\nlabel", body: nil)
+        XCTFail("control characters in an artifact label must be rejected")
+    } catch RunJournalBundleError.invalidOperation { }
+    do {
+        _ = try await bundle.recordArtifact(
+            artifactID: "artifact-media", label: "label", mediaType: "text/\nplain",
+            body: nil)
+        XCTFail("control characters in a media type must be rejected")
+    } catch RunJournalBundleError.invalidOperation { }
+    for (index, separator) in ["\u{2028}", "\u{2029}"].enumerated() {
+        do {
+            _ = try await bundle.recordArtifact(
+                artifactID: "artifact-separator-\(index)",
+                label: "bad\(separator)label", body: nil)
+            XCTFail("Unicode line separators in an artifact label must be rejected")
+        } catch RunJournalBundleError.invalidOperation { }
+    }
+    do {
+        _ = try await bundle.recordArtifact(
+            artifactID: "artifact-too-large", label: "label",
+            body: Data(repeating: 0x61, count: 8 * 1024 * 1024 + 1))
+        XCTFail("an artifact body beyond the bounded size must be rejected")
+    } catch RunJournalBundleError.invalidOperation { }
+
+    _ = try await bundle.finishAction(permit, state: .succeeded, retrySafety: .safe)
+    _ = try await bundle.finishTurn(TurnRef("artifact-turn"))
+    _ = try await bundle.finishRun()
+    try await bundle.closeChecked()
+
+    let reopened = try await RunJournalBundle.reopen(
+        home: home, session: bundleTestSession, work: bundleTestWork, workHost: bundleTestHost,
+        sessionAuthority: bundleTestAuthority, sessionAttachment: bundleTestAttachment,
+        run: RunRef("artifact-follow-up"), actor: bundleTestActor)
+    do {
+        _ = try await reopened.recordArtifact(
+            artifactID: "artifact-1", label: "reused", body: nil)
+        XCTFail("artifact identities must remain single-use after cold reopen")
+    } catch RunJournalBundleError.invalidOperation { }
+    try await reopened.closeChecked()
+}
+
 func test_runJournalBundleSemanticGateSerializesConcurrentMutations() async throws {
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
@@ -677,6 +802,11 @@ func test_runJournalBundleTurnOutcomesReachCatalogNotificationsAndDeduplicate() 
         XCTAssertEqual(
             turnCommits.filter { $0.eventRef.journal == bundle.sessionJournal }.count,
             item.1 == .none ? 1 : 2)
+        let workEvents = try bundleEvents(
+            home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
+        let finishedTurn = try XCTUnwrap(
+            workEvents.last(where: { $0.type == TimelineEventType.turnFinished }))
+        XCTAssertEqual(finishedTurn.payload["outcome"]?.stringValue, item.0.rawValue)
         let turnCatalog = LocalTimelineCatalog.scan(home: home)
         let turnSummary = try XCTUnwrap(turnCatalog.sessions.first?.summary)
         var delivery = CanonicalNotificationDelivery()

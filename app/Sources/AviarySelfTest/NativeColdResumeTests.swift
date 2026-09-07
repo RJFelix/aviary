@@ -14,6 +14,14 @@ private struct NativeResumeFixture {
     let request: ChatRequest
 }
 
+private enum NativeResumePostContextAction {
+    case none
+    case repositoryReview
+    case genericArtifact
+    case runtimeWithReviewMarker
+    case python
+}
+
 private func nativeResumeManifest(
     request: ChatRequest, bundle: RunJournalBundle, store: ContextBodyStore
 ) throws -> ContextManifest {
@@ -71,7 +79,7 @@ private func makeNativeResumeFixture(
     crossingKind: ActionKind = .provider,
     assistantContent: [ChatContent]? = [.text("after the boundary")],
     suffixInput: String? = nil,
-    addUnrepresentedAction: Bool = false,
+    postContextAction: NativeResumePostContextAction = .none,
     tools requestedTools: [ChatTool]? = nil
 ) async throws -> NativeResumeFixture {
     let home = scratchHome()
@@ -92,6 +100,8 @@ private func makeNativeResumeFixture(
     let bundle = try await RunJournalBundle.openForExecution(
         home: home, identity: identity, actorID: "native-resume-producer",
         makeAttachmentID: { "native-cold-attachment" })
+    let turn = TurnRef("native-cold-turn")
+    _ = try await bundle.startTurn(turn)
     let store = ContextBodyStore(home: home)
     let tools = requestedTools ?? [ChatTool(
         name: "python", description: "Execute Python.",
@@ -125,13 +135,60 @@ private func makeNativeResumeFixture(
                 causalCursor: await bundle.latestWorkCursor))
         _ = try await bundle.markCommandDelivered(commandID: commandID)
     }
-    if addUnrepresentedAction {
+    switch postContextAction {
+    case .none:
+        break
+    case .python:
         let action = try await bundle.beginAction(
             action: ActionRef("unrepresented-python-action"), kind: .python,
             intent: "Execute a tool result absent from a later context")
         _ = try await bundle.finishAction(
             action, state: .succeeded, retrySafety: .unsafe)
+    case .repositoryReview, .runtimeWithReviewMarker:
+        let kind: ActionKind
+        if case .repositoryReview = postContextAction {
+            kind = .artifact
+        } else {
+            kind = .runtime
+        }
+        let permit = try await bundle.beginAction(
+            action: ActionRef("observed-repository-review-action"),
+            kind: kind,
+            intent: "Observe the current repository working tree for review",
+            target: "git-working-tree",
+            scope: "run",
+            metadata: [
+                "media_type": .string(ObservedRepositoryReview.mediaType)
+            ])
+        let review = await ObservedRepositoryReview.observe(
+            cwd: home.root, runID: identity.runID, turnID: turn.turnID,
+            observedAt: Date(timeIntervalSince1970: 1))
+        let artifactIdentity = Data(
+            "aviary.repository-review-v2\u{0}\(identity.runID)\u{0}\(turn.turnID)".utf8)
+        _ = try await bundle.recordArtifact(
+            artifactID: "repository-review-v2."
+                + AviarySHA256.hash(data: artifactIdentity).description,
+            label: "Observed repository review",
+            mediaType: ObservedRepositoryReview.mediaType,
+            body: try review.encoded(),
+            action: permit.action,
+            provenance: permit.startedCommit.eventRef)
+        _ = try await bundle.finishAction(
+            permit, state: .succeeded, retrySafety: .safe)
+    case .genericArtifact:
+        let permit = try await bundle.beginAction(
+            action: ActionRef("generic-artifact-action"), kind: .artifact,
+            intent: "Retain an unrelated artifact",
+            target: "generic-output",
+            metadata: ["media_type": .string("application/octet-stream")])
+        _ = try await bundle.recordArtifact(
+            artifactID: "generic-artifact", label: "Generic artifact",
+            mediaType: "application/octet-stream", body: Data("generic".utf8),
+            action: permit.action, provenance: permit.startedCommit.eventRef)
+        _ = try await bundle.finishAction(
+            permit, state: .succeeded, retrySafety: .safe)
     }
+    _ = try await bundle.finishTurn(turn)
     _ = try await bundle.finishRun()
     let sessionCursor = try XCTUnwrap(await bundle.latestSessionCursor)
     let workCursor = try XCTUnwrap(await bundle.latestWorkCursor)
@@ -181,7 +238,7 @@ private func assertNativeResumeThrows(
 }
 
 func test_nativeColdResumeReconstructsProducerContextAndReportsCoverage() async throws {
-    let fixture = try await makeNativeResumeFixture()
+    let fixture = try await makeNativeResumeFixture(postContextAction: .repositoryReview)
     defer { try? FileManager.default.removeItem(at: fixture.home.root) }
     let result = try resumeNativeFixture(fixture)
     XCTAssertEqual(result.pinnedMessages.map(\.plainText), ["instructions"])
@@ -333,11 +390,56 @@ func test_nativeColdResumeRefusesTextOnlyOrDanglingStructuredAssistant() async t
 }
 
 func test_nativeColdResumeRefusesPostBoundaryActionAndCompactionCrossing() async throws {
-    let actionGap = try await makeNativeResumeFixture(addUnrepresentedAction: true)
+    let actionGap = try await makeNativeResumeFixture(postContextAction: .python)
     defer { try? FileManager.default.removeItem(at: actionGap.home.root) }
     assertNativeResumeThrows({ try resumeNativeFixture(actionGap) }) { error in
         guard case .workStateUnavailable(let reason) = error else {
             return XCTFail("expected Work action gap refusal, got \(error)")
+        }
+        XCTAssertTrue(reason.contains("post-context action"))
+    }
+
+    let genericArtifact = try await makeNativeResumeFixture(
+        postContextAction: .genericArtifact)
+    defer { try? FileManager.default.removeItem(at: genericArtifact.home.root) }
+    assertNativeResumeThrows({ try resumeNativeFixture(genericArtifact) }) { error in
+        guard case .workStateUnavailable(let reason) = error else {
+            return XCTFail("expected generic artifact action refusal, got \(error)")
+        }
+        XCTAssertTrue(reason.contains("post-context action"))
+    }
+
+    let runtimeMarker = try await makeNativeResumeFixture(
+        postContextAction: .runtimeWithReviewMarker)
+    defer { try? FileManager.default.removeItem(at: runtimeMarker.home.root) }
+    assertNativeResumeThrows({ try resumeNativeFixture(runtimeMarker) }) { error in
+        guard case .workStateUnavailable(let reason) = error else {
+            return XCTFail("expected runtime review-marker refusal, got \(error)")
+        }
+        XCTAssertTrue(reason.contains("post-context action"))
+    }
+
+    let mutatedOutcome = try await makeNativeResumeFixture(
+        postContextAction: .repositoryReview)
+    defer { try? FileManager.default.removeItem(at: mutatedOutcome.home.root) }
+    var mutatedWorkRecords = mutatedOutcome.workRead.records
+    let reviewOutcomeIndex = try XCTUnwrap(mutatedWorkRecords.lastIndex(where: {
+        $0.event.type == TimelineEventType.actionOutcome
+            && $0.event.payload["kind"]?.stringValue == ActionKind.artifact.rawValue
+    }))
+    let reviewOutcomeRecord = mutatedWorkRecords[reviewOutcomeIndex]
+    var reviewOutcomePayload = try XCTUnwrap(reviewOutcomeRecord.event.payload.objectValue)
+    reviewOutcomePayload["retry_safety"] = .string(ActionRetrySafety.unsafe.rawValue)
+    mutatedWorkRecords[reviewOutcomeIndex] = TimelineJournalRecord(
+        event: cloneNativeResumeEvent(
+            reviewOutcomeRecord.event, payload: .object(reviewOutcomePayload)),
+        rawLineBytes: reviewOutcomeRecord.rawLineBytes,
+        byteStart: reviewOutcomeRecord.byteStart, byteEnd: reviewOutcomeRecord.byteEnd)
+    assertNativeResumeThrows({ try resumeNativeFixture(
+        mutatedOutcome,
+        workRead: TimelineJournalReadResult(records: mutatedWorkRecords)) }) { error in
+        guard case .workStateUnavailable(let reason) = error else {
+            return XCTFail("expected mutated review outcome refusal, got \(error)")
         }
         XCTAssertTrue(reason.contains("post-context action"))
     }

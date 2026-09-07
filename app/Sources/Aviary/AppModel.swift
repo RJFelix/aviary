@@ -1626,7 +1626,7 @@ final class AppModel {
             }
             let requestedCapabilities: Set<WorkServiceCapability> = [
                 .observe, .control, .start, .send, .steer, .queue, .cancel, .end,
-                .createSession,
+                .inspectArtifacts, .createSession,
             ]
             let pending = pendingServiceAttaches[targetKey]
             let request: WorkServiceAttachRequest
@@ -1821,6 +1821,7 @@ final class AppModel {
             }
             let requestedCapabilities: Set<WorkServiceCapability> = [
                 .observe, .control, .start, .send, .steer, .queue, .cancel, .end,
+                .inspectArtifacts,
             ]
             let request = WorkServiceCreateSessionRequest(
                 work: descriptor.work, journal: descriptor.journal,
@@ -3075,7 +3076,7 @@ final class AppModel {
             }
             let requested: Set<WorkServiceCapability> = [
                 .observe, .control, .start, .send, .steer, .queue, .cancel, .end,
-                .createSession,
+                .inspectArtifacts, .createSession,
             ]
             let configuration = WorkServiceWorkConfiguration(
                 providerID: providerSpec.id, modelID: model.id,
@@ -3637,6 +3638,26 @@ final class LiveRun: Identifiable {
     /// state only; relaunch/reconstruction dedupes by this exact attachment relationship.
     private(set) var serviceAttachmentKey: ServiceAttachmentKey?
     var serviceProjection: WorkServiceAttachedWorkProjection? { serviceBridge?.projection }
+    /// The current descriptor is presentation metadata only. Body bytes are not fetched until
+    /// the Review changes affordance explicitly opens the review sheet and the person requests
+    /// a load there. It is mirrored from the bridge so an open review sheet observes canonical
+    /// A-to-B selection changes instead of retaining the value read at presentation time.
+    private(set) var serviceReviewDescriptor: WorkServiceArtifactDescriptor? = nil
+    var canLoadServiceRepositoryReview: Bool {
+        guard let descriptor = serviceReviewDescriptor,
+              descriptor.available,
+              descriptor.bodyReference != nil else { return false }
+        return serviceProjection?.capabilities.contains(.inspectArtifacts) == true
+    }
+
+    func loadServiceRepositoryReview(
+        expectedDescriptor: WorkServiceArtifactDescriptor
+    ) async
+        -> Result<ObservedRepositoryReview, RepositoryReviewLoadError> {
+        guard let serviceBridge else { return .failure(.unavailable) }
+        return await serviceBridge.loadLatestRepositoryReview(expectedDescriptor: expectedDescriptor)
+    }
+
     var serviceActivities: [WorkActionSnapshot] { serviceBridge?.activities ?? [] }
     /// Mirrored from the non-observable service bridge so an open action sheet tracks canonical
     /// lifecycle changes instead of freezing the value that happened to be selected.
@@ -3803,6 +3824,7 @@ final class LiveRun: Identifiable {
             thinkingLevel: bridge.thinkingLevel)
         self.serviceBridge = bridge
         self.serviceAttachmentKey = bridge.serviceAttachmentKey
+        self.serviceReviewDescriptor = bridge.latestRepositoryReviewDescriptor
         self.serviceActionPresentations = bridge.actionPresentations
         self.serviceProjectionOmissions = bridge.projection.projectionOmissions
         self.servicePendingInputs = bridge.pendingInputs
@@ -4323,6 +4345,7 @@ final class LiveRun: Identifiable {
         publish(serviceBridge.historyError, to: \.serviceHistoryError)
         publish(serviceBridge.recordedModelContext, to: \.recordedModelContext)
         publish(serviceBridge.canonicalWorkingState, to: \.canonicalWorkingState)
+        publish(serviceBridge.latestRepositoryReviewDescriptor, to: \.serviceReviewDescriptor)
         // This is canonical Session evidence (input.accepted/message history), not a Start
         // receipt. It remains true even when the visible transcript has bounded omissions.
         publish(serviceBridge.hasCanonicalInputDelivery, to: \.initialPromptDelivered)
