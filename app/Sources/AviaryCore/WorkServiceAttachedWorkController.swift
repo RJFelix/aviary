@@ -1097,9 +1097,13 @@ public actor WorkServiceAttachedWorkController {
                 generation: historyStorage.generation + 1)
             return
         }
-        var currentBranchTip = historyStorage.branchTip
+        let currentBranchTip = historyStorage.branchTip
+        var branchExtended = false
         if currentBranchTip != snapshot.semanticTip {
-            guard Self.selectedBranch(snapshot.messages, contains: historyStorage.messages) else {
+            guard Self.selectedBranch(snapshot.messages, contains: historyStorage.messages),
+                  Self.semanticTipDescends(
+                      from: currentBranchTip, to: snapshot.semanticTip,
+                      messages: snapshot.messageHistory) else {
                 historyStorage = historyWindow(
                     messages: historyStorage.messages,
                     frozenTipCursor: historyStorage.frozenTipCursor,
@@ -1113,12 +1117,13 @@ public actor WorkServiceAttachedWorkController {
                 return
             }
             // The selected branch only extended (or made its existing implicit tip explicit).
-            // Adopt the new semantic tip for subsequent older-page requests while keeping the
-            // physical frozen tip/digest unchanged; newly appended tail rows remain outside the
-            // historical window until the user explicitly returns to latest.
-            currentBranchTip = snapshot.semanticTip
+            // Keep the original branch identity for the frozen window: the next reverse page
+            // must continue proving the same branch, while newly appended tail rows are merely
+            // reported as newer content until the user explicitly returns to latest.
+            branchExtended = true
         }
         let hasNewer = historyStorage.hasNewer || historyStorage.frozenTipCursor != cursor
+            || branchExtended
         historyStorage = historyWindow(
             messages: historyStorage.messages,
             frozenTipCursor: historyStorage.frozenTipCursor,
@@ -1145,6 +1150,38 @@ public actor WorkServiceAttachedWorkController {
             selectedIndex += 1
         }
         return true
+    }
+
+    /// Return whether `to` extends the exact semantic branch identified by `from`. A nil tip is
+    /// the implicit root branch and therefore precedes an explicit tip; a non-nil tip must walk
+    /// through canonical conversation parents rather than merely sharing a visible prefix.
+    private static func semanticTipDescends(
+        from ancestor: EventRef?, to descendant: EventRef?,
+        messages: [SessionMessageSnapshot]
+    ) -> Bool {
+        guard ancestor != descendant else { return true }
+        guard let descendant else { return false }
+        guard let ancestor else { return true }
+        var messagesByID: [String: SessionMessageSnapshot] = [:]
+        for message in messages {
+            guard let source = message.sourceEvent else { continue }
+            guard messagesByID.updateValue(message, forKey: source.eventID) == nil else {
+                return false
+            }
+        }
+        var current: EventRef? = descendant
+        var visited: Set<String> = []
+        while let tip = current {
+            guard tip.journal == ancestor.journal,
+                  visited.insert(tip.eventID).inserted,
+                  let message = messagesByID[tip.eventID] else {
+                return false
+            }
+            guard let parent = message.conversationParent else { return false }
+            if parent == ancestor { return true }
+            current = parent
+        }
+        return false
     }
 
     private func latestHistoryWindow(
@@ -1194,9 +1231,16 @@ public actor WorkServiceAttachedWorkController {
         _ page: WorkServiceHistoryPage,
         request: WorkServiceHistoryRequest
     ) throws -> WorkServiceConversationHistoryWindow {
-        guard Self.validDescriptor(
-                  page.work, expected: work, expectedJournal: journal,
-                  expectedHostInstance: descriptorStorage.hostObservation?.instance),
+        let expectedHostInstance: WorkHostInstanceRef?
+        if case .connected(let instance) = connectivityStorage {
+            expectedHostInstance = instance
+        } else {
+            expectedHostInstance = descriptorStorage.hostObservation?.instance
+        }
+        guard Self.validHistoryAuthority(
+                  page.authority, expected: work, expectedJournal: journal,
+                  expectedHostInstance: expectedHostInstance),
+              page.authority.sourceCompleteness == .complete,
               page.target == request.target,
               page.frozenTipCursor == request.frozenTipCursor,
               page.frozenTipDigest == request.frozenTipDigest,
@@ -1287,7 +1331,8 @@ public actor WorkServiceAttachedWorkController {
             frozenTipCursor: page.frozenTipCursor,
             frozenTipDigest: page.frozenTipDigest,
             // A concurrent refresh may have proven that the selected branch only extended after
-            // the frozen physical tip. Preserve that newer semantic identity for the next page.
+            // the frozen physical tip. Preserve the original branch identity for the next page;
+            // the extension is represented by hasNewer above.
             branchTip: historyStorage.branchTip,
             nextBeforeCursor: page.nextBeforeCursor,
             hasEarlier: page.hasOlder,
@@ -3008,6 +3053,24 @@ public actor WorkServiceAttachedWorkController {
         }
         guard let observation = descriptor.hostObservation else { return false }
         return observation.instance == expectedHostInstance
+    }
+
+    private static func validHistoryAuthority(
+        _ authority: WorkServiceHistoryAuthority,
+        expected: WorkRef,
+        expectedJournal: JournalRef,
+        expectedHostInstance: WorkHostInstanceRef?
+    ) -> Bool {
+        guard authority.work == expected,
+              authority.journal == expectedJournal,
+              authority.journal.owner == .work(expected),
+              authority.journal.authority.authorityID == expected.workHostID,
+              authority.hostInstance.host == WorkHostRef(expected.workHostID),
+              validIdentity(authority.hostInstance.instanceID),
+              validIdentity(authority.hostInstance.startIdentity) else {
+            return false
+        }
+        return expectedHostInstance.map { authority.hostInstance == $0 } ?? true
     }
 
     private static func validCursor(_ cursor: JournalCursor, journal: JournalRef) -> Bool {

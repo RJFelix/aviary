@@ -7155,8 +7155,10 @@ await Harness.run(
         + casesDisposableTimelineProjectionStore
         + casesLocalTimelineProjectionSource
         + casesLocalTimelineProjectionReader
+        + casesLocalSessionHistoryProjectionReader
         + casesBoundedTimelineReducerProjection
         + casesPersistentProjectionRadixMap
+        + casesPersistentSessionHistoryIndex
         + casesPersistentSessionExactState
         + casesPersistentWorkExactState
         + casesWorkReducerTransition

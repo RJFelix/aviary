@@ -2892,7 +2892,12 @@ func test_workServiceTransportHistoryPageCorrelationAndBoundaries() throws {
         payload: .object(["text": .string("hello")]))
     let cursor = JournalCursor(
         journal: sessionJournal, eventID: event.eventID, sequence: event.sequence)
-    let workDescriptor = try WorkServiceWorkDescriptor(
+    let historyAuthority = try WorkServiceHistoryAuthority(
+        work: transportWork, journal: transportJournal,
+        hostInstance: WorkHostInstanceRef(
+            host: transportHost, instanceID: "transport-instance", startIdentity: "transport-start"),
+        sourceCompleteness: .complete)
+    let legacyDescriptor = try WorkServiceWorkDescriptor(
         work: transportWork, journal: transportJournal, recordedDisposition: .reusable,
         execution: .idle, currentRun: nil, currentRunSession: nil,
         currentRunSessionAttachment: nil, hostObservation: nil)
@@ -2906,7 +2911,7 @@ func test_workServiceTransportHistoryPageCorrelationAndBoundaries() throws {
     let pageDigest = try WorkServiceHistoryPageEvidence.digest(
         events: [event], target: target, cursor: cursor)
     let page = WorkServiceHistoryPage(
-        work: workDescriptor, events: [event], target: target,
+        authority: historyAuthority, events: [event], target: target,
         lowerBoundaryCursor: cursor, upperBoundaryCursor: cursor,
         nextBeforeCursor: nil, hasOlder: false, frozenTipCursor: cursor,
         frozenTipDigest: digest, prefixDigest: pageDigest,
@@ -2928,6 +2933,118 @@ func test_workServiceTransportHistoryPageCorrelationAndBoundaries() throws {
             host: transportHost, instanceID: "transport-instance", startIdentity: "transport-start"))
     XCTAssertEqual(WorkServiceTransportOperation.historyBeforeCursor.rawValue,
                    "history_before_cursor")
+
+    // The first page has no caller-supplied freeze. The host establishes its cursor and digest,
+    // and correlation must continue to accept that truthful response.
+    let firstPageRequest = WorkServiceHistoryRequest(
+        work: transportWork, journal: transportJournal, attachment: attachment,
+        client: transportClientA, target: target, limit: 2,
+        maxBytes: WorkServiceBounds.maxEventPageBytes)
+    let firstPageEnvelope = WorkServiceTransportRequestEnvelope(
+        id: response.id, operation: .historyBeforeCursor, client: transportClientA,
+        payload: try transportEnvelopePayload(firstPageRequest))
+    try WorkServiceTransportCodec.validateResponseCorrelation(
+        response, request: firstPageEnvelope, expectedHostInstance: response.hostInstance)
+
+    // Checking only the first returned sequence is insufficient: a later event can cross the
+    // exclusive request boundary while the page remains sorted and otherwise well formed.
+    let crossingEvent = TimelineEvent(
+        eventID: "history-message-2", journal: sessionJournal, sequence: 2,
+        previousEventID: event.eventID, session: session, client: transportClientA,
+        actor: TimelineActor(actorID: transportClientA.clientID, kind: "gui"),
+        hostRecordedAt: Date(), type: TimelineEventType.inputAccepted,
+        payload: .object(["text": .string("crosses the exclusive boundary")]))
+    let crossingCursor = JournalCursor(
+        journal: sessionJournal, eventID: crossingEvent.eventID,
+        sequence: crossingEvent.sequence)
+    let crossingRequest = WorkServiceHistoryRequest(
+        work: transportWork, journal: transportJournal, attachment: attachment,
+        client: transportClientA, target: target, beforeCursor: crossingCursor,
+        frozenTipCursor: crossingCursor, frozenTipDigest: digest,
+        branchTip: EventRef(journal: sessionJournal, eventID: event.eventID),
+        limit: 2, maxBytes: WorkServiceBounds.maxEventPageBytes)
+    let crossingPageDigest = try WorkServiceHistoryPageEvidence.digest(
+        events: [event, crossingEvent], target: target, cursor: crossingCursor)
+    let crossingPage = WorkServiceHistoryPage(
+        authority: historyAuthority, events: [event, crossingEvent], target: target,
+        lowerBoundaryCursor: cursor, upperBoundaryCursor: crossingCursor,
+        nextBeforeCursor: nil, hasOlder: false, frozenTipCursor: crossingCursor,
+        frozenTipDigest: digest, prefixDigest: crossingPageDigest,
+        branchTip: EventRef(journal: sessionJournal, eventID: event.eventID))
+    let crossingResponse = WorkServiceTransportResponseEnvelope(
+        id: "history-crossing-boundary", ok: true,
+        data: try transportEnvelopePayload(crossingPage), hostInstance: response.hostInstance)
+    let crossingEnvelope = WorkServiceTransportRequestEnvelope(
+        id: crossingResponse.id, operation: .historyBeforeCursor, client: transportClientA,
+        payload: try transportEnvelopePayload(crossingRequest))
+    do {
+        try WorkServiceTransportCodec.validateResponseCorrelation(
+            crossingResponse, request: crossingEnvelope,
+            expectedHostInstance: response.hostInstance)
+        XCTFail("history transport accepted a later event at the exclusive before cursor")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+
+    // A continuation is pinned to the exact supplied physical cursor, not merely its journal.
+    let movedFreezePage = WorkServiceHistoryPage(
+        authority: historyAuthority, events: [event], target: target,
+        lowerBoundaryCursor: cursor, upperBoundaryCursor: cursor,
+        nextBeforeCursor: nil, hasOlder: false, frozenTipCursor: crossingCursor,
+        frozenTipDigest: digest, prefixDigest: pageDigest,
+        branchTip: EventRef(journal: sessionJournal, eventID: event.eventID))
+    let movedFreezeResponse = WorkServiceTransportResponseEnvelope(
+        id: requestEnvelope.id, ok: true,
+        data: try transportEnvelopePayload(movedFreezePage), hostInstance: response.hostInstance)
+    do {
+        try WorkServiceTransportCodec.validateResponseCorrelation(
+            movedFreezeResponse, request: requestEnvelope,
+            expectedHostInstance: response.hostInstance)
+        XCTFail("history transport accepted a response that moved the supplied frozen cursor")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+
+    // Sparse or unknown history authority is observable state, not authority for a complete page.
+    let incompleteAuthority = try WorkServiceHistoryAuthority(
+        work: transportWork, journal: transportJournal,
+        hostInstance: historyAuthority.hostInstance, sourceCompleteness: .incomplete)
+    let incompletePage = WorkServiceHistoryPage(
+        authority: incompleteAuthority, events: [event], target: target,
+        lowerBoundaryCursor: cursor, upperBoundaryCursor: cursor,
+        nextBeforeCursor: nil, hasOlder: false, frozenTipCursor: cursor,
+        frozenTipDigest: digest, prefixDigest: pageDigest,
+        branchTip: EventRef(journal: sessionJournal, eventID: event.eventID))
+    let incompleteResponse = WorkServiceTransportResponseEnvelope(
+        id: requestEnvelope.id, ok: true,
+        data: try transportEnvelopePayload(incompletePage), hostInstance: response.hostInstance)
+    do {
+        try WorkServiceTransportCodec.validateResponseCorrelation(
+            incompleteResponse, request: requestEnvelope,
+            expectedHostInstance: response.hostInstance)
+        XCTFail("history transport accepted incomplete history authority")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
+
+    // History has no compatibility alias for the old full descriptor. A legacy-shaped response
+    // must fail at the transport boundary before Codable can discard or reinterpret fields.
+    guard case .object(var legacyPayload) = try transportEnvelopePayload(page) else {
+        XCTFail("history page must encode as an object")
+        return
+    }
+    legacyPayload.removeValue(forKey: "authority")
+    legacyPayload["work"] = try transportEnvelopePayload(legacyDescriptor)
+    let legacyResponse = WorkServiceTransportResponseEnvelope(
+        id: "history-legacy-descriptor", ok: true, data: .object(legacyPayload),
+        hostInstance: response.hostInstance)
+    do {
+        try WorkServiceTransportCodec.validateResponseSemantics(
+            legacyResponse, operation: .historyBeforeCursor)
+        XCTFail("history transport accepted a legacy full Work descriptor")
+    } catch WorkServiceTransportError.invalidResponse {
+        XCTAssertTrue(true)
+    }
 
     let alternateBranch = EventRef(journal: sessionJournal, eventID: "history-message-other")
     let staleBranchRequest = WorkServiceHistoryRequest(
@@ -2951,7 +3068,7 @@ func test_workServiceTransportHistoryPageCorrelationAndBoundaries() throws {
     let wrongCursor = JournalCursor(
         journal: sessionJournal, eventID: "history-message-other", sequence: event.sequence)
     let wrongPage = WorkServiceHistoryPage(
-        work: workDescriptor, events: [event], target: target,
+        authority: historyAuthority, events: [event], target: target,
         lowerBoundaryCursor: wrongCursor, upperBoundaryCursor: cursor,
         nextBeforeCursor: nil, hasOlder: false, frozenTipCursor: cursor,
         frozenTipDigest: digest, prefixDigest: digest,
@@ -2970,7 +3087,7 @@ func test_workServiceTransportHistoryPageCorrelationAndBoundaries() throws {
     // Prefix digests include the canonical algorithm marker. A bare 64-character hex string is
     // not a valid digest, even though its payload length looks plausible.
     let badDigestPage = WorkServiceHistoryPage(
-        work: workDescriptor, events: [event], target: target,
+        authority: historyAuthority, events: [event], target: target,
         lowerBoundaryCursor: cursor, upperBoundaryCursor: cursor,
         nextBeforeCursor: nil, hasOlder: false, frozenTipCursor: cursor,
         frozenTipDigest: String(repeating: "b", count: 64), prefixDigest: pageDigest,
@@ -2993,7 +3110,7 @@ func test_workServiceTransportHistoryPageCorrelationAndBoundaries() throws {
         session: session, actor: TimelineActor(actorID: "host", kind: "host"),
         hostRecordedAt: Date(), type: TimelineEventType.sessionAttached)
     let controlPage = WorkServiceHistoryPage(
-        work: workDescriptor, events: [controlEvent], target: target,
+        authority: historyAuthority, events: [controlEvent], target: target,
         lowerBoundaryCursor: JournalCursor(journal: sessionJournal, eventID: controlEvent.eventID, sequence: 1),
         upperBoundaryCursor: JournalCursor(journal: sessionJournal, eventID: controlEvent.eventID, sequence: 1),
         nextBeforeCursor: nil, hasOlder: false, frozenTipCursor: cursor,

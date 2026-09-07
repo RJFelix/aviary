@@ -283,7 +283,7 @@ public enum WorkServiceTransportCodec {
                     try validateTimelineEvent(event)
                 }
             case .historyBeforeCursor:
-                try validateWorkDescriptor(data["work"] ?? .null)
+                try validateHistoryAuthority(data["authority"] ?? .null)
                 try validateArray(data["events"], maxCount: WorkServiceBounds.maxEventsPerPage)
                 try validateArray(data["omissions"], maxCount: WorkServiceBounds.maxOmissions)
                 try validateCursor(data["lowerBoundaryCursor"])
@@ -937,7 +937,7 @@ public enum WorkServiceTransportCodec {
                 throw WorkServiceTransportError.invalidResponse
             }
             if let expectedHostInstance {
-                try validateDescriptorHost(response.work, expected: expectedHostInstance)
+                try validateHistoryAuthority(response.authority, expected: expectedHostInstance)
             }
             try validateHistoryPage(
                 response, request: request, expectedHostInstance: expectedHostInstance)
@@ -1264,6 +1264,58 @@ public enum WorkServiceTransportCodec {
         }
     }
 
+    private static func validateHistoryAuthority(
+        _ value: JSONValue, expected: WorkHostInstanceRef? = nil
+    ) throws {
+        guard case .object(let object) = value,
+              object.keys.allSatisfy({
+                  ["work", "journal", "hostInstance", "sourceCompleteness"].contains($0)
+              }),
+              object["work"] != nil,
+              object["journal"] != nil,
+              object["hostInstance"] != nil,
+              object["sourceCompleteness"] != nil else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        try validateIdentity(object["work"]?["workHostID"], required: true)
+        try validateIdentity(object["work"]?["workID"], required: true)
+        try validateJournalReference(object["journal"] ?? .null)
+        try validateHostInstance(object["hostInstance"], required: true)
+        let work = try decodeResponseValue(WorkRef.self, from: object["work"]!)
+        let journal = try decodeResponseValue(JournalRef.self, from: object["journal"]!)
+        let hostInstance = try decodeResponseValue(
+            WorkHostInstanceRef.self, from: object["hostInstance"]!)
+        guard let completeness = object["sourceCompleteness"]?.stringValue,
+              WorkServiceSourceCompleteness(rawValue: completeness) != nil,
+              journal.owner == .work(work),
+              journal.authority.authorityID == work.workHostID,
+              hostInstance.host == WorkHostRef(work.workHostID) else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        try validateHostInstanceValue(hostInstance)
+        let authority = try decodeResponseValue(
+            WorkServiceHistoryAuthority.self, from: value)
+        guard authority.work == work, authority.journal == journal,
+              authority.hostInstance == hostInstance else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        if let expected, authority.hostInstance != expected {
+            throw WorkServiceTransportError.invalidResponse
+        }
+    }
+
+    private static func validateHistoryAuthority(
+        _ authority: WorkServiceHistoryAuthority, expected: WorkHostInstanceRef
+    ) throws {
+        guard authority.journal.owner == .work(authority.work),
+              authority.journal.authority.authorityID == authority.work.workHostID,
+              authority.hostInstance.host == WorkHostRef(authority.work.workHostID),
+              authority.hostInstance == expected else {
+            throw WorkServiceTransportError.invalidResponse
+        }
+        try validateHostInstanceValue(authority.hostInstance)
+    }
+
     private static func validateEventPage(
         _ events: [TimelineEvent], journal: JournalRef,
         after: JournalCursor?, served: JournalCursor?, next: JournalCursor?,
@@ -1318,18 +1370,19 @@ public enum WorkServiceTransportCodec {
         request: WorkServiceHistoryRequest,
         expectedHostInstance: WorkHostInstanceRef?
     ) throws {
-        guard response.work.work == request.work,
-              response.work.journal == request.journal,
+        guard response.authority.work == request.work,
+              response.authority.journal == request.journal,
+              response.authority.sourceCompleteness == .complete,
               request.target.journal == response.target.journal,
               response.frozenTipCursor.journal == request.target.journal,
-              response.frozenTipDigest == request.frozenTipDigest
-                  || request.frozenTipDigest == nil,
+              request.frozenTipCursor.map({ response.frozenTipCursor == $0 }) ?? true,
+              request.frozenTipDigest.map({ response.frozenTipDigest == $0 }) ?? true,
               response.branchTip == request.branchTip
                   || request.branchTip == nil else {
             throw WorkServiceTransportError.invalidResponse
         }
         if let expectedHostInstance {
-            try validateDescriptorHost(response.work, expected: expectedHostInstance)
+            try validateHistoryAuthority(response.authority, expected: expectedHostInstance)
         }
         let frozen = response.frozenTipCursor
         guard frozen.sequence >= 0,
@@ -1370,8 +1423,11 @@ public enum WorkServiceTransportCodec {
         } else if response.hasOlder {
             throw WorkServiceTransportError.invalidResponse
         }
-        if let before = request.beforeCursor, let first = response.events.first {
-            guard first.sequence < before.sequence else {
+        for event in response.events {
+            guard event.sequence <= frozen.sequence else {
+                throw WorkServiceTransportError.invalidResponse
+            }
+            if let before = request.beforeCursor, event.sequence >= before.sequence {
                 throw WorkServiceTransportError.invalidResponse
             }
         }

@@ -467,10 +467,9 @@ internal enum WorkReducerTransition {
                 quarantine(event, state: &state, reason: "Work session attachment is malformed")
                 return
             }
-            if let existing = state.sessionAttachment(for: attachment.attachmentID),
-               existing.session != session {
+            if state.sessionAttachment(for: attachment.attachmentID) != nil {
                 quarantine(event, state: &state,
-                           reason: "Work session attachment identity was reused by another Session")
+                           reason: "Work session attachment identity was reused")
                 return
             }
             state.stageSessionAttachment(WorkSessionAttachmentSnapshot(
@@ -478,9 +477,9 @@ internal enum WorkReducerTransition {
                 capabilities: Set(event.payload["capabilities"]?.arrayValue?.compactMap(\.stringValue) ?? [])))
         case TimelineEventType.sessionDetached:
             guard let attachment = event.sessionAttachment,
-                  state.sessionAttachment(for: attachment.attachmentID) != nil else {
+                  state.sessionAttachment(for: attachment.attachmentID)?.isAttached == true else {
                 quarantine(event, state: &state,
-                           reason: "Work session detach references unknown attachment")
+                           reason: "Work session detach references an unknown or detached attachment")
                 return
             }
             state.stageSessionAttachmentDetached(attachment.attachmentID)

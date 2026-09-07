@@ -205,6 +205,37 @@ func test_sessionReducerTransitionProjectsAttachmentsAndContextFailures() {
     XCTAssertTrue(live.snapshot.structuralIntegrityValid)
 }
 
+func test_sessionReducerTransitionRejectsDetachedAttachmentIdentityReuse() {
+    let created = sessionTransitionEvent(
+        TimelineEventType.sessionCreated, id: "session-reuse-1", sequence: 1)
+    let attachment = SessionAttachmentRef("session-reuse-attachment")
+    let attached = sessionTransitionEvent(
+        TimelineEventType.sessionAttached, id: "session-reuse-2", sequence: 2,
+        previous: created.eventID, work: sessionTransitionWork,
+        workHost: WorkHostRef(sessionTransitionWork.workHostID), attachment: attachment)
+    let detached = sessionTransitionEvent(
+        TimelineEventType.sessionDetached, id: "session-reuse-3", sequence: 3,
+        previous: attached.eventID, work: sessionTransitionWork,
+        workHost: WorkHostRef(sessionTransitionWork.workHostID), attachment: attachment)
+    let reattached = sessionTransitionEvent(
+        TimelineEventType.sessionAttached, id: "session-reuse-4", sequence: 4,
+        previous: detached.eventID, work: sessionTransitionWork,
+        workHost: WorkHostRef(sessionTransitionWork.workHostID), attachment: attachment)
+    let detachedAgain = sessionTransitionEvent(
+        TimelineEventType.sessionDetached, id: "session-reuse-5", sequence: 5,
+        previous: reattached.eventID, work: sessionTransitionWork,
+        workHost: WorkHostRef(sessionTransitionWork.workHostID), attachment: attachment)
+
+    var reducer = SessionReducer()
+    for event in [created, attached, detached, reattached, detachedAgain] {
+        reducer.apply(event)
+    }
+    XCTAssertFalse(reducer.snapshot.attachments[attachment.attachmentID]?.isAttached ?? true)
+    XCTAssertEqual(reducer.snapshot.quarantinedEvents, [reattached, detachedAgain])
+    XCTAssertTrue(reducer.snapshot.structuralIntegrityValid)
+    XCTAssertFalse(reducer.snapshot.semanticProjectionValid)
+}
+
 func test_sessionReducerTransitionMaterializesBranchesAndPreservesInstrumentation() {
     let root = sessionTransitionEvent(
         TimelineEventType.inputAccepted, id: "session-branch-1", sequence: 1,
@@ -308,6 +339,9 @@ let casesSessionReducerTransition: [Case] = [
     }),
     ("phase3 Session transition projects attachments and context failures", {
         test_sessionReducerTransitionProjectsAttachmentsAndContextFailures()
+    }),
+    ("phase3 Session transition rejects detached attachment identity reuse", {
+        test_sessionReducerTransitionRejectsDetachedAttachmentIdentityReuse()
     }),
     ("phase3 Session transition materializes branches with bounded instrumentation", {
         test_sessionReducerTransitionMaterializesBranchesAndPreservesInstrumentation()

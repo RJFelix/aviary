@@ -459,9 +459,9 @@ internal enum SessionReducerTransition {
                 quarantine(event, state: &state, reason: "session attachment missing Work or attachment identity")
                 return
             }
-            if let existing = state.attachment(for: attachment.attachmentID), existing.work != work {
+            if state.attachment(for: attachment.attachmentID) != nil {
                 quarantine(event, state: &state,
-                           reason: "Session attachment identity was reused by another Work")
+                           reason: "Session attachment identity was reused")
                 return
             }
             state.stageAttachment(SessionAttachmentSnapshot(
@@ -470,8 +470,10 @@ internal enum SessionReducerTransition {
             updateScalar(&state) { $0.lifecycle = .active }
         case TimelineEventType.sessionDetached:
             guard let attachment = event.sessionAttachment,
-                  var attachmentState = state.attachment(for: attachment.attachmentID) else {
-                quarantine(event, state: &state, reason: "session detach references unknown attachment")
+                  var attachmentState = state.attachment(for: attachment.attachmentID),
+                  attachmentState.isAttached else {
+                quarantine(event, state: &state,
+                           reason: "session detach references an unknown or detached attachment")
                 return
             }
             attachmentState.isAttached = false

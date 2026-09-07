@@ -444,6 +444,50 @@ private func journalBackedHome() throws -> (AgentHome, URL) {
     return (AgentHome(root: root), root)
 }
 
+private struct JournalBackedControlSealFixture: Codable {
+    let schemaVersion: Int
+    let journal: JournalRef
+    let cursor: JournalCursor
+    let byteCount: Int
+    let sha256: String
+}
+
+/// Append one well-formed event from a future control reducer and advance the durability seal.
+/// The production control writer deliberately cannot emit unknown events, so this fixture uses
+/// the underlying canonical writer after the service owner has closed its writer.
+private func journalBackedAppendUnknownControlEvent(
+    home: AgentHome,
+    workHost: WorkHostRef
+) async throws {
+    let journal = JournalRef.workHost(workHost)
+    let url = home.timelineV2WorkHostControlJournalURL(workHostID: workHost.workHostID)
+    let writer = try TimelineJournalWriter(
+        reopening: url, journal: journal,
+        actor: TimelineActor(actorID: "future-control-reducer", kind: "future"),
+        home: home)
+    let commit = try await writer.append(TimelineEventDraft(
+        workHost: workHost,
+        type: "control.future-authority",
+        declaredDomains: [.work, .session],
+        payload: .object(["authority": .string("future-state")])))
+    try await writer.closeChecked()
+
+    let data = try Data(contentsOf: url)
+    let seal = JournalBackedControlSealFixture(
+        schemaVersion: 1, journal: journal, cursor: commit.cursor,
+        byteCount: data.count, sha256: AviarySHA256.hash(data: data).description)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    var encoded = try encoder.encode(seal)
+    encoded.append(0x0A)
+    let sealURL = url.appendingPathExtension("commit")
+    let handle = try FileHandle(forWritingTo: sealURL)
+    try handle.truncate(atOffset: 0)
+    try handle.write(contentsOf: encoded)
+    try handle.synchronize()
+    try handle.close()
+}
+
 private actor JournalDraftResolutionCounter {
     private(set) var calls = 0
 
@@ -2217,7 +2261,9 @@ func testJournalBackedWorkServiceJoinsExactStartAndRejectsNewerCursor() async th
         await service.controlJournal.close()
         return
     }
-    XCTAssertEqual(end.state, .accepted)
+    XCTAssertEqual(
+        end.state, .accepted,
+        "cleanup End rejection=\(String(describing: end.rejection)) diagnostic=\(String(describing: end.diagnostic))")
     await service.controlJournal.close()
 }
 
@@ -2669,6 +2715,273 @@ func testJournalBackedWorkServicePublishesCreateSessionAndReopensItsEvidence() a
     await restarted.controlJournal.close()
 }
 
+func testJournalBackedWorkServiceHistoryRejectsForgedMirroredPredecessor() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("history-forged-predecessor-client")
+    let grants = journalBackedAllCapabilities()
+    let store = JournalBackedTestManifestStore(productionCapable: true)
+    let authorizer = WorkServiceCapabilityPolicy(grantsByClient: [client: grants])
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "history-forged-predecessor-a",
+        startIdentity: "history-forged-predecessor-a",
+        authorizer: authorizer, manifestStore: store)
+    let control = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "history-forged-predecessor-work",
+        causalControlCursor: control,
+        requestedCapabilities: [.observe, .control, .createSession]))
+    let secondary = try await service.createSession(WorkServiceCreateSessionRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: client,
+        commandID: "history-forged-predecessor-session",
+        causalControlCursor: created.controlCursor,
+        causalWorkCursor: created.workCursor,
+        requestedCapabilities: [.observe]))
+    let secondarySession = try XCTUnwrap(secondary.session)
+    let secondaryJournal = try XCTUnwrap(secondary.sessionJournal)
+    let secondaryAttachment = try XCTUnwrap(secondary.attachment)
+    let predecessorID = try XCTUnwrap(created.workCursor.eventID)
+    await service.controlJournal.close()
+
+    let forgedID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+    let needle = "\"eventID\":\"\(predecessorID)\""
+    let replacement = "\"eventID\":\"\(forgedID)\""
+    XCTAssertEqual(needle.utf8.count, replacement.utf8.count)
+
+    func rewrite(_ url: URL, selectingLine: (String) -> Bool) throws -> Int {
+        let original = try String(contentsOf: url, encoding: .utf8)
+        var count = 0
+        let lines = original.split(separator: "\n", omittingEmptySubsequences: false).map {
+            line -> String in
+            let value = String(line)
+            guard selectingLine(value) else { return value }
+            count += value.components(separatedBy: needle).count - 1
+            return value.replacingOccurrences(of: needle, with: replacement)
+        }
+        let mutated = Data(lines.joined(separator: "\n").utf8)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: mutated)
+        try handle.synchronize()
+        try handle.close()
+        return count
+    }
+
+    let workURL = home.timelineV2WorkJournalURL(created.work.work)
+    XCTAssertEqual(try rewrite(workURL) { _ in true }, 1)
+    let sessionURL = home.timelineV2SessionJournalURL(secondarySession)
+    XCTAssertEqual(try rewrite(sessionURL) { _ in true }, 3)
+    let controlURL = home.timelineV2WorkHostControlJournalURL(
+        workHostID: created.work.work.workHostID)
+    XCTAssertEqual(try rewrite(controlURL) { line in
+        line.contains("\"type\":\"session_creation.reserved\"")
+            || line.contains("\"type\":\"session_creation.completed\"")
+    }, 2)
+
+    // Keep the control writer's committed-prefix framing proof internally consistent so the
+    // mutant isolates predecessor identity rather than failing on an unrelated stale checksum.
+    let commitURL = controlURL.appendingPathExtension("commit")
+    let controlData = try Data(contentsOf: controlURL)
+    var commit = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: commitURL)) as? [String: Any])
+    commit["sha256"] = AviarySHA256.hash(data: controlData).description
+    let commitData = try JSONSerialization.data(
+        withJSONObject: commit, options: [.sortedKeys, .withoutEscapingSlashes])
+    let commitHandle = try FileHandle(forWritingTo: commitURL)
+    try commitHandle.truncate(atOffset: 0)
+    try commitHandle.write(contentsOf: commitData)
+    try commitHandle.synchronize()
+    try commitHandle.close()
+
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "history-forged-predecessor-b",
+        startIdentity: "history-forged-predecessor-b",
+        authorizer: authorizer, manifestStore: store)
+    do {
+        _ = try await restarted.historyBeforeCursor(WorkServiceHistoryRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: secondaryAttachment.attachment, client: client,
+            target: .session(session: secondarySession, journal: secondaryJournal),
+            limit: 1))
+        XCTFail("history accepted a mirrored event after a fabricated predecessor identity")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    await restarted.controlJournal.close()
+}
+
+func testJournalBackedWorkServicePagesMirroredSessionAndRejectsMutatedAuthority() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("history-mirrored-page-client")
+    let forgedClient = ClientRef("history-mirrored-page-forged")
+    let grants = journalBackedAllCapabilities()
+    let store = JournalBackedTestManifestStore(productionCapable: true)
+    let authorizer = WorkServiceCapabilityPolicy(grantsByClient: [client: grants])
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "history-mirrored-page-a",
+        startIdentity: "history-mirrored-page-a",
+        authorizer: authorizer, manifestStore: store)
+    let control = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "history-mirrored-page-work",
+        causalControlCursor: control,
+        requestedCapabilities: [.observe, .control, .createSession]))
+    let secondary = try await service.createSession(WorkServiceCreateSessionRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: client,
+        commandID: "history-mirrored-page-session",
+        causalControlCursor: created.controlCursor,
+        causalWorkCursor: created.workCursor,
+        requestedCapabilities: [.observe]))
+    let session = try XCTUnwrap(secondary.session)
+    let journal = try XCTUnwrap(secondary.sessionJournal)
+    let sessionAttachment = try XCTUnwrap(secondary.sessionAttachment)
+    let clientAttachment = try XCTUnwrap(secondary.attachment)
+    XCTAssertEqual(secondary.relationship?.publication, .mirrored)
+
+    let writer = try TimelineJournalWriter(
+        reopening: home.timelineV2SessionJournalURL(session), journal: journal,
+        actor: TimelineActor(actorID: "history-mirrored-page-writer", kind: "self-test"),
+        home: home)
+    func appendMessage(
+        _ text: String, role: String, parent: EventRef?
+    ) async throws -> TimelineJournalCommit {
+        try await writer.append(TimelineEventDraft(
+            conversationParent: parent, session: session, work: created.work.work,
+            workHost: WorkHostRef(created.work.work.workHostID), client: client,
+            sessionAttachment: sessionAttachment,
+            type: TimelineEventType.messageCommitted, declaredDomains: [.session],
+            payload: .object(["role": .string(role), "text": .string(text)])))
+    }
+    let firstMessage = try await appendMessage(
+        "mirrored selected 1", role: "user", parent: nil)
+    let secondMessage = try await appendMessage(
+        "mirrored selected 2", role: "assistant", parent: firstMessage.eventRef)
+    let thirdMessage = try await appendMessage(
+        "mirrored selected 3", role: "user", parent: secondMessage.eventRef)
+    let offBranch = try await appendMessage(
+        "mirrored hidden branch", role: "assistant", parent: firstMessage.eventRef)
+    let fourthMessage = try await appendMessage(
+        "mirrored selected 4", role: "assistant", parent: thirdMessage.eventRef)
+    let selected = try await writer.append(TimelineEventDraft(
+        causedByEventID: fourthMessage.eventRef,
+        conversationParent: fourthMessage.eventRef,
+        session: session, type: TimelineEventType.sessionTipSelected,
+        declaredDomains: [.session],
+        payload: .object(["target": .string(fourthMessage.eventRef.eventID)])))
+    try await writer.closeChecked()
+
+    let target = WorkServiceReadTarget.session(session: session, journal: journal)
+    let firstPage = try await service.historyBeforeCursor(WorkServiceHistoryRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: clientAttachment.attachment, client: client,
+        target: target, limit: 2))
+    XCTAssertEqual(firstPage.authority.work, created.work.work)
+    XCTAssertEqual(firstPage.authority.journal, created.work.journal)
+    XCTAssertEqual(firstPage.authority.sourceCompleteness, .complete)
+    XCTAssertEqual(firstPage.events.map { $0.payload["text"]?.stringValue }, [
+        "mirrored selected 3", "mirrored selected 4",
+    ])
+    XCTAssertFalse(firstPage.events.contains { $0.eventID == offBranch.eventRef.eventID })
+    XCTAssertTrue(firstPage.hasOlder)
+    XCTAssertEqual(firstPage.nextBeforeCursor?.eventID, thirdMessage.eventRef.eventID)
+    XCTAssertEqual(firstPage.frozenTipCursor, selected.cursor)
+    XCTAssertEqual(firstPage.branchTip, fourthMessage.eventRef)
+
+    let continuationRequest = WorkServiceHistoryRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: clientAttachment.attachment, client: client,
+        target: target, beforeCursor: firstPage.nextBeforeCursor,
+        frozenTipCursor: firstPage.frozenTipCursor,
+        frozenTipDigest: firstPage.frozenTipDigest,
+        branchTip: firstPage.branchTip, limit: 2)
+    let continuation = try await service.historyBeforeCursor(continuationRequest)
+    XCTAssertEqual(continuation.events.map { $0.payload["text"]?.stringValue }, [
+        "mirrored selected 1", "mirrored selected 2",
+    ])
+    XCTAssertFalse(continuation.hasOlder)
+    XCTAssertNil(continuation.nextBeforeCursor)
+    XCTAssertEqual(continuation.frozenTipCursor, firstPage.frozenTipCursor)
+    XCTAssertEqual(continuation.frozenTipDigest, firstPage.frozenTipDigest)
+    XCTAssertEqual(continuation.branchTip, firstPage.branchTip)
+
+    // Mutate only the Work mirror's top-level client. Its command, the Session publication,
+    // and Work Host control result remain canonical and still name the real client, so this
+    // isolates the cross-journal authority equality rather than damaging the append chain.
+    let workURL = home.timelineV2WorkJournalURL(created.work.work)
+    let original = try String(contentsOf: workURL, encoding: .utf8)
+    var mutationCount = 0
+    let mutatedLines = try original.split(
+        separator: "\n", omittingEmptySubsequences: false
+    ).map { substring -> String in
+        let line = String(substring)
+        guard line.contains("\"type\":\"session.attached\""),
+              line.contains("\"sessionID\":\"\(session.sessionID)\"") else {
+            return line
+        }
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+        object["client"] = ["clientID": forgedClient.clientID]
+        mutationCount += 1
+        return try XCTUnwrap(String(
+            data: JSONSerialization.data(
+                withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]),
+            encoding: .utf8))
+    }
+    XCTAssertEqual(mutationCount, 1)
+    let workHandle = try FileHandle(forWritingTo: workURL)
+    try workHandle.truncate(atOffset: 0)
+    try workHandle.write(contentsOf: Data(mutatedLines.joined(separator: "\n").utf8))
+    try workHandle.synchronize()
+    try workHandle.close()
+
+    let mutatedRead = TimelineJournalReader.read(
+        try Data(contentsOf: workURL), journal: created.work.journal,
+        actor: TimelineActor(actorID: "history-mirrored-page-reader", kind: "self-test"),
+        hostRecordedAt: Date())
+    let mutatedMirror = try XCTUnwrap(mutatedRead.records.map(\.event).first {
+        $0.type == TimelineEventType.sessionAttached && $0.session == session
+    })
+    XCTAssertEqual(mutatedMirror.client, forgedClient)
+    XCTAssertEqual(mutatedMirror.command?.client, client)
+
+    let currentRequest = WorkServiceHistoryRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: clientAttachment.attachment, client: client,
+        target: target, limit: 2)
+    for (diagnostic, request) in [
+        ("current", currentRequest), ("frozen", continuationRequest),
+    ] {
+        do {
+            _ = try await service.historyBeforeCursor(request)
+            XCTFail("\(diagnostic) history accepted a mutated mirrored Work authority field")
+        } catch WorkServiceProtocolError.sourceIncomplete {
+            XCTAssertTrue(true)
+        }
+    }
+    await service.controlJournal.close()
+
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "history-mirrored-page-b",
+        startIdentity: "history-mirrored-page-b",
+        authorizer: authorizer, manifestStore: store)
+    for (diagnostic, request) in [
+        ("restart current", currentRequest), ("restart frozen", continuationRequest),
+    ] {
+        do {
+            _ = try await restarted.historyBeforeCursor(request)
+            XCTFail("\(diagnostic) history accepted a mutated mirrored Work authority field")
+        } catch WorkServiceProtocolError.sourceIncomplete {
+            XCTAssertTrue(true)
+        }
+    }
+    await restarted.controlJournal.close()
+}
+
 func testJournalBackedWorkServiceSessionAndClientBoundsPreserveExactRetry() async throws {
     let (home, root) = try journalBackedHome()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -2924,6 +3237,17 @@ func testJournalBackedWorkServicePublishesTerminalSessionReferenceAndReopens() a
     XCTAssertEqual(reopened.relationship, referenced.relationship)
     XCTAssertEqual(reopened.workCursor, terminalWorkCursor)
     XCTAssertEqual(reopened.controlCursor, referenced.controlCursor)
+    let terminalHistory = try await restarted.historyBeforeCursor(
+        WorkServiceHistoryRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: viewerAttachment.attachment, client: viewer,
+            target: .session(
+                session: referencedSession, journal: referencedJournal),
+            limit: 8))
+    XCTAssertTrue(terminalHistory.events.isEmpty)
+    XCTAssertFalse(terminalHistory.hasOlder)
+    XCTAssertEqual(terminalHistory.frozenTipCursor.sequence, 3)
+    XCTAssertEqual(terminalHistory.authority.sourceCompleteness, .complete)
     await restarted.controlJournal.close()
 }
 
@@ -3140,6 +3464,610 @@ func testJournalBackedWorkServiceReadsLongWorkAndSessionJournalsThroughControlle
     XCTAssertEqual(projection.workSnapshot.lifecycle, .active)
     XCTAssertEqual(projection.sessionSnapshot.lifecycle, .active)
     await service.controlJournal.close()
+}
+
+func testJournalBackedWorkServicePagesPersistentSessionHistoryWithoutFullReplay() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("persistent-history-client")
+    let authorizer = WorkServiceCapabilityPolicy(
+        grantsByClient: [client: journalBackedAllCapabilities()])
+    let manifestStore = JournalBackedTestManifestStore(productionCapable: true)
+    let service = try JournalBackedWorkService(
+        home: home,
+        instanceID: "persistent-history-instance-a",
+        startIdentity: "persistent-history-start-a",
+        authorizer: authorizer, manifestStore: manifestStore)
+    let initial = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "create-persistent-history",
+        causalControlCursor: initial,
+        requestedCapabilities: [.observe, .control]))
+
+    let sessionURL = home.timelineV2SessionJournalURL(created.session)
+    let initialRead = TimelineJournalReader.read(
+        try Data(contentsOf: sessionURL), journal: created.sessionJournal,
+        actor: TimelineActor(actorID: "persistent-history-fixture", kind: "test"),
+        hostRecordedAt: Date())
+    let initialLast = try XCTUnwrap(initialRead.records.last?.event)
+    var bytes = Data()
+    var previousID = initialLast.eventID
+    let messageCount = 1_000
+    for offset in 0..<messageCount {
+        let sequence = initialLast.sequence + offset + 1
+        let eventID = "persistent-history-message-\(sequence)"
+        let event = TimelineEvent(
+            eventID: eventID, journal: created.sessionJournal, sequence: sequence,
+            previousEventID: previousID, session: created.session,
+            work: created.work.work, workHost: WorkHostRef(created.work.work.workHostID),
+            sessionAttachment: created.sessionAttachment,
+            actor: TimelineActor(actorID: "persistent-history-fixture", kind: "test"),
+            hostRecordedAt: Date(timeIntervalSince1970: TimeInterval(sequence)),
+            type: TimelineEventType.messageCommitted, declaredDomains: [.session],
+            payload: .object([
+                "role": .string(offset.isMultiple(of: 2) ? "user" : "assistant"),
+                "text": .string("persistent history message \(offset)")
+            ]))
+        bytes.append(try JSONEncoder().encode(event))
+        bytes.append(0x0A)
+        previousID = eventID
+    }
+    let appendHandle = try FileHandle(forWritingTo: sessionURL)
+    try appendHandle.seekToEnd()
+    try appendHandle.write(contentsOf: bytes)
+    try appendHandle.synchronize()
+    try appendHandle.close()
+
+    let metricsBefore = await service.journalReadMetrics()
+    let historyMetricsBefore = await service.historyReadMetrics()
+    let target = WorkServiceReadTarget.session(
+        session: created.session, journal: created.sessionJournal)
+    let first = try await service.historyBeforeCursor(WorkServiceHistoryRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: client,
+        target: target, limit: 8))
+    XCTAssertEqual(first.authority.work, created.work.work)
+    XCTAssertEqual(first.authority.journal, created.work.journal)
+    XCTAssertEqual(first.authority.sourceCompleteness, .complete)
+    XCTAssertEqual(first.events.count, 8)
+    XCTAssertEqual(first.events.first?.payload["text"]?.stringValue,
+                   "persistent history message 992")
+    XCTAssertEqual(first.events.last?.payload["text"]?.stringValue,
+                   "persistent history message 999")
+    XCTAssertTrue(first.hasOlder)
+    XCTAssertNotNil(first.nextBeforeCursor)
+    XCTAssertEqual(first.frozenTipCursor.sequence, initialLast.sequence + messageCount)
+    XCTAssertTrue(first.frozenTipDigest.hasPrefix("sha256:"))
+    let metricsAfterFirst = await service.journalReadMetrics()
+    XCTAssertTrue(
+        metricsAfterFirst.recordsApplied - metricsBefore.recordsApplied < 32,
+        "history must not replay the 1,000-event Session through JBS's lifetime reducer")
+    let historyMetricsAfterFirst = await service.historyReadMetrics()
+    XCTAssertEqual(historyMetricsAfterFirst.calls - historyMetricsBefore.calls, 1)
+    XCTAssertEqual(historyMetricsAfterFirst.indexBuilds - historyMetricsBefore.indexBuilds, 1)
+    XCTAssertEqual(
+        historyMetricsAfterFirst.decodedPhysicalEvents
+            - historyMetricsBefore.decodedPhysicalEvents,
+        first.frozenTipCursor.sequence)
+    XCTAssertTrue(
+        historyMetricsAfterFirst.metadataLookups
+            - historyMetricsBefore.metadataLookups <= 11)
+    XCTAssertEqual(
+        historyMetricsAfterFirst.canonicalRangeReads
+            - historyMetricsBefore.canonicalRangeReads,
+        12) // eight messages plus two relationship rows in each authority pass
+    XCTAssertEqual(
+        historyMetricsAfterFirst.parentLinks - historyMetricsBefore.parentLinks,
+        0)
+    XCTAssertTrue(historyMetricsAfterFirst.mapObjectsRead > historyMetricsBefore.mapObjectsRead)
+    XCTAssertTrue(historyMetricsAfterFirst.sourceBytesScanned > historyMetricsBefore.sourceBytesScanned)
+
+    let appendedSequence = first.frozenTipCursor.sequence + 1
+    let appendedID = "persistent-history-message-\(appendedSequence)"
+    let appended = TimelineEvent(
+        eventID: appendedID, journal: created.sessionJournal, sequence: appendedSequence,
+        previousEventID: first.frozenTipCursor.eventID, session: created.session,
+        work: created.work.work, workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment,
+        actor: TimelineActor(actorID: "persistent-history-fixture", kind: "test"),
+        hostRecordedAt: Date(timeIntervalSince1970: TimeInterval(appendedSequence)),
+        type: TimelineEventType.messageCommitted, declaredDomains: [.session],
+        payload: .object([
+            "role": .string("assistant"),
+            "text": .string(
+                "newer than frozen history " + String(repeating: "x", count: 8 * 1_024))
+        ]))
+    var appendedBytes = try JSONEncoder().encode(appended)
+    appendedBytes.append(0x0A)
+    let laterHandle = try FileHandle(forWritingTo: sessionURL)
+    try laterHandle.seekToEnd()
+    try laterHandle.write(contentsOf: appendedBytes)
+    try laterHandle.synchronize()
+    try laterHandle.close()
+
+    await service.controlJournal.close()
+    let restarted = try JournalBackedWorkService(
+        home: home,
+        instanceID: "persistent-history-instance-b",
+        startIdentity: "persistent-history-start-b",
+        authorizer: authorizer, manifestStore: manifestStore)
+    let recovery = try await restarted.scanRecovery()
+    XCTAssertEqual(recovery.count, 1)
+    XCTAssertEqual(recovery[0].disposition, .idleReconstructable)
+    XCTAssertEqual(recovery[0].sessionCursor?.sequence, appendedSequence)
+    let historyMetricsAfterRecovery = await restarted.historyReadMetrics()
+    XCTAssertEqual(historyMetricsAfterRecovery.calls, 1)
+    XCTAssertEqual(historyMetricsAfterRecovery.indexBuilds, 1)
+    XCTAssertEqual(historyMetricsAfterRecovery.rebuilds, 1)
+    XCTAssertEqual(historyMetricsAfterRecovery.decodedPhysicalEvents, appendedSequence)
+    XCTAssertEqual(
+        historyMetricsAfterRecovery.canonicalRangeReads,
+        3) // one selected message plus the two canonical relationship rows
+    let continuation = try await restarted.historyBeforeCursor(WorkServiceHistoryRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: client,
+        target: target, beforeCursor: first.nextBeforeCursor,
+        frozenTipCursor: first.frozenTipCursor,
+        frozenTipDigest: first.frozenTipDigest, branchTip: first.branchTip,
+        limit: 8, maxBytes: 2 * 1_024))
+    XCTAssertEqual(continuation.frozenTipCursor, first.frozenTipCursor)
+    XCTAssertEqual(continuation.frozenTipDigest, first.frozenTipDigest)
+    XCTAssertEqual(continuation.events.last?.payload["text"]?.stringValue,
+                   "persistent history message 991")
+    XCTAssertFalse(continuation.events.contains { $0.eventID == appendedID })
+
+    let latest = try await restarted.historyBeforeCursor(WorkServiceHistoryRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: client,
+        target: target, limit: 1))
+    XCTAssertEqual(latest.events.map(\.eventID), [appendedID])
+    XCTAssertEqual(latest.frozenTipCursor.sequence, appendedSequence)
+    let finalHistoryMetrics = await restarted.historyReadMetrics()
+    XCTAssertEqual(finalHistoryMetrics.calls, 3)
+    XCTAssertEqual(finalHistoryMetrics.indexBuilds, 1)
+    XCTAssertEqual(finalHistoryMetrics.cacheHits, 4)
+    XCTAssertEqual(finalHistoryMetrics.decodedPhysicalEvents, appendedSequence)
+    // Recovery and latest read three and five canonical rows respectively; the frozen
+    // continuation reads its byte-bounded messages plus two relationship rows per pass.
+    XCTAssertEqual(
+        finalHistoryMetrics.canonicalRangeReads,
+        12 + continuation.events.count)
+    XCTAssertEqual(finalHistoryMetrics.parentLinks, 0)
+    await restarted.controlJournal.close()
+}
+
+func testJournalBackedWorkServiceHistoryRejectsNonProducerSessionGenesis() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("history-genesis-mutant-client")
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "history-genesis-mutant-instance",
+        startIdentity: "history-genesis-mutant-start",
+        authorizer: WorkServiceCapabilityPolicy(
+            grantsByClient: [client: journalBackedAllCapabilities()]),
+        manifestStore: JournalBackedTestManifestStore(productionCapable: true))
+    let initial = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "history-genesis-mutant-create",
+        causalControlCursor: initial,
+        requestedCapabilities: [.observe, .control]))
+
+    // Keep the canonical identity/append chain intact while adding a field the actual idle
+    // producer never emits. The Session reducer permits an otherwise harmless payload on
+    // session.created; history authority must still reject it as non-producer evidence.
+    let url = home.timelineV2SessionJournalURL(created.session)
+    let original = try Data(contentsOf: url)
+    guard let newline = original.firstIndex(of: 0x0A) else {
+        XCTFail("idle Session journal has no genesis line")
+        return
+    }
+    let first = Data(original[..<newline])
+    guard var object = try JSONSerialization.jsonObject(with: first) as? [String: Any] else {
+        XCTFail("idle Session genesis is not a JSON object")
+        return
+    }
+    object["payload"] = ["unexpected": "not-produced"]
+    let mutatedFirst = try JSONSerialization.data(
+        withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+    var mutated = mutatedFirst
+    mutated.append(0x0A)
+    mutated.append(original[(newline + 1)...])
+    let handle = try FileHandle(forWritingTo: url)
+    try handle.truncate(atOffset: 0)
+    try handle.write(contentsOf: mutated)
+    try handle.synchronize()
+    try handle.close()
+
+    do {
+        _ = try await service.historyBeforeCursor(WorkServiceHistoryRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: client,
+            target: .session(
+                session: created.session, journal: created.sessionJournal),
+            limit: 1))
+        XCTFail("history accepted a Session genesis envelope the producer never emits")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    await service.controlJournal.close()
+}
+
+func testJournalBackedWorkServiceHistoryRejectsUnknownWorkRelationshipSemantics() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("history-unknown-work-client")
+    let authorizer = WorkServiceCapabilityPolicy(
+        grantsByClient: [client: journalBackedAllCapabilities()])
+    let manifestStore = JournalBackedTestManifestStore(productionCapable: true)
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "history-unknown-work-instance-a",
+        startIdentity: "history-unknown-work-start-a",
+        authorizer: authorizer, manifestStore: manifestStore)
+    let initial = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "history-unknown-work-create",
+        causalControlCursor: initial,
+        requestedCapabilities: [.observe, .control]))
+
+    let initialPage = try await service.historyBeforeCursor(WorkServiceHistoryRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: client,
+        target: .session(
+            session: created.session, journal: created.sessionJournal),
+        limit: 1))
+    XCTAssertTrue(initialPage.events.isEmpty)
+
+    // A future Session event can truthfully declare that it changes the Work relationship even
+    // when today's reducer does not understand its type. A frozen content cursor must not freeze
+    // authorization: history must not keep serving from the earlier attachment projection or
+    // report the Work reconstructable after restart.
+    let writer = try TimelineJournalWriter(
+        reopening: home.timelineV2SessionJournalURL(created.session),
+        journal: created.sessionJournal,
+        actor: TimelineActor(actorID: "future-history-relationship", kind: "future"),
+        home: home)
+    _ = try await writer.append(TimelineEventDraft(
+        session: created.session, work: created.work.work,
+        workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment,
+        type: "session.future-attachment",
+        declaredDomains: [.work],
+        payload: .object(["relationship": .string("future-state")])))
+    try await writer.closeChecked()
+    let historyKey = AviarySHA256.hash(data: Data(
+        "session-history-v4\0\(created.sessionJournal.stableKey)".utf8)).description
+    try FileManager.default.removeItem(at: home.timelineV2Dir
+        .appending(path: "projections", directoryHint: .isDirectory)
+        .appending(path: "session-history-v4", directoryHint: .isDirectory)
+        .appending(path: historyKey, directoryHint: .isDirectory))
+
+    do {
+        _ = try await service.historyBeforeCursor(WorkServiceHistoryRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: client,
+            target: .session(
+                session: created.session, journal: created.sessionJournal),
+            frozenTipCursor: initialPage.frozenTipCursor,
+            frozenTipDigest: initialPage.frozenTipDigest,
+            branchTip: initialPage.branchTip,
+            limit: 1))
+        XCTFail("frozen history served stale authority across an unknown Work-domain event")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try await service.historyBeforeCursor(WorkServiceHistoryRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: client,
+            target: .session(
+                session: created.session, journal: created.sessionJournal),
+            limit: 1))
+        XCTFail("current history accepted an unknown Work-domain relationship suffix")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    await service.controlJournal.close()
+
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "history-unknown-work-instance-b",
+        startIdentity: "history-unknown-work-start-b",
+        authorizer: authorizer, manifestStore: manifestStore)
+    let recovery = try await restarted.scanRecovery()
+    XCTAssertEqual(recovery.count, 1)
+    XCTAssertEqual(recovery.first?.disposition, .corrupt)
+    XCTAssertEqual(recovery.first?.sourcePresence, .unverified)
+    await restarted.controlJournal.close()
+}
+
+func testJournalBackedWorkServiceHistoryRejectsUnknownSessionRelationshipSemantics() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("history-unknown-session-client")
+    let authorizer = WorkServiceCapabilityPolicy(
+        grantsByClient: [client: journalBackedAllCapabilities()])
+    let manifestStore = JournalBackedTestManifestStore(productionCapable: true)
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "history-unknown-session-instance-a",
+        startIdentity: "history-unknown-session-start-a",
+        authorizer: authorizer, manifestStore: manifestStore)
+    let initial = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "history-unknown-session-create",
+        causalControlCursor: initial,
+        requestedCapabilities: [.observe, .control]))
+
+    let initialPage = try await service.historyBeforeCursor(WorkServiceHistoryRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: client,
+        target: .session(
+            session: created.session, journal: created.sessionJournal),
+        limit: 1))
+
+    // Work-journal relationship evidence is also cross-domain. A future event that declares a
+    // Session effect must prevent today's Work reducer from lending its older attachment row to
+    // either a current or already-frozen history request.
+    let writer = try TimelineJournalWriter(
+        reopening: home.timelineV2WorkJournalURL(created.work.work),
+        journal: created.work.journal,
+        actor: TimelineActor(actorID: "future-work-session-relationship", kind: "future"),
+        home: home)
+    _ = try await writer.append(TimelineEventDraft(
+        session: created.session, work: created.work.work,
+        workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment,
+        type: "work.future-session-relationship",
+        declaredDomains: [.session],
+        payload: .object(["relationship": .string("future-state")])))
+    try await writer.closeChecked()
+
+    for request in [
+        WorkServiceHistoryRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: client,
+            target: .session(
+                session: created.session, journal: created.sessionJournal),
+            limit: 1),
+        WorkServiceHistoryRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: client,
+            target: .session(
+                session: created.session, journal: created.sessionJournal),
+            frozenTipCursor: initialPage.frozenTipCursor,
+            frozenTipDigest: initialPage.frozenTipDigest,
+            branchTip: initialPage.branchTip, limit: 1),
+    ] {
+        do {
+            _ = try await service.historyBeforeCursor(request)
+            XCTFail("history accepted an unknown Session-domain Work relationship suffix")
+        } catch WorkServiceProtocolError.sourceIncomplete {
+            XCTAssertTrue(true)
+        }
+    }
+    await service.controlJournal.close()
+
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "history-unknown-session-instance-b",
+        startIdentity: "history-unknown-session-start-b",
+        authorizer: authorizer, manifestStore: manifestStore)
+    let recovery = try await restarted.scanRecovery()
+    XCTAssertEqual(recovery.count, 1)
+    XCTAssertEqual(recovery.first?.disposition, .corrupt)
+    XCTAssertEqual(recovery.first?.sourcePresence, .unverified)
+    await restarted.controlJournal.close()
+}
+
+func testJournalBackedWorkServiceHistoryRejectsUnknownControlAuthority() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("history-unknown-control-client")
+    let authorizer = WorkServiceCapabilityPolicy(
+        grantsByClient: [client: journalBackedAllCapabilities()])
+    let manifestStore = JournalBackedTestManifestStore(productionCapable: true)
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "history-unknown-control-instance-a",
+        startIdentity: "history-unknown-control-start-a",
+        authorizer: authorizer, manifestStore: manifestStore)
+    let initial = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "history-unknown-control-create",
+        causalControlCursor: initial,
+        requestedCapabilities: [.observe, .control]))
+    let first = try await service.historyBeforeCursor(WorkServiceHistoryRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: client,
+        target: .session(
+            session: created.session, journal: created.sessionJournal),
+        limit: 1))
+
+    // An older service cannot know whether a future Work Host control event changes creation,
+    // attachment, capability, or registration authority. Keep the event and its seal canonical,
+    // but refuse both current and frozen history rather than lending authority from the prefix.
+    await service.controlJournal.close()
+    try await journalBackedAppendUnknownControlEvent(
+        home: home, workHost: WorkHostRef(created.work.work.workHostID))
+    for request in [
+        WorkServiceHistoryRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: client,
+            target: .session(
+                session: created.session, journal: created.sessionJournal),
+            limit: 1),
+        WorkServiceHistoryRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: client,
+            target: .session(
+                session: created.session, journal: created.sessionJournal),
+            frozenTipCursor: first.frozenTipCursor,
+            frozenTipDigest: first.frozenTipDigest,
+            branchTip: first.branchTip, limit: 1),
+    ] {
+        do {
+            _ = try await service.historyBeforeCursor(request)
+            XCTFail("history accepted unknown Work Host control authority")
+        } catch WorkServiceProtocolError.sourceIncomplete {
+            XCTAssertTrue(true)
+        }
+    }
+
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "history-unknown-control-instance-b",
+        startIdentity: "history-unknown-control-start-b",
+        authorizer: authorizer, manifestStore: manifestStore)
+    do {
+        _ = try await restarted.scanRecovery()
+        XCTFail("recovery enumerated Work from unknown Work Host control authority")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    await restarted.controlJournal.close()
+}
+
+func testJournalBackedWorkServiceHistoryRejectsRelationshipChangeDuringRead() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("history-relationship-race-client")
+    let authorizer = WorkServiceCapabilityPolicy(
+        grantsByClient: [client: journalBackedAllCapabilities()])
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "history-relationship-race-instance",
+        startIdentity: "history-relationship-race-start",
+        authorizer: authorizer,
+        manifestStore: JournalBackedTestManifestStore(productionCapable: true))
+    let control = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "history-relationship-race-create",
+        causalControlCursor: control,
+        requestedCapabilities: [.observe, .control]))
+
+    let gate = JournalStartGate()
+    await service.installHistoryAfterInitialReadHook {
+        await gate.enterAndWait()
+    }
+    let request = WorkServiceHistoryRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: client,
+        target: .session(
+            session: created.session, journal: created.sessionJournal),
+        limit: 1)
+    let inFlight = Task { try await service.historyBeforeCursor(request) }
+    await gate.waitUntilEntered()
+
+    // The first target read saw the relationship attached. Commit a detach while the service is
+    // suspended after releasing that source lease; the second authority pass must observe it and
+    // withhold every message byte.
+    let writer = try TimelineJournalWriter(
+        reopening: home.timelineV2SessionJournalURL(created.session),
+        journal: created.sessionJournal,
+        actor: TimelineActor(actorID: "history-relationship-race", kind: "self-test"),
+        home: home)
+    _ = try await writer.append(TimelineEventDraft(
+        session: created.session, work: created.work.work,
+        workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment,
+        type: TimelineEventType.sessionDetached,
+        declaredDomains: [.session, .work]))
+    try await writer.closeChecked()
+    await gate.release()
+
+    do {
+        _ = try await inFlight.value
+        XCTFail("history crossed a Session detach committed during its authority read")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try await service.historyBeforeCursor(request)
+        XCTFail("history retained stale relationship authority after the raced detach")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    await service.controlJournal.close()
+}
+
+func testJournalBackedWorkServiceHistoryRejectsSessionDetachDisagreement() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("history-session-detach-client")
+    let authorizer = WorkServiceCapabilityPolicy(
+        grantsByClient: [client: journalBackedAllCapabilities()])
+    let manifestStore = JournalBackedTestManifestStore(productionCapable: true)
+    let service = try JournalBackedWorkService(
+        home: home, instanceID: "history-session-detach-instance-a",
+        startIdentity: "history-session-detach-start-a",
+        authorizer: authorizer, manifestStore: manifestStore)
+    let initial = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "history-session-detach-create",
+        causalControlCursor: initial,
+        requestedCapabilities: [.observe, .control]))
+    let first = try await service.historyBeforeCursor(WorkServiceHistoryRequest(
+        work: created.work.work, journal: created.work.journal,
+        attachment: created.attachment.attachment, client: client,
+        target: .session(
+            session: created.session, journal: created.sessionJournal),
+        limit: 1))
+
+    let writer = try TimelineJournalWriter(
+        reopening: home.timelineV2SessionJournalURL(created.session),
+        journal: created.sessionJournal,
+        actor: TimelineActor(actorID: "history-session-detach", kind: "self-test"),
+        home: home)
+    _ = try await writer.append(TimelineEventDraft(
+        session: created.session, work: created.work.work,
+        workHost: WorkHostRef(created.work.work.workHostID),
+        sessionAttachment: created.sessionAttachment,
+        type: TimelineEventType.sessionDetached,
+        declaredDomains: [.session, .work], payload: .object([:])))
+    try await writer.closeChecked()
+    let historyKey = AviarySHA256.hash(data: Data(
+        "session-history-v4\0\(created.sessionJournal.stableKey)".utf8)).description
+    try FileManager.default.removeItem(at: home.timelineV2Dir
+        .appending(path: "projections", directoryHint: .isDirectory)
+        .appending(path: "session-history-v4", directoryHint: .isDirectory)
+        .appending(path: historyKey, directoryHint: .isDirectory))
+
+    do {
+        _ = try await service.historyBeforeCursor(WorkServiceHistoryRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: client,
+            target: .session(
+                session: created.session, journal: created.sessionJournal),
+            frozenTipCursor: first.frozenTipCursor,
+            frozenTipDigest: first.frozenTipDigest, branchTip: first.branchTip,
+            limit: 1))
+        XCTFail("frozen history ignored a current Session detach")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try await service.historyBeforeCursor(WorkServiceHistoryRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: client,
+            target: .session(
+                session: created.session, journal: created.sessionJournal),
+            limit: 1))
+        XCTFail("current history ignored a current Session detach")
+    } catch WorkServiceProtocolError.sourceIncomplete {
+        XCTAssertTrue(true)
+    }
+    await service.controlJournal.close()
+
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "history-session-detach-instance-b",
+        startIdentity: "history-session-detach-start-b",
+        authorizer: authorizer, manifestStore: manifestStore)
+    let recovery = try await restarted.scanRecovery()
+    XCTAssertEqual(recovery.count, 1)
+    XCTAssertEqual(recovery.first?.disposition, .corrupt)
+    XCTAssertEqual(recovery.first?.sourcePresence, .unverified)
+    await restarted.controlJournal.close()
 }
 
 /// Exercise the nonresident source path without using a writer append for every record (which
@@ -3682,6 +4610,12 @@ let casesJournalBackedWorkService: [Case] = [
     ("journal-backed service publishes and reopens Create Session evidence", {
         try await testJournalBackedWorkServicePublishesCreateSessionAndReopensItsEvidence()
     }),
+    ("journal-backed service history rejects a forged mirrored predecessor", {
+        try await testJournalBackedWorkServiceHistoryRejectsForgedMirroredPredecessor()
+    }),
+    ("journal-backed service pages mirrored Session history and rejects mutated authority", {
+        try await testJournalBackedWorkServicePagesMirroredSessionAndRejectsMutatedAuthority()
+    }),
     ("journal-backed service bounds Session/client relationships without breaking retry", {
         try await testJournalBackedWorkServiceSessionAndClientBoundsPreserveExactRetry()
     }),
@@ -3723,6 +4657,27 @@ let casesJournalBackedWorkService: [Case] = [
     }),
     ("journal-backed service reads Work and Session through multiple pages", {
         try await testJournalBackedWorkServiceReadsLongWorkAndSessionJournalsThroughControllerPages()
+    }),
+    ("journal-backed service pages persistent Session history without full replay", {
+        try await testJournalBackedWorkServicePagesPersistentSessionHistoryWithoutFullReplay()
+    }),
+    ("journal-backed service history rejects non-producer Session genesis", {
+        try await testJournalBackedWorkServiceHistoryRejectsNonProducerSessionGenesis()
+    }),
+    ("journal-backed service history rejects unknown Work relationship semantics", {
+        try await testJournalBackedWorkServiceHistoryRejectsUnknownWorkRelationshipSemantics()
+    }),
+    ("journal-backed service history rejects unknown Session relationship semantics", {
+        try await testJournalBackedWorkServiceHistoryRejectsUnknownSessionRelationshipSemantics()
+    }),
+    ("journal-backed service history rejects unknown Work Host control authority", {
+        try await testJournalBackedWorkServiceHistoryRejectsUnknownControlAuthority()
+    }),
+    ("journal-backed service history rejects a relationship change during read", {
+        try await testJournalBackedWorkServiceHistoryRejectsRelationshipChangeDuringRead()
+    }),
+    ("journal-backed service history rejects Session detach disagreement", {
+        try await testJournalBackedWorkServiceHistoryRejectsSessionDetachDisagreement()
     }),
     ("journal-backed service keeps oversized journals readable and incrementally cached", {
         try await testJournalBackedWorkServiceKeepsOversizedJournalsReadableAndIncrementallyCached()

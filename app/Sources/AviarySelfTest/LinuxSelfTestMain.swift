@@ -83,11 +83,17 @@ enum LinuxSelfTestMain {
             ("Linux platform: local Timeline projection reader", {
                 try await runLinuxCases(casesLocalTimelineProjectionReader)
             }),
+            ("Linux platform: local Session history projection reader", {
+                try await runLinuxCases(casesLocalSessionHistoryProjectionReader)
+            }),
             ("Linux platform: bounded Timeline reducer projection", {
                 try await runLinuxCases(casesBoundedTimelineReducerProjection)
             }),
             ("Linux platform: persistent projection radix map", {
                 try await runLinuxCases(casesPersistentProjectionRadixMap)
+            }),
+            ("Linux platform: persistent Session history index", {
+                try await runLinuxCases(casesPersistentSessionHistoryIndex)
             }),
             ("Linux platform: persistent Work exact state", {
                 try await runLinuxCases(casesPersistentWorkExactState)

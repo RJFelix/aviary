@@ -395,7 +395,7 @@ private func testPersistentWorkExactStateReopenPreservesActiveRunOwner() throws 
     XCTAssertNil(finished.eventLocalSnapshot.activeRunSessionAttachment)
 }
 
-private func testPersistentWorkExactStateReattachCounts() throws {
+private func testPersistentWorkExactStateRejectsDetachedIdentityReuseAndKeepsCounts() throws {
     let directory = try persistentDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     let map = try persistentMap(at: directory)
@@ -403,19 +403,23 @@ private func testPersistentWorkExactStateReattachCounts() throws {
     let session = SessionRef("count-session")
     let a = SessionAttachmentRef("count-a")
     let b = SessionAttachmentRef("count-b")
+    let c = SessionAttachmentRef("count-c")
     let events = [
         persistentEvent(TimelineEventType.workCreated, "count-1", 1),
         persistentEvent(TimelineEventType.sessionAttached, "count-2", 2, previous: "count-1", session: session, attachment: a),
         persistentEvent(TimelineEventType.sessionAttached, "count-3", 3, previous: "count-2", session: session, attachment: b),
         persistentEvent(TimelineEventType.sessionDetached, "count-4", 4, previous: "count-3", session: session, attachment: a),
         persistentEvent(TimelineEventType.sessionAttached, "count-5", 5, previous: "count-4", session: session, attachment: a),
-        persistentEvent(TimelineEventType.sessionDetached, "count-6", 6, previous: "count-5", session: session, attachment: b),
-        persistentEvent(TimelineEventType.sessionDetached, "count-7", 7, previous: "count-6", session: session, attachment: a)
+        persistentEvent(TimelineEventType.sessionAttached, "count-6", 6, previous: "count-5", session: session, attachment: c),
+        persistentEvent(TimelineEventType.sessionDetached, "count-7", 7, previous: "count-6", session: session, attachment: b),
+        persistentEvent(TimelineEventType.sessionDetached, "count-8", 8, previous: "count-7", session: session, attachment: c)
     ]
+    var afterRejectedReuse: PersistentWorkExactState.ApplyResult?
     var afterDetachingB: PersistentWorkExactState.ApplyResult?
     for event in events {
         let result = try state.apply(event)
-        if event.eventID == "count-6" { afterDetachingB = result }
+        if event.eventID == "count-5" { afterRejectedReuse = result }
+        if event.eventID == "count-7" { afterDetachingB = result }
     }
     XCTAssertFalse(try XCTUnwrap(
         afterDetachingB?.eventLocalSnapshot.sessionAttachments["count-b"]
@@ -423,7 +427,10 @@ private func testPersistentWorkExactStateReattachCounts() throws {
     XCTAssertTrue(try XCTUnwrap(afterDetachingB).eventLocalSnapshot.attachedSessionIDs.contains(
         session.sessionID))
     XCTAssertTrue(state.eventLocalSnapshot.attachedSessionIDs.isEmpty)
-    XCTAssertFalse(state.eventLocalSnapshot.sessionAttachments["count-a"]!.isAttached)
+    XCTAssertFalse(try XCTUnwrap(
+        afterRejectedReuse?.eventLocalSnapshot.sessionAttachments["count-a"]
+    ).isAttached)
+    XCTAssertEqual(try XCTUnwrap(afterRejectedReuse).eventLocalSnapshot.quarantinedEvents.map(\.eventID), ["count-5"])
 }
 
 private func testPersistentWorkExactStateDetachUsesStoredSessionAcrossReopen() throws {
@@ -433,6 +440,7 @@ private func testPersistentWorkExactStateDetachUsesStoredSessionAcrossReopen() t
     let storedSession = SessionRef("stored-session")
     let misleadingSession = SessionRef("misleading-session")
     let attachment = SessionAttachmentRef("stored-attachment")
+    let replacement = SessionAttachmentRef("stored-replacement")
     let events = [
         persistentEvent(TimelineEventType.workCreated, "stored-1", 1),
         persistentEvent(TimelineEventType.sessionAttached, "stored-2", 2,
@@ -442,10 +450,10 @@ private func testPersistentWorkExactStateDetachUsesStoredSessionAcrossReopen() t
                         previous: "stored-2", attachment: attachment),
         persistentEvent(TimelineEventType.sessionAttached, "stored-4", 4,
                         previous: "stored-3", session: storedSession,
-                        attachment: attachment),
+                        attachment: replacement),
         persistentEvent(TimelineEventType.sessionDetached, "stored-5", 5,
                         previous: "stored-4", session: misleadingSession,
-                        attachment: attachment),
+                        attachment: replacement),
     ]
     var memory = InMemoryWorkTransitionState()
     var root: PersistentProjectionRadixMap.Root?
@@ -457,14 +465,17 @@ private func testPersistentWorkExactStateDetachUsesStoredSessionAcrossReopen() t
             result.eventLocalSnapshot.attachedSessionIDs,
             memory.snapshot.attachedSessionIDs,
             "attached Session parity mismatch after reopen at \(event.eventID)")
-        XCTAssertEqual(
-            result.eventLocalSnapshot.sessionAttachments[attachment.attachmentID]?.isAttached,
-            memory.snapshot.sessionAttachments[attachment.attachmentID]?.isAttached,
-            "attachment state parity mismatch after reopen at \(event.eventID)")
+        if let expected = event.sessionAttachment {
+            XCTAssertEqual(
+                result.eventLocalSnapshot.sessionAttachments[expected.attachmentID]?.isAttached,
+                memory.snapshot.sessionAttachments[expected.attachmentID]?.isAttached,
+                "attachment state parity mismatch after reopen at \(event.eventID)")
+        }
         root = result.root
     }
     XCTAssertTrue(memory.snapshot.attachedSessionIDs.isEmpty)
     XCTAssertFalse(try XCTUnwrap(memory.snapshot.sessionAttachments[attachment.attachmentID]).isAttached)
+    XCTAssertFalse(try XCTUnwrap(memory.snapshot.sessionAttachments[replacement.attachmentID]).isAttached)
 }
 
 private func testPersistentWorkExactStateUnknownQuarantinePrivacy() throws {
@@ -743,8 +754,8 @@ let casesPersistentWorkExactState: [Case] = [
     ("phase3 persistent Work exact state preserves active Run owner after reopen", {
         try testPersistentWorkExactStateReopenPreservesActiveRunOwner()
     }),
-    ("phase3 persistent Work exact state keeps reattach counts exact", {
-        try testPersistentWorkExactStateReattachCounts()
+    ("phase3 persistent Work exact state rejects detached identity reuse and keeps counts exact", {
+        try testPersistentWorkExactStateRejectsDetachedIdentityReuseAndKeepsCounts()
     }),
     ("phase3 persistent Work exact state derives detach Session from stored attachment", {
         try testPersistentWorkExactStateDetachUsesStoredSessionAcrossReopen()

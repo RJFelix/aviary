@@ -1244,8 +1244,10 @@ public struct WorkServiceHistoryRequest: Codable, Hashable, Sendable {
     public let target: WorkServiceReadTarget
     /// Exclusive upper boundary. Nil means the current canonical tip on the first request.
     public let beforeCursor: JournalCursor?
-    /// Once established, continuation is pinned to this tip. Appends after it are allowed, but
-    /// replacement, truncation, or mutation of the frozen prefix must fail closed.
+    /// Once established, continuation is pinned to this tip. Within the Work Host's cooperating
+    /// owner-lock append contract, appends after it are allowed while replacement, truncation, or
+    /// mutation of the frozen prefix fails closed. This is an integrity contract between Aviary
+    /// writers, not a sandbox boundary against a process directly rewriting journal bytes.
     public let frozenTipCursor: JournalCursor?
     public let frozenTipDigest: String?
     /// Semantic branch identity from the Session reducer. A continuation must remain on this
@@ -1275,8 +1277,60 @@ public struct WorkServiceHistoryRequest: Codable, Hashable, Sendable {
     }
 }
 
+/// The minimal authority returned with a bounded conversation-history page. History consumers
+/// must not receive the full Work descriptor: constructing one can require replaying mutable Work
+/// state that is unrelated to the selected Session journal. This authority binds the page to the
+/// exact Work/journal and to the Work Host instance that negotiated the read. Completeness is
+/// carried explicitly so a sparse or otherwise incomplete source cannot be mistaken for an
+/// authenticated complete history prefix.
+public struct WorkServiceHistoryAuthority: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let journal: JournalRef
+    public let hostInstance: WorkHostInstanceRef
+    public let sourceCompleteness: WorkServiceSourceCompleteness
+
+    public init(work: WorkRef, journal: JournalRef,
+                hostInstance: WorkHostInstanceRef,
+                sourceCompleteness: WorkServiceSourceCompleteness) throws {
+        guard journal.owner == .work(work),
+              journal.authority.authorityID == work.workHostID,
+              hostInstance.host == WorkHostRef(work.workHostID) else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "history authority must bind the exact Work journal and Work Host")
+        }
+        self.work = work
+        self.journal = journal
+        self.hostInstance = hostInstance
+        self.sourceCompleteness = sourceCompleteness
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let work = try container.decode(WorkRef.self, forKey: .work)
+        let journal = try container.decode(JournalRef.self, forKey: .journal)
+        let hostInstance = try container.decode(WorkHostInstanceRef.self, forKey: .hostInstance)
+        let sourceCompleteness = try container.decode(
+            WorkServiceSourceCompleteness.self, forKey: .sourceCompleteness)
+        guard journal.owner == .work(work),
+              journal.authority.authorityID == work.workHostID,
+              hostInstance.host == WorkHostRef(work.workHostID) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .journal, in: container,
+                debugDescription: "history authority identities do not agree")
+        }
+        self.work = work
+        self.journal = journal
+        self.hostInstance = hostInstance
+        self.sourceCompleteness = sourceCompleteness
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case work, journal, hostInstance, sourceCompleteness
+    }
+}
+
 public struct WorkServiceHistoryPage: Codable, Hashable, Sendable {
-    public let work: WorkServiceWorkDescriptor
+    public let authority: WorkServiceHistoryAuthority
     public let events: [TimelineEvent]
     public let target: WorkServiceReadTarget
     public let lowerBoundaryCursor: JournalCursor?
@@ -1292,13 +1346,13 @@ public struct WorkServiceHistoryPage: Codable, Hashable, Sendable {
     public let prefixDigest: String
     public let omissions: [WorkServiceOmission]
 
-    public init(work: WorkServiceWorkDescriptor, events: [TimelineEvent], target: WorkServiceReadTarget,
+    public init(authority: WorkServiceHistoryAuthority, events: [TimelineEvent], target: WorkServiceReadTarget,
                 lowerBoundaryCursor: JournalCursor?, upperBoundaryCursor: JournalCursor?,
                 nextBeforeCursor: JournalCursor?, hasOlder: Bool,
                 frozenTipCursor: JournalCursor, frozenTipDigest: String,
                 prefixDigest: String, branchTip: EventRef? = nil,
                 omissions: [WorkServiceOmission] = []) {
-        self.work = work
+        self.authority = authority
         self.events = events
         self.target = target
         self.lowerBoundaryCursor = lowerBoundaryCursor
@@ -3437,7 +3491,9 @@ public actor InMemoryWorkService: WorkServiceClient {
             events: target.events, visibleEvents: all, journal: target.journal, target: request.target,
             before: request.beforeCursor, frozenTip: request.frozenTipCursor,
             frozenDigest: request.frozenTipDigest, branchTip: effectiveBranchTip,
-            work: try requiredDescriptor(for: state.work, includeObservation: true),
+            authority: try WorkServiceHistoryAuthority(
+                work: state.work, journal: state.journal, hostInstance: hostInstance,
+                sourceCompleteness: state.sourceCompleteness),
             limit: request.limit, maxBytes: request.maxBytes)
     }
 
@@ -4122,7 +4178,7 @@ public actor InMemoryWorkService: WorkServiceClient {
         events: [TimelineEvent], visibleEvents: [TimelineEvent]? = nil,
         journal: JournalRef, target: WorkServiceReadTarget,
         before: JournalCursor?, frozenTip: JournalCursor?, frozenDigest: String?,
-        branchTip: EventRef?, work: WorkServiceWorkDescriptor,
+        branchTip: EventRef?, authority: WorkServiceHistoryAuthority,
         limit: Int, maxBytes: Int
     ) throws -> WorkServiceHistoryPage {
         guard limit > 0, limit <= WorkServiceBounds.maxEventsPerPage,
@@ -4224,7 +4280,7 @@ public actor InMemoryWorkService: WorkServiceClient {
                 diagnostic: "older visible messages remain"))
         }
         return WorkServiceHistoryPage(
-            work: work,
+            authority: authority,
             events: selected, target: target, lowerBoundaryCursor: lower,
             upperBoundaryCursor: upper, nextBeforeCursor: nextBefore,
             hasOlder: hasOlder, frozenTipCursor: frozen,

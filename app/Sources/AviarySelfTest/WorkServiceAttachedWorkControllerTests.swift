@@ -47,6 +47,33 @@ private enum AttachedControllerServiceMode: Sendable {
     case omittedAttachment
 }
 
+private func semanticTipDescends(
+    from ancestor: EventRef?, to descendant: EventRef?,
+    messages: [SessionMessageSnapshot]
+) -> Bool {
+    guard ancestor != descendant else { return true }
+    guard let descendant else { return false }
+    guard let ancestor else { return true }
+    let messagesByID = Dictionary(
+        uniqueKeysWithValues: messages.compactMap { message -> (String, SessionMessageSnapshot)? in
+            guard let source = message.sourceEvent else { return nil }
+            return (source.eventID, message)
+        })
+    var current: EventRef? = descendant
+    var visited: Set<String> = []
+    while let tip = current {
+        guard tip.journal == ancestor.journal,
+              visited.insert(tip.eventID).inserted,
+              let message = messagesByID[tip.eventID],
+              let parent = message.conversationParent else {
+            return false
+        }
+        if parent == ancestor { return true }
+        current = parent
+    }
+    return false
+}
+
 private final class AttachedControllerCheckpointBox: @unchecked Sendable {
     var record: WorkServiceAttachedWorkCheckpointStore.Record?
     var saveCount = 0
@@ -309,6 +336,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
     func snapshotRequestCursors() -> [Int] { snapshotAfterSequences }
     func pageRequestCursors() -> [Int] { pageAfterSequences }
     func historyRequestCount() -> Int { historyRequests.count }
+    func historyRequestBranchTips() -> [EventRef?] { historyRequests.map(\.branchTip) }
     func setHistoryGate(_ gate: AttachedControllerHistoryGate?) { historyGate = gate }
 
     func handshake(_ request: WorkServiceHandshakeRequest) async throws -> WorkServiceHandshakeResponse {
@@ -495,7 +523,9 @@ private actor AttachedControllerTestService: WorkServiceClient {
         let frozen = request.frozenTipCursor ?? tip
         let frozenDigest = prefixDigest(sessionEvents, cursor: frozen)
         guard request.frozenTipDigest == nil || request.frozenTipDigest == frozenDigest,
-              request.branchTip == nil || request.branchTip == reducer.snapshot.semanticTip
+              semanticTipDescends(
+                  from: request.branchTip, to: reducer.snapshot.semanticTip,
+                  messages: reducer.snapshot.messages)
         else { throw AttachedControllerTestError.transport }
         let cutoff = request.beforeCursor?.sequence ?? frozen.sequence + 1
         let candidates = visible.filter {
@@ -534,12 +564,15 @@ private actor AttachedControllerTestService: WorkServiceClient {
         }
         let hasOlder = candidates.count > selected.count
         return WorkServiceHistoryPage(
-            work: try currentDescriptor(), events: selected, target: request.target,
+            authority: try WorkServiceHistoryAuthority(
+                work: fixture.work, journal: fixture.workJournal,
+                hostInstance: fixture.instance, sourceCompleteness: .complete),
+            events: selected, target: request.target,
             lowerBoundaryCursor: canonicalLower, upperBoundaryCursor: canonicalUpper,
             nextBeforeCursor: hasOlder ? canonicalLower : nil, hasOlder: hasOlder,
             frozenTipCursor: frozen, frozenTipDigest: frozenDigest,
             prefixDigest: pageDigest,
-            branchTip: reducer.snapshot.semanticTip,
+            branchTip: request.branchTip,
             omissions: hasOlder
                 ? [WorkServiceOmission(
                     category: "history", count: candidates.count - selected.count)]
@@ -1567,6 +1600,134 @@ func testWorkServiceAttachedControllerPagesHistoryWithoutMovingCanonicalCursors(
     XCTAssertFalse(selectedLatest.hasNewer)
 }
 
+func testWorkServiceAttachedControllerKeepsFrozenAncestorBranchTipAcrossDescendantRefresh()
+    async throws {
+    let fixture = try AttachedControllerFixture(workID: "history-descendant-branch")
+    let service = AttachedControllerTestService(fixture: fixture)
+    let actor = TimelineActor(actorID: "controller-history-descendant", kind: "test")
+    var sessionEvents = Array(fixture.sessionEvents.prefix(2))
+    for index in 0..<1_000 {
+        let previousMessageID = index == 0
+            ? nil : "descendant-history-\(index - 1)"
+        let sequence = sessionEvents.count + 1
+        sessionEvents.append(TimelineEvent(
+            eventID: "descendant-history-\(index)", journal: fixture.sessionJournal,
+            sequence: sequence, hostSequence: sequence,
+            previousEventID: sessionEvents.last?.eventID,
+            conversationParent: previousMessageID.map {
+                EventRef(journal: fixture.sessionJournal, eventID: $0)
+            }, session: fixture.session, work: fixture.work, workHost: fixture.host,
+            client: fixture.client, sessionAttachment: fixture.sessionAttachment,
+            actor: actor, hostRecordedAt: Date(timeIntervalSince1970: TimeInterval(sequence)),
+            type: index.isMultiple(of: 2)
+                ? TimelineEventType.inputAccepted : TimelineEventType.messageCommitted,
+            declaredDomains: [.session],
+            payload: .object([
+                "role": .string(index.isMultiple(of: 2) ? "user" : "assistant"),
+                "text": .string("descendant-\(index)")
+            ])))
+    }
+    let originalTipID = "descendant-history-999"
+    let originalTipSequence = sessionEvents.count + 1
+    sessionEvents.append(TimelineEvent(
+        eventID: "descendant-tip-initial", journal: fixture.sessionJournal,
+        sequence: originalTipSequence, hostSequence: originalTipSequence,
+        previousEventID: sessionEvents.last?.eventID,
+        conversationParent: EventRef(
+            journal: fixture.sessionJournal, eventID: originalTipID),
+        session: fixture.session, work: fixture.work, workHost: fixture.host,
+        client: fixture.client, sessionAttachment: fixture.sessionAttachment,
+        actor: actor, hostRecordedAt: Date(timeIntervalSince1970: TimeInterval(originalTipSequence)),
+        type: TimelineEventType.sessionTipSelected, declaredDomains: [.session]))
+    let originalBranchTip = EventRef(
+        journal: fixture.sessionJournal, eventID: originalTipID)
+    await service.replaceSessionEvents(sessionEvents)
+    let controller = try makeAttachedController(
+        fixture: fixture, service: service, pageLimit: 128)
+
+    let initial: WorkServiceAttachedWorkProjection
+    do {
+        initial = try await controller.refresh()
+    } catch {
+        XCTFail("initial refresh failed: \(error)")
+        throw error
+    }
+    let initialHistory = await controller.conversationHistory()
+    XCTAssertTrue(initial.isCanonical)
+    XCTAssertEqual(initialHistory.branchTip, originalBranchTip)
+    XCTAssertTrue(initialHistory.hasEarlier)
+
+    let firstOlder: WorkServiceConversationHistoryWindow
+    do {
+        firstOlder = try await controller.loadEarlierConversationHistory()
+    } catch {
+        XCTFail("first older page failed: \(error)")
+        throw error
+    }
+    XCTAssertTrue(firstOlder.hasEarlier)
+    XCTAssertEqual(firstOlder.branchTip, originalBranchTip)
+
+    let prior = sessionEvents.last!
+    let descendantID = "descendant-history-1000"
+    let descendantSequence = prior.sequence + 1
+    sessionEvents.append(TimelineEvent(
+        eventID: descendantID, journal: fixture.sessionJournal,
+        sequence: descendantSequence, hostSequence: descendantSequence,
+        previousEventID: prior.eventID,
+        conversationParent: EventRef(
+            journal: fixture.sessionJournal, eventID: originalTipID),
+        session: fixture.session, work: fixture.work, workHost: fixture.host,
+        client: fixture.client, sessionAttachment: fixture.sessionAttachment,
+        actor: actor, hostRecordedAt: Date(timeIntervalSince1970: TimeInterval(descendantSequence)),
+        type: TimelineEventType.messageCommitted, declaredDomains: [.session],
+        payload: .object([
+            "role": .string("assistant"), "text": .string("descendant-1000")
+        ])))
+    let tipSequence = descendantSequence + 1
+    sessionEvents.append(TimelineEvent(
+        eventID: "descendant-tip-selected", journal: fixture.sessionJournal,
+        sequence: tipSequence, hostSequence: tipSequence,
+        previousEventID: descendantID,
+        conversationParent: EventRef(
+            journal: fixture.sessionJournal, eventID: descendantID),
+        session: fixture.session, work: fixture.work, workHost: fixture.host,
+        client: fixture.client, sessionAttachment: fixture.sessionAttachment,
+        actor: actor, hostRecordedAt: Date(timeIntervalSince1970: TimeInterval(tipSequence)),
+        type: TimelineEventType.sessionTipSelected, declaredDomains: [.session]))
+    await service.replaceSessionEvents(sessionEvents)
+
+    let refreshed: WorkServiceAttachedWorkProjection
+    do {
+        refreshed = try await controller.refresh()
+    } catch {
+        XCTFail("descendant refresh failed: \(error)")
+        throw error
+    }
+    let browsing = await controller.conversationHistory()
+    XCTAssertTrue(refreshed.isCanonical)
+    XCTAssertTrue(browsing.hasNewer)
+    XCTAssertEqual(browsing.status, .ready)
+    XCTAssertEqual(browsing.branchTip, originalBranchTip)
+
+    let secondOlder: WorkServiceConversationHistoryWindow
+    do {
+        secondOlder = try await controller.loadEarlierConversationHistory()
+    } catch {
+        XCTFail("second older page failed: \(error)")
+        throw error
+    }
+    XCTAssertEqual(secondOlder.status, .ready)
+    XCTAssertTrue(secondOlder.hasNewer)
+    XCTAssertEqual(secondOlder.branchTip, originalBranchTip)
+    XCTAssertTrue(secondOlder.messages.count > 0)
+    XCTAssertTrue(
+        (secondOlder.messages.first?.sourceCursor?.sequence ?? Int.max)
+            < (firstOlder.messages.first?.sourceCursor?.sequence ?? Int.max))
+    let requestBranchTips = await service.historyRequestBranchTips()
+    XCTAssertEqual(requestBranchTips.count, 2)
+    XCTAssertTrue(requestBranchTips.allSatisfy { $0 == originalBranchTip })
+}
+
 func testWorkServiceAttachedControllerAcknowledgesWorkAndSessionWithExactControlChain() async throws {
     let fixture = try AttachedControllerFixture()
     let service = AttachedControllerTestService(fixture: fixture)
@@ -2026,6 +2187,9 @@ let casesWorkServiceAttachedWorkController: [Case] = [
     }),
     ("phase3 Work controller pages history without moving canonical cursors", {
         try await testWorkServiceAttachedControllerPagesHistoryWithoutMovingCanonicalCursors()
+    }),
+    ("phase3 Work controller keeps frozen ancestor branch across descendant refresh", {
+        try await testWorkServiceAttachedControllerKeepsFrozenAncestorBranchTipAcrossDescendantRefresh()
     }),
     ("phase3 Work controller acknowledges Work and Session with exact control chaining", {
         try await testWorkServiceAttachedControllerAcknowledgesWorkAndSessionWithExactControlChain()

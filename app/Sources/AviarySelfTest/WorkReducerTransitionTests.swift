@@ -307,7 +307,7 @@ func test_workReducerTransitionGuardsLiveHandleTerminalState() {
     XCTAssertTrue(reducer.snapshot.structuralIntegrityValid)
 }
 
-func test_workReducerTransitionKeepsSessionAttachedUntilLastAttachmentDetaches() {
+func test_workReducerTransitionKeepsSessionAttachedAndRejectsDetachedIdentityReuse() {
     let first = SessionAttachmentRef("session-attachment-a")
     let second = SessionAttachmentRef("session-attachment-b")
     let events = [
@@ -337,23 +337,27 @@ func test_workReducerTransitionKeepsSessionAttachedUntilLastAttachmentDetaches()
     XCTAssertEqual(state.activeSessionAttachmentCount(for: transitionTestSession), 1)
     XCTAssertEqual(state.snapshot.attachedSessionIDs, [transitionTestSession.sessionID])
     applyTransition(events[4], to: &state)
-    XCTAssertEqual(state.activeSessionAttachmentCount(for: transitionTestSession), 2)
-    XCTAssertEqual(state.snapshot.attachedSessionIDs, [transitionTestSession.sessionID])
-    applyTransition(events[5], to: &state)
     XCTAssertEqual(state.activeSessionAttachmentCount(for: transitionTestSession), 1)
     XCTAssertEqual(state.snapshot.attachedSessionIDs, [transitionTestSession.sessionID])
-    // Detach the reattached first attachment, leaving no active attachments.
+    XCTAssertEqual(state.snapshot.quarantinedEvents, [events[4]])
+    applyTransition(events[5], to: &state)
+    XCTAssertEqual(state.activeSessionAttachmentCount(for: transitionTestSession), 0)
+    XCTAssertTrue(state.snapshot.attachedSessionIDs.isEmpty)
+    // A detached durable relationship cannot be reactivated or detached again. A caller that
+    // wants to attach the same Session later must mint a new SessionAttachmentRef.
     let finalDetach = transitionTestEvent(TimelineEventType.sessionDetached, id: "attachment-7", sequence: 7,
                                           previous: "attachment-6", work: transitionTestWork, attachment: first)
     applyTransition(finalDetach, to: &state)
     XCTAssertEqual(state.activeSessionAttachmentCount(for: transitionTestSession), 0)
     XCTAssertTrue(state.snapshot.attachedSessionIDs.isEmpty)
-    // A second detach of an already detached attachment is harmless and must not underflow.
+    XCTAssertEqual(state.snapshot.quarantinedEvents, [events[4], finalDetach])
+    // A second detach remains quarantined and must not underflow.
     let repeatedDetach = transitionTestEvent(TimelineEventType.sessionDetached, id: "attachment-8", sequence: 8,
                                              previous: finalDetach.eventID, work: transitionTestWork, attachment: first)
     applyTransition(repeatedDetach, to: &state)
     XCTAssertEqual(state.activeSessionAttachmentCount(for: transitionTestSession), 0)
     XCTAssertTrue(state.snapshot.attachedSessionIDs.isEmpty)
+    XCTAssertEqual(state.snapshot.quarantinedEvents, [events[4], finalDetach, repeatedDetach])
 }
 
 func test_workReducerTransitionSeparatesUnknownAndSemanticQuarantineEvidence() {
@@ -422,8 +426,8 @@ let casesWorkReducerTransition: [Case] = [
     ("phase3 Work transition guards terminal Handle state", {
         test_workReducerTransitionGuardsLiveHandleTerminalState()
     }),
-    ("phase3 Work transition keeps Session attached until the last detach", {
-        test_workReducerTransitionKeepsSessionAttachedUntilLastAttachmentDetaches()
+    ("phase3 Work transition rejects detached Session attachment identity reuse", {
+        test_workReducerTransitionKeepsSessionAttachedAndRejectsDetachedIdentityReuse()
     }),
     ("phase3 Work transition separates unknown and quarantined evidence", {
         test_workReducerTransitionSeparatesUnknownAndSemanticQuarantineEvidence()

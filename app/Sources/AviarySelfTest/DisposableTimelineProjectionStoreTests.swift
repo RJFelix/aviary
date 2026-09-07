@@ -777,8 +777,7 @@ func testDisposableProjectionStoreRejectsWrongJournalSourceCursorAndPrefix() thr
         _ = try store.commit(projectionStoreCommit(
             rows: rows, currentBucket: .init(bucketStart: 1, rows: rows),
             expectedGeneration: first.generation,
-            journal: JournalRef.work(projectionStoreWork, journalID: "foreign-journal"),
-            ))
+            journal: JournalRef.work(projectionStoreWork, journalID: "foreign-journal")))
         XCTFail("a foreign JournalRef must be rejected")
     } catch DisposableTimelineProjectionStore.StoreError.invalidCommit(.wrongJournal) {
         XCTAssertTrue(true)

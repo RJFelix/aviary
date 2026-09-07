@@ -234,23 +234,45 @@ latest labeled, keyboard-reachable, and non-color-dependent. GUI checkpoint sche
 invalidates disposable pre-cursor snapshots; persistent Session exact-state reconstruction now also
 restores the exact message source cursor.
 
-This is a bounded GUI and wire-page claim, not yet an arbitrary-scale storage claim. The journal-
-backed host currently serves reverse pages only while its canonical record cache is resident (up to
-one million records/256 MiB), and that cache still owns a lifetime-sized `SessionReducer` message
-projection. Nonresident reverse reads fail explicitly until a persistent selected-branch message
-index and authenticated sparse reverse anchors exist. Therefore the 100,000-event and O(window)
-resident-memory exit criteria remain open even though ordinary visible history is now incrementally
-pageable. Current focused receipts are history 14 cases / 157 assertions, attached controller 31 /
-288, persistent Session exact state 12 / 1,206, and protocol/daemon handshake 9 / 91. The signed
-release app builds, `just compile` passes, and the uninterrupted integrated suite passes 960 cases /
-13,718 assertions in 422.93 seconds. A scheduler-sensitive launcher fixture discovered by that run
-now waits for the child process's actual exit boundary and passes five consecutive isolated runs plus
-the integrated rerun. The final history fixtures are `conversation-history-fixture.png` (1600x1032,
-`5af49072fd40...86a`) and `conversation-history-narrow-fixture.png` (520x932,
-`570479e722f6...236`), both visually inspected cleanly; the narrow fixture is byte-identical across
-rerenders. Independent high-judgment review found no
-remaining P0/P1 issue after the page-digest, refresh-race, bounded-anchor, protocol-version,
-checkpoint-rollout, stale-retry, and persistent-source-cursor corrections.
+Persistent selected-branch history checkpoint (2026-09-06): nonresident reverse paging no longer
+depends on the journal-backed host's resident record cache or a lifetime `SessionReducer` message
+array. A versioned, private, content-addressed Session index stores metadata and exact canonical JSONL
+row evidence but no message bodies. One advisory-owner lease covers source observation, cold index
+construction or cache validation, bounded parent traversal, canonical range reads, and the final
+source fence. Every returned body is reread from the Session journal and checked against its event,
+Session, physical predecessor, sequence, role, text, branch parent, line, prefix, and source evidence.
+The Work Host independently revalidates current Work, control, client-attachment, and Session-
+relationship authority around that content read; a frozen conversation view never freezes access.
+Alternate attached Sessions derive their own journal and opaque index directory rather than borrowing
+the creation Session's source.
+
+The scale fixture cold-builds 100,000 physical events with 10,000 visible messages using bounded line
+buffers and no lifetime event/body array, then pages through at most `limit + 1` authenticated
+metadata/parent lookups and only the selected canonical line ranges. Cold construction remains an
+explicit O(journal) operation and retained metadata remains O(events/messages); after a Session append,
+proving current relationship authority may currently require one full latest-index rebuild before an
+older frozen page can be served. Failed attempts increment the service history call counter, but a
+late-failing scan cannot yet publish partial event/byte metrics. Disposable index corruption is
+rebuildable from an intact canonical source; source replacement, middle rewrite, unknown Work,
+Session, or Work Host control semantics, relationship disagreement, forged physical predecessors,
+and incomplete/tampered authority fail closed. The cache is not a sandbox: completeness assumes the
+private cooperative builder and owner-lock protocol, and a same-user process deliberately recomputing
+a coherent cache is outside the current trust boundary.
+
+The independent GUI window, race, scroll-anchor, keyboard, and visual-fixture contract above remains
+unchanged. Final independent review found no remaining P0/P1 defect after the authority reread became
+relationship-only, Work comparison was scoped to the requested and creation attachments, and durable
+attachment identities became single-use across detach. The uninterrupted macOS suite passes 984
+cases / 13,985 assertions in 470.59 seconds; the focused history matrix passes 36 cases / 394
+assertions, including the 100,000-event path and authority/race mutants. `just compile` passes and the
+release renderer produced all 9 screens; Live and Sessions were visually inspected cleanly.
+
+A fresh Ubuntu 24.04.4 x86_64 snapshot with Swift 6.0.3 and the complete sibling `runtime-hosts`
+payload builds `aviaryd` and `AviarySelfTest`; Session-history coverage passes 2 cases / 131
+assertions and real-daemon round trips pass 3 cases / 70 assertions. A macOS Swift 6.3.3 client also
+completed a handshake through SSH streamlocal forwarding to that Linux daemon. These are capability
+and transport proofs for the private same-user Unix-socket/SSH path, not a claim of remote principal
+authentication, sandboxing, or hostile-host containment.
 
 Phase 3C closure checkpoint (2026-09-04): accepted and duplicate service commands no longer
 become UI truth on the strength of a transport receipt. The client retains the exact command

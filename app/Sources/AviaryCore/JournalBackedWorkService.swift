@@ -995,6 +995,49 @@ public struct JournalBackedWorkServiceReadMetrics: Codable, Hashable, Sendable {
     }
 }
 
+/// Successful conversation-history costs are deliberately separate from forward journal reads.
+/// `calls` also counts attempts that fail, but the remaining counters are published only when a
+/// reader returns its metrics. A bounded metadata lookup or selected canonical-line read must
+/// never inflate `recordsApplied` and hide an accidental full Session reducer replay.
+public struct JournalBackedWorkServiceHistoryMetrics: Codable, Hashable, Sendable {
+    public let calls: Int
+    public let indexBuilds: Int
+    public let cacheHits: Int
+    public let rebuilds: Int
+    public let decodedPhysicalEvents: Int
+    public let sourceBytesScanned: Int
+    public let peakBufferBytes: Int
+    public let metadataLookups: Int
+    public let parentLinks: Int
+    public let canonicalRangeReads: Int
+    public let canonicalRangeBytes: Int
+    public let mapObjectsRead: Int
+    public let mapBytesRead: Int
+
+    public init(
+        calls: Int = 0, indexBuilds: Int = 0, cacheHits: Int = 0,
+        rebuilds: Int = 0, decodedPhysicalEvents: Int = 0,
+        sourceBytesScanned: Int = 0, peakBufferBytes: Int = 0,
+        metadataLookups: Int = 0, parentLinks: Int = 0,
+        canonicalRangeReads: Int = 0, canonicalRangeBytes: Int = 0,
+        mapObjectsRead: Int = 0, mapBytesRead: Int = 0
+    ) {
+        self.calls = max(0, calls)
+        self.indexBuilds = max(0, indexBuilds)
+        self.cacheHits = max(0, cacheHits)
+        self.rebuilds = max(0, rebuilds)
+        self.decodedPhysicalEvents = max(0, decodedPhysicalEvents)
+        self.sourceBytesScanned = max(0, sourceBytesScanned)
+        self.peakBufferBytes = max(0, peakBufferBytes)
+        self.metadataLookups = max(0, metadataLookups)
+        self.parentLinks = max(0, parentLinks)
+        self.canonicalRangeReads = max(0, canonicalRangeReads)
+        self.canonicalRangeBytes = max(0, canonicalRangeBytes)
+        self.mapObjectsRead = max(0, mapObjectsRead)
+        self.mapBytesRead = max(0, mapBytesRead)
+    }
+}
+
 /// Resolves the immutable canonical admission evidence used by public command receipts.
 /// A Hosted actor saying it admitted work is not enough: the exact client-qualified command
 /// envelope must be present in the reduced Work journal, with an addressable event and host
@@ -1155,6 +1198,11 @@ public actor JournalBackedWorkService: WorkServiceClient {
 
     private var journalCache: [JournalCacheKey: JournalReadCacheEntry] = [:]
     private var readMetrics = JournalBackedWorkServiceReadMetrics()
+    private var historyMetrics = JournalBackedWorkServiceHistoryMetrics()
+    /// Internal deterministic race seam. Production leaves this nil; self-tests use it to
+    /// suspend after the first Session read and prove the second authority pass observes a
+    /// concurrent relationship transition.
+    private var historyAfterInitialReadHook: (@Sendable () async -> Void)?
     /// A durable reservation prevents two processes from minting Runs, while this in-process
     /// task map prevents an actor re-entrant duplicate from observing the winner's pre-assembly
     /// reservation and incorrectly reporting ``sourceIncomplete``.  The key is the complete
@@ -1225,6 +1273,20 @@ public actor JournalBackedWorkService: WorkServiceClient {
     /// only an append suffix rather than rereading the complete journal.
     public func journalReadMetrics() -> JournalBackedWorkServiceReadMetrics {
         readMetrics
+    }
+
+    /// Return conversation-history instrumentation without combining it with the forward
+    /// journal-reader counters. Successful full Session scans remain visible instead of
+    /// disappearing inside a normal descriptor or polling read; a failed scan currently reports
+    /// its attempted call but cannot publish partial byte/event counters.
+    public func historyReadMetrics() -> JournalBackedWorkServiceHistoryMetrics {
+        historyMetrics
+    }
+
+    func installHistoryAfterInitialReadHook(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        historyAfterInitialReadHook = hook
     }
 
     public func handshake(_ request: WorkServiceHandshakeRequest) async throws
@@ -2308,7 +2370,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
     ) async throws -> WorkServiceHistoryPage {
         try await ensureLoaded()
         try validateClient(request.client)
-        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        let control = try await controlSnapshot()
         let attachment = try await requireAttached(
             work: request.work, journal: request.journal, attachment: request.attachment,
             client: request.client, capability: .observe)
@@ -2316,45 +2378,124 @@ public actor JournalBackedWorkService: WorkServiceClient {
             throw WorkServiceProtocolError.invalidRequest(
                 "history paging requires a Session target")
         }
-        try await validateReadableTarget(request.target, attachment: attachment, source: source)
-        let entry = try await records(for: request.target, source: source)
-        guard entry.isFullyResident else {
-            // A sparse resident cache can serve forward reducer pages, but reverse conversation
-            // paging requires branch membership. Until the store has persisted branch anchors,
-            // refusing is more truthful than presenting physical non-message events as chat.
+        guard attachment.session == session,
+              attachment.sessionJournal == journal,
+              let sessionAttachment = attachment.sessionAttachment,
+              journal.owner == .session(session), journal.kind == .session,
+              journal.authority.authorityID == host.workHostID else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
+        let source = try await historyCanonicalWorkSource(
+            work: request.work, journal: request.journal, control: control)
+        let indexDirectory = sessionHistoryIndexDirectory(for: journal)
+        let reader: LocalSessionHistoryProjectionReader
+        do {
+            reader = try LocalSessionHistoryProjectionReader(
+                home: home, session: session, journal: journal,
+                indexDirectory: indexDirectory)
+        } catch {
             throw WorkServiceProtocolError.sourceIncomplete
         }
-        let records = entry.result.records
-        let sessionSnapshot: SessionSnapshot
-        if session == source.session {
-            sessionSnapshot = source.sessionState
-        } else {
-            var reducer = SessionReducer()
-            for record in entry.result.records { reducer.apply(record.event) }
-            sessionSnapshot = reducer.snapshot
+        let result: LocalSessionHistoryProjectionReader.Result
+        incrementHistoryMetrics(calls: 1)
+        do {
+            result = try reader.read(
+                before: request.beforeCursor,
+                frozenTip: request.frozenTipCursor,
+                frozenTipDigest: request.frozenTipDigest,
+                branchTip: request.branchTip,
+                limit: request.limit, maxBytes: request.maxBytes)
+        } catch let error as LocalSessionHistoryProjectionReader.ReaderError {
+            switch error {
+            case .pageCannotProgress(let required, let maximum):
+                throw WorkServiceProtocolError.eventPageCannotProgress(
+                    requiredBytes: required, maximumBytes: maximum)
+            case .pageTooLarge:
+                throw WorkServiceProtocolError.invalidRequest(
+                    "history page bounds are invalid")
+            default:
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+        } catch {
+            throw WorkServiceProtocolError.sourceIncomplete
         }
-        let visibleIDs: Set<String> = Set(sessionSnapshot.messages.compactMap {
-            guard let ref = $0.sourceEvent, ref.journal == journal else { return nil }
-            return ref.eventID
-        })
-        let visible = records.filter { visibleIDs.contains($0.event.eventID) }
-        if let requestedBranchTip = request.branchTip,
-           requestedBranchTip != sessionSnapshot.semanticTip {
-            let actual = entry.lastRecord.map {
-                JournalCursor(journal: journal, eventID: $0.event.eventID,
-                              sequence: $0.event.sequence)
-            } ?? JournalCursor(journal: journal, sequence: 0)
-            throw WorkServiceProtocolError.staleCursor(
-                expected: request.frozenTipCursor ?? JournalCursor(journal: journal, sequence: 0),
-                actual: actual)
+        incrementHistoryMetrics(result.metrics)
+        if let historyAfterInitialReadHook {
+            await historyAfterInitialReadHook()
         }
-        let branchTip = request.branchTip ?? sessionSnapshot.semanticTip
-        return try historyPage(
-            entry: entry, records: records, visible: visible, target: request.target,
-            before: request.beforeCursor, frozenTip: request.frozenTipCursor,
-            frozenDigest: request.frozenTipDigest, branchTip: branchTip,
-            journal: journal, work: try await descriptor(for: request.work, client: request.client),
-            limit: request.limit, maxBytes: request.maxBytes)
+        let relationshipIsCanonical = try await historyRelationshipIsCanonical(
+            work: request.work, session: session, journal: journal,
+            sessionAttachment: sessionAttachment,
+            relationshipEvents: result.relationshipEvents,
+            source: source, control: control)
+        guard relationshipIsCanonical else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        // Work and Session relationship facts live in independent append-only journals. Take a
+        // second bounded pass after every source used by the first validation has returned. A
+        // SessionAttachment identity is terminal once detached, so equal attached projections
+        // on both passes are ABA-proof: there was an interval in which the requested Session,
+        // the creation Session, and Work authority all overlapped. Content-only Session appends
+        // remain valid and do not perturb this relationship projection.
+        let latestSource = try await historyCanonicalWorkSource(
+            work: request.work, journal: request.journal, control: control)
+        let authorityAttachmentIDs = Set([
+            sessionAttachment.attachmentID,
+            source.registration.reservation.sessionAttachment.attachmentID,
+        ])
+        guard authorityAttachmentIDs.allSatisfy({ attachmentID in
+            latestSource.workState.sessionAttachments[attachmentID]
+                == source.workState.sessionAttachments[attachmentID]
+        }) else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let latestRelationship: LocalSessionHistoryProjectionReader.RelationshipAuthorityResult
+        do {
+            latestRelationship = try reader.readCurrentRelationshipAuthority()
+        } catch {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        incrementHistoryMetrics(latestRelationship.metrics)
+        guard try await historyRelationshipIsCanonical(
+                work: request.work, session: session, journal: journal,
+                sessionAttachment: sessionAttachment,
+                relationshipEvents: latestRelationship.relationshipEvents,
+                source: latestSource, control: control) else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        // Every source/registry call above may suspend this actor. Re-read the bounded control
+        // facts last and perform the final authorization check synchronously, so a detach,
+        // capability revocation, registration conflict, or replacement Session publication
+        // cannot race an already-started history read and receive bytes afterward.
+        let finalControl = try await controlSnapshot()
+        guard historyFinalControlIsAuthorized(
+              finalControl, initialControl: control, request: request,
+              session: session, journal: journal,
+              sessionAttachment: sessionAttachment, registration: source.registration) else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
+        let frozen = result.source.physicalCursor
+        let upper = result.events.last.map {
+            JournalCursor(journal: journal, eventID: $0.eventID, sequence: $0.sequence)
+        }
+        let lower = result.events.first.map {
+            JournalCursor(journal: journal, eventID: $0.eventID, sequence: $0.sequence)
+        }
+        let pageDigest = try WorkServiceHistoryPageEvidence.digest(
+            events: result.events, target: request.target, cursor: upper ?? frozen)
+        let omissions = result.hasOlder ? [WorkServiceOmission(
+            category: "history", count: 1,
+            diagnostic: "older selected-branch messages remain")] : []
+        return WorkServiceHistoryPage(
+            authority: try WorkServiceHistoryAuthority(
+                work: request.work, journal: request.journal,
+                hostInstance: hostInstance, sourceCompleteness: .complete),
+            events: result.events, target: request.target,
+            lowerBoundaryCursor: lower, upperBoundaryCursor: upper,
+            nextBeforeCursor: result.nextBeforeCursor, hasOlder: result.hasOlder,
+            frozenTipCursor: frozen, frozenTipDigest: result.source.wirePrefixDigest,
+            prefixDigest: pageDigest, branchTip: result.semanticTip,
+            omissions: omissions)
     }
 
     public func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws
@@ -2808,6 +2949,27 @@ public actor JournalBackedWorkService: WorkServiceClient {
             } else {
                 .rejected
             }
+            let rejectionProjection: (WorkServiceCommandRejection?, String?) =
+                switch result.receipt.admission {
+                case .accepted:
+                    (nil, nil)
+                case .rejected(_, reason: .causalConflict):
+                    // Native admission rejected the caller's exact Work cursor before writing
+                    // any command fact. Preserve that retry-safe result at the service boundary
+                    // instead of collapsing it into an unrelated lifecycle refusal.
+                    (.staleCursor, "Hosted Work rejected a stale causal Work cursor.")
+                case .rejected(_, reason: .journalUnavailable):
+                    (.sourceIncomplete, "Hosted Work could not durably admit the command.")
+                case .rejected(_, reason: .emptyInput),
+                        .rejected(_, reason: .invalidActor):
+                    (.malformedRequest, "Hosted Work rejected malformed command input.")
+                case .rejected(_, reason: .unsupportedCommand),
+                        .rejected(_, reason: .unsupportedCancellation):
+                    (.invalidState, "Hosted Work does not support the requested command here.")
+                case .rejected(_, reason: .invalidState(_, let controllerState)):
+                    (.invalidState,
+                     "Hosted Work refused the command while \(controllerState.rawValue).")
+                }
             let outcome = result.receipt.wasAdmitted ? commandOutcome(request.kind) : nil
             let latest = try await canonicalSource(
                 work: request.work, journal: request.journal,
@@ -2829,8 +2991,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 // later duplicate retries must therefore expose the same immutable cursor.
                 resultingWorkCursor: exactEvidence?.cursor ?? latest.workCursor,
                 authorization: attachment.authorization, outcome: outcome,
-                rejection: state == .rejected ? .invalidState : nil,
-                diagnostic: result.receipt.delivery.detail)
+                rejection: rejectionProjection.0,
+                diagnostic: result.receipt.delivery.detail ?? rejectionProjection.1)
         } catch let error as HostedInHouseWorkError {
             throw WorkServiceProtocolError.invalidRequest(error.localizedDescription)
         }
@@ -2856,24 +3018,45 @@ public actor JournalBackedWorkService: WorkServiceClient {
             $0.reservation.work.workID < $1.reservation.work.workID
         }) {
             let reservation = creation.reservation
-            let verified = await controlJournal.verifiedCreationProjection(
-                client: reservation.client, commandID: reservation.command.commandID)
-            guard verified.verification.isVerified,
-                  let registration = verified.projection?.registration else {
+            guard let registration = creation.registration, !creation.isConflicted else {
                 let disposition: JournalBackedWorkRecoveryDisposition =
                     creation.registration == nil ? .unavailable : .corrupt
                 result.append(JournalBackedWorkRecoveryEntry(
                     work: reservation.work, journal: creation.registration?.workJournal,
-                    disposition: disposition, sourcePresence: verified.verification.sourcePresence,
-                    failure: verified.verification.failure,
+                    disposition: disposition, sourcePresence: .notObserved,
+                    failure: creation.isConflicted ? .creationConflicted : .registrationMissing,
                     hostInstance: hostInstance,
                     diagnostic: "creation source verification did not produce a reconstructable pair"))
                 continue
             }
             do {
-                let source = try await canonicalSource(
+                let source = try await historyCanonicalWorkSource(
                     work: reservation.work, journal: registration.workJournal,
-                    registration: registration)
+                    control: control)
+                let sessionReader = try LocalSessionHistoryProjectionReader(
+                    home: home, session: reservation.session,
+                    journal: registration.sessionJournal,
+                    indexDirectory: sessionHistoryIndexDirectory(
+                        for: registration.sessionJournal),
+                    limits: .init(maximumPageBytes: 1 * 1_024 * 1_024))
+                incrementHistoryMetrics(calls: 1)
+                let sessionObservation = try sessionReader.read(
+                    limit: 1, maxBytes: 1 * 1_024 * 1_024)
+                incrementHistoryMetrics(sessionObservation.metrics)
+                guard source.workState.sessionAttachments[
+                    reservation.sessionAttachment.attachmentID].map({
+                        $0.attachment == reservation.sessionAttachment
+                            && $0.session == reservation.session && $0.isAttached
+                    }) == true,
+                    currentHistorySessionRelationshipIsAttached(
+                        sessionObservation.relationshipEvents,
+                        session: reservation.session, work: reservation.work,
+                        attachment: reservation.sessionAttachment),
+                    primaryHistoryRelationshipIsCanonical(
+                    relationshipEvents: sessionObservation.relationshipEvents,
+                    source: source) else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
                 // Recovery classification is a fresh observation. The in-memory manifest cache
                 // is useful for routing only; it is never enough to call an idle Work
                 // reconstructable after a store loss, deletion, or tamper event.
@@ -2936,12 +3119,13 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 result.append(JournalBackedWorkRecoveryEntry(
                     work: reservation.work, journal: registration.workJournal,
                     disposition: disposition, workCursor: source.workCursor,
-                    sessionCursor: source.sessionCursor, sourcePresence: .verified,
+                    sessionCursor: sessionObservation.source.physicalCursor,
+                    sourcePresence: .verified,
                     hostInstance: host, diagnostic: nil))
             } catch {
                 result.append(JournalBackedWorkRecoveryEntry(
                     work: reservation.work, journal: registration.workJournal,
-                    disposition: .corrupt, sourcePresence: .verified,
+                    disposition: .corrupt, sourcePresence: .unverified,
                     hostInstance: hostInstance, diagnostic: "canonical source read failed"))
             }
         }
@@ -2972,6 +3156,556 @@ public actor JournalBackedWorkService: WorkServiceClient {
         var boundedSessionRecords: [TimelineJournalRecord] {
             sessionRead.records.isEmpty ? sessionCache.prefixRecords : sessionRead.records
         }
+    }
+
+    /// History needs current Work/relationship authority, but not the creation Session's full
+    /// transcript. Keeping this projection separate prevents a reverse-page request for one
+    /// attached Session from replaying another Session into an unbounded message array.
+    private struct HistoryCanonicalWorkSource: Sendable {
+        let registration: WorkHostControlWorkRegistration
+        let workCache: JournalReadCacheEntry
+        let workState: WorkSnapshot
+        let workCursor: JournalCursor
+    }
+
+    private func historyCanonicalWorkSource(
+        work: WorkRef,
+        journal: JournalRef,
+        control: WorkHostControlSnapshot
+    ) async throws -> HistoryCanonicalWorkSource {
+        let matchingCreations = control.creations.values.filter {
+            $0.reservation.work == work && $0.registration?.workJournal == journal
+        }
+        guard control.structuralIntegrityValid, control.semanticProjectionValid,
+              control.unknownEvents.isEmpty,
+              control.workHost == host,
+              matchingCreations.count == 1,
+              let creation = matchingCreations.first, !creation.isConflicted,
+              let registration = creation.registration,
+              registration.reservation == creation.reservation,
+              registration.reservation.work == work,
+              registration.workJournal == journal,
+              journal.owner == .work(work), journal.kind == .work,
+              journal.authority.authorityID == host.workHostID,
+              registration.sessionJournal.owner == .session(
+                registration.reservation.session),
+              registration.sessionJournal.kind == .session,
+              registration.sessionJournal.authority.authorityID == host.workHostID else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let activeObservation = try await liveObservationIfActive(work: work, supplied: nil)
+        let cache: JournalReadCacheEntry
+        if let activeObservation {
+            guard activeObservation.workOnly.journal == journal else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            cache = try journalCacheEntry(from: activeObservation.workOnly, work: work)
+        } else {
+            cache = try readJournal(
+                journal, expectedURL: home.timelineV2WorkJournalURL(work))
+        }
+        guard cache.result.quarantinedSuffix == nil,
+              cache.result.truncatedTail == nil,
+              let state = cache.workSnapshot,
+              state.structuralIntegrityValid, state.semanticProjectionValid,
+              state.unknownDomains.isDisjoint(with: [.work, .session]),
+              state.work == work, state.workHost == host, state.journal == journal,
+              let last = cache.lastRecord?.event else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+
+        // The control registration alone is never source proof. Authenticate the exact bounded
+        // creation prefix against the current Work journal and require its original Session
+        // relationship before allowing an unrelated history index to be opened.
+        let prefix = cache.result.records.isEmpty
+            ? cache.prefixRecords : cache.result.records
+        guard registration.workGenesisCursor.journal == journal,
+              registration.workGenesisCursor.sequence > 0,
+              let registeredIndex = prefix.firstIndex(where: {
+                $0.event.sequence == registration.workGenesisCursor.sequence
+                    && $0.event.eventID == registration.workGenesisCursor.eventID
+              }) else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        var genesisReducer = WorkReducer()
+        for record in prefix[...registeredIndex] { genesisReducer.apply(record.event) }
+        let genesis = genesisReducer.snapshot
+        guard genesis.structuralIntegrityValid, genesis.semanticProjectionValid,
+              genesis.work == work, genesis.workHost == host, genesis.journal == journal,
+              genesis.sessionAttachments[
+                registration.reservation.sessionAttachment.attachmentID].map({
+                    $0.attachment == registration.reservation.sessionAttachment
+                        && $0.session == registration.reservation.session
+                        && $0.isAttached
+                }) == true else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return HistoryCanonicalWorkSource(
+            registration: registration, workCache: cache, workState: state,
+            workCursor: JournalCursor(
+                journal: journal, eventID: last.eventID, sequence: last.sequence))
+    }
+
+    private func historyRelationshipIsCanonical(
+        work: WorkRef,
+        session: SessionRef,
+        journal: JournalRef,
+        sessionAttachment: SessionAttachmentRef,
+        relationshipEvents: [TimelineEvent],
+        source: HistoryCanonicalWorkSource,
+        control: WorkHostControlSnapshot
+    ) async throws -> Bool {
+        let reservation = source.registration.reservation
+        guard currentHistorySessionRelationshipIsAttached(
+            relationshipEvents, session: session, work: work,
+            attachment: sessionAttachment) else {
+            return false
+        }
+        if session == reservation.session,
+           journal == source.registration.sessionJournal,
+           sessionAttachment == reservation.sessionAttachment {
+            return source.workState.sessionAttachments[
+                sessionAttachment.attachmentID].map({
+                    $0.attachment == sessionAttachment && $0.session == session
+                        && $0.isAttached
+                }) == true
+                && primaryHistoryRelationshipIsCanonical(
+                    relationshipEvents: relationshipEvents, source: source)
+        }
+
+        // An alternate Session cannot substitute for the registered creation pair. Authenticate
+        // that fixed pair through its own metadata-only index before validating the requested
+        // Session publication below.
+        let primaryReader = try LocalSessionHistoryProjectionReader(
+            home: home, session: reservation.session,
+            journal: source.registration.sessionJournal,
+            indexDirectory: sessionHistoryIndexDirectory(
+                for: source.registration.sessionJournal))
+        let primary = try primaryReader.readCurrentRelationshipAuthority()
+        incrementHistoryMetrics(primary.metrics)
+        guard currentHistorySessionRelationshipIsAttached(
+                primary.relationshipEvents,
+                session: reservation.session, work: reservation.work,
+                attachment: reservation.sessionAttachment),
+              primaryHistoryRelationshipIsCanonical(
+                relationshipEvents: primary.relationshipEvents, source: source),
+              source.workState.sessionAttachments[
+                reservation.sessionAttachment.attachmentID].map({
+                    $0.attachment == reservation.sessionAttachment
+                        && $0.session == reservation.session && $0.isAttached
+                }) == true else {
+            return false
+        }
+
+        let candidates = control.sessionCreations.values.filter {
+            !$0.isConflicted && $0.reservation.work == work
+                && $0.reservation.session == session
+                && $0.reservation.sessionJournal == journal
+                && $0.reservation.sessionAttachment == sessionAttachment
+        }
+        guard candidates.count == 1, let creation = candidates.first,
+              let publication = creation.result,
+              publication.publication == "mirrored"
+                || publication.publication == "terminal_reference",
+              publication.causalWorkCursor == creation.reservation.causalWorkCursor,
+              publication.causalSessionCursor.journal == journal,
+              publication.causalSessionCursor.sequence == 0,
+              publication.causalSessionCursor.eventID == nil,
+              publication.sessionCursor.journal == journal,
+              publication.sessionCreatedEvent.journal == journal,
+              publication.sessionAttachedEvent.journal == journal,
+              publication.cursorAdvancedEvent.journal == journal,
+              let created = relationshipEvent(
+                publication.sessionCreatedEvent, in: relationshipEvents),
+              let attached = relationshipEvent(
+                publication.sessionAttachedEvent, in: relationshipEvents),
+              let advanced = relationshipEvent(
+                publication.cursorAdvancedEvent, in: relationshipEvents),
+              created.type == TimelineEventType.sessionCreated,
+              created.sequence == 1, created.previousEventID == nil,
+              created.session == session, created.work == nil,
+              created.workHost == nil, created.client == nil,
+              created.sessionAttachment == nil, created.causedByEventID == nil,
+              attached.type == TimelineEventType.sessionAttached,
+              attached.sequence == 2,
+              attached.previousEventID == created.eventID,
+              attached.session == session, attached.work == work,
+              attached.workHost == host,
+              attached.client == creation.reservation.client,
+              attached.sessionAttachment == sessionAttachment,
+              attached.causedByEventID == EventRef(
+                journal: journal, eventID: created.eventID),
+              historyCapabilities(in: attached) == publication.capabilities.sorted(),
+              advanced.type == TimelineEventType.sessionAttachmentCursorAdvanced,
+              advanced.sequence == 3,
+              advanced.previousEventID == attached.eventID,
+              advanced.session == session, advanced.work == work,
+              advanced.workHost == host,
+              advanced.client == creation.reservation.client,
+              advanced.sessionAttachment == sessionAttachment,
+              historyCapabilities(in: advanced) == publication.capabilities.sorted(),
+              historyRecordedWorkCursor(in: advanced) == publication.resultingWorkCursor,
+              publication.sessionCursor == JournalCursor(
+                journal: journal, eventID: advanced.eventID,
+                sequence: advanced.sequence) else {
+            return false
+        }
+        let publicationCommand = CommandRef(
+            commandID: creation.reservation.command.commandID,
+            client: creation.reservation.client,
+            sessionAttachment: sessionAttachment,
+            causalCursor: publication.causalWorkCursor)
+        guard historyProducerEnvelope(
+                created, idempotencyKey: publicationCommand.commandID,
+                command: publicationCommand, declaredDomains: [.session]),
+              created.hostSequence.map({ $0 > 0 }) == true,
+              created.payload == .object([:]),
+              historyProducerEnvelope(
+                attached, idempotencyKey: publicationCommand.commandID,
+                command: publicationCommand, declaredDomains: [.session, .work]),
+              attached.hostSequence == created.hostSequence.map({ $0 + 1 }),
+              attached.actor == created.actor,
+              attached.payload == historyCapabilitiesPayload(publication.capabilities),
+              historyProducerEnvelope(
+                advanced, idempotencyKey: publicationCommand.commandID,
+                command: publicationCommand, declaredDomains: [.session, .work]),
+              advanced.actor == created.actor,
+              advanced.payload == historyCursorPayload(
+                publication.resultingWorkCursor,
+                capabilities: publication.capabilities) else {
+            return false
+        }
+
+        if publication.publication == "mirrored" {
+            guard source.workState.sessionAttachments[
+                    sessionAttachment.attachmentID].map({
+                        $0.attachment == sessionAttachment && $0.session == session
+                            && $0.isAttached
+                    }) == true,
+                  let mirrorRef = publication.workMirrorEvent,
+                  mirrorRef.journal == source.registration.workJournal,
+                  publication.resultingWorkCursor.journal == mirrorRef.journal,
+                  publication.resultingWorkCursor.eventID == mirrorRef.eventID,
+                  let mirror = try await exactWorkEvent(
+                    at: publication.resultingWorkCursor,
+                    after: publication.causalWorkCursor, source: source),
+                  mirror.eventID == mirrorRef.eventID,
+                  mirror.type == TimelineEventType.sessionAttached,
+                  mirror.session == session, mirror.work == work,
+                  mirror.workHost == host,
+                  mirror.client == creation.reservation.client,
+                  mirror.sessionAttachment == sessionAttachment,
+                  mirror.causedByEventID == EventRef(
+                    journal: journal, eventID: attached.eventID),
+                  historyCapabilities(in: mirror) == publication.capabilities.sorted(),
+                  historyProducerEnvelope(
+                    mirror, idempotencyKey: publicationCommand.commandID,
+                    command: publicationCommand, declaredDomains: [.work, .session]),
+                  mirror.actor == created.actor,
+                  mirror.hostSequence == attached.hostSequence.map({ $0 + 1 }),
+                  mirror.payload == historyCapabilitiesPayload(publication.capabilities),
+                  advanced.hostSequence == mirror.hostSequence.map({ $0 + 1 }),
+                  advanced.causedByEventID == mirrorRef else {
+                return false
+            }
+        } else {
+            guard publication.workMirrorEvent == nil,
+                  publication.resultingWorkCursor == publication.causalWorkCursor,
+                  source.workCursor == publication.causalWorkCursor,
+                  let terminal = source.workCache.lastRecord?.event,
+                  [TimelineEventType.workCompleted, TimelineEventType.workDestroyed,
+                   TimelineEventType.workFailed].contains(terminal.type),
+                  JournalCursor(
+                    journal: source.registration.workJournal,
+                    eventID: terminal.eventID, sequence: terminal.sequence)
+                    == publication.causalWorkCursor,
+                  advanced.causedByEventID == EventRef(
+                    journal: source.registration.workJournal,
+                    eventID: terminal.eventID),
+                  advanced.hostSequence == attached.hostSequence.map({ $0 + 1 }) else {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Resolve the current known attach/detach state from canonical rows reread under the
+    /// history reader's latest source lease. The immutable creation row proves provenance; this
+    /// latest transition prevents a later Session detach from leaving that old proof usable.
+    private func currentHistorySessionRelationshipIsAttached(
+        _ events: [TimelineEvent],
+        session: SessionRef,
+        work: WorkRef,
+        attachment: SessionAttachmentRef
+    ) -> Bool {
+        let latest = events.filter {
+            $0.session == session && $0.sessionAttachment == attachment
+                && ($0.type == TimelineEventType.sessionAttached
+                    || $0.type == TimelineEventType.sessionDetached)
+        }.max { $0.sequence < $1.sequence }
+        guard let latest, latest.type == TimelineEventType.sessionAttached,
+              latest.work == work else {
+            return false
+        }
+        return true
+    }
+
+    private func historyFinalControlIsAuthorized(
+        _ final: WorkHostControlSnapshot,
+        initialControl: WorkHostControlSnapshot,
+        request: WorkServiceHistoryRequest,
+        session: SessionRef,
+        journal: JournalRef,
+        sessionAttachment: SessionAttachmentRef,
+        registration: WorkHostControlWorkRegistration
+    ) -> Bool {
+        guard final.structuralIntegrityValid, final.semanticProjectionValid,
+              final.unknownEvents.isEmpty,
+              final.workHost == host,
+              let clientAttachment = final.clientAttachments[
+                request.attachment.attachmentID],
+              clientAttachment.attachment == request.attachment,
+              clientAttachment.work == request.work,
+              clientAttachment.workJournal == request.journal,
+              clientAttachment.client == request.client,
+              clientAttachment.session == session,
+              clientAttachment.sessionJournal == journal,
+              clientAttachment.sessionAttachment == sessionAttachment,
+              clientAttachment.isAttached,
+              clientAttachment.capabilities.contains(
+                WorkServiceCapability.observe.rawValue) else {
+            return false
+        }
+        let finalCreations = final.creations.values.filter {
+            $0.reservation.work == request.work
+                && $0.registration?.workJournal == request.journal
+                && !$0.isConflicted && $0.registration == registration
+        }
+        guard finalCreations.count == 1 else { return false }
+
+        let reservation = registration.reservation
+        if session == reservation.session,
+           journal == registration.sessionJournal,
+           sessionAttachment == reservation.sessionAttachment {
+            return true
+        }
+        func selectedCreation(
+            _ control: WorkHostControlSnapshot
+        ) -> WorkHostControlSessionCreationSnapshot? {
+            let values = control.sessionCreations.values.filter {
+                !$0.isConflicted && $0.abort == nil
+                    && $0.reservation.work == request.work
+                    && $0.reservation.session == session
+                    && $0.reservation.sessionJournal == journal
+                    && $0.reservation.sessionAttachment == sessionAttachment
+            }
+            return values.count == 1 ? values[0] : nil
+        }
+        guard let initial = selectedCreation(initialControl),
+              let current = selectedCreation(final), current == initial else {
+            return false
+        }
+        return true
+    }
+
+    private func primaryHistoryRelationshipIsCanonical(
+        relationshipEvents: [TimelineEvent],
+        source: HistoryCanonicalWorkSource
+    ) -> Bool {
+        let registration = source.registration
+        let reservation = registration.reservation
+        guard registration.sessionGenesisCursor.journal == registration.sessionJournal,
+              registration.sessionGenesisCursor.sequence == 2,
+              let attachedID = registration.sessionGenesisCursor.eventID,
+              let attached = relationshipEvent(
+                EventRef(journal: registration.sessionJournal, eventID: attachedID),
+                in: relationshipEvents),
+              let created = relationshipEvents.first(where: {
+                  $0.type == TimelineEventType.sessionCreated && $0.sequence == 1
+              }),
+              created.previousEventID == nil,
+              created.session == reservation.session, created.work == nil,
+              created.workHost == nil, created.client == nil,
+              created.sessionAttachment == nil, created.causedByEventID == nil,
+              JournalCursor(
+                journal: attached.journal, eventID: attached.eventID,
+                sequence: attached.sequence) == registration.sessionGenesisCursor,
+              attached.type == TimelineEventType.sessionAttached,
+              attached.previousEventID == created.eventID,
+              attached.session == reservation.session,
+              attached.work == reservation.work,
+              attached.workHost == nil, attached.client == nil,
+              attached.sessionAttachment == reservation.sessionAttachment,
+              attached.causedByEventID == nil,
+              historyCapabilities(in: attached) == [],
+              registration.workGenesisCursor.journal == registration.workJournal,
+              registration.workGenesisCursor.sequence == 2,
+              source.workCache.prefixRecords.count >= 2 else {
+            return false
+        }
+        let workCreated = source.workCache.prefixRecords[0].event
+        let workAttached = source.workCache.prefixRecords[1].event
+        let valid = historyProducerEnvelope(
+                created, idempotencyKey: nil, command: nil,
+                declaredDomains: [.session])
+            && created.hostSequence == 1 && created.payload == .object([:])
+            && historyProducerEnvelope(
+                attached, idempotencyKey: nil, command: nil,
+                declaredDomains: [.session, .work])
+            && attached.actor == created.actor && attached.hostSequence == 3
+            && attached.payload == historyCapabilitiesPayload([])
+            && workCreated.type == TimelineEventType.workCreated
+            && workCreated.sequence == 1 && workCreated.previousEventID == nil
+            && workCreated.work == reservation.work && workCreated.workHost == host
+            && workCreated.session == nil && workCreated.sessionAttachment == nil
+            && workCreated.causedByEventID == nil && workCreated.client == nil
+            && historyProducerEnvelope(
+                workCreated, idempotencyKey: nil, command: nil,
+                declaredDomains: [.work])
+            && workCreated.actor == created.actor && workCreated.hostSequence == 2
+            && workCreated.payload == .object([:])
+            && workAttached.type == TimelineEventType.sessionAttached
+            && workAttached.sequence == 2
+            && workAttached.previousEventID == workCreated.eventID
+            && workAttached.work == reservation.work
+            && workAttached.workHost == host
+            && workAttached.session == reservation.session
+            && workAttached.client == nil
+            && workAttached.sessionAttachment == reservation.sessionAttachment
+            && workAttached.causedByEventID == EventRef(
+                journal: attached.journal, eventID: attached.eventID)
+            && historyCapabilities(in: workAttached) == []
+            && historyProducerEnvelope(
+                workAttached, idempotencyKey: nil, command: nil,
+                declaredDomains: [.work, .session])
+            && workAttached.actor == created.actor && workAttached.hostSequence == 4
+            && workAttached.payload == historyCapabilitiesPayload([])
+            && registration.workGenesisCursor == JournalCursor(
+                journal: registration.workJournal,
+                eventID: workAttached.eventID, sequence: workAttached.sequence)
+        return valid
+    }
+
+    private func relationshipEvent(
+        _ reference: EventRef,
+        in events: [TimelineEvent]
+    ) -> TimelineEvent? {
+        let matching = events.filter {
+            $0.journal == reference.journal && $0.eventID == reference.eventID
+        }
+        return matching.count == 1 ? matching[0] : nil
+    }
+
+    private func exactWorkEvent(
+        at cursor: JournalCursor,
+        after predecessor: JournalCursor,
+        source: HistoryCanonicalWorkSource
+    ) async throws -> TimelineEvent? {
+        guard cursor.journal == source.registration.workJournal,
+              predecessor.journal == cursor.journal,
+              cursor.sequence == predecessor.sequence + 1 else { return nil }
+        if source.workCache.isFullyResident,
+           (predecessor.sequence == 0
+                ? predecessor.eventID == nil
+                : source.workCache.sequenceToIndex[predecessor.sequence].flatMap({ index in
+                    index < source.workCache.result.records.count
+                        ? source.workCache.result.records[index].event.eventID : nil
+                }) == predecessor.eventID),
+           let index = source.workCache.sequenceToIndex[cursor.sequence],
+           index < source.workCache.result.records.count {
+            let event = source.workCache.result.records[index].event
+            return event.eventID == cursor.eventID
+                    && event.sequence == cursor.sequence
+                    && event.previousEventID == predecessor.eventID
+                ? event : nil
+        }
+        let page: Page
+        do {
+            page = try await self.page(
+                entry: source.workCache, journal: source.registration.workJournal,
+                expectedURL: home.timelineV2WorkJournalURL(
+                    source.registration.reservation.work),
+                after: predecessor,
+                target: .work(journal: source.registration.workJournal),
+                limit: 1, maxBytes: WorkServiceBounds.maxEventPageBytes)
+        } catch WorkServiceProtocolError.staleCursor {
+            // This cursor comes from durable relationship evidence rather than the caller's
+            // paging position. A fabricated predecessor means the relationship projection is
+            // incomplete; it is not a useful stale-cursor repair instruction for the GUI.
+            return nil
+        }
+        guard page.events.count == 1, let event = page.events.first,
+              event.eventID == cursor.eventID, event.sequence == cursor.sequence,
+              event.previousEventID == predecessor.eventID else {
+            return nil
+        }
+        return event
+    }
+
+    private func historyCapabilities(in event: TimelineEvent) -> [String]? {
+        guard let values = event.payload["capabilities"]?.arrayValue else { return nil }
+        let result = values.compactMap(\.stringValue)
+        return result.count == values.count ? result.sorted() : nil
+    }
+
+    private func historyRecordedWorkCursor(in event: TimelineEvent) -> JournalCursor? {
+        event.payload["cursor"].flatMap { decodeTimelineValue($0) }
+    }
+
+    private func historyProducerEnvelope(
+        _ event: TimelineEvent,
+        idempotencyKey: String?,
+        command: CommandRef?,
+        declaredDomains: Set<TimelineDomain>
+    ) -> Bool {
+        event.schemaVersion == TimelineEvent.currentSchemaVersion
+            && event.payloadVersion == 1
+            && event.provenance == .native
+            && event.idempotencyKey == idempotencyKey
+            && event.command == command
+            && event.parentActivityID == nil
+            && event.conversationParent == nil
+            && event.clientAttachment == nil
+            && event.run == nil
+            && event.turn == nil
+            && event.action == nil
+            && event.handle == nil
+            && event.clientTimestamp == nil
+            && event.omittedEvidenceLinkCount == nil
+            && event.links.isEmpty
+            && event.declaredDomains == declaredDomains
+    }
+
+    private func historyCapabilitiesPayload(_ capabilities: [String]) -> JSONValue {
+        .object([
+            "capabilities": .array(capabilities.sorted().map(JSONValue.string))
+        ])
+    }
+
+    private func historyCursorPayload(
+        _ cursor: JournalCursor, capabilities: [String]
+    ) -> JSONValue {
+        .object([
+            "capabilities": .array(capabilities.sorted().map(JSONValue.string)),
+            "cursor": historyEncodedValue(cursor),
+        ])
+    }
+
+    private func historyEncodedValue<T: Encodable>(_ value: T) -> JSONValue {
+        guard let data = try? JSONEncoder().encode(value),
+              let decoded = JSONValue.parse(data) else {
+            return .null
+        }
+        return decoded
+    }
+
+    private func sessionHistoryIndexDirectory(for journal: JournalRef) -> URL {
+        let material = "session-history-v4\0\(journal.stableKey)"
+        let key = AviarySHA256.hash(data: Data(material.utf8)).description
+        return home.timelineV2Dir
+            .appending(path: "projections", directoryHint: .isDirectory)
+            .appending(path: "session-history-v4", directoryHint: .isDirectory)
+            .appending(path: key, directoryHint: .isDirectory)
     }
 
     /// Admit a Hosted actor only as part of an explicit Start. Create deliberately leaves the
@@ -3137,7 +3871,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 selectedPromptAssembly = durableAssembly
             }
             // A newly selected Session may have canonical native attachment history but no
-            // legacy flat projection yet.  Reopen the selected Session's existing projection
+            // prior flat projection yet. Reopen the selected Session's existing projection
             // only when it owns the immediately preceding Run; an alternating owner gets a
             // genuinely fresh projection while the Work-level Run remains a replacement.
             // A Session may alternate ownership after End. Its existing Aviary flat projection
@@ -3534,24 +4268,36 @@ public actor JournalBackedWorkService: WorkServiceClient {
             sessionAttachment: binding.sessionAttachment)
     }
 
+    private func hasUnstartedStartReservation(
+        _ source: HistoryCanonicalWorkSource, binding: WorkBinding
+    ) async throws -> Bool {
+        guard let store = manifestStore else { return false }
+        let selection = try await store.currentSelection(
+            work: source.registration.reservation.work,
+            session: binding.session,
+            sessionAttachment: binding.sessionAttachment)
+        if let selection {
+            let run = selection.manifest.identity.run
+            let hasStarted = source.workCache.runStartedIDs.contains(run.runID)
+            let hasFinished = source.workCache.runFinishedIDs.contains(run.runID)
+            if !hasStarted && !hasFinished { return true }
+        }
+        return try await store.hasPendingStart(
+            work: source.registration.reservation.work,
+            session: binding.session,
+            sessionAttachment: binding.sessionAttachment)
+    }
+
     private func ensureLoaded() async throws {
         guard !loaded else { return }
         let control = try await controlSnapshot()
         guard control.structuralIntegrityValid, control.semanticProjectionValid,
-              control.quarantinedEvents.isEmpty else {
+              control.quarantinedEvents.isEmpty, control.unknownEvents.isEmpty else {
             throw WorkServiceProtocolError.sourceIncomplete
         }
         for creation in control.creations.values {
             let reservation = creation.reservation
-            let verified = await controlJournal.verifiedCreationProjection(
-                client: reservation.client, commandID: reservation.command.commandID)
-            guard verified.verification.isVerified,
-                  let registration = verified.projection?.registration else {
-                if let registration = creation.registration {
-                    try? await registerCanonical(
-                        work: reservation.work, registration: registration,
-                        disposition: .unavailable, sourceID: "creation-" + reservation.command.commandID)
-                }
+            guard let registration = creation.registration, !creation.isConflicted else {
                 continue
             }
             var resolvedManifest: JournalBackedWorkLaunchManifest?
@@ -3565,9 +4311,9 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 }
             }
             do {
-                let source = try await canonicalSource(
+                let source = try await historyCanonicalWorkSource(
                     work: reservation.work, journal: registration.workJournal,
-                    registration: registration)
+                    control: control)
                 let disposition: WorkHostRegistryCanonicalDisposition =
                     source.workState.lifecycle == .completed || source.workState.lifecycle == .destroyed
                         ? .historical : .recovering
@@ -4539,6 +5285,13 @@ public actor JournalBackedWorkService: WorkServiceClient {
             sessionAttachment: source.sessionAttachment)
     }
 
+    private func primaryWorkBinding(_ source: HistoryCanonicalWorkSource) -> WorkBinding {
+        WorkBinding(
+            session: source.registration.reservation.session,
+            work: source.registration.reservation.work, workHost: host,
+            sessionAttachment: source.registration.reservation.sessionAttachment)
+    }
+
     private func validateTarget(_ target: WorkServiceReadTarget, source: CanonicalSource) throws {
         switch target {
         case .work(let journal):
@@ -4615,96 +5368,6 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let basePrefixDigest: String?
         let prefixDigest: String?
         let omissions: [WorkServiceOmission]
-    }
-
-    private func historyPage(
-        entry: JournalReadCacheEntry, records: [TimelineJournalRecord],
-        visible: [TimelineJournalRecord], target: WorkServiceReadTarget,
-        before: JournalCursor?, frozenTip: JournalCursor?, frozenDigest: String?,
-        branchTip: EventRef?, journal: JournalRef, work: WorkServiceWorkDescriptor,
-        limit: Int, maxBytes: Int
-    ) throws -> WorkServiceHistoryPage {
-        guard limit > 0, limit <= WorkServiceBounds.maxEventsPerPage,
-              maxBytes > 0, maxBytes <= WorkServiceBounds.maxEventPageBytes else {
-            throw WorkServiceProtocolError.invalidRequest("history page bounds are invalid")
-        }
-        let currentTip = entry.lastRecord.map {
-            JournalCursor(journal: journal, eventID: $0.event.eventID, sequence: $0.event.sequence)
-        } ?? JournalCursor(journal: journal, sequence: 0)
-        let frozen = frozenTip ?? currentTip
-        guard frozen.journal == journal, frozen.sequence >= 0,
-              frozen.sequence <= currentTip.sequence else {
-            throw WorkServiceProtocolError.invalidRequest("history frozen tip is foreign or ahead")
-        }
-        let actualFrozenDigest = try prefixDigest(
-            for: frozen, entry: entry, records: records,
-            sequenceToIndex: entry.sequenceToIndex, journal: journal) ?? entry.prefixSeed
-        if let frozenDigest, frozenDigest != actualFrozenDigest {
-            throw WorkServiceProtocolError.staleCursor(expected: frozen, actual: currentTip)
-        }
-        if let branchTip {
-            guard branchTip.journal == journal,
-                  records.contains(where: { $0.event.eventID == branchTip.eventID }) else {
-                throw WorkServiceProtocolError.staleCursor(expected: frozen, actual: currentTip)
-            }
-        }
-        let branchVisible = visible.filter { $0.event.sequence <= frozen.sequence }
-        let cutoff: Int
-        if let before {
-            guard before.journal == journal, before.sequence >= 0,
-                  before.sequence <= frozen.sequence else {
-                throw WorkServiceProtocolError.invalidRequest("history boundary is foreign or ahead")
-            }
-            if before.sequence > 0 {
-                guard branchVisible.contains(where: {
-                    $0.event.sequence == before.sequence && $0.event.eventID == before.eventID
-                }) else {
-                    throw WorkServiceProtocolError.invalidRequest(
-                        "history boundary must identify a visible message")
-                }
-            } else if before.eventID != nil {
-                throw WorkServiceProtocolError.invalidRequest("history baseline has an event ID")
-            }
-            cutoff = before.sequence
-        } else { cutoff = Int.max }
-        let candidates = branchVisible.filter { $0.event.sequence < cutoff }
-        var selected: [TimelineEvent] = []
-        var bytes = 0
-        for record in candidates.reversed() {
-            guard selected.count < limit else { break }
-            let size = try WorkServiceEventPageSizing.encodedByteCount(of: record.event)
-            guard size <= maxBytes else {
-                if selected.isEmpty {
-                    throw WorkServiceProtocolError.eventPageCannotProgress(
-                        requiredBytes: size, maximumBytes: maxBytes)
-                }
-                break
-            }
-            guard bytes + size <= maxBytes else { break }
-            selected.append(record.event)
-            bytes += size
-        }
-        selected.reverse()
-        let lower = selected.first.map {
-            JournalCursor(journal: journal, eventID: $0.eventID, sequence: $0.sequence)
-        }
-        let upper = selected.last.map {
-            JournalCursor(journal: journal, eventID: $0.eventID, sequence: $0.sequence)
-        }
-        let hasOlder = candidates.count > selected.count
-        let pageDigest = try WorkServiceHistoryPageEvidence.digest(
-            events: selected, target: target, cursor: upper ?? frozen)
-        let omissions = hasOlder ? [WorkServiceOmission(
-            category: "history", count: min(candidates.count - selected.count,
-                                              WorkServiceBounds.maxOmissionCount),
-            diagnostic: "older visible messages remain")] : []
-        return WorkServiceHistoryPage(
-            work: work,
-            events: selected, target: target, lowerBoundaryCursor: lower,
-            upperBoundaryCursor: upper, nextBeforeCursor: hasOlder ? lower : nil,
-            hasOlder: hasOlder, frozenTipCursor: frozen,
-            frozenTipDigest: frozenDigest ?? actualFrozenDigest,
-            prefixDigest: pageDigest, branchTip: branchTip, omissions: omissions)
     }
 
     private func page(
@@ -5331,6 +5994,63 @@ public actor JournalBackedWorkService: WorkServiceClient {
             invalidations: add(readMetrics.invalidations, invalidations),
             bytesScanned: add(readMetrics.bytesScanned, bytesScanned),
             recordsApplied: add(readMetrics.recordsApplied, recordsApplied))
+    }
+
+    private func incrementHistoryMetrics(
+        calls: Int = 0,
+        indexBuilds: Int = 0,
+        cacheHits: Int = 0,
+        rebuilds: Int = 0,
+        decodedPhysicalEvents: Int = 0,
+        sourceBytesScanned: Int = 0,
+        peakBufferBytes: Int = 0,
+        metadataLookups: Int = 0,
+        parentLinks: Int = 0,
+        canonicalRangeReads: Int = 0,
+        canonicalRangeBytes: Int = 0,
+        mapObjectsRead: Int = 0,
+        mapBytesRead: Int = 0
+    ) {
+        func add(_ value: Int, _ delta: Int) -> Int {
+            guard delta > 0 else { return value }
+            let (result, overflow) = value.addingReportingOverflow(delta)
+            return overflow ? Int.max : result
+        }
+        historyMetrics = JournalBackedWorkServiceHistoryMetrics(
+            calls: add(historyMetrics.calls, calls),
+            indexBuilds: add(historyMetrics.indexBuilds, indexBuilds),
+            cacheHits: add(historyMetrics.cacheHits, cacheHits),
+            rebuilds: add(historyMetrics.rebuilds, rebuilds),
+            decodedPhysicalEvents: add(
+                historyMetrics.decodedPhysicalEvents, decodedPhysicalEvents),
+            sourceBytesScanned: add(historyMetrics.sourceBytesScanned, sourceBytesScanned),
+            peakBufferBytes: max(historyMetrics.peakBufferBytes, max(0, peakBufferBytes)),
+            metadataLookups: add(historyMetrics.metadataLookups, metadataLookups),
+            parentLinks: add(historyMetrics.parentLinks, parentLinks),
+            canonicalRangeReads: add(
+                historyMetrics.canonicalRangeReads, canonicalRangeReads),
+            canonicalRangeBytes: add(
+                historyMetrics.canonicalRangeBytes, canonicalRangeBytes),
+            mapObjectsRead: add(historyMetrics.mapObjectsRead, mapObjectsRead),
+            mapBytesRead: add(historyMetrics.mapBytesRead, mapBytesRead))
+    }
+
+    private func incrementHistoryMetrics(
+        _ metrics: LocalSessionHistoryProjectionReader.Metrics
+    ) {
+        incrementHistoryMetrics(
+            indexBuilds: metrics.historyIndexBuilds,
+            cacheHits: metrics.historyCacheHits,
+            rebuilds: metrics.historyProjectionRebuilds,
+            decodedPhysicalEvents: metrics.decodedPhysicalEvents,
+            sourceBytesScanned: metrics.sourceBytesScanned,
+            peakBufferBytes: metrics.peakBufferBytes,
+            metadataLookups: metrics.metadataLookups,
+            parentLinks: metrics.parentLinks,
+            canonicalRangeReads: metrics.historyCanonicalRangeReads,
+            canonicalRangeBytes: metrics.historyCanonicalRangeBytes,
+            mapObjectsRead: metrics.historyMapObjects,
+            mapBytesRead: metrics.historyMapBytes)
     }
 
     /// The empty-prefix token is scoped to the logical journal, so a cursor from one journal can
