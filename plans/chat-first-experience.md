@@ -259,3 +259,46 @@ timeline architecture are not prerequisites for these conversation improvements.
   restart require user intent; after End changes the control cursor, the saved test Create may
   need a proven-stale rejection followed by an explicit fresh attempt. Do not silently mint a
   replacement request or infer delivery from a green connection badge.
+
+### Authorized restart and real coding/review journey — 2026-09-08
+
+The deployment boundary above is now exercised, not merely planned. With Ryan's explicit
+approval, End recorded `run.finished` for the original chat and its Python process exited;
+the helper then stopped gracefully and the current signed helper launched. The conversation
+remained saved. The original live Python namespace was intentionally ended, not recovered.
+
+Restart exposed one more admission distinction: a same-journal stale Create was reported as a
+generic internal error. Commit `556b6ad` adds an exact typed pre-append stale-cursor error at
+the control journal and translates only that proven rejection to the service's stale response.
+Unknown append/transport failures remain indeterminate; duplicate lookup retains precedence.
+The GUI could then explicitly retry the isolated cart request with a fresh identity, without
+resending any of Ryan's unrelated saved requests. The extended real durable socket test passes
+**1 case / 76 assertions**; Work Host creation tests pass **8 / 144**. Debug SelfTest and signed
+release app/helper builds and strict signature verification pass. No new full-suite or Linux
+receipt is implied by those focused checks.
+
+Actual signed GUI, live provider (`openai-codex/gpt-5.6-luna`, high), isolated Git project:
+
+- Original quantity-total regression failed before admission. The first real turn changed
+  only `cart.py`; independent `python3 -B -m unittest -v` passed both existing tests.
+- Review changes required explicit file-content loading and showed the exact one-file diff,
+  with working-tree attribution and sensitive-content limits visible.
+- Revision feedback was placed in the composer without sending: the transcript still had
+  only the original turn, the draft was visible, and Send remained an explicit action.
+- One explicit Send requested negative-quantity rejection and a regression test. The agent
+  preserved both existing tests, changed the expected two files, and independent execution
+  passed **3 tests**. The second saved review showed those exact changes.
+- Canonical Work evidence has one accepted/delivered pair per request and two distinct
+  started/finished turns; no manual retry or duplicate revision was needed.
+- Closing and reopening only the GUI preserved the same helper and Python PIDs and restored
+  both turns with an empty composer. This proves local live-host reattachment, not cold
+  Python-state reconstruction. The test runtime was subsequently explicitly Ended, with
+  canonical `run.finished` and Python exit; its saved chat and scratch files remain inspectable.
+
+One real-use defect remains from this journey: immediately after revision Send, the GUI briefly
+showed an indeterminate-command warning and an unavailable Session row, then caught up to the
+exact delivered command and completed answer without replay. Data preservation/reconciliation
+worked, but this transient alarming presentation is not acceptable evidence of a polished
+delivery experience. Trace receipt generation and concurrent canonical reads before changing
+error severity or suppressing genuine uncertainty. The stale-Create card's “request needs an
+adjustment” wording also overstates the required action when the request text is already valid.
