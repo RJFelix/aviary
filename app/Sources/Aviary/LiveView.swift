@@ -239,7 +239,7 @@ struct RunPane: View {
     /// technical column. Live keeps the detailed inspector.
     var showsInspector = true
 
-    @State private var showMarkdownPreview = true
+    @State private var showMarkdownPreview = false
     @State private var showLaunchDetails = false
     @State private var selectedItem: TranscriptItem?
     @State private var selectedAction: SelectedAction?
@@ -247,26 +247,8 @@ struct RunPane: View {
     @State private var showInputDeliveryReview = false
     @State private var showCockpitInspector = false
     @State private var showRepositoryReview = false
-    @State private var composerDelivery: ComposerDelivery = .steerNext
-
-    private enum ComposerDelivery: String, CaseIterable, Identifiable {
-        case steerNext
-        case queueFollowUp
-
-        var id: String { rawValue }
-        var label: String {
-            switch self {
-            case .steerNext: "Steer next"
-            case .queueFollowUp: "Queue follow-up"
-            }
-        }
-        var detail: String {
-            switch self {
-            case .steerNext: "Deliver before the next model call"
-            case .queueFollowUp: "Start a distinct turn after current work"
-            }
-        }
-    }
+    @State private var showActivityHistory = false
+    @State private var composerDelivery: ChatBusyDelivery = .followUp
 
     // Fixed trailing inspector column rather than `.inspector` or a conditional split
     // pane — see the note on SessionsView.body for why both of those misbehave.
@@ -301,7 +283,7 @@ struct RunPane: View {
                     Divider()
                 }
                 if let banner = run.errorBanner {
-                    NoticeBanner(level: .danger, title: "Run needs attention", message: banner)
+                    NoticeBanner(level: .danger, title: "Chat needs attention", message: banner)
                         .padding(Design.gutter)
                 }
                 if let notice = run.commandNotice {
@@ -335,6 +317,12 @@ struct RunPane: View {
                             selectedAction = SelectedAction(id: $0.id)
                         })
                     Divider()
+                } else if run.isServiceBacked && run.isStreaming {
+                    Label("Agent is working · current step has not been reported", systemImage: "ellipsis")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, Design.gutter).padding(.vertical, 8)
+                    Divider()
                 }
                 TranscriptView(
                     items: run.items,
@@ -366,19 +354,19 @@ struct RunPane: View {
             }
         }
         .confirmationDialog(
-            "End this run?",
+            "End the agent session?",
             isPresented: $confirmEndRun,
             titleVisibility: .visible
         ) {
-            Button("End run", role: .destructive) {
+            Button("End agent session", role: .destructive) {
                 Task { await run.end() }
             }
-            Button("Keep running", role: .cancel) {}
+            Button("Keep session open", role: .cancel) {}
         } message: {
             Text(
                 run.isServiceBacked
-                    ? "This sends an explicit End command to the Work Host. The GUI can detach "
-                        + "without ending it, and the transcript remains available."
+                    ? "This ends the current agent session and releases its runtime. The chat stays saved. "
+                        + "To leave without interrupting the agent, just select another chat or close the window."
                     : "This stops the agent and destroys its current Python runtime. "
                         + "The transcript remains available.")
         }
@@ -407,6 +395,10 @@ struct RunPane: View {
             RepositoryReviewView(run: run)
                 .frame(minWidth: 560, idealWidth: 760, minHeight: 620, idealHeight: 780)
         }
+        .sheet(isPresented: $showActivityHistory) {
+            ChatActivityHistoryView(run: run)
+                .frame(minWidth: 400, idealWidth: 580, minHeight: 480, idealHeight: 660)
+        }
     }
 
     private var runHeader: some View {
@@ -424,7 +416,7 @@ struct RunPane: View {
                     .font(.system(size: 13.5, weight: .semibold))
                     .lineLimit(1)
                 Chip(
-                    text: run.presentationState,
+                    text: ChatInteractionPresentation.stateLabel(run.commandState),
                     tint: run.presentationState == "failed"
                         ? Design.danger
                         : run.presentationState == "working" ? Design.success : .secondary)
@@ -435,6 +427,19 @@ struct RunPane: View {
                          tint: (run.exitCode ?? 0) == 0 ? .secondary : Design.danger)
                 }
                 Spacer()
+            }
+
+            runMetadata
+
+            HStack(spacing: 8) {
+                if !run.serviceActionPresentations.isEmpty {
+                    Button { showActivityHistory = true } label: {
+                        Label("Activity", systemImage: "list.bullet.rectangle")
+                    }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .help("See current and recently recorded agent actions")
+                    .accessibilityLabel("Activity")
+                }
                 if run.canLoadServiceRepositoryReview {
                     ViewThatFits(in: .horizontal) {
                         Button {
@@ -471,10 +476,9 @@ struct RunPane: View {
                     .accessibilityHint(
                         "Opens recorded provider context and current durable Work and Session evidence")
                 }
+                Spacer(minLength: 0)
                 controls
             }
-
-            runMetadata
 
             if hasPendingInputs {
                 HStack(spacing: 6) {
@@ -523,7 +527,9 @@ struct RunPane: View {
                 if run.usage.cost.total > 0 {
                     Chip(text: Fmt.cost(run.usage.cost.total), tint: Design.accent)
                 }
-                Chip(text: run.elapsedLabel, symbol: "clock", tint: .secondary)
+                if run.hasCanonicalStartTime && run.elapsedLabel != "time unknown" {
+                    Chip(text: run.elapsedLabel, symbol: "clock", tint: .secondary)
+                }
                 Spacer()
                 if let share = run.contextShare, let tokens = run.contextTokens {
                     HStack(spacing: 5) {
@@ -550,7 +556,9 @@ struct RunPane: View {
                 if let m = run.modelLabel, !m.isEmpty {
                     Chip(text: m, symbol: "cpu", tint: Design.assistant)
                 }
-                Chip(text: run.elapsedLabel, symbol: "clock", tint: .secondary)
+                if run.hasCanonicalStartTime && run.elapsedLabel != "time unknown" {
+                    Chip(text: run.elapsedLabel, symbol: "clock", tint: .secondary)
+                }
                 Spacer(minLength: 4)
                 if let share = run.contextShare {
                     Chip(
@@ -593,67 +601,21 @@ struct RunPane: View {
     }
 
     private var controls: some View {
-        ViewThatFits(in: .horizontal) {
-            fullControls
-            compactControls
-        }
-    }
-
-    private var fullControls: some View {
         HStack(spacing: 6) {
+            if !run.hasExited && run.isStreaming
+                && (run.commandCapabilities.supports(.agentLoop) || run.commandState == .canceling) {
                 Button {
-                if run.hasExited { model.closeRun(run) } else { model.detachRun(run) }
+                    Task { _ = await run.cancel(.agentLoop) }
                 } label: {
-                Label(
-                    run.hasExited ? "Close view" : "Detach view",
-                    systemImage: run.hasExited ? "xmark" : "rectangle.on.rectangle.slash"
-                )
-                .font(.system(size: 10.5))
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help(
-                run.hasExited
-                    ? "Close this completed view"
-                    : "Hide this chat view without ending the run")
-
-            if !run.hasExited {
-                if run.commandCapabilities.supports(.agentLoop) && run.isStreaming {
-                    Button {
-                        Task { _ = await run.cancel(.agentLoop) }
-                    } label: {
-                        Label(
-                            run.commandState == .canceling ? "Canceling…" : "Cancel at boundary",
-                            systemImage: "pause.circle"
-                        )
-                        .font(.system(size: 10.5))
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .accessibilityValue(
-                        run.commandState == .canceling ? "In progress" : "Available")
-                    .disabled(run.commandState == .canceling || run.isEnding)
-                    .help(
-                        "Stop the agent loop at its next safe boundary; this cannot interrupt "
-                            + "an in-flight model stream or Python action")
+                    Label(run.commandState == .canceling ? "Stopping…" : "Stop after step",
+                          systemImage: "stop.circle")
                 }
-                Button {
-                    confirmEndRun = true
-                } label: {
-                    Label(run.isEnding ? "Ending…" : "End run", systemImage: "stop.fill")
-                        .font(.system(size: 10.5))
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .tint(Design.danger)
-                .accessibilityValue(run.isEnding ? "In progress" : "Available")
-                .disabled(run.isEnding || !run.serviceControlsAvailable)
-                .help(
-                    run.isServiceBacked
-                        ? "Send an explicit End command to the Work Host"
-                        : "Stop the agent and destroy this run's Python runtime")
+                .buttonStyle(.bordered).controlSize(.small)
+                .disabled(run.commandState == .canceling || run.isEnding
+                    || !run.commandCapabilities.supports(.agentLoop))
+                .help(ChatInteractionPresentation.stopExplanation)
+                .accessibilityHint(ChatInteractionPresentation.stopExplanation)
             }
-
             RunOptionsMenu(
                 run: run,
                 models: model.pickerModels,
@@ -661,71 +623,13 @@ struct RunPane: View {
                 isWorking: run.isStreaming,
                 isCanceling: run.commandState == .canceling,
                 cancellationScopes: run.commandCapabilities.cancellationScopes,
-                sessionFile: run.sessionFile)
+                sessionFile: run.sessionFile,
+                onEnd: { confirmEndRun = true })
         }
     }
-
-    private var compactControls: some View {
-        HStack(spacing: 5) {
-            Button {
-                if run.hasExited { model.closeRun(run) } else { model.detachRun(run) }
-            } label: {
-                Image(systemName: run.hasExited ? "xmark" : "rectangle.on.rectangle.slash")
-                    .frame(width: 20, height: 20)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .accessibilityLabel(run.hasExited ? "Close view" : "Detach view")
-            .help(
-                run.hasExited
-                    ? "Close this completed view"
-                    : "Hide this chat view without ending the run")
-
-            if !run.hasExited {
-                if run.commandCapabilities.supports(.agentLoop) && run.isStreaming {
-                    Button {
-                        Task { _ = await run.cancel(.agentLoop) }
-                    } label: {
-                        Image(systemName: "pause.circle")
-                            .frame(width: 20, height: 20)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(run.commandState == .canceling || run.isEnding)
-                    .accessibilityLabel("Cancel at boundary")
-                    .help("Stop the agent loop at its next safe boundary")
-                }
-                Button {
-                    confirmEndRun = true
-                } label: {
-                    Image(systemName: "stop.fill")
-                        .frame(width: 20, height: 20)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .tint(Design.danger)
-                .disabled(run.isEnding || !run.serviceControlsAvailable)
-                .accessibilityLabel(run.isEnding ? "Ending run" : "End run")
-                .help(
-                    run.isServiceBacked
-                        ? "Send an explicit End command to the Work Host"
-                        : "Stop the agent and destroy this run's Python runtime")
-            }
-
-            RunOptionsMenu(
-                run: run,
-                models: model.pickerModels,
-                hasExited: run.hasExited,
-                isWorking: run.isStreaming,
-                isCanceling: run.commandState == .canceling,
-                cancellationScopes: run.commandCapabilities.cancellationScopes,
-                sessionFile: run.sessionFile)
-        }
-    }
-
     private var composer: some View {
         VStack(spacing: 0) {
-            HStack(alignment: .bottom, spacing: 8) {
+            VStack(alignment: .leading, spacing: 8) {
                 ZStack(alignment: .topLeading) {
                     if run.draft.isEmpty {
                         Text(composerPlaceholder)
@@ -740,7 +644,7 @@ struct RunPane: View {
                         set: { run.setDraft($0) }))
                         .font(.system(size: 12.5))
                         .scrollContentBackground(.hidden)
-                        .frame(minHeight: 34, maxHeight: 130)
+                        .frame(minHeight: 42, maxHeight: 105)
                         .padding(.horizontal, 1)
                         // No focus state is mutated by streaming or delivery callbacks. This
                         // remains the same editor identity while the parent observes the run.
@@ -756,7 +660,7 @@ struct RunPane: View {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .strokeBorder(.separator, lineWidth: 1))
 
-                VStack(spacing: 5) {
+                HStack(spacing: 8) {
                     Button {
                         showMarkdownPreview.toggle()
                     } label: {
@@ -771,15 +675,14 @@ struct RunPane: View {
                     .accessibilityValue(showMarkdownPreview ? "Visible" : "Hidden")
                     .help(showMarkdownPreview ? "Hide Markdown preview" : "Show Markdown preview")
 
+                    Spacer(minLength: 0)
+
                     if run.isStreaming {
                         HStack(spacing: 4) {
-                            Text("Delivery")
-                                .font(.system(size: 9.5))
-                                .foregroundStyle(.secondary)
                             Picker(
                                 "Delivery mode",
                                 selection: Binding(
-                                    get: { effectiveComposerDelivery ?? .steerNext },
+                                    get: { effectiveComposerDelivery ?? .followUp },
                                     set: { composerDelivery = $0 })
                             ) {
                                 ForEach(availableComposerDeliveries) { choice in
@@ -792,7 +695,7 @@ struct RunPane: View {
                             .disabled(availableComposerDeliveries.count < 2)
                             .accessibilityLabel("Delivery mode")
                             .accessibilityValue(
-                                effectiveComposerDelivery?.detail
+                                effectiveComposerDelivery?.explanation
                                     ?? "No delivery mode available")
                         }
                     }
@@ -821,6 +724,15 @@ struct RunPane: View {
             .padding(.horizontal, Design.gutter)
             .padding(.vertical, 9)
 
+            if run.isStreaming {
+                Text(run.commandState == .canceling
+                    ? ChatInteractionPresentation.stopExplanation : composerActionDetail)
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Design.gutter).padding(.bottom, 9)
+            }
+
             if let notice = run.draftPersistenceNotice {
                 Divider()
                 VStack(alignment: .leading, spacing: 6) {
@@ -832,7 +744,7 @@ struct RunPane: View {
                         .accessibilityHint(notice)
                     if run.draftHandoffRecoveryAvailable {
                         HStack(spacing: 6) {
-                            Button("Check Work again") {
+                            Button("Check delivery") {
                                 Task { await run.refreshService() }
                             }
                                 .buttonStyle(.bordered)
@@ -872,62 +784,55 @@ struct RunPane: View {
         .background(.bar)
     }
 
-    private var availableComposerDeliveries: [ComposerDelivery] {
+    private var availableComposerDeliveries: [ChatBusyDelivery] {
         guard run.isStreaming else { return [] }
-        var choices: [ComposerDelivery] = []
-        if run.commandCapabilities.supportsSteering { choices.append(.steerNext) }
-        if run.commandCapabilities.supportsQueuedFollowUps { choices.append(.queueFollowUp) }
-        return choices
+        return ChatBusyDelivery.available(
+            supportsGuidance: run.commandCapabilities.supportsSteering,
+            supportsFollowUp: run.commandCapabilities.supportsQueuedFollowUps)
     }
 
-    private var effectiveComposerDelivery: ComposerDelivery? {
+    private var effectiveComposerDelivery: ChatBusyDelivery? {
         let choices = availableComposerDeliveries
         if choices.contains(composerDelivery) { return composerDelivery }
         return choices.first
     }
 
     private var composerActionLabel: String {
-        guard run.isStreaming else { return "Send now" }
-        return effectiveComposerDelivery?.label ?? "Working"
+        guard run.isStreaming else { return "Send" }
+        return effectiveComposerDelivery?.buttonLabel ?? "Working"
     }
 
     private var composerActionSymbol: String {
         guard run.isStreaming else { return "arrow.up" }
         return switch effectiveComposerDelivery {
-        case .steerNext: "arrow.turn.down.right"
-        case .queueFollowUp: "text.append"
+        case .guideCurrentWork: "arrow.turn.down.right"
+        case .followUp: "text.append"
         case nil: "hourglass"
         }
     }
 
     private var composerActionDetail: String {
-        guard run.isStreaming else { return "Send as the next user turn" }
-        return effectiveComposerDelivery?.detail
-            ?? "This Work advertises no input mode while it is working"
+        guard run.isStreaming else { return "Send a message to the agent" }
+        return effectiveComposerDelivery?.explanation
+            ?? "The agent cannot receive another message right now. Your draft stays here."
     }
 
     private var composerPlaceholder: String {
-        guard run.isStreaming else { return "Ask for something…" }
-        return switch effectiveComposerDelivery {
-        case .steerNext: "Steer the run — lands before the next model call…"
-        case .queueFollowUp: "Queue a distinct follow-up turn…"
-        case nil: "This Work is busy and advertises no input mode…"
-        }
+        guard run.isStreaming else { return "Ask a question or describe a change…" }
+        return effectiveComposerDelivery?.placeholder ?? "Draft your next message…"
     }
 
     private var composerAccessibilityLabel: String {
         guard run.isStreaming else { return "Message composer" }
         return switch effectiveComposerDelivery {
-        case .steerNext: "Steering message"
-        case .queueFollowUp: "Queued follow-up message"
+        case .guideCurrentWork: "Guidance for current work"
+        case .followUp: "Follow-up message"
         case nil: "Unavailable message composer"
         }
     }
 
     private var composerAccessibilityHint: String {
-        guard run.isStreaming else { return "Send as the next user turn" }
-        return effectiveComposerDelivery?.detail
-            ?? "This Work advertises no input mode while it is working"
+        composerActionDetail
     }
 
     private var composerCanSubmit: Bool {
@@ -938,11 +843,12 @@ struct RunPane: View {
 
     private func submitComposer() {
         let text = run.draft
+        let submittedChoice = effectiveComposerDelivery
         let delivery: LiveRunComposerDelivery
         if run.isStreaming {
             switch effectiveComposerDelivery {
-            case .steerNext: delivery = .steerNext
-            case .queueFollowUp: delivery = .queueFollowUp
+            case .guideCurrentWork: delivery = .steerNext
+            case .followUp: delivery = .queueFollowUp
             case nil: return
             }
         } else {
@@ -950,6 +856,11 @@ struct RunPane: View {
         }
         Task {
             let receipt = await run.submitComposer(text, delivery: delivery)
+            if let submittedChoice {
+                composerDelivery = ChatBusyDelivery.afterSubmission(
+                    submitted: submittedChoice, current: composerDelivery,
+                    handedOff: receipt.wasHandedOff)
+            }
             if receipt.wasHandedOff, !run.isServiceBacked {
                 await run.reconcileDraftAfterHandOff(text)
             }
@@ -1147,6 +1058,7 @@ struct RunOptionsMenu: View {
     var isCanceling: Bool
     var cancellationScopes: Set<SessionCancellationScope>
     var sessionFile: String?
+    var onEnd: () -> Void
     @State private var choosingModel = false
 
     var body: some View {
@@ -1172,7 +1084,7 @@ struct RunOptionsMenu: View {
             .disabled(true)
             .help("Thinking level is fixed when this run starts")
             Divider()
-            Button("Cancel at next safe boundary") {
+            Button("Stop after current step") {
                 Task { _ = await run.cancel(.agentLoop) }
             }
             .accessibilityValue(
@@ -1203,7 +1115,7 @@ struct RunOptionsMenu: View {
             if !cancellationScopes.contains(.modelStream)
                 || !cancellationScopes.contains(.currentAction)
             {
-                Text("Unavailable scopes are disabled; End run is broader teardown.")
+                Text("Immediate interruption is available only where supported.")
             }
             Divider()
             Button("Copy launch command") {
@@ -1217,14 +1129,19 @@ struct RunOptionsMenu: View {
                 }
             }
             Divider()
-            Button(hasExited ? "Close view" : "Detach view") {
+            Button("Hide chat view") {
                 if hasExited { model.closeRun(run) } else { model.detachRun(run) }
+            }
+            .help("Leaves the agent running. Reopen this chat from the chat list or agent connections.")
+            if !hasExited {
+                Button("End agent session…", role: .destructive, action: onEnd)
+                    .disabled(run.isEnding || !run.serviceControlsAvailable)
             }
         } label: {
             Image(systemName: "ellipsis.circle")
         }
-        .accessibilityLabel("Run actions")
-        .accessibilityHint("Actions for this run, including cancellation scopes")
+        .accessibilityLabel("Chat options")
+        .accessibilityHint("Agent settings, interruption options, and ending the agent session")
         .menuStyle(.borderlessButton)
         .fixedSize()
         // Attached to the menu, not inside its content: a sheet modifier on a view that only

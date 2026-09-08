@@ -35,8 +35,8 @@ struct CockpitView: View {
     }
 
     private var ongoingRuns: [LiveRun] {
-        // An exited run is still valuable on Live until dismissed, but it is no longer an
-        // ongoing conversation. Keep the front page about work that can receive a message.
+        // Retain ended chats until explicitly dismissed. Their state stays distinct from
+        // an idle agent that can receive another message.
         model.runs
     }
 
@@ -371,10 +371,13 @@ private struct RunRailCard: View {
                 }
                 .font(.system(size: 9.5)).foregroundStyle(.secondary)
                 HStack {
-                    Text(run.isStreaming ? "working" : "ready")
-                        .foregroundStyle(run.isStreaming ? Design.success : .secondary)
+                    Text(ChatInteractionPresentation.stateLabel(run.commandState))
+                        .foregroundStyle(run.commandState == .failed ? Design.danger
+                            : run.isStreaming ? Design.success : .secondary)
                     Spacer()
-                    Text(run.elapsedLabel)
+                    if run.hasCanonicalStartTime && run.elapsedLabel != "time unknown" {
+                        Text(run.elapsedLabel)
+                    }
                 }
                 .font(Design.numeric(9.5))
             }
@@ -417,7 +420,7 @@ private struct CanonicalWorkspaceRailCard: View {
                     Text(entry.state.label)
                         .foregroundStyle(entry.state.tint)
                     if isAttachedHere {
-                        Text("attached here")
+                        Text("open here")
                             .foregroundStyle(Design.accent)
                     }
                     if let model = entry.modelID, !model.isEmpty {
@@ -425,17 +428,13 @@ private struct CanonicalWorkspaceRailCard: View {
                     }
                 }
                 .font(.system(size: 9.5, weight: .medium))
-                HStack(spacing: 5) {
-                    Text(entry.authorityID)
-                        .lineLimit(1).truncationMode(.middle)
-                    Spacer()
+                if entry.workEvidence.count > 1 || entry.omittedWorkEvidenceCount > 0 {
                     Text(
-                        "\(entry.workEvidence.count) Work"
+                        "\(entry.workEvidence.count) recorded agent workspaces"
                             + (entry.omittedWorkEvidenceCount > 0
-                                ? " +\(entry.omittedWorkEvidenceCount)" : ""))
+                                ? " · \(entry.omittedWorkEvidenceCount) more not shown" : ""))
+                        .font(.system(size: 9.5)).foregroundStyle(.secondary)
                 }
-                .font(Design.mono(9))
-                .foregroundStyle(.secondary)
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -459,7 +458,8 @@ private struct CanonicalWorkspaceRailCard: View {
                         ? ", \(entry.omittedWorkEvidenceCount) Work omitted from this page" : "")
                     + (isAttachedHere ? ", attached to this GUI" : ", not attached to this GUI")
                 : "Attention and state unknown")
-        .accessibilityHint("Opens this Session workspace")
+        .help("Agent service: \(entry.authorityID)")
+        .accessibilityHint("Opens this chat")
     }
 }
 

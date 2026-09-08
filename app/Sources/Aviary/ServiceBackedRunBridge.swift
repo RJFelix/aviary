@@ -387,7 +387,7 @@ final class ServiceBackedRunBridge {
                 historyError = nil
             }
             inputDeliveryProjection = Self.makeInputDeliveryProjection(from: next)
-            lastError = next.readDiagnostics.last
+            lastError = ServiceBackedGUIControlPolicy.blockingReadDiagnostic(in: next)
             return next
         } catch {
             let observed = await controller.projection()

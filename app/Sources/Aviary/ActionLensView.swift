@@ -1,148 +1,92 @@
 import AviaryCore
 import SwiftUI
 
-/// A compact, always-visible answer to the three questions that matter during a live action.
-/// Every statement comes from canonical action evidence; an undeclared next step stays unknown.
+/// The primary surface reports only recorded activity. Missing intent, timing, causality, and
+/// speculative next steps belong in the evidence view, not in three permanent warning columns.
 struct WorkActivityStrip: View {
     let action: WorkActionPresentation
     let concurrentActions: [WorkActionPresentation]
     let onInspect: (WorkActionPresentation) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
-                PulseDot(color: tint)
-                Text("Current activity")
-                    .font(.system(size: 11, weight: .semibold))
-                Chip(text: action.stateTitle, tint: tint)
-                if concurrentActions.count > 1 {
-                    Menu {
-                        ForEach(concurrentActions) { candidate in
-                            Button(concurrentMenuLabel(candidate)) {
-                                onInspect(candidate)
-                            }
-                        }
-                    } label: {
-                        Label("\(concurrentActions.count) concurrent", systemImage: "square.stack.3d.up")
-                            .font(.system(size: 9, weight: .semibold))
+        HStack(alignment: .top, spacing: 9) {
+            PulseDot(color: WorkActionVisuals.tint(for: action.state))
+                .padding(.top, 5)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(action.intent ?? action.kindTitle)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(2)
+                HStack(spacing: 5) {
+                    Text(action.kindTitle)
+                    Text("·")
+                    Text(action.stateTitle)
+                    if concurrentActions.count > 1 {
+                        Text("· \(concurrentActions.count) active actions")
                     }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .accessibilityHint("Choose a current action to inspect")
                 }
-                Spacer()
-                Button("Inspect evidence") { onInspect(action) }
-                    .buttonStyle(.link)
-                    .font(.system(size: 10.5))
+                .font(.system(size: 10.5)).foregroundStyle(.secondary)
             }
-
-            AdaptiveActivityStoryLayout() {
-                storyColumn("NOW", value: action.kindTitle, detail: action.timeAvailability)
-                storyColumn(
-                    "WHY", value: action.intent ?? "Intent not recorded", detail: causeLabel)
-                storyColumn(
-                    "NEXT", value: "Unknown",
-                    detail: "The Work has not declared its next step")
+            Spacer(minLength: 5)
+            Menu {
+                ForEach(concurrentActions) { candidate in
+                    Button(menuLabel(candidate)) {
+                        onInspect(candidate)
+                    }
+                }
+            } label: {
+                Text("Details")
             }
+            .menuStyle(.borderlessButton).fixedSize()
+            .accessibilityLabel("Current activity details")
         }
-        .padding(.horizontal, Design.gutter)
-        .padding(.vertical, 10)
-        .background(tint.opacity(0.075))
+        .padding(.horizontal, Design.gutter).padding(.vertical, 10)
+        .background(Design.accent.opacity(0.055))
     }
 
-    private func storyColumn(_ label: String, value: String, detail: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(Design.sectionTitle)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.system(size: 11, weight: .medium))
-                .fixedSize(horizontal: false, vertical: true)
-            Text(detail)
-                .font(.system(size: 9.5))
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .help("\(value). \(detail)")
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(label): \(value). \(detail)")
+    private func menuLabel(_ candidate: WorkActionPresentation) -> String {
+        let subject = String((candidate.intent ?? candidate.affectedTarget ?? candidate.kindTitle)
+            .replacingOccurrences(of: "\n", with: " ").prefix(64))
+        return "\(subject) · \(candidate.stateTitle) · …\(candidate.id.suffix(8))"
     }
-
-    private var causeLabel: String {
-        guard let cause = action.intentEvidence?.causedBy
-                ?? action.startedEvidence?.causedBy else {
-            return "No causal event was recorded"
-        }
-        return "From \(cause.eventID)"
-    }
-
-    private func concurrentMenuLabel(_ candidate: WorkActionPresentation) -> String {
-        let subject = candidate.intent ?? candidate.affectedTarget ?? "intent not recorded"
-        let compactSubject = String(
-            subject.replacingOccurrences(of: "\n", with: " ").prefix(48))
-        let discriminator = String(candidate.id.suffix(10))
-        return "\(candidate.kindTitle) — \(candidate.stateTitle) · "
-            + "\(compactSubject) · …\(discriminator)"
-    }
-
-    private var tint: Color { WorkActionVisuals.tint(for: action.state) }
 }
 
-/// A real width-sensitive layout avoids relying on text compression to decide whether the
-/// activity story fits. Wide panes get three columns; compact panes get three full-width rows.
-private struct AdaptiveActivityStoryLayout: Layout {
-    private let breakpoint: CGFloat = 600
-    private let spacing: CGFloat = 9
+/// A chat-local home for completed actions as well as live ones. This reads the same bounded
+/// projection as the inspector and keeps omissions visible; it never labels this a full audit.
+struct ChatActivityHistoryView: View {
+    var run: LiveRun
+    @Environment(\.dismiss) private var dismiss
 
-    func sizeThatFits(
-        proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
-    ) -> CGSize {
-        let width = proposal.width ?? breakpoint
-        guard !subviews.isEmpty else { return CGSize(width: width, height: 0) }
-        if width >= breakpoint {
-            let itemWidth = max(0, (width - spacing * CGFloat(subviews.count - 1))
-                / CGFloat(subviews.count))
-            let sizes = subviews.map {
-                $0.sizeThatFits(ProposedViewSize(width: itemWidth, height: nil))
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Agent activity").font(.headline)
+                    Text("Current and recently recorded actions")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }.padding(16)
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    if let omissions = run.serviceProjectionOmissionSummary {
+                        Text(omissions).font(.caption).foregroundStyle(.secondary)
+                    }
+                    if run.serviceActionPresentations.isEmpty {
+                        Text("No recorded actions are available in this view.")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(run.serviceActionPresentations) { action in
+                        WorkActionLensRow(action: action)
+                        Divider()
+                    }
+                }.padding(16)
             }
-            return CGSize(width: width, height: sizes.map(\.height).max() ?? 0)
         }
-        let sizes = subviews.map {
-            $0.sizeThatFits(ProposedViewSize(width: width, height: nil))
-        }
-        return CGSize(
-            width: width,
-            height: sizes.map(\.height).reduce(0, +)
-                + spacing * CGFloat(max(0, subviews.count - 1)))
-    }
-
-    func placeSubviews(
-        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
-    ) {
-        guard !subviews.isEmpty else { return }
-        if bounds.width >= breakpoint {
-            let itemWidth = max(0, (bounds.width - spacing * CGFloat(subviews.count - 1))
-                / CGFloat(subviews.count))
-            for (index, subview) in subviews.enumerated() {
-                subview.place(
-                    at: CGPoint(
-                        x: bounds.minX + CGFloat(index) * (itemWidth + spacing),
-                        y: bounds.minY),
-                    anchor: .topLeading,
-                    proposal: ProposedViewSize(width: itemWidth, height: bounds.height))
-            }
-            return
-        }
-        var y = bounds.minY
-        for subview in subviews {
-            let size = subview.sizeThatFits(
-                ProposedViewSize(width: bounds.width, height: nil))
-            subview.place(
-                at: CGPoint(x: bounds.minX, y: y), anchor: .topLeading,
-                proposal: ProposedViewSize(width: bounds.width, height: size.height))
-            y += size.height + spacing
-        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Agent activity")
     }
 }
 
@@ -186,22 +130,26 @@ struct WorkActionLensRow: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("work-action-\(action.actionID)")
             .accessibilityLabel("\(action.kindTitle), \(action.stateTitle)")
             .accessibilityValue(expanded ? "Expanded" : "Collapsed")
             .accessibilityHint("Shows or hides canonical action evidence")
 
-            HStack(alignment: .top, spacing: 5) {
-                Text("Could affect")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Text(action.affectedTarget ?? "target not recorded")
-                    .font(Design.mono(9))
-                    .foregroundStyle(action.affectedTarget == nil ? .tertiary : .secondary)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
+            if expanded {
+                HStack(alignment: .top, spacing: 5) {
+                    Text("Could affect")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Text(action.affectedTarget ?? "target not recorded")
+                        .font(Design.mono(9))
+                        .foregroundStyle(action.affectedTarget == nil ? .tertiary : .secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
             }
 
             if let retry = action.retryGuidance,
+               expanded || action.state == .failed || action.state == .indeterminateEffect,
                action.retrySafety == .unsafe || action.retrySafety == .unknown
                     || action.retrySafety == nil || action.state == .indeterminateEffect {
                 Label(retry, systemImage: "exclamationmark.triangle.fill")

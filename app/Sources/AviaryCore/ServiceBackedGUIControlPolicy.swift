@@ -7,6 +7,12 @@ import Foundation
 /// treats transport connectivity as permission. Keeping the decision in AviaryCore lets every
 /// client render the same controls and makes the composer contract testable without SwiftUI.
 public struct ServiceBackedGUIControlPolicy: Hashable, Sendable {
+    /// Read diagnostics are retained history, not the outcome of the latest refresh. A
+    /// verified fresh projection retires their blocking presentation, without deleting them.
+    public static func blockingReadDiagnostic(in projection: WorkServiceAttachedWorkProjection) -> String? {
+        projection.isCanonical ? nil : projection.readDiagnostics.last
+    }
+
     public let execution: WorkServiceExecutionState
     public let currentRun: RunRef?
     public let currentRunSession: SessionRef?

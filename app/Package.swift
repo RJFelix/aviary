@@ -65,6 +65,8 @@ let linuxCoreSources: [String] = [
     "ServiceBackedDraftStore.swift",
     "ServiceBackedGUIOrchestration.swift",
     "ServiceBackedGUIControlPolicy.swift",
+    "ChatInteractionPresentation.swift",
+    "ServiceBackedCommandNoticePolicy.swift",
     "ServiceBackedStartIntentStore.swift",
     "SkillGate.swift",
     "SubAgents.swift",
@@ -126,6 +128,8 @@ let linuxSelfTestSources: [String] = [
     "ServiceBackedDraftStoreTests.swift",
     "ServiceBackedGUIOrchestrationTests.swift",
     "ServiceBackedGUIControlPolicyTests.swift",
+    "ChatInteractionPresentationTests.swift",
+    "ServiceBackedCommandNoticePolicyTests.swift",
     "LinuxSelfTestMain.swift",
 ]
 #else

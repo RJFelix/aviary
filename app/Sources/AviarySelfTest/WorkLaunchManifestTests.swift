@@ -726,24 +726,93 @@ func test_workLaunchCreateRetentionRequiresExactControlCursorAndRequestDigest() 
         requestedCapabilities: [])
     let digest = try WorkLaunchCreateKey.requestDigest(
         configuration: draft.configuration, requestedCapabilities: draft.requestedCapabilities)
+    // A Create key carries the exact control cursor observed by the host. It is not required
+    // to be genesis: another client may have advanced the shared control journal between two
+    // Create attempts.
+    let advancedCursor = JournalCursor(
+        journal: fixture.controlJournal, eventID: "control-event-23", sequence: 23)
     let valid = WorkLaunchCreateKey(
         client: ClientRef("create-client"), requestDigest: digest,
-        commandID: "create-command", causalControlCursor: fixture.controlCursor)
-    _ = try fixture.store.retain(draft, for: valid)
-    XCTAssertNotNil(try fixture.store.loadRetainedDraft(
+        commandID: "create-command", causalControlCursor: advancedCursor)
+    let first = try fixture.store.retain(draft, for: valid)
+    let secondKey = WorkLaunchCreateKey(
+        client: valid.client, requestDigest: digest,
+        commandID: "create-command-2", causalControlCursor: advancedCursor)
+    let second = try fixture.store.retain(draft, for: secondKey)
+    XCTAssertEqual(try fixture.store.loadRetainedDraft(
         client: valid.client, commandID: valid.commandID,
-        causalControlCursor: valid.causalControlCursor, draftDigest: try draft.contentDigest()))
+        causalControlCursor: valid.causalControlCursor, draftDigest: try draft.contentDigest())?.key,
+        valid)
+    XCTAssertEqual(try fixture.store.loadRetainedDraft(
+        client: secondKey.client, commandID: secondKey.commandID,
+        causalControlCursor: secondKey.causalControlCursor,
+        draftDigest: try draft.contentDigest())?.key, secondKey)
+
+    let reopened = WorkLaunchManifestStore(home: fixture.home)
+    XCTAssertEqual(try reopened.loadRetainedDraft(for: valid), first)
+    XCTAssertEqual(try reopened.loadRetainedDraft(for: secondKey), second)
+    XCTAssertEqual(try reopened.retain(draft, for: valid), first,
+                   "an exact duplicate reopens the original retained bytes")
+
+    let changedDraft = WorkLaunchManifestDraft(
+        workspace: draft.workspace, runtime: draft.runtime,
+        configuration: WorkServiceWorkConfiguration(recordPayloads: true),
+        requestedCapabilities: [],
+        recordingPolicy: WorkLaunchRecordingPolicy(recordPayloads: true))
+    let changedDigest = try WorkLaunchCreateKey.requestDigest(
+        configuration: changedDraft.configuration,
+        requestedCapabilities: changedDraft.requestedCapabilities)
+    let conflictingKey = WorkLaunchCreateKey(
+        client: valid.client, requestDigest: changedDigest,
+        commandID: valid.commandID, causalControlCursor: advancedCursor)
+    try expectWorkLaunchError({
+        _ = try reopened.retain(changedDraft, for: conflictingKey)
+    }) {
+        if case .requestConflict = $0 { return true }
+        return false
+    }
 
     let wrongDigest = WorkLaunchCreateKey(
         client: valid.client, requestDigest: "sha256:" + String(repeating: "0", count: 64),
-        commandID: valid.commandID, causalControlCursor: fixture.controlCursor)
+        commandID: valid.commandID, causalControlCursor: advancedCursor)
     try expectWorkLaunchError({ _ = try fixture.store.retain(draft, for: wrongDigest) }) {
         if case .requestConflict = $0 { return true }
         return false
     }
+
+    let zeroWithEvent = WorkLaunchCreateKey(
+        client: valid.client, requestDigest: digest, commandID: "zero-with-event",
+        causalControlCursor: JournalCursor(
+            journal: fixture.controlJournal, eventID: "not-genesis", sequence: 0))
+    try expectWorkLaunchError({ _ = try fixture.store.retain(draft, for: zeroWithEvent) }) {
+        if case .invalidManifest = $0 { return true }
+        return false
+    }
+    let positiveWithoutEvent = WorkLaunchCreateKey(
+        client: valid.client, requestDigest: digest, commandID: "positive-without-event",
+        causalControlCursor: JournalCursor(
+            journal: fixture.controlJournal, eventID: nil, sequence: 1))
+    try expectWorkLaunchError({ _ = try fixture.store.retain(draft, for: positiveWithoutEvent) }) {
+        if case .invalidManifest = $0 { return true }
+        return false
+    }
+    for cursor in [
+        JournalCursor(journal: fixture.controlJournal, eventID: " \n", sequence: 1),
+        JournalCursor(journal: fixture.controlJournal, eventID: "overflow", sequence: Int.max),
+        JournalCursor(journal: fixture.controlJournal, eventID: nil, sequence: -1),
+    ] {
+        let malformed = WorkLaunchCreateKey(
+            client: valid.client, requestDigest: digest, commandID: "malformed-cursor",
+            causalControlCursor: cursor)
+        try expectWorkLaunchError({ _ = try fixture.store.retain(draft, for: malformed) }) {
+            if case .invalidManifest = $0 { return true }
+            return false
+        }
+    }
     let wrongJournal = WorkLaunchCreateKey(
         client: valid.client, requestDigest: digest, commandID: "other-command",
-        causalControlCursor: JournalCursor(journal: fixture.workJournal, sequence: 0))
+        causalControlCursor: JournalCursor(
+            journal: fixture.workJournal, eventID: "foreign-control-event", sequence: 23))
     try expectWorkLaunchError({ _ = try fixture.store.retain(draft, for: wrongJournal) }) {
         if case .identityMismatch = $0 { return true }
         return false

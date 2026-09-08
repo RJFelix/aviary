@@ -315,6 +315,7 @@ final class AppModel {
     /// A successful handshake/catalog read cannot resolve an outstanding Create transaction.
     /// Clear this only when the retained Create outbox has actually been reconciled.
     var localWorkServiceCreateError: String?
+    private var localWorkServiceCreatesReconciled = false
     var localWorkServiceError: String? {
         get {
             if localWorkServiceHandshake == nil, let connectivity = localWorkServiceObservationError {
@@ -714,13 +715,18 @@ final class AppModel {
             let (session, freshHandshake) = try await reconnectLocalWorkService()
             localWorkServiceHandshake = freshHandshake
             localWorkspaceCatalog = freshHandshake.workspaceCatalog
-            guard await reconcilePendingCreateIntents(session: session, client: client) else {
-                return
-            }
-            guard await reconcilePendingCreateSessionIntents(
-                session: session, client: client) != .blocked else { return }
+            let createsReconciled = await reconcilePendingCreateIntents(session: session, client: client)
+            let sessionsReconciled = createsReconciled
+                ? await reconcilePendingCreateSessionIntents(session: session, client: client) != .blocked
+                : false
+            let reconciliationWarning = localWorkServiceObservationError
+            // A blocked creation must not hide unrelated attachments or implicitly replay Start.
             await restoreServiceWork(
-                session: session, client: client, handshake: freshHandshake)
+                session: session, client: client, handshake: freshHandshake,
+                resumeInitialStart: createsReconciled && sessionsReconciled)
+            if !sessionsReconciled, localWorkServiceObservationError == nil {
+                localWorkServiceObservationError = reconciliationWarning
+            }
         } catch {
             // The GUI remains usable for Claude Code and historical sessions if the local
             // helper is unavailable.  Keep this error bounded and do not expose launcher paths.
@@ -746,20 +752,29 @@ final class AppModel {
             let (session, handshake) = try await reconnectLocalWorkService()
             localWorkServiceHandshake = handshake
             localWorkspaceCatalog = handshake.workspaceCatalog
-            guard await reconcilePendingCreateIntents(session: session, client: client),
-                  await reconcilePendingCreateSessionIntents(session: session, client: client) != .blocked else { return }
-            await restoreServiceWork(session: session, client: client, handshake: handshake)
+            let createsReconciled = await reconcilePendingCreateIntents(session: session, client: client)
+            let sessionsReconciled = createsReconciled
+                ? await reconcilePendingCreateSessionIntents(session: session, client: client) != .blocked
+                : false
+            let reconciliationWarning = localWorkServiceObservationError
+            await restoreServiceWork(
+                session: session, client: client, handshake: handshake,
+                resumeInitialStart: createsReconciled && sessionsReconciled)
+            if !sessionsReconciled, localWorkServiceObservationError == nil {
+                localWorkServiceObservationError = reconciliationWarning
+            }
         } catch {
             localWorkServiceError = Self.serviceErrorMessage(error)
         }
     }
 
     /// Read the host catalog and recreate every attachment belonging to this durable client.
-    /// This is observation/reconstruction only: the presence of an attachment is not an excuse
-    /// to issue another Attach command, and terminal Work remains inspectable.
+    /// This never issues another Attach. Initial Start recovery is a separate, explicit mode;
+    /// blocked creation reconciliation permits only observation of existing attachments.
     private func restoreServiceWork(
         session: WorkServiceClientSession, client: ClientRef,
-        handshake suppliedHandshake: WorkServiceHandshakeResponse? = nil
+        handshake suppliedHandshake: WorkServiceHandshakeResponse? = nil,
+        resumeInitialStart: Bool = true
     ) async {
         defer { settlePendingChats() }
         let handshake: WorkServiceHandshakeResponse?
@@ -838,7 +853,8 @@ final class AppModel {
                       !hiddenServiceAttachmentKeys.contains(key) else { continue }
                 await adoptServiceAttachment(
                     descriptor: descriptor, attachment: attachment,
-                    session: session, client: client, focus: false)
+                    session: session, client: client, focus: false,
+                    resumeInitialStart: resumeInitialStart)
             }
         }
         // A Start seed may outlive both its GUI and its Run. Terminal Work is not auto-opened
@@ -991,7 +1007,8 @@ final class AppModel {
         session: WorkServiceClientSession,
         client: ClientRef,
         focus: Bool,
-        destination: Section = .live
+        destination: Section = .live,
+        resumeInitialStart: Bool = true
     ) async -> String? {
         guard attachment.session != nil,
               attachment.sessionJournal != nil,
@@ -1084,6 +1101,7 @@ final class AppModel {
                 draftStore: restoredDraft.store,
                 restoredDraft: restoredDraft.snapshot,
                 draftRestorationFailure: restoredDraft.failure)
+            run.initialStartRequiresExplicitRetry = !resumeInitialStart
             // A central restore and an explicit Attach/Create may have started from the same
             // catalog generation. Recheck after every suspension; only one exact attachment
             // becomes a GUI row/controller, and an explicit focusing caller reuses that winner.
@@ -1110,8 +1128,8 @@ final class AppModel {
             run.observeService()
             // A Create may have been durably accepted just before the previous GUI disappeared.
             // Re-drive that exact first prompt only after the attachment has been reconstructed;
-            // refreshService will retry later if this initial read was incomplete.
-            if let unresolvedInitialStart,
+            // refreshService may retry an incomplete first read only in recovery-enabled mode.
+            if resumeInitialStart, let unresolvedInitialStart,
                bridge.projection.isCanonical,
                bridge.hasMatchingStartAttachment(for: unresolvedInitialStart),
                await controller.pendingCommand() == nil {
@@ -1196,6 +1214,7 @@ final class AppModel {
     private func reconcilePendingCreateIntents(
         session: WorkServiceClientSession, client: ClientRef
     ) async -> Bool {
+        localWorkServiceCreatesReconciled = false
         do {
             let store = try ServiceBackedCreateIntentStore(home: home, client: client)
             let pending = try store.loadPending()
@@ -1248,6 +1267,7 @@ final class AppModel {
                 }
             }
             localWorkServiceCreateError = nil
+            localWorkServiceCreatesReconciled = true
             return true
         } catch {
             localWorkServiceCreateError =
@@ -2016,8 +2036,11 @@ final class AppModel {
             }
             localWorkServiceHandshake = handshake
             localWorkspaceCatalog = handshake.workspaceCatalog
-            guard await reconcilePendingCreateSessionIntents(
-                session: session, client: client) != .blocked else { return }
+            let sessionsReconciled = localWorkServiceCreatesReconciled
+                ? await reconcilePendingCreateSessionIntents(session: session, client: client) != .blocked
+                : false
+            let resumeInitialStart = localWorkServiceCreatesReconciled && sessionsReconciled
+            let reconciliationWarning = localWorkServiceObservationError
             // Detached service rows still own this GUI's durable attachment and must continue
             // receiving canonical updates. Presentation detachment is not an observation opt-out.
             let attachedServiceRuns = workRuns
@@ -2036,10 +2059,14 @@ final class AppModel {
                 servicePollOffset = (offset + budget) % attachedServiceRuns.count
             }
             for run in selectedServiceRuns {
-                await run.refreshService()
+                await run.refreshService(resumeInitialStart: resumeInitialStart)
             }
             await restoreServiceWork(
-                session: session, client: client, handshake: handshake)
+                session: session, client: client, handshake: handshake,
+                resumeInitialStart: resumeInitialStart)
+            if !sessionsReconciled, localWorkServiceObservationError == nil {
+                localWorkServiceObservationError = reconciliationWarning
+            }
         } catch {
             localWorkServiceError = Self.serviceErrorMessage(error)
         }
@@ -2048,6 +2075,7 @@ final class AppModel {
     /// Closing Aviary removes only this GUI's transport attachment.  It never sends End,
     /// Complete, Destroy, or a process signal to service-backed Work.
     func disconnectLocalWorkService() async {
+        localWorkServiceCreatesReconciled = false
         for run in workRuns where run.isServiceBacked { await run.disconnect() }
         await localWorkService?.disconnect()
         localWorkServiceHandshake = nil
@@ -3468,6 +3496,7 @@ final class AppModel {
             // a relaunch must not present this newly-created idle Work as an ordinary composer.
             let initialStart = try ServiceBackedCreateIntentStore.InitialStart(
                 commandID: pendingChatID.flatMap { id in pendingChats.first { $0.id == id }?.startCommandID } ?? "start-v2-" + UUID().uuidString.lowercased(), prompt: prompt)
+            localWorkServiceCreatesReconciled = false
             try createIntentStore.retain(createRequest, initialStart: initialStart)
             if let pendingChatID, !updatePendingChat(pendingChatID, phase: .awaitingAcceptance) { return }
             let response = try await session.createWork(createRequest)
@@ -3480,6 +3509,7 @@ final class AppModel {
                 do {
                     guard rejectPendingChatAttempt(createRequest.commandID) else { throw PendingChatError.conflict }
                     try createIntentStore.clear(createRequest)
+                    localWorkServiceCreatesReconciled = true
                 } catch {
                     localWorkServiceCreateError =
                         "Create was rejected, but its durable intent could not be cleared; new Work is withheld until it is reconciled."
@@ -3498,6 +3528,7 @@ final class AppModel {
                 try Self.retainStartIntent(
                     initialStart, response: response, home: home, client: client)
                 try createIntentStore.clear(createRequest)
+                localWorkServiceCreatesReconciled = true
             } catch {
                 // Keeping the intent is safe: the next bootstrap replays the exact idempotent
                 // request and promotes the Start seed again. Surface the durability issue without
@@ -3786,9 +3817,22 @@ struct RunCommandNotice: Equatable {
 
     var level: Level
     var message: String
+    /// Present only for a service-backed success. Warnings deliberately carry no service
+    /// identity so a later refresh can never erase a local error or draft-storage failure.
+    var serviceAcknowledgement: ServiceBackedCommandNotice?
 
-    static func warning(_ message: String) -> Self { .init(level: .warning, message: message) }
-    static func success(_ message: String) -> Self { .init(level: .success, message: message) }
+    static func warning(_ message: String) -> Self {
+        .init(level: .warning, message: message, serviceAcknowledgement: nil)
+    }
+
+    static func success(
+        _ message: String,
+        serviceAcknowledgement: ServiceBackedCommandNotice? = nil
+    ) -> Self {
+        .init(
+            level: .success, message: message,
+            serviceAcknowledgement: serviceAcknowledgement)
+    }
 }
 
 // MARK: - A live run
@@ -4677,8 +4721,9 @@ final class LiveRun: Identifiable {
                 if let retainedMarkerWarning {
                     commandNotice = .warning(retainedMarkerWarning)
                 } else {
-                    commandNotice = .success(
-                        "Start accepted by the Work Host; canonical state is catching up.")
+                    setServiceSuccessNotice(
+                        "Agent service accepted your message; updating this chat…",
+                        kind: .start, receipt: receipt)
                 }
             }
             return .service(receipt)
@@ -4748,6 +4793,45 @@ final class LiveRun: Identifiable {
         publish(serviceBridge.hasCanonicalInputDelivery, to: \.initialPromptDelivered)
     }
 
+    private func serviceAcknowledgement(
+        kind: WorkServiceCommandKind,
+        receipt: WorkServiceCommandReceipt
+    ) -> ServiceBackedCommandNotice? {
+        guard let serviceBridge else { return nil }
+        let key = serviceBridge.serviceAttachmentKey
+        return ServiceBackedCommandNotice(
+            work: receipt.work, commandID: receipt.commandID, kind: kind,
+            client: key.client, attachment: key.clientAttachment,
+            sessionAttachment: key.workSession.sessionAttachment)
+    }
+
+    private func setServiceSuccessNotice(
+        _ message: String,
+        kind: WorkServiceCommandKind,
+        receipt: WorkServiceCommandReceipt
+    ) {
+        commandNotice = .success(
+            message,
+            serviceAcknowledgement: serviceAcknowledgement(kind: kind, receipt: receipt))
+        // Normally the receipt marks the projection as requiring refresh, but a synchronous
+        // duplicate/reconstruction can already have canonical evidence. Reconcile immediately
+        // as well as from the polling path without weakening the incomplete-read guard.
+        reconcileServiceCommandNotice()
+    }
+
+    /// Retire only an acknowledgement whose exact canonical command has caught up. The policy
+    /// is intentionally called after all refresh/recovery work so warnings produced by those
+    /// paths, including local draft failures, remain visible.
+    private func reconcileServiceCommandNotice() {
+        guard let notice = commandNotice,
+              notice.level == .success,
+              let acknowledgement = notice.serviceAcknowledgement,
+              let projection = serviceBridge?.projection else { return }
+        if ServiceBackedCommandNoticePolicy.shouldClear(acknowledgement, from: projection) {
+            commandNotice = nil
+        }
+    }
+
     /// Load one older page for this GUI only. Failure preserves the authenticated rows already
     /// on screen and exposes a retry affordance; it never retries a command or acknowledges a
     /// shared read cursor.
@@ -4779,7 +4863,7 @@ final class LiveRun: Identifiable {
         syncServiceState()
     }
 
-    func refreshService() async {
+    func refreshService(resumeInitialStart: Bool = true) async {
         guard let serviceBridge else { return }
         _ = await serviceBridge.refresh()
         syncServiceState()
@@ -4803,7 +4887,7 @@ final class LiveRun: Identifiable {
         // If the GUI had to wait through a transiently incomplete first read, retry the
         // persisted Start only after the pair is canonical. A command that already crossed the
         // boundary remains in the controller's durable pending record and is never auto-replayed.
-        if !startResolvedByEvidence, let initialStart,
+        if resumeInitialStart, !initialStartRequiresExplicitRetry, !startResolvedByEvidence, let initialStart,
            serviceCommandBarrier.operationsInFlight == 0,
            serviceBridge.projection.isCanonical,
            serviceBridge.hasMatchingStartAttachment(for: initialStart),
@@ -4812,6 +4896,7 @@ final class LiveRun: Identifiable {
             _ = await startService(
                 prompt: initialStart.prompt, commandID: initialStart.commandID)
         }
+        reconcileServiceCommandNotice()
     }
 
     /// User-directed repair of a command whose durable outcome was not yet safely known.
@@ -4836,8 +4921,9 @@ final class LiveRun: Identifiable {
                 markerResolved = true
             }
             if markerResolved {
-                commandNotice = .success(
-                    "The exact pending command was accepted; canonical state is catching up.")
+                setServiceSuccessNotice(
+                    "Agent service accepted your message; updating this chat…",
+                    kind: pending?.kind ?? .start, receipt: receipt)
             }
             syncServiceState()
             return .service(receipt)
@@ -4881,6 +4967,8 @@ final class LiveRun: Identifiable {
 
     private var mirror: Task<Void, Never>?
     private var initialStart: ServiceBackedStartIntent?
+    /// Observation-only reconstruction must not become an automatic Start on the next poll.
+    var initialStartRequiresExplicitRetry = false
     var savedInitialPrompt: String? { initialStart?.prompt }
     func hasCanonicalDelivery(for chat: PendingChat) -> Bool {
         guard let serviceBridge else { return false }
@@ -5134,8 +5222,9 @@ final class LiveRun: Identifiable {
                 if receipt.state == .accepted || receipt.state == .duplicate {
                     if title == "New run" { title = String(text.prefix(60)) }
                     if markerResolved {
-                        commandNotice = .success(
-                            "Command accepted by the Work Host; canonical state is catching up.")
+                        setServiceSuccessNotice(
+                            "Agent service accepted your message; updating this chat…",
+                            kind: kind, receipt: receipt)
                     }
                 }
                 syncServiceState()
@@ -5253,8 +5342,9 @@ final class LiveRun: Identifiable {
                     true
                 }
                 if markerResolved {
-                    commandNotice = .success(
-                        "Follow-up accepted by the Work Host; canonical state is catching up.")
+                    setServiceSuccessNotice(
+                        "Agent service accepted your message; updating this chat…",
+                        kind: .queue, receipt: receipt)
                 }
                 syncServiceState()
                 return .service(receipt)
@@ -5295,8 +5385,9 @@ final class LiveRun: Identifiable {
         if let serviceBridge {
             do {
                 let receipt = try await serviceBridge.cancel(scope: scope)
-                commandNotice = .success(
-                    "Cancellation accepted by the Work Host; canonical state is catching up.")
+                setServiceSuccessNotice(
+                    "Agent service accepted the stop request; updating this chat…",
+                    kind: .cancel, receipt: receipt)
                 syncServiceState()
                 return .service(receipt)
             } catch {
@@ -5438,9 +5529,10 @@ final class LiveRun: Identifiable {
             }
             isEnding = true
             do {
-                _ = try await serviceBridge.end()
-                commandNotice = .success(
-                    "End accepted by the Work Host; waiting for canonical terminal state.")
+                let receipt = try await serviceBridge.end()
+                setServiceSuccessNotice(
+                    "Agent service accepted the end request; updating this chat…",
+                    kind: .end, receipt: receipt)
             } catch {
                 commandNotice = .warning(serviceBridge.errorBanner ?? "The Work Host did not accept End.")
             }

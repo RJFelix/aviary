@@ -189,3 +189,73 @@ docs (the model's summary exposed their conflicting claims). Add a default full 
 using the production prompt builder, not only a one-source test prompt. Host-policy changes across
 Create replay still need an explicit original-authorization retention contract; this check used
 unchanged grants. Generic launch failures remain retained unless non-admission is proven.
+
+## Conversation ergonomics — 2026-09-08
+
+The next slice keeps execution/control contracts intact and changes the primary interaction:
+
+- Title, state, project/model, and controls have separate space at narrow widths. Machine IDs
+  and unknown timing are no longer permanent chat-list/header decoration; exact evidence is
+  still available in details. Ended/failed fallback cards no longer call themselves ready.
+- Current activity is a compact recorded intent/type/state, not three columns of missing
+  explanations. No recorded current step is explicitly reported as such. Activity opens current
+  and recent completed actions from the chat, with evidence disclosure and projection omissions.
+- A full-width composer defaults busy messages to separate follow-ups where supported. “Guide
+  current work” is an explicit, one-message override; failed submissions preserve the choice and
+  draft. Timing is explained beside the control. Markdown preview is opt-in.
+- “Stop after step” retains the exact supported safe-boundary cancellation scope. Ending the
+  agent session is a confirmed secondary action; leaving a chat never implies termination.
+- Changes/review explains the saved working-tree observation in ordinary language. Attribution
+  and checkpoint limits remain inspectable; the sensitive-file-content warning stays visible
+  before loading. Review still prepares a draft, never sends feedback automatically.
+- Acknowledgements carry exact command identity and retire only after matching canonical
+  acceptance evidence catches up. This is not proof of runtime delivery or task completion.
+  Local warnings and draft-storage errors cannot be retired by that policy. Historical read
+  diagnostics remain inspectable but stop blocking the composer after a verified fresh read.
+- A failed new-chat reconciliation no longer skips reconstruction of unrelated existing
+  attachments on GUI startup/reconnect. New creation still waits for reconciliation; existing
+  chats still require their own complete, identity-fenced catalog and canonical reads. Blocked
+  recovery is observation-only through both restoration and later polling: it cannot implicitly
+  retry a retained Start. Explicit Check delivery remains available. The signed journey probe
+  has a guarded case and a recovery-enabled control that admits exactly one Start.
+
+Verification must include the signed production chat, not just the 520px/1200px populated
+fixtures. The planned isolated cart exercise starts from a failing quantity-total test, receives
+a real agent edit, inspects the saved diff, prepares a revision in the composer, and verifies
+the resulting files independently. It must not reuse or send any of Ryan's other saved prompts.
+
+After this slice, the remaining product work is chiefly richer progress summaries across child
+agents/background work, a more integrated changes-and-evidence workspace, and stronger ongoing
+real-use/remote regression coverage. Broader command ownership, security containment, and a new
+timeline architecture are not prerequisites for these conversation improvements.
+
+### Conversation slice verification and newly exposed startup boundary
+
+- Full macOS SelfTest before the final Create-key correction: **1,040 cases / 14,732
+  assertions**, all passed in **537.81s**. Notice retirement and recovered-read admission have
+  **8 / 25** focused assertions; busy-message presentation has **2 / 15**.
+- Populated production-view fixtures were inspected at 520px and 1200px; the narrow composer
+  and header no longer truncate their primary controls. These are pane fixtures, not a claim
+  that the whole application window supports 520px. The actual signed GUI also restored the
+  existing conversation with an enabled composer and without the obsolete acknowledgement.
+- The real coding exercise stopped before admission of its new chat: the launch manifest store
+  required a genesis control cursor, so a second Create on an already-used host failed with an
+  internal error. The exact test request remains saved; no agent edited the cart project. This
+  is a missing production-sequence regression, not evidence that the coding/review journey passed.
+- The corrected store accepts well-formed cursors in the exact host control journal; the control
+  journal still performs current-cursor CAS. A real durable resolver/Unix-socket regression now
+  creates two distinct chats and replays both identities without another creation or control
+  append: **1 case / 65 assertions**, passed. It does not call a live provider.
+- Final focused Create-key validation is **1 / 13**; the full local launch-resolver group is
+  **7 / 101**. The signed AppModel save/failure/relaunch/retry probe passes. Successful action
+  history now keeps internal targets and retry warnings in its expanded evidence rather than
+  presenting every completed step as a warning; failed/indeterminate warnings remain visible.
+- The signed GUI was quit and reopened with the test Create still unresolved: the original
+  chat reattached, showed Ready with its composer available, and preserved the separate startup
+  warning. The original helper and its Python PID were unchanged. The populated activity sheet
+  was visually inspected; its repeated action rows have stable accessibility identifiers.
+- Deployment must not kill the existing user's live Python namespace. Replacing the signed
+  helper on disk does not upgrade its running process. Explicit End and a graceful service
+  restart require user intent; after End changes the control cursor, the saved test Create may
+  need a proven-stale rejection followed by an explicit fresh attempt. Do not silently mint a
+  replacement request or infer delivery from a green connection badge.

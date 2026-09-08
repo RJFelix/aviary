@@ -575,6 +575,51 @@ func test_localWorkHostLaunchResolverServesQualifiedModelsThroughDurableSocket()
             try await connected.listWorks(WorkServiceListRequest(client: clientRef))
         }
         XCTAssertEqual(page.works.map(\.work), [created.work.work])
+
+        // The controller refresh above advanced the shared control journal with read
+        // acknowledgements. A later Create must retain that exact non-genesis cursor rather than
+        // treating the first Create of the Host lifetime as the only valid launch key.
+        let secondRequest = request(
+            commandID: "qualified-model-create-after-control-progress",
+            cursor: afterDuplicate.controlCursor,
+            modelID: fixture.modelID)
+        let second = try await localResolverStage("second socket Create after control progress") {
+            try await connected.createWork(secondRequest)
+        }
+        XCTAssertEqual(second.receipt.state, .accepted)
+        XCTAssertNotEqual(second.work.work, created.work.work)
+        XCTAssertNotEqual(second.session, created.session)
+        XCTAssertNotEqual(second.sessionJournal, created.sessionJournal)
+        XCTAssertNotEqual(second.sessionAttachment, created.sessionAttachment)
+        XCTAssertNotEqual(second.attachment.attachment, created.attachment.attachment)
+
+        let afterSecond = try await localResolverStage("post-second-Create handshake") {
+            try await connected.handshake(WorkServiceHandshakeRequest(client: clientRef))
+        }
+        XCTAssertNotEqual(afterSecond.controlCursor, afterDuplicate.controlCursor)
+        let secondDuplicate = try await localResolverStage("duplicate second socket Create") {
+            try await connected.createWork(secondRequest)
+        }
+        XCTAssertEqual(secondDuplicate.receipt.state, .duplicate)
+        XCTAssertEqual(secondDuplicate.work.work, second.work.work)
+        XCTAssertEqual(secondDuplicate.session, second.session)
+        XCTAssertEqual(secondDuplicate.sessionJournal, second.sessionJournal)
+        XCTAssertEqual(secondDuplicate.sessionAttachment, second.sessionAttachment)
+        XCTAssertEqual(secondDuplicate.attachment.attachment, second.attachment.attachment)
+        XCTAssertEqual(secondDuplicate.workCursor, second.workCursor)
+        XCTAssertEqual(secondDuplicate.sessionCursor, second.sessionCursor)
+        XCTAssertEqual(secondDuplicate.controlCursor, second.controlCursor)
+        XCTAssertEqual(secondDuplicate.receipt.resultingControlCursor, second.controlCursor)
+        let afterSecondDuplicate = try await localResolverStage(
+            "post-second-duplicate handshake") {
+                try await connected.handshake(WorkServiceHandshakeRequest(client: clientRef))
+            }
+        XCTAssertEqual(afterSecondDuplicate.controlCursor, afterSecond.controlCursor)
+
+        let twoWorkPage = try await localResolverStage("two-Work final list") {
+            try await connected.listWorks(WorkServiceListRequest(client: clientRef))
+        }
+        XCTAssertEqual(Set(twoWorkPage.works.map(\.work)), Set([created.work.work, second.work.work]))
         await connected.close()
         client = nil
         await coordinator.forceStop()

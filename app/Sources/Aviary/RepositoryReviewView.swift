@@ -23,6 +23,7 @@ struct RepositoryReviewView: View {
     @State private var placedInComposer = false
     @State private var placedFeedbackCount = 0
     @State private var loadIdentity: UUID?
+    @State private var showReviewLimits = false
     @Environment(\.dismiss) private var dismiss
 
     init(run: LiveRun) {
@@ -95,7 +96,7 @@ struct RepositoryReviewView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Review changes")
                     .font(.system(size: 14, weight: .semibold))
-                Text("Bounded repository observation")
+                Text("A saved view of the working tree")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
             }
@@ -112,18 +113,22 @@ struct RepositoryReviewView: View {
     private var boundaryNotice: some View {
         VStack(alignment: .leading, spacing: 4) {
             Label(
-                "Observed working-tree state relative to recorded HEAD",
+                "Working-tree changes, not just the agent's edits",
                 systemImage: "eye")
                 .font(.system(size: 11.5, weight: .semibold))
                 .foregroundStyle(Design.accent)
-            Text(
-                "This is an observation only — not attribution, a checkpoint, or containment. "
-                    + "Aviary does not stage, revert, commit, or intentionally write worktree contents. "
-                    + "Tracked diff text is file content and may contain sensitive values or host paths."
-            )
+            Text("This saved review can include your edits and other work. Reading it does not change any files.")
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            DisclosureGroup("What this review covers", isExpanded: $showReviewLimits) {
+                Text("Changes are relative to the recorded Git HEAD, at the time shown below. "
+                    + "This is not a checkpoint or proof that the task is correct. "
+                    + "File contents may include sensitive values or paths. "
+                    + "Aviary does not stage, revert, or commit anything from this view.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }.font(.caption)
         }
         .padding(11)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -135,26 +140,29 @@ struct RepositoryReviewView: View {
     }
 
     private var loadPrompt: some View {
-        Card("Review artifact", symbol: "arrow.down.circle") {
+        Card("Saved changes", symbol: "arrow.down.circle") {
             VStack(alignment: .leading, spacing: 8) {
                 Text(
                     selectedDescriptor == nil
                         ? "A matching review artifact is no longer available."
-                        : "The matching artifact is ready to read. Loading rechecks its canonical identity before anything is shown."
+                        : "Open the recorded file changes and diffs, then prepare feedback for the agent. Aviary checks that the saved review still matches this chat."
                 )
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Diffs show file contents, which may include sensitive values or paths.")
+                    .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let selectedDescriptor {
                     HStack(spacing: 8) {
                         Chip(text: selectedDescriptor.available ? "available" : "unavailable",
                              tint: selectedDescriptor.available ? Design.success : Design.warning)
-                        Text("bounded body")
+                        Text("saved review")
                             .font(Design.mono(9.5))
                             .foregroundStyle(.tertiary)
                     }
                 }
-                Button("Load review") {
+                Button("Show file changes") {
                     loadReview()
                 }
                 .buttonStyle(.borderedProminent)

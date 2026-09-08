@@ -39,6 +39,113 @@ enum ChatJourneyProbe {
         throw Failure.assertion("preflight did not settle")
     }
 
+    /// Exercise the AppModel LiveRun restore guard against a real canonical in-memory host.
+    /// This stays below bootstrap/model/GUI boundaries: Create is the only host setup, and the
+    /// Start seed is retained exactly as it would be across a process restart.
+    @MainActor private static func makeServiceProbeRun(
+        service: InMemoryWorkService,
+        response: WorkServiceCreateWorkResponse,
+        home: AgentHome,
+        prompt: String,
+        commandID: String
+    ) async throws -> LiveRun {
+        guard let key = ServiceAttachmentKey(
+            work: response.work.work, attachment: response.attachment) else {
+            throw Failure.assertion("canonical Create response had no attachment key")
+        }
+        let intentStore = try WorkServiceAttachedWorkIntentStore(home: home, key: key)
+        let controller = try WorkServiceAttachedWorkController(
+            service: service, seed: .created(response), intentStore: intentStore)
+        let projection = try await controller.refresh()
+        let start = try ServiceBackedStartIntent(
+            client: response.attachment.client,
+            work: response.work.work,
+            session: response.session,
+            sessionJournal: response.sessionJournal,
+            sessionAttachment: response.sessionAttachment,
+            clientAttachment: response.attachment.attachment,
+            causalWorkCursor: response.workCursor,
+            commandID: commandID,
+            prompt: prompt)
+        let startStore = try ServiceBackedStartIntentStore(home: home, key: key)
+        try startStore.retain(start)
+        let bridge = ServiceBackedRunBridge(
+            controller: controller,
+            projection: projection,
+            history: await controller.conversationHistory(),
+            serviceAttachmentKey: key,
+            workspaceLabel: "journey-probe",
+            modelLabel: nil,
+            thinkingLevel: nil)
+        return LiveRun(
+            service: bridge,
+            initialStart: start,
+            initialStartStore: startStore)
+    }
+
+    @MainActor private static func runServiceInitialStartProbe(root: URL) async throws {
+        let home = AgentHome(root: root.appending(
+            path: "service-home", directoryHint: .isDirectory))
+        try FileManager.default.createDirectory(at: home.root, withIntermediateDirectories: true)
+        let host = WorkHostRef("journey-probe-host")
+        let client = ClientRef("journey-probe-client")
+        let grants = Set(WorkServiceCapability.allCases)
+        let service = InMemoryWorkService(
+            host: host,
+            instanceID: "journey-probe-instance",
+            startIdentity: "journey-probe-start",
+            authorizer: WorkServiceCapabilityPolicy(grantsByClient: [client: grants]))
+        let first = try await service.createWork(.init(
+            client: client,
+            commandID: "journey-create-guarded",
+            causalControlCursor: JournalCursor(
+                journal: .workHost(host), sequence: 0),
+            requestedCapabilities: grants))
+        let guarded = try await makeServiceProbeRun(
+            service: service, response: first, home: home,
+            prompt: "preserve this initial prompt", commandID: "journey-start-guarded")
+        guarded.initialStartRequiresExplicitRetry = true
+        await guarded.refreshService()
+        guard let guardedProjection = guarded.serviceProjection else {
+            throw Failure.assertion("guarded service run lost its projection")
+        }
+        try require(
+            guarded.savedInitialPrompt == "preserve this initial prompt",
+            "explicit-retry restore dropped the retained initial prompt")
+        try require(
+            guardedProjection.workSnapshot.commands.values.allSatisfy {
+                $0.commandKind != .start
+            } && guardedProjection.descriptor.currentRun == nil
+                && guardedProjection.workSnapshot.activeRun == nil,
+            "explicit-retry restore admitted Start during refresh")
+
+        // A fresh idle Work proves the control: ordinary reconstruction still admits exactly one
+        // Start, and the canonical follow-up refresh resolves its retained marker.
+        let latest = try await service.handshake(.init(client: client))
+        let second = try await service.createWork(.init(
+            client: client,
+            commandID: "journey-create-default",
+            causalControlCursor: latest.controlCursor,
+            requestedCapabilities: grants))
+        let ordinary = try await makeServiceProbeRun(
+            service: service, response: second, home: home,
+            prompt: "ordinary initial prompt", commandID: "journey-start-default")
+        await ordinary.refreshService(resumeInitialStart: false)
+        try require(ordinary.serviceProjection?.descriptor.currentRun == nil
+                    && ordinary.savedInitialPrompt == "ordinary initial prompt",
+                    "observation-only poll admitted or dropped a retained Start")
+        await ordinary.refreshService()
+        await ordinary.refreshService()
+        guard let ordinaryProjection = ordinary.serviceProjection else {
+            throw Failure.assertion("ordinary service run lost its projection")
+        }
+        let starts = ordinaryProjection.workSnapshot.commands.values.filter {
+            $0.commandKind == .start
+        }
+        try require(starts.count == 1 && ordinaryProjection.descriptor.currentRun != nil,
+                    "default restore did not admit exactly one canonical Start")
+    }
+
     @MainActor private static func run() async throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "aviary-chat-journey-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -129,5 +236,7 @@ enum ChatJourneyProbe {
                                                  prompt: "keep this in the editor"), "save failure claimed success")
         try require(failedSave.pendingChats.isEmpty && failedSave.pendingChatStoreError != nil,
                     "save failure missing visible explanation")
+
+        try await runServiceInitialStartProbe(root: root)
     }
 }

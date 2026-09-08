@@ -3145,6 +3145,9 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
     }
 
     private func validateCreateKeyShape(_ key: WorkLaunchCreateKey) throws {
+        // Create keys are caller-owned, but their causal clock is still a canonical control
+        // cursor. It may name any well-formed control-journal position; only the host's reserve
+        // operation decides whether that position is current (and performs the CAS).
         guard !key.client.clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               key.client.clientID.utf8.count <= limits.maximumIdentityBytes,
               !key.client.clientID.unicodeScalars.contains(where: { $0.value == 0 }),
@@ -3152,6 +3155,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
               key.commandID.utf8.count <= limits.maximumIdentityBytes,
               !key.commandID.unicodeScalars.contains(where: { $0.value == 0 }),
               key.causalControlCursor.sequence >= 0,
+              key.causalControlCursor.sequence < Int.max,
               key.causalControlCursor.journal.stableKey.utf8.count <= limits.maximumIdentityBytes,
               !key.causalControlCursor.journal.stableKey.unicodeScalars.contains(where: { $0.value == 0 }),
               (key.causalControlCursor.eventID?.utf8.count ?? 0) <= limits.maximumIdentityBytes,
@@ -3159,10 +3163,17 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         else {
             throw WorkLaunchManifestStoreError.invalidManifest("create key")
         }
+        if key.causalControlCursor.sequence == 0, key.causalControlCursor.eventID != nil {
+            throw WorkLaunchManifestStoreError.invalidManifest("create key cursor")
+        }
+        if key.causalControlCursor.sequence > 0 {
+            guard let eventID = key.causalControlCursor.eventID,
+                  !eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw WorkLaunchManifestStoreError.invalidManifest("create key cursor")
+            }
+        }
         let persistedHost = try home.requirePersistedWorkHost()
-        let expected = JournalCursor(
-            journal: .workHost(persistedHost), eventID: nil, sequence: 0)
-        guard key.causalControlCursor == expected else {
+        guard key.causalControlCursor.journal == .workHost(persistedHost) else {
             throw WorkLaunchManifestStoreError.identityMismatch
         }
     }
