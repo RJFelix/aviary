@@ -81,6 +81,33 @@ private func bootstrapSocketRoot(_ name: String) throws -> URL {
     return url
 }
 
+/// Reproduce the kernel artifact left when a daemon disappears without running listener cleanup:
+/// a socket inode remains at the published path, but no descriptor is listening on it.
+private func bootstrapLeaveStaleSocket(at url: URL) throws {
+    let bytes = Data(url.path.utf8)
+    guard !bytes.isEmpty, bytes.count <= 103 else {
+        throw NSError(domain: "AviarySelfTest", code: 2)
+    }
+    let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+    defer { close(descriptor) }
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    var nulTerminated = bytes
+    nulTerminated.append(0)
+    withUnsafeMutableBytes(of: &address.sun_path) { destination in
+        nulTerminated.withUnsafeBytes { source in
+            destination.copyBytes(from: source)
+        }
+    }
+    let result = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    guard result == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+}
+
 func testWorkServiceClientIdentityIsStableAndAtomic() async throws {
     let root = try bootstrapScratchDirectory("identity")
     defer { try? FileManager.default.removeItem(at: root) }
@@ -96,6 +123,37 @@ func testWorkServiceClientIdentityIsStableAndAtomic() async throws {
     XCTAssertEqual(information.st_mode & mode_t(0o077), 0)
     let bytes = try Data(contentsOf: store.url)
     XCTAssertEqual(bytes.count, first.clientID.utf8.count + 1)
+}
+
+func testWorkServiceClientIdentityUsesPrivateChildOfConventionalHome() throws {
+    let root = try bootstrapScratchDirectory("identity-conventional-home")
+    defer { try? FileManager.default.removeItem(at: root) }
+    XCTAssertEqual(chmod(root.path, mode_t(0o755)), 0)
+    let home = AgentHome(root: root)
+    let formerRootLevelFile = root.appending(
+        path: "work-service-client-id", directoryHint: .notDirectory)
+
+    let first = try WorkServiceClientIdentityStore(
+        url: home.workServiceClientIdentityFile).loadOrCreate()
+    XCTAssertFalse(FileManager.default.fileExists(atPath: formerRootLevelFile.path),
+                   "opening the private store must not create or migrate a root-level identity")
+
+    var rootInformation = stat()
+    XCTAssertEqual(lstat(root.path, &rootInformation), 0)
+    XCTAssertEqual(rootInformation.st_mode & mode_t(0o777), mode_t(0o755),
+                   "identity creation must not chmod the existing AgentHome")
+    var directoryInformation = stat()
+    XCTAssertEqual(lstat(home.workServiceClientIdentityDirectory.path, &directoryInformation), 0)
+    XCTAssertEqual(directoryInformation.st_mode & S_IFMT, mode_t(S_IFDIR))
+    XCTAssertEqual(directoryInformation.st_mode & mode_t(0o777), mode_t(0o700))
+    var fileInformation = stat()
+    XCTAssertEqual(lstat(home.workServiceClientIdentityFile.path, &fileInformation), 0)
+    XCTAssertEqual(fileInformation.st_mode & S_IFMT, mode_t(S_IFREG))
+    XCTAssertEqual(fileInformation.st_mode & mode_t(0o777), mode_t(0o600))
+
+    let reopened = try WorkServiceClientIdentityStore(
+        url: home.workServiceClientIdentityFile).loadOrCreate()
+    XCTAssertEqual(reopened, first)
 }
 
 func testWorkServiceClientIdentityRejectsMalformedAndPrivateBoundaryViolations() async throws {
@@ -203,6 +261,68 @@ func testLocalWorkServiceBootstrapCoalescesLaunchAndAcceptsRacingDaemon() async 
     XCTAssertEqual(await firstSession.state, .connected(instance))
     await bootstrap.disconnect()
     await server.stop()
+}
+
+func testLocalWorkServiceBootstrapReplacesStaleDiscoveredEndpoint() async throws {
+    let host = WorkHostRef("bootstrap-stale-host")
+    let client = ClientRef("bootstrap-stale-client")
+    let socketRoot = try bootstrapSocketRoot("stale-endpoint")
+    defer { try? FileManager.default.removeItem(at: socketRoot) }
+    let staleEndpoint = WorkServiceTransportEndpoint(
+        path: socketRoot.appending(path: "dead.sock", directoryHint: .notDirectory).path)
+    try bootstrapLeaveStaleSocket(at: URL(fileURLWithPath: staleEndpoint.path))
+    let freshEndpoint = WorkServiceTransportEndpoint(
+        path: socketRoot.appending(path: "replacement.sock", directoryHint: .notDirectory).path)
+    let service = InMemoryWorkService(
+        host: host, instanceID: "bootstrap-stale-replacement-instance",
+        startIdentity: "bootstrap-stale-replacement-start",
+        authorizer: WorkServiceCapabilityPolicy(
+            grantsByClient: [client: Set(WorkServiceCapability.allCases)]))
+    let instance = await service.hostInstance
+    let stale = WorkServiceHostLocation(
+        host: host,
+        expectedInstance: WorkHostInstanceRef(
+            host: host, instanceID: "bootstrap-dead-instance",
+            startIdentity: "bootstrap-dead-start"),
+        protocolVersion: WorkServiceProtocol.currentVersion,
+        transport: .unixSocket(staleEndpoint))
+    let fresh = WorkServiceHostLocation(
+        host: host, expectedInstance: instance,
+        protocolVersion: WorkServiceProtocol.currentVersion,
+        transport: .unixSocket(freshEndpoint))
+    let locator = BootstrapSequenceLocator([stale, fresh])
+    let server = WorkServiceUnixSocketServer(endpoint: freshEndpoint, service: service)
+    let launches = BootstrapLaunchCounter()
+    let bootstrap = try LocalWorkServiceBootstrap(
+        locator: locator, client: client, timeout: 2, pollInterval: 0.005,
+        launcher: {
+            await launches.invoked()
+            try await server.start()
+        })
+
+    let session = try await bootstrap.connect()
+    XCTAssertEqual(await launches.count, 1)
+    XCTAssertEqual(await session.state, .connected(instance))
+    await bootstrap.disconnect()
+    await server.stop()
+}
+
+func testLocalWorkServiceBootstrapPreservesSafeLauncherFailure() async throws {
+    let bootstrap = try LocalWorkServiceBootstrap(
+        locator: BootstrapFixedLocator(location: nil),
+        client: ClientRef("bootstrap-launch-error-client"),
+        launcher: { throw LocalAviaryDaemonLauncherError.executableNotFound })
+    do {
+        _ = try await bootstrap.connect()
+        XCTFail("a missing approved daemon executable must remain distinguishable")
+    } catch LocalWorkServiceBootstrapError.launcherFailed(let error) {
+        XCTAssertEqual(error, .executableNotFound)
+        XCTAssertEqual(
+            error.errorDescription,
+            "The Aviary Work Host executable was not found in an approved location.")
+    } catch {
+        XCTFail("unexpected launcher failure classification")
+    }
 }
 
 func testLocalWorkServiceBootstrapRediscoveriesAfterStaleGeneration() async throws {
@@ -461,6 +581,9 @@ let casesLocalWorkServiceBootstrap: [Case] = [
     ("phase3 local Work service client identity is stable and atomic", {
         try await testWorkServiceClientIdentityIsStableAndAtomic()
     }),
+    ("phase3 local Work service client identity uses a private conventional-home child", {
+        try testWorkServiceClientIdentityUsesPrivateChildOfConventionalHome()
+    }),
     ("phase3 local Work service client identity rejects malformed/private records", {
         try await testWorkServiceClientIdentityRejectsMalformedAndPrivateBoundaryViolations()
     }),
@@ -469,6 +592,12 @@ let casesLocalWorkServiceBootstrap: [Case] = [
     }),
     ("phase3 local Work service bootstrap coalesces a racing daemon launch", {
         try await testLocalWorkServiceBootstrapCoalescesLaunchAndAcceptsRacingDaemon()
+    }),
+    ("phase3 local Work service bootstrap replaces a stale discovered endpoint", {
+        try await testLocalWorkServiceBootstrapReplacesStaleDiscoveredEndpoint()
+    }),
+    ("phase3 local Work service bootstrap preserves safe launcher failures", {
+        try await testLocalWorkServiceBootstrapPreservesSafeLauncherFailure()
     }),
     ("phase3 local Work service bootstrap rediscoveries after stale generation", {
         try await testLocalWorkServiceBootstrapRediscoveriesAfterStaleGeneration()

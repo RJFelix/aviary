@@ -210,8 +210,8 @@ struct CommandPaletteView: View {
                     ].compactMap { $0 }.joined(separator: " · "),
                     symbol: "cpu", tint: Design.assistant,
                     action: {
-                        model.section = .live
-                        NotificationCenter.default.post(name: .aviaryNewRun, object: nil)
+                        model.newChatRequested = true
+                        model.section = .cockpit
                     }))
                 if out.count >= 200 { break }
             }
@@ -232,12 +232,12 @@ struct CommandPaletteView: View {
 
     private var actions: [Entry] {
         [
-            Entry(kind: .action, title: "New run…",
-                  subtitle: "Launch the engine and drive it from here",
+            Entry(kind: .action, title: "New chat…",
+                  subtitle: "Start a conversation about a coding task",
                   symbol: "play.circle.fill", tint: Design.success,
                   action: {
-                      model.section = .live
-                      NotificationCenter.default.post(name: .aviaryNewRun, object: nil)
+                      model.newChatRequested = true
+                      model.section = .cockpit
                   }),
             Entry(kind: .action, title: "Refresh everything",
                   subtitle: "Rescan transcripts, runtime health, and the model catalog",

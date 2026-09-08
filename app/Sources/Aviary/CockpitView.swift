@@ -10,6 +10,7 @@ struct CockpitView: View {
     /// as every other run, and choosing it fills the same detail pane a run's chat would use
     /// rather than opening a modal over it. See `NewSessionPane`.
     @State private var composingNewSession = false
+    @State private var showsConnections = false
     @State private var selectedCanonicalEntryID: String?
     /// Selecting a Session does not select one of its Works. This exact key is set only by the
     /// relationship card in the Session pane, so several attached Works never collapse by order.
@@ -19,19 +20,24 @@ struct CockpitView: View {
         GeometryReader { geo in
             HStack(spacing: 0) {
                 runRail
-                    .frame(width: geo.size.width / 3)
+                    .frame(width: min(280, max(190, geo.size.width * 0.27)))
                 Divider()
                 detail
-                    .frame(width: geo.size.width * 2 / 3 - 1)
+                    .frame(maxWidth: .infinity)
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
+        .onChange(of: model.newChatRequested) { _, requested in
+            if requested { beginNewChat() }
+        }
+        .onAppear { if model.newChatRequested { beginNewChat() } }
+        .sheet(isPresented: $showsConnections) { ChatConnectionsView() }
     }
 
     private var ongoingRuns: [LiveRun] {
         // An exited run is still valuable on Live until dismissed, but it is no longer an
         // ongoing conversation. Keep the front page about work that can receive a message.
-        model.runs.filter { !$0.hasExited }
+        model.runs
     }
 
     /// Live attachments without a canonical Session row remain visible as an explicit fallback.
@@ -63,6 +69,7 @@ struct CockpitView: View {
     }
 
     private var selectedCanonicalEntry: CanonicalSessionWorkspaceRailEntry? {
+        if model.selectedPendingChatID != nil { return nil }
         if let selectedCanonicalEntryID,
            let entry = canonicalEntries.first(where: { $0.id == selectedCanonicalEntryID }) {
             return entry
@@ -90,15 +97,46 @@ struct CockpitView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text("SESSION WORKSPACE")
+                    Text("CHATS")
                         .font(Design.sectionTitle).tracking(0.6)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Text("\(unrepresentedRuns.count + canonicalEntries.count)")
+                    Text("\(model.pendingChats.count + unrepresentedRuns.count + canonicalEntries.count)")
                         .font(Design.numeric(10, weight: .semibold))
                         .foregroundStyle(.tertiary)
+                    Button { showsConnections = true } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }.buttonStyle(.plain)
+                        .accessibilityLabel("Manage agent connections")
+                        .help("Manage agent connections and reopen detached chats")
                 }
                 .padding(.horizontal, 12).padding(.top, 12)
+
+                NewRunRailCard(selected: composingNewSession) { beginNewChat() }
+
+                if let error = model.pendingChatStoreError {
+                    Text(error).font(.caption).foregroundStyle(Design.danger)
+                        .textSelection(.enabled).padding(8)
+                }
+                ForEach(model.pendingChats) { chat in
+                    Button {
+                        model.selectedPendingChatID = chat.id
+                        composingNewSession = false
+                        selectedCanonicalEntryID = nil
+                        selectedCanonicalWorkTarget = nil
+                    } label: {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(chat.prompt.isEmpty ? "New chat" : String(chat.prompt.prefix(90)))
+                                .font(.system(size: 12, weight: .medium)).lineLimit(2)
+                            Label(model.pendingChatStatus(chat), systemImage: "bubble.left.and.exclamationmark.bubble.right")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                        .background(RoundedRectangle(cornerRadius: 9).fill(
+                            model.selectedPendingChatID == chat.id && !composingNewSession
+                                ? Design.accentSoft : Color.secondary.opacity(0.05)))
+                    }.buttonStyle(.plain)
+                }
 
                 if !needsAttentionEntries.isEmpty {
                     railHeading("NEEDS YOU")
@@ -106,11 +144,12 @@ struct CockpitView: View {
                 }
 
                 if !unrepresentedRuns.isEmpty {
-                    railHeading("LOCAL ATTACHMENTS")
+                    railHeading("RECENT")
                 }
                 ForEach(unrepresentedRuns) { run in
                     RunRailCard(run: run, selected: isShowing(run)) {
                         model.focusedRunID = run.id
+                        model.selectedPendingChatID = nil
                         selectedCanonicalEntryID = nil
                         selectedCanonicalWorkTarget = nil
                         composingNewSession = false
@@ -128,14 +167,8 @@ struct CockpitView: View {
                 }
 
                 if !otherEntries.isEmpty {
-                    railHeading("OTHER SESSIONS")
+                    railHeading("RECENT CONVERSATIONS")
                     ForEach(otherEntries) { entry in workspaceCard(entry) }
-                }
-
-                NewRunRailCard(selected: composingNewSession) {
-                    composingNewSession = true
-                    selectedCanonicalEntryID = nil
-                    selectedCanonicalWorkTarget = nil
                 }
 
                 if model.canonicalWorkspaceRail.omittedEntryCount > 0 {
@@ -159,6 +192,8 @@ struct CockpitView: View {
         if composingNewSession {
             NewSessionPane(onStart: { composingNewSession = false },
                             onCancel: { composingNewSession = false })
+        } else if let chat = model.pendingChats.first(where: { $0.id == model.selectedPendingChatID }) {
+            PendingChatPane(chat: chat)
         } else if let entry = selectedCanonicalEntry,
                   entry.workEvidence.count + entry.omittedWorkEvidenceCount > 1 {
             // Keep the Session's Work relationship selector visible even after one relationship
@@ -172,7 +207,7 @@ struct CockpitView: View {
                 selectedCanonicalWorkTarget = target
             }
         } else if let run = selectedRun {
-            // Live keeps its optional diagnostics inspector. Cockpit promises chat space.
+            // Keep chat space primary; context and working state open from the run header.
             RunPane(run: run, showsInspector: false)
         } else if let entry = selectedCanonicalEntry {
             CanonicalSessionWorkspacePane(
@@ -182,11 +217,7 @@ struct CockpitView: View {
                 selectedCanonicalWorkTarget = target
             }
         } else {
-            EmptyStateView(
-                symbol: "plus.bubble",
-                title: "Start a session",
-                message: "Your ongoing sessions appear in the left rail. Start one here, then "
-                    + "its chat and Markdown-aware composer stay on this page.")
+            NewSessionPane(onStart: { composingNewSession = false })
         }
     }
 
@@ -260,9 +291,18 @@ struct CockpitView: View {
             selected: !composingNewSession && selectedCanonicalEntry?.id == entry.id
         ) {
             selectedCanonicalEntryID = entry.id
+            model.selectedPendingChatID = nil
             selectedCanonicalWorkTarget = nil
             composingNewSession = false
         }
+    }
+
+    private func beginNewChat() {
+        composingNewSession = true
+        model.selectedPendingChatID = nil
+        selectedCanonicalEntryID = nil
+        selectedCanonicalWorkTarget = nil
+        model.newChatRequested = false
     }
 
     private func railHeading(_ title: String) -> some View {
@@ -280,17 +320,19 @@ struct CockpitView: View {
 /// header that reads "cancel back to whatever was selected" rather than "dismiss".
 private struct NewSessionPane: View {
     var onStart: () -> Void
-    var onCancel: () -> Void
+    var onCancel: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Label("New session", systemImage: "plus.circle.fill")
+                Label("New chat", systemImage: "plus.bubble")
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
-                Button("Cancel", action: onCancel)
-                    .buttonStyle(.bordered).controlSize(.small)
-                    .keyboardShortcut(.cancelAction)
+                if let onCancel {
+                    Button("Cancel", action: onCancel)
+                        .buttonStyle(.bordered).controlSize(.small)
+                        .keyboardShortcut(.cancelAction)
+                }
             }
             .padding(14)
 
@@ -770,7 +812,7 @@ private struct NewRunRailCard: View {
             HStack(spacing: 8) {
                 Image(systemName: "plus")
                     .font(.system(size: 13, weight: .semibold))
-                Text("New session")
+                Text("New chat")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
             }

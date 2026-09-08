@@ -39,7 +39,7 @@ browser redirect cannot reach this machine). Credentials live in Aviary's own `a
 
 Flags: `--cwd <path>`, `--host python3-shared` (for numpy/pandas), `--record` (capture request
 payloads), `--budget <tokens>` and `--minutes <n>` (a goal the agent can see and plan against),
-`--quiet`. A prompt starting with `/name` expands a prompt template. In the GUI, the Live tab's
+`--quiet`. A prompt starting with `/name` expands a prompt template. In the GUI, the Chats view's
 launcher picks between the in-house engine and Claude Code driving.
 
 What the agent gets: one tool, `python`, running in a persistent interpreter where variables
@@ -93,15 +93,15 @@ accordingly. Preferences → Workshop turns either half off.
 
 | Screen | What it answers |
 |---|---|
-| **Cockpit** | What is running, what just ran, what needs a decision. Credential and Work Host problems appear here before they cost you a session. |
-| **Live** | Start a run and steer it mid-flight. Runs Aviary owns are drivable; runs started in a terminal are observable — the UI never offers a control that would quietly do nothing. |
-| **Sessions** | Read any transcript. Python cells next to their output, thinking collapsed, injected context folded away, tool errors flagged, per-message token and cost accounting. |
+| **Chats** | Write a request, continue a conversation, understand activity, and review changes. Native requests are saved before agent startup; a failed start leaves the prompt and recovery controls in the chat. Advanced attachment controls live under Manage agent connections. |
+| **History** | Read recorded and imported transcripts. Python cells next to their output, thinking collapsed, injected context folded away, tool errors flagged, per-message token and cost accounting. |
+| **Workshop** | Capture, track, and review improvements to Aviary. Improve Aviary is always available in the toolbar and with ⇧⌘I. |
 | **Flock** | The sub-agent tree: who spawned whom, with what instructions, on which model, and a timeline showing whether that fan-out actually ran in parallel. |
 | **Models** | Every provider and model, and whether the credential will resolve — see below. |
 | **Usage** | Tokens and cost across every session on disk, by model, provider, project, and day, plus cache-hit and tool-error rates. |
 | **What was sent** | Optional per-run recording of every provider payload, decomposed: system prompt, each discovered context file, every skill description, tool schemas, messages — with each part's share of the input you were billed for. |
 | **Library** | Skills, prompt templates, extensions, packages — and every directory that was searched, including the empty ones. |
-| **Health** | Process topology, three cross-checked liveness signals, and one-click repair for the failure modes that don't self-heal. |
+| **Diagnostics** | Inspect runtime and connection health; distinguish agent-service readiness from Python availability. |
 
 ⌘K searches all of it at once.
 

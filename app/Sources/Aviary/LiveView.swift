@@ -275,6 +275,20 @@ struct RunPane: View {
             VStack(spacing: 0) {
                 runHeader
                 Divider()
+                if let prompt = model.pendingChats.first(where: {
+                    $0.createdAssociation != nil && $0.createdAssociation == run.serviceAttachmentKey
+                })?.prompt ?? run.savedInitialPrompt, !prompt.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Saved first message · delivery not yet confirmed", systemImage: "tray")
+                            .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        ScrollView {
+                            Text(prompt).font(.system(size: 13)).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }.frame(maxHeight: 160)
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
+                        .background(Design.accentSoft.opacity(0.4))
+                    Divider()
+                }
                 if let banner = run.errorBanner {
                     NoticeBanner(level: .danger, title: "Run needs attention", message: banner)
                         .padding(Design.gutter)
@@ -1219,7 +1233,7 @@ struct LauncherSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Label("New run", systemImage: "play.circle.fill")
+                Label("New chat", systemImage: "plus.bubble")
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
                 Button("Cancel") { dismiss() }
@@ -1236,35 +1250,66 @@ struct LauncherSheet: View {
     }
 }
 
-/// The launcher's cards and start action, shared by the modal (`LauncherSheet`, used from Live)
-/// and Cockpit's inline composer (`NewSessionPane`). Same options either way — a run does not
-/// need fewer of them just because it was started from a card instead of a sheet — so the form
-/// lives once and each caller supplies its own chrome and its own `onStart`.
+/// The launcher's request, project, agent choice, and advanced settings, shared by the modal
+/// sheet and Chats' inline composer.
 struct LauncherFormBody: View {
     @Environment(AppModel.self) private var model
     var onStart: () -> Void
 
     @State private var cwd = ""
+    @State private var projectChosen = false
     @State private var prompt = ""
     @State private var provider: String = ""
     @State private var modelID: String = ""
     @State private var thinking = "high"
-    /// Which engine to go back to when you leave `claude-code` behind. Remembered because
-    /// Harness and In-house are a real choice between themselves, and snapping to one of them
-    /// arbitrarily would silently change what a run is.
+    /// Which direct engine to return to when leaving `claude-code` behind.
     @State private var lastDirectEngine: AppModel.Engine = .inHouse
-    @State private var persistSession = true
     @State private var noContextFiles = false
     @State private var recordPayloads = false
+    @State private var advancedExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    Card("Workspace", symbol: "folder") {
+                    Card("What should Aviary do?", symbol: "text.bubble") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ZStack(alignment: .topLeading) {
+                                if prompt.isEmpty {
+                                    Text("Describe the coding task, question, or change…")
+                                        .font(.system(size: 12.5))
+                                        .foregroundStyle(.tertiary)
+                                        .padding(.horizontal, 11)
+                                        .padding(.vertical, 10)
+                                        .allowsHitTesting(false)
+                                }
+                                TextEditor(text: $prompt)
+                                    .font(.system(size: 12.5))
+                                    .frame(minHeight: 120)
+                                    .scrollContentBackground(.hidden)
+                                    .padding(6)
+                                    .accessibilityLabel("New chat request")
+                            }
+                            .background(
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .fill(Color(nsColor: .textBackgroundColor))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .strokeBorder(.separator, lineWidth: 1))
+                            Text(model.engineChoice == .inHouse
+                                 ? "Your request is saved locally before Aviary tries to reach an agent."
+                                 : "Claude Code runs in this app's process. Keep Aviary open while it works.")
+                                .font(.system(size: 10)).foregroundStyle(.tertiary)
+                        }
+                    }
+
+                    Card("Project", symbol: "folder") {
                         VStack(alignment: .leading, spacing: 7) {
                             HStack(spacing: 7) {
-                                TextField("", text: $cwd)
+                                TextField("", text: Binding(get: { cwd }, set: {
+                                    cwd = $0; projectChosen = true
+                                }))
                                     .textFieldStyle(.roundedBorder)
                                     .font(Design.mono(11))
                                 Button("Choose…") { chooseDirectory() }
@@ -1276,6 +1321,7 @@ struct LauncherFormBody: View {
                                         ForEach(model.recentCwds, id: \.self) { path in
                                             Button {
                                                 cwd = path
+                                                projectChosen = true
                                             } label: {
                                                 Chip(
                                                     text: URL(fileURLWithPath: path)
@@ -1290,26 +1336,14 @@ struct LauncherFormBody: View {
                                     }
                                 }
                             }
-                            Text(
-                                "This local folder is registered by the co-located Work Host. "
-                                + "The GUI keeps the path here; Create and Start carry only "
-                                    + "the host-minted opaque workspace ID. AGENTS.md and "
-                                    + "CLAUDE.md discovery still starts from this choice."
-                            )
+                            Text("Aviary reads project instructions starting from this folder.")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
-
-                            if model.engineChoice == .inHouse {
-                                WorkHostStatusRow(
-                                    handshake: model.localWorkServiceHandshake,
-                                    catalog: model.localWorkspaceCatalog,
-                                    error: model.localWorkServiceError)
-                            }
                         }
                     }
 
-                    Card("Engine", symbol: "cpu") {
+                    Card("How to run it", symbol: "bolt") {
                         VStack(alignment: .leading, spacing: 8) {
                             Picker(
                                 "",
@@ -1321,7 +1355,10 @@ struct LauncherFormBody: View {
                             }
                             .pickerStyle(.segmented).labelsHidden()
                             .onChange(of: model.engineChoice) { _, now in
-                                if now != .claudeCode { lastDirectEngine = now }
+                                if now != .claudeCode {
+                                    lastDirectEngine = now
+                                    noContextFiles = false
+                                }
                                 if now == .claudeCode { recordPayloads = false }
                                 // The engines offer disjoint catalogues, so a selection made
                                 // under one is meaningless under the other. Re-seeded rather
@@ -1334,7 +1371,9 @@ struct LauncherFormBody: View {
                                     modelID = modelsForProvider.first?.id ?? ""
                                 }
                             }
-                            Text(engineExplanation)
+                            Text(model.engineChoice == .inHouse
+                                ? "Aviary runs the agent and keeps the conversation available when this window closes."
+                                : "Claude Code runs the agent using its own account and conversation history.")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -1371,7 +1410,7 @@ struct LauncherFormBody: View {
                         .controlSize(.small)
                     }
 
-                    Card("Model", symbol: "cpu") {
+                    Card("Agent", symbol: "cpu") {
                         VStack(alignment: .leading, spacing: 8) {
                             if model.pickerModels.isEmpty {
                                 Text(
@@ -1412,42 +1451,29 @@ struct LauncherFormBody: View {
                                     ModelFactsRow(model: selected, requestedThinking: thinking)
                                 }
                             }
+                        }
+                    }
+
+                    if model.engineChoice == .inHouse {
+                        agentServiceStatus
+                    }
+
+                    DisclosureGroup("Advanced settings", isExpanded: $advancedExpanded) {
+                        VStack(alignment: .leading, spacing: 8) {
                             Picker("Thinking", selection: $thinking) {
                                 ForEach(
                                     ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
                                     id: \.self
                                 ) { Text($0).tag($0) }
                             }
-                        }
-                    }
-
-                    Card("First prompt", symbol: "text.cursor") {
-                        VStack(alignment: .leading, spacing: 6) {
-                            TextEditor(text: $prompt)
-                                .font(.system(size: 12.5))
-                                .frame(minHeight: 90)
-                                .scrollContentBackground(.hidden)
-                                .padding(6)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                        .fill(Color(nsColor: .textBackgroundColor))
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                        .strokeBorder(.separator, lineWidth: 1))
-                            Text("Optional — you can start empty and type into the run.")
-                                .font(.system(size: 10)).foregroundStyle(.tertiary)
-                        }
-                    }
-
-                    Card("Options", symbol: "slider.horizontal.3") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Toggle("Save the session to disk", isOn: $persistSession)
-                                .disabled(true)
-                            Text("Aviary currently always keeps a crash-readable session journal.")
+                            Text(model.engineChoice == .inHouse
+                                 ? "Your chat is saved locally before delivery is attempted."
+                                 : "Claude Code uses a local conversation journal; its running process belongs to this app.")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.tertiary)
-                            Toggle("Skip AGENTS.md / CLAUDE.md discovery", isOn: $noContextFiles)
+                            if model.engineChoice == .claudeCode {
+                                Toggle("Skip AGENTS.md / CLAUDE.md discovery", isOn: $noContextFiles)
+                            }
                             Divider().opacity(0.5)
                             Toggle("Record what's sent to the model", isOn: $recordPayloads)
                                 .disabled(model.engineChoice == .claudeCode)
@@ -1462,25 +1488,19 @@ struct LauncherFormBody: View {
                                 )
                                 .font(.system(size: 10))
                                 .foregroundStyle(.tertiary)
-                            } else if model.preferInHouseEngine {
-                                Text(
-                                    "On the in-house engine this is native — the provider "
-                                    + "announces each payload as it sends it, so there is no "
-                                        + "extension to install."
-                                )
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(.tertiary)
-                            } else if EngineLocator.wireLogExtension() == nil {
-                                Text(
-                                    "Unavailable: harness-extensions/wire-log.ts is missing "
-                                        + "from this checkout."
-                                )
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(Design.warning)
                             }
                         }
+                        .padding(.top, 8)
                         .controlSize(.small)
                     }
+                    .font(.system(size: 11.5, weight: .medium))
+                    .padding(12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(Color(nsColor: .controlBackgroundColor)))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(.separator.opacity(0.6), lineWidth: 1))
                 }
                 .padding(14)
             }
@@ -1488,14 +1508,10 @@ struct LauncherFormBody: View {
             Divider()
 
             HStack {
-                if let engine = model.engine {
-                    Text("\(engine.kind.label) · \(engine.version ?? "?")")
-                        .font(.system(size: 10)).foregroundStyle(.tertiary)
-                }
                 Spacer()
                 Button {
                     if model.engineChoice == .claudeCode {
-                        model.startClaudeCodeRun(
+                        let created = model.startClaudeCodeRun(
                             cwd: cwd.isEmpty ? model.defaultCwd : cwd,
                             // From the Model card, like every other engine. `claudeCodeModel`
                             // is still where the choice is remembered between runs, which is
@@ -1505,10 +1521,10 @@ struct LauncherFormBody: View {
                             // level, so it is expressed by omitting the flag entirely.
                             effort: thinking == "off" ? nil : thinking,
                             prompt: prompt, noContextFiles: noContextFiles)
-                        onStart()
+                        if created { onStart() }
                         return
                     }
-                    model.startInHouseRun(
+                    let saved = model.createPendingChat(
                         cwd: cwd.isEmpty ? model.defaultCwd : cwd,
                         providerID: provider.isEmpty ? nil : provider,
                         modelID: modelID.isEmpty ? nil : modelID,
@@ -1516,15 +1532,19 @@ struct LauncherFormBody: View {
                         thinkingLevel: thinking == "off" ? nil : thinking,
                         noContextFiles: noContextFiles,
                         recordPayloads: recordPayloads)
-                    onStart()
+                    if saved { onStart() }
                 } label: {
-                    Label("Start run", systemImage: "play.fill")
+                    Label(startActionLabel, systemImage: "arrow.up.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
+                .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
             }
             .padding(14)
+        }
+        .onChange(of: model.defaultCwd) { _, value in
+            if !projectChosen { cwd = value }
         }
         .onAppear {
             if cwd.isEmpty { cwd = model.defaultCwd }
@@ -1551,28 +1571,47 @@ struct LauncherFormBody: View {
         }
     }
 
-    /// What each engine actually is, in the terms that matter when choosing one.
-    ///
-    /// The third entry is a different kind of thing from the first two and the text says so:
-    /// the first two are Aviary's loop over a provider, and the third is somebody else's loop
-    /// over Aviary's kernel. Hiding that behind a neutral label would make the picker lie.
-    private var engineExplanation: String {
-        switch model.engineChoice {
-        case .inHouse:
-            return "Aviary's durable Work Host owns the agent loop, provider client and Python "
-                + "runtime. This GUI is an attached client: Work and its canonical transcript "
-                + "survive a closed window or quit, and another GUI can reattach later. The "
-                + "selected local folder is registered as a host workspace; only its opaque "
-                + "ID crosses the service boundary. Steering, queued follow-ups, payload "
-                + "recording and explicit End are available when the Work advertises them."
-        case .claudeCode:
-            return "Claude Code drives, and Aviary's kernel is the only tool it gets — its "
-                + "loop, its history, its stopping decision; your interpreter, your skills, "
-                + "your memory. Tokens come out of the Claude plan rather than metered API "
-                + "credit, which is the point. What you give up: steering, sub-agents, model "
-                + "switching mid-run, and resuming an Aviary session, because the "
-                + "conversation belongs to Claude Code and it will not accept a prepared one."
+    @ViewBuilder
+    private var agentServiceStatus: some View {
+        if let error = model.localWorkServiceError {
+            Card(model.localWorkServiceHandshake == nil ? "Agent service unavailable" : "Chat setup needs attention",
+                 symbol: "exclamationmark.triangle.fill") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("You can still save this chat. Aviary will keep your request here and will not claim it was sent.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Design.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(error)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Button("Retry connection") {
+                            Task {
+                                await model.bootstrapLocalWorkService()
+                                await model.refreshServiceWork()
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        Button("Open Diagnostics") { model.section = .health }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
+                }
+            }
+        } else if model.localWorkServiceHandshake == nil {
+            HStack(spacing: 7) {
+                ProgressView().controlSize(.small)
+                Text("Connecting to the local agent service…")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            }
         }
+    }
+
+    private var startActionLabel: String {
+        "Start chat"
     }
 
     /// Hoisted out of the card's body: a multi-part string literal inside a ViewBuilder is
@@ -1615,7 +1654,10 @@ struct LauncherFormBody: View {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.directoryURL = URL(fileURLWithPath: cwd.isEmpty ? model.defaultCwd : cwd)
-        if panel.runModal() == .OK, let url = panel.url { cwd = url.path }
+        if panel.runModal() == .OK, let url = panel.url {
+            cwd = url.path
+            projectChosen = true
+        }
     }
 }
 

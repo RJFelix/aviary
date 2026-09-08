@@ -4,6 +4,11 @@ Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C 
 Date: 2026-09-06
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
+Product steering, 2026-09-07: Ryan's first real signed-app journey exposed a startup failure,
+lost pre-launch prompt, overlapping navigation, and machinery-first vocabulary. Further
+checkpoint/restore expansion is paused for the [chat-first experience reset](chat-first-experience.md).
+Its acceptance bar is the real user journey, not only component tests or design fixtures.
+
 Transactional projection foundation (2026-09-04): the first Darwin/Linux disposable projection
 store now publishes a checksummed, generation-fenced `HEAD` only after its content-addressed bucket,
 recent-page, reducer-head, and deterministic sealed-bucket-reference objects cross the store's

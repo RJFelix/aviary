@@ -1,12 +1,11 @@
 import SwiftUI
 import AviaryCore
 
-/// The bottom-right capture affordance: a pill that opens into a compose card.
+/// The bottom-right capture composer, opened from reserved toolbar or menu space.
 ///
-/// It lives in `RootView`'s overlay rather than on any one screen, because the whole point
-/// is to catch a reaction where you have it. A request you had to navigate to a tab to file
-/// is a request you file later, differently, or not at all — and the context that made it
-/// worth filing is gone by the time you get there.
+/// It lives in `RootView`'s overlay rather than on any one screen, because the whole point is
+/// to catch a reaction where you have it. The collapsed action does not live here: permanent
+/// overlay chrome covered primary chat actions, so the toolbar owns the idle affordance.
 struct CapturePanel: View {
     @Environment(AppModel.self) private var model
     @FocusState private var focus: Field?
@@ -15,51 +14,10 @@ struct CapturePanel: View {
     private enum Field { case title, body }
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: 0) {
-            if model.capturePanelOpen {
-                composer
-            } else {
-                pill
-            }
-        }
+        composer
         .padding(.trailing, 18)
         .padding(.bottom, 18)
-        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: model.capturePanelOpen)
-    }
-
-    // MARK: Collapsed
-
-    private var pill: some View {
-        Button {
-            // Capture happens first, so the shot is free of this panel. The pill shows a
-            // spinner for the few hundred milliseconds that takes rather than looking dead.
-            model.openCapturePanel()
-            focus = .title
-        } label: {
-            HStack(spacing: 6) {
-                if model.isCapturingShot {
-                    ProgressView().controlSize(.small).scaleEffect(0.6)
-                        .frame(width: 10, height: 10)
-                } else {
-                    Image(systemName: "hammer.fill").font(.system(size: 10, weight: .semibold))
-                }
-                Text(model.isCapturingShot ? "Capturing…" : "Improve Aviary")
-                    .font(.system(size: 11.5, weight: .medium))
-                if model.board.openCount > 0 {
-                    Text("\(model.board.openCount)")
-                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                        .padding(.horizontal, 5).padding(.vertical, 1.5)
-                        .background(Capsule().fill(Design.accent.opacity(0.22)))
-                        .foregroundStyle(Design.accent)
-                }
-            }
-            .padding(.horizontal, 12).padding(.vertical, 8)
-            .background(.regularMaterial, in: Capsule())
-            .overlay(Capsule().strokeBorder(.separator, lineWidth: 1))
-            .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
-        }
-        .buttonStyle(.plain)
-        .help("File a change request against Aviary (⇧⌘I)")
+        .onAppear { focus = .title }
     }
 
     // MARK: Expanded

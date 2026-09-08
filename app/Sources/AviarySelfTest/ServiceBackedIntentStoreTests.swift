@@ -42,6 +42,118 @@ private func serviceBackedIntentFixture()
     return (home, root, service, response, seed)
 }
 
+func testServiceBackedClientStoresAcceptConventionalPrivateHomeBoundary() async throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+        path: "aviary-service-intents-conventional-home-\(UUID().uuidString)",
+        directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let home = AgentHome(root: root.appending(path: "home", directoryHint: .isDirectory))
+    try FileManager.default.createDirectory(
+        at: home.root, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: NSNumber(value: Int16(0o755))])
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: Int16(0o755))], ofItemAtPath: home.root.path)
+
+    let host = WorkHostRef("conventional-home-host")
+    let client = ClientRef("conventional-home-client")
+    let capabilities: Set<WorkServiceCapability> = [
+        .observe, .control, .start, .send, .createSession,
+    ]
+    let service = InMemoryWorkService(
+        host: host,
+        authorizer: WorkServiceCapabilityPolicy(grantsByClient: [client: capabilities]))
+    let handshake = try await service.handshake(WorkServiceHandshakeRequest(client: client))
+    let createRequest = WorkServiceCreateWorkRequest(
+        client: client, commandID: "conventional-home-create",
+        causalControlCursor: handshake.controlCursor,
+        requestedCapabilities: capabilities)
+    let seed = try ServiceBackedCreateIntentStore.InitialStart(
+        commandID: "conventional-home-start", prompt: "preserve this prompt")
+
+    let createStore = try ServiceBackedCreateIntentStore(home: home, client: client)
+    XCTAssertTrue(try createStore.loadPending().isEmpty)
+    try createStore.retain(createRequest, initialStart: seed)
+    XCTAssertEqual(try createStore.loadPending().map(\.request), [createRequest])
+    let response = try await service.createWork(createRequest)
+    let attachmentKey = try XCTUnwrap(
+        ServiceAttachmentKey(work: response.work.work, attachment: response.attachment))
+
+    let startStore = try ServiceBackedStartIntentStore(home: home, key: attachmentKey)
+    XCTAssertNil(try startStore.load())
+    let startIntent = try ServiceBackedStartIntent(
+        seed: seed, response: response, client: client)
+    try startStore.retain(startIntent)
+    XCTAssertEqual(try startStore.load(), startIntent)
+
+    let createSessionStore = try ServiceBackedCreateSessionIntentStore(
+        home: home, client: client, host: host)
+    XCTAssertTrue(try createSessionStore.load().isEmpty)
+    let createSessionRequest = WorkServiceCreateSessionRequest(
+        work: response.work.work, journal: response.work.journal,
+        attachment: response.attachment.attachment, client: client,
+        commandID: "conventional-home-create-session",
+        causalControlCursor: response.controlCursor,
+        causalWorkCursor: response.workCursor,
+        requestedCapabilities: capabilities)
+    try createSessionStore.retain(createSessionRequest)
+    XCTAssertEqual(try createSessionStore.load(), [createSessionRequest])
+
+    let draftStore = try ServiceBackedDraftStore(home: home, key: attachmentKey)
+    XCTAssertNil(try draftStore.load())
+    _ = try draftStore.replace("saved locally", expectedGeneration: nil)
+    XCTAssertEqual(try draftStore.load()?.text, "saved locally")
+
+    let homeAttributes = try FileManager.default.attributesOfItem(atPath: home.root.path)
+    XCTAssertEqual((homeAttributes[.posixPermissions] as? NSNumber)?.intValue, 0o755,
+                   "client stores must not chmod an existing AgentHome")
+    let clients = home.root.appending(
+        path: "work-service-clients", directoryHint: .isDirectory)
+    let clientAttributes = try FileManager.default.attributesOfItem(atPath: clients.path)
+    XCTAssertEqual((clientAttributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+    let enumerator = try XCTUnwrap(FileManager.default.enumerator(
+        at: clients, includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey]))
+    while let item = enumerator.nextObject() as? URL {
+        let values = try item.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
+        let attributes = try FileManager.default.attributesOfItem(atPath: item.path)
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+        if values.isDirectory == true {
+            XCTAssertEqual(permissions, 0o700, "private client directories must remain private")
+        } else if values.isRegularFile == true {
+            XCTAssertEqual(permissions, 0o600, "durable client records and locks must remain private")
+        }
+    }
+}
+
+func testServiceBackedIntentStoresRejectWritableHomeBoundary() async throws {
+    let (home, root, _, response, _) = try await serviceBackedIntentFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: Int16(0o775))], ofItemAtPath: home.root.path)
+    let client = response.attachment.client
+    let host = WorkHostRef(response.work.work.workHostID)
+    let attachmentKey = try XCTUnwrap(
+        ServiceAttachmentKey(work: response.work.work, attachment: response.attachment))
+
+    do {
+        _ = try ServiceBackedCreateIntentStore(home: home, client: client)
+        XCTFail("Create intent storage must reject a group-writable AgentHome")
+    } catch LocalCreateIntentError.corrupt {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try ServiceBackedCreateSessionIntentStore(home: home, client: client, host: host)
+        XCTFail("Create Session intent storage must reject a group-writable AgentHome")
+    } catch LocalCreateIntentError.corrupt {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try ServiceBackedStartIntentStore(home: home, key: attachmentKey)
+        XCTFail("Start intent storage must reject a group-writable AgentHome")
+    } catch ServiceBackedStartIntentError.corrupt {
+        XCTAssertTrue(true)
+    }
+}
+
 func testServiceBackedIntentStoresCarryCreateIntoCanonicalStartEvidence() async throws {
     let (home, root, service, response, seed) = try await serviceBackedIntentFixture()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -476,6 +588,12 @@ func testServiceBackedCreateSessionIntentSurvivesAndRejectsIdentityDrift() async
 }
 
 let casesServiceBackedIntentStores: [Case] = [
+    ("phase3 GUI client stores support conventional private home boundaries", {
+        try await testServiceBackedClientStoresAcceptConventionalPrivateHomeBoundary()
+    }),
+    ("phase3 GUI intent stores reject writable home boundaries", {
+        try await testServiceBackedIntentStoresRejectWritableHomeBoundary()
+    }),
     ("phase3 GUI intents carry Create into canonical Start evidence", {
         try await testServiceBackedIntentStoresCarryCreateIntoCanonicalStartEvidence()
     }),

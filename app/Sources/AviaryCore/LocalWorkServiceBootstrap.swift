@@ -38,6 +38,7 @@ private final class LocalWorkServiceBootstrapWait<Value: Sendable>: @unchecked S
 public enum LocalWorkServiceBootstrapError: Error, LocalizedError, Equatable, Sendable {
     case launcherUnavailable
     case launchFailed
+    case launcherFailed(LocalAviaryDaemonLauncherError)
     case timedOut
     case discoveryFailed
     case transportFailed
@@ -48,6 +49,8 @@ public enum LocalWorkServiceBootstrapError: Error, LocalizedError, Equatable, Se
         switch self {
         case .launcherUnavailable: return "No local Work Host launcher was supplied."
         case .launchFailed: return "The local Work Host could not be launched."
+        case .launcherFailed(let error):
+            return error.errorDescription ?? "The local Work Host could not be launched."
         case .timedOut: return "The local Work Host did not become reachable before the timeout."
         case .discoveryFailed: return "The local Work Host could not be discovered."
         case .transportFailed: return "The local Work Host connection failed at the transport boundary."
@@ -308,6 +311,11 @@ public actor LocalWorkServiceBootstrap {
         } catch WorkServiceClientSessionError.unavailable {
             // A missing or not-yet-reachable daemon is the only condition which authorizes
             // invoking the injected launcher below.
+        } catch WorkServiceTransportError.endpointUnavailable {
+            // A discovery record can outlive an abruptly stopped daemon.  The transport has
+            // proved that this was a pre-handshake dead endpoint, so starting a replacement is
+            // as safe as starting after an absent discovery record.  Other transport failures
+            // remain fail-closed: they may belong to a live but incompatible or unhealthy host.
         } catch let error as WorkServiceClientSessionError {
             throw LocalWorkServiceBootstrapError.connectionFailed(error)
         } catch {
@@ -333,6 +341,14 @@ public actor LocalWorkServiceBootstrap {
                 let sleep = min(UInt64(pollInterval * 1_000_000_000), deadline - now)
                 do { try await Task.sleep(nanoseconds: sleep) }
                 catch { throw LocalWorkServiceBootstrapError.canceled }
+            } catch WorkServiceTransportError.endpointUnavailable {
+                // The replacement daemon publishes atomically, but polling may still race the
+                // old descriptor before that publication.  Keep retrying within the same bound.
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard now < deadline else { throw LocalWorkServiceBootstrapError.timedOut }
+                let sleep = min(UInt64(pollInterval * 1_000_000_000), deadline - now)
+                do { try await Task.sleep(nanoseconds: sleep) }
+                catch { throw LocalWorkServiceBootstrapError.canceled }
             } catch let error as WorkServiceClientSessionError {
                 throw LocalWorkServiceBootstrapError.connectionFailed(error)
             } catch {
@@ -347,6 +363,12 @@ public actor LocalWorkServiceBootstrap {
         let task = Task<Void, Error> {
             do { try await launcher() }
             catch is CancellationError { throw LocalWorkServiceBootstrapError.canceled }
+            catch let error as LocalAviaryDaemonLauncherError {
+                // Launcher failures are deliberately path-free and non-secret. Preserve their
+                // typed classification so the caller can distinguish a damaged bundle from an
+                // invalid AgentHome or an operating-system spawn failure.
+                throw LocalWorkServiceBootstrapError.launcherFailed(error)
+            }
             catch { throw LocalWorkServiceBootstrapError.launchFailed }
         }
         let wait = LocalWorkServiceBootstrapWait<Void>()

@@ -7154,6 +7154,7 @@ await Harness.run(
         + casesAttachmentQualifiedIdentity
         + casesServiceBackedIntentStores
         + casesServiceBackedDraftStore
+        + casesPendingChatStore
         + casesServiceBackedGUIOrchestration
         + casesServiceBackedGUIControlPolicy
         + casesWorkServiceAttachedWorkController

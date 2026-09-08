@@ -14,6 +14,7 @@ struct AviaryApp: App {
     init() {
         _ = Self.launchedAt
         // Headless modes short-circuit before any scene is created, and exit.
+        ChatJourneyProbe.runIfRequested()
         WireInspect.runIfRequested()
         Snapshot.runIfRequested()
         AgentCLI.runIfRequested()
@@ -164,9 +165,9 @@ struct AviaryCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            Button("New Run…") {
-                model.section = .live
-                NotificationCenter.default.post(name: .aviaryNewRun, object: nil)
+            Button("New Chat") {
+                model.newChatRequested = true
+                model.section = .cockpit
             }
             .keyboardShortcut("n")
         }
@@ -185,7 +186,7 @@ struct AviaryCommands: Commands {
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Divider()
             ForEach(Section.visible) { s in
-                Button(s.title) { model.section = s }
+                Button(s.title) { model.section = s == .live ? .cockpit : s }
                     .keyboardShortcut(shortcutKey(for: s), modifiers: .command)
             }
         }
@@ -203,14 +204,6 @@ struct AviaryCommands: Commands {
         }
 
         CommandGroup(replacing: .help) {
-            Button("Prime Agent Docs in Finder") {
-                if let engine = model.engine, let cli = engine.leadingArguments.first {
-                    let docs = URL(fileURLWithPath: cli)
-                        .deletingLastPathComponent().deletingLastPathComponent()
-                        .deletingLastPathComponent().appending(path: "docs")
-                    NSWorkspace.shared.activateFileViewerSelecting([docs])
-                }
-            }
             Button("Reveal Agent Directory in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([model.home.root])
             }
@@ -276,7 +269,7 @@ struct MenuBarContent: View {
                         model.reattachRun(s)
                     } else {
                         model.focusedRunID = s.id
-                    model.section = .live
+                        model.section = .cockpit
                     }
                     openWindow(id: "main")
                     NSApp.activate(ignoringOtherApps: true)

@@ -79,27 +79,28 @@ enum Section: String, CaseIterable, Identifiable, Hashable {
     ///
     /// Flock is a Work/Session projection. Legacy child rows remain available only as an
     /// explicit compatibility section when no canonical Session projection exists.
-    static var visible: [Section] { allCases }
+    static var visible: [Section] { [.cockpit, .sessions, .workshop, .flock, .models, .usage, .library, .health] }
+    static var primary: [Section] { [.cockpit, .sessions, .workshop] }
+    static var tools: [Section] { [.flock, .models, .usage, .library, .health] }
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .cockpit: return "Cockpit"
-        case .live: return "Live"
-        case .sessions: return "Sessions"
+        case .cockpit, .live: return "Chats"
+        case .sessions: return "History"
         case .workshop: return "Workshop"
         case .flock: return "Flock"
         case .models: return "Models"
         case .usage: return "Usage"
         case .library: return "Library"
-        case .health: return "Health"
+        case .health: return "Diagnostics"
         }
     }
 
     var symbol: String {
         switch self {
-        case .cockpit: return "gauge.open.with.lines.needle.33percent"
+        case .cockpit: return "bubble.left.and.bubble.right"
         case .live: return "dot.radiowaves.left.and.right"
         case .sessions: return "bubble.left.and.text.bubble.right"
         case .workshop: return "hammer"
@@ -113,9 +114,8 @@ enum Section: String, CaseIterable, Identifiable, Hashable {
 
     var subtitle: String {
         switch self {
-        case .cockpit: return "Everything at a glance"
-        case .live: return "Start and steer a run"
-        case .sessions: return "Read what happened"
+        case .cockpit, .live: return "Your conversations and current work"
+        case .sessions: return "Recorded and imported conversations"
         case .workshop: return "Ask Aviary to change"
         case .flock: return "Sub-agent trees"
         case .models: return "Providers and routes"
@@ -134,6 +134,14 @@ enum Section: String, CaseIterable, Identifiable, Hashable {
 @Observable
 @MainActor
 final class AppModel {
+    /// Local chat presentation precedes remote Session admission. It is never a claim that
+    /// the agent received a prompt or that canonical Work exists.
+    var pendingChats: [PendingChat] = []
+    var selectedPendingChatID: UUID?
+    var pendingChatStoreError: String?
+    var newChatRequested = false
+    private var pendingChatAttempts: Set<UUID> = []
+    var pendingChatDetails: [UUID: String] = [:]
     // MARK: Configuration
 
     var home: AgentHome = .default
@@ -621,6 +629,7 @@ final class AppModel {
     }
 
     func bootstrap() async {
+        restorePendingChats()
         // Capture the login shell's environment before anything spawns a subprocess.
         // Without this the engine inherits launchd's environment and every
         // environment-variable credential silently resolves to its own name.
@@ -675,9 +684,7 @@ final class AppModel {
         }
         do {
             let workHost = try home.requirePersistedWorkHost()
-            let identityStore = try WorkServiceClientIdentityStore(
-                url: home.root.appending(
-                    path: "work-service-client-id", directoryHint: .notDirectory))
+            let identityStore = try WorkServiceClientIdentityStore(url: home.workServiceClientIdentityFile)
             let client = try identityStore.loadOrCreate()
             let locator = LocalWorkServiceHostLocator(home: home, workHost: workHost)
             let launcher = try LocalAviaryDaemonLauncher(agentHome: home).asLauncher()
@@ -705,6 +712,10 @@ final class AppModel {
         } catch {
             // The GUI remains usable for Claude Code and historical sessions if the local
             // helper is unavailable.  Keep this error bounded and do not expose launcher paths.
+            await localWorkService?.disconnect()
+            localWorkService = nil
+            localWorkServiceHandshake = nil
+            localWorkspaceCatalog = .empty
             localWorkServiceError = Self.serviceErrorMessage(error)
         }
     }
@@ -716,6 +727,7 @@ final class AppModel {
         session: WorkServiceClientSession, client: ClientRef,
         handshake suppliedHandshake: WorkServiceHandshakeResponse? = nil
     ) async {
+        defer { settlePendingChats() }
         let handshake: WorkServiceHandshakeResponse?
         if let suppliedHandshake {
             handshake = suppliedHandshake
@@ -1094,13 +1106,29 @@ final class AppModel {
     }
 
     private static func serviceErrorMessage(_ error: Error) -> String {
+        if let error = error as? WorkServiceClientIdentityError {
+            switch error {
+            case .invalidURL, .accessDenied:
+                return "Aviary could not open its private connection identity. Check access to Aviary's local data folder; your saved chats are kept."
+            case .invalidRecord:
+                return "Aviary's saved connection identity is unreadable. It has not been replaced, because that could disconnect existing conversations."
+            case .ioFailure:
+                return "Aviary could not save its connection identity. Check local disk access, then retry."
+            }
+        }
+        if error is AgentHomeError {
+            return "Aviary could not load the agent service's saved identity. Its existing data has been kept; check access to Aviary's local data folder."
+        }
+        if let error = error as? LocalAviaryDaemonLauncherError {
+            return error.errorDescription ?? "The local agent service could not start. Retry connection or open Diagnostics."
+        }
         if let error = error as? LocalWorkServiceBootstrapError {
             return error.errorDescription ?? "The local Work Host is unavailable."
         }
         if error is WorkServiceClientSessionError {
             return "The local Work Host connection is unavailable."
         }
-        return "The local Work Host could not be reached or reconstructed."
+        return "Aviary could not connect to the local agent service. Retry connection; if this continues, open Diagnostics."
     }
 
     /// Reconcile Create intents retained before a GUI crash or lost response. Replaying the exact
@@ -1123,6 +1151,7 @@ final class AppModel {
                         // than replaying a known-dead intent forever. Transport errors below are
                         // different: their effect may be indeterminate and must remain retained.
                         do {
+                            guard rejectPendingChatAttempt(request.commandID) else { throw PendingChatError.conflict }
                             try store.clear(request)
                         } catch {
                             localWorkServiceError =
@@ -1136,6 +1165,7 @@ final class AppModel {
                         continue
                     }
                     if let initialStart = retained.initialStart {
+                        try associatePendingChat(request: request, response: response)
                         try Self.retainStartIntent(
                             initialStart, response: response, home: home, client: client)
                     }
@@ -1143,6 +1173,7 @@ final class AppModel {
                 } catch {
                     if Self.isProvenStaleCreateFailure(error) {
                         do {
+                            guard rejectPendingChatAttempt(request.commandID) else { throw PendingChatError.conflict }
                             try store.clear(request)
                         } catch {
                             localWorkServiceError =
@@ -3018,15 +3049,282 @@ final class AppModel {
         }
     }
 
+    // MARK: Chat exists before its executor does
+
+    func restorePendingChats() {
+        guard !isPreview else { return }
+        do {
+            let inventory = try PendingChatStore(home: home).load()
+            pendingChats = inventory.rows.sorted { $0.createdAt > $1.createdAt }
+            pendingChatStoreError = inventory.unavailable.isEmpty ? nil
+                : "Some saved chats could not be read. Their files have been kept; open Diagnostics for help."
+            // Restoring saved cards must not override the returning conversation or a
+            // notification destination. Cards remain available in the Chats rail.
+        } catch {
+            pendingChatStoreError = "Saved chats could not be loaded. No saved files were removed."
+        }
+    }
+
+    /// Success means only that the exact request is saved locally, never that it was sent.
+    @discardableResult
+    func createPendingChat(
+        cwd: String, providerID: String?, modelID: String?, prompt: String,
+        thinkingLevel: String? = nil, noContextFiles: Bool = false,
+        recordPayloads: Bool = false, title: String? = nil,
+        attemptStartup: Bool = true
+    ) -> Bool {
+        guard acceptsNewWork else { return false }
+        do {
+            let chat = try PendingChatStore(home: home).create(
+                prompt: prompt, cwd: cwd, providerID: providerID, modelID: modelID,
+                thinkingLevel: thinkingLevel, title: title ?? String(prompt.prefix(80)),
+                noContextFiles: noContextFiles, recordPayloads: recordPayloads)
+            pendingChats.insert(chat, at: 0)
+            selectedPendingChatID = chat.id
+            pendingChatStoreError = nil
+            section = .cockpit
+            if attemptStartup { retryPendingChat(chat.id) }
+            return true
+        } catch PendingChatError.capacity {
+            pendingChatStoreError = "Saved chats are full. Discard an unsent chat from the Chats list, then try again. Your text is still in the editor."
+            return false
+        } catch {
+            pendingChatStoreError = "Your chat could not be saved. Your text is still in the editor. Check available disk space or copy it before leaving."
+            return false
+        }
+    }
+
+    func pendingChatIsPreparing(_ chat: PendingChat) -> Bool { pendingChatAttempts.contains(chat.id) }
+
+    func pendingChatStatus(_ chat: PendingChat) -> String {
+        if pendingChatAttempts.contains(chat.id) { return "Connecting…" }
+        if chat.createdAssociation != nil { return "Saved · opening conversation" }
+        if chat.phase == .awaitingAcceptance { return "Saved · checking delivery" }
+        if chat.phase == .preparing { return "Saved · startup interrupted" }
+        return chat.phase == .saved ? "Saved · not sent" : "Not sent · needs attention"
+    }
+
+    func pendingChatExplanation(_ chat: PendingChat) -> String {
+        if let detail = pendingChatDetails[chat.id] { return detail }
+        if chat.phase == .saved {
+            return "This request is saved on this Mac and has not been sent. Start the chat when you are ready."
+        }
+        if chat.createdAssociation != nil {
+            return "The agent service created this conversation. Reconnect to open it; your request will not be sent twice."
+        }
+        if chat.phase == .awaitingAcceptance {
+            return "Aviary lost confirmation of delivery. Your request is saved. Check delivery to reconcile the original attempt without sending another copy."
+        }
+        if chat.phase == .preparing {
+            return "Startup was interrupted. Your request is saved. Retry checks any retained delivery attempt before proceeding."
+        }
+        switch chat.failureKind {
+        case .providerUnavailable: return "The selected model is not available. Choose a configured model, then retry."
+        case .workspaceUnavailable: return "The project folder is unavailable. Check the folder, then retry."
+        case .invalidRequest: return "The request needs an adjustment before it can be sent. Your original text is saved."
+        default: return "The local agent service is not ready. Your request is saved on this Mac and has not been sent. Retry connection to continue."
+        }
+    }
+
+    private func replacePendingChat(_ value: PendingChat) {
+        if let index = pendingChats.firstIndex(where: { $0.id == value.id }) {
+            pendingChats[index] = value
+        }
+    }
+
+    @discardableResult
+    private func updatePendingChat(
+        _ id: UUID, phase: PendingChatPhase, failure: PendingChatFailureKind? = nil,
+        association: ServiceAttachmentKey? = nil, newAttempt: Bool = false
+    ) -> Bool {
+        guard let chat = pendingChats.first(where: { $0.id == id }) else { return false }
+        do {
+            let changed = try chat.changing(
+                phase: phase, failureKind: failure,
+                attemptCommandID: newAttempt ? UUID() : nil, createdAssociation: association)
+            let saved = try PendingChatStore(home: home).update(changed, expectedGeneration: chat.generation)
+            replacePendingChat(saved)
+            return true
+        } catch {
+            pendingChatDetails[id] = "Saving this chat's status failed. No new request was sent. Reopen Aviary to reload the saved version; your visible prompt is kept."
+            return false
+        }
+    }
+
+    private func blockPendingChat(_ id: UUID?, message: String, kind: PendingChatFailureKind = .unknown) {
+        guard let id else { show(message, isError: true); return }
+        pendingChatDetails[id] = message
+        guard let chat = pendingChats.first(where: { $0.id == id }),
+              chat.phase != .awaitingAcceptance, chat.createdAssociation == nil else { return }
+        _ = updatePendingChat(id, phase: .blocked, failure: kind)
+    }
+
+    private func rejectPendingChatAttempt(_ commandID: String) -> Bool {
+        guard let chat = pendingChats.first(where: {
+            $0.attemptCommandID.uuidString.lowercased() == commandID && $0.createdAssociation == nil
+        }) else { return true }
+        guard updatePendingChat(chat.id, phase: .blocked, failure: .invalidRequest) else { return false }
+        return updatePendingChat(chat.id, phase: .blocked, failure: .invalidRequest, newAttempt: true)
+    }
+
+    func editPendingChat(_ chat: PendingChat, prompt: String, cwd: String,
+                         providerID: String, modelID: String) -> Bool {
+        guard !pendingChatAttempts.contains(chat.id), chat.createdAssociation == nil,
+              chat.phase != .awaitingAcceptance else { return false }
+        do {
+            let edited = try chat.edited(prompt: prompt, cwd: cwd,
+                providerID: providerID, modelID: modelID, thinkingLevel: chat.thinkingLevel,
+                title: chat.title, noContextFiles: false, recordPayloads: chat.recordPayloads)
+            replacePendingChat(try PendingChatStore(home: home).update(edited, expectedGeneration: chat.generation))
+            pendingChatDetails.removeValue(forKey: chat.id)
+            return true
+        } catch {
+            pendingChatDetails[chat.id] = "Your edits could not be saved. They are still in the editor; copy them before leaving."
+            return false
+        }
+    }
+
+    /// Returns true only after the exact host association is durable locally, before Create
+    /// intent cleanup. This closes the response/GUI-publication crash window.
+    private func associatePendingChat(request: WorkServiceCreateWorkRequest,
+                                      response: WorkServiceCreateWorkResponse) throws {
+        guard let chat = pendingChats.first(where: {
+            $0.attemptCommandID.uuidString.lowercased() == request.commandID
+        }) else { return }
+        guard let key = ServiceAttachmentKey(work: response.work.work, attachment: response.attachment),
+              updatePendingChat(chat.id, phase: .awaitingAcceptance, association: key) else {
+            throw PendingChatError.conflict
+        }
+    }
+
+    private func settlePendingChats() {
+        for chat in pendingChats {
+            guard let key = chat.createdAssociation,
+                  let run = workRuns.first(where: { $0.serviceAttachmentKey == key }) else { continue }
+            guard run.hasCanonicalDelivery(for: chat) else {
+                if let error = run.errorBanner {
+                    pendingChatDetails[chat.id] = "The conversation is saved, but the agent could not start. " + error
+                }
+                continue
+            }
+            do {
+                try PendingChatStore(home: home).delete(id: chat.id, expectedGeneration: chat.generation)
+                pendingChats.removeAll { $0.id == chat.id }
+                pendingChatDetails.removeValue(forKey: chat.id)
+                if selectedPendingChatID == chat.id {
+                    selectedPendingChatID = nil
+                    focusedRunID = run.id
+                }
+            } catch {
+                pendingChatDetails[chat.id] = "Your conversation is ready, but its saved startup card could not be cleared. Reconnecting will open the same conversation, not send again."
+            }
+        }
+    }
+
+    func openPendingConversation(_ chat: PendingChat) {
+        guard let key = chat.createdAssociation,
+              let run = workRuns.first(where: { $0.serviceAttachmentKey == key }) else { return }
+        selectedPendingChatID = nil
+        focusedRunID = run.id
+        section = .cockpit
+    }
+
+    func canOpenPendingConversation(_ chat: PendingChat) -> Bool {
+        guard let key = chat.createdAssociation else { return false }
+        return workRuns.contains { $0.serviceAttachmentKey == key }
+    }
+
+    /// A reviewed escape from indeterminate startup. Copying only saves a new local request;
+    /// the person must separately choose Start, because the original may still take effect.
+    func copyPendingChatAsUnsent(_ chat: PendingChat) {
+        guard chat.createdAssociation != nil, !pendingChatIsPreparing(chat) else { return }
+        _ = createPendingChat(cwd: chat.cwd, providerID: chat.providerID, modelID: chat.modelID,
+            prompt: chat.prompt, thinkingLevel: chat.thinkingLevel,
+            noContextFiles: chat.noContextFiles, recordPayloads: chat.recordPayloads,
+            title: chat.title, attemptStartup: false)
+    }
+
+    /// Explicit presentation-only dismissal, never cancellation, End, or an intent replay.
+    func stopTrackingPendingChat(_ chat: PendingChat) {
+        guard chat.createdAssociation != nil, !pendingChatIsPreparing(chat) else { return }
+        do {
+            try PendingChatStore(home: home).delete(id: chat.id, expectedGeneration: chat.generation)
+            pendingChats.removeAll { $0.id == chat.id }
+            pendingChatDetails.removeValue(forKey: chat.id)
+            if selectedPendingChatID == chat.id { selectedPendingChatID = nil }
+            show("Startup card removed. The original work was not stopped.")
+        } catch {
+            pendingChatDetails[chat.id] = "The startup card could not be removed. It has been kept."
+        }
+    }
+
+    /// Only definitely unsent local cards may be discarded. An independent retained Create
+    /// obligation must be reconciled first, even if its card was marked blocked before a crash.
+    func discardPendingChat(_ chat: PendingChat) {
+        guard !pendingChatIsPreparing(chat), chat.createdAssociation == nil,
+              chat.phase == .saved || chat.phase == .blocked else { return }
+        do {
+            let identity = try WorkServiceClientIdentityStore(url: home.workServiceClientIdentityFile).loadOrCreate()
+            let retained = try ServiceBackedCreateIntentStore(home: home, client: identity).loadPending()
+            guard !retained.contains(where: {
+                $0.initialStart?.commandID == chat.startCommandID
+                    || $0.request.commandID == chat.attemptCommandID.uuidString.lowercased()
+            }) else {
+                pendingChatDetails[chat.id] = "Delivery still needs checking. Check delivery before discarding this request; it may already belong to the agent service."
+                return
+            }
+            try PendingChatStore(home: home).delete(id: chat.id, expectedGeneration: chat.generation)
+            pendingChats.removeAll { $0.id == chat.id }
+            pendingChatDetails.removeValue(forKey: chat.id)
+            if selectedPendingChatID == chat.id { selectedPendingChatID = nil }
+        } catch {
+            pendingChatDetails[chat.id] = "The saved request could not be safely discarded. It has been kept."
+        }
+    }
+
+    func retryPendingChat(_ id: UUID) {
+        guard acceptsNewWork, !pendingChatAttempts.contains(id),
+              let original = pendingChats.first(where: { $0.id == id }) else { return }
+        pendingChatAttempts.insert(id)
+        pendingChatDetails.removeValue(forKey: id)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.pendingChatAttempts.remove(id) }
+            if original.phase == .awaitingAcceptance || original.createdAssociation != nil {
+                if self.localWorkService == nil { await self.bootstrapLocalWorkService() }
+                do {
+                    let (session, handshake) = try await self.reconnectLocalWorkService()
+                    guard let client = self.localWorkServiceClient,
+                          await self.reconcilePendingCreateIntents(session: session, client: client) else { return }
+                    await self.restoreServiceWork(session: session, client: client, handshake: handshake)
+                    self.settlePendingChats()
+                } catch {
+                    self.pendingChatDetails[id] = "Still unable to confirm delivery. Your saved request is kept; no second attempt was sent. " + Self.serviceErrorMessage(error)
+                }
+                return
+            }
+            guard self.updatePendingChat(id, phase: .preparing),
+                  let chat = self.pendingChats.first(where: { $0.id == id }) else { return }
+            await self.startServiceInHouseRun(
+                cwd: chat.cwd, providerID: chat.providerID, modelID: chat.modelID,
+                prompt: chat.prompt, thinkingLevel: chat.thinkingLevel,
+                noContextFiles: chat.noContextFiles, recordPayloads: chat.recordPayloads,
+                title: chat.title, onCreated: nil, pendingChatID: id)
+        }
+    }
+
     private func startServiceInHouseRun(
         cwd: String, providerID: String?, modelID: String?, prompt: String,
         thinkingLevel: String?, noContextFiles: Bool, recordPayloads: Bool, title: String?,
-        onCreated: (@MainActor (LiveRun) -> Void)?
+        onCreated: (@MainActor (LiveRun) -> Void)?, pendingChatID: UUID? = nil
     ) async {
+        guard prompt.utf8.count <= WorkServiceBounds.maxCommandValueCharacters else {
+            blockPendingChat(pendingChatID, message: "Your prompt is saved, but this connection accepts at most \(WorkServiceBounds.maxCommandValueCharacters) bytes per message. Shorten the request before retrying.", kind: .invalidRequest)
+            return
+        }
         guard !noContextFiles else {
-            show(
-                "The local Work Host currently requires project context files. Disable “Skip "
-                    + "AGENTS.md / CLAUDE.md discovery” for this run.", isError: true)
+            blockPendingChat(pendingChatID, message:
+                "This agent requires project instructions. Choose Edit request and save it to include those instructions before retrying.", kind: .invalidRequest)
             return
         }
         guard
@@ -3034,13 +3332,18 @@ final class AppModel {
                 [providerID, modelID].compactMap { $0 }.joined(separator: "/"),
                 in: modelsConfig) ?? AgentCLI.resolve(modelID, in: modelsConfig)
         else {
-            toast = Toast(message: "No configured provider serves that model.", isError: true)
+            blockPendingChat(pendingChatID, message: "The selected model is not configured. Choose a model in Models, then retry this saved chat.", kind: .providerUnavailable)
             return
         }
         if localWorkService == nil { await bootstrapLocalWorkService() }
+        if let pendingChatID,
+           !pendingChats.contains(where: { $0.id == pendingChatID && $0.createdAssociation == nil }) {
+            settlePendingChats()
+            return
+        }
         guard localWorkService != nil,
               let client = localWorkServiceClient else {
-            show(localWorkServiceError ?? "The local Work Host is unavailable.", isError: true)
+            blockPendingChat(pendingChatID, message: localWorkServiceError ?? "The local agent service is unavailable. Your request has not been sent.", kind: .hostUnavailable)
             return
         }
         guard beginServiceLifecycleOperation() else { return }
@@ -3055,16 +3358,21 @@ final class AppModel {
                 isDefault: true)
             let (session, handshake) = try await reconnectLocalWorkService()
             guard !serviceCreateInFlight else {
-                show("A Work creation is already in progress; wait for its durable result.", isError: true)
+                blockPendingChat(pendingChatID, message: "Another conversation is being prepared. Your request is saved; retry in a moment.")
                 return
             }
             serviceCreateInFlight = true
             defer { serviceCreateInFlight = false }
             guard await reconcilePendingCreateIntents(session: session, client: client) else {
-                show(
+                blockPendingChat(pendingChatID, message:
                     localWorkServiceError
                         ?? "A prior Work creation is still awaiting reconciliation.",
-                    isError: true)
+                    kind: .hostUnavailable)
+                return
+            }
+            if let pendingChatID,
+               !pendingChats.contains(where: { $0.id == pendingChatID && $0.createdAssociation == nil }) {
+                await restoreServiceWork(session: session, client: client, handshake: handshake)
                 return
             }
             guard handshake.workspaceCatalog.isComplete,
@@ -3084,7 +3392,7 @@ final class AppModel {
                 includeContextFiles: true, recordPayloads: recordPayloads)
             let createRequest = WorkServiceCreateWorkRequest(
                 client: client,
-                commandID: UUID().uuidString.lowercased(),
+                commandID: pendingChatID.flatMap { id in pendingChats.first { $0.id == id }?.attemptCommandID.uuidString.lowercased() } ?? UUID().uuidString.lowercased(),
                 causalControlCursor: handshake.controlCursor,
                 configuration: configuration,
                 requestedCapabilities: requested)
@@ -3093,8 +3401,9 @@ final class AppModel {
             // transaction record before Create crosses the host boundary. Until Start resolves,
             // a relaunch must not present this newly-created idle Work as an ordinary composer.
             let initialStart = try ServiceBackedCreateIntentStore.InitialStart(
-                commandID: "start-v2-" + UUID().uuidString.lowercased(), prompt: prompt)
+                commandID: pendingChatID.flatMap { id in pendingChats.first { $0.id == id }?.startCommandID } ?? "start-v2-" + UUID().uuidString.lowercased(), prompt: prompt)
             try createIntentStore.retain(createRequest, initialStart: initialStart)
+            if let pendingChatID, !updatePendingChat(pendingChatID, phase: .awaitingAcceptance) { return }
             let response = try await session.createWork(createRequest)
             guard response.receipt.state == .accepted
                 || response.receipt.state == .duplicate else {
@@ -3103,6 +3412,7 @@ final class AppModel {
                 // boundary; retaining it as an indeterminate mutation would freeze every later
                 // Create forever. Clear the exact intent before allowing the user to retry.
                 do {
+                    guard rejectPendingChatAttempt(createRequest.commandID) else { throw PendingChatError.conflict }
                     try createIntentStore.clear(createRequest)
                 } catch {
                     localWorkServiceError =
@@ -3110,14 +3420,15 @@ final class AppModel {
                     return
                 }
                 let detail = response.receipt.diagnostic ?? "no durable Work was admitted."
-                show(
+                blockPendingChat(pendingChatID, message:
                     response.receipt.rejection == .staleCursor
                         ? "The Work Host rejected Create because its control cursor was stale. No Work was created; retry when ready."
                         : "The Work Host rejected Create: \(detail)",
-                    isError: true)
+                    kind: .invalidRequest)
                 return
             }
             do {
+                try associatePendingChat(request: createRequest, response: response)
                 try Self.retainStartIntent(
                     initialStart, response: response, home: home, client: client)
                 try createIntentStore.clear(createRequest)
@@ -3183,8 +3494,11 @@ final class AppModel {
             // reconstruction instead of publishing a row after shutdown's drain.
             guard acceptsNewWork else { return }
             runs.append(run)
-            focusedRunID = run.id
-            section = .live
+            if pendingChatID == nil {
+                focusedRunID = run.id
+                section = .cockpit
+            }
+            settlePendingChats()
             onCreated?(run)
             if let unresolvedRetainedStart,
                bridge.hasMatchingStartAttachment(for: unresolvedRetainedStart) {
@@ -3195,8 +3509,13 @@ final class AppModel {
                 run.commandNotice = .warning(
                     "The retained initial Start belongs to a different Session attachment; review and retry it explicitly.")
             }
+        } catch let error as WorkHostWorkspaceRegistryError {
+            blockPendingChat(pendingChatID,
+                message: (error.errorDescription ?? "The project folder is unavailable.")
+                    + " Choose Edit request to check the project folder. Your request has not been sent.",
+                kind: .workspaceUnavailable)
         } catch {
-            show(Self.serviceErrorMessage(error), isError: true)
+            blockPendingChat(pendingChatID, message: Self.serviceErrorMessage(error), kind: .hostUnavailable)
         }
     }
 
@@ -3205,15 +3524,16 @@ final class AppModel {
     /// No provider or model resolution, because there is no provider here — Claude Code holds
     /// the credential and picks the route. The model is a Claude Code alias (`sonnet`, `opus`,
     /// `haiku`), which is why it is a plain string rather than a `ModelSpec`.
+    @discardableResult
     func startClaudeCodeRun(
         cwd: String, model: String, effort: String?, prompt: String,
         noContextFiles: Bool = false, title: String? = nil
-    ) {
+    ) -> Bool {
         guard acceptsNewWork else {
             show(
                 "Aviary is ending its current Work and cannot start another run yet.", isError: true
             )
-            return
+            return false
         }
         // Remembered for the next run, and for the places that start one without a sheet —
         // the workshop launcher and `continueSession`.
@@ -3231,7 +3551,7 @@ final class AppModel {
             toast = Toast(
                 message: "Could not open the session journal: \(error.localizedDescription)",
                 isError: true)
-            return
+            return false
         }
         let commandController = SessionCommandController(identity: identity, writer: writer)
         let run = LiveRun(
@@ -3245,6 +3565,7 @@ final class AppModel {
         focusedRunID = run.id
         section = .live
         run.startClaudeCode(prompt: prompt)
+        return true
     }
 
     /// Continue an existing session on whichever engine is selected.
@@ -3844,7 +4165,10 @@ final class LiveRun: Identifiable {
         // WorkSnapshot currently carries no canonical run.started timestamp.  Keep the local
         // initialization value private; the service UI uses `startedLabel`/`elapsedLabel` and
         // never presents it as host history.
-        self.title = title ?? bridge.workspaceLabel
+        self.title = title
+            ?? bridge.transcriptItems.first(where: { $0.kind == .user && !$0.text.isEmpty })
+                .map { String($0.text.prefix(80)) }
+            ?? bridge.workspaceLabel
         self.commandState = bridge.commandState
         self.isStreaming = bridge.isStreaming
         self.hasExited = bridge.isTerminal
@@ -4484,6 +4808,11 @@ final class LiveRun: Identifiable {
 
     private var mirror: Task<Void, Never>?
     private var initialStart: ServiceBackedStartIntent?
+    var savedInitialPrompt: String? { initialStart?.prompt }
+    func hasCanonicalDelivery(for chat: PendingChat) -> Bool {
+        guard let serviceBridge else { return false }
+        return chat.hasCanonicalDelivery(in: serviceBridge.projection)
+    }
     private var initialStartStore: ServiceBackedStartIntentStore?
     private var draftPersistence: LiveRunDraftPersistence?
     private var draftPersistenceTask: Task<Void, Never>?

@@ -286,9 +286,13 @@ public struct ServiceBackedCreateSessionIntentStore: Sendable {
         ].enumerated() {
             var information = stat()
             if lstat(candidate.path, &information) == 0 {
+                let mode = information.st_mode & mode_t(0o777)
+                let acceptableMode = index == 0
+                    ? (mode & mode_t(0o022)) == 0
+                    : mode == mode_t(0o700)
                 guard (information.st_mode & S_IFMT) == S_IFDIR,
                       information.st_uid == geteuid(),
-                      (information.st_mode & mode_t(0o777)) == mode_t(0o700) else {
+                      acceptableMode else {
                     throw LocalCreateIntentError.corrupt
                 }
             } else {

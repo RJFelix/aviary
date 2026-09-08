@@ -77,6 +77,10 @@ public enum WorkServiceTransportErrorCode: String, Codable, Hashable, Sendable {
 /// for a caller to classify the result.
 public enum WorkServiceTransportError: Error, Equatable, Sendable {
     case invalidEndpoint(String)
+    /// Discovery named a syntactically valid local endpoint, but no listener owned it.
+    /// Keep this distinct from an established connection failing: local bootstrap may replace
+    /// stale discovery only for this pre-handshake condition.
+    case endpointUnavailable
     case endpointOccupied
     case notConnected
     case alreadyConnected
@@ -3744,7 +3748,8 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
         case .remote(let code, _):
             return code == .identityMismatch || code == .transportClosed
                 || code == .serverStopping || code == .serviceUnavailable
-        case .invalidEndpoint, .endpointOccupied, .alreadyConnected, .frameTooLarge,
+        case .invalidEndpoint, .endpointUnavailable, .endpointOccupied, .alreadyConnected,
+             .frameTooLarge,
              .tooManyPendingRequests, .timedOut, .canceled:
             return false
         }
@@ -3894,6 +3899,12 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
             }
         } catch WorkServiceUnixSocketFailure.invalidPath {
             throw WorkServiceTransportError.invalidEndpoint(endpointStorage.path)
+        } catch WorkServiceUnixSocketFailure.system(let code)
+            where code == ENOENT || code == ECONNREFUSED {
+            // A daemon killed without running its defer path can leave either a descriptor whose
+            // socket was removed or a stale socket inode with no listener.  Both mean discovery
+            // named an unavailable endpoint; neither is a write failure on an accepted service.
+            throw WorkServiceTransportError.endpointUnavailable
         } catch WorkServiceUnixSocketFailure.system(let code) where code == ETIMEDOUT {
             throw WorkServiceTransportError.timedOut(operation: .handshake)
         } catch let error as WorkServiceUnixSocketFailure {
@@ -4177,6 +4188,8 @@ private enum WorkServiceTransportText {
         if let error = error as? WorkServiceTransportError {
             switch error {
             case .invalidEndpoint: return (.invalidRequest, "invalid transport endpoint")
+            case .endpointUnavailable:
+                return (.serviceUnavailable, "transport endpoint is unavailable")
             case .endpointOccupied: return (.invalidRequest, "socket endpoint is occupied")
             case .notConnected: return (.transportClosed, "client is not connected")
             case .alreadyConnected: return (.invalidRequest, "client is already connected")

@@ -30,9 +30,11 @@ struct RootView: View {
         // be looking at the Workshop to learn that the thing you asked for is ready.
         .overlay(alignment: .top) { ReloadBanner() }
         .overlay(alignment: .bottom) { toastOverlay }
-        // Bottom-trailing, on every screen, deliberately outside the section switch: the
-        // point of the panel is to catch a reaction wherever you have it.
-        .overlay(alignment: .bottomTrailing) { CapturePanel() }
+        // The compose panel stays contextual and app-wide, but its idle affordance lives in
+        // reserved toolbar space. An overlay must never cover a chat's primary action.
+        .overlay(alignment: .bottomTrailing) {
+            if model.capturePanelOpen { CapturePanel() }
+        }
         .animation(.easeInOut(duration: 0.18), value: model.toast?.id)
         .animation(.easeInOut(duration: 0.2), value: model.reloader.phase)
     }
@@ -41,7 +43,8 @@ struct RootView: View {
     private var detail: some View {
         switch model.section {
         case .cockpit: CockpitView()
-        case .live: LiveView()
+        // Internal execution routes open the same conversation workspace.
+        case .live: CockpitView()
         case .sessions: SessionsView()
         case .workshop: WorkshopView()
         case .flock: FlockView()
@@ -56,8 +59,8 @@ struct RootView: View {
         switch model.section {
         case .cockpit:
             return model.engineChoice == .inHouse
-                ? "In-house · durable Work Host"
-                : "Claude Code · driven sessions"
+                ? "Your conversations and agent activity"
+                : "Conversations powered by Claude Code"
         case .sessions:
             let archived = model.sessions.filter(\.isArchived).count
             let current = model.sessions.count - archived
@@ -119,23 +122,33 @@ struct RootView: View {
             Button {
                 model.showCommandPalette = true
             } label: {
-                Image(systemName: "command")
+                Label("Command palette", systemImage: "command")
             }
             .help("Command palette (⌘K)")
 
             Button {
-                Task { await model.refreshAll() }
+                model.openCapturePanel()
             } label: {
-                Image(systemName: "arrow.clockwise")
+                Label("Improve Aviary", systemImage: "hammer.fill")
             }
-            .help("Refresh everything (⌘R)")
+            .help("Suggest an improvement to Aviary (⇧⌘I)")
 
             Button {
-                model.showInspector.toggle()
+                Task { await model.refreshAll() }
             } label: {
-                Image(systemName: "sidebar.trailing")
+                Label("Refresh", systemImage: "arrow.clockwise")
             }
-            .help("Toggle inspector (⌥⌘I)")
+            .help("Refresh everything (⌘R)")
+            .accessibilityLabel("Refresh")
+
+            if model.section != .cockpit && model.section != .live {
+                Button {
+                    model.showInspector.toggle()
+                } label: {
+                    Image(systemName: "sidebar.trailing")
+                }
+                .help("Toggle inspector (⌥⌘I)")
+            }
         }
     }
 
@@ -192,68 +205,22 @@ struct SidebarView: View {
 
     private var sidebarList: some View {
         List(selection: Binding(
-            get: { model.section },
+            get: { model.section == .live ? .cockpit : model.section },
             set: { model.section = $0 ?? .cockpit }))
         {
             SwiftUI.Section {
-                ForEach(Section.visible) { s in
+                ForEach(Section.primary) { s in
                     SidebarRow(section: s, badge: badge(for: s))
                         .tag(s)
                 }
             }
 
-            if !model.runs.isEmpty {
-                SwiftUI.Section("Attached runs") {
-                    ForEach(model.runs) { run in
-                        Button {
-                            model.focusedRunID = run.id
-                            model.section = .live
-                        } label: {
-                            HStack(spacing: 6) {
-                                if run.isStreaming {
-                                    PulseDot(color: Design.success)
-                                } else if run.hasExited {
-                                    Image(systemName: "stop.circle")
-                                        .font(.system(size: 9))
-                                        .foregroundStyle(.tertiary)
-                                } else {
-                                    Circle().fill(.tertiary).frame(width: 7, height: 7)
-                                }
-                                Text(run.title)
-                                    .font(.system(size: 11.5))
-                                    .lineLimit(1)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
+            SwiftUI.Section("Details") {
+                ForEach(Section.tools) { s in
+                    SidebarRow(section: s, badge: badge(for: s))
+                        .tag(s)
                 }
             }
-
-            if !model.detachedRuns.isEmpty {
-                SwiftUI.Section("Detached Work") {
-                    ForEach(model.detachedRuns) { run in
-                        Button {
-                            model.reattachRun(run)
-                        } label: {
-                            HStack(spacing: 6) {
-                                if run.isStreaming { PulseDot(color: Design.success) }
-                                else { Circle().fill(.tertiary).frame(width: 7, height: 7) }
-                                Text(run.title).font(.system(size: 11.5)).lineLimit(1)
-                                Spacer()
-                                Image(systemName: "arrowshape.turn.up.left")
-                                    .font(.system(size: 9)).foregroundStyle(.tertiary)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .help("Reattach this run")
-                    }
-                }
-            }
-
-            // The "Working agents" section is deliberately not shown — it listed sessions
-            // the harness daemon is holding, and on the in-house engine it was actively wrong:
-            // a live in-house run still rendered "Nothing running". Kept as
-            // `WorkingAgentsSection`; see docs/architecture.md, "Retired daemon surfaces".
         }
         .listStyle(.sidebar)
         // The sidebar's own vibrancy is removed. The original reason no longer holds — that
@@ -304,10 +271,12 @@ struct SidebarView: View {
                     .fill(healthColor)
                     .frame(width: 7, height: 7)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("Aviary")
+                    Text(model.localWorkServiceError != nil
+                         ? (model.localWorkServiceHandshake == nil ? "Agent service needs attention" : "Chat setup needs attention") :
+                         model.localWorkServiceHandshake != nil ? "Agent service connected" : "Connecting to agent service…")
                         .font(.system(size: 10.5, weight: .medium))
                         .lineLimit(1)
-                    Text(model.runtimeProbes.first(where: \.ok)?.summary ?? "runtime unchecked")
+                    Text("Runs on this Mac")
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(.tertiary)
                         .lineLimit(1).truncationMode(.middle)
@@ -334,8 +303,8 @@ struct SidebarView: View {
     }
 
     private var healthColor: Color {
-        if model.runtimeProbes.isEmpty { return .secondary }
-        return model.runtimeProbes.contains(where: \.ok) ? Design.success : Design.danger
+        if model.localWorkServiceError != nil { return Design.danger }
+        return model.localWorkServiceHandshake != nil ? Design.success : .secondary
     }
 }
 

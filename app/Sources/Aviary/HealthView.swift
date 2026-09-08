@@ -2,14 +2,8 @@ import SwiftUI
 import AppKit
 import AviaryCore
 
-/// Can Aviary run an agent right now, and what is it able to reach.
-///
-/// This screen used to be about process topology — a supervisor's pid and socket, an
-/// ownership lease, a pool of kernels, worker processes — because the harness put all of that
-/// between Aviary and a running agent, and each signal about it lied in its own way. None of
-/// it exists now. Agents run in this process and interpreters in a runtime host it owns, so
-/// the questions left are the ones that were always the point: does the runtime start, which
-/// models are reachable, and what is signed in.
+/// Service connectivity, interpreter availability, and provider configuration are separate
+/// observations. A successful Python probe does not mean the agent service is reachable.
 struct HealthView: View {
     @Environment(AppModel.self) private var model
     @State private var busy = false
@@ -17,6 +11,7 @@ struct HealthView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
+                serviceCard
                 verdict
                 runtimeCard
                 claudeCodeCard
@@ -30,12 +25,35 @@ struct HealthView: View {
 
     // MARK: Verdict
 
-    /// What the screen now answers: can Aviary run an agent right now.
-    ///
-    /// It used to report the harness supervisor's health — sessions held, kernels pooled,
-    /// whether the socket was wedged. None of that exists any more: Aviary runs its agents
-    /// in-process and its interpreters in a runtime host it owns, so the only question worth
-    /// a verdict is whether that host starts.
+    private var serviceCard: some View {
+        Card("Local agent service", symbol: "network") {
+            VStack(alignment: .leading, spacing: 10) {
+                if let error = model.localWorkServiceError {
+                    Label(model.localWorkServiceHandshake == nil
+                          ? "Connection needs attention" : "Connected · chat setup needs attention",
+                          systemImage: "exclamationmark.circle")
+                        .foregroundStyle(Design.danger)
+                    Text(error).textSelection(.enabled)
+                } else if model.localWorkServiceHandshake != nil {
+                    Label("Connected on this Mac", systemImage: "checkmark.circle")
+                        .foregroundStyle(Design.success)
+                    Text("Aviary can reach the agent service. Project and model readiness are checked when a chat starts.")
+                } else {
+                    Text("No agent-service connection has been established yet.")
+                }
+                Text("A connection problem does not discard saved requests or stop work that the service already owns.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Retry connection") {
+                    Task {
+                        await model.bootstrapLocalWorkService()
+                        await model.refreshServiceWork()
+                    }
+                }.buttonStyle(.bordered)
+            }.font(.system(size: 12))
+        }
+    }
+
+    /// Interpreter probe only; this is not an overall readiness verdict.
     private var verdict: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
@@ -46,7 +64,7 @@ struct HealthView: View {
                         .foregroundStyle(verdictColor)
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(runtimeOK ? "Ready" : "Runtime unavailable")
+                    Text(runtimeOK ? "Python interpreter available" : "Python interpreter unavailable")
                         .font(.system(size: 15, weight: .semibold))
                     Text(verdictSubtitle)
                         .font(.system(size: 11.5)).foregroundStyle(.secondary)
@@ -78,7 +96,7 @@ struct HealthView: View {
         else { return "No runtime host has been probed yet." }
         let models = model.pickerModels.count
         return probe.summary
-            + " · \(models) model\(models == 1 ? "" : "s") reachable"
+            + " · \(models) configured model\(models == 1 ? "" : "s")"
     }
 
     private var actions: some View {

@@ -76,6 +76,22 @@ public struct AgentHome: Sendable, Hashable {
         root.appending(path: "work-host-id", directoryHint: .notDirectory)
     }
 
+    /// Private storage for the durable GUI/device identity used to attach to the Work service.
+    ///
+    /// The conventional AgentHome may predate native Work and be mode 0755. Keep the identity
+    /// store's strict private-parent contract by giving it a dedicated child rather than chmodding
+    /// the whole home or weakening the store. This locator deliberately does not inspect or
+    /// migrate the former root-level `work-service-client-id`; migration requires an explicit
+    /// identity-preservation policy if a released build ever writes that legacy location.
+    public var workServiceClientIdentityDirectory: URL {
+        root.appending(path: "work-service-client", directoryHint: .isDirectory)
+    }
+
+    public var workServiceClientIdentityFile: URL {
+        workServiceClientIdentityDirectory.appending(
+            path: "client-id", directoryHint: .notDirectory)
+    }
+
     /// Load or create the durable Work Host identity for this home.
     ///
     /// A stable lock plus synchronized temporary-file publication is used as a create-if-absent
