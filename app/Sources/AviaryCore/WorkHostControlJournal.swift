@@ -95,6 +95,19 @@ private func controlSHA256(_ data: Data) -> String {
     "sha256:" + AviarySHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }
 
+/// The caller's Create cursor was compared with the current control projection while holding
+/// the canonical mutation gate. This proves rejection before append, rather than an unknown
+/// append failure, so the service boundary may safely expose the exact cursor pair.
+public struct WorkHostControlCreationStaleCursorError: Error, Equatable, Sendable {
+    public let expected: JournalCursor
+    public let actual: JournalCursor
+
+    public init(expected: JournalCursor, actual: JournalCursor) {
+        self.expected = expected
+        self.actual = actual
+    }
+}
+
 /// A small streaming SHA-256 implementation used only for the control journal seal.  The
 /// platform digest helper intentionally exposes a one-shot API; keeping this state here means an
 /// append extends the prior seal without retaining or hashing the complete history again.
@@ -2383,8 +2396,8 @@ public actor WorkHostControlJournal {
         }
         try rejectNewMutationWhileSessionCreationIncomplete(current)
         guard request.causalControlCursor == actualCursor else {
-            throw TimelineJournalWriter.WriterError.invalidDraft(
-                reason: "creation reservation causal control cursor is stale")
+            throw WorkHostControlCreationStaleCursorError(
+                expected: request.causalControlCursor, actual: actualCursor)
         }
 
         let minted = try mintCreationIdentity(current: current)
@@ -4008,10 +4021,14 @@ public actor WorkHostControlJournal {
         current: WorkHostControlSnapshot,
         causalCursor: JournalCursor
     ) async throws -> TimelineJournalCommit {
-        guard causalCursor == currentCursor(of: current),
-              causalCursor.journal == journal else {
+        guard causalCursor.journal == journal else {
             throw TimelineJournalWriter.WriterError.invalidDraft(
-                reason: "creation mutation causal control cursor is stale")
+                reason: "creation mutation causal control journal does not match host journal")
+        }
+        let actualCursor = currentCursor(of: current)
+        guard causalCursor == actualCursor else {
+            throw WorkHostControlCreationStaleCursorError(
+                expected: causalCursor, actual: actualCursor)
         }
         let (expectedSequence, sequenceOverflow) = causalCursor.sequence.addingReportingOverflow(1)
         guard !sequenceOverflow else {

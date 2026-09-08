@@ -1487,7 +1487,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 configurationDigest: retained.configurationDigest,
                 causalControlCursor: request.causalControlCursor)
             retainedManifest = retained
-            reservation = try await controlJournal.reserveCreation(creationRequest)
+            do {
+                reservation = try await controlJournal.reserveCreation(creationRequest)
+            } catch let error as WorkHostControlCreationStaleCursorError {
+                throw WorkServiceProtocolError.staleCursor(
+                    expected: error.expected, actual: error.actual)
+            }
             priorManifest = nil
         }
         let binding = WorkBinding(

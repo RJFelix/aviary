@@ -616,6 +616,46 @@ func test_localWorkHostLaunchResolverServesQualifiedModelsThroughDurableSocket()
             }
         XCTAssertEqual(afterSecondDuplicate.controlCursor, afterSecond.controlCursor)
 
+        // A new command cannot reuse the launch-time cursor after later control mutations. The
+        // durable socket must preserve that typed stale result without reserving another Work or
+        // advancing the control journal; exact duplicates remain lookups of their original Works.
+        let staleRequest = request(
+            commandID: "qualified-model-new-command-at-stale-cursor",
+            cursor: initial.controlCursor,
+            modelID: fixture.modelID)
+        do {
+            _ = try await connected.createWork(staleRequest)
+            XCTFail("a new Create at a stale control cursor must be rejected")
+        } catch WorkServiceTransportError.remote(let code, _) {
+            XCTAssertEqual(code, .staleCursor)
+        }
+        let afterStale = try await localResolverStage("post-stale-Create handshake") {
+            try await connected.handshake(WorkServiceHandshakeRequest(client: clientRef))
+        }
+        XCTAssertEqual(afterStale.controlCursor, afterSecondDuplicate.controlCursor)
+
+        let firstDuplicateAfterStale = try await localResolverStage(
+            "first duplicate after stale Create") {
+                try await connected.createWork(createRequest)
+            }
+        XCTAssertEqual(firstDuplicateAfterStale.receipt.state, .duplicate)
+        XCTAssertEqual(firstDuplicateAfterStale.work.work, created.work.work)
+        XCTAssertEqual(firstDuplicateAfterStale.session, created.session)
+        XCTAssertEqual(firstDuplicateAfterStale.attachment.attachment, created.attachment.attachment)
+        let secondDuplicateAfterStale = try await localResolverStage(
+            "second duplicate after stale Create") {
+                try await connected.createWork(secondRequest)
+            }
+        XCTAssertEqual(secondDuplicateAfterStale.receipt.state, .duplicate)
+        XCTAssertEqual(secondDuplicateAfterStale.work.work, second.work.work)
+        XCTAssertEqual(secondDuplicateAfterStale.session, second.session)
+        XCTAssertEqual(secondDuplicateAfterStale.attachment.attachment, second.attachment.attachment)
+        let afterPostStaleDuplicates = try await localResolverStage(
+            "post-stale-duplicates handshake") {
+                try await connected.handshake(WorkServiceHandshakeRequest(client: clientRef))
+            }
+        XCTAssertEqual(afterPostStaleDuplicates.controlCursor, afterStale.controlCursor)
+
         let twoWorkPage = try await localResolverStage("two-Work final list") {
             try await connected.listWorks(WorkServiceListRequest(client: clientRef))
         }
