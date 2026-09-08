@@ -229,7 +229,8 @@ public enum InHouseModelResolver {
             var modelIDs = Set<String>()
             for model in provider.models {
                 guard model.providerID == provider.id,
-                      isValidIdentifier(model.id), modelIDs.insert(model.id).inserted else {
+                      isValidIdentifier(model.id, allowSlash: true),
+                      modelIDs.insert(model.id).inserted else {
                     return .failure(modelIDs.contains(model.id) ? .duplicateModel : .invalidConfiguration)
                 }
                 guard model.api.map(isValidAPI) ?? true,

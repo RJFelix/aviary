@@ -638,6 +638,84 @@ func test_workLaunchPromptAssemblyRetainsSourcesAndReplaysExactBytes() throws {
     XCTAssertEqual(replayed.sources[0].renderedDigest, source.renderedDigest)
 }
 
+func test_workLaunchPreparedStartReservationUsesRecordBound() throws {
+    let fixture = try WorkLaunchManifestFixture()
+    defer { fixture.remove() }
+
+    let workspace = fixture.root.appending(
+        path: "prepared-start-workspace", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    try Data(String(repeating: "context line\n", count: 900).utf8).write(
+        to: workspace.appending(path: "AGENTS.md"))
+    let assembly = try SystemPromptAssembly.build(
+        cwd: workspace.path,
+        skills: "# Skills\n" + String(repeating: "skill material\n", count: 80),
+        memory: "# Memory\n" + String(repeating: "memory material\n", count: 80),
+        includeContextFiles: true)
+    XCTAssertTrue(assembly.sources.contains { $0.kind == .contextFile && $0.status == .present })
+    XCTAssertTrue(assembly.sources.contains { $0.kind == .skill })
+    XCTAssertTrue(assembly.sources.contains { $0.kind == .memory })
+    let retainedAssembly = try fixture.store.retainPromptAssembly(
+        assembly, authority: .workHost(fixture.host),
+        provenance: WorkLaunchManifestProvenance(source: "start.prompt.v1"))
+
+    let launchWorkspace = WorkLaunchWorkspace(locator: workspace.path, policy: .workspace)
+    let draft = WorkLaunchManifestDraft(
+        workspace: launchWorkspace,
+        runtime: fixture.manifest.runtime,
+        configuration: WorkServiceWorkConfiguration(includeContextFiles: true),
+        requestedCapabilities: [],
+        contextPolicy: WorkLaunchContextPolicy(includeContextFiles: true))
+    let createKey = WorkLaunchCreateKey(
+        client: fixture.startIntent.client,
+        requestDigest: try WorkLaunchCreateKey.requestDigest(
+            configuration: draft.configuration,
+            requestedCapabilities: draft.requestedCapabilities),
+        commandID: "create-large-prepared-start",
+        causalControlCursor: fixture.controlCursor)
+    let retainedDraft = try fixture.store.retain(draft, for: createKey)
+    let template = try fixture.store.publishTemplate(
+        retainedDraft, binding: fixture.binding.workBinding)
+    let admission = try fixture.store.reserveStart(
+        template, binding: fixture.binding.workBinding, run: fixture.run,
+        startIntent: fixture.startIntent,
+        initialInputBodyReference: fixture.bodyReference)
+    guard case .winner(let reservation) = admission else {
+        XCTFail("first Start must win the reservation")
+        return
+    }
+    let prepared = try fixture.store.prepareStart(
+        reservation, promptAssembly: retainedAssembly)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    let preparedBytes = try encoder.encode(prepared).count
+    XCTAssertTrue(preparedBytes > fixture.store.limits.maximumMetadataBytes)
+    XCTAssertTrue(preparedBytes <= fixture.store.limits.maximumRecordBytes)
+
+    let reopened = WorkLaunchManifestStore(home: fixture.home)
+    XCTAssertEqual(
+        try reopened.readStartReservation(for: fixture.binding.workBinding), prepared)
+    let retried = try reopened.reserveStart(
+        template, binding: fixture.binding.workBinding, run: fixture.run,
+        startIntent: fixture.startIntent,
+        initialInputBodyReference: fixture.bodyReference)
+    guard case .reserved(let exact) = retried else {
+        XCTFail("an exact retry must reuse the prepared reservation")
+        return
+    }
+    XCTAssertEqual(exact, prepared)
+
+    let smallRecordStore = WorkLaunchManifestStore(
+        home: fixture.home,
+        limits: WorkLaunchManifestLimits(maximumRecordBytes: preparedBytes - 1))
+    try expectWorkLaunchError({
+        _ = try smallRecordStore.readStartReservation(for: fixture.binding.workBinding)
+    }) {
+        if case .recordTooLarge = $0 { return true }
+        return false
+    }
+}
+
 func test_workLaunchCreateRetentionRequiresExactControlCursorAndRequestDigest() throws {
     let fixture = try WorkLaunchManifestFixture()
     defer { fixture.remove() }
@@ -768,6 +846,9 @@ let casesWorkLaunchManifest: [Case] = [
     }),
     ("phase3 launch prompt: source bodies are durable and byte-exact", {
         try test_workLaunchPromptAssemblyRetainsSourcesAndReplaysExactBytes()
+    }),
+    ("phase3 launch prompt: prepared Start reservation uses record bound", {
+        try test_workLaunchPreparedStartReservationUsesRecordBound()
     }),
     ("phase3 launch create: control cursor and request digest are exact", {
         try test_workLaunchCreateRetentionRequiresExactControlCursorAndRequestDigest()

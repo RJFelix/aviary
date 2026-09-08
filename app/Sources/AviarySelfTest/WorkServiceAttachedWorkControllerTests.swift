@@ -312,6 +312,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
     var sessionEvents: [TimelineEvent]
     var controlCursorStorage: JournalCursor
     var hostInstanceStorage: WorkHostInstanceRef
+    var descriptorExecutionOverride: WorkServiceExecutionState?
     var readAcknowledgements: [WorkServiceReadTarget: JournalCursor] = [:]
     var readAcknowledgementResponses: [String: WorkServiceAcknowledgeReadResponse] = [:]
     var readAcknowledgementRequests: [WorkServiceAcknowledgeReadRequest] = []
@@ -377,6 +378,9 @@ private actor AttachedControllerTestService: WorkServiceClient {
     }
     func setCorruptPrefixDigests(_ enabled: Bool) { corruptPrefixDigests = enabled }
     func setHostInstance(_ instance: WorkHostInstanceRef) { hostInstanceStorage = instance }
+    func setDescriptorExecutionOverride(_ execution: WorkServiceExecutionState?) {
+        descriptorExecutionOverride = execution
+    }
     func controlCursor() -> JournalCursor { controlCursorStorage }
     func snapshotRequestCursors() -> [Int] { snapshotAfterSequences }
     func pageRequestCursors() -> [Int] { pageAfterSequences }
@@ -860,7 +864,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
         return try WorkServiceWorkDescriptor(
             work: fixture.descriptor.work, journal: fixture.descriptor.journal,
             recordedDisposition: fixture.descriptor.recordedDisposition,
-            execution: execution, currentRun: reduced.activeRun,
+            execution: descriptorExecutionOverride ?? execution, currentRun: reduced.activeRun,
             currentRunSession: reduced.activeRunSession,
             currentRunSessionAttachment: reduced.activeRunSessionAttachment,
             configuration: fixture.descriptor.configuration, hostObservation: observation,
@@ -1477,6 +1481,61 @@ func testWorkServiceAttachedControllerRetainsIndeterminateCommandUntilExplicitRe
     XCTAssertFalse(awaitingRefresh.needsRecovery)
     XCTAssertTrue((try await controller.refresh()).isCanonical)
     XCTAssertNil(await controller.pendingCommand())
+}
+
+func testWorkServiceAttachedControllerRetriesExactIndeterminateStartThroughRecoveryDescriptor()
+    async throws {
+    let fixture = try AttachedControllerFixture(workID: "exact-start-recovery")
+    let service = AttachedControllerTestService(fixture: fixture)
+    let controller = try makeAttachedController(fixture: fixture, service: service)
+    _ = try await controller.refresh()
+    await service.failNextCommand()
+    do {
+        _ = try await controller.start("retained prompt", commandID: "retained-start")
+        XCTFail("transport failure should retain the exact Start")
+    } catch WorkServiceAttachedWorkControllerError.transportFailure {
+        XCTAssertEqual((await controller.pendingCommand())?.state, .indeterminate)
+    }
+    await service.setDescriptorExecutionOverride(.recoveryRequired)
+    let recovered = try await controller.refresh()
+    XCTAssertTrue(recovered.isCanonical)
+    XCTAssertTrue(recovered.needsRecovery)
+    let recoveryControls = ServiceBackedGUIControlPolicy(projection: recovered)
+    XCTAssertTrue(recoveryControls.canRetryPendingCommand(kind: .start))
+    XCTAssertFalse(recoveryControls.canSubmitText)
+    XCTAssertFalse(recoveryControls.canRetryPendingCommand(kind: .send))
+    XCTAssertEqual(await service.commandCount(), 1)
+
+    let receipt = try await controller.retryPendingCommand()
+    XCTAssertEqual(receipt.state, .accepted)
+    XCTAssertEqual(await service.commandCount(), 2)
+    XCTAssertEqual((await service.lastCommand())?.kind, .start)
+    XCTAssertEqual((await service.lastCommand())?.command.commandID, "retained-start")
+    XCTAssertEqual((await service.lastCommand())?.value, "retained prompt")
+
+    let changedFixture = try AttachedControllerFixture(workID: "changed-start-recovery")
+    let changedService = AttachedControllerTestService(fixture: changedFixture)
+    let changedController = try makeAttachedController(
+        fixture: changedFixture, service: changedService)
+    _ = try await changedController.refresh()
+    await changedService.failNextCommand()
+    do {
+        _ = try await changedController.start("retained prompt", commandID: "retained-start")
+        XCTFail("transport failure should retain the exact Start")
+    } catch WorkServiceAttachedWorkControllerError.transportFailure {
+        XCTAssertTrue(true)
+    }
+    await changedService.advanceWorkCursor()
+    await changedService.setDescriptorExecutionOverride(.recoveryRequired)
+    let changedProjection = try await changedController.refresh()
+    XCTAssertFalse(ServiceBackedGUIControlPolicy(projection: changedProjection)
+        .canRetryPendingCommand(kind: .start))
+    do {
+        _ = try await changedController.retryPendingCommand()
+        XCTFail("a retained Start at an older causal cursor must remain fenced")
+    } catch WorkServiceAttachedWorkControllerError.recoveryRequired {
+        XCTAssertEqual(await changedService.commandCount(), 1)
+    }
 }
 
 func testWorkServiceAttachedControllerPersistsRemoteStaleForRecreationAndReissue() async throws {
@@ -2607,6 +2666,9 @@ let casesWorkServiceAttachedWorkController: [Case] = [
     }),
     ("phase3 Work controller retains indeterminate command for explicit retry", {
         try await testWorkServiceAttachedControllerRetainsIndeterminateCommandUntilExplicitRetry()
+    }),
+    ("phase3 Work controller retries only exact indeterminate Start through recovery", {
+        try await testWorkServiceAttachedControllerRetriesExactIndeterminateStartThroughRecoveryDescriptor()
     }),
     ("phase3 Work controller persists remote stale for recreation and reissue", {
         try await testWorkServiceAttachedControllerPersistsRemoteStaleForRecreationAndReissue()

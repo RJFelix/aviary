@@ -311,7 +311,19 @@ final class AppModel {
     /// not already attach to. The launcher uses this for an explicit Attach action; rows are
     /// never reconstructed from a partially read or quarantined page.
     private(set) var localServiceCatalogWorks: [WorkServiceWorkDescriptor] = []
-    var localWorkServiceError: String?
+    private var localWorkServiceObservationError: String?
+    /// A successful handshake/catalog read cannot resolve an outstanding Create transaction.
+    /// Clear this only when the retained Create outbox has actually been reconciled.
+    var localWorkServiceCreateError: String?
+    var localWorkServiceError: String? {
+        get {
+            if localWorkServiceHandshake == nil, let connectivity = localWorkServiceObservationError {
+                return connectivity
+            }
+            return localWorkServiceCreateError ?? localWorkServiceObservationError
+        }
+        set { localWorkServiceObservationError = newValue }
+    }
     private var localWorkServiceBootstrapInFlight = false
     private var serviceRefreshInFlight = false
     /// Cursor for the bounded central service poll. Stable ordering plus rotation prevents
@@ -720,6 +732,28 @@ final class AppModel {
         }
     }
 
+    /// Explicit recovery, unlike background catalog polling, reconciles the original Create
+    /// identity before reconstructing its conversation. A live socket alone is not success.
+    func retryLocalWorkService() async {
+        if localWorkService == nil {
+            await bootstrapLocalWorkService()
+            return
+        }
+        guard let client = localWorkServiceClient,
+              beginServiceLifecycleOperation() else { return }
+        defer { finishServiceLifecycleOperation() }
+        do {
+            let (session, handshake) = try await reconnectLocalWorkService()
+            localWorkServiceHandshake = handshake
+            localWorkspaceCatalog = handshake.workspaceCatalog
+            guard await reconcilePendingCreateIntents(session: session, client: client),
+                  await reconcilePendingCreateSessionIntents(session: session, client: client) != .blocked else { return }
+            await restoreServiceWork(session: session, client: client, handshake: handshake)
+        } catch {
+            localWorkServiceError = Self.serviceErrorMessage(error)
+        }
+    }
+
     /// Read the host catalog and recreate every attachment belonging to this durable client.
     /// This is observation/reconstruction only: the presence of an attachment is not an excuse
     /// to issue another Attach command, and terminal Work remains inspectable.
@@ -1085,7 +1119,9 @@ final class AppModel {
                     prompt: unresolvedInitialStart.prompt, commandID: unresolvedInitialStart.commandID)
             } else if unresolvedInitialStart != nil {
                 run.commandNotice = .warning(
-                    "The retained initial Start belongs to a different Session attachment; review and retry it explicitly.")
+                    bridge.projection.isCanonical
+                        ? "The saved first message is awaiting startup reconciliation. Check delivery before retrying."
+                        : "The saved first message is waiting for a complete Work and Session read. It has not been resubmitted.")
             }
             return nil
         } catch {
@@ -1105,7 +1141,29 @@ final class AppModel {
         return workspace.label ?? "Workspace \(workspaceID.rawValue.prefix(12))"
     }
 
-    private static func serviceErrorMessage(_ error: Error) -> String {
+    static func serviceErrorMessage(_ error: Error) -> String {
+        if let error = error as? WorkServiceTransportError {
+            switch error {
+            case .remote(let code, _):
+                // Do not echo arbitrary remote diagnostic text (it can contain source data).
+                switch code {
+                case .launchUnavailable:
+                    return "The agent service answered, but it cannot prepare this chat's model, project, or runtime configuration. Check Models, the project settings, and Diagnostics, then retry the saved request."
+                case .internalError:
+                    return "The agent service answered with an internal error while preparing the chat. This is not a connection failure. The saved request is retained for an exact retry."
+                case .sourceIncomplete:
+                    return "The agent service cannot verify its saved Work state. The request is retained; no replacement Work will be created."
+                case .capabilityDenied:
+                    return "The agent service has not granted permission to prepare this chat. Your saved request is retained."
+                default:
+                    return "The agent service rejected the operation (\(code.rawValue)). Your saved request is retained; check Diagnostics before retrying."
+                }
+            case .invalidFrame, .invalidResponse:
+                return "The agent service returned a response Aviary could not validate. The original request is retained for reconciliation; it will not be replaced with another copy."
+            default:
+                return "Confirmation from the agent service was interrupted. Your saved request is retained for reconciliation, not sent again as a new request."
+            }
+        }
         if let error = error as? WorkServiceClientIdentityError {
             switch error {
             case .invalidURL, .accessDenied:
@@ -1154,7 +1212,7 @@ final class AppModel {
                             guard rejectPendingChatAttempt(request.commandID) else { throw PendingChatError.conflict }
                             try store.clear(request)
                         } catch {
-                            localWorkServiceError =
+                            localWorkServiceCreateError =
                                 "A rejected Work creation intent could not be cleared safely; new Work is withheld."
                             return false
                         }
@@ -1176,7 +1234,7 @@ final class AppModel {
                             guard rejectPendingChatAttempt(request.commandID) else { throw PendingChatError.conflict }
                             try store.clear(request)
                         } catch {
-                            localWorkServiceError =
+                            localWorkServiceCreateError =
                                 "A stale Work creation intent could not be cleared safely; new Work is withheld."
                             return false
                         }
@@ -1184,14 +1242,15 @@ final class AppModel {
                             "A retained Work creation intent was stale and was cleared; retry Create to use the current Work Host cursor."
                         continue
                     }
-                    localWorkServiceError =
-                        "A retained Work creation intent could not be reconciled; no new Work will be created until the Work Host is reachable."
+                    localWorkServiceCreateError = Self.serviceErrorMessage(error)
+                        + " New chats are paused until this saved Create attempt is reconciled."
                     return false
                 }
             }
+            localWorkServiceCreateError = nil
             return true
         } catch {
-            localWorkServiceError =
+            localWorkServiceCreateError =
                 "A retained Work creation intent could not be read safely; new Work is withheld."
             return false
         }
@@ -2011,6 +2070,8 @@ final class AppModel {
             sharedHandshake = try await session.refreshHandshake()
         } catch {
             await session.disconnect()
+            localWorkServiceHandshake = nil
+            localWorkspaceCatalog = .empty
             throw error
         }
         let probeHandshake: WorkServiceHandshakeResponse
@@ -2025,6 +2086,8 @@ final class AppModel {
             // still alive. Never dispatch a mutation using B's cursor on A's connection; poison
             // the cached session so the next attempt discovers the new instance.
             await session.disconnect()
+            localWorkServiceHandshake = nil
+            localWorkspaceCatalog = .empty
             throw LocalWorkServiceBootstrapError.connectionFailed(.notConnected)
         }
         localWorkServiceHandshake = probeHandshake
@@ -3113,6 +3176,9 @@ final class AppModel {
             return "The agent service created this conversation. Reconnect to open it; your request will not be sent twice."
         }
         if chat.phase == .awaitingAcceptance {
+            if let issue = localWorkServiceCreateError {
+                return issue + " Check delivery retries the original saved identity, not a new copy."
+            }
             return "Aviary lost confirmation of delivery. Your request is saved. Check delivery to reconcile the original attempt without sending another copy."
         }
         if chat.phase == .preparing {
@@ -3415,7 +3481,7 @@ final class AppModel {
                     guard rejectPendingChatAttempt(createRequest.commandID) else { throw PendingChatError.conflict }
                     try createIntentStore.clear(createRequest)
                 } catch {
-                    localWorkServiceError =
+                    localWorkServiceCreateError =
                         "Create was rejected, but its durable intent could not be cleared; new Work is withheld until it is reconciled."
                     return
                 }
@@ -3436,7 +3502,7 @@ final class AppModel {
                 // Keeping the intent is safe: the next bootstrap replays the exact idempotent
                 // request and promotes the Start seed again. Surface the durability issue without
                 // discarding the attached Work or losing its initial prompt.
-                localWorkServiceError =
+                localWorkServiceCreateError =
                     "Work was created, but its GUI Start intent could not be durably resolved; the exact request will be reconciled on relaunch."
             }
             guard let serviceAttachmentKey = ServiceAttachmentKey(
@@ -3507,7 +3573,9 @@ final class AppModel {
                     commandID: unresolvedRetainedStart.commandID)
             } else if unresolvedRetainedStart != nil {
                 run.commandNotice = .warning(
-                    "The retained initial Start belongs to a different Session attachment; review and retry it explicitly.")
+                    bridge.projection.isCanonical
+                        ? "The saved first message is awaiting startup reconciliation. Check delivery before retrying."
+                        : "The saved first message is waiting for a complete Work and Session read. It has not been resubmitted.")
             }
         } catch let error as WorkHostWorkspaceRegistryError {
             blockPendingChat(pendingChatID,
@@ -3515,7 +3583,12 @@ final class AppModel {
                     + " Choose Edit request to check the project folder. Your request has not been sent.",
                 kind: .workspaceUnavailable)
         } catch {
-            blockPendingChat(pendingChatID, message: Self.serviceErrorMessage(error), kind: .hostUnavailable)
+            let message = Self.serviceErrorMessage(error)
+            if let pendingChatID,
+               pendingChats.contains(where: { $0.id == pendingChatID && $0.phase == .awaitingAcceptance }) {
+                localWorkServiceCreateError = message
+            }
+            blockPendingChat(pendingChatID, message: message, kind: .hostUnavailable)
         }
     }
 

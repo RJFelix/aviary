@@ -140,3 +140,52 @@ advanced many-client/Work connections remain available rather than silently remo
   inspection remains available from the chat header rather than an always-open sidebar.
 - These are **macOS startup, durability, UI, and existing regression** receipts. No fresh Linux
   run or complete live model coding/review session is claimed by this slice.
+
+## Real-use startup follow-up — 2026-09-08
+
+Ryan's first real chat exposed gaps that the preceding preflight-only receipt did not cover:
+
+- An unrelated configured `vendor/model` ID invalidated the entire in-house model catalog,
+  including a selected Codex model. Provider-local model identifiers must permit slashes.
+- A successfully created idle Work correctly has no live Run observation. The attached-chat
+  reader nevertheless required that observation and withheld the canonical conversation.
+- Exact Create replay returns a duplicate receipt. Chat reconstruction must accept that receipt
+  while retaining exact identities and distinguishing original receipt authorization from current
+  attachment capabilities.
+- A successful catalog refresh erased the earlier Create error. Connectivity and outstanding
+  startup failure now have separate state; recovery explicitly reconciles retained Create intents.
+- A normal multi-source system prompt can exceed the small metadata-record bound even though
+  every source and body is valid. Prepared Start reservations embed that assembly and need the
+  bounded launch-record limit, not the scalar/pointer metadata limit.
+
+The acceptance bar for this follow-up is the actual signed GUI recovering the original saved
+conversation and receiving a provider response, plus a durable socket Create/read/duplicate
+regression using production-shaped configuration. Handshake, Python availability, pure resolver
+tests, and fixture screenshots are separate supporting evidence, not substitutes for that flow.
+
+### Follow-up receipt
+
+- The signed GUI recovered Ryan's original Work/Session, delivered the original 96-byte request,
+  and displayed the Codex model's completed documentation summary. Canonical Work evidence has
+  exactly one `run.started`, one `command.accepted`, one `command.delivered`, and one completed
+  turn. Other saved requests and the unsent verification card were not dispatched.
+- The interrupted, unprepared Start reservation was backed up and repaired explicitly in place.
+  Its prompt, Work, Session, and reserved Run identities were unchanged. The recovered flattened
+  context matched the previously retained 12,931-byte body digest; repair provenance is explicit.
+  No automatic crash-recovery rule was weakened to infer missing context. The old idle helper had
+  no Run/child process and was replaced; no running agent was interrupted.
+- Full macOS SelfTest before the last UI-policy alignment: **1,030 cases / 14,688 assertions**,
+  all passed in **503.04s**. The final explicit-retry policy delta then passed its integrated
+  controller/UI-policy test (**1 / 15**) and the policy suite (**4 / 59**). The signed app/helper
+  and signed AppModel journey probe pass; the final live GUI response was visually inspected.
+- New focused proofs: qualified-model durable socket Create/read/exact duplicate **1 / 46**;
+  realistic prepared reservation bound/reopen/negative size limit **1 / 8**. Earlier supporting
+  controller and transport suites passed **38 / 328** and **29 / 358** respectively.
+
+This closes the reported chat-start blocker, not the complete coding/review journey or fresh
+Linux verification. Follow-up UX work should clear acknowledgement banners once canonical
+catch-up completes, replace remaining machinery-heavy copy, and reconcile superseded architecture
+docs (the model's summary exposed their conflicting claims). Add a default full startup canary
+using the production prompt builder, not only a one-source test prompt. Host-policy changes across
+Create replay still need an explicit original-authorization retention contract; this check used
+unchanged grants. Generic launch failures remain retained unless non-admission is proven.

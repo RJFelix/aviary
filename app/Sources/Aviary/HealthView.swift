@@ -43,10 +43,11 @@ struct HealthView: View {
                 }
                 Text("A connection problem does not discard saved requests or stop work that the service already owns.")
                     .font(.caption).foregroundStyle(.secondary)
+                Text("Retry checks saved startup attempts using their original identities and may continue a chat that has not reached the agent yet.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Button("Retry connection") {
                     Task {
-                        await model.bootstrapLocalWorkService()
-                        await model.refreshServiceWork()
+                        await model.retryLocalWorkService()
                     }
                 }.buttonStyle(.bordered)
             }.font(.system(size: 12))

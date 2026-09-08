@@ -70,6 +70,7 @@ public enum WorkServiceTransportErrorCode: String, Codable, Hashable, Sendable {
     case transportClosed = "transport_closed"
     case serverStopping = "server_stopping"
     case internalError = "internal_error"
+    case launchUnavailable = "launch_unavailable"
 }
 
 /// Public errors make failures distinguishable without exposing POSIX errno details as a
@@ -4185,6 +4186,11 @@ private enum WorkServiceTransportText {
 
     static func error(for error: Error)
         -> (WorkServiceTransportErrorCode, String?) {
+        if let launchError = error as? LocalWorkHostLaunchResolver.Error {
+            // These descriptions are fixed, reviewed strings, never arbitrary provider errors.
+            // A reachable host with invalid launch material is not a disconnected transport.
+            return (.launchUnavailable, launchError.errorDescription)
+        }
         if let error = error as? WorkServiceTransportError {
             switch error {
             case .invalidEndpoint: return (.invalidRequest, "invalid transport endpoint")

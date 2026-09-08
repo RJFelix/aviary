@@ -371,6 +371,43 @@ func test_inHouseModelResolverIncludesAuthenticatedCodexBuiltin() throws {
     XCTAssertTrue(selection.modelIsBuiltIn)
 }
 
+func test_inHouseModelResolverAcceptsQualifiedConfiguredModelIDsWithoutWeakeningValidation() throws {
+    var auth = AuthInfo()
+    auth.providers.insert("openai-codex")
+    let inputs = resolverInputs([
+        resolverProvider("litellm", models: ["baseten/Qwen3-Coder-480B-A35B-Instruct"]),
+        resolverProvider("optiq", models: ["mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"]),
+    ], auth: auth, environment: ["INHOUSE_TOKEN": "captured-secret"])
+
+    let codex = try XCTUnwrap(tryResult(InHouseModelResolver.resolve(
+        "openai-codex/gpt-5.6-luna", inputs: inputs)))
+    XCTAssertEqual(codex.qualifiedID, "openai-codex/gpt-5.6-luna",
+                   "unrelated provider-qualified model ids must not poison Codex selection")
+
+    let litellm = try XCTUnwrap(tryResult(InHouseModelResolver.resolve(
+        "litellm/baseten/Qwen3-Coder-480B-A35B-Instruct", inputs: inputs)))
+    XCTAssertEqual(litellm.providerID, "litellm")
+    XCTAssertEqual(litellm.modelID, "baseten/Qwen3-Coder-480B-A35B-Instruct")
+
+    let malformed = resolverInputs([
+        resolverProvider("litellm", models: ["baseten/model\ninvalid"]),
+    ], environment: ["INHOUSE_TOKEN": "captured-secret"])
+    guard case .failure(.invalidConfiguration) = InHouseModelResolver.resolve(
+        nil, inputs: malformed) else {
+        XCTFail("qualified model ids must still reject control characters")
+        return
+    }
+
+    let duplicate = resolverInputs([
+        resolverProvider("litellm", models: ["baseten/model", "baseten/model"]),
+    ], environment: ["INHOUSE_TOKEN": "captured-secret"])
+    guard case .failure(.duplicateModel) = InHouseModelResolver.resolve(
+        nil, inputs: duplicate) else {
+        XCTFail("qualified model ids must retain exact duplicate detection")
+        return
+    }
+}
+
 func test_inHouseModelResolverUsesCapturedEnvironmentAndReturnsNoCredential() throws {
     var captured = ["INHOUSE_TOKEN": "secret-value"]
     let inputs = resolverInputs(
@@ -425,6 +462,9 @@ let casesInHouseModelResolver: [Case] = [
     }),
     ("phase3 model resolver: authenticated Codex builtin resolves", {
         try test_inHouseModelResolverIncludesAuthenticatedCodexBuiltin()
+    }),
+    ("phase3 model resolver: qualified configured model ids are valid and bounded", {
+        try test_inHouseModelResolverAcceptsQualifiedConfiguredModelIDsWithoutWeakeningValidation()
     }),
     ("phase3 model resolver: environment is captured without secrets", {
         try test_inHouseModelResolverUsesCapturedEnvironmentAndReturnsNoCredential()

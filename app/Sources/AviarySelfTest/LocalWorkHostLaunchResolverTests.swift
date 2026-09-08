@@ -12,14 +12,14 @@ private struct LocalResolverFixture {
     let providerID: String
     let modelID: String
 
-    init() throws {
+    init(modelID: String = "local-model") throws {
         root = FileManager.default.temporaryDirectory.appending(
             path: "aviary-local-resolver-\(UUID().uuidString)", directoryHint: .isDirectory)
         home = AgentHome(root: root.appending(path: "home", directoryHint: .isDirectory))
         workspace = root.appending(path: "workspace", directoryHint: .isDirectory)
         runtime = root.appending(path: "runtime", directoryHint: .isDirectory)
         providerID = "local-provider"
-        modelID = "local-model"
+        self.modelID = modelID
         try FileManager.default.createDirectory(at: home.root, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         workspaceRegistry = try WorkHostWorkspaceRegistry(home: home)
@@ -115,6 +115,21 @@ private struct LocalResolverFixture {
                     generation: 1, digest: try template.contentDigest()),
                 templateByteCount: bytes.count),
             WorkRunBinding(workBinding: binding, run: RunRef("resolver-run")))
+    }
+}
+
+private struct LocalResolverIntegrationFailure: Error, CustomStringConvertible {
+    let description: String
+}
+
+private func localResolverStage<Value>(
+    _ name: String,
+    _ operation: () async throws -> Value
+) async throws -> Value {
+    do {
+        return try await operation()
+    } catch {
+        throw LocalResolverIntegrationFailure(description: "\(name): \(error)")
     }
 }
 
@@ -382,6 +397,194 @@ func test_localWorkHostLaunchResolverProbeReopensDurablePromptFreeTemplate() thr
     XCTAssertTrue(recreated.canReconstruct(reopened))
 }
 
+func test_localWorkHostLaunchResolverServesQualifiedModelsThroughDurableSocket() async throws {
+    let fixture = try LocalResolverFixture(
+        modelID: "baseten/Qwen3-Coder-480B-A35B-Instruct")
+    let socketNonce = UUID().uuidString.lowercased().prefix(12)
+    let socketRoot = URL(fileURLWithPath: "/tmp", isDirectory: true)
+        .resolvingSymlinksInPath()
+        .appendingPathComponent("aw-\(socketNonce)", isDirectory: true)
+    defer {
+        try? FileManager.default.removeItem(at: fixture.root)
+        try? FileManager.default.removeItem(at: socketRoot)
+    }
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: Int16(0o755))],
+        ofItemAtPath: fixture.home.root.path)
+    let homePermissions = try FileManager.default.attributesOfItem(
+        atPath: fixture.home.root.path)[.posixPermissions] as? NSNumber
+    XCTAssertEqual(homePermissions?.intValue, 0o755)
+    try FileManager.default.createDirectory(
+        at: socketRoot, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: NSNumber(value: Int16(0o700))])
+
+    let clientRef = ClientRef("qualified-model-socket-client")
+    let launchResolver = fixture.resolver
+    let workspaceRegistry = fixture.workspaceRegistry
+    let serviceResolver = WorkHostDaemonServiceResolver.durable(
+        authorizer: WorkServiceCapabilityPolicy(
+            grantsByClient: [clientRef: [.observe, .control]]),
+        draftResolver: { request in try launchResolver.draft(for: request) },
+        reconstructabilityProbe: launchResolver.reconstructabilityProbe,
+        workspaceCatalogProvider: { try workspaceRegistry.catalog() })
+    let coordinator = try WorkHostDaemonCoordinator(
+        home: fixture.home, socketRoot: socketRoot,
+        instanceID: "qualified-model-instance", startIdentity: "qualified-model-start",
+        resolver: serviceResolver)
+    var client: WorkServiceUnixSocketClient?
+    do {
+        let descriptor = try await localResolverStage("coordinator start") {
+            try await coordinator.start()
+        }
+        let connected = WorkServiceUnixSocketClient(
+            endpoint: descriptor.endpoint, client: clientRef,
+            expectedHost: descriptor.hostInstance.host)
+        client = connected
+        let initial = try await localResolverStage("initial handshake") {
+            try await connected.connect(build: "qualified-model-socket-test")
+        }
+        XCTAssertEqual(initial.workspaceCatalog.defaultWorkspace?.workspaceID, fixture.workspaceID)
+
+        func request(
+            commandID: String,
+            cursor: JournalCursor,
+            modelID: String?
+        ) -> WorkServiceCreateWorkRequest {
+            WorkServiceCreateWorkRequest(
+                client: clientRef, commandID: commandID, causalControlCursor: cursor,
+                configuration: WorkServiceWorkConfiguration(
+                    providerID: fixture.providerID, modelID: modelID,
+                    workspaceID: fixture.workspaceID),
+                requestedCapabilities: [.observe, .control])
+        }
+
+        for unavailable in [
+            request(
+                commandID: "qualified-model-invalid", cursor: initial.controlCursor,
+                modelID: "missing/model"),
+            request(
+                commandID: "qualified-model-missing", cursor: initial.controlCursor,
+                modelID: nil),
+        ] {
+            do {
+                _ = try await connected.createWork(unavailable)
+                XCTFail("an unavailable model must be rejected before control admission")
+            } catch let error as WorkServiceTransportError {
+                guard case .remote(let code, let detail) = error else {
+                    XCTFail("unexpected unavailable-model transport error: \(error)")
+                    continue
+                }
+                XCTAssertEqual(code, .launchUnavailable)
+                XCTAssertEqual(detail, "The requested in-house model is unavailable.")
+            }
+            let afterFailure = try await localResolverStage(
+                "handshake after \(unavailable.commandID)") {
+                    try await connected.handshake(
+                        WorkServiceHandshakeRequest(client: clientRef))
+                }
+            XCTAssertEqual(afterFailure.controlCursor, initial.controlCursor)
+            let empty = try await localResolverStage(
+                "list after \(unavailable.commandID)") {
+                    try await connected.listWorks(WorkServiceListRequest(client: clientRef))
+                }
+            XCTAssertTrue(empty.works.isEmpty)
+        }
+
+        let createRequest = request(
+            commandID: "qualified-model-create", cursor: initial.controlCursor,
+            modelID: fixture.modelID)
+        let initialStart = try ServiceBackedCreateIntentStore.InitialStart(
+            commandID: "qualified-model-start", prompt: "qualified model prompt")
+        let created = try await localResolverStage("qualified-model socket Create") {
+            try await connected.createWork(createRequest)
+        }
+        XCTAssertEqual(created.receipt.state, .accepted)
+        XCTAssertEqual(created.work.configuration.modelID, fixture.modelID)
+        XCTAssertEqual(created.work.execution, .idle)
+        XCTAssertNil(created.work.currentRun)
+        let exactKey = try XCTUnwrap(ServiceAttachmentKey(
+            work: created.work.work, attachment: created.attachment))
+        let createdStart = try ServiceBackedStartIntent(
+            seed: initialStart, response: created, client: clientRef)
+        let intentStore = try WorkServiceAttachedWorkIntentStore(
+            home: fixture.home, key: exactKey)
+        let createdController = try WorkServiceAttachedWorkController(
+            service: connected, seed: .created(created), intentStore: intentStore)
+        let createdProjection = try await localResolverStage("accepted controller refresh") {
+            try await createdController.refresh()
+        }
+        XCTAssertTrue(createdProjection.isCanonical)
+        XCTAssertEqual(createdProjection.descriptor.work, created.work.work)
+        XCTAssertEqual(createdProjection.attachment.attachment, created.attachment.attachment)
+        XCTAssertEqual(createdProjection.attachment.client, clientRef)
+        XCTAssertEqual(createdProjection.attachment.session, created.session)
+        XCTAssertEqual(createdProjection.attachment.sessionJournal, created.sessionJournal)
+        XCTAssertEqual(
+            createdProjection.attachment.sessionAttachment, created.sessionAttachment)
+        XCTAssertEqual(
+            ServiceAttachmentKey(
+                work: createdProjection.descriptor.work,
+                attachment: createdProjection.attachment),
+            exactKey)
+        XCTAssertTrue(createdStart.hasMatchingAttachment(in: createdProjection))
+
+        let afterCreate = try await localResolverStage("post-Create handshake") {
+            try await connected.handshake(WorkServiceHandshakeRequest(client: clientRef))
+        }
+        XCTAssertNotEqual(afterCreate.controlCursor, initial.controlCursor)
+
+        let duplicate = try await localResolverStage("duplicate socket Create") {
+            try await connected.createWork(createRequest)
+        }
+        XCTAssertEqual(duplicate.receipt.state, .duplicate)
+        XCTAssertEqual(duplicate.work.work, created.work.work)
+        XCTAssertEqual(duplicate.session, created.session)
+        XCTAssertEqual(duplicate.sessionJournal, created.sessionJournal)
+        XCTAssertEqual(duplicate.sessionAttachment, created.sessionAttachment)
+        XCTAssertEqual(duplicate.attachment.attachment, created.attachment.attachment)
+        XCTAssertEqual(duplicate.workCursor, created.workCursor)
+        XCTAssertEqual(duplicate.sessionCursor, created.sessionCursor)
+        XCTAssertEqual(duplicate.controlCursor, created.controlCursor)
+        XCTAssertEqual(duplicate.receipt.resultingControlCursor, created.controlCursor)
+        XCTAssertEqual(duplicate.receipt.authorization, created.receipt.authorization)
+        XCTAssertEqual(duplicate.work.execution, .idle)
+        XCTAssertNil(duplicate.work.currentRun)
+        let duplicateStart = try ServiceBackedStartIntent(
+            seed: initialStart, response: duplicate, client: clientRef)
+        XCTAssertEqual(duplicateStart, createdStart)
+        let duplicateController = try WorkServiceAttachedWorkController(
+            service: connected, seed: .created(duplicate),
+            intentStore: intentStore)
+        let duplicateProjection = try await localResolverStage("duplicate controller refresh") {
+            try await duplicateController.refresh()
+        }
+        XCTAssertTrue(duplicateProjection.isCanonical)
+        XCTAssertEqual(duplicateProjection.descriptor.work, created.work.work)
+        XCTAssertEqual(duplicateProjection.attachment.attachment, exactKey.clientAttachment)
+        XCTAssertEqual(
+            ServiceAttachmentKey(
+                work: duplicateProjection.descriptor.work,
+                attachment: duplicateProjection.attachment),
+            exactKey)
+        XCTAssertTrue(duplicateStart.hasMatchingAttachment(in: duplicateProjection))
+        let afterDuplicate = try await localResolverStage("post-duplicate handshake") {
+            try await connected.handshake(WorkServiceHandshakeRequest(client: clientRef))
+        }
+        XCTAssertEqual(afterDuplicate.controlCursor, afterCreate.controlCursor)
+        let page = try await localResolverStage("final Work list") {
+            try await connected.listWorks(WorkServiceListRequest(client: clientRef))
+        }
+        XCTAssertEqual(page.works.map(\.work), [created.work.work])
+        await connected.close()
+        client = nil
+        await coordinator.forceStop()
+    } catch {
+        await client?.close()
+        await coordinator.forceStop()
+        throw error
+    }
+}
+
 let casesLocalWorkHostLaunchResolver: [Case] = [
     ("phase3 local launch resolver: default and qualified model", {
         try test_localWorkHostLaunchResolverSelectsDefaultAndQualifiedModels()
@@ -400,5 +603,8 @@ let casesLocalWorkHostLaunchResolver: [Case] = [
     }),
     ("phase3 local launch resolver: durable prompt-free template reopens", {
         try test_localWorkHostLaunchResolverProbeReopensDurablePromptFreeTemplate()
+    }),
+    ("phase3 local launch resolver: qualified model survives durable socket Create", {
+        try await test_localWorkHostLaunchResolverServesQualifiedModelsThroughDurableSocket()
     }),
 ]

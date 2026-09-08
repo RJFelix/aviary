@@ -47,6 +47,21 @@ enum ChatJourneyProbe {
         let home = AgentHome(root: root.appending(path: "home", directoryHint: .isDirectory))
         let model = AppModel()
         model.home = home
+        let internalFailure = AppModel.serviceErrorMessage(WorkServiceTransportError.remote(
+            code: .internalError, detail: "credential-shaped-private-detail"))
+        try require(internalFailure.contains("internal error") && !internalFailure.contains("credential-shaped"),
+                    "service failure diagnostic hid classification or exposed raw detail")
+        model.localWorkServiceCreateError = internalFailure
+        // This is what a successful catalog refresh used to do: it must not erase the
+        // independent outstanding Create failure or make Diagnostics look fully healthy.
+        model.localWorkServiceError = nil
+        try require(model.localWorkServiceError == internalFailure, "catalog success erased Create failure")
+        model.localWorkServiceError = "Connection interrupted"
+        try require(model.localWorkServiceError == "Connection interrupted",
+                    "disconnected state was hidden behind a prior Create failure")
+        model.localWorkServiceError = nil
+        model.localWorkServiceCreateError = nil
+        try require(model.localWorkServiceError == nil, "resolved Create kept stale failure")
         // Larger than the service limit but inside the local save limit. No provider/bootstrap
         // call is reachable; this is a deterministic pre-admission failure.
         let exact = String(repeating: "A🙂\n", count: 2_000)

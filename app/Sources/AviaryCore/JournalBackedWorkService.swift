@@ -1546,26 +1546,27 @@ public actor JournalBackedWorkService: WorkServiceClient {
               verifiedRegistration == registration else {
             throw WorkServiceProtocolError.sourceIncomplete
         }
-        let attachment = try await attachForCreate(
+        let attachmentPublication = try await attachForCreate(
             request: request, reservation: reservation,
             registration: verifiedRegistration, authorization: auth)
-        let controlCursor = try await currentControlCursor()
         let source = try await canonicalSource(
             work: reservation.work, journal: verifiedRegistration.workJournal,
             registration: verifiedRegistration)
         let descriptor = try await descriptor(for: reservation.work, client: request.client)
+        let receiptState: WorkServiceCommandReceiptState = priorCreation == nil
+            ? .accepted : .duplicate
         return WorkServiceCreateWorkResponse(
             work: descriptor, authorization: auth,
             session: reservation.session, sessionJournal: verifiedRegistration.sessionJournal,
             sessionAttachment: reservation.sessionAttachment,
-            attachment: attachment,
+            attachment: attachmentPublication.attachment,
             workCursor: source.workCursor, sessionCursor: source.sessionCursor,
-            controlCursor: controlCursor,
+            controlCursor: attachmentPublication.controlCursor,
             receipt: WorkServiceControlReceipt(
                 operation: .createWork, work: reservation.work,
-                commandID: request.commandID, state: .accepted,
+                commandID: request.commandID, state: receiptState,
                 host: hostInstance, causalControlCursor: request.causalControlCursor,
-                resultingControlCursor: controlCursor, authorization: auth,
+                resultingControlCursor: attachmentPublication.controlCursor, authorization: auth,
                 outcome: .created))
     }
 
@@ -4446,12 +4447,17 @@ public actor JournalBackedWorkService: WorkServiceClient {
             JournalCursor(journal: binding.sessionJournal, eventID: sessionLast.eventID, sequence: sessionLast.sequence))
     }
 
+    private struct CreateAttachmentPublication {
+        let attachment: WorkServiceClientAttachment
+        let controlCursor: JournalCursor
+    }
+
     private func attachForCreate(
         request: WorkServiceCreateWorkRequest,
         reservation: WorkHostControlCreationReservation,
         registration: WorkHostControlWorkRegistration,
         authorization: WorkServiceAuthorizationOutcome
-    ) async throws -> WorkServiceClientAttachment {
+    ) async throws -> CreateAttachmentPublication {
         let control = try await controlSnapshot()
         let attachmentCommandID = createAttachmentCommandID(
             client: request.client, commandID: request.commandID)
@@ -4459,14 +4465,27 @@ public actor JournalBackedWorkService: WorkServiceClient {
             control: control, work: reservation.work, journal: registration.workJournal,
             client: request.client, commandID: attachmentCommandID)
         if let prior {
-            return try clientAttachment(prior, control: control)
+            guard let publication = try await controlJournal.priorCommand(
+                work: reservation.work, client: request.client,
+                commandID: attachmentCommandID),
+                  publication.event.type == TimelineEventType.clientAttached,
+                  publication.event.work == reservation.work,
+                  publication.event.journal == control.journal,
+                  publication.event.client == request.client,
+                  publication.event.command?.commandID == attachmentCommandID,
+                  publication.commit.eventRef == prior.attachedEvent else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            return CreateAttachmentPublication(
+                attachment: try clientAttachment(prior, control: control),
+                controlCursor: publication.commit.cursor)
         }
         let attachment = try await mintClientAttachment()
         let cursor = try await currentControlCursor()
         let command = CommandRef(commandID: attachmentCommandID, client: request.client,
                                  sessionAttachment: reservation.sessionAttachment,
                                  causalCursor: cursor)
-        _ = try await controlJournal.attachClient(
+        let publication = try await controlJournal.attachClient(
             work: reservation.work, workJournal: registration.workJournal,
             attachment: attachment, client: request.client,
             capabilities: Set(authorization.granted.map(\.rawValue)),
@@ -4475,10 +4494,13 @@ public actor JournalBackedWorkService: WorkServiceClient {
             sessionAttachment: reservation.sessionAttachment, command: command,
             causalControlCursor: cursor)
         let updated = try await controlSnapshot()
-        guard let record = updated.clientAttachments[attachment.attachmentID] else {
+        guard let record = updated.clientAttachments[attachment.attachmentID],
+              record.attachedEvent == publication.eventRef else {
             throw WorkServiceProtocolError.sourceIncomplete
         }
-        return try clientAttachment(record, control: updated)
+        return CreateAttachmentPublication(
+            attachment: try clientAttachment(record, control: updated),
+            controlCursor: publication.cursor)
     }
 
     private func registerCanonical(

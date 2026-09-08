@@ -40,8 +40,7 @@ struct ChatConnectionsView: View {
                             HStack {
                                 Button("Retry connection") {
                                     Task {
-                                        await model.bootstrapLocalWorkService()
-                                        await model.refreshServiceWork()
+                                        await model.retryLocalWorkService()
                                     }
                                 }
                                 .buttonStyle(.borderedProminent)

@@ -3528,12 +3528,12 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(reservation)
-        guard data.count <= limits.maximumMetadataBytes else {
+        guard data.count <= limits.maximumRecordBytes else {
             throw WorkLaunchManifestStoreError.recordTooLarge
         }
         try WorkLaunchDurableIO.replace(
             data, at: startReservationURL(for: reservation.binding),
-            maximumBytes: limits.maximumMetadataBytes)
+            maximumBytes: limits.maximumRecordBytes)
     }
 
     private func ensureStartPointer(
@@ -3738,7 +3738,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         for binding: WorkBinding
     ) throws -> WorkLaunchStartReservation? {
         guard let data = try WorkLaunchDurableIO.readBounded(
-            startReservationURL(for: binding), maximumBytes: limits.maximumMetadataBytes) else {
+            startReservationURL(for: binding), maximumBytes: limits.maximumRecordBytes) else {
             return nil
         }
         do {
@@ -3776,7 +3776,7 @@ public struct WorkLaunchManifestStore: Sendable, Hashable {
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        guard try encoder.encode(reservation).count <= limits.maximumMetadataBytes else {
+        guard try encoder.encode(reservation).count <= limits.maximumRecordBytes else {
             throw WorkLaunchManifestStoreError.recordTooLarge
         }
     }

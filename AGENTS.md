@@ -47,6 +47,9 @@ what it does; this file is how to work on it without relearning the traps.
 - **A socket or PID is not Work Host health.** `aviaryd` may accept a connection while its
   journal-backed service cannot serve canonical Work. Verify an accepted identity-fenced
   handshake and a real bounded service read; transport reachability is not execution recovery.
+  For startup fixes, also prove Create with production-shaped mixed-provider configuration:
+  model IDs such as `vendor/model` are valid. A green handshake/list and a preflight-only GUI
+  probe do not exercise launch selection, Create, or provider response. Keep those receipts separate.
 - **A blank snapshot is a capture-path bug before it is a view bug.** Captures go through
   ScreenCaptureKit because `cacheDisplay` only sees NSView drawing, and most SwiftUI
   content — every chart, every material — is layer-only. A screen that looks fine in the

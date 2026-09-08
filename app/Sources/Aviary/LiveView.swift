@@ -285,6 +285,17 @@ struct RunPane: View {
                             Text(prompt).font(.system(size: 13)).textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }.frame(maxHeight: 160)
+                        if let pending = run.serviceProjection?.pendingCommand, pending.kind == .start {
+                            HStack(spacing: 8) {
+                                Button("Check delivery") { Task { await run.refreshService() } }
+                                Button("Retry saved startup") { Task { _ = await run.retryServiceCommand() } }
+                                    .disabled(run.hasExited || run.isEnding
+                                        || pending.state == .awaitingCanonicalEvidence
+                                        || !run.serviceRetryAvailable)
+                            }.buttonStyle(.bordered).controlSize(.small)
+                            Text("Retry uses the original saved request, not a new copy.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
                         .background(Design.accentSoft.opacity(0.4))
                     Divider()
@@ -1588,8 +1599,7 @@ struct LauncherFormBody: View {
                     HStack(spacing: 8) {
                         Button("Retry connection") {
                             Task {
-                                await model.bootstrapLocalWorkService()
-                                await model.refreshServiceWork()
+                                await model.retryLocalWorkService()
                             }
                         }
                         .buttonStyle(.borderedProminent)
@@ -2090,7 +2100,7 @@ private struct ServiceWorkCard: View {
                                 .help(
                                     run.serviceRetryAvailable
                                         ? "Retry the exact retained command"
-                                        : "Retry is disabled because this Session no longer owns the active Run")
+                                        : "Retry requires complete current state, permission, and the original request's ownership")
                             if pending.state == .stale {
                                 Button("Abandon stale") {
                                     Task { _ = await run.abandonStaleServiceCommand() }

@@ -17,6 +17,7 @@ public struct ServiceBackedGUIControlPolicy: Hashable, Sendable {
     public let isCanonical: Bool
     public let needsRecovery: Bool
     public let requiresRefresh: Bool
+    private var exactUnadmittedStartRecovery = false
 
     public init(
         execution: WorkServiceExecutionState,
@@ -54,6 +55,24 @@ public struct ServiceBackedGUIControlPolicy: Hashable, Sendable {
             isCanonical: projection.isCanonical,
             needsRecovery: projection.needsRecovery,
             requiresRefresh: projection.requiresRefresh)
+        if let pending = projection.pendingCommand {
+            // A host may retain a Start reservation before it has a Run. Only the explicit
+            // retry of that exact, current request can ask the host to finish admission.
+            exactUnadmittedStartRecovery = projection.isCanonical
+                && !projection.requiresRefresh
+                && execution == .recoveryRequired
+                && currentRun == nil && currentRunSession == nil && currentRunSessionAttachment == nil
+                && projection.workSnapshot.activeRun == nil
+                && projection.workSnapshot.activeRunSession == nil
+                && projection.workSnapshot.activeRunSessionAttachment == nil
+                && projection.workSnapshot.execution == .idle
+                && pending.kind == .start && pending.state == .indeterminate
+                && pending.causalWorkCursor == projection.workCursor
+                && pending.client == projection.attachment.client
+                && pending.attachment == projection.attachment.attachment
+                && pending.sessionAttachment == projection.attachment.sessionAttachment
+                && hasExactRunOwner && capabilities.contains(.control) && capabilities.contains(.start)
+        }
     }
 
     /// An idle Work has no owner tuple. An active Work is controllable only by the exact Session
@@ -120,6 +139,7 @@ public struct ServiceBackedGUIControlPolicy: Hashable, Sendable {
     }
 
     public func canRetryPendingCommand(kind: WorkServiceCommandKind) -> Bool {
+        if kind == .start && exactUnadmittedStartRecovery { return true }
         guard canMutate, capabilities.contains(Self.capability(for: kind)) else { return false }
         switch kind {
         case .start: return currentRun == nil

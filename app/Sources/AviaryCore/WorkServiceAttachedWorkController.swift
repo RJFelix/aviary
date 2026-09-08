@@ -1615,7 +1615,8 @@ public actor WorkServiceAttachedWorkController {
         // touching the intent store or dispatching.  In particular, a refresh may have
         // transferred this Work's active Run to another Session since the original attempt.
         try validateCommandAdmission(
-            kind: pending.request.kind, commandID: pending.request.command.commandID)
+            kind: pending.request.kind, commandID: pending.request.command.commandID,
+            allowRetainedStartRecovery: true)
         return try await submit(pending.request, retainingState: pending.state)
     }
 
@@ -1852,7 +1853,8 @@ public actor WorkServiceAttachedWorkController {
     }
 
     private func validateCommandAdmission(
-        kind: WorkServiceCommandKind, commandID: String
+        kind: WorkServiceCommandKind, commandID: String,
+        allowRetainedStartRecovery: Bool = false
     ) throws {
         guard Self.validIdentity(commandID) else {
             throw WorkServiceAttachedWorkControllerError.commandNotAdmissible
@@ -1900,10 +1902,40 @@ public actor WorkServiceAttachedWorkController {
         case .active:
             break
         }
-        guard descriptorStorage.execution != .recoveryRequired,
-              descriptorStorage.execution != .unknown,
-              let reducedExecution = Self.serviceExecution(workSnapshotStorage.execution),
-              descriptorStorage.execution == reducedExecution,
+        guard let reducedExecution = Self.serviceExecution(workSnapshotStorage.execution) else {
+            throw WorkServiceAttachedWorkControllerError.recoveryRequired
+        }
+        let exactRetainedStartRecovery: Bool
+        if allowRetainedStartRecovery,
+           let pending = pendingStorage,
+           pending.state == .indeterminate,
+           kind == .start,
+           pending.request.kind == .start,
+           pending.request.command.commandID == commandID,
+           pending.request.work == work,
+           pending.request.journal == journal,
+           pending.request.attachment == attachmentStorage.attachment,
+           pending.request.command.client == client,
+           pending.request.command.sessionAttachment == sessionAttachment,
+           pending.request.command.causalCursor == workCursorStorage,
+           pending.request.causalWorkCursor == workCursorStorage,
+           pending.request.value != nil,
+           !pending.request.valueWasTruncated,
+           descriptorStorage.execution == .recoveryRequired,
+           descriptorStorage.currentRun == nil,
+           descriptorStorage.currentRunSession == nil,
+           descriptorStorage.currentRunSessionAttachment == nil,
+           reducedExecution == .idle,
+           workSnapshotStorage.activeRun == nil,
+           workSnapshotStorage.activeRunSession == nil,
+           workSnapshotStorage.activeRunSessionAttachment == nil {
+            exactRetainedStartRecovery = true
+        } else {
+            exactRetainedStartRecovery = false
+        }
+        guard descriptorStorage.execution != .unknown,
+              (descriptorStorage.execution == reducedExecution
+                  || exactRetainedStartRecovery),
               workSnapshotStorage.unknownEvents.isEmpty,
               sessionSnapshotStorage.unknownEvents.isEmpty,
               sessionSnapshotStorage.lifecycle == .active else {
@@ -3189,7 +3221,10 @@ public actor WorkServiceAttachedWorkController {
                   response.sessionJournal == sessionJournal,
                   response.sessionAttachment == sessionAttachment,
                   response.attachment == attachment,
-                  response.authorization == attachment.authorization,
+                  // Duplicate Create preserves its original receipt authorization;
+                  // the returned attachment carries the current capabilities.
+                  (response.receipt.state == .duplicate
+                      || response.authorization == attachment.authorization),
                   response.workCursor.journal == descriptor.journal,
                   response.sessionCursor.journal == sessionJournal,
                   validCursor(response.workCursor, journal: descriptor.journal),
@@ -3199,7 +3234,7 @@ public actor WorkServiceAttachedWorkController {
                   response.receipt.operation == .createWork,
                   response.receipt.work == descriptor.work,
                   validIdentity(response.receipt.commandID),
-                  response.receipt.state == .accepted,
+                  (response.receipt.state == .accepted || response.receipt.state == .duplicate),
                   response.receipt.host.host == WorkHostRef(descriptor.work.workHostID),
                   validIdentity(response.receipt.host.instanceID),
                   validIdentity(response.receipt.host.startIdentity),
@@ -3258,8 +3293,11 @@ public actor WorkServiceAttachedWorkController {
                 $0.instance.host == WorkHostRef(expected.workHostID)
             } ?? true
         }
-        guard let observation = descriptor.hostObservation else { return false }
-        return observation.instance == expectedHostInstance
+        // The service connection/response envelope fences the answering host instance. A
+        // Run-free Create has no live actor observation yet; requiring one would prevent the
+        // canonical idle Work from ever reaching Start. Match any observation that is present,
+        // without fabricating liveness for an absent one (as in transport validation).
+        return descriptor.hostObservation.map { $0.instance == expectedHostInstance } ?? true
     }
 
     private static func validHistoryAuthority(
