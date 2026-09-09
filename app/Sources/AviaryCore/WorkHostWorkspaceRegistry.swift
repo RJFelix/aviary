@@ -79,6 +79,43 @@ public enum WorkHostWorkspaceCapability: String, Codable, Hashable, Sendable, Ca
     case resolve
 }
 
+/// A bounded, path-free explanation for an unavailable workspace.  The reason is intentionally
+/// coarse: it gives a client enough information to offer the right recovery action without
+/// exposing a host-local locator or filesystem measurement.
+public enum WorkHostWorkspaceUnavailabilityReason: String, Codable, Hashable, Sendable {
+    case identityNeedsConfirmation = "identity_needs_confirmation"
+    case inaccessible
+}
+
+/// Host-private durable identity. `volumeUUID` is Foundation's persistent volume UUID on Darwin;
+/// `device` is retained as a current observation and as the fallback on platforms/filesystems
+/// which do not publish one.  Foundation's `volumeIdentifier` and `fileResourceIdentifier` are
+/// explicitly process/restart-scoped, so neither is persisted here.
+struct WorkHostWorkspaceFilesystemIdentity: Codable, Hashable, Sendable {
+    let device: UInt64
+    let inode: UInt64
+    let type: UInt64
+    let volumeUUID: String?
+
+    init(device: UInt64, inode: UInt64, type: UInt64, volumeUUID: String? = nil) {
+        self.device = device
+        self.inode = inode
+        self.type = type
+        self.volumeUUID = volumeUUID
+    }
+
+    func identifiesSameResource(as current: Self) -> Bool {
+        guard inode == current.inode, type == current.type else { return false }
+        if let volumeUUID {
+            // Once registration captured a persistent volume identity, losing that evidence is
+            // not permission to fall back to a boot-scoped device number.
+            guard let currentVolumeUUID = current.volumeUUID else { return false }
+            return volumeUUID == currentVolumeUUID
+        }
+        return device == current.device
+    }
+}
+
 /// The client-safe description of one workspace.  In particular, this type has no URL, path,
 /// username, process ID, or host-local diagnostic field.
 public struct WorkHostWorkspaceDescriptor: Codable, Hashable, Sendable, Identifiable {
@@ -87,6 +124,7 @@ public struct WorkHostWorkspaceDescriptor: Codable, Hashable, Sendable, Identifi
     public let isDefault: Bool
     public let availability: WorkHostWorkspaceAvailability
     public let capabilities: Set<WorkHostWorkspaceCapability>
+    public let unavailabilityReason: WorkHostWorkspaceUnavailabilityReason?
 
     public var id: WorkHostWorkspaceID { workspaceID }
     public var identifier: WorkHostWorkspaceID { workspaceID }
@@ -98,20 +136,25 @@ public struct WorkHostWorkspaceDescriptor: Codable, Hashable, Sendable, Identifi
         label: String? = nil,
         isDefault: Bool = false,
         availability: WorkHostWorkspaceAvailability = .available,
-        capabilities: Set<WorkHostWorkspaceCapability> = []
+        capabilities: Set<WorkHostWorkspaceCapability> = [],
+        unavailabilityReason: WorkHostWorkspaceUnavailabilityReason? = nil
     ) throws {
         guard WorkHostWorkspaceRegistry.isValidLabel(label) else {
             throw WorkHostWorkspaceRegistryError.invalidLabel
+        }
+        guard availability == .unavailable || unavailabilityReason == nil else {
+            throw WorkHostWorkspaceRegistryError.malformedRegistry
         }
         self.workspaceID = workspaceID
         self.label = label
         self.isDefault = isDefault
         self.availability = availability
         self.capabilities = capabilities
+        self.unavailabilityReason = unavailabilityReason
     }
 
     private enum CodingKeys: String, CodingKey {
-        case workspaceID, label, isDefault, availability, capabilities
+        case workspaceID, label, isDefault, availability, capabilities, unavailabilityReason
     }
 
     public init(from decoder: Decoder) throws {
@@ -126,6 +169,8 @@ public struct WorkHostWorkspaceDescriptor: Codable, Hashable, Sendable, Identifi
             WorkHostWorkspaceAvailability.self, forKey: .availability)
         let capabilities = try values.decode(
             Set<WorkHostWorkspaceCapability>.self, forKey: .capabilities)
+        let unavailabilityReason = try values.decodeIfPresent(
+            WorkHostWorkspaceUnavailabilityReason.self, forKey: .unavailabilityReason)
         guard capabilities.count <= WorkHostWorkspaceCapability.allCases.count else {
             throw WorkHostWorkspaceRegistryError.malformedRegistry
         }
@@ -134,7 +179,8 @@ public struct WorkHostWorkspaceDescriptor: Codable, Hashable, Sendable, Identifi
             label: label,
             isDefault: isDefault,
             availability: availability,
-            capabilities: capabilities)
+            capabilities: capabilities,
+            unavailabilityReason: unavailabilityReason)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -146,6 +192,33 @@ public struct WorkHostWorkspaceDescriptor: Codable, Hashable, Sendable, Identifi
         try values.encode(
             capabilities.sorted { $0.rawValue < $1.rawValue },
             forKey: .capabilities)
+        try values.encodeIfPresent(unavailabilityReason, forKey: .unavailabilityReason)
+    }
+}
+
+/// A host-local, single-use-shaped confirmation prepared from an explicit directory selection.
+/// Only opaque identity and the revision fence are public; path and filesystem observations never
+/// cross the Work-service boundary.  Confirming reopens and revalidates the selected directory.
+public struct WorkHostWorkspaceReconfirmation: Hashable, Sendable {
+    public let workspaceID: WorkHostWorkspaceID
+    public let expectedRegistryRevision: UInt64
+
+    fileprivate let canonicalPath: String
+    fileprivate let expectedRegisteredIdentity: WorkHostWorkspaceFilesystemIdentity
+    fileprivate let selectedIdentity: WorkHostWorkspaceFilesystemIdentity
+
+    fileprivate init(
+        workspaceID: WorkHostWorkspaceID,
+        expectedRegistryRevision: UInt64,
+        canonicalPath: String,
+        expectedRegisteredIdentity: WorkHostWorkspaceFilesystemIdentity,
+        selectedIdentity: WorkHostWorkspaceFilesystemIdentity
+    ) {
+        self.workspaceID = workspaceID
+        self.expectedRegistryRevision = expectedRegistryRevision
+        self.canonicalPath = canonicalPath
+        self.expectedRegisteredIdentity = expectedRegisteredIdentity
+        self.selectedIdentity = selectedIdentity
     }
 }
 
@@ -311,6 +384,7 @@ public enum WorkHostWorkspaceRegistryError: Error, LocalizedError, Equatable, Se
     case workspaceNotOwned
     case workspaceInaccessible
     case workspaceIdentityMismatch
+    case workspaceReconfirmationStale
     case invalidLabel
     case invalidWorkspaceID
     case capacityExceeded
@@ -336,7 +410,9 @@ public enum WorkHostWorkspaceRegistryError: Error, LocalizedError, Equatable, Se
         case .workspaceNotOwned: return "The requested workspace is not owned by this host user."
         case .workspaceInaccessible: return "The requested workspace is inaccessible."
         case .workspaceIdentityMismatch:
-            return "The registered workspace has been replaced and must be registered again."
+            return "The registered workspace identity no longer matches this folder and requires confirmation."
+        case .workspaceReconfirmationStale:
+            return "The workspace changed after confirmation was prepared. Choose the folder again."
         case .invalidLabel: return "The workspace label is invalid."
         case .invalidWorkspaceID: return "The workspace identity is invalid."
         case .capacityExceeded: return "The workspace registry capacity is exhausted."
@@ -413,12 +489,18 @@ public struct WorkHostWorkspaceRegistry: Sendable, Hashable {
                 $0.canonicalPath == canonical.url.path
             }) {
                 var existing = store.entries[existingIndex]
-                // A path is only a locator. If the directory at that path has been replaced,
-                // never silently rebind the old opaque ID to the new inode.
-                guard existing.filesystemIdentity == canonical.identity else {
+                // A path is only a locator. If the directory identity at that path changed,
+                // never silently rebind the old opaque ID to the new filesystem object.
+                guard existing.filesystemIdentity.identifiesSameResource(as: canonical.identity) else {
                     throw WorkHostWorkspaceRegistryError.workspaceIdentityMismatch
                 }
                 var changed = false
+                // Normalize a positively matched legacy/raw-device identity through this one
+                // explicit registration path. A pre-existing mismatch never reaches this write.
+                if existing.filesystemIdentity != canonical.identity {
+                    existing.filesystemIdentity = canonical.identity
+                    changed = true
+                }
                 if let label, existing.label != label {
                     existing.label = label
                     changed = true
@@ -460,6 +542,71 @@ public struct WorkHostWorkspaceRegistry: Sendable, Hashable {
         }
     }
 
+    /// Prepare an explicit re-confirmation from a user-selected directory. The selected path must
+    /// still be the registered canonical path; this operation cannot relocate launch manifests.
+    /// No durable state changes until the returned revision- and identity-bound token is confirmed.
+    public func prepareReconfirmation(
+        workspaceID: WorkHostWorkspaceID,
+        directory: URL
+    ) throws -> WorkHostWorkspaceReconfirmation {
+        try validateRootIfPresent()
+        guard rootExists() else { throw WorkHostWorkspaceRegistryError.workspaceNotFound }
+        return try withExclusiveLock(createRoot: false) {
+            let store = try readStore()
+            guard let entry = store.entries.first(where: { $0.id == workspaceID.rawValue }) else {
+                throw WorkHostWorkspaceRegistryError.workspaceNotFound
+            }
+            let selected = try secureWorkspaceURL(directory, requireWrite: true)
+            guard selected.url.path == entry.canonicalPath else {
+                throw WorkHostWorkspaceRegistryError.workspaceIdentityMismatch
+            }
+            return WorkHostWorkspaceReconfirmation(
+                workspaceID: workspaceID,
+                expectedRegistryRevision: store.revision,
+                canonicalPath: entry.canonicalPath,
+                expectedRegisteredIdentity: entry.filesystemIdentity,
+                selectedIdentity: selected.identity)
+        }
+    }
+
+    /// Confirm a previously prepared directory selection. Every mutable input is re-read under
+    /// the registry lock. A changed revision, registration, path, or selected filesystem object
+    /// invalidates the token rather than silently adopting new state.
+    @discardableResult
+    public func confirmReconfirmation(
+        _ confirmation: WorkHostWorkspaceReconfirmation
+    ) throws -> WorkHostWorkspaceDescriptor {
+        try validateRootIfPresent()
+        guard rootExists() else { throw WorkHostWorkspaceRegistryError.workspaceNotFound }
+        return try withExclusiveLock(createRoot: false) {
+            var store = try readStore()
+            guard store.revision == confirmation.expectedRegistryRevision,
+                  let index = store.entries.firstIndex(where: {
+                      $0.id == confirmation.workspaceID.rawValue
+                  }),
+                  store.entries[index].canonicalPath == confirmation.canonicalPath,
+                  store.entries[index].filesystemIdentity
+                    == confirmation.expectedRegisteredIdentity else {
+                throw WorkHostWorkspaceRegistryError.workspaceReconfirmationStale
+            }
+
+            let selected = try secureWorkspaceURL(
+                URL(fileURLWithPath: confirmation.canonicalPath, isDirectory: true),
+                requireWrite: true)
+            guard selected.url.path == confirmation.canonicalPath,
+                  selected.identity == confirmation.selectedIdentity else {
+                throw WorkHostWorkspaceRegistryError.workspaceReconfirmationStale
+            }
+
+            if store.entries[index].filesystemIdentity != selected.identity {
+                store.entries[index].filesystemIdentity = selected.identity
+                store.revision = try nextRevision(after: store.revision)
+                try publish(store)
+            }
+            return try descriptor(for: store.entries[index])
+        }
+    }
+
     /// Return a fresh path-free public snapshot of the host registry.
     public func catalog() throws -> WorkHostWorkspaceCatalog {
         try validateRootIfPresent()
@@ -473,6 +620,24 @@ public struct WorkHostWorkspaceRegistry: Sendable, Hashable {
                 .map { try descriptor(for: $0) }
             return try WorkHostWorkspaceCatalog(
                 entries: descriptors, revision: store.revision, isComplete: true)
+        }
+    }
+
+    /// Look up an already-registered canonical directory without registering, minting, or
+    /// writing anything. This is the recovery discovery path for a fresh-chat request whose
+    /// existing registration now needs explicit identity confirmation.
+    public func registeredWorkspace(
+        for directory: URL
+    ) throws -> WorkHostWorkspaceDescriptor? {
+        try validateRootIfPresent()
+        guard rootExists() else { return nil }
+        let selected = try secureWorkspaceURL(directory, requireWrite: false)
+        return try withExclusiveLock(createRoot: false) {
+            let store = try readStore()
+            guard let entry = store.entries.first(where: {
+                $0.canonicalPath == selected.url.path
+            }) else { return nil }
+            return try descriptor(for: entry)
         }
     }
 
@@ -496,7 +661,7 @@ public struct WorkHostWorkspaceRegistry: Sendable, Hashable {
             }
             let resolved = try secureWorkspaceURL(
                 URL(fileURLWithPath: entry.canonicalPath), requireWrite: false)
-            guard resolved.identity == entry.filesystemIdentity else {
+            guard entry.filesystemIdentity.identifiesSameResource(as: resolved.identity) else {
                 throw WorkHostWorkspaceRegistryError.workspaceIdentityMismatch
             }
             return resolved.url
@@ -523,27 +688,12 @@ public struct WorkHostWorkspaceRegistry: Sendable, Hashable {
         var label: String?
         var isDefault: Bool
         var canonicalPath: String
-        var filesystemIdentity: WorkspaceFilesystemIdentity
-    }
-
-    /// Host-private identity captured from the no-follow directory descriptor. It intentionally
-    /// never appears in the public workspace catalog, but prevents a replaced directory at the
-    /// same path from inheriting a previously approved opaque ID.
-    private struct WorkspaceFilesystemIdentity: Codable, Hashable, Sendable {
-        let device: UInt64
-        let inode: UInt64
-        let type: UInt64
-
-        init(device: UInt64, inode: UInt64, type: UInt64) {
-            self.device = device
-            self.inode = inode
-            self.type = type
-        }
+        var filesystemIdentity: WorkHostWorkspaceFilesystemIdentity
     }
 
     private struct ValidatedWorkspace: Sendable {
         let url: URL
-        let identity: WorkspaceFilesystemIdentity
+        let identity: WorkHostWorkspaceFilesystemIdentity
     }
 
     private struct StoredRegistry: Codable, Hashable {
@@ -704,12 +854,21 @@ public struct WorkHostWorkspaceRegistry: Sendable, Hashable {
                   !entry.canonicalPath.unicodeScalars.contains(where: { $0.value == 0 }),
                   entry.filesystemIdentity.inode > 0,
                   entry.filesystemIdentity.type == UInt64(S_IFDIR),
+                  Self.isValidVolumeUUID(entry.filesystemIdentity.volumeUUID),
                   paths.insert(entry.canonicalPath).inserted else {
                 throw WorkHostWorkspaceRegistryError.malformedRegistry
             }
             if entry.isDefault { defaults += 1 }
         }
         guard defaults <= 1 else { throw WorkHostWorkspaceRegistryError.malformedRegistry }
+    }
+
+    private static func isValidVolumeUUID(_ value: String?) -> Bool {
+        guard let value else { return true }
+        return !value.isEmpty && value.utf8.count <= 128
+            && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value == value.lowercased()
+            && !value.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f })
     }
 
     private func publish(_ store: StoredRegistry) throws {
@@ -818,26 +977,34 @@ public struct WorkHostWorkspaceRegistry: Sendable, Hashable {
             label: entry.label,
             isDefault: entry.isDefault,
             availability: probe.availability,
-            capabilities: probe.capabilities)
+            capabilities: probe.capabilities,
+            unavailabilityReason: probe.unavailabilityReason)
     }
 
     private struct WorkspaceProbe {
         let availability: WorkHostWorkspaceAvailability
         let capabilities: Set<WorkHostWorkspaceCapability>
+        let unavailabilityReason: WorkHostWorkspaceUnavailabilityReason?
     }
 
     private func probeWorkspace(
-        _ path: String, expectedIdentity: WorkspaceFilesystemIdentity
+        _ path: String, expectedIdentity: WorkHostWorkspaceFilesystemIdentity
     ) -> WorkspaceProbe {
         guard path.utf8.count <= bounds.maxPathBytes else {
-            return WorkspaceProbe(availability: .unavailable, capabilities: [])
+            return WorkspaceProbe(
+                availability: .unavailable, capabilities: [],
+                unavailabilityReason: .inaccessible)
         }
         guard let canonical = try? secureWorkspaceURL(
             URL(fileURLWithPath: path), requireWrite: false) else {
-            return WorkspaceProbe(availability: .unavailable, capabilities: [])
+            return WorkspaceProbe(
+                availability: .unavailable, capabilities: [],
+                unavailabilityReason: .inaccessible)
         }
-        guard canonical.identity == expectedIdentity else {
-            return WorkspaceProbe(availability: .unavailable, capabilities: [])
+        guard expectedIdentity.identifiesSameResource(as: canonical.identity) else {
+            return WorkspaceProbe(
+                availability: .unavailable, capabilities: [],
+                unavailabilityReason: .identityNeedsConfirmation)
         }
         var capabilities: Set<WorkHostWorkspaceCapability> = [.directory, .resolve]
         if access(canonical.url.path, R_OK) == 0 { capabilities.insert(.read) }
@@ -846,7 +1013,8 @@ public struct WorkHostWorkspaceRegistry: Sendable, Hashable {
         let available = capabilities.contains(.read) && capabilities.contains(.execute)
         return WorkspaceProbe(
             availability: available ? .available : .unavailable,
-            capabilities: capabilities)
+            capabilities: capabilities,
+            unavailabilityReason: available ? nil : .inaccessible)
     }
 
     private func secureWorkspaceURL(
@@ -902,9 +1070,29 @@ public struct WorkHostWorkspaceRegistry: Sendable, Hashable {
         }
         return ValidatedWorkspace(
             url: URL(fileURLWithPath: canonicalPath, isDirectory: true),
-            identity: WorkspaceFilesystemIdentity(
+            identity: WorkHostWorkspaceFilesystemIdentity(
                 device: UInt64(info.st_dev), inode: UInt64(info.st_ino),
-                type: UInt64(info.st_mode & S_IFMT)))
+                type: UInt64(info.st_mode & S_IFMT),
+                volumeUUID: persistentVolumeUUID(for: canonicalPath)))
+    }
+
+    private func persistentVolumeUUID(for canonicalPath: String) -> String? {
+        #if canImport(Darwin)
+        // Apple documents `volumeUUIDString` as persistent. The similarly named
+        // `volumeIdentifier` and `fileResourceIdentifier` are explicitly not persistent across
+        // restarts and therefore cannot replace the raw-device identity that failed here.
+        guard let raw = try? URL(fileURLWithPath: canonicalPath, isDirectory: true)
+                .resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString,
+              raw == raw.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty, raw.utf8.count <= 128,
+              !raw.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f })
+        else { return nil }
+        return raw.lowercased()
+        #else
+        // Linux has no Foundation persistent-volume-UUID contract. Keep the bounded raw
+        // st_dev + inode fallback there; explicit confirmation remains available after remount.
+        return nil
+        #endif
     }
 
     private func rejectFinalSymlink(_ path: String) throws {

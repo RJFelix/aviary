@@ -195,6 +195,61 @@ enum ChatJourneyProbe {
                     "default restore did not admit exactly one canonical Start")
     }
 
+    @MainActor private static func runProjectReconfirmationProbe(root: URL) async throws {
+        let home = AgentHome(root: root.appending(path: "project-reconfirmation-home"))
+        let directory = root.appending(path: "project-reconfirmation-directory")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let registry = try WorkHostWorkspaceRegistry(home: home)
+        let registered = try registry.registerLocalDirectory(directory, label: "Project probe")
+        let originalDirectory = try registry.resolve(registered.workspaceID)
+        // Model the exact pre-volume-UUID failure seen after reboot, only in this owned fixture.
+        guard var object = try JSONSerialization.jsonObject(with: Data(contentsOf: home.workHostWorkspaceRegistryFile)) as? [String: Any],
+              var entries = object["entries"] as? [[String: Any]], entries.count == 1,
+              var identity = entries[0]["filesystemIdentity"] as? [String: Any],
+              let device = identity["device"] as? NSNumber else {
+            throw Failure.assertion("project registry fixture shape changed")
+        }
+        identity["volumeUUID"] = nil
+        identity["device"] = device.uint64Value + 1
+        entries[0]["filesystemIdentity"] = identity
+        object["entries"] = entries
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            .write(to: home.workHostWorkspaceRegistryFile, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: home.workHostWorkspaceRegistryFile.path)
+        let unavailable = try registry.catalog().entries.first
+        try require(unavailable?.unavailabilityReason == .identityNeedsConfirmation,
+                    "workspace mismatch lost its specific reason")
+
+        let store = try PendingChatStore(home: home)
+        let chat = try PendingChat(prompt: "Preserve this exact request", cwd: directory.path,
+            phase: .blocked, failureKind: .workspaceConfirmationRequired)
+        try store.insert(chat)
+        let model = AppModel()
+        model.home = home
+        model.restorePendingChats()
+        let originalBytes = try Data(contentsOf: home.workHostWorkspaceRegistryFile)
+        let token = try model.preparePendingProjectReconfirmation(chatID: chat.id, directory: directory)
+        let preparedBytes = try Data(contentsOf: home.workHostWorkspaceRegistryFile)
+        try require(preparedBytes == originalBytes,
+                    "choosing a folder mutated registration before confirmation")
+        try require(model.runs.isEmpty && model.localWorkService == nil,
+                    "preparing folder confirmation started a service or agent")
+        let outcome = try await model.confirmPendingProjectReconfirmation(token, chatID: chat.id)
+        if case .confirmedNeedsRefresh = outcome {} else {
+            throw Failure.assertion("offline confirmation did not separate registry success from service refresh")
+        }
+        let resolved = try registry.resolve(registered.workspaceID)
+        try require(resolved.path == originalDirectory.path,
+                    "confirmation lost the original workspace identity")
+        guard let saved = try store.load().rows.first else { throw Failure.assertion("confirmation lost saved chat") }
+        try require(saved.phase == .saved && saved.failureKind == nil && saved.prompt == chat.prompt
+                    && saved.attemptCommandID == chat.attemptCommandID
+                    && saved.startCommandID == chat.startCommandID && saved.createdAssociation == nil,
+                    "confirmation changed input identity, text, or delivery state")
+        try require(model.runs.isEmpty && model.localWorkService == nil,
+                    "confirming a project implicitly started a service or submitted input")
+    }
+
     @MainActor private static func run() async throws {
         // This is the actual rail presentation gate, not a hand-built visual fixture. A
         // selected exact attachment may preserve a title, never repair canonical ambiguity.
@@ -229,6 +284,7 @@ enum ChatJourneyProbe {
             .appending(path: "aviary-chat-journey-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        try await runProjectReconfirmationProbe(root: root)
         let home = AgentHome(root: root.appending(path: "home", directoryHint: .isDirectory))
         let model = AppModel()
         model.home = home

@@ -650,6 +650,24 @@ public actor WorkHostRegistry {
         return lookupUnchecked(work)
     }
 
+    /// Remove one exact disposable recovery observation after its caller has independently
+    /// revalidated canonical source and reconstruction material. This is deliberately a
+    /// synchronous actor-local compare-and-swap: it can never remove a live actor, reservation,
+    /// historical fact, or unavailable fact, and a concurrent registry change simply returns
+    /// false.
+    @discardableResult
+    func discardRecoveringFact(
+        _ work: WorkRef,
+        expected: WorkHostRegistryCanonicalFact
+    ) -> Bool {
+        guard isValidWork(work), work.workHostID == host.workHostID,
+              expected.work == work, expected.disposition == .recovering,
+              live[work] == nil, registrationReservations[work] == nil,
+              canonical[work] == expected else { return false }
+        canonical.removeValue(forKey: work)
+        return true
+    }
+
     /// Return a deterministic, bounded page over live registrations and canonical facts.
     /// Tokens are opaque to callers and carry only a bounded offset; they are not capabilities.
     public func list(

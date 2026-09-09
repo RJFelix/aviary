@@ -1212,7 +1212,7 @@ public enum WorkServiceTransportCodec {
         for entry in entries.arrayValue! {
             guard case .object(let fields) = entry,
                   fields.keys.allSatisfy({
-                      ["workspaceID", "label", "isDefault", "availability", "capabilities"]
+                      ["workspaceID", "label", "isDefault", "availability", "capabilities", "unavailabilityReason"]
                           .contains($0)
                   }) else {
                 throw WorkServiceTransportError.invalidResponse

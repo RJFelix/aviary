@@ -51,7 +51,7 @@ install -m 0644 "$ROOT/runtime-hosts/python3-shared/host.py" \
     "$APP_DIR/Contents/Resources/runtime-hosts/python3-shared/host.py"
 
 BUILD_STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-BUILD_COMMIT="$(git -C "$(dirname "$0")/.." rev-parse --short HEAD 2>/dev/null || echo unknown)"
+BUILD_COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

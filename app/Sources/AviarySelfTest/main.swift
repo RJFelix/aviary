@@ -6973,6 +6973,9 @@ let casesWorkService: [Case] = [
 ]
 
 let casesWorkHostRegistry: [Case] = [
+    ("phase3 Work Host registry: discards only exact recovering fact", {
+        try await test_workHostRegistryDiscardsOnlyExactRecoveringFact()
+    }),
     ("phase3 Work Host registry: full identity and stable instance ownership", {
         try await test_workHostRegistryOwnsFullWorkRefsAndStableInstanceIdentity()
     }),

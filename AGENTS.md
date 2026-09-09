@@ -136,6 +136,10 @@ just compile  # both targets build
 just shots    # every screen renders, against your real agent directory
 ```
 
+`AviarySelfTest` uses `AVIARY_SELFTEST_FILTER` for substring selection; it does not parse
+`--help` as a discovery command (that launches the full suite, including runtime processes).
+Inspect the registered case arrays with `rg`, then run with an explicit filter for focused work.
+
 Both non-harness engines have a terminal entry point, and using them is how you verify a
 change without clicking: `Aviary --agent "<prompt>"` for the in-house engine, and
 `Aviary --claude-code "<prompt>"` for a driven one. The driven path shares

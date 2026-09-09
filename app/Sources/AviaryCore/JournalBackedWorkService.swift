@@ -2755,6 +2755,13 @@ public actor JournalBackedWorkService: WorkServiceClient {
         }
         let unstartedStartReservation = try await hasUnstartedStartReservation(
             source, binding: callerBinding)
+        // A failed bootstrap may have left only a disposable `.recovering` fact behind. Recheck
+        // the complete idle source and current launch material before allowing a new Start to
+        // claim that unowned Work slot; every other recovery boundary remains fenced below.
+        if request.kind == .start {
+            _ = await discardReconstructableRecoveringFact(
+                work: request.work, source: source)
+        }
         let registryRequiresRecovery: Bool = if let lookup = await registry.lookup(request.work) {
             switch lookup {
             case .recovering, .unavailable: true
@@ -4766,6 +4773,10 @@ public actor JournalBackedWorkService: WorkServiceClient {
         } catch {
             throw error
         }
+        // This is observation-only repair of a stale negative bootstrap fact. It does not open an
+        // actor or append a journal; the descriptor below re-reads the registry after the CAS so
+        // the published execution state reflects the exact current slot.
+        _ = await discardReconstructableRecoveringFact(work: work, source: source)
         let lookup = await registry.lookup(work)
         let recorded: WorkServiceRecordedDisposition
         switch source.workState.lifecycle {
@@ -4947,6 +4958,88 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 for: source, control: control),
             artifacts: sourceArtifacts,
             omissions: omissions)
+    }
+
+    /// Remove a same-process bootstrap `.recovering` fact only when a fresh canonical pair proves
+    /// that the reusable idle Work is safe to claim again. The registry CAS is deliberately the
+    /// final operation: all reads that may suspend are followed by an exact source/fact fence.
+    private func discardReconstructableRecoveringFact(
+        work: WorkRef,
+        source: CanonicalSource
+    ) async -> Bool {
+        guard let lookup = await registry.lookup(work),
+              case .recovering(let expectedFact) = lookup,
+              expectedFact.work == work,
+              Self.isReconstructableIdleSource(source) else { return false }
+
+        let hasUnstartedStartReservation: Bool
+        do {
+            hasUnstartedStartReservation = try await self.hasUnstartedStartReservation(
+                source, binding: primaryWorkBinding(source))
+        } catch {
+            return false
+        }
+        guard !hasUnstartedStartReservation,
+              let store = manifestStore else { return false }
+        guard let resolved = try? await store.resolve(
+            work: work, session: source.session, sessionAttachment: source.sessionAttachment),
+              (try? await store.canReconstruct(resolved)) == true else {
+            return false
+        }
+
+        // The manifest probe above may suspend while the canonical journals or registry change.
+        // Re-read both source cursors and the exact expected fact before the synchronous CAS.
+        guard let current = try? await requireCanonical(
+            work: work, journal: source.workJournal),
+              current.workCursor == source.workCursor,
+              current.sessionCursor == source.sessionCursor,
+              Self.isReconstructableIdleSource(current) else { return false }
+        let currentHasUnstartedStartReservation: Bool
+        do {
+            currentHasUnstartedStartReservation = try await self.hasUnstartedStartReservation(
+                current, binding: primaryWorkBinding(current))
+        } catch {
+            return false
+        }
+        guard !currentHasUnstartedStartReservation,
+              let currentLookup = await registry.lookup(work),
+              case .recovering(let currentFact) = currentLookup,
+              currentFact == expectedFact else { return false }
+        return await registry.discardRecoveringFact(work, expected: expectedFact)
+    }
+
+    private static func isReconstructableIdleSource(_ source: CanonicalSource) -> Bool {
+        let work = source.workState
+        let session = source.sessionState
+        guard work.lifecycle == .active,
+              work.execution == .idle,
+              work.activeRun == nil,
+              work.activeRunSession == nil,
+              work.activeRunSessionAttachment == nil,
+              work.activeTurn == nil,
+              work.activeActionIDs.isEmpty,
+              !work.handles.values.contains(where: { !Self.isSettledHandle($0) }),
+              work.unknownEvents.isEmpty,
+              work.unknownDomains.isEmpty,
+              work.quarantinedEvents.isEmpty,
+              work.corruptionReasons.isEmpty,
+              work.structuralIntegrityValid,
+              work.semanticProjectionValid,
+              session.lifecycle == .active,
+              session.unknownEvents.isEmpty,
+              session.unknownDomains.isEmpty,
+              session.quarantinedEvents.isEmpty,
+              session.corruptionReasons.isEmpty,
+              session.structuralIntegrityValid,
+              session.semanticProjectionValid else { return false }
+        return true
+    }
+
+    private static func isSettledHandle(_ handle: WorkHandleSnapshot) -> Bool {
+        switch handle.state {
+        case "succeeded", "failed", "canceled", "completed": return true
+        default: return false
+        }
     }
 
     private func clientAttachment(

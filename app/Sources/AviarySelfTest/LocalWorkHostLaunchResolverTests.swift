@@ -118,6 +118,24 @@ private struct LocalResolverFixture {
     }
 }
 
+private func localResolverMutateLegacyDevice(home: AgentHome) throws {
+    let file = home.workHostWorkspaceRegistryFile
+    let data = try Data(contentsOf: file)
+    guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          var entries = object["entries"] as? [[String: Any]],
+          !entries.isEmpty,
+          var identity = entries[0]["filesystemIdentity"] as? [String: Any],
+          let device = (identity["device"] as? NSNumber)?.uint64Value else {
+        throw WorkHostWorkspaceRegistryError.malformedRegistry
+    }
+    identity.removeValue(forKey: "volumeUUID")
+    identity["device"] = NSNumber(value: device &+ 1)
+    entries[0]["filesystemIdentity"] = identity
+    object["entries"] = entries
+    try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        .write(to: file, options: .atomic)
+}
+
 private struct LocalResolverIntegrationFailure: Error, CustomStringConvertible {
     let description: String
 }
@@ -395,6 +413,29 @@ func test_localWorkHostLaunchResolverProbeReopensDurablePromptFreeTemplate() thr
     let reopened = try XCTUnwrap(try store.readTemplate(for: binding.work))
     XCTAssertEqual(reopened, durable)
     XCTAssertTrue(recreated.canReconstruct(reopened))
+}
+
+func test_localWorkHostLaunchResolverReconfirmationRestoresSameTemplate() throws {
+    let fixture = try LocalResolverFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let (template, binding) = try fixture.template()
+    let originalDigest = try template.template.contentDigest()
+    XCTAssertTrue(fixture.resolver.canReconstruct(template))
+
+    // Model an older persisted registry record whose raw device identity is stale. The launch
+    // template remains unchanged: only the explicit workspace confirmation may refresh identity.
+    try localResolverMutateLegacyDevice(home: fixture.home)
+    XCTAssertFalse(fixture.resolver.canReconstruct(template))
+
+    let prepared = try fixture.workspaceRegistry.prepareReconfirmation(
+        workspaceID: fixture.workspaceID, directory: fixture.workspace)
+    let confirmed = try fixture.workspaceRegistry.confirmReconfirmation(prepared)
+    XCTAssertEqual(confirmed.workspaceID, fixture.workspaceID)
+    XCTAssertEqual(confirmed.availability, .available)
+    XCTAssertTrue(fixture.resolver.canReconstruct(template))
+    XCTAssertEqual(try template.template.contentDigest(), originalDigest)
+    XCTAssertEqual(template.template.draft.configuration.workspaceID, fixture.workspaceID)
+    XCTAssertEqual(binding.workBinding.work, template.template.work)
 }
 
 func test_localWorkHostLaunchResolverServesQualifiedModelsThroughDurableSocket() async throws {
@@ -688,6 +729,9 @@ let casesLocalWorkHostLaunchResolver: [Case] = [
     }),
     ("phase3 local launch resolver: durable prompt-free template reopens", {
         try test_localWorkHostLaunchResolverProbeReopensDurablePromptFreeTemplate()
+    }),
+    ("phase3 local launch resolver: reconfirmation restores same template", {
+        try test_localWorkHostLaunchResolverReconfirmationRestoresSameTemplate()
     }),
     ("phase3 local launch resolver: qualified model survives durable socket Create", {
         try await test_localWorkHostLaunchResolverServesQualifiedModelsThroughDurableSocket()

@@ -15,6 +15,7 @@ struct PendingChatPane: View {
     @State private var confirmingDiscard = false
     @State private var confirmingSeparateCopy = false
     @State private var confirmingStopTracking = false
+    @State private var showingProjectReconfirmation = false
 
     private var canEdit: Bool {
         (chat.phase == .saved || chat.phase == .blocked) && chat.createdAssociation == nil
@@ -107,6 +108,11 @@ struct PendingChatPane: View {
             }
         }
         .onChange(of: chat.id) { _, _ in editing = false }
+        .sheet(isPresented: $showingProjectReconfirmation) {
+            ProjectReconfirmationSheet(initialDirectory: chat.cwd,
+                prepare: { try model.preparePendingProjectReconfirmation(chatID: chat.id, directory: $0) },
+                confirm: { try await model.confirmPendingProjectReconfirmation($0, chatID: chat.id) })
+        }
         .confirmationDialog("Discard this unsent chat?", isPresented: $confirmingDiscard) {
             Button("Discard chat", role: .destructive) { model.discardPendingChat(chat) }
         } message: {
@@ -129,6 +135,10 @@ struct PendingChatPane: View {
                ? "Check delivery" : chat.phase == .saved ? "Start chat" : "Retry startup") { model.retryPendingChat(chat.id) }
             .buttonStyle(.borderedProminent).disabled(editing)
         if canEdit {
+            if chat.failureKind == .workspaceConfirmationRequired || chat.failureKind == .workspaceUnavailable {
+                Button("Confirm project folder…") { showingProjectReconfirmation = true }
+                    .buttonStyle(.bordered).disabled(editing)
+            }
             Button("Edit request") {
                 prompt = chat.prompt; cwd = chat.cwd
                 provider = chat.providerID ?? ""; modelID = chat.modelID ?? ""

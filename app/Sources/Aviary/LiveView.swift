@@ -248,6 +248,8 @@ struct RunPane: View {
     @State private var showCockpitInspector = false
     @State private var showRepositoryReview = false
     @State private var showActivityHistory = false
+    @State private var showProjectReconfirmation = false
+    @State private var projectCheckError: String?
     @State private var composerDelivery: ChatBusyDelivery = .followUp
 
     // Fixed trailing inspector column rather than `.inspector` or a conditional split
@@ -282,7 +284,30 @@ struct RunPane: View {
                         .background(Design.accentSoft.opacity(0.4))
                     Divider()
                 }
-                if let banner = run.errorBanner {
+                if let issue = model.projectIssue(for: run) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        NoticeBanner(level: .warning,
+                            title: issue.unavailabilityReason == .identityNeedsConfirmation
+                                ? "Confirm this chat’s project folder" : "Project folder unavailable",
+                            message: issue.unavailabilityReason == .identityNeedsConfirmation
+                                ? "The agent service is connected, but the saved folder identity no longer matches. This can happen after a restart. Your conversation is safe; confirm the original folder before continuing."
+                                : "The agent service is connected, but it cannot open this chat’s project folder. Restore access to the original folder, then check again. Your conversation is saved.")
+                        HStack {
+                            Button("Confirm project folder…") { showProjectReconfirmation = true }
+                            Button("Check again") {
+                                Task {
+                                    do {
+                                        try await model.refreshProjectAvailability()
+                                        projectCheckError = nil
+                                    } catch { projectCheckError = AppModel.serviceErrorMessage(error) }
+                                }
+                            }
+                        }.buttonStyle(.bordered).controlSize(.small)
+                        if let projectCheckError {
+                            Text(projectCheckError).font(.caption).foregroundStyle(Design.warning)
+                        }
+                    }.padding(Design.gutter)
+                } else if let banner = run.errorBanner {
                     NoticeBanner(level: .danger, title: "Chat needs attention", message: banner)
                         .padding(Design.gutter)
                 } else if run.serviceCommandInFlight {
@@ -402,6 +427,11 @@ struct RunPane: View {
         .sheet(isPresented: $showActivityHistory) {
             ChatActivityHistoryView(run: run)
                 .frame(minWidth: 400, idealWidth: 580, minHeight: 480, idealHeight: 660)
+        }
+        .sheet(isPresented: $showProjectReconfirmation) {
+            ProjectReconfirmationSheet(initialDirectory: run.config.cwd,
+                prepare: { try model.prepareProjectReconfirmation(for: run, directory: $0) },
+                confirm: { try await model.confirmProjectReconfirmation($0, for: run) })
         }
     }
 

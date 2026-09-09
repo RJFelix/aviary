@@ -1419,6 +1419,32 @@ func test_workServiceTransportCodecBoundsAndRoundTripsEnvelopes() throws {
     XCTAssertEqual(try WorkServiceTransportCodec.decodeResponse(responseFrame.dropLast()), response)
 }
 
+func test_workServiceTransportRetainsProjectReconfirmationReason() async throws {
+    let workspace = try WorkHostWorkspaceDescriptor(
+        workspaceID: WorkHostWorkspaceID("workspace-00000000-0000-0000-0000-000000000021"),
+        label: "Project", availability: .unavailable,
+        unavailabilityReason: .identityNeedsConfirmation)
+    let service = InMemoryWorkService(host: transportHost, authorizer: transportAuthorizer(),
+        workspaceCatalog: try WorkHostWorkspaceCatalog(entries: [workspace], revision: 1))
+    let endpoint = WorkServiceTransportEndpoint(path: transportSocketPath())
+    let server = WorkServiceUnixSocketServer(endpoint: endpoint, service: service)
+    let client = WorkServiceUnixSocketClient(endpoint: endpoint, client: transportClientA)
+    do {
+        try await server.start()
+        let handshake = try await client.handshake(.init(client: transportClientA))
+        XCTAssertTrue(handshake.accepted)
+        XCTAssertEqual(handshake.workspaceCatalog.entries.first?.unavailabilityReason, .identityNeedsConfirmation)
+        XCTAssertEqual(handshake.workspaceCatalog.entries.first?.workspaceID, workspace.workspaceID)
+        XCTAssertEqual(handshake.workspaceCatalog.entries.first?.availability, .unavailable)
+        let listing = try await client.listWorks(.init(client: transportClientA))
+        XCTAssertTrue(listing.works.isEmpty)
+        await stopTransport(server, [client])
+    } catch {
+        await stopTransport(server, [client])
+        throw error
+    }
+}
+
 func test_workServiceTransportRejectsRawWorkspacePathAlongsideOpaqueID() async throws {
     let path = transportSocketPath()
     let fixture = try await transportFixture(path: path)
@@ -3213,6 +3239,9 @@ let casesWorkServiceTransport: [Case] = [
     }),
     ("phase3 Work service transport: codec bounds and envelope round trips", {
         try test_workServiceTransportCodecBoundsAndRoundTripsEnvelopes()
+    }),
+    ("phase3 Work service transport: project reconfirmation reason survives socket", {
+        try await test_workServiceTransportRetainsProjectReconfirmationReason()
     }),
     ("phase3 Work service transport: raw workspace paths are rejected", {
         try await test_workServiceTransportRejectsRawWorkspacePathAlongsideOpaqueID()

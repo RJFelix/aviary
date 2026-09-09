@@ -68,6 +68,58 @@ private func workspaceRegistryCanonicalPath(_ url: URL) -> String {
     return String(cString: pointer)
 }
 
+private func workspaceRegistryMutateFirstIdentity(
+    home: AgentHome,
+    _ mutation: (inout [String: Any]) throws -> Void
+) throws {
+    let file = home.workHostWorkspaceRegistryFile
+    let data = try Data(contentsOf: file)
+    guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          var entries = object["entries"] as? [[String: Any]],
+          !entries.isEmpty,
+          var identity = entries[0]["filesystemIdentity"] as? [String: Any] else {
+        throw WorkHostWorkspaceRegistryError.malformedRegistry
+    }
+    try mutation(&identity)
+    entries[0]["filesystemIdentity"] = identity
+    object["entries"] = entries
+    let updated = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    try updated.write(to: file, options: .atomic)
+    guard chmod(file.path, mode_t(0o600)) == 0 else {
+        throw WorkHostWorkspaceRegistryError.ioFailure
+    }
+}
+
+private func workspaceRegistryMutateFirstEntry(
+    home: AgentHome,
+    _ mutation: (inout [String: Any]) throws -> Void
+) throws {
+    let file = home.workHostWorkspaceRegistryFile
+    let data = try Data(contentsOf: file)
+    guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          var entries = object["entries"] as? [[String: Any]], !entries.isEmpty else {
+        throw WorkHostWorkspaceRegistryError.malformedRegistry
+    }
+    try mutation(&entries[0])
+    object["entries"] = entries
+    let updated = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    try updated.write(to: file, options: .atomic)
+    guard chmod(file.path, mode_t(0o600)) == 0 else {
+        throw WorkHostWorkspaceRegistryError.ioFailure
+    }
+}
+
+private func workspaceRegistryFirstIdentity(home: AgentHome) throws -> [String: Any] {
+    let data = try Data(contentsOf: home.workHostWorkspaceRegistryFile)
+    guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let entries = object["entries"] as? [[String: Any]],
+          let first = entries.first,
+          let identity = first["filesystemIdentity"] as? [String: Any] else {
+        throw WorkHostWorkspaceRegistryError.malformedRegistry
+    }
+    return identity
+}
+
 func test_workHostWorkspaceRegistryStableAcrossReopen() throws {
     let fixture = try WorkHostWorkspaceRegistryFixture()
     defer { fixture.tearDown() }
@@ -164,6 +216,178 @@ func test_workHostWorkspaceRegistryResolvesOnlyAfterCurrentValidation() throws {
     workspaceRegistryExpectError({ _ = try registry.resolve(descriptor.workspaceID) }, .workspaceIdentityMismatch)
 }
 
+func test_workHostWorkspaceRegistryStableVolumeIgnoresChangedRawDevice() throws {
+    #if canImport(Darwin)
+    let fixture = try WorkHostWorkspaceRegistryFixture()
+    defer { fixture.tearDown() }
+    let registry = try WorkHostWorkspaceRegistry(home: fixture.home)
+    let registered = try registry.registerLocalDirectory(fixture.first)
+    let original = try workspaceRegistryFirstIdentity(home: fixture.home)
+    _ = try XCTUnwrap(original["volumeUUID"] as? String)
+    let originalDevice = try XCTUnwrap((original["device"] as? NSNumber)?.uint64Value)
+
+    try workspaceRegistryMutateFirstIdentity(home: fixture.home) {
+        $0["device"] = NSNumber(value: originalDevice &+ 1)
+    }
+
+    XCTAssertEqual(
+        workspaceRegistryCanonicalPath(try registry.resolve(registered.workspaceID)),
+        workspaceRegistryCanonicalPath(fixture.first))
+    let descriptor = try XCTUnwrap(try registry.registeredWorkspace(for: fixture.first))
+    XCTAssertEqual(descriptor.availability, .available)
+    XCTAssertNil(descriptor.unavailabilityReason)
+
+    // Explicit registration is the one normalization path for a positively matched legacy/raw
+    // observation. It retains the opaque ID and refreshes the non-authoritative device value.
+    let normalized = try registry.registerLocalDirectory(fixture.first)
+    XCTAssertEqual(normalized.workspaceID, registered.workspaceID)
+    XCTAssertEqual(try registry.catalog().revision, 2)
+    #endif
+}
+
+func test_workHostWorkspaceRegistryDurableVolumeEvidenceNeverFallsBack() throws {
+    let directoryType = UInt64(S_IFDIR)
+    let durable = WorkHostWorkspaceFilesystemIdentity(
+        device: 41, inode: 73, type: directoryType, volumeUUID: "durable-volume")
+    let sameDurableAfterDeviceDrift = WorkHostWorkspaceFilesystemIdentity(
+        device: 42, inode: 73, type: directoryType, volumeUUID: "durable-volume")
+    let lostDurableEvidence = WorkHostWorkspaceFilesystemIdentity(
+        device: 41, inode: 73, type: directoryType, volumeUUID: nil)
+    let changedDurableVolume = WorkHostWorkspaceFilesystemIdentity(
+        device: 41, inode: 73, type: directoryType, volumeUUID: "other-volume")
+    let changedInode = WorkHostWorkspaceFilesystemIdentity(
+        device: 41, inode: 74, type: directoryType, volumeUUID: "durable-volume")
+    let legacy = WorkHostWorkspaceFilesystemIdentity(
+        device: 41, inode: 73, type: directoryType, volumeUUID: nil)
+
+    XCTAssertTrue(durable.identifiesSameResource(as: sameDurableAfterDeviceDrift))
+    XCTAssertFalse(durable.identifiesSameResource(as: lostDurableEvidence))
+    XCTAssertFalse(durable.identifiesSameResource(as: changedDurableVolume))
+    XCTAssertFalse(durable.identifiesSameResource(as: changedInode))
+    XCTAssertTrue(legacy.identifiesSameResource(as: durable))
+}
+
+func test_workHostWorkspaceRegistryRejectsChangedDurableVolumeAndInode() throws {
+    let fixture = try WorkHostWorkspaceRegistryFixture()
+    defer { fixture.tearDown() }
+    let registry = try WorkHostWorkspaceRegistry(home: fixture.home)
+    let registered = try registry.registerLocalDirectory(fixture.first)
+    let original = try workspaceRegistryFirstIdentity(home: fixture.home)
+    let originalInode = try XCTUnwrap((original["inode"] as? NSNumber)?.uint64Value)
+
+    try workspaceRegistryMutateFirstIdentity(home: fixture.home) {
+        $0["inode"] = NSNumber(value: originalInode &+ 1)
+        $0["volumeUUID"] = "00000000-0000-0000-0000-000000000001"
+    }
+
+    workspaceRegistryExpectError({
+        _ = try registry.resolve(registered.workspaceID)
+    }, .workspaceIdentityMismatch)
+    let descriptor = try XCTUnwrap(try registry.registeredWorkspace(for: fixture.first))
+    XCTAssertEqual(descriptor.availability, .unavailable)
+    XCTAssertEqual(descriptor.unavailabilityReason, .identityNeedsConfirmation)
+}
+
+func test_workHostWorkspaceRegistryLegacyDeviceMismatchRequiresExplicitConfirmation() throws {
+    let fixture = try WorkHostWorkspaceRegistryFixture()
+    defer { fixture.tearDown() }
+    let registry = try WorkHostWorkspaceRegistry(home: fixture.home)
+    let registered = try registry.registerLocalDirectory(fixture.first)
+    let original = try workspaceRegistryFirstIdentity(home: fixture.home)
+    let originalDevice = try XCTUnwrap((original["device"] as? NSNumber)?.uint64Value)
+
+    try workspaceRegistryMutateFirstIdentity(home: fixture.home) {
+        $0.removeValue(forKey: "volumeUUID")
+        $0["device"] = NSNumber(value: originalDevice &+ 1)
+    }
+    let mismatchedBytes = try Data(contentsOf: fixture.home.workHostWorkspaceRegistryFile)
+    let reopened = try WorkHostWorkspaceRegistry(home: fixture.home)
+
+    workspaceRegistryExpectError({
+        _ = try reopened.resolve(registered.workspaceID)
+    }, .workspaceIdentityMismatch)
+    workspaceRegistryExpectError({
+        _ = try reopened.registerLocalDirectory(fixture.first)
+    }, .workspaceIdentityMismatch)
+    let lookup = try XCTUnwrap(try reopened.registeredWorkspace(for: fixture.first))
+    XCTAssertEqual(lookup.workspaceID, registered.workspaceID)
+    XCTAssertEqual(lookup.unavailabilityReason, .identityNeedsConfirmation)
+    XCTAssertEqual(
+        try Data(contentsOf: fixture.home.workHostWorkspaceRegistryFile), mismatchedBytes,
+        "ordinary reads and registration must not migrate a mismatched legacy identity")
+
+    let prepared = try reopened.prepareReconfirmation(
+        workspaceID: registered.workspaceID, directory: fixture.first)
+    XCTAssertEqual(prepared.workspaceID, registered.workspaceID)
+    XCTAssertEqual(prepared.expectedRegistryRevision, 1)
+    let confirmed = try reopened.confirmReconfirmation(prepared)
+    XCTAssertEqual(confirmed.workspaceID, registered.workspaceID)
+    XCTAssertEqual(confirmed.availability, .available)
+    XCTAssertNil(confirmed.unavailabilityReason)
+    XCTAssertEqual(try reopened.catalog().revision, 2)
+}
+
+func test_workHostWorkspaceRegistryReconfirmationRejectsChangedInputs() throws {
+    // A selection for another canonical path is rejected before a token exists.
+    do {
+        let fixture = try WorkHostWorkspaceRegistryFixture()
+        defer { fixture.tearDown() }
+        let registry = try WorkHostWorkspaceRegistry(home: fixture.home)
+        let registered = try registry.registerLocalDirectory(fixture.first)
+        workspaceRegistryExpectError({
+            _ = try registry.prepareReconfirmation(
+                workspaceID: registered.workspaceID, directory: fixture.second)
+        }, .workspaceIdentityMismatch)
+    }
+
+
+    // The token also binds the registered path itself, independent of the revision fence.
+    do {
+        let fixture = try WorkHostWorkspaceRegistryFixture()
+        defer { fixture.tearDown() }
+        let registry = try WorkHostWorkspaceRegistry(home: fixture.home)
+        let registered = try registry.registerLocalDirectory(fixture.first)
+        let prepared = try registry.prepareReconfirmation(
+            workspaceID: registered.workspaceID, directory: fixture.first)
+        try workspaceRegistryMutateFirstEntry(home: fixture.home) {
+            $0["canonicalPath"] = workspaceRegistryCanonicalPath(fixture.second)
+        }
+        workspaceRegistryExpectError({
+            _ = try registry.confirmReconfirmation(prepared)
+        }, .workspaceReconfirmationStale)
+    }
+
+    // Replacing the selected directory after preparation invalidates the exact identity binding.
+    do {
+        let fixture = try WorkHostWorkspaceRegistryFixture()
+        defer { fixture.tearDown() }
+        let registry = try WorkHostWorkspaceRegistry(home: fixture.home)
+        let registered = try registry.registerLocalDirectory(fixture.first)
+        let prepared = try registry.prepareReconfirmation(
+            workspaceID: registered.workspaceID, directory: fixture.first)
+        try FileManager.default.removeItem(at: fixture.first)
+        try FileManager.default.createDirectory(at: fixture.first, withIntermediateDirectories: false)
+        workspaceRegistryExpectError({
+            _ = try registry.confirmReconfirmation(prepared)
+        }, .workspaceReconfirmationStale)
+    }
+
+    // Any intervening registry mutation invalidates the revision fence, even if the selected
+    // directory itself is unchanged.
+    do {
+        let fixture = try WorkHostWorkspaceRegistryFixture()
+        defer { fixture.tearDown() }
+        let registry = try WorkHostWorkspaceRegistry(home: fixture.home)
+        let registered = try registry.registerLocalDirectory(fixture.first)
+        let prepared = try registry.prepareReconfirmation(
+            workspaceID: registered.workspaceID, directory: fixture.first)
+        _ = try registry.registerLocalDirectory(fixture.second)
+        workspaceRegistryExpectError({
+            _ = try registry.confirmReconfirmation(prepared)
+        }, .workspaceReconfirmationStale)
+    }
+}
+
 func test_workHostWorkspaceRegistryPublicProjectionIsPathFree() throws {
     let fixture = try WorkHostWorkspaceRegistryFixture()
     defer { fixture.tearDown() }
@@ -179,6 +403,7 @@ func test_workHostWorkspaceRegistryPublicProjectionIsPathFree() throws {
     XCTAssertFalse(json.contains("pid"))
     XCTAssertTrue(json.contains("workspaceID"))
     XCTAssertTrue(json.contains("isComplete"))
+    XCTAssertFalse(json.contains("canonicalPath"))
 }
 
 func test_workHostWorkspaceRegistryRejectsSymlinksAndInvalidLabelsOrIDs() throws {
@@ -325,6 +550,21 @@ let casesWorkHostWorkspaceRegistry: [Case] = [
     }),
     ("phase3 workspace registry: current resolution validation", {
         try test_workHostWorkspaceRegistryResolvesOnlyAfterCurrentValidation()
+    }),
+    ("phase3 workspace registry: stable volume ignores raw device drift", {
+        try test_workHostWorkspaceRegistryStableVolumeIgnoresChangedRawDevice()
+    }),
+    ("phase3 workspace registry: durable volume evidence never falls back", {
+        try test_workHostWorkspaceRegistryDurableVolumeEvidenceNeverFallsBack()
+    }),
+    ("phase3 workspace registry: changed durable identity rejects", {
+        try test_workHostWorkspaceRegistryRejectsChangedDurableVolumeAndInode()
+    }),
+    ("phase3 workspace registry: legacy mismatch requires confirmation", {
+        try test_workHostWorkspaceRegistryLegacyDeviceMismatchRequiresExplicitConfirmation()
+    }),
+    ("phase3 workspace registry: reconfirmation fences changed inputs", {
+        try test_workHostWorkspaceRegistryReconfirmationRejectsChangedInputs()
     }),
     ("phase3 workspace registry: path-free public projection", {
         try test_workHostWorkspaceRegistryPublicProjectionIsPathFree()

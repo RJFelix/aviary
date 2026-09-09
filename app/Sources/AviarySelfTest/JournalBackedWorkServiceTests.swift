@@ -8,7 +8,12 @@ import Foundation
 actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchManifestStore {
     private let digest: String
     private let expectedInputDigest: String?
-    private let productionCapable: Bool
+    private var productionCapable: Bool
+    private var canReconstructGate: JournalReconstructGate?
+    private let testHostedResolver:
+        (@Sendable (WorkRunBinding) -> HostedInHouseWorkConfiguration?)?
+    private let testPromptAssembly: WorkLaunchPromptAssembly?
+    private let testHome: AgentHome?
     private let simulateUnstartedReservation: Bool
     private let draft: WorkLaunchManifestDraft
     private var requestedConfiguration: WorkServiceWorkConfiguration?
@@ -23,7 +28,11 @@ actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchManifestStor
         productionCapable: Bool = false,
         failAfterTemplatePublication: Bool = false,
         expectedPrompt: String? = nil,
-        simulateUnstartedReservation: Bool = false
+        simulateUnstartedReservation: Bool = false,
+        hostedResolver: (@Sendable (WorkRunBinding) -> HostedInHouseWorkConfiguration?)? = nil,
+        promptAssembly: WorkLaunchPromptAssembly? = nil,
+        workspaceLocator: String = "/tmp/aviary-journal-service",
+        home: AgentHome? = nil
     ) {
         if let expectedPrompt {
             digest = "sha256:" + AviarySHA256.hash(data: Data(expectedPrompt.utf8))
@@ -34,13 +43,17 @@ actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchManifestStor
             expectedInputDigest = nil
         }
         self.productionCapable = productionCapable
+        self.canReconstructGate = nil
+        self.testHostedResolver = hostedResolver
+        self.testPromptAssembly = promptAssembly
+        self.testHome = home
         self.simulateUnstartedReservation = simulateUnstartedReservation
         self.failAfterTemplatePublication = failAfterTemplatePublication
         self.requestedConfiguration = nil
         self.requestedCapabilities = nil
         draft = WorkLaunchManifestDraft(
             workspace: WorkLaunchWorkspace(
-                locator: "/tmp/aviary-journal-service",
+                locator: workspaceLocator,
                 policy: .temporary),
             runtime: WorkLaunchRuntime(
                 providerID: "test-provider", modelID: "test-model", runtimeVariant: "test"),
@@ -218,8 +231,14 @@ actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchManifestStor
                 return manifestFromRecord(existing, template: template)
             }
         }
+        let initialInputBodyReference = try testHome.map {
+            try ContextBodyStore(home: $0).retain(
+                body, authority: .work(binding.work), mediaType: "text/plain")
+        }
         let final = try template.template.draft.bind(
-            to: WorkRunBinding(workBinding: binding, run: run), startIntent: intent)
+            to: WorkRunBinding(workBinding: binding, run: run), startIntent: intent,
+            initialInputBodyReference: initialInputBodyReference,
+            promptAssembly: testPromptAssembly)
             .withResumePolicy(policy.resumePolicy)
         let bytes = try final.canonicalBytes()
         let record = WorkLaunchManifestRecord(
@@ -326,9 +345,20 @@ actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchManifestStor
     func canReconstruct(
         _ manifest: JournalBackedWorkLaunchManifest
     ) async throws -> Bool {
+        if let canReconstructGate {
+            await canReconstructGate.wait()
+        }
         // The self-test resolver has no provider, but productionCapable is an explicit fixture
         // assertion that its injected host-private configuration probe succeeded.
-        productionCapable && manifest.template != nil
+        return productionCapable && manifest.template != nil
+    }
+
+    func setProductionCapable(_ value: Bool) {
+        productionCapable = value
+    }
+
+    fileprivate func setCanReconstructGate(_ gate: JournalReconstructGate?) {
+        canReconstructGate = gate
     }
 
     private func manifestFromRecord(
@@ -347,6 +377,7 @@ actor JournalBackedTestManifestStore: JournalBackedWorkServiceLaunchManifestStor
     private func productionResolver() ->
         (@Sendable (WorkRunBinding) -> HostedInHouseWorkConfiguration?)? {
         guard productionCapable else { return nil }
+        if let testHostedResolver { return testHostedResolver }
         return { _ in fatalError("Create must not open a production Hosted actor") }
     }
 }
@@ -544,6 +575,31 @@ private actor JournalCatalogProbeGate {
         pending.removeAll()
         for continuation in continuations {
             continuation.resume(returning: catalog)
+        }
+    }
+}
+
+private actor JournalReconstructGate {
+    private var enteredValue = false
+    private var released = false
+    private var pending: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        enteredValue = true
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            pending.append(continuation)
+        }
+    }
+
+    func entered() -> Bool { enteredValue }
+
+    func release() {
+        released = true
+        let continuations = pending
+        pending.removeAll()
+        for continuation in continuations {
+            continuation.resume()
         }
     }
 }
@@ -2142,6 +2198,192 @@ func testJournalBackedWorkServiceDoesNotProjectPreMarkerStartAsIdle() async thro
             XCTAssertTrue(true)
         }
     }
+    await restarted.controlJournal.close()
+}
+
+func testJournalBackedWorkServiceRepairsReconstructableBootstrapFactOnFreshDescribe() async throws {
+    func repairStage<Value>(
+        _ name: String, _ operation: () async throws -> Value
+    ) async throws -> Value {
+        do {
+            return try await operation()
+        } catch {
+            XCTFail("bootstrap repair stage \(name) failed: \(error)")
+            throw error
+        }
+    }
+    guard let runtimeHost = try makeHost(.reference) else { return }
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("bootstrap-repair-client")
+    let grants = journalBackedAllCapabilities()
+    let assembly = try journalServiceRaceAssembly()
+    let host = try home.requirePersistedWorkHost()
+    let launchWorkspace = root.appending(path: "launch-workspace", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: launchWorkspace, withIntermediateDirectories: true)
+    let retainedAssembly = try WorkLaunchManifestStore(home: home).retainPromptAssembly(
+        assembly, authority: .workHost(host),
+        provenance: WorkLaunchManifestProvenance(source: "bootstrap-repair-test"))
+    let runtimeAssembly = try retainedAssembly.materialize(
+        using: ContextBodyStore(home: home))
+    let store = JournalBackedTestManifestStore(
+        productionCapable: false,
+        hostedResolver: { binding in
+            var model = fakeModel()
+            model.providerID = "test-provider"
+            model.id = "test-model"
+            return HostedInHouseWorkConfiguration(
+                home: home, cwd: launchWorkspace.path, model: model,
+                provider: JournalReservationProvider(), runtimeHost: runtimeHost,
+                workRunBinding: binding, serviceActorID: "bootstrap-repair-test",
+                systemPrompt: runtimeAssembly.flattenedText,
+                systemPromptAssembly: runtimeAssembly)
+        }, promptAssembly: retainedAssembly, workspaceLocator: launchWorkspace.path, home: home)
+    let service = try JournalBackedWorkService(
+        home: home,
+        authorizer: WorkServiceCapabilityPolicy(grantsByClient: [client: grants]),
+        manifestStore: store)
+    let cursor = try await repairStage("initial handshake") {
+        try await service.handshake(WorkServiceHandshakeRequest(client: client)).controlCursor
+    }
+    let created = try await repairStage("initial Create") {
+        try await service.createWork(WorkServiceCreateWorkRequest(
+            client: client, commandID: "create-bootstrap-repair", causalControlCursor: cursor,
+            requestedCapabilities: [.observe, .control, .start, .end]))
+    }
+    await service.controlJournal.close()
+
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "bootstrap-repair-instance",
+        startIdentity: "bootstrap-repair-start",
+        authorizer: WorkServiceCapabilityPolicy(grantsByClient: [client: grants]),
+        manifestStore: store)
+    let before: JournalBackedWorkRecoveryEntry = try XCTUnwrap(try await repairStage("initial recovery scan") {
+        try await restarted.scanRecovery().first
+    })
+    XCTAssertEqual(before.disposition, .recoveryRequired)
+    let beforeWorkCursor = try XCTUnwrap(before.workCursor)
+    let beforeSessionCursor = try XCTUnwrap(before.sessionCursor)
+    let unresolved: WorkServiceWorkDescriptor = try await repairStage("unresolved descriptor") {
+        try await restarted.describeWork(WorkServiceDescribeRequest(
+            work: created.work.work, journal: created.work.journal, client: client))
+    }
+    XCTAssertEqual(unresolved.execution, .recoveryRequired)
+    XCTAssertEqual(unresolved.hostObservation?.reachability, .recovering)
+    XCTAssertNil(unresolved.currentRun)
+
+    // The exact same service generation observes newly available launch material. Repair is
+    // limited to the old negative bootstrap fact; no Work/Session journal append is performed.
+    await store.setProductionCapable(true)
+    let repaired: WorkServiceWorkDescriptor = try await repairStage("repaired descriptor") {
+        try await restarted.describeWork(WorkServiceDescribeRequest(
+            work: created.work.work, journal: created.work.journal, client: client))
+    }
+    XCTAssertEqual(repaired.execution, .idle)
+    XCTAssertNil(repaired.currentRun)
+    XCTAssertNil(repaired.hostObservation)
+    let after: JournalBackedWorkRecoveryEntry = try XCTUnwrap(try await repairStage("repaired recovery scan") {
+        try await restarted.scanRecovery().first
+    })
+    XCTAssertEqual(after.disposition, .idleReconstructable)
+    XCTAssertEqual(try XCTUnwrap(after.workCursor), beforeWorkCursor)
+    XCTAssertEqual(try XCTUnwrap(after.sessionCursor), beforeSessionCursor)
+
+    // Recovery repair only removes the stale negative observation. A real Start remains the
+    // explicit operation that opens Hosted and publishes a new Run generation.
+    let started: WorkServiceCommandReceipt = try await repairStage("explicit Start") {
+        try await restarted.command(WorkServiceCommandRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment,
+            commandID: "bootstrap-repair-start", client: client,
+            sessionAttachment: created.sessionAttachment, causalWorkCursor: beforeWorkCursor,
+            kind: .start, value: "retry after repair"))
+    }
+    XCTAssertEqual(started.state, .accepted)
+    XCTAssertEqual(started.outcome, .started)
+    var hostClosed = false
+    var lastEndCursor: JournalCursor?
+    for _ in 0..<200 {
+        if let lookup = await restarted.registry.lookup(created.work.work) {
+            switch lookup {
+            case .live(let entry):
+                let snapshot = await entry.hostedWork.snapshot()
+                hostClosed = snapshot.lifecycle == .ended && snapshot.journalHealth == .closed
+                if !hostClosed, let cursor = snapshot.latestWorkCursor, cursor != lastEndCursor {
+                    lastEndCursor = cursor
+                    _ = try? await entry.hostedWork.submit(HostedInHouseWorkCommand(
+                        work: created.work.work, session: created.session,
+                        sessionAttachment: created.sessionAttachment, client: client,
+                        commandID: "bootstrap-repair-end", causalCursor: cursor,
+                        command: .endRun))
+                }
+            case .historical, .recovering, .unavailable:
+                hostClosed = true
+            }
+        } else {
+            hostClosed = true
+        }
+        if hostClosed { break }
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    XCTAssertTrue(hostClosed, "explicit Start cleanup must drain Hosted before fixture teardown")
+    await restarted.controlJournal.close()
+}
+
+func testJournalBackedWorkServiceLeavesRecoveryWhenSourceChangesDuringProbe() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("bootstrap-fence-client")
+    let grants = journalBackedAllCapabilities()
+    let store = JournalBackedTestManifestStore(productionCapable: false)
+    let service = try JournalBackedWorkService(
+        home: home,
+        authorizer: WorkServiceCapabilityPolicy(grantsByClient: [client: grants]),
+        manifestStore: store)
+    let cursor = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "create-bootstrap-fence", causalControlCursor: cursor,
+        requestedCapabilities: [.observe, .control, .start]))
+    await service.controlJournal.close()
+
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "bootstrap-fence-instance",
+        startIdentity: "bootstrap-fence-start",
+        authorizer: WorkServiceCapabilityPolicy(grantsByClient: [client: grants]),
+        manifestStore: store)
+    _ = try await restarted.scanRecovery()
+    await store.setProductionCapable(true)
+    let gate = JournalReconstructGate()
+    await store.setCanReconstructGate(gate)
+    let descriptorTask = Task {
+        try await restarted.describeWork(WorkServiceDescribeRequest(
+            work: created.work.work, journal: created.work.journal, client: client))
+    }
+    for _ in 0..<100 {
+        if await gate.entered() { break }
+        try? await Task.sleep(nanoseconds: 1_000_000)
+    }
+    XCTAssertTrue(await gate.entered(), "descriptor did not reach the reconstruction probe")
+
+    // A valid Session append changes the canonical pair while canReconstruct is suspended. The
+    // exact cursor fence must retain recovery rather than discarding the stale negative fact.
+    let writer = try TimelineJournalWriter(
+        reopening: home.timelineV2SessionJournalURL(created.session),
+        journal: created.sessionJournal,
+        actor: TimelineActor(actorID: "bootstrap-fence-writer", kind: "self-test"), home: home)
+    _ = try await writer.append(TimelineEventDraft(
+        session: created.session, work: created.work.work,
+        sessionAttachment: created.sessionAttachment,
+        type: TimelineEventType.messageCommitted, declaredDomains: [.session], payload: .object([
+            "role": .string(ChatRole.assistant.rawValue),
+            "text": .string("source changed during probe"),
+        ])))
+    try await writer.closeChecked()
+    await gate.release()
+    let descriptor = try await descriptorTask.value
+    XCTAssertEqual(descriptor.execution, .recoveryRequired)
+    XCTAssertEqual(descriptor.hostObservation?.reachability, .recovering)
     await restarted.controlJournal.close()
 }
 
@@ -5001,6 +5243,12 @@ let casesJournalBackedWorkService: [Case] = [
     }),
     ("journal-backed service classifies pre-marker Start as recovery", {
         try await testJournalBackedWorkServiceDoesNotProjectPreMarkerStartAsIdle()
+    }),
+    ("journal-backed service repairs a reconstructable bootstrap fact", {
+        try await testJournalBackedWorkServiceRepairsReconstructableBootstrapFactOnFreshDescribe()
+    }),
+    ("journal-backed service fences source changes during reconstruction probe", {
+        try await testJournalBackedWorkServiceLeavesRecoveryWhenSourceChangesDuringProbe()
     }),
     ("journal-backed service list requires observe", {
         try await testJournalBackedWorkServiceListRequiresObserveCapability()

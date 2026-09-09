@@ -363,3 +363,42 @@ Ordinary register/resolve must still reject silent replacement. Show project una
 separately from transport connectivity and conversation integrity. Do not silently update Ryan's
 existing registry while diagnosing; the live Python namespace was intentionally ended and is
 not part of this repair. No remote or Linux recovery claim follows from a macOS volume fix.
+
+### Project confirmation after a macOS restart (2026-09-09)
+
+The bounded repair is implemented. New macOS registrations retain the persistent volume UUID
+when available, together with directory inode/type. A changed raw device number alone no longer
+invalidates that identity; changed inode/volume or missing previously recorded volume evidence
+still fails closed. Filesystems without a volume UUID retain the device-based fallback. Existing
+device-only records with a mismatch require explicit confirmation, not silent promotion.
+
+Both an attached idle chat and an unsent blocked request now offer **Confirm project folder**.
+Choosing the original folder is read-only. Confirming it revalidates the registry revision,
+original opaque project ID/path, and chosen directory identity before updating that same project.
+The saved prompt and command IDs are retained. A successful folder write is reported separately
+from a failed service refresh or draft-status save. Neither confirmation nor its observation-only
+refresh sends input, reconciles unrelated Creates, or starts/restarts an agent.
+
+The service can discard its obsolete in-memory bootstrap recovery observation after a fresh,
+clean idle Work/Session pair and reconstructable launch material are proven. A second cursor and
+registry-fact check fences changes during the probe. Active Runs, unfinished handles, pending
+Start reservations, unknown/corrupt sources, and unrelated recovery facts remain unavailable.
+An explicit subsequent Start is still required; there is no claim of recovered Python state.
+
+The signed production confirmation sheet has been rendered and visually inspected via
+`project-reconfirmation-fixture`; the signed AppModel journey verifies exact prompt/command-ID
+preservation and no implicit service or agent start in an isolated home. This fixture is not a
+claim that the user's currently running older helper has loaded the new code. User folder
+registrations have not been changed as part of verification.
+
+Final macOS regression: **1,054 cases / 14,915 assertions**, all passed in **508.63 seconds**.
+Focused checks include 14/93 workspace registry, 8/120 local resolver, 9/247 Work Host registry,
+1/19 bootstrap repair and explicit Start, 1/3 changed-source refusal, 1/5 socket reason delivery,
+14/58 pending-chat preservation, and 1/7 pending-Start recovery refusal. The bootstrap fixture
+retains real input/prompt bodies, admits Start through JBS, and explicitly drains Hosted afterward;
+it uses a test provider/store, not a paid-provider or user-chat round-trip. No current Linux or
+remote-workflow receipt is claimed for this patch.
+
+The packaging verification also caught a pre-existing relative-cwd bug: `bundle-app.sh` looked
+up its Git commit relative to `app/` after changing directories, stamping `unknown`. It now uses
+its captured absolute repository root. Final packaging must stamp the checkpoint actually built.

@@ -22,6 +22,7 @@ enum VisualFixtureRoute: String {
     case repositoryReviewStale = "repository-review-stale-fixture"
     case repositoryReviewFeedbackNearFull = "repository-review-feedback-near-full-fixture"
     case repositoryReviewFeedbackFull = "repository-review-feedback-full-fixture"
+    case projectReconfirmation = "project-reconfirmation-fixture"
 
     var isNarrow: Bool {
         self == .serviceChatNarrow || self == .productionDeliveryNarrow
@@ -54,6 +55,11 @@ struct VisualFixtureView: View {
             RepositoryReviewFeedbackFixtureView(draftCount: 3_995)
         case .repositoryReviewFeedbackFull:
             RepositoryReviewFeedbackFixtureView(draftCount: 4_000)
+        case .projectReconfirmation:
+            ProjectReconfirmationSheet(initialDirectory: "", prepare: { _ in
+                throw WorkHostWorkspaceRegistryError.workspaceNotFound
+            }, confirm: { _ in .confirmedNeedsRefresh })
+                .background(Color(nsColor: .windowBackgroundColor))
         }
     }
 }

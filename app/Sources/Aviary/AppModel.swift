@@ -1159,6 +1159,126 @@ final class AppModel {
         return workspace.label ?? "Workspace \(workspaceID.rawValue.prefix(12))"
     }
 
+    /// A workspace problem is not a transport failure or damaged conversation. Only an exact
+    /// local-host catalog join may replace the otherwise generic recovery explanation.
+    func projectIssue(for run: LiveRun) -> WorkHostWorkspaceDescriptor? {
+        guard let projection = run.serviceProjection,
+              projection.isCanonical, projection.needsRecovery,
+              projection.descriptor.currentRun == nil,
+              projection.pendingCommand == nil, !projection.commandInFlight,
+              !projection.requiresRefresh, run.serviceBridge?.lastError == nil,
+              run.serviceBridge?.isConnected == true,
+              let hostID = home.persistedWorkHostID,
+              projection.descriptor.work.workHostID == hostID,
+              let handshake = localWorkServiceHandshake, handshake.accepted,
+              handshake.host == WorkHostRef(hostID),
+              projection.descriptor.hostObservation?.instance == nil
+                || projection.descriptor.hostObservation?.instance == handshake.hostInstance,
+              localWorkspaceCatalog.isComplete,
+              let workspaceID = projection.descriptor.configuration.workspaceID else { return nil }
+        let matches = localWorkspaceCatalog.entries.filter { $0.workspaceID == workspaceID }
+        guard matches.count == 1, !matches[0].isAvailable else { return nil }
+        return matches[0]
+    }
+
+    func prepareProjectReconfirmation(
+        for run: LiveRun, directory: URL
+    ) throws -> WorkHostWorkspaceReconfirmation {
+        guard let issue = projectIssue(for: run) else {
+            throw WorkHostWorkspaceRegistryError.workspaceNotFound
+        }
+        return try WorkHostWorkspaceRegistry(home: home).prepareReconfirmation(
+            workspaceID: issue.workspaceID, directory: directory)
+    }
+
+    /// Separates a successful registry update from a failed subsequent service refresh. Neither
+    /// branch admits Start, reconciles unrelated Creates, or sends input.
+    func confirmProjectReconfirmation(
+        _ confirmation: WorkHostWorkspaceReconfirmation, for run: LiveRun
+    ) async throws -> ProjectReconfirmationResult {
+        guard projectIssue(for: run)?.workspaceID == confirmation.workspaceID else {
+            throw WorkHostWorkspaceRegistryError.workspaceNotFound
+        }
+        _ = try WorkHostWorkspaceRegistry(home: home).confirmReconfirmation(confirmation)
+        do {
+            try await refreshProjectAvailability()
+            return run.serviceBridge?.lastError == nil
+                && run.serviceBridge?.isConnected == true
+                && run.serviceProjection?.isCanonical == true
+                && run.serviceProjection?.needsRecovery == false
+                && run.serviceProjection?.requiresRefresh == false
+                ? .confirmed : .confirmedNeedsRefresh
+        } catch {
+            localWorkServiceObservationError = Self.serviceErrorMessage(error)
+            return .confirmedNeedsRefresh
+        }
+    }
+
+    func preparePendingProjectReconfirmation(
+        chatID: UUID, directory: URL
+    ) throws -> WorkHostWorkspaceReconfirmation {
+        guard let chat = pendingChats.first(where: { $0.id == chatID }),
+              chat.phase == .blocked, chat.createdAssociation == nil,
+              !pendingChatIsPreparing(chat),
+              [.workspaceUnavailable, .workspaceConfirmationRequired].contains(chat.failureKind)
+        else { throw WorkHostWorkspaceRegistryError.invalidWorkspacePath }
+        let registry = try WorkHostWorkspaceRegistry(home: home)
+        guard let workspace = try registry.registeredWorkspace(for: URL(fileURLWithPath: chat.cwd)) else {
+            throw WorkHostWorkspaceRegistryError.workspaceNotFound
+        }
+        return try registry.prepareReconfirmation(workspaceID: workspace.workspaceID, directory: directory)
+    }
+
+    func confirmPendingProjectReconfirmation(
+        _ confirmation: WorkHostWorkspaceReconfirmation, chatID: UUID
+    ) async throws -> ProjectReconfirmationResult {
+        guard let chat = pendingChats.first(where: { $0.id == chatID }),
+              chat.phase == .blocked, chat.createdAssociation == nil,
+              !pendingChatIsPreparing(chat),
+              [.workspaceUnavailable, .workspaceConfirmationRequired].contains(chat.failureKind)
+        else { throw WorkHostWorkspaceRegistryError.workspaceNotFound }
+        let registry = try WorkHostWorkspaceRegistry(home: home)
+        guard try registry.registeredWorkspace(for: URL(fileURLWithPath: chat.cwd))?.workspaceID
+                == confirmation.workspaceID else { throw WorkHostWorkspaceRegistryError.workspaceNotFound }
+        _ = try registry.confirmReconfirmation(confirmation)
+        // Registry and draft are distinct stores. If saving this status fails, keep the exact
+        // saved request and report that separately; never imply the successful repair rolled back.
+        do {
+            let ready = try chat.edited(prompt: chat.prompt, cwd: chat.cwd,
+                providerID: chat.providerID, modelID: chat.modelID,
+                thinkingLevel: chat.thinkingLevel, title: chat.title,
+                noContextFiles: chat.noContextFiles, recordPayloads: chat.recordPayloads)
+            replacePendingChat(try PendingChatStore(home: home).update(ready, expectedGeneration: chat.generation))
+        } catch {
+            pendingChatDetails[chatID] = "The project is confirmed, but saving this chat’s status failed. Your original request is kept; no message was sent."
+            return .confirmedNeedsChatSave
+        }
+        pendingChatDetails.removeValue(forKey: chatID)
+        do {
+            try await refreshProjectAvailability()
+            let matching = localWorkspaceCatalog.entries.filter { $0.workspaceID == confirmation.workspaceID }
+            return localWorkspaceCatalog.isComplete && matching.count == 1 && matching[0].isAvailable
+                ? .confirmed : .confirmedNeedsRefresh
+        } catch {
+            localWorkServiceObservationError = Self.serviceErrorMessage(error)
+            return .confirmedNeedsRefresh
+        }
+    }
+
+    func refreshProjectAvailability() async throws {
+        guard let client = localWorkServiceClient,
+              beginServiceLifecycleOperation() else {
+            throw LocalWorkServiceBootstrapError.discoveryFailed
+        }
+        defer { finishServiceLifecycleOperation() }
+        let (session, handshake) = try await reconnectLocalWorkService()
+        await restoreServiceWork(session: session, client: client, handshake: handshake,
+                                 resumeInitialStart: false)
+        for run in workRuns where run.isServiceBacked {
+            await run.refreshService(resumeInitialStart: false)
+        }
+    }
+
     static func serviceErrorMessage(_ error: Error) -> String {
         if let error = error as? WorkServiceTransportError {
             switch error {
@@ -3220,6 +3340,8 @@ final class AppModel {
         switch chat.failureKind {
         case .providerUnavailable: return "The selected model is not available. Choose a configured model, then retry."
         case .workspaceUnavailable: return "The project folder is unavailable. Check the folder, then retry."
+        case .workspaceConfirmationRequired:
+            return "The saved project folder identity needs confirmation, which can happen after a restart. Confirm the original folder, then start this saved request when ready. Nothing has been sent."
         case .staleCreate:
             return "Startup needs a fresh attempt. Your request was not accepted, and the saved text is unchanged. Retry startup when ready."
         case .invalidRequest: return "The request needs an adjustment before it can be sent. Your original text is saved."
@@ -3623,9 +3745,11 @@ final class AppModel {
             }
         } catch let error as WorkHostWorkspaceRegistryError {
             blockPendingChat(pendingChatID,
-                message: (error.errorDescription ?? "The project folder is unavailable.")
-                    + " Choose Edit request to check the project folder. Your request has not been sent.",
-                kind: .workspaceUnavailable)
+                message: error == .workspaceIdentityMismatch
+                    ? "The saved project folder identity needs confirmation, which can happen after a restart. Confirm the original folder, then start this saved request when ready. Nothing has been sent."
+                    : (error.errorDescription ?? "The project folder is unavailable.")
+                        + " Choose Edit request to check the project folder. Your request has not been sent.",
+                kind: error == .workspaceIdentityMismatch ? .workspaceConfirmationRequired : .workspaceUnavailable)
         } catch {
             let message = Self.serviceErrorMessage(error)
             if let pendingChatID,

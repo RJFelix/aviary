@@ -20,6 +20,7 @@ public enum PendingChatPhase: String, Codable, CaseIterable, Hashable, Sendable 
 public enum PendingChatFailureKind: String, Codable, CaseIterable, Hashable, Sendable {
     case hostUnavailable
     case workspaceUnavailable
+    case workspaceConfirmationRequired
     case providerUnavailable
     case authorizationRequired
     /// Create was rejected by a stale control cursor before Work admission. The saved prompt

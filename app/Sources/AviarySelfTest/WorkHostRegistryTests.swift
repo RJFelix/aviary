@@ -421,6 +421,49 @@ func test_workHostRegistrySeparatesCanonicalFactsFromLiveLiveness() async throws
     }
 }
 
+func test_workHostRegistryDiscardsOnlyExactRecoveringFact() async throws {
+    let host = WorkHostRef("recovering-cas-host")
+    let registry = WorkHostRegistry(
+        host: host, instanceID: "current-instance", startIdentity: "current-start")
+    let hostInstance = await registry.hostInstance
+    let recoveringWork = WorkRef(workHostID: host.workHostID, workID: "recovering")
+    let expected = registryCanonicalFact(
+        work: recoveringWork, disposition: .recovering, hostInstance: hostInstance)
+    try await registry.registerCanonical(expected)
+
+    let divergent = registryCanonicalFact(
+        work: recoveringWork, disposition: .recovering,
+        hostInstance: WorkHostInstanceRef(
+            host: host, instanceID: "other-instance", startIdentity: "other-start"))
+    XCTAssertFalse(await registry.discardRecoveringFact(recoveringWork, expected: divergent))
+    XCTAssertEqual((await registry.lookup(recoveringWork))?.kind, .recovering)
+
+    XCTAssertTrue(await registry.discardRecoveringFact(recoveringWork, expected: expected))
+    XCTAssertNil(await registry.lookup(recoveringWork))
+    XCTAssertFalse(await registry.discardRecoveringFact(recoveringWork, expected: expected))
+
+    let historicalWork = WorkRef(workHostID: host.workHostID, workID: "historical")
+    let historical = registryCanonicalFact(
+        work: historicalWork, disposition: .historical, hostInstance: hostInstance)
+    try await registry.registerCanonical(historical)
+    XCTAssertFalse(await registry.discardRecoveringFact(historicalWork, expected: historical))
+    XCTAssertEqual((await registry.lookup(historicalWork))?.kind, .historical)
+
+    let unavailableWork = WorkRef(workHostID: host.workHostID, workID: "unavailable")
+    let unavailable = registryCanonicalFact(
+        work: unavailableWork, disposition: .unavailable, hostInstance: hostInstance)
+    try await registry.registerCanonical(unavailable)
+    XCTAssertFalse(await registry.discardRecoveringFact(unavailableWork, expected: unavailable))
+    XCTAssertEqual((await registry.lookup(unavailableWork))?.kind, .unavailable)
+
+    let reservedWork = WorkRef(workHostID: host.workHostID, workID: "reserved")
+    let reservation = try await registry.reserveRegistration(for: reservedWork)
+    let reservedFact = registryCanonicalFact(
+        work: reservedWork, disposition: .recovering, hostInstance: hostInstance)
+    XCTAssertFalse(await registry.discardRecoveringFact(reservedWork, expected: reservedFact))
+    await registry.cancelRegistration(reservation)
+}
+
 func test_workHostRegistryIgnoresClientDisconnects() async throws {
     guard let host = try makeHost(.reference) else { return }
     let home = scratchHome()
