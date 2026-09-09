@@ -302,3 +302,64 @@ worked, but this transient alarming presentation is not acceptable evidence of a
 delivery experience. Trace receipt generation and concurrent canonical reads before changing
 error severity or suppressing genuine uncertainty. The stale-Create card's “request needs an
 adjustment” wording also overstates the required action when the request text is already valid.
+
+### Delivery lifetime and exact receipt reconciliation — 2026-09-09
+
+The transient warning above came from exposing a crash-safe retained intent as a settled
+failure while its original service call was still awaiting a response. The controller now
+projects an explicitly process-local `commandInFlight` fact. It is never persisted and never
+proves delivery: a reconstructed controller still treats its retained intent as uncertain.
+The chat and inspector show neutral confirmation progress during that live call, while actual
+transport failures, storage failures, and restored uncertainty retain their warning paths.
+Mutations, retries, and stale-intent abandonment are disabled until the original call settles.
+
+Independent review found a second ordering bug: polling could observe acceptance before the
+original response, clear the intent, then let the late response recreate a disk-only intent
+which blocked the next input. Reconciliation now waits for that original call to settle.
+Gated tests cover acceptance-before-response, accepted-but-response-lost, pre-effect failure,
+restart, and a subsequent distinct input. Removing just this guard reproduced both early
+intent clearing and the next-input `pendingCommandExists` failure; restoring it passed.
+
+Proven stale Create rejection also has its own persisted presentation classification. It asks
+for an explicit fresh startup attempt, says the text is unchanged, and does not demand editing
+the prompt. Unknown transport effects remain retained and are not classified as stale.
+
+Receipts so far: in-flight focused group **3 cases / 50 assertions**; pending-chat group
+**14 / 58**; signed release build, strict signature verification, and signed AppModel journey
+probe pass. The probe exercises both live neutral presentation and restored uncertainty,
+including draft-handoff notices. Full macOS SelfTest passes **1,044 cases / 14,836 assertions**
+in **896.69 seconds**, including the new controller, GUI policy, and pending-chat tests.
+Later sidebar/App-only changes require their own app build/probe; this is not a Linux receipt.
+
+Real signed GUI/provider verification used a new isolated project at
+`/private/tmp/aviary-delivery-check.43nc5g`. The unavailable previous temporary folder was
+reported accurately; editing the saved project's path preserved the request and did not
+submit until explicit Start. The initial request ran three unit tests; one follow-up asked
+which test covers negative quantities. Both completed without retry or the false red delivery
+warning. Canonical Work `work-f37b96ad-d4e9-4447-999d-5b4b437c547a` has two accepted inputs,
+two started/finished turns, and explicit test-runtime End at `run.finished` sequence 43.
+Independent execution also passed all three tests. No unrelated saved requests were sent.
+
+The reproduced sidebar title flicker is also corrected: during an incomplete catalog join, an
+unambiguous exact attached canonical projection may supply the retained chat title. The unknown
+conversation state remains disclosed, and agent state is explicitly qualified. Duplicate,
+missing-summary, noncanonical, placeholder, and ambiguous multi-Work cases do not get a fallback.
+The final signed AppModel probe exercises the actual presentation gate for positive and negative
+cases; final release bundle and strict signature verification pass. This is deterministic
+presentation coverage, not an additional provider round-trip after the sidebar change.
+
+Separately, cold reconstruction of an older workspace is blocked by a stored filesystem device
+identity mismatch; expose that specific condition without silently rebinding the user's
+workspace or claiming lost Python state survived.
+
+Next bounded repair: workspace identity across restart. The original Aviary directory retains
+inode `278097385`, but its recorded device number `16777232` differs from the post-reboot
+`16777231`. New registrations use the latter. `registerLocalDirectory` refuses the same path
+with changed identity, so the current instruction to register again cannot actually repair it.
+For new registrations, use an available restart-stable volume identity plus directory identity;
+never equate unrelated directories by inode alone. Add explicit folder reconfirmation for an
+existing opaque workspace ID, with current-generation checks and clear effect on future launches.
+Ordinary register/resolve must still reject silent replacement. Show project unavailability
+separately from transport connectivity and conversation integrity. Do not silently update Ryan's
+existing registry while diagnosing; the live Python namespace was intentionally ended and is
+not part of this repair. No remote or Linux recovery claim follows from a macOS volume fix.

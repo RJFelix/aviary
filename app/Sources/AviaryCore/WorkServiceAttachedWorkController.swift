@@ -124,6 +124,10 @@ public struct WorkServiceAttachedWorkProjection: Sendable, Hashable {
     public let readDiagnostics: [String]
     public let connectivity: WorkServiceAttachedWorkConnectivity
     public let pendingCommand: WorkServiceAttachedWorkPendingCommand?
+    /// Process-local request lifetime, not durable delivery evidence. A retained intent is
+    /// conservatively indeterminate on disk even while its original call is still awaiting a
+    /// response. Reopening a controller always resets this flag to false.
+    public let commandInFlight: Bool
     public let lastReceipt: WorkServiceCommandReceipt?
     /// A correlated command receipt names canonical Work state this projection has not reduced
     /// yet. This is ordinary catch-up, not a recovery failure, but mutation must wait for refresh.
@@ -146,6 +150,7 @@ public struct WorkServiceAttachedWorkProjection: Sendable, Hashable {
         readDiagnostics: [String] = [],
         connectivity: WorkServiceAttachedWorkConnectivity = .disconnected,
         pendingCommand: WorkServiceAttachedWorkPendingCommand? = nil,
+        commandInFlight: Bool = false,
         lastReceipt: WorkServiceCommandReceipt? = nil,
         requiresRefresh: Bool = false
     ) {
@@ -221,6 +226,7 @@ public struct WorkServiceAttachedWorkProjection: Sendable, Hashable {
         self.readDiagnostics = Array(readDiagnostics.prefix(Self.maxDiagnostics))
         self.connectivity = connectivity
         self.pendingCommand = pendingCommand
+        self.commandInFlight = commandInFlight
         self.lastReceipt = lastReceipt
         self.requiresRefresh = requiresRefresh
         let healthySnapshots = workSnapshot.structuralIntegrityValid
@@ -535,6 +541,7 @@ public actor WorkServiceAttachedWorkController {
     private var readDiagnosticsStorage: [String] = []
     private var connectivityStorage: WorkServiceAttachedWorkConnectivity = .disconnected
     private var pendingStorage: PendingInternal?
+    private var commandInFlightStorage = false
     /// The Work Host control cursor is independent from both read cursors. It is advanced only
     /// from a validated handshake or acknowledgement receipt, then chained into the next
     /// acknowledgement request.
@@ -761,7 +768,8 @@ public actor WorkServiceAttachedWorkController {
             workOmissions: workOmissionsStorage, sessionOmissions: sessionOmissionsStorage,
             readDiagnostics: readDiagnosticsStorage,
             connectivity: connectivityStorage,
-            pendingCommand: pendingStorage?.projection, lastReceipt: lastReceiptStorage,
+            pendingCommand: pendingStorage?.projection,
+            commandInFlight: commandInFlightStorage, lastReceipt: lastReceiptStorage,
             requiresRefresh: requiresRefreshStorage)
     }
 
@@ -1630,6 +1638,9 @@ public actor WorkServiceAttachedWorkController {
     /// refresh first and supply a new command id for any reissue. An indeterminate command may
     /// have taken effect and therefore cannot be abandoned or rebased through this API.
     public func abandonStaleCommand() throws {
+        guard !commandInFlightStorage else {
+            throw WorkServiceAttachedWorkControllerError.pendingCommandExists
+        }
         guard let pending = pendingStorage else {
             throw WorkServiceAttachedWorkControllerError.noPendingCommand
         }
@@ -1669,6 +1680,9 @@ public actor WorkServiceAttachedWorkController {
         _ request: WorkServiceCommandRequest,
         retainingState requestedState: WorkServiceAttachedWorkPendingState?
     ) async throws -> WorkServiceCommandReceipt {
+        guard !commandInFlightStorage else {
+            throw WorkServiceAttachedWorkControllerError.pendingCommandExists
+        }
         let state = requestedState ?? .indeterminate
         if pendingStorage == nil {
             do {
@@ -1684,6 +1698,8 @@ public actor WorkServiceAttachedWorkController {
         } else if pendingStorage?.request != request {
             throw WorkServiceAttachedWorkControllerError.pendingCommandExists
         }
+        commandInFlightStorage = true
+        defer { commandInFlightStorage = false }
         do {
             let receipt = try await service.command(request)
             guard receipt.work == work,
@@ -1817,6 +1833,10 @@ public actor WorkServiceAttachedWorkController {
     private func reconcilePendingCommand(
         in snapshot: WorkSnapshot, through cursor: JournalCursor
     ) throws {
+        // A read may observe acceptance before the original response continuation resumes.
+        // Do not clear its intent here only for submit() to recreate an orphaned on-disk
+        // obligation after receiving the receipt. The next post-response read reconciles it.
+        guard !commandInFlightStorage else { return }
         guard let pending = pendingStorage else { return }
         guard pending.state != .stale else { return }
         let canonicalID = WorkServiceCommandLedgerIdentity.commandID(

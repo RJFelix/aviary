@@ -17,7 +17,8 @@ private func guiPolicy(
     capabilities: Set<WorkServiceCapability>,
     canonical: Bool = true,
     recovery: Bool = false,
-    refresh: Bool = false
+    refresh: Bool = false,
+    inFlight: Bool = false
 ) -> ServiceBackedGUIControlPolicy {
     ServiceBackedGUIControlPolicy(
         execution: execution,
@@ -29,7 +30,8 @@ private func guiPolicy(
         capabilities: capabilities,
         isCanonical: canonical,
         needsRecovery: recovery,
-        requiresRefresh: refresh)
+        requiresRefresh: refresh,
+        commandInFlight: inFlight)
 }
 
 func testServiceBackedGUIControlPolicyRoutesFirstInputToStart() {
@@ -139,6 +141,21 @@ func testServiceBackedGUIControlPolicyDistinguishesSettledAndNonActionableStates
 }
 
 let casesServiceBackedGUIControlPolicy: [Case] = [
+    ("phase3 GUI control policy withholds duplicate in-flight mutations", {
+        for state in [WorkServiceExecutionState.idle, .running] {
+            let policy = guiPolicy(
+                execution: state, currentRun: guiPolicyRun,
+                ownerSession: guiPolicySessionA, ownerAttachment: guiPolicyAttachmentA,
+                capabilities: Set(WorkServiceCapability.allCases), inFlight: true)
+            XCTAssertTrue(policy.hasExactRunOwner)
+            XCTAssertFalse(policy.canSubmitText)
+            XCTAssertFalse(policy.canEnd)
+            XCTAssertFalse(policy.canRetryPendingCommand(kind: .send))
+            XCTAssertFalse(policy.commandCapabilities.supportsSteering)
+            XCTAssertFalse(policy.commandCapabilities.supportsQueuedFollowUps)
+            XCTAssertFalse(policy.commandCapabilities.supports(.agentLoop))
+        }
+    }),
     ("phase3 GUI control policy routes first input to Start", {
         testServiceBackedGUIControlPolicyRoutesFirstInputToStart()
     }),

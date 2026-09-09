@@ -237,7 +237,8 @@ final class ServiceBackedRunBridge {
     /// command must still belong to this exact active Session relationship; keep the repair UI
     /// disabled when a refresh observes an ownership transfer.
     var canRetryPendingCommand: Bool {
-        guard let pending = projection.pendingCommand else { return false }
+        guard !projection.commandInFlight,
+              let pending = projection.pendingCommand else { return false }
         return controlPolicy.canRetryPendingCommand(kind: pending.kind)
     }
 
@@ -317,7 +318,7 @@ final class ServiceBackedRunBridge {
 
     var errorBanner: String? {
         if let lastError { return lastError }
-        if let pending = projection.pendingCommand {
+        if let pending = projection.pendingCommand, !projection.commandInFlight {
             switch pending.state {
             case .stale:
                 return "A \(pending.kind.rawValue) command is stale. Refresh canonical Work before deciding whether to abandon it and issue a new command."

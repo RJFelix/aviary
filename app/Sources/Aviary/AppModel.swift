@@ -1228,7 +1228,10 @@ final class AppModel {
                         // than replaying a known-dead intent forever. Transport errors below are
                         // different: their effect may be indeterminate and must remain retained.
                         do {
-                            guard rejectPendingChatAttempt(request.commandID) else { throw PendingChatError.conflict }
+                            guard rejectPendingChatAttempt(
+                                request.commandID,
+                                failure: response.receipt.rejection == .staleCursor ? .staleCreate : .invalidRequest
+                            ) else { throw PendingChatError.conflict }
                             try store.clear(request)
                         } catch {
                             localWorkServiceCreateError =
@@ -1250,7 +1253,9 @@ final class AppModel {
                 } catch {
                     if Self.isProvenStaleCreateFailure(error) {
                         do {
-                            guard rejectPendingChatAttempt(request.commandID) else { throw PendingChatError.conflict }
+                            guard rejectPendingChatAttempt(request.commandID, failure: .staleCreate) else {
+                                throw PendingChatError.conflict
+                            }
                             try store.clear(request)
                         } catch {
                             localWorkServiceCreateError =
@@ -3215,6 +3220,8 @@ final class AppModel {
         switch chat.failureKind {
         case .providerUnavailable: return "The selected model is not available. Choose a configured model, then retry."
         case .workspaceUnavailable: return "The project folder is unavailable. Check the folder, then retry."
+        case .staleCreate:
+            return "Startup needs a fresh attempt. Your request was not accepted, and the saved text is unchanged. Retry startup when ready."
         case .invalidRequest: return "The request needs an adjustment before it can be sent. Your original text is saved."
         default: return "The local agent service is not ready. Your request is saved on this Mac and has not been sent. Retry connection to continue."
         }
@@ -3253,12 +3260,14 @@ final class AppModel {
         _ = updatePendingChat(id, phase: .blocked, failure: kind)
     }
 
-    private func rejectPendingChatAttempt(_ commandID: String) -> Bool {
+    private func rejectPendingChatAttempt(
+        _ commandID: String, failure: PendingChatFailureKind = .invalidRequest
+    ) -> Bool {
         guard let chat = pendingChats.first(where: {
             $0.attemptCommandID.uuidString.lowercased() == commandID && $0.createdAssociation == nil
         }) else { return true }
-        guard updatePendingChat(chat.id, phase: .blocked, failure: .invalidRequest) else { return false }
-        return updatePendingChat(chat.id, phase: .blocked, failure: .invalidRequest, newAttempt: true)
+        guard updatePendingChat(chat.id, phase: .blocked, failure: failure) else { return false }
+        return updatePendingChat(chat.id, phase: .blocked, failure: failure, newAttempt: true)
     }
 
     func editPendingChat(_ chat: PendingChat, prompt: String, cwd: String,
@@ -3507,7 +3516,11 @@ final class AppModel {
                 // boundary; retaining it as an indeterminate mutation would freeze every later
                 // Create forever. Clear the exact intent before allowing the user to retry.
                 do {
-                    guard rejectPendingChatAttempt(createRequest.commandID) else { throw PendingChatError.conflict }
+                    let failureKind: PendingChatFailureKind =
+                        response.receipt.rejection == .staleCursor ? .staleCreate : .invalidRequest
+                    guard rejectPendingChatAttempt(createRequest.commandID, failure: failureKind) else {
+                        throw PendingChatError.conflict
+                    }
                     try createIntentStore.clear(createRequest)
                     localWorkServiceCreatesReconciled = true
                 } catch {
@@ -3518,9 +3531,9 @@ final class AppModel {
                 let detail = response.receipt.diagnostic ?? "no durable Work was admitted."
                 blockPendingChat(pendingChatID, message:
                     response.receipt.rejection == .staleCursor
-                        ? "The Work Host rejected Create because its control cursor was stale. No Work was created; retry when ready."
+                        ? "Startup needs a fresh attempt. Your request was not accepted, and the saved text is unchanged. Retry startup when ready."
                         : "The Work Host rejected Create: \(detail)",
-                    kind: .invalidRequest)
+                    kind: response.receipt.rejection == .staleCursor ? .staleCreate : .invalidRequest)
                 return
             }
             do {
@@ -3983,7 +3996,8 @@ final class LiveRun: Identifiable {
     private(set) var draftHandoff: ServiceBackedDraftHandoff?
     private(set) var draftPersistenceState: LiveRunDraftPersistenceState = .memoryOnly
     var draftPersistenceNotice: String? {
-        if draftHandoff != nil {
+        if draftHandoff != nil, serviceCommandBarrier.operationsInFlight == 0,
+           !serviceCommandInFlight {
             return "This draft has an unresolved Work Host handoff. Aviary will not resend it until exact canonical evidence resolves the command."
         }
         switch draftPersistenceState {
@@ -4076,6 +4090,7 @@ final class LiveRun: Identifiable {
     /// state only; relaunch/reconstruction dedupes by this exact attachment relationship.
     private(set) var serviceAttachmentKey: ServiceAttachmentKey?
     var serviceProjection: WorkServiceAttachedWorkProjection? { serviceBridge?.projection }
+    private(set) var serviceCommandInFlight = false
     /// The current descriptor is presentation metadata only. Body bytes are not fetched until
     /// the Review changes affordance explicitly opens the review sheet and the person requests
     /// a load there. It is mirrored from the bridge so an open review sheet observes canonical
@@ -4771,6 +4786,7 @@ final class LiveRun: Identifiable {
         publish(serviceBridge.isTerminal, to: \.hasExited)
         publish(serviceBridge.isEnding, to: \.isEnding)
         publish(serviceBridge.commandState, to: \.commandState)
+        publish(serviceBridge.projection.commandInFlight, to: \.serviceCommandInFlight)
         publish(serviceBridge.errorBanner, to: \.errorBanner)
         publish(serviceBridge.modelLabel, to: \.modelLabel)
         publish(serviceBridge.thinkingLevel, to: \.thinkingLevel)

@@ -285,9 +285,11 @@ struct CockpitView: View {
 
     @ViewBuilder
     private func workspaceCard(_ entry: CanonicalSessionWorkspaceRailEntry) -> some View {
+        let attachedRuns = matchingRuns(for: entry)
         CanonicalWorkspaceRailCard(
             entry: entry,
-            isAttachedHere: !matchingRuns(for: entry).isEmpty,
+            attachedRun: selectedMatchingRun(for: entry),
+            isAttachedHere: !attachedRuns.isEmpty,
             selected: !composingNewSession && selectedCanonicalEntry?.id == entry.id
         ) {
             selectedCanonicalEntryID = entry.id
@@ -312,6 +314,39 @@ struct CockpitView: View {
             .foregroundStyle(.tertiary)
             .padding(.horizontal, 4)
             .padding(.top, 5)
+    }
+}
+
+/// Presentation-only identity retained while an exact attached Work outpaces the Session rail
+/// catalog. The command state remains explicitly qualified as Work state; it is never promoted to
+/// canonical Session state.
+struct CanonicalWorkspaceRailAttachedFallback: Equatable, Sendable {
+    let title: String
+    let commandState: SessionCommandState
+}
+
+/// Pure gate for the rail's transient attached-chat fallback. Keep this independent of SwiftUI so
+/// the AppModel journey probe can cover the safety cases without fabricating a view hierarchy.
+enum CanonicalWorkspaceRailPresentation {
+    static func attachedFallback(
+        entryIsKnown: Bool,
+        entryJoin: CanonicalSessionWorkspaceRailJoin,
+        attachedServiceBacked: Bool,
+        attachedProjectionIsCanonical: Bool,
+        attachedTitle: String?,
+        attachedCommandState: SessionCommandState?
+    ) -> CanonicalWorkspaceRailAttachedFallback? {
+        guard !entryIsKnown,
+              entryJoin == .incomplete,
+              attachedServiceBacked,
+              attachedProjectionIsCanonical,
+              let attachedTitle,
+              attachedTitle != "New run",
+              !attachedTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let attachedCommandState
+        else { return nil }
+        return CanonicalWorkspaceRailAttachedFallback(
+            title: attachedTitle, commandState: attachedCommandState)
     }
 }
 
@@ -399,9 +434,28 @@ private struct RunRailCard: View {
 
 private struct CanonicalWorkspaceRailCard: View {
     let entry: CanonicalSessionWorkspaceRailEntry
+    let attachedRun: LiveRun?
     let isAttachedHere: Bool
     let selected: Bool
     let action: () -> Void
+
+    /// A live service attachment can retain the chat identity while the catalog is catching up.
+    /// This is presentation-only: the canonical entry remains unknown and its state is never
+    /// replaced by the attached Work's command state. Duplicate or missing-summary rows have no
+    /// safe join, so they keep the explicit unavailable title.
+    private var attachedCatchUpPresentation: CanonicalWorkspaceRailAttachedFallback? {
+        CanonicalWorkspaceRailPresentation.attachedFallback(
+            entryIsKnown: entry.isKnown,
+            entryJoin: entry.join,
+            attachedServiceBacked: attachedRun?.isServiceBacked ?? false,
+            attachedProjectionIsCanonical: attachedRun?.serviceProjection?.isCanonical ?? false,
+            attachedTitle: attachedRun?.title,
+            attachedCommandState: attachedRun?.commandState)
+    }
+
+    private var displayTitle: String {
+        attachedCatchUpPresentation?.title ?? entry.title
+    }
 
     var body: some View {
         Button(action: action) {
@@ -410,7 +464,7 @@ private struct CanonicalWorkspaceRailCard: View {
                     Image(systemName: entry.state.symbol)
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(entry.state.tint)
-                    Text(entry.title)
+                    Text(displayTitle)
                         .font(.system(size: 12, weight: .semibold))
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
@@ -422,6 +476,12 @@ private struct CanonicalWorkspaceRailCard: View {
                     if isAttachedHere {
                         Text("open here")
                             .foregroundStyle(Design.accent)
+                    }
+                    if let attachedCatchUpPresentation {
+                        Text("Attached agent · \(ChatInteractionPresentation.stateLabel(attachedCatchUpPresentation.commandState))")
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
                     if let model = entry.modelID, !model.isEmpty {
                         Text(model).lineLimit(1).truncationMode(.middle)
@@ -450,14 +510,17 @@ private struct CanonicalWorkspaceRailCard: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(
-            "\(entry.title), \(entry.state.label), authority \(entry.authorityID)")
+            "\(displayTitle), \(entry.state.label), authority \(entry.authorityID)")
         .accessibilityValue(
             entry.isKnown
                 ? "Canonical Session, \(entry.workEvidence.count) retained Work"
                     + (entry.omittedWorkEvidenceCount > 0
                         ? ", \(entry.omittedWorkEvidenceCount) Work omitted from this page" : "")
                     + (isAttachedHere ? ", attached to this GUI" : ", not attached to this GUI")
-                : "Attention and state unknown")
+                : attachedCatchUpPresentation.map {
+                    "Conversation state not yet verified; attached agent "
+                        + ChatInteractionPresentation.stateLabel($0.commandState)
+                } ?? "Attention and state unknown")
         .help("Agent service: \(entry.authorityID)")
         .accessibilityHint("Opens this chat")
     }

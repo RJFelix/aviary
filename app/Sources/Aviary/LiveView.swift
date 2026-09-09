@@ -285,6 +285,10 @@ struct RunPane: View {
                 if let banner = run.errorBanner {
                     NoticeBanner(level: .danger, title: "Chat needs attention", message: banner)
                         .padding(Design.gutter)
+                } else if run.serviceCommandInFlight {
+                    NoticeBanner(level: .info, title: "Awaiting confirmation",
+                        message: "Waiting for the agent service to confirm receipt. Aviary will not send another copy.")
+                        .padding(Design.gutter)
                 }
                 if let notice = run.commandNotice {
                     NoticeBanner(
@@ -1992,12 +1996,14 @@ private struct ServiceWorkCard: View {
                     if let pending = projection.pendingCommand {
                         Divider().opacity(0.5)
                         Label(
-                            "\(pending.kind.rawValue) is \(pending.state.rawValue); refresh and "
+                            projection.commandInFlight
+                                ? "Waiting for the agent service to confirm this request. No retry is needed."
+                                : "\(pending.kind.rawValue) is \(pending.state.rawValue); refresh and "
                                 + "reconcile explicitly before retrying.",
-                            systemImage: "exclamationmark.triangle"
+                            systemImage: projection.commandInFlight ? "clock" : "exclamationmark.triangle"
                         )
                             .font(.system(size: 10))
-                            .foregroundStyle(Design.warning)
+                            .foregroundStyle(projection.commandInFlight ? Design.accent : Design.warning)
                             .fixedSize(horizontal: false, vertical: true)
                         HStack(spacing: 6) {
                             Button("Refresh") {
@@ -2025,7 +2031,7 @@ private struct ServiceWorkCard: View {
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
                                     .tint(Design.warning)
-                                    .disabled(run.hasExited || run.isEnding)
+                                    .disabled(run.hasExited || run.isEnding || projection.commandInFlight)
                             }
                         }
                     }

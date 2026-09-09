@@ -296,6 +296,10 @@ private func attachedControllerPrefixDigest(
 }
 
 private actor AttachedControllerTestService: WorkServiceClient {
+    var commandGate: AttachedControllerHistoryGate?
+    func setCommandGate(_ gate: AttachedControllerHistoryGate?) { commandGate = gate }
+    var commandReceiptGate: AttachedControllerHistoryGate?
+    func setCommandReceiptGate(_ gate: AttachedControllerHistoryGate?) { commandReceiptGate = gate }
     let fixture: AttachedControllerFixture
     var mode: AttachedControllerServiceMode = .normal
     var artifactDescriptors: [WorkServiceArtifactDescriptor]
@@ -699,6 +703,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
 
     func command(_ request: WorkServiceCommandRequest) async throws -> WorkServiceCommandReceipt {
         commandRequests.append(request)
+        if let commandGate { await commandGate.enter() }
         if mode == .remoteStale {
             throw WorkServiceTransportError.remote(code: .staleCursor, detail: nil)
         }
@@ -761,6 +766,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
             authorization: authorization, outcome: request.kind == .start ? .started : .inputAccepted)
         acceptedCommands[request.command.commandID] = receipt
         commandEffects += 1
+        if let commandReceiptGate { await commandReceiptGate.enter() }
         if loseAcceptedResponsesRemaining > 0 {
             loseAcceptedResponsesRemaining -= 1
             throw AttachedControllerTestError.transport
@@ -1481,6 +1487,92 @@ func testWorkServiceAttachedControllerRetainsIndeterminateCommandUntilExplicitRe
     XCTAssertFalse(awaitingRefresh.needsRecovery)
     XCTAssertTrue((try await controller.refresh()).isCanonical)
     XCTAssertNil(await controller.pendingCommand())
+}
+
+func testWorkServiceAttachedControllerDistinguishesInFlightFromLostResponse() async throws {
+    for fails in [false, true] {
+        let fixture = try AttachedControllerFixture()
+        let service = AttachedControllerTestService(fixture: fixture)
+        let storeURL = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-inflight-intent-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: storeURL) }
+        let store = try WorkServiceAttachedWorkIntentStore(url: storeURL)
+        let controller = try makeAttachedController(fixture: fixture, service: service, intentStore: store)
+        _ = try await controller.refresh()
+        let gate = AttachedControllerHistoryGate()
+        await service.setCommandGate(gate)
+        if fails { await service.failNextCommand() }
+        let task = Task { try await controller.start("saved input", commandID: "gated-input") }
+        await gate.waitUntilEntered()
+        let waiting = try await controller.refresh()
+        XCTAssertTrue(waiting.commandInFlight, "read-only polling must retain the original call's lifetime")
+        XCTAssertEqual(waiting.pendingCommand?.state, .indeterminate,
+                       "the crash-safe durable intent must not claim acceptance")
+        XCTAssertTrue(waiting.isCanonical, "a pending call is not itself source corruption")
+        let reopened = try makeAttachedController(fixture: fixture, service: service, intentStore: store)
+        let restored = await reopened.projection()
+        XCTAssertFalse(restored.commandInFlight, "disk restoration must not invent a live transport call")
+        XCTAssertEqual(restored.pendingCommand?.state, .indeterminate)
+        do {
+            _ = try await controller.retryPendingCommand()
+            XCTFail("a second transport attempt must not race the original in-flight call")
+        } catch WorkServiceAttachedWorkControllerError.pendingCommandExists { }
+        XCTAssertEqual(await service.commandCount(), 1)
+        await gate.release()
+        do {
+            let receipt = try await task.value
+            XCTAssertFalse(fails)
+            XCTAssertEqual(receipt.state, .accepted)
+        } catch WorkServiceAttachedWorkControllerError.transportFailure {
+            XCTAssertTrue(fails)
+        }
+        let settled = await controller.projection()
+        XCTAssertFalse(settled.commandInFlight, "both success and transport failure end the local request lifetime")
+        XCTAssertEqual(settled.pendingCommand?.state, fails ? .indeterminate : .awaitingCanonicalEvidence)
+        _ = try await controller.refresh()
+        XCTAssertEqual(await service.commandCount(), 1, "refresh never replays the request")
+        XCTAssertEqual((await controller.pendingCommand())?.state, fails ? .indeterminate : nil)
+    }
+}
+
+func testWorkServiceAttachedControllerAcceptanceReadCannotOrphanInFlightIntent() async throws {
+    for losesResponse in [false, true] {
+        let fixture = try AttachedControllerFixture()
+        let service = AttachedControllerTestService(fixture: fixture)
+        let storeURL = FileManager.default.temporaryDirectory
+            .appending(path: "aviary-receipt-race-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: storeURL) }
+        let store = try WorkServiceAttachedWorkIntentStore(url: storeURL)
+        let controller = try makeAttachedController(fixture: fixture, service: service, intentStore: store)
+        _ = try await controller.refresh()
+        let gate = AttachedControllerHistoryGate()
+        await service.setCommandReceiptGate(gate)
+        if losesResponse { await service.loseNextAcceptedResponse() }
+        let task = Task { try await controller.start("first input", commandID: "acceptance-before-response") }
+        await gate.waitUntilEntered()
+        let observed = try await controller.refresh()
+        XCTAssertTrue(observed.commandInFlight)
+        XCTAssertEqual(observed.workSnapshot.commands.count, 1, "the acceptance is already visible")
+        XCTAssertNotNil(observed.pendingCommand, "the original response still owns its intent transition")
+        await gate.release()
+        do {
+            let receipt = try await task.value
+            XCTAssertFalse(losesResponse)
+            XCTAssertEqual(receipt.state, .accepted)
+        } catch WorkServiceAttachedWorkControllerError.transportFailure {
+            XCTAssertTrue(losesResponse)
+        }
+        let reconciled = try await controller.refresh()
+        XCTAssertFalse(reconciled.commandInFlight)
+        XCTAssertNil(reconciled.pendingCommand)
+        XCTAssertEqual(await service.commandCount(), 1, "canonical catch-up must not replay the request")
+        await service.setCommandReceiptGate(nil)
+        let second = try await controller.start("second input", commandID: "after-reconciliation")
+        XCTAssertEqual(second.state, .accepted, "no orphaned on-disk intent may block the next input")
+        _ = try await controller.refresh()
+        XCTAssertNil(await controller.pendingCommand())
+        XCTAssertEqual(await service.commandEffectCount(), 2)
+    }
 }
 
 func testWorkServiceAttachedControllerRetriesExactIndeterminateStartThroughRecoveryDescriptor()
@@ -2622,6 +2714,12 @@ func testWorkServiceAttachedControllerResumesMoreThan256PagesFromCheckpointCurso
 }
 
 let casesWorkServiceAttachedWorkController: [Case] = [
+    ("phase3 Work controller acceptance read cannot orphan an in-flight intent", {
+        try await testWorkServiceAttachedControllerAcceptanceReadCannotOrphanInFlightIntent()
+    }),
+    ("phase3 Work controller distinguishes in-flight from lost response", {
+        try await testWorkServiceAttachedControllerDistinguishesInFlightFromLostResponse()
+    }),
     ("phase4b Work controller fetches latest authorized artifact in chunks", {
         try await testWorkServiceAttachedControllerFetchesLatestAuthorizedArtifactInChunks()
     }),

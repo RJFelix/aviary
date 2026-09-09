@@ -23,6 +23,7 @@ public struct ServiceBackedGUIControlPolicy: Hashable, Sendable {
     public let isCanonical: Bool
     public let needsRecovery: Bool
     public let requiresRefresh: Bool
+    public let commandInFlight: Bool
     private var exactUnadmittedStartRecovery = false
 
     public init(
@@ -35,7 +36,8 @@ public struct ServiceBackedGUIControlPolicy: Hashable, Sendable {
         capabilities: Set<WorkServiceCapability>,
         isCanonical: Bool,
         needsRecovery: Bool,
-        requiresRefresh: Bool
+        requiresRefresh: Bool,
+        commandInFlight: Bool = false
     ) {
         self.execution = execution
         self.currentRun = currentRun
@@ -47,6 +49,7 @@ public struct ServiceBackedGUIControlPolicy: Hashable, Sendable {
         self.isCanonical = isCanonical
         self.needsRecovery = needsRecovery
         self.requiresRefresh = requiresRefresh
+        self.commandInFlight = commandInFlight
     }
 
     public init(projection: WorkServiceAttachedWorkProjection) {
@@ -60,11 +63,12 @@ public struct ServiceBackedGUIControlPolicy: Hashable, Sendable {
             capabilities: projection.capabilities,
             isCanonical: projection.isCanonical,
             needsRecovery: projection.needsRecovery,
-            requiresRefresh: projection.requiresRefresh)
+            requiresRefresh: projection.requiresRefresh,
+            commandInFlight: projection.commandInFlight)
         if let pending = projection.pendingCommand {
             // A host may retain a Start reservation before it has a Run. Only the explicit
             // retry of that exact, current request can ask the host to finish admission.
-            exactUnadmittedStartRecovery = projection.isCanonical
+            exactUnadmittedStartRecovery = !projection.commandInFlight && projection.isCanonical
                 && !projection.requiresRefresh
                 && execution == .recoveryRequired
                 && currentRun == nil && currentRunSession == nil && currentRunSessionAttachment == nil
@@ -102,7 +106,7 @@ public struct ServiceBackedGUIControlPolicy: Hashable, Sendable {
     }
 
     private var canMutate: Bool {
-        isCanonical && !needsRecovery && !requiresRefresh
+        isCanonical && !needsRecovery && !requiresRefresh && !commandInFlight
             && hasExactRunOwner && capabilities.contains(.control)
     }
 

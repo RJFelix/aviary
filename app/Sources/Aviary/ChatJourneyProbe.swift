@@ -119,6 +119,55 @@ enum ChatJourneyProbe {
                 && guardedProjection.workSnapshot.activeRun == nil,
             "explicit-retry restore admitted Start during refresh")
 
+        // The durable intent is conservatively uncertain before the transport call returns.
+        // Only this GUI's live request lifetime can distinguish sending from lost confirmation;
+        // reopening must continue to show the latter, never pretend a call is still alive.
+        guard let originalBridge = guarded.serviceBridge else {
+            throw Failure.assertion("guarded service run lost its bridge")
+        }
+        let pending = WorkServiceAttachedWorkPendingCommand(
+            state: .indeterminate, kind: .start, commandID: "presentation-probe",
+            client: client, attachment: first.attachment.attachment,
+            sessionAttachment: first.sessionAttachment,
+            causalWorkCursor: first.workCursor, valueDigest: nil)
+        let presentationDraftStore = try ServiceBackedDraftStore(
+            home: home, key: originalBridge.serviceAttachmentKey)
+        let presentationDraft = try presentationDraftStore.beginHandoff(
+            text: "saved input", kind: .start, commandID: "presentation-probe",
+            expectedGeneration: nil)
+        for inFlight in [true, false] {
+            let projection = WorkServiceAttachedWorkProjection(
+                descriptor: guardedProjection.descriptor,
+                attachment: guardedProjection.attachment,
+                capabilities: guardedProjection.capabilities,
+                workSnapshot: guardedProjection.workSnapshot,
+                sessionSnapshot: guardedProjection.sessionSnapshot,
+                workCursor: guardedProjection.workCursor,
+                sessionCursor: guardedProjection.sessionCursor,
+                workSourceCompleteness: .complete, sessionSourceCompleteness: .complete,
+                connectivity: guardedProjection.connectivity,
+                pendingCommand: pending, commandInFlight: inFlight)
+            let bridge = ServiceBackedRunBridge(
+                controller: originalBridge.controller, projection: projection,
+                history: originalBridge.history,
+                serviceAttachmentKey: originalBridge.serviceAttachmentKey,
+                workspaceLabel: "presentation-probe", modelLabel: nil, thinkingLevel: nil)
+            let run = LiveRun(service: bridge, cwd: home.root.path, title: "presentation-probe",
+                              draftStore: presentationDraftStore, restoredDraft: presentationDraft)
+            run.observeService()
+            try require(run.serviceCommandInFlight == inFlight,
+                        "request lifetime was not mirrored into the actual chat presentation")
+            try require((run.errorBanner == nil) == inFlight,
+                        "sending must not claim failure, and lost confirmation must remain visible")
+            try require((run.draftPersistenceNotice == nil) == inFlight,
+                        "an in-flight handoff is not a draft-storage failure")
+            if inFlight {
+                try require(!bridge.canRetryPendingCommand, "live original request exposed a duplicate retry")
+                try require(!run.acceptsInput && !run.serviceControlsAvailable,
+                            "live original request left mutation controls enabled")
+            }
+        }
+
         // A fresh idle Work proves the control: ordinary reconstruction still admits exactly one
         // Start, and the canonical follow-up refresh resolves its retained marker.
         let latest = try await service.handshake(.init(client: client))
@@ -147,6 +196,35 @@ enum ChatJourneyProbe {
     }
 
     @MainActor private static func run() async throws {
+        // This is the actual rail presentation gate, not a hand-built visual fixture. A
+        // selected exact attachment may preserve a title, never repair canonical ambiguity.
+        let attached = CanonicalWorkspaceRailPresentation.attachedFallback(
+            entryIsKnown: false, entryJoin: .incomplete,
+            attachedServiceBacked: true, attachedProjectionIsCanonical: true,
+            attachedTitle: "Known chat title", attachedCommandState: .idle)
+        try require(attached?.title == "Known chat title" && attached?.commandState == .idle,
+                    "catalog catch-up discarded exact attached chat identity")
+        for join in [CanonicalSessionWorkspaceRailJoin.duplicateSummary, .missingSummary, .exact] {
+            try require(CanonicalWorkspaceRailPresentation.attachedFallback(
+                entryIsKnown: false, entryJoin: join,
+                attachedServiceBacked: true, attachedProjectionIsCanonical: true,
+                attachedTitle: "Known chat title", attachedCommandState: .idle) == nil,
+                "attached presentation hid a non-catch-up catalog condition")
+        }
+        for flags in [(true, true, true), (false, false, true), (false, true, false)] {
+            try require(CanonicalWorkspaceRailPresentation.attachedFallback(
+                entryIsKnown: flags.0, entryJoin: .incomplete,
+                attachedServiceBacked: flags.1, attachedProjectionIsCanonical: flags.2,
+                attachedTitle: "Known chat title", attachedCommandState: .idle) == nil,
+                "attached presentation replaced known state or used an unverified attachment")
+        }
+        for title: String? in [nil, "", "   ", "New run"] {
+            try require(CanonicalWorkspaceRailPresentation.attachedFallback(
+                entryIsKnown: false, entryJoin: .incomplete,
+                attachedServiceBacked: true, attachedProjectionIsCanonical: true,
+                attachedTitle: title, attachedCommandState: .idle) == nil,
+                "ambiguous or placeholder attachment invented a title")
+        }
         let root = FileManager.default.temporaryDirectory
             .appending(path: "aviary-chat-journey-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

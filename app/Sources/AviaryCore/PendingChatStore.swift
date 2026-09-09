@@ -22,6 +22,9 @@ public enum PendingChatFailureKind: String, Codable, CaseIterable, Hashable, Sen
     case workspaceUnavailable
     case providerUnavailable
     case authorizationRequired
+    /// Create was rejected by a stale control cursor before Work admission. The saved prompt
+    /// remains valid and can be retried with a fresh attempt identity.
+    case staleCreate
     case invalidRequest
     case unknown
 }

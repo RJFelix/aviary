@@ -281,6 +281,28 @@ func test_pendingChatStoreAllowsDefinitiveRejectionThenFreshAttempt() throws {
     XCTAssertEqual(preparing.failureKind, nil)
 }
 
+func test_pendingChatStorePersistsStaleCreateClassificationUntilFreshAttempt() throws {
+    let (home, root) = try pendingChatTestHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try PendingChatStore(home: home)
+    let original = try store.create(prompt: "retry unchanged", cwd: "/tmp")
+    let stale = try PendingChat(
+        id: original.id, createdAt: original.createdAt, prompt: original.prompt, cwd: original.cwd,
+        phase: .blocked, failureKind: .staleCreate,
+        attemptCommandID: original.attemptCommandID, startCommandID: original.startCommandID)
+    let blocked = try store.update(stale, expectedGeneration: original.generation)
+    let loaded = try XCTUnwrap(try store.load().rows.first)
+    XCTAssertEqual(loaded.failureKind, .staleCreate)
+    XCTAssertEqual(loaded.prompt, original.prompt)
+
+    let freshAttempt = try PendingChat(
+        id: blocked.id, createdAt: blocked.createdAt, prompt: blocked.prompt, cwd: blocked.cwd,
+        phase: .preparing, attemptCommandID: UUID(), startCommandID: blocked.startCommandID)
+    let preparing = try store.update(freshAttempt, expectedGeneration: blocked.generation)
+    XCTAssertNil(preparing.failureKind)
+    XCTAssertEqual(preparing.prompt, original.prompt)
+}
+
 func test_pendingChatStoreEditsBlockedChatWithoutChangingIdentity() throws {
     let (home, root) = try pendingChatTestHome()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -413,6 +435,9 @@ let casesPendingChatStore: [Case] = [
     }),
     ("pending chat store: rejected attempt can be retried with a new command", {
         try test_pendingChatStoreAllowsDefinitiveRejectionThenFreshAttempt()
+    }),
+    ("pending chat store: stale Create classification persists until retry", {
+        try test_pendingChatStorePersistsStaleCreateClassificationUntilFreshAttempt()
     }),
     ("pending chat store: blocked edits retain identity", {
         try test_pendingChatStoreEditsBlockedChatWithoutChangingIdentity()
