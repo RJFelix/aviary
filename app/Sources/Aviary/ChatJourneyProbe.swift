@@ -267,6 +267,93 @@ enum ChatJourneyProbe {
             AppModel.preferredServiceRestoreIndex(
                 candidates: [guardedKey], preferred: ordinaryKey) == nil,
             "a missing or hidden attachment preference matched another candidate")
+
+        // During cold host replay the canonical Session rail can be available before its live
+        // attachment. The exact saved relationship may provisionally select that one row once
+        // this process has loaded the same durable client, without claiming attachment ownership.
+        let guardedCandidate = AppModel.CanonicalWorkspaceSelectionCandidate(
+            id: "guarded-session", workTargets: [guardedKey.workSession])
+        let ordinaryCandidate = AppModel.CanonicalWorkspaceSelectionCandidate(
+            id: "ordinary-session", workTargets: [ordinaryKey.workSession])
+        try require(
+            AppModel.canonicalWorkspaceSelectionID(
+                candidates: [guardedCandidate, ordinaryCandidate],
+                explicitID: nil, focusedID: nil, preferred: ordinaryKey,
+                ownedKeys: [], localClient: client) == ordinaryCandidate.id,
+            "cold restoration did not provisionally select the exact saved chat")
+        try require(
+            AppModel.canonicalWorkspaceSelectionID(
+                candidates: [guardedCandidate, ordinaryCandidate],
+                explicitID: guardedCandidate.id, focusedID: nil, preferred: ordinaryKey,
+                ownedKeys: [], localClient: client) == guardedCandidate.id,
+            "an explicit rail selection lost to provisional restoration")
+        try require(
+            AppModel.canonicalWorkspaceSelectionID(
+                candidates: [guardedCandidate, ordinaryCandidate],
+                explicitID: nil, focusedID: guardedCandidate.id, preferred: ordinaryKey,
+                ownedKeys: [], localClient: client) == guardedCandidate.id,
+            "an existing focused chat lost to provisional restoration")
+        try require(
+            AppModel.canonicalWorkspaceSelectionID(
+                candidates: [guardedCandidate, ordinaryCandidate],
+                explicitID: nil, focusedID: nil, preferred: ordinaryKey,
+                ownedKeys: [], localClient: client,
+                hasFocusedUnrepresentedRun: true) == nil,
+            "a new focused live chat lost to a historical canonical row")
+        try require(
+            AppModel.canonicalWorkspaceSelectionID(
+                candidates: [guardedCandidate, ordinaryCandidate],
+                explicitID: guardedCandidate.id, focusedID: nil, preferred: ordinaryKey,
+                ownedKeys: [], localClient: client,
+                hasFocusedUnrepresentedRun: true) == guardedCandidate.id,
+            "an explicit canonical selection lost to an unrepresented live focus")
+        try require(
+            AppModel.canonicalWorkspaceSelectionID(
+                candidates: [guardedCandidate],
+                explicitID: nil, focusedID: nil, preferred: ordinaryKey,
+                ownedKeys: [], localClient: client) == nil,
+            "an unrelated canonical row inherited the saved chat selection")
+        let unknownOrdinaryCandidate = AppModel.CanonicalWorkspaceSelectionCandidate(
+            id: "unknown-ordinary-session", workTargets: [ordinaryKey.workSession],
+            isExact: false)
+        try require(
+            AppModel.canonicalWorkspaceSelectionID(
+                candidates: [unknownOrdinaryCandidate],
+                explicitID: nil, focusedID: nil, preferred: ordinaryKey,
+                ownedKeys: [], localClient: client) == nil,
+            "an unknown canonical relationship inherited the saved chat selection")
+        try require(
+            AppModel.canonicalWorkspaceSelectionID(
+                candidates: [ordinaryCandidate],
+                explicitID: nil, focusedID: nil, preferred: ordinaryKey,
+                ownedKeys: [], localClient: ClientRef("foreign-client")) == nil,
+            "a different GUI client inherited the saved chat selection")
+        let duplicateOrdinaryCandidate = AppModel.CanonicalWorkspaceSelectionCandidate(
+            id: "duplicate-ordinary-session", workTargets: [ordinaryKey.workSession])
+        try require(
+            AppModel.canonicalWorkspaceSelectionID(
+                candidates: [ordinaryCandidate, duplicateOrdinaryCandidate],
+                explicitID: nil, focusedID: nil, preferred: ordinaryKey,
+                ownedKeys: [], localClient: client) == nil,
+            "an ambiguous canonical relationship was provisionally selected")
+        try require(
+            AppModel.canonicalWorkspaceRestoringIDs(
+                candidates: [guardedCandidate, ordinaryCandidate],
+                restoringKeys: [ordinaryKey]) == [ordinaryCandidate.id],
+            "restoration presentation marked an unrelated canonical row")
+        try require(
+            AppModel.canonicalWorkspaceRestoringIDs(
+                candidates: [ordinaryCandidate, duplicateOrdinaryCandidate],
+                restoringKeys: [ordinaryKey]).isEmpty,
+            "restoration presentation marked an ambiguous canonical relationship")
+        let multiWorkCandidate = AppModel.CanonicalWorkspaceSelectionCandidate(
+            id: "multi-work-session",
+            workTargets: [guardedKey.workSession, ordinaryKey.workSession])
+        try require(
+            AppModel.canonicalWorkspacePreferredTarget(
+                candidate: multiWorkCandidate, preferred: ordinaryKey,
+                ownedKeys: [], localClient: client) == ordinaryKey.workSession,
+            "a multi-Work Session did not preserve the preferred exact Work relationship")
         let pendingSelection = UUID()
         reopenedLaunch.selectedPendingChatID = pendingSelection
         reopenedLaunch.newChatRequested = true

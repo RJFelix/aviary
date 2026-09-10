@@ -52,7 +52,7 @@ struct CockpitView: View {
 
     private var selectedRun: LiveRun? {
         if let entry = selectedCanonicalEntry {
-            return selectedMatchingRun(for: entry, target: selectedCanonicalWorkTarget)
+            return selectedMatchingRun(for: entry, target: effectiveSelectedCanonicalWorkTarget)
         }
         if let focused = model.focusedRunID,
            let run = unrepresentedRuns.first(where: { $0.id == focused })
@@ -68,18 +68,51 @@ struct CockpitView: View {
         model.canonicalWorkspaceRail.entries
     }
 
+    private var focusedCanonicalEntryID: String? {
+        guard let focused = model.focusedRunID,
+              let entry = canonicalEntries.first(where: { entry in
+                  matchingRuns(for: entry).contains { $0.id == focused }
+              }) else { return nil }
+        return entry.id
+    }
+
+    private var effectiveSelectedCanonicalWorkTarget: WorkSessionKey? {
+        if let selectedCanonicalWorkTarget { return selectedCanonicalWorkTarget }
+        if selectedCanonicalEntryID != nil { return nil }
+        if let focused = model.focusedRunID,
+           let run = ongoingRuns.first(where: { $0.id == focused }),
+           let key = run.serviceAttachmentKey,
+           selectedCanonicalEntry.map({ entryContains(key.workSession, in: $0) }) == true {
+            return key.workSession
+        }
+        guard let entry = selectedCanonicalEntry else { return nil }
+        let candidate = AppModel.CanonicalWorkspaceSelectionCandidate(entry: entry)
+        return AppModel.canonicalWorkspacePreferredTarget(
+            candidate: candidate,
+            preferred: model.preferredServiceAttachmentKey,
+            ownedKeys: model.ownedServiceAttachmentPresentationKeys,
+            localClient: model.localWorkServiceClient)
+    }
+
     private var selectedCanonicalEntry: CanonicalSessionWorkspaceRailEntry? {
         if model.selectedPendingChatID != nil { return nil }
-        if let selectedCanonicalEntryID,
-           let entry = canonicalEntries.first(where: { $0.id == selectedCanonicalEntryID }) {
+        let hasFocusedUnrepresentedRun = model.focusedRunID.map { focused in
+            ongoingRuns.contains { $0.id == focused } && focusedCanonicalEntryID == nil
+        } ?? false
+        let candidates = canonicalEntries.map {
+            AppModel.CanonicalWorkspaceSelectionCandidate(entry: $0)
+        }
+        if let selectedID = AppModel.canonicalWorkspaceSelectionID(
+            candidates: candidates, explicitID: selectedCanonicalEntryID,
+            focusedID: focusedCanonicalEntryID,
+            preferred: model.preferredServiceAttachmentKey,
+            ownedKeys: model.ownedServiceAttachmentPresentationKeys,
+            localClient: model.localWorkServiceClient,
+            hasFocusedUnrepresentedRun: hasFocusedUnrepresentedRun),
+           let entry = canonicalEntries.first(where: { $0.id == selectedID }) {
             return entry
         }
-        if let focused = model.focusedRunID,
-           ongoingRuns.contains(where: { $0.id == focused }) {
-            return canonicalEntries.first(where: { entry in
-                matchingRuns(for: entry).contains { $0.id == focused }
-            })
-        }
+        if hasFocusedUnrepresentedRun { return nil }
         if let firstAttached = canonicalEntries.first(where: { !matchingRuns(for: $0).isEmpty }) {
             return firstAttached
         }
@@ -95,7 +128,8 @@ struct CockpitView: View {
     }
 
     private var runRail: some View {
-        ScrollView {
+        let restoringIDs = model.serviceRestoringCanonicalEntryIDs()
+        return ScrollView {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("CHATS")
@@ -149,7 +183,9 @@ struct CockpitView: View {
 
                 if !needsAttentionEntries.isEmpty {
                     railHeading("NEEDS YOU")
-                    ForEach(needsAttentionEntries) { entry in workspaceCard(entry) }
+                    ForEach(needsAttentionEntries) { entry in
+                        workspaceCard(entry, isRestoring: restoringIDs.contains(entry.id))
+                    }
                 }
 
                 if !unrepresentedRuns.isEmpty {
@@ -167,17 +203,23 @@ struct CockpitView: View {
 
                 if !workingEntries.isEmpty {
                     railHeading("WORKING")
-                    ForEach(workingEntries) { entry in workspaceCard(entry) }
+                    ForEach(workingEntries) { entry in
+                        workspaceCard(entry, isRestoring: restoringIDs.contains(entry.id))
+                    }
                 }
 
                 if !reviewEntries.isEmpty {
                     railHeading("READY FOR REVIEW")
-                    ForEach(reviewEntries) { entry in workspaceCard(entry) }
+                    ForEach(reviewEntries) { entry in
+                        workspaceCard(entry, isRestoring: restoringIDs.contains(entry.id))
+                    }
                 }
 
                 if !otherEntries.isEmpty {
                     railHeading("RECENT CONVERSATIONS")
-                    ForEach(otherEntries) { entry in workspaceCard(entry) }
+                    ForEach(otherEntries) { entry in
+                        workspaceCard(entry, isRestoring: restoringIDs.contains(entry.id))
+                    }
                 }
 
                 if model.canonicalWorkspaceRail.omittedEntryCount > 0 {
@@ -210,8 +252,8 @@ struct CockpitView: View {
             CanonicalSessionWorkspacePane(
                 entry: entry,
                 attachedRun: selectedMatchingRun(
-                    for: entry, target: selectedCanonicalWorkTarget),
-                selectedWorkTarget: selectedCanonicalWorkTarget
+                    for: entry, target: effectiveSelectedCanonicalWorkTarget),
+                selectedWorkTarget: effectiveSelectedCanonicalWorkTarget
             ) { target in
                 selectedCanonicalWorkTarget = target
             }
@@ -221,7 +263,7 @@ struct CockpitView: View {
         } else if let entry = selectedCanonicalEntry {
             CanonicalSessionWorkspacePane(
                 entry: entry, attachedRun: nil,
-                selectedWorkTarget: selectedCanonicalWorkTarget
+                selectedWorkTarget: effectiveSelectedCanonicalWorkTarget
             ) { target in
                 selectedCanonicalWorkTarget = target
             }
@@ -293,12 +335,15 @@ struct CockpitView: View {
     }
 
     @ViewBuilder
-    private func workspaceCard(_ entry: CanonicalSessionWorkspaceRailEntry) -> some View {
+    private func workspaceCard(
+        _ entry: CanonicalSessionWorkspaceRailEntry, isRestoring: Bool
+    ) -> some View {
         let attachedRuns = matchingRuns(for: entry)
         CanonicalWorkspaceRailCard(
             entry: entry,
             attachedRun: selectedMatchingRun(for: entry),
             isAttachedHere: !attachedRuns.isEmpty,
+            isRestoringHere: isRestoring,
             selected: !composingNewSession && selectedCanonicalEntry?.id == entry.id
         ) {
             selectedCanonicalEntryID = entry.id
@@ -451,6 +496,7 @@ private struct CanonicalWorkspaceRailCard: View {
     let entry: CanonicalSessionWorkspaceRailEntry
     let attachedRun: LiveRun?
     let isAttachedHere: Bool
+    let isRestoringHere: Bool
     let selected: Bool
     let action: () -> Void
 
@@ -490,6 +536,9 @@ private struct CanonicalWorkspaceRailCard: View {
                         .foregroundStyle(entry.state.tint)
                     if isAttachedHere {
                         Text("open here")
+                            .foregroundStyle(Design.accent)
+                    } else if isRestoringHere {
+                        Text("Restoring chat…")
                             .foregroundStyle(Design.accent)
                     }
                     if let attachedCatchUpPresentation {
@@ -533,7 +582,9 @@ private struct CanonicalWorkspaceRailCard: View {
                 ? "Canonical Session, \(entry.workEvidence.count) retained Work"
                     + (entry.omittedWorkEvidenceCount > 0
                         ? ", \(entry.omittedWorkEvidenceCount) Work omitted from this page" : "")
-                    + (isAttachedHere ? ", attached to this GUI" : ", not attached to this GUI")
+                    + (isAttachedHere ? ", attached to this GUI"
+                        : isRestoringHere ? ", restoring this GUI attachment"
+                        : ", not attached to this GUI")
                 : attachedCatchUpPresentation.map {
                     "Conversation state not yet verified; attached agent "
                         + ChatInteractionPresentation.stateLabel($0.commandState)

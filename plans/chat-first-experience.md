@@ -575,3 +575,47 @@ turn without another model response. No files were changed by these agent turns.
 gaps are under correction: native `end_run`/`queue_follow_up` command kinds were not recognized by
 the acknowledgement policy, and a settled cancellation currently leaves only an Idle/Ready state
 without an explicit stopped-turn marker.
+
+Checkpoint `5160ffe` closes these presentation gaps. The full macOS suite passes **1,083 cases /
+16,198 assertions in 503.83s**; focused native-notice and stop-result policies pass 10/49 and 6/26.
+The production AppModel probe passes. Release GUI/helper builds pass in 184.98s / 1.98s with strict
+signature verification. In the signed app, separate transcript links opened saved reviews 1 and 2,
+while the header shortcut opened latest review 3; the older diff was verified quantity-only.
+
+GUI-only relaunch retained the idle runtime and displayed the canonically derived “Stop request
+delivered — Ready for your next message.” Explicit End then recorded acceptance/delivery/Run finish
+at Work sequences 100/101/102, released the runtime, and retired both notices without manual
+refresh. The local helper was subsequently replaced after GUI shutdown and verified child-process
+quiescence; SIGTERM did not exit it within the observed interval, so the exact helper PID was
+terminated forcibly. The fresh signed helper served the same canonical selected chat and history.
+This is not a graceful-shutdown success claim.
+
+The follow-up semantic-cache audit found that old disposable Work and GUI reducer snapshots can
+retain an unrecognized `end_run` kind indefinitely without rereading journal bytes. Versioned
+invalidation/replay is shipped in `b58a83a`: Work exact state/map and bounded head v3, attached GUI
+checkpoint v6. Only recognized obsolete versions are discarded; malformed current roots remain
+fail-closed. Focused obsolete-Work/GUI tests pass 1/11 and 1/7, including unchanged journal bytes
+and canonical zero-based replay. The full macOS suite passes **1,085 cases / 16,216 assertions in
+488.12s**. Release GUI/helper builds pass in 166.26s / 1.92s, followed by a stamped incremental
+bundle and strict signature verification. No original journal migration is needed.
+
+The fresh signed helper served the older saved review's exact quantity-only diff. GUI-only
+relaunch subsequently restored the selected chat without navigation; the helper PID remained
+unchanged and no new input was submitted. Initial cold replay exposed a provisional-selection
+gap: before attachment reconstruction finished, the canonical rail selected the first historical
+card instead of the remembered attachment and described restoring cards as not attached. The
+View action did not repair the whole catalog, whose asynchronous restoration was completing
+independently.
+
+The final presentation correction selects the uniquely exact remembered relationship once the
+durable local client is known, without claiming attachment or enabling commands. Explicit rail
+selection and focused live chats win, including newly focused chats whose canonical row has not
+arrived. Multi-Work Sessions retain the exact preferred Work target. Catalog-proven restoration
+candidates show “Restoring chat…”; overlapping operations use refcounts, and the rail computes
+the affected-ID set once per render. No restoring claim is made during the catalog fetch itself.
+The actual AppModel journey probe passes in both debug and signed release, with wrong-client,
+unknown, ambiguous, unrelated, multi-Work, and focus-precedence cases. Final GUI/helper release
+builds pass in 42.41s / 0.09s with strict signature verification. The 1,085-case core receipt above
+predates only this three-file GUI/probe correction; Core sources are unchanged.
+The next architecture proposal is `phase5-agent-handle-pilot.md`, explicitly awaiting design
+approval rather than authorizing a scheduler or changing child lifetime in this UI batch.

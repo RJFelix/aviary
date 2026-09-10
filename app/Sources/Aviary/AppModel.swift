@@ -337,6 +337,29 @@ final class AppModel {
     private var serviceRefreshSchedule = ServiceBackedRefreshSchedulingPolicy.State()
     private let presentationDefaults: UserDefaults
     private(set) var preferredServiceAttachmentKey: ServiceAttachmentKey?
+    /// Exact owned attachments whose catalog rows are currently being reconstructed. This is
+    /// presentation state only; it never authorizes a second restoration or a Work mutation.
+    private var restoringServiceAttachmentCounts: [ServiceAttachmentKey: Int] = [:]
+    var restoringServiceAttachmentKeys: Set<ServiceAttachmentKey> {
+        Set(restoringServiceAttachmentCounts.keys)
+    }
+
+    private func beginRestoringServiceAttachments(_ keys: Set<ServiceAttachmentKey>) {
+        for key in keys {
+            restoringServiceAttachmentCounts[key, default: 0] += 1
+        }
+    }
+
+    private func finishRestoringServiceAttachments(_ keys: Set<ServiceAttachmentKey>) {
+        for key in keys {
+            guard let count = restoringServiceAttachmentCounts[key] else { continue }
+            if count <= 1 {
+                restoringServiceAttachmentCounts.removeValue(forKey: key)
+            } else {
+                restoringServiceAttachmentCounts[key] = count - 1
+            }
+        }
+    }
     private var serviceCreateInFlight = false
     /// Process-level service work that can publish or mutate a GUI attachment. Shutdown closes
     /// admission and drains this set before taking its final `workRuns` snapshot, so an adoption
@@ -632,6 +655,100 @@ final class AppModel {
     ) -> Int? {
         guard let preferred else { return nil }
         return candidates.firstIndex { $0 == preferred }
+    }
+
+    struct CanonicalWorkspaceSelectionCandidate: Hashable {
+        let id: String
+        let workTargets: Set<WorkSessionKey>
+        let isExact: Bool
+
+        init(entry: CanonicalSessionWorkspaceRailEntry) {
+            id = entry.id
+            workTargets = Set(entry.workEvidence.compactMap {
+                WorkSessionKey(
+                    work: $0.work, session: entry.session,
+                    sessionJournal: entry.sessionJournal,
+                    sessionAttachment: $0.attachment)
+            })
+            isExact = entry.isKnown && entry.join == .exact
+        }
+
+        init(id: String, workTargets: Set<WorkSessionKey>, isExact: Bool = true) {
+            self.id = id
+            self.workTargets = workTargets
+            self.isExact = isExact
+        }
+    }
+
+    /// Resolve only presentation selection. Once this process has loaded the saved durable
+    /// client, its complete attachment key may provisionally select one uniquely exact canonical
+    /// Session/Work relationship while the host catalog is still replaying. This does not claim
+    /// the attachment is open or restoring.
+    static func canonicalWorkspaceSelectionID(
+        candidates: [CanonicalWorkspaceSelectionCandidate],
+        explicitID: String?, focusedID: String?,
+        preferred: ServiceAttachmentKey?, ownedKeys: Set<ServiceAttachmentKey>,
+        localClient: ClientRef?, hasFocusedUnrepresentedRun: Bool = false
+    ) -> String? {
+        if let explicitID, candidates.contains(where: { $0.id == explicitID }) {
+            return explicitID
+        }
+        // A newly focused live chat may precede its canonical rail row. Returning no canonical
+        // selection keeps that live pane visible rather than selecting an older conversation.
+        if hasFocusedUnrepresentedRun { return nil }
+        if let focusedID, candidates.contains(where: { $0.id == focusedID }) {
+            return focusedID
+        }
+        guard let preferred,
+              ownedKeys.contains(preferred) || localClient == preferred.client else { return nil }
+        let matches = candidates.filter {
+            $0.isExact && $0.workTargets.contains(preferred.workSession)
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0].id
+    }
+
+    /// Keep the exact preferred Work relationship when one canonical Session row represents
+    /// multiple Works. This is presentation-only and never implies that the client attachment
+    /// has finished restoring.
+    static func canonicalWorkspacePreferredTarget(
+        candidate: CanonicalWorkspaceSelectionCandidate,
+        preferred: ServiceAttachmentKey?, ownedKeys: Set<ServiceAttachmentKey>,
+        localClient: ClientRef?
+    ) -> WorkSessionKey? {
+        guard candidate.isExact, let preferred,
+              ownedKeys.contains(preferred) || localClient == preferred.client,
+              candidate.workTargets.contains(preferred.workSession) else { return nil }
+        return preferred.workSession
+    }
+
+    static func canonicalWorkspaceRestoringIDs(
+        candidates: [CanonicalWorkspaceSelectionCandidate],
+        restoringKeys: Set<ServiceAttachmentKey>
+    ) -> Set<String> {
+        var result: Set<String> = []
+        for key in restoringKeys {
+            let matches = candidates.filter {
+                $0.isExact && $0.workTargets.contains(key.workSession)
+            }
+            if matches.count == 1 {
+                result.insert(matches[0].id)
+            }
+        }
+        return result
+    }
+
+    var ownedServiceAttachmentPresentationKeys: Set<ServiceAttachmentKey> {
+        restoringServiceAttachmentKeys.union(
+            workRuns.compactMap(\.serviceAttachmentKey))
+    }
+
+    func serviceRestoringCanonicalEntryIDs() -> Set<String> {
+        let candidates = canonicalWorkspaceRail.entries.map(
+            CanonicalWorkspaceSelectionCandidate.init(entry:))
+        return Self.canonicalWorkspaceRestoringIDs(
+            candidates: candidates,
+            restoringKeys: restoringServiceAttachmentKeys)
     }
 
     private static func preferredServiceAttachmentDefaultsKey(home: AgentHome) -> String {
@@ -932,6 +1049,16 @@ final class AppModel {
                 savePreferredServiceAttachment(nil)
             }
         }
+        let representedKeys = Set(workRuns.compactMap(\.serviceAttachmentKey))
+        let restoringKeys = Set<ServiceAttachmentKey>(restorationCandidates.compactMap { candidate in
+            let (descriptor, attachment) = candidate
+            guard let key = ServiceAttachmentKey(work: descriptor.work, attachment: attachment),
+                  !hiddenServiceAttachmentKeys.contains(key),
+                  !representedKeys.contains(key) else { return nil }
+            return key
+        })
+        beginRestoringServiceAttachments(restoringKeys)
+        defer { finishRestoringServiceAttachments(restoringKeys) }
         for (descriptor, attachment) in restorationCandidates {
             // Terminal Work remains available from Sessions/catalog and through the explicit
             // Attach action below, but relaunch should not flood Live with completed history.
