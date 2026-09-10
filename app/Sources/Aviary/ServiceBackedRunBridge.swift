@@ -169,36 +169,44 @@ final class ServiceBackedRunBridge {
         inputDeliveryProjection.unresolvedAcceptedCommands
     }
 
-    /// The newest repository-review descriptor in the current authenticated Work projection.
-    /// Artifact publication order is the only ordering contract available here; keeping the
-    /// last exact media-type match makes the selection deterministic without inventing a clock.
+    var repositoryReviewHistory: WorkServiceRepositoryReviewHistory {
+        WorkServiceRepositoryReviewHistory(
+            workSession: serviceAttachmentKey.workSession,
+            descriptors: projection.descriptor.artifacts,
+            messages: visibleMessages,
+            artifactIndexComplete: projection.isCanonical
+                && projection.capabilities.contains(.inspectArtifacts)
+                && !projection.descriptor.omissions.contains {
+                ["artifacts", "artifact_index", "artifact_identity_scope"].contains($0.category)
+            })
+    }
+
+    /// Publication order is recorded order, not a fabricated observation time.
     var latestRepositoryReviewDescriptor: WorkServiceArtifactDescriptor? {
-        guard !projection.descriptor.omissions.contains(where: {
-            ["artifacts", "artifact_index", "artifact_identity_scope"].contains($0.category)
-        }) else { return nil }
-        return projection.descriptor.artifacts.last {
-            $0.mediaType == ObservedRepositoryReviewFormat.mediaType
-        }
+        let history = repositoryReviewHistory
+        return history.sourceComplete ? history.rows.last?.descriptor : nil
     }
 
     /// Resolve and parse the selected review only after a person explicitly asks to load it.
     /// ``WorkServiceAttachedWorkController`` revalidates the descriptor, body reference, fence,
     /// byte count, and digest during the read. A changed identity is never returned as stale
     /// content.
-    func loadLatestRepositoryReview(
+    func loadRepositoryReview(
         expectedDescriptor: WorkServiceArtifactDescriptor,
         maxTotalBytes: Int = ObservedRepositoryReviewLimits.default.totalArtifactBytes
     ) async -> Result<ObservedRepositoryReview, RepositoryReviewLoadError> {
-        guard let selected = latestRepositoryReviewDescriptor,
-              selected == expectedDescriptor else {
+        let selected = expectedDescriptor
+        guard repositoryReviewHistory.sourceComplete,
+              repositoryReviewHistory.rows.contains(where: { $0.descriptor == selected }) else {
             return .failure(.unavailable)
         }
         do {
             let fetched = try await controller.fetchArtifactBody(
-                mediaType: ObservedRepositoryReviewFormat.mediaType,
+                descriptor: selected,
                 maxTotalBytes: maxTotalBytes)
             guard fetched.descriptor == selected,
-                  latestRepositoryReviewDescriptor == selected else {
+                  repositoryReviewHistory.sourceComplete,
+                  repositoryReviewHistory.rows.contains(where: { $0.descriptor == selected }) else {
                 return .failure(.unavailable)
             }
             guard fetched.data.count <= maxTotalBytes else {
@@ -222,7 +230,9 @@ final class ServiceBackedRunBridge {
             case .incomplete:
                 // If the selected descriptor is still present, the canonical projection was
                 // changing or incomplete during the read; do not present the partial result.
-                return .failure(latestRepositoryReviewDescriptor == selected ? .stale : .unavailable)
+                return .failure(repositoryReviewHistory.rows.contains(where: {
+                    $0.descriptor == selected
+                }) ? .stale : .unavailable)
             case .omitted, .notFound, .malformed, .capabilityDenied, .invalidOptions:
                 return .failure(.unavailable)
             }

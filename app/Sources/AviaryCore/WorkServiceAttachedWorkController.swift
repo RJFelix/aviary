@@ -385,6 +385,124 @@ public struct WorkServiceFetchedArtifact: Hashable, Sendable {
     public var mediaType: String? { descriptor.mediaType }
 }
 
+/// One metadata-only repository-review history row. The body is intentionally not retained here;
+/// callers must select this exact descriptor and fetch its body on demand.
+public struct WorkServiceRepositoryReviewHistoryRow: Codable, Hashable, Sendable {
+    public let descriptor: WorkServiceArtifactDescriptor
+    public let transcriptSourceEvents: [EventRef]
+    public let omittedTranscriptSourceEventCount: Int
+
+    public init(
+        descriptor: WorkServiceArtifactDescriptor,
+        transcriptSourceEvents: [EventRef] = [],
+        omittedTranscriptSourceEventCount: Int = 0
+    ) {
+        self.descriptor = descriptor
+        self.transcriptSourceEvents = transcriptSourceEvents
+        self.omittedTranscriptSourceEventCount = max(0, omittedTranscriptSourceEventCount)
+    }
+}
+
+/// A bounded, publication-ordered list of saved repository-review descriptors for one exact
+/// Work/Session attachment. This is a metadata projection; review bodies are never loaded here.
+public struct WorkServiceRepositoryReviewHistory: Codable, Hashable, Sendable {
+    public static let maximumRowCount = WorkServiceBounds.maxArtifactsPerWork
+    public static let maximumTranscriptSourceEventsPerRow = 32
+
+    public let workSession: WorkSessionKey
+    public let rows: [WorkServiceRepositoryReviewHistoryRow]
+    public let omittedRowCount: Int
+    public let sourceComplete: Bool
+
+    public var isAvailable: Bool { sourceComplete }
+
+    public init(
+        workSession: WorkSessionKey,
+        descriptors: [WorkServiceArtifactDescriptor],
+        messages: [SessionMessageSnapshot],
+        artifactIndexComplete: Bool,
+        maxRows: Int = Self.maximumRowCount
+    ) {
+        self.workSession = workSession
+        guard artifactIndexComplete else {
+            self.rows = []
+            self.omittedRowCount = 0
+            self.sourceComplete = false
+            return
+        }
+
+        // Other Sessions/attachments may legitimately publish reviews on the same Work. They are
+        // not corruption for this history; only descriptors carrying this exact relationship are
+        // candidates for the current list.
+        let candidates = descriptors.filter {
+            $0.mediaType == ObservedRepositoryReviewFormat.mediaType
+                && $0.work == workSession.work
+                && $0.session == workSession.session
+                && $0.sessionAttachment == workSession.sessionAttachment
+        }
+        let valid = candidates.filter {
+            Self.isReviewDescriptor($0, for: workSession)
+        }
+        let invalidCount = candidates.count - valid.count
+        guard Set(valid.map(\.artifactID)).count == valid.count else {
+            self.rows = []
+            self.omittedRowCount = valid.count
+            self.sourceComplete = false
+            return
+        }
+        let limit = min(max(0, maxRows), Self.maximumRowCount)
+        let retained = Array(valid.suffix(limit))
+        self.omittedRowCount = invalidCount + valid.count - retained.count
+        self.rows = retained.map { descriptor in
+            var seenSourceEvents: Set<EventRef> = []
+            let matches = messages.compactMap { message -> EventRef? in
+                guard message.role == "assistant" || message.role == "model",
+                      let descriptorTurn = descriptor.turn,
+                      let messageTurn = message.turn,
+                      message.run == descriptor.run,
+                      messageTurn == descriptorTurn,
+                      message.sessionAttachment == descriptor.sessionAttachment,
+                      let source = message.sourceEvent,
+                      source.journal == workSession.sessionJournal else { return nil }
+                if let cursor = message.sourceCursor,
+                   cursor.journal != source.journal
+                       || cursor.eventID != source.eventID
+                       || cursor.sequence <= 0 {
+                    return nil
+                }
+                guard seenSourceEvents.insert(source).inserted else { return nil }
+                return source
+            }
+            let bounded = Array(matches.prefix(Self.maximumTranscriptSourceEventsPerRow))
+            return WorkServiceRepositoryReviewHistoryRow(
+                descriptor: descriptor,
+                transcriptSourceEvents: bounded,
+                omittedTranscriptSourceEventCount: matches.count - bounded.count)
+        }
+        // A presentation cap is explicit in omittedRowCount, but does not make the retained
+        // metadata unavailable. Source completeness only describes whether the artifact index was
+        // complete and every retained review descriptor passed the exact identity filter.
+        self.sourceComplete = invalidCount == 0
+    }
+
+    private static func isReviewDescriptor(
+        _ descriptor: WorkServiceArtifactDescriptor,
+        for key: WorkSessionKey
+    ) -> Bool {
+        guard descriptor.mediaType == ObservedRepositoryReviewFormat.mediaType,
+              descriptor.work == key.work,
+              descriptor.session == key.session,
+              descriptor.sessionAttachment == key.sessionAttachment,
+              descriptor.sourceEvent.journal.owner == .work(key.work),
+              descriptor.sourceEvent.journal.authority.authorityID == key.work.workHostID,
+              descriptor.turn != nil,
+              descriptor.action != nil,
+              let cause = descriptor.causedByEventID,
+              cause.journal == descriptor.sourceEvent.journal else { return false }
+        return true
+    }
+}
+
 /// Deliberately coarse, local-only outcomes for an on-demand artifact read.  Remote diagnostics
 /// are never surfaced here: a caller gets a useful distinction without receiving host paths,
 /// storage details, or untrusted error text.
@@ -774,27 +892,50 @@ public actor WorkServiceAttachedWorkController {
     }
 
     /// Fetch the newest descriptor in the current bounded projection whose media type exactly
-    /// matches `mediaType`, then resolve its retained body in bounded chunks.  The descriptor
+    /// matches `mediaType`, then resolve its retained body in bounded chunks. The descriptor
     /// order is the host's publication order. Selection requires a complete artifact index;
     /// an omitted window cannot prove that a matching retained row is the newest.
     public func fetchArtifactBody(
         mediaType: String,
         maxTotalBytes: Int = 16 * 1024 * 1024
     ) async throws -> WorkServiceFetchedArtifact {
-        guard !mediaType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              mediaType.utf8.count <= WorkServiceBounds.maxDiagnosticCharacters,
-              mediaType.utf8.allSatisfy({ $0 >= 0x20 && $0 != 0x7f }),
-              mediaType.unicodeScalars.allSatisfy({
-                  $0.value != 0x2028 && $0.value != 0x2029
-              }),
-              maxTotalBytes > 0,
-              maxTotalBytes <= WorkServiceAttachedWorkControllerBounds.maxArtifactBodyBytes else {
-            throw WorkServiceAttachedArtifactLoadError.invalidOptions
-        }
+        try Self.validateArtifactFetchOptions(mediaType: mediaType, maxTotalBytes: maxTotalBytes)
+        let selected = try selectLatestArtifact(mediaType: mediaType)
+        return try await fetchArtifactBody(selected: selected, maxTotalBytes: maxTotalBytes)
+    }
 
-        let fence = try currentArtifactProjectionFence()
-        // The wire contract does not promise whether an omitted window retained its newest or
-        // oldest rows. A retained media match therefore cannot establish the latest review.
+    /// Fetch one exact descriptor from the current authenticated projection. This is used for
+    /// older turn-linked reviews; unlike the media-type convenience overload it never selects by
+    /// publication order.
+    public func fetchArtifactBody(
+        descriptor requested: WorkServiceArtifactDescriptor,
+        maxTotalBytes: Int = 16 * 1024 * 1024
+    ) async throws -> WorkServiceFetchedArtifact {
+        try Self.validateArtifactFetchOptions(
+            mediaType: requested.mediaType, maxTotalBytes: maxTotalBytes)
+        let selected = try selectExactArtifact(requested)
+        return try await fetchArtifactBody(selected: selected, maxTotalBytes: maxTotalBytes)
+    }
+
+    /// Return a metadata-only, publication-ordered list of repository reviews for this exact
+    /// Work/Session attachment. Bodies are loaded only through an explicit descriptor fetch.
+    public func repositoryReviewHistory(
+        maxRows: Int = WorkServiceRepositoryReviewHistory.maximumRowCount
+    ) -> WorkServiceRepositoryReviewHistory {
+        let currentProjection = projection()
+        return WorkServiceRepositoryReviewHistory(
+            workSession: serviceAttachmentKey.workSession,
+            descriptors: descriptorStorage.artifacts,
+            messages: historyStorage.messages,
+            artifactIndexComplete: currentProjection.isCanonical
+                && currentProjection.capabilities.contains(.inspectArtifacts)
+                && !descriptorStorage.omissions.contains(where: Self.isArtifactIndexOmission),
+            maxRows: maxRows)
+    }
+
+    private func selectLatestArtifact(
+        mediaType: String
+    ) throws -> WorkServiceArtifactDescriptor {
         guard !descriptorStorage.omissions.contains(where: Self.isArtifactIndexOmission) else {
             throw WorkServiceAttachedArtifactLoadError.omitted
         }
@@ -803,6 +944,35 @@ public actor WorkServiceAttachedWorkController {
         }) else {
             throw WorkServiceAttachedArtifactLoadError.notFound
         }
+        return selected
+    }
+
+    private func selectExactArtifact(
+        _ requested: WorkServiceArtifactDescriptor
+    ) throws -> WorkServiceArtifactDescriptor {
+        guard !descriptorStorage.omissions.contains(where: Self.isArtifactIndexOmission) else {
+            throw WorkServiceAttachedArtifactLoadError.omitted
+        }
+        guard Self.validArtifactProvenance(requested, work: work, journal: journal),
+              requested.session == session,
+              requested.sessionAttachment == sessionAttachment else {
+            throw WorkServiceAttachedArtifactLoadError.malformed
+        }
+        let sameID = descriptorStorage.artifacts.filter {
+            $0.artifactID == requested.artifactID
+        }
+        guard sameID.count == 1, sameID[0] == requested else {
+            if sameID.isEmpty { throw WorkServiceAttachedArtifactLoadError.notFound }
+            throw WorkServiceAttachedArtifactLoadError.malformed
+        }
+        return sameID[0]
+    }
+
+    private func fetchArtifactBody(
+        selected: WorkServiceArtifactDescriptor,
+        maxTotalBytes: Int
+    ) async throws -> WorkServiceFetchedArtifact {
+        let fence = try currentArtifactProjectionFence()
         guard Self.validArtifactProvenance(
             selected, work: work, journal: journal) else {
             throw WorkServiceAttachedArtifactLoadError.malformed
@@ -3483,6 +3653,25 @@ public actor WorkServiceAttachedWorkController {
         let hex = digest.dropFirst("sha256:".count)
         guard hex.count == 64 else { return false }
         return hex.allSatisfy { $0.isNumber || ("a"..."f").contains($0) }
+    }
+
+    private static func validateArtifactFetchOptions(
+        mediaType: String?, maxTotalBytes: Int
+    ) throws {
+        if let mediaType {
+            guard !mediaType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  mediaType.utf8.count <= WorkServiceBounds.maxDiagnosticCharacters,
+                  mediaType.utf8.allSatisfy({ $0 >= 0x20 && $0 != 0x7f }),
+                  mediaType.unicodeScalars.allSatisfy({
+                      $0.value != 0x2028 && $0.value != 0x2029
+                  }) else {
+                throw WorkServiceAttachedArtifactLoadError.invalidOptions
+            }
+        }
+        guard maxTotalBytes > 0,
+              maxTotalBytes <= WorkServiceAttachedWorkControllerBounds.maxArtifactBodyBytes else {
+            throw WorkServiceAttachedArtifactLoadError.invalidOptions
+        }
     }
 
     private static func validArtifactProvenance(

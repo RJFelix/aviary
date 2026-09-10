@@ -601,6 +601,16 @@ final class AppModel {
         return runs.first { $0.id == focusedRunID } ?? runs.first
     }
 
+    /// Pin the first background-restored run as the initial presentation choice. Cockpit's
+    /// canonical rows can reorder as later attachments arrive, so leaving focus nil would make
+    /// its implicit `firstAttached` fallback switch the visible composer during startup. A
+    /// nonnil focus represents an existing presentation choice and is never replaced here.
+    static func focusAfterBackgroundServiceRestore(
+        current: UUID?, admitted: UUID
+    ) -> UUID {
+        current ?? admitted
+    }
+
     // MARK: Lifecycle
 
     /// True when this process is a throwaway window for looking at one screen.
@@ -1124,6 +1134,9 @@ final class AppModel {
             if focus {
                 focusedRunID = run.id
                 section = destination
+            } else {
+                focusedRunID = Self.focusAfterBackgroundServiceRestore(
+                    current: focusedRunID, admitted: run.id)
             }
             run.observeService()
             // A Create may have been durably accepted just before the previous GUI disappeared.
@@ -4225,15 +4238,22 @@ final class LiveRun: Identifiable {
     private(set) var serviceAttachmentKey: ServiceAttachmentKey?
     var serviceProjection: WorkServiceAttachedWorkProjection? { serviceBridge?.projection }
     private(set) var serviceCommandInFlight = false
-    /// The current descriptor is presentation metadata only. Body bytes are not fetched until
-    /// the Review changes affordance explicitly opens the review sheet and the person requests
-    /// a load there. It is mirrored from the bridge so an open review sheet observes canonical
-    /// A-to-B selection changes instead of retaining the value read at presentation time.
+    /// Only descriptor metadata is mirrored; review bodies require an explicit load.
     private(set) var serviceReviewDescriptor: WorkServiceArtifactDescriptor? = nil
+    private(set) var serviceReviewHistory: WorkServiceRepositoryReviewHistory?
+    var serviceReviewsByTranscriptID: [String: WorkServiceArtifactDescriptor] {
+        guard let history = serviceReviewHistory, history.sourceComplete else { return [:] }
+        var result: [String: WorkServiceArtifactDescriptor] = [:]
+        for row in history.rows {
+            for source in row.transcriptSourceEvents {
+                result["canonical:\(history.workSession.session.sessionID):\(source.eventID)"] = row.descriptor
+            }
+        }
+        return result
+    }
     var canLoadServiceRepositoryReview: Bool {
-        guard let descriptor = serviceReviewDescriptor,
-              descriptor.available,
-              descriptor.bodyReference != nil else { return false }
+        guard let history = serviceReviewHistory, history.sourceComplete,
+              !history.rows.isEmpty else { return false }
         return serviceProjection?.capabilities.contains(.inspectArtifacts) == true
     }
 
@@ -4242,7 +4262,7 @@ final class LiveRun: Identifiable {
     ) async
         -> Result<ObservedRepositoryReview, RepositoryReviewLoadError> {
         guard let serviceBridge else { return .failure(.unavailable) }
-        return await serviceBridge.loadLatestRepositoryReview(expectedDescriptor: expectedDescriptor)
+        return await serviceBridge.loadRepositoryReview(expectedDescriptor: expectedDescriptor)
     }
 
     var serviceActivities: [WorkActionSnapshot] { serviceBridge?.activities ?? [] }
@@ -4426,6 +4446,7 @@ final class LiveRun: Identifiable {
         self.serviceBridge = bridge
         self.serviceAttachmentKey = bridge.serviceAttachmentKey
         self.serviceReviewDescriptor = bridge.latestRepositoryReviewDescriptor
+        self.serviceReviewHistory = bridge.repositoryReviewHistory
         self.serviceActionPresentations = bridge.actionPresentations
         self.serviceActivitySourceIsCurrent = bridge.activitySourceIsCurrent
         self.serviceProjectionOmissions = bridge.projection.projectionOmissions
@@ -4954,6 +4975,7 @@ final class LiveRun: Identifiable {
         publish(serviceBridge.recordedModelContext, to: \.recordedModelContext)
         publish(serviceBridge.canonicalWorkingState, to: \.canonicalWorkingState)
         publish(serviceBridge.latestRepositoryReviewDescriptor, to: \.serviceReviewDescriptor)
+        publish(serviceBridge.repositoryReviewHistory, to: \.serviceReviewHistory)
         // This is canonical Session evidence (input.accepted/message history), not a Start
         // receipt. It remains true even when the visible transcript has bounded omissions.
         publish(serviceBridge.hasCanonicalInputDelivery, to: \.initialPromptDelivered)

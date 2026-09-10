@@ -247,6 +247,7 @@ struct RunPane: View {
     @State private var showInputDeliveryReview = false
     @State private var showCockpitInspector = false
     @State private var showRepositoryReview = false
+    @State private var selectedReviewDescriptor: WorkServiceArtifactDescriptor?
     @State private var showActivityHistory = false
     @State private var showProjectReconfirmation = false
     @State private var projectCheckError: String?
@@ -399,6 +400,12 @@ struct RunPane: View {
                     onJumpToLatestHistory: run.isServiceBacked ? {
                         await run.jumpServiceHistoryToLatest()
                     } : nil,
+                    reviewMessageIDs: Set(run.serviceReviewsByTranscriptID.keys),
+                    onReviewMessage: { id in
+                        guard let descriptor = run.serviceReviewsByTranscriptID[id] else { return }
+                        selectedReviewDescriptor = descriptor
+                        showRepositoryReview = true
+                    },
                     onSelect: { selectedItem = $0 })
                 Divider()
                 composer
@@ -452,7 +459,7 @@ struct RunPane: View {
                 .accessibilityLabel("Run context and working state")
         }
         .sheet(isPresented: $showRepositoryReview) {
-            RepositoryReviewView(run: run)
+            RepositoryReviewView(run: run, descriptor: selectedReviewDescriptor)
                 .frame(minWidth: 560, idealWidth: 760, minHeight: 620, idealHeight: 780)
         }
         .sheet(isPresented: $showActivityHistory) {
@@ -508,11 +515,13 @@ struct RunPane: View {
                 if run.canLoadServiceRepositoryReview {
                     ViewThatFits(in: .horizontal) {
                         Button {
+                            selectedReviewDescriptor = nil
                             showRepositoryReview = true
                         } label: {
                             Label("Review changes", systemImage: "doc.text.magnifyingglass")
                         }
                         Button {
+                            selectedReviewDescriptor = nil
                             showRepositoryReview = true
                         } label: {
                             Image(systemName: "doc.text.magnifyingglass")

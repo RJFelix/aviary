@@ -219,6 +219,27 @@ enum ChatJourneyProbe {
         try require(starts.count == 1 && ordinaryProjection.descriptor.currentRun != nil,
                     "default restore did not admit exactly one canonical Start")
 
+        // Startup restoration admits attachments one at a time. Once the first visible chat has
+        // become the implicit presentation choice, later background rows must not retarget its
+        // composer or override a pre-existing explicit focus.
+        var restoredRuns = [guarded]
+        var restoredFocus = AppModel.focusAfterBackgroundServiceRestore(
+            current: nil, admitted: guarded.id)
+        guarded.setDraft("draft stays with the first restored chat")
+        restoredRuns.append(ordinary)
+        restoredFocus = AppModel.focusAfterBackgroundServiceRestore(
+            current: restoredFocus, admitted: ordinary.id)
+        let restoredSelection = restoredRuns.first { $0.id == restoredFocus }
+        try require(
+            restoredSelection?.id == guarded.id
+                && restoredSelection?.draft == "draft stays with the first restored chat"
+                && ordinary.draft.isEmpty,
+            "later background restoration retargeted the visible composer")
+        let explicitFocus = AppModel.focusAfterBackgroundServiceRestore(
+            current: ordinary.id, admitted: guarded.id)
+        try require(explicitFocus == ordinary.id,
+                    "background restoration overrode an existing run focus")
+
         // Model a response that was lost after the host recorded End. Exact canonical command
         // evidence retires only that uncertainty; a foreign command or ordinary local warning
         // must survive the same refresh path.

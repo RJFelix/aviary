@@ -452,9 +452,28 @@ distinct from rejection and clears only when matching canonical acceptance/deliv
 foreign command evidence, incomplete reads, and unrelated draft/storage warnings cannot clear it.
 The notice-policy suite passes 9 cases / 40 assertions, and the actual AppModel journey probe
 passes the lost-confirmation/source-incomplete case after canonical End has caught up. No command
-is automatically retried. Final broad and signed-GUI verification of these follow-ons is pending.
+is automatically retried. Final regression passed 1,059 cases / 14,991 assertions in 655.44 seconds.
+The signed `53d73d0` app continued the isolated chat through a 12-second Python turn, preserved its
+human title, displayed the exact reply, and recorded an explicit clean End. An earlier whole-suite
+shell-Future assertion did not reproduce in 15 isolated repetitions or the final full run; no test
+was skipped. An opt-in unbuffered per-case trace now identifies the actual case during long runs.
 
-The next authorized slice is saved review history: expose older turn-linked repository observations
-alongside the newest review, with exact descriptor/body selection. These remain whole-working-tree
-observations, not attributed per-turn deltas or restorable checkpoints. Write-capable checkpoint
-work and the separate Phase 5 Handle design remain outside this chat-first slice.
+### Saved review history — 2026-09-10
+
+The next slice exposes older turn-linked repository observations alongside the newest review.
+Selection and loading use the full exact descriptor, not just its media type or artifact ID.
+The bounded metadata list is scoped to the current Work/Session attachment; transcript links join
+Run, Turn, Session attachment, and source journal. A newer publication does not replace an older
+selection. A missing/changed descriptor invalidates its displayed body without silently loading
+another review. Bodies remain on-demand, capability-checked, bounded, and digest-verified.
+
+These remain whole-working-tree observations, not attributed per-turn deltas or restorable
+checkpoints. Revision feedback is a composer draft, never an automatic Send. Write-capable
+checkpoint work and the separate Phase 5 Handle design remain outside this chat-first slice.
+Focused, visual, and signed-history verification is pending.
+
+The live startup journey also exposed an implicit-selection race: asynchronous restoration could
+reorder the chat list before any default focus was pinned. The first background attachment now
+establishes default focus only if none exists. Later restoration cannot retarget the visible
+composer, and explicit chat/pending-request/new-chat choices retain priority. The AppModel journey
+probe covers a retained draft between the first and second restoration plus existing explicit focus.

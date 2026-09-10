@@ -26,9 +26,9 @@ struct RepositoryReviewView: View {
     @State private var showReviewLimits = false
     @Environment(\.dismiss) private var dismiss
 
-    init(run: LiveRun) {
+    init(run: LiveRun, descriptor: WorkServiceArtifactDescriptor? = nil) {
         self.run = run
-        _selectedDescriptor = State(initialValue: run.serviceReviewDescriptor)
+        _selectedDescriptor = State(initialValue: descriptor ?? run.serviceReviewDescriptor)
         self.fixtureRetryEnabled = false
         _state = State(initialValue: .ready)
     }
@@ -54,8 +54,20 @@ struct RepositoryReviewView: View {
         _state = State(initialValue: .failed(error))
     }
 
-    private var currentDescriptor: WorkServiceArtifactDescriptor? {
-        run?.serviceReviewDescriptor
+    private var reviewRows: [WorkServiceRepositoryReviewHistoryRow] {
+        guard let history = run?.serviceReviewHistory, history.sourceComplete else { return [] }
+        return history.rows
+    }
+
+    private var selectedIsAvailable: Bool {
+        guard let selectedDescriptor else { return false }
+        return reviewRows.contains { $0.descriptor == selectedDescriptor }
+    }
+
+    private var selectedIsLoadable: Bool {
+        selectedIsAvailable && selectedDescriptor?.available == true
+            && selectedDescriptor?.bodyReference != nil
+            && run?.serviceProjection?.capabilities.contains(.inspectArtifacts) == true
     }
 
     var body: some View {
@@ -64,6 +76,7 @@ struct RepositoryReviewView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
+                    if run?.isServiceBacked == true { historyPicker }
                     boundaryNotice
                     switch state {
                     case .ready:
@@ -83,10 +96,50 @@ struct RepositoryReviewView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Repository review")
-        .onChange(of: currentDescriptor) { _, descriptor in
-            descriptorDidChange(to: descriptor)
+        .onChange(of: run?.serviceReviewHistory) { _, _ in
+            historyDidChange()
         }
         .onDisappear { loadIdentity = nil }
+    }
+
+    private var historyPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Saved reviews").font(.system(size: 11.5, weight: .semibold))
+                Spacer()
+                Text("\(reviewRows.count) recorded")
+                    .font(Design.numeric(10)).foregroundStyle(.secondary)
+            }
+            Picker("Review", selection: Binding(
+                get: { selectedDescriptor },
+                set: { descriptor in
+                    guard let descriptor, reviewRows.contains(where: {
+                        $0.descriptor == descriptor
+                    }) else { return }
+                    selectReview(descriptor)
+                }
+            )) {
+                if !selectedIsAvailable {
+                    Text("Selected review unavailable")
+                        .tag(selectedDescriptor)
+                }
+                ForEach(Array(reviewRows.enumerated()), id: \.element.descriptor.artifactID) { index, row in
+                    Text(index == reviewRows.count - 1
+                        ? "Latest · Saved review \(index + 1)"
+                        : "Saved review \(index + 1)")
+                        .tag(Optional(row.descriptor))
+                }
+            }
+            .labelsHidden()
+            .accessibilityLabel("Saved review selection")
+            Text("Ordered by publication. Each review records the working tree at that time, not the difference from the preceding review.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let omitted = run?.serviceReviewHistory?.omittedRowCount, omitted > 0 {
+                Text("\(omitted) review records are unavailable or outside this bounded list.")
+                    .font(.caption).foregroundStyle(Design.warning)
+            }
+        }
     }
 
     private var header: some View {
@@ -168,7 +221,7 @@ struct RepositoryReviewView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .keyboardShortcut(.defaultAction)
-                .disabled(run == nil || selectedDescriptor == nil)
+                .disabled(run == nil || !selectedIsLoadable)
                 .accessibilityHint("Fetches and validates the selected review artifact")
             }
         }
@@ -222,7 +275,7 @@ struct RepositoryReviewView: View {
                         .tint(detail.tint)
                         .disabled(
                             (run == nil && !fixtureRetryEnabled)
-                                || (run != nil && currentDescriptor == nil))
+                                || (run != nil && !selectedIsLoadable))
                     Chip(text: "no content shown", tint: detail.tint)
                 }
             }
@@ -460,10 +513,7 @@ struct RepositoryReviewView: View {
             if !fixtureRetryEnabled { state = .failed(.unavailable) }
             return
         }
-        // Retry adopts the descriptor currently mirrored by LiveRun. It never reuses the
-        // descriptor that was selected when this sheet was first presented.
-        selectedDescriptor = run.serviceReviewDescriptor
-        guard let descriptor = selectedDescriptor else {
+        guard selectedIsLoadable, let descriptor = selectedDescriptor else {
             state = .failed(.unavailable)
             return
         }
@@ -481,17 +531,20 @@ struct RepositoryReviewView: View {
         }
     }
 
-    private func descriptorDidChange(to descriptor: WorkServiceArtifactDescriptor?) {
+    private func selectReview(_ descriptor: WorkServiceArtifactDescriptor) {
+        guard descriptor != selectedDescriptor else { return }
         loadIdentity = nil
-        let wasShowingBody: Bool
-        switch state {
-        case .loaded, .loading: wasShowingBody = true
-        case .ready, .failed: wasShowingBody = false
-        }
         selectedDescriptor = descriptor
-        guard wasShowingBody else { return }
-        // A descriptor identity change invalidates any body already on screen. Keep the
-        // failure copy deliberately coarse; a later retry will adopt the new descriptor.
+        state = .ready
+        placedInComposer = false
+        placedFeedbackCount = 0
+    }
+
+    private func historyDidChange() {
+        // A later publication does not retarget an older selection. A removed or changed exact
+        // descriptor invalidates its body; retry never silently substitutes another review.
+        guard !selectedIsAvailable else { return }
+        loadIdentity = nil
         state = .failed(.unavailable)
     }
 

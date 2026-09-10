@@ -29,6 +29,8 @@ struct TranscriptView: View {
     var earlierHistoryError: String?
     var onLoadEarlierHistory: (() -> Void)?
     var onJumpToLatestHistory: (() async -> Void)?
+    var reviewMessageIDs: Set<String> = []
+    var onReviewMessage: ((String) -> Void)?
     var onSelect: ((TranscriptItem) -> Void)?
 
     @State private var scrollTarget: String?
@@ -61,13 +63,23 @@ struct TranscriptView: View {
                                 .onAppear { requestEarlierHistoryIfNeeded() }
                         }
                         ForEach(visible) { item in
-                            TranscriptRow(
-                                item: item,
-                                searchQuery: searchQuery,
-                                hideThinking: hideThinking,
-                                isLast: item.id == visible.last?.id && isStreaming,
-                                onSelect: onSelect)
-                                .id(item.id)
+                            VStack(alignment: .leading, spacing: 6) {
+                                TranscriptRow(
+                                    item: item,
+                                    searchQuery: searchQuery,
+                                    hideThinking: hideThinking,
+                                    isLast: item.id == visible.last?.id && isStreaming,
+                                    onSelect: onSelect)
+                                if reviewMessageIDs.contains(item.id), let onReviewMessage {
+                                    Button { onReviewMessage(item.id) } label: {
+                                        Label("Saved changes after this turn", systemImage: "doc.text.magnifyingglass")
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Design.accent)
+                                    .padding(.leading, 30)
+                                }
+                            }.id(item.id)
                         }
                         if isStreaming {
                             StreamingIndicator()

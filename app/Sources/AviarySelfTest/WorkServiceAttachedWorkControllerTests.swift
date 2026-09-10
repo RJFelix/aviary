@@ -969,6 +969,25 @@ private func attachedArtifact(
         run: RunRef("controller-artifact-run")), reference)
 }
 
+private func attachedReviewArtifact(
+    fixture: AttachedControllerFixture, id: String, turnID: String, body: Data
+) -> (WorkServiceArtifactDescriptor, TimelineBodyReference) {
+    let digest = attachedArtifactDigest(body)
+    let reference = TimelineBodyReference(
+        authority: fixture.workJournal, referenceID: digest,
+        mediaType: ObservedRepositoryReviewFormat.mediaType,
+        byteCount: body.count, digest: digest)
+    let source = EventRef(journal: fixture.workJournal, eventID: "\(id)-event")
+    return (try! WorkServiceArtifactDescriptor(
+        artifactID: id, work: fixture.work, label: id,
+        mediaType: ObservedRepositoryReviewFormat.mediaType,
+        byteCount: body.count, digest: digest, available: true,
+        bodyReference: reference, sourceEvent: source,
+        session: fixture.session, sessionAttachment: fixture.sessionAttachment,
+        run: RunRef("controller-review-run-\(turnID)"), turn: TurnRef(turnID),
+        action: ActionRef("\(id)-action"), causedByEventID: source), reference)
+}
+
 private func configureAttachedArtifact(
     fixture: AttachedControllerFixture, service: AttachedControllerTestService,
     artifact: WorkServiceArtifactDescriptor, reference: TimelineBodyReference, body: Data
@@ -996,6 +1015,167 @@ func testWorkServiceAttachedControllerFetchesLatestAuthorizedArtifactInChunks() 
     XCTAssertEqual(fetched.reference, latestReference)
     XCTAssertEqual(fetched.data, body)
     XCTAssertEqual(await service.artifactBodyRequestCount(), 2)
+}
+
+func testWorkServiceAttachedControllerFetchesExactOlderReviewAndLatestReview() async throws {
+    let fixture = try AttachedControllerFixture()
+    let olderBody = Data("older review".utf8)
+    let latestBody = Data("latest review".utf8)
+    let (older, olderReference) = attachedReviewArtifact(
+        fixture: fixture, id: "review-older", turnID: "turn-older", body: olderBody)
+    let (latest, latestReference) = attachedReviewArtifact(
+        fixture: fixture, id: "review-latest", turnID: "turn-latest", body: latestBody)
+    let service = AttachedControllerTestService(fixture: fixture)
+    await service.setArtifactDescriptors([older, latest])
+    await service.setArtifactBody(olderBody, for: olderReference)
+    await service.setArtifactBody(latestBody, for: latestReference)
+    let controller = try makeAttachedController(fixture: fixture, service: service)
+    _ = try await controller.refresh()
+
+    let fetchedOlder = try await controller.fetchArtifactBody(descriptor: older)
+    XCTAssertEqual(fetchedOlder.artifactID, older.artifactID)
+    XCTAssertEqual(fetchedOlder.data, olderBody)
+    let fetchedLatest = try await controller.fetchArtifactBody(
+        mediaType: ObservedRepositoryReviewFormat.mediaType)
+    XCTAssertEqual(fetchedLatest.artifactID, latest.artifactID)
+    XCTAssertEqual(fetchedLatest.data, latestBody)
+    let history = await controller.repositoryReviewHistory(maxRows: 8)
+    XCTAssertTrue(history.isAvailable)
+    XCTAssertEqual(history.rows.map { $0.descriptor.artifactID }, [older.artifactID, latest.artifactID])
+
+    let wrongAttachment = try WorkServiceArtifactDescriptor(
+        artifactID: older.artifactID, work: older.work, label: older.label,
+        mediaType: older.mediaType, byteCount: older.byteCount, digest: older.digest,
+        available: older.available, bodyReference: older.bodyReference,
+        sourceEvent: older.sourceEvent, session: older.session,
+        sessionAttachment: SessionAttachmentRef("other-attachment"), run: older.run,
+        turn: older.turn, action: older.action, causedByEventID: older.causedByEventID)
+    do {
+        _ = try await controller.fetchArtifactBody(descriptor: wrongAttachment)
+        XCTFail("a descriptor for another Session attachment must be rejected")
+    } catch WorkServiceAttachedArtifactLoadError.malformed {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try await controller.fetchArtifactBody(
+            descriptor: older, maxTotalBytes: olderBody.count - 1)
+        XCTFail("an exact descriptor exceeding the body bound must be rejected")
+    } catch WorkServiceAttachedArtifactLoadError.tooLarge {
+        XCTAssertTrue(true)
+    }
+
+    let changed = try WorkServiceArtifactDescriptor(
+        artifactID: older.artifactID, work: older.work, label: "replacement",
+        mediaType: older.mediaType, byteCount: older.byteCount, digest: older.digest,
+        available: older.available, bodyReference: older.bodyReference,
+        sourceEvent: older.sourceEvent, session: older.session,
+        sessionAttachment: older.sessionAttachment, run: older.run, turn: older.turn,
+        action: older.action, causedByEventID: older.causedByEventID)
+    await service.setArtifactDescriptors([changed, latest])
+    _ = try await controller.refresh()
+    do {
+        _ = try await controller.fetchArtifactBody(descriptor: older)
+        XCTFail("a replaced descriptor must not fetch under the older identity")
+    } catch WorkServiceAttachedArtifactLoadError.malformed {
+        XCTAssertTrue(true)
+    }
+    let denied = WorkServiceAuthorizationOutcome(
+        requested: Set(WorkServiceCapability.allCases),
+        granted: Set(WorkServiceCapability.allCases).subtracting([.inspectArtifacts]),
+        denied: [.inspectArtifacts])
+    await service.setAttachmentAuthorization(denied)
+    _ = try await controller.refresh()
+    do {
+        _ = try await controller.fetchArtifactBody(descriptor: changed)
+        XCTFail("an exact review fetch without inspect capability must be denied")
+    } catch WorkServiceAttachedArtifactLoadError.capabilityDenied(.inspectArtifacts) {
+        XCTAssertTrue(true)
+    }
+}
+
+func testWorkServiceRepositoryReviewHistoryJoinsOnlyExactTurnRunAttachmentAndSessionJournal() throws {
+    let fixture = try AttachedControllerFixture()
+    let foreignFixture = try AttachedControllerFixture(workID: "foreign-work")
+    let (older, _) = attachedReviewArtifact(
+        fixture: fixture, id: "review-older", turnID: "turn-older", body: Data("old".utf8))
+    let (latest, _) = attachedReviewArtifact(
+        fixture: fixture, id: "review-latest", turnID: "turn-latest", body: Data("new".utf8))
+    let (foreign, _) = attachedReviewArtifact(
+        fixture: foreignFixture, id: "review-foreign", turnID: "turn-foreign", body: Data("foreign".utf8))
+    let otherAttachment = try WorkServiceArtifactDescriptor(
+        artifactID: "review-other-attachment", work: latest.work, label: "other attachment",
+        mediaType: latest.mediaType, byteCount: latest.byteCount, digest: latest.digest,
+        available: latest.available, bodyReference: latest.bodyReference,
+        sourceEvent: latest.sourceEvent, session: latest.session,
+        sessionAttachment: SessionAttachmentRef("other-attachment"), run: latest.run,
+        turn: latest.turn, action: latest.action, causedByEventID: latest.causedByEventID)
+    let olderSource = EventRef(journal: fixture.sessionJournal, eventID: "message-older")
+    let latestSource = EventRef(journal: fixture.sessionJournal, eventID: "message-latest")
+    let exactOlder = SessionMessageSnapshot(
+        eventID: "message-older", role: "assistant", text: "old",
+        sourceEvent: olderSource, run: older.run, turn: older.turn,
+        sessionAttachment: older.sessionAttachment)
+    let exactLatest = SessionMessageSnapshot(
+        eventID: "message-latest", role: "assistant", text: "new",
+        sourceEvent: latestSource, run: latest.run, turn: latest.turn,
+        sessionAttachment: latest.sessionAttachment)
+    let sameTurnDifferentRun = SessionMessageSnapshot(
+        eventID: "message-foreign-run", role: "assistant", text: "wrong run",
+        sourceEvent: EventRef(journal: fixture.sessionJournal, eventID: "message-foreign-run"),
+        run: RunRef("foreign-run"), turn: latest.turn,
+        sessionAttachment: latest.sessionAttachment)
+    let mismatchedSourceCursor = SessionMessageSnapshot(
+        eventID: "message-mismatched-cursor", role: "assistant", text: "wrong cursor",
+        sourceEvent: latestSource,
+        sourceCursor: JournalCursor(
+            journal: fixture.sessionJournal, eventID: "different-source", sequence: 3),
+        run: latest.run, turn: latest.turn, sessionAttachment: latest.sessionAttachment)
+    let foreignSession = SessionMessageSnapshot(
+        eventID: "message-foreign-session", role: "assistant", text: "wrong session",
+        sourceEvent: EventRef(
+            journal: JournalRef.session(
+                SessionRef("foreign-session"), journalID: "foreign-session-journal",
+                authority: TimelineAuthorityRef(fixture.host.workHostID)),
+            eventID: "message-foreign-session"),
+        run: latest.run, turn: latest.turn, sessionAttachment: latest.sessionAttachment)
+    let key = try XCTUnwrap(WorkSessionKey(
+        work: fixture.work, session: fixture.session,
+        sessionJournal: fixture.sessionJournal, sessionAttachment: fixture.sessionAttachment))
+    let history = WorkServiceRepositoryReviewHistory(
+        workSession: key, descriptors: [foreign, otherAttachment, older, latest],
+        messages: [
+            exactOlder, exactLatest, sameTurnDifferentRun, mismatchedSourceCursor, foreignSession,
+        ],
+        artifactIndexComplete: true, maxRows: 8)
+    XCTAssertTrue(history.isAvailable)
+    XCTAssertEqual(history.rows.map { $0.descriptor.artifactID }, [older.artifactID, latest.artifactID])
+    XCTAssertEqual(history.rows[0].transcriptSourceEvents, [olderSource])
+    XCTAssertEqual(history.rows[1].transcriptSourceEvents, [latestSource])
+
+    let changedOlder = try WorkServiceArtifactDescriptor(
+        artifactID: older.artifactID, work: older.work, label: "changed older",
+        mediaType: older.mediaType, byteCount: older.byteCount, digest: older.digest,
+        available: older.available, bodyReference: older.bodyReference,
+        sourceEvent: older.sourceEvent, session: older.session,
+        sessionAttachment: older.sessionAttachment, run: older.run, turn: older.turn,
+        action: older.action, causedByEventID: older.causedByEventID)
+    let conflicting = WorkServiceRepositoryReviewHistory(
+        workSession: key, descriptors: [older, changedOlder, latest], messages: [],
+        artifactIndexComplete: true, maxRows: 8)
+    XCTAssertFalse(conflicting.isAvailable)
+    XCTAssertTrue(conflicting.rows.isEmpty)
+
+    let capped = WorkServiceRepositoryReviewHistory(
+        workSession: key, descriptors: [older, latest], messages: [],
+        artifactIndexComplete: true, maxRows: 1)
+    XCTAssertTrue(capped.isAvailable)
+    XCTAssertEqual(capped.rows.count, 1)
+    XCTAssertEqual(capped.omittedRowCount, 1)
+    let unavailable = WorkServiceRepositoryReviewHistory(
+        workSession: key, descriptors: [older, latest], messages: [],
+        artifactIndexComplete: false, maxRows: 8)
+    XCTAssertFalse(unavailable.isAvailable)
+    XCTAssertTrue(unavailable.rows.isEmpty)
 }
 
 func testWorkServiceAttachedControllerRejectsArtifactProgressAndMetadataFailures() async throws {
@@ -1070,6 +1250,12 @@ func testWorkServiceAttachedControllerDistinguishesArtifactOmittedUnavailableAnd
     do {
         _ = try await omittedController.fetchArtifactBody(mediaType: "application/octet-stream")
         XCTFail("a retained match in an omitted index cannot prove the latest artifact")
+    } catch WorkServiceAttachedArtifactLoadError.omitted {
+        XCTAssertTrue(true)
+    }
+    do {
+        _ = try await omittedController.fetchArtifactBody(descriptor: artifact)
+        XCTFail("an exact descriptor in an omitted index must remain unavailable")
     } catch WorkServiceAttachedArtifactLoadError.omitted {
         XCTAssertTrue(true)
     }
@@ -2722,6 +2908,12 @@ let casesWorkServiceAttachedWorkController: [Case] = [
     }),
     ("phase4b Work controller fetches latest authorized artifact in chunks", {
         try await testWorkServiceAttachedControllerFetchesLatestAuthorizedArtifactInChunks()
+    }),
+    ("phase4b Work controller fetches exact older review and latest review", {
+        try await testWorkServiceAttachedControllerFetchesExactOlderReviewAndLatestReview()
+    }),
+    ("phase4b Work controller projects exact repository review history", {
+        try testWorkServiceRepositoryReviewHistoryJoinsOnlyExactTurnRunAttachmentAndSessionJournal()
     }),
     ("phase4b Work controller rejects artifact progress and metadata failures", {
         try await testWorkServiceAttachedControllerRejectsArtifactProgressAndMetadataFailures()

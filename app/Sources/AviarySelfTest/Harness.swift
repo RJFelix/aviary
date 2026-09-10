@@ -36,8 +36,13 @@ enum Harness {
         } else {
             selected = cases
         }
+        let traceCases = ProcessInfo.processInfo.environment["AVIARY_SELFTEST_TRACE"] == "1"
         let started = Date()
         for (name, body) in selected {
+            let caseStarted = Date()
+            if traceCases {
+                FileHandle.standardError.write(Data("BEGIN \(name)\n".utf8))
+            }
             let before = withStateLock {
                 currentCase = name
                 return failures.count
@@ -49,6 +54,10 @@ enum Harness {
             }
             let mark = withStateLock { failures.count == before ? "✓" : "✗" }
             print("  \(mark) \(name)")
+            if traceCases {
+                let seconds = String(format: "%.2f", Date().timeIntervalSince(caseStarted))
+                FileHandle.standardError.write(Data("END \(name) (\(seconds)s, \(mark))\n".utf8))
+            }
         }
         let elapsed = String(format: "%.2fs", Date().timeIntervalSince(started))
         print("")
