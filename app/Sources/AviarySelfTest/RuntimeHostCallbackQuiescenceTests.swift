@@ -57,10 +57,79 @@ private final class CallbackCount: @unchecked Sendable {
         lock.lock(); value += 1; lock.unlock()
     }
 
+    func incrementAndGet() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        value += 1
+        return value
+    }
+
     var count: Int {
         lock.lock(); defer { lock.unlock() }
         return value
     }
+}
+
+func test_runtimeHostPreservesEveryJSONCallbackResultShape() async throws {
+    for variant in [HostVariant.reference, .shared] {
+        guard let host = try makeHost(variant) else { continue }
+        _ = try await host.start()
+        let session = try await host.createSession(id: "callback-json-\(variant.rawValue)")
+        await host.onCallback { _, _, kind, _ in
+            switch kind {
+            case "object": return .object(["ok": .bool(true)])
+            case "array": return .array([])
+            case "string": return .string("")
+            case "number": return .number(0)
+            case "boolean": return .bool(false)
+            case "null": return .null
+            default: return .object(["error": .string("unexpected callback")])
+            }
+        }
+
+        let result = try await host.execute(
+            "[ask_app('object'), ask_app('array'), ask_app('string'), "
+                + "ask_app('number'), ask_app('boolean'), ask_app('null')]",
+            in: session, timeout: 5)
+        XCTAssertEqual(
+            result.value, "[{'ok': True}, [], '', 0, False, None]",
+            "\(variant.rawValue) must preserve arrays, scalars, and null instead of timing out "
+                + "or coercing falsey JSON values to an object")
+        await host.stop()
+    }
+}
+
+func test_runtimeHostSpawnFutureObservesArrayChildrenReply() async throws {
+    guard let host = try makeHost(.reference) else { return }
+    _ = try await host.start()
+    let session = try await host.createSession(id: "spawn-array-result")
+    let childPolls = CallbackCount()
+    await host.onCallback { _, _, kind, _ in
+        switch kind {
+        case "spawn":
+            return .object([
+                "id": .string("child-one"), "name": .string("fixture"),
+                "state": .string("running"),
+            ])
+        case "children":
+            let poll = childPolls.incrementAndGet()
+            return .array([.object([
+                "id": .string("child-one"), "name": .string("fixture"),
+                "state": .string(poll == 1 ? "running" : "done"),
+                "answer": poll == 1 ? .null : .string("finished"),
+            ])])
+        default:
+            return .object(["error": .string("unexpected callback")])
+        }
+    }
+
+    let result = try await host.execute(
+        "spawn('fixture').result(timeout=5)", in: session, timeout: 8)
+    XCTAssertEqual(result.value, "'finished'")
+    XCTAssertTrue(childPolls.count >= 2, "the watcher must poll through running to done")
+    try await host.closeCallbackAdmissionAndWait()
+    XCTAssertEqual(await host.activeCallbackCount, 0)
+    await host.stop()
 }
 
 private func launchCallbackFloodHost(
@@ -306,6 +375,12 @@ func test_runtimeHostCallHookPropagatesTransportFailure() async throws {
 }
 
 let casesRuntimeHostCallbackQuiescence: [Case] = [
+    ("runtimeHost: callbacks preserve every JSON result shape", {
+        try await test_runtimeHostPreservesEveryJSONCallbackResultShape()
+    }),
+    ("runtimeHost: spawn Future observes array children replies", {
+        try await test_runtimeHostSpawnFutureObservesArrayChildrenReply()
+    }),
     ("runtimeHost: slow callbacks drain before quiescence", {
         try await test_runtimeHostDrainsSlowCallbacksBeforeQuiescence()
     }),

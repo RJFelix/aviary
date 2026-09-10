@@ -140,6 +140,9 @@ _callback_seq = [0]
 _callback_sender = None
 _callback_history = OrderedDict()
 _CALLBACK_HISTORY_LIMIT = 1024
+# A callback may legitimately resolve to JSON null. Keep pending state out-of-band rather than
+# overloading None, or a null reply is indistinguishable from no reply and waits until timeout.
+_CALLBACK_PENDING = object()
 
 
 def set_callback_sender(sender) -> None:
@@ -150,7 +153,8 @@ def set_callback_sender(sender) -> None:
 def pending_callback_messages(session: str) -> list[dict]:
     with _callback_lock:
         return [entry["message"] for entry in _callbacks.values()
-                if entry.get("session") == session and entry.get("result") is None]
+                if (entry.get("session") == session
+                    and entry.get("result") is _CALLBACK_PENDING)]
 
 
 def _remember_callback_outcome_locked(rid: str, status: str) -> None:
@@ -167,7 +171,7 @@ def _remember_callback_outcome_locked(rid: str, status: str) -> None:
         _callback_history.popitem(last=False)
 
 
-def request_from_app(kind: str, payload: dict, session: str = "", timeout: float = 900.0) -> dict:
+def request_from_app(kind: str, payload: dict, session: str = "", timeout: float = 900.0):
     with _callback_lock:
         _callback_seq[0] += 1
         rid = f"cb-{_callback_seq[0]}"
@@ -175,7 +179,7 @@ def request_from_app(kind: str, payload: dict, session: str = "", timeout: float
         message = {"event": "callback", "rid": rid, "kind": kind,
                    "payload": payload, "session": session}
         _callbacks[rid] = {
-            "event": event, "result": None, "session": session, "message": message,
+            "event": event, "result": _CALLBACK_PENDING, "session": session, "message": message,
         }
     sender = _callback_sender
     if sender is None:
@@ -185,7 +189,7 @@ def request_from_app(kind: str, payload: dict, session: str = "", timeout: float
     if not event.wait(timeout):
         with _callback_lock:
             entry = _callbacks.get(rid)
-            if entry is not None and entry.get("result") is None:
+            if entry is not None and entry.get("result") is _CALLBACK_PENDING:
                 _callbacks.pop(rid, None)
                 _remember_callback_outcome_locked(rid, "stale")
                 return {"error": "Aviary did not answer the %s request within %ss" % (
@@ -193,27 +197,25 @@ def request_from_app(kind: str, payload: dict, session: str = "", timeout: float
             entry = _callbacks.pop(rid, None)
             if entry is not None:
                 _remember_callback_outcome_locked(rid, "accepted")
-                return entry.get("result") or {}
+                return entry.get("result")
         return {"error": "Aviary did not answer the %s request within %ss" % (
             bounded_diagnostic(kind, 120), int(timeout))}
     with _callback_lock:
         entry = _callbacks.pop(rid, None)
         if entry is not None:
             _remember_callback_outcome_locked(rid, "accepted")
-    return (entry or {}).get("result") or {}
+    return entry.get("result") if entry is not None else {}
 
 
-def resolve_callback(rid: str, result: dict) -> dict:
+def resolve_callback(rid: str, result) -> dict:
     """Resolve one callback atomically and report whether this result won the race."""
-    if not isinstance(result, dict):
-        return {"delivered": False, "status": "invalid"}
     with _callback_lock:
         entry = _callbacks.get(rid)
         if entry is None:
             status = _callback_history.get(rid)
             return {"delivered": False,
                     "status": "duplicate" if status == "accepted" else "stale"}
-        if entry.get("result") is not None:
+        if entry.get("result") is not _CALLBACK_PENDING:
             return {"delivered": False, "status": "duplicate"}
         entry["result"] = result
         _remember_callback_outcome_locked(rid, "accepted")
@@ -684,8 +686,10 @@ class Host:
             elif op == "session.detach":
                 self.reply(rid, self.detach(msg, client))
             elif op == "callback.result":
-                result = msg.get("result")
-                resolution = resolve_callback(msg.get("rid") or "", result)
+                if "result" not in msg:
+                    resolution = {"delivered": False, "status": "invalid"}
+                else:
+                    resolution = resolve_callback(msg.get("rid") or "", msg["result"])
                 self.reply(rid, resolution)
             elif op in ("exec", "inspect"):
                 self.dispatch_to_session(rid, op, msg, client)

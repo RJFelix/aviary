@@ -1193,7 +1193,7 @@ let cases1: [Case] = [
         XCTAssertEqual(started.value, "True", "sh() did not block")
         // The Future is still in the namespace a cell later, and resolves to the output.
         let collected = try await host.execute("job.result()['stdout'].strip()", in: s)
-        XCTAssertEqual(collected.value, "'late'")
+        XCTAssertEqual(collected.value, "'late'", collected.exception ?? "missing shell Future value")
         // And it carries the deliver-later affordance every long builtin shares.
         let hasNotify = try await host.execute("hasattr(job, 'notify')", in: s)
         XCTAssertEqual(hasNotify.value, "True")
@@ -7164,6 +7164,7 @@ await Harness.run(
         + casesServiceBackedCommandNoticePolicy
         + casesWorkServiceAttachedWorkController
         + casesWorkActionPresentation
+        + casesChatActivityPresentation
         + casesDisposableTimelineProjectionStore
         + casesLocalTimelineProjectionSource
         + casesLocalTimelineProjectionReader

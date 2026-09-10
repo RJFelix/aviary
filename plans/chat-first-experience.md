@@ -402,3 +402,59 @@ remote-workflow receipt is claimed for this patch.
 The packaging verification also caught a pre-existing relative-cwd bug: `bundle-app.sh` looked
 up its Git commit relative to `app/` after changing directories, stamping `unknown`. It now uses
 its captured absolute repository root. Final packaging must stamp the checkpoint actually built.
+
+### Activity comprehension — 2026-09-10
+
+The next bounded slice groups the existing chat-local action view into unsettled actions,
+recorded problems, and completed outcomes. A failed historical action is not itself evidence that
+the agent is blocked or that the human should retry. Retained actions on a disconnected or
+incomplete projection must look last-recorded, not live. Counts describe the bounded view.
+
+Child activity is a separate Work-wide summary of the latest recorded child lifecycle states,
+using the already-gated working-state projection. It does not infer names, current Run ownership,
+progress, result correctness, or runtime liveness. Child admission and settlement are produced by
+AgentRunner; generic Python Futures are not covered. Handle lifecycle has no production callers
+yet, so it is not advertised as a background-task inventory.
+
+An audit ruled out an attractive but false action tree: production `parentActivity` links currently
+connect an action's own intent/start/outcome observations, not separate parent/child operations.
+Those links remain inspectable evidence; this slice does not turn them into a nesting hierarchy
+or introduce the separately gated Phase 5 ownership/scheduler design.
+
+The classification/bounds/source-quality suite passes 2 cases / 52 assertions; the full macOS
+suite passes 1,056 cases / 14,968 assertions. The actual AppModel journey probe covers a
+disconnect-only freshness change without erasing recorded child states. Wide, narrow, and stale
+production-content fixtures were visually inspected, as was the signed app's real activity sheet.
+
+The paid-provider GUI probe exposed an existing runtime defect: a real child reached durable
+`done`, but the parent stayed blocked in `spawn(...).result()`. Callback replies accepted only
+objects although `children()` returns an array. The isolated test was explicitly ended; after
+terminating only its stuck runtime, its Python outcome was recorded as indeterminate and its
+Run finished. Both Python hosts now preserve every JSON result shape, including falsey values;
+an explicit sentinel distinguishes a pending callback from a valid null reply. Missing result
+fields remain malformed. Real-host regressions cover result shapes, malformed/replayed replies,
+and a spawn Future polling from running to done.
+
+After rebuilding the signed bundle and restarting the local service, a fresh GUI chat spawned a
+real child, displayed its running/finished lifecycle, and received the correct three-line result
+in the parent within 13 seconds. Its Run was then explicitly ended and its runtime exited. The
+isolated input file and the five pre-existing request/Work files checked before the test remained
+byte-identical. The first hung test remains a recorded indeterminate outcome, not rewritten as a
+success. No current Linux/remote receipt is claimed for this callback repair.
+
+Two follow-on interaction defects surfaced in that real flow. The rail now preserves the title
+of an exact attached chat when catalog attention is temporarily unknown; its canonical state stays
+unknown and command routing still requires the original exact attachment. The journey probe
+reproduces the actual exact-join/unknown-state cursor-lag shape, not only presentation flags.
+
+End now retains a stable command identity across confirmation failure. An uncertain notice is
+distinct from rejection and clears only when matching canonical acceptance/delivery is available;
+foreign command evidence, incomplete reads, and unrelated draft/storage warnings cannot clear it.
+The notice-policy suite passes 9 cases / 40 assertions, and the actual AppModel journey probe
+passes the lost-confirmation/source-incomplete case after canonical End has caught up. No command
+is automatically retried. Final broad and signed-GUI verification of these follow-ons is pending.
+
+The next authorized slice is saved review history: expose older turn-linked repository observations
+alongside the newest review, with exact descriptor/body selection. These remain whole-working-tree
+observations, not attributed per-turn deltas or restorable checkpoints. Write-capable checkpoint
+work and the separate Phase 5 Handle design remain outside this chat-first slice.

@@ -50,6 +50,11 @@ enum ServiceBackedRunBridgeError: Error, LocalizedError, Sendable {
     }
 }
 
+enum ServiceBackedRunBridgeFailureCertainty: Equatable, Sendable {
+    case rejected
+    case uncertain
+}
+
 /// Presentation-safe outcomes for the on-demand repository review read. The GUI deliberately
 /// does not expose transport diagnostics, host paths, or storage details from the Work service.
 enum RepositoryReviewLoadError: Error, Equatable, Sendable {
@@ -128,6 +133,9 @@ final class ServiceBackedRunBridge {
     /// timing, retry guidance, provenance, and observation-boundary disclosures.
     var actionPresentations: [WorkActionPresentation] {
         WorkActionPresentation.project(projection.activities)
+    }
+    var activitySourceIsCurrent: Bool {
+        lastError == nil && ChatActivityPresentation.sourceIsCurrent(projection)
     }
     var visibleMessages: [SessionMessageSnapshot] { history.messages }
     /// Delivery evidence comes from the canonical Session reducer, not from a Start receipt.
@@ -463,9 +471,70 @@ final class ServiceBackedRunBridge {
 
     /// The only service-backed lifecycle termination operation.  Generic GUI disconnect and
     /// process termination never call this method.
-    func end() async throws -> WorkServiceCommandReceipt {
+    func end(commandID: String) async throws -> WorkServiceCommandReceipt {
         try requireExactRunOwner()
-        return try await issue { try await self.controller.end() }
+        return try await issue { try await self.controller.end(commandID: commandID) }
+    }
+
+    /// A failed response is not itself a rejection. Only a structured rejection, a proven stale
+    /// cursor, or a controller gate that runs before request retention proves that this exact
+    /// command did not cross. A retained command may have taken effect and is never retried here.
+    func failureCertainty(
+        for error: Error, commandID: String, kind: WorkServiceCommandKind
+    ) async -> ServiceBackedRunBridgeFailureCertainty {
+        if error is ServiceBackedRunBridgeError { return .rejected }
+        let key = serviceAttachmentKey
+        let notice = ServiceBackedCommandNotice(
+            work: work, commandID: commandID, kind: kind,
+            client: key.client, attachment: key.clientAttachment,
+            sessionAttachment: key.workSession.sessionAttachment,
+            evidence: .canonicalCommand)
+        if ServiceBackedCommandNoticePolicy.hasExactCanonicalCommandEvidence(
+            for: notice, in: projection) {
+            return .uncertain
+        }
+        if hasMatchingAcceptedReceipt(commandID: commandID, kind: kind) {
+            return .uncertain
+        }
+        if let pending = await controller.pendingCommand() {
+            if pending.commandID == commandID {
+                return pending.state == .stale ? .rejected : .uncertain
+            }
+        }
+        guard let controllerError = error as? WorkServiceAttachedWorkControllerError else {
+            return .uncertain
+        }
+        switch controllerError {
+        case .staleCursor, .pendingCommandExists, .noPendingCommand,
+             .commandNotAdmissible, .capabilityDenied, .terminalWork,
+             .recoveryRequired, .invalidSeed, .invalidOptions:
+            return .rejected
+        case .sourceIncomplete, .notConnected, .malformedResponse,
+             .transportFailure, .hostMismatch:
+            return .uncertain
+        }
+    }
+
+    private func hasMatchingAcceptedReceipt(
+        commandID: String, kind: WorkServiceCommandKind
+    ) -> Bool {
+        guard let receipt = projection.lastReceipt,
+              receipt.work == work,
+              receipt.commandID == commandID,
+              receipt.state == .accepted || receipt.state == .duplicate
+        else { return false }
+        switch kind {
+        case .start:
+            return receipt.outcome == .started || receipt.outcome == .startRecoveryRequired
+        case .send: return receipt.outcome == .inputAccepted
+        case .steer: return receipt.outcome == .steeringAccepted
+        case .queue: return receipt.outcome == .queued
+        case .hold: return receipt.outcome == .holdRequested
+        case .cancel: return receipt.outcome == .cancellationRequested
+        case .end: return receipt.outcome == .endRequested
+        case .destroy: return receipt.outcome == .destroyed
+        case .complete: return receipt.outcome == .completed
+        }
     }
 
     private func requireExactRunOwner() throws {

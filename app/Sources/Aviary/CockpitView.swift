@@ -319,7 +319,8 @@ struct CockpitView: View {
 
 /// Presentation-only identity retained while an exact attached Work outpaces the Session rail
 /// catalog. The command state remains explicitly qualified as Work state; it is never promoted to
-/// canonical Session state.
+/// canonical Session state. An exact join can still be unknown when the canonical attachment
+/// cursor is catching up, so this gate covers both incomplete and exact/unknown joins.
 struct CanonicalWorkspaceRailAttachedFallback: Equatable, Sendable {
     let title: String
     let commandState: SessionCommandState
@@ -337,7 +338,7 @@ enum CanonicalWorkspaceRailPresentation {
         attachedCommandState: SessionCommandState?
     ) -> CanonicalWorkspaceRailAttachedFallback? {
         guard !entryIsKnown,
-              entryJoin == .incomplete,
+              [.incomplete, .exact].contains(entryJoin),
               attachedServiceBacked,
               attachedProjectionIsCanonical,
               let attachedTitle,

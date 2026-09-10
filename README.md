@@ -122,12 +122,17 @@ applied and what happened, without displaying credential values.
 
 ## Where did my input tokens go?
 
-A two-message session can bill 17,000 input tokens, and nothing on disk explains it: the
-transcript holds messages, while the system prompt, the discovered `AGENTS.md` files, the
-skill catalogue and the tool schemas are assembled at request time and persisted nowhere.
+A short conversation can still carry a large model context: instructions, discovered context
+files, skills, tool schemas, and earlier messages all contribute. Native in-house runs record
+a bounded context manifest for each provider crossing and, before dispatch, retain the message,
+tool-schema, and prompt-source bodies needed by guarded cold conversation resume. Resume still
+requires valid retained bodies and compatible runtime capabilities. **Context and working state**
+in the chat shows the last recorded crossing and its
+source decomposition, separately from runtime state. It does not predict the next request or
+prove that a Python namespace survived a restart.
 
-Start a run with **Record what's sent to the model** and Aviary captures each provider
-payload at its own request boundary, then breaks it apart:
+For additional provider-wire inspection, start a run with **Record what's sent to the model**.
+This captures the provider payload at its request boundary and offers a separate wire breakdown:
 
 ```
 PART                                               chars   tokens   share
@@ -145,8 +150,10 @@ each, then rescaled by each part's exact share of the provider's own input count
 figures are anchored to something billed rather than to a heuristic. On the payload above
 the raw estimate came within 7% of the billed total.
 
-Recording is off by default and per-run, because it writes your full system prompt and
-conversation to a file. The same breakdown is available from a shell:
+Optional wire recording is off by default and per-run, because it writes your full system prompt
+and conversation to a file. This switch does **not** disable the native retained context bodies
+used for guarded cold conversation resume; those also contain sensitive prompt content. The wire
+breakdown is available from a shell:
 
 ```sh
 Aviary --analyse-wire ~/Library/Application\ Support/Aviary/wire/run-*.jsonl --input-tokens 17351

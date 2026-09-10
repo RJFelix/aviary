@@ -316,10 +316,14 @@ struct RunPane: View {
                         .padding(Design.gutter)
                 }
                 if let notice = run.commandNotice {
+                    let noticeTitle = switch notice.level {
+                    case .success: "Command acknowledged"
+                    case .uncertain: "Command outcome uncertain"
+                    case .warning: "Needs attention"
+                    }
                     NoticeBanner(
                         level: notice.level == .success ? .success : .warning,
-                        title: notice.level == .success
-                            ? "Command acknowledged" : "Command not accepted",
+                        title: noticeTitle,
                         message: notice.message
                     )
                         .padding(Design.gutter)
@@ -342,15 +346,42 @@ struct RunPane: View {
                     WorkActivityStrip(
                         action: action,
                         concurrentActions: run.currentServiceActions,
+                        sourceIsCurrent: run.serviceActivitySourceIsCurrent,
                         onInspect: {
                             selectedAction = SelectedAction(id: $0.id)
                         })
                     Divider()
                 } else if run.isServiceBacked && run.isStreaming {
-                    Label("Agent is working · current step has not been reported", systemImage: "ellipsis")
+                    Label(
+                        run.serviceActivitySourceIsCurrent
+                            ? "Agent is working · current step has not been reported"
+                            : "Waiting to refresh agent activity",
+                        systemImage: "ellipsis")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, Design.gutter).padding(.vertical, 8)
+                    Divider()
+                }
+                if run.childActivity.hasRecords {
+                    Button { showActivityHistory = true } label: {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "person.2")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Recorded child agents").font(.system(size: 11, weight: .medium))
+                                Text(run.childActivity.summary)
+                                    .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer(minLength: 4)
+                            Image(systemName: "chevron.right").font(.caption)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .padding(.horizontal, Design.gutter).padding(.vertical, 8)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("chat-child-activity")
+                    .accessibilityHint("Shows recorded child lifecycle counts and their limits")
                     Divider()
                 }
                 TranscriptView(
@@ -466,7 +497,7 @@ struct RunPane: View {
             runMetadata
 
             HStack(spacing: 8) {
-                if !run.serviceActionPresentations.isEmpty {
+                if !run.serviceActionPresentations.isEmpty || run.childActivity.hasRecords {
                     Button { showActivityHistory = true } label: {
                         Label("Activity", systemImage: "list.bullet.rectangle")
                     }

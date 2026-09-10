@@ -125,6 +125,31 @@ enum ChatJourneyProbe {
         guard let originalBridge = guarded.serviceBridge else {
             throw Failure.assertion("guarded service run lost its bridge")
         }
+        // The same last-known canonical rows can remain on screen after disconnect. They must
+        // not keep the activity strip looking live or turn unavailable child evidence into zero.
+        for connected in [true, false] {
+            var work = guardedProjection.workSnapshot
+            work.childStates = ["recorded-child": "running"]
+            let activityProjection = WorkServiceAttachedWorkProjection(
+                descriptor: guardedProjection.descriptor,
+                attachment: guardedProjection.attachment,
+                capabilities: guardedProjection.capabilities,
+                workSnapshot: work, sessionSnapshot: guardedProjection.sessionSnapshot,
+                workCursor: guardedProjection.workCursor, sessionCursor: guardedProjection.sessionCursor,
+                workSourceCompleteness: .complete, sessionSourceCompleteness: .complete,
+                connectivity: connected ? guardedProjection.connectivity : .disconnected)
+            let activityBridge = ServiceBackedRunBridge(
+                controller: originalBridge.controller, projection: activityProjection,
+                history: originalBridge.history, serviceAttachmentKey: originalBridge.serviceAttachmentKey,
+                workspaceLabel: "activity-probe", modelLabel: nil, thinkingLevel: nil)
+            let activityRun = LiveRun(service: activityBridge, cwd: home.root.path, title: "activity-probe")
+            try require(activityRun.serviceActivitySourceIsCurrent == connected,
+                        "activity freshness did not follow the actual bridge connection")
+            try require(activityRun.childActivity.hasRecords,
+                        "disconnect erased retained child lifecycle evidence")
+            try require(activityRun.chatActivity.sourceIsComplete == connected,
+                        "activity summary claimed a disconnected view was current")
+        }
         let pending = WorkServiceAttachedWorkPendingCommand(
             state: .indeterminate, kind: .start, commandID: "presentation-probe",
             client: client, attachment: first.attachment.attachment,
@@ -193,6 +218,51 @@ enum ChatJourneyProbe {
         }
         try require(starts.count == 1 && ordinaryProjection.descriptor.currentRun != nil,
                     "default restore did not admit exactly one canonical Start")
+
+        // Model a response that was lost after the host recorded End. Exact canonical command
+        // evidence retires only that uncertainty; a foreign command or ordinary local warning
+        // must survive the same refresh path.
+        guard let ordinaryBridge = ordinary.serviceBridge else {
+            throw Failure.assertion("ordinary service run lost its bridge")
+        }
+        let endCommandID = "journey-end-lost-confirmation"
+        _ = try await ordinaryBridge.end(commandID: endCommandID)
+        let retainedEnd = await ordinaryBridge.controller.pendingCommand()
+        try require(retainedEnd == nil,
+                    "canonical End refresh did not clear its retained command")
+        let certainty = await ordinaryBridge.failureCertainty(
+            for: WorkServiceAttachedWorkControllerError.sourceIncomplete,
+            commandID: endCommandID, kind: .end)
+        try require(certainty == .uncertain,
+                    "lost End response was presented as a proven rejection")
+        let key = ordinaryBridge.serviceAttachmentKey
+        let acknowledgement = ServiceBackedCommandNotice(
+            work: ordinaryBridge.work, commandID: endCommandID, kind: .end,
+            client: key.client, attachment: key.clientAttachment,
+            sessionAttachment: key.workSession.sessionAttachment,
+            evidence: .canonicalCommand)
+        ordinary.commandNotice = .uncertain(
+            "End confirmation was interrupted.", serviceAcknowledgement: acknowledgement)
+        await ordinary.refreshService(resumeInitialStart: false)
+        try require(ordinary.commandNotice == nil,
+                    "exact canonical End did not retire its uncertainty notice")
+
+        let foreignAcknowledgement = ServiceBackedCommandNotice(
+            work: ordinaryBridge.work, commandID: "foreign-end", kind: .end,
+            client: key.client, attachment: key.clientAttachment,
+            sessionAttachment: key.workSession.sessionAttachment,
+            evidence: .canonicalCommand)
+        ordinary.commandNotice = .uncertain(
+            "Foreign End confirmation was interrupted.",
+            serviceAcknowledgement: foreignAcknowledgement)
+        await ordinary.refreshService(resumeInitialStart: false)
+        try require(ordinary.commandNotice?.serviceAcknowledgement == foreignAcknowledgement,
+                    "canonical End cleared a foreign uncertainty notice")
+
+        ordinary.commandNotice = .warning("Unrelated local draft error")
+        await ordinary.refreshService(resumeInitialStart: false)
+        try require(ordinary.commandNotice == .warning("Unrelated local draft error"),
+                    "canonical End cleared an unrelated local warning")
     }
 
     @MainActor private static func runProjectReconfirmationProbe(root: URL) async throws {
@@ -254,18 +324,115 @@ enum ChatJourneyProbe {
         // This is the actual rail presentation gate, not a hand-built visual fixture. A
         // selected exact attachment may preserve a title, never repair canonical ambiguity.
         let attached = CanonicalWorkspaceRailPresentation.attachedFallback(
-            entryIsKnown: false, entryJoin: .incomplete,
+            entryIsKnown: false, entryJoin: .exact,
             attachedServiceBacked: true, attachedProjectionIsCanonical: true,
             attachedTitle: "Known chat title", attachedCommandState: .idle)
         try require(attached?.title == "Known chat title" && attached?.commandState == .idle,
-                    "catalog catch-up discarded exact attached chat identity")
-        for join in [CanonicalSessionWorkspaceRailJoin.duplicateSummary, .missingSummary, .exact] {
+                    "exact unknown catalog discarded attached chat identity")
+        let incompleteAttached = CanonicalWorkspaceRailPresentation.attachedFallback(
+            entryIsKnown: false, entryJoin: .incomplete,
+            attachedServiceBacked: true, attachedProjectionIsCanonical: true,
+            attachedTitle: "Known chat title", attachedCommandState: .idle)
+        try require(incompleteAttached == attached,
+                    "incomplete catalog lost the existing attached chat fallback")
+        for join in [CanonicalSessionWorkspaceRailJoin.duplicateSummary, .missingSummary] {
             try require(CanonicalWorkspaceRailPresentation.attachedFallback(
                 entryIsKnown: false, entryJoin: join,
                 attachedServiceBacked: true, attachedProjectionIsCanonical: true,
                 attachedTitle: "Known chat title", attachedCommandState: .idle) == nil,
                 "attached presentation hid a non-catch-up catalog condition")
         }
+        // Reproduce the production shape: the canonical summary joins by exact Session journal,
+        // but the attached Work cursor is ahead, so effective attention and the rail state remain
+        // unknown while Work's independently attached projection is still available.
+        let railSession = SessionRef("rail-catch-up-session")
+        let railSessionJournal = JournalRef.session(
+            railSession, journalID: "rail-catch-up-session-journal",
+            authority: TimelineAuthorityRef("rail-catch-up-authority"))
+        let railWork = WorkRef(workHostID: "rail-catch-up-host", workID: "rail-catch-up-work")
+        let railWorkJournal = JournalRef.work(railWork, journalID: "rail-catch-up-work-journal")
+        let railAttachment = SessionAttachmentRef("rail-catch-up-attachment")
+        let railRequestedCursor = JournalCursor(
+            journal: railWorkJournal, eventID: "rail-work-created", sequence: 1)
+        var railSessionSnapshot = SessionSnapshot()
+        railSessionSnapshot.session = railSession
+        railSessionSnapshot.journal = railSessionJournal
+        railSessionSnapshot.lifecycle = .active
+        railSessionSnapshot.attention = .none
+        railSessionSnapshot.lastEventID = "rail-session-attached"
+        railSessionSnapshot.lastSequence = 2
+        railSessionSnapshot.seenEventIDs = ["rail-session-created", "rail-session-attached"]
+        railSessionSnapshot.messages = [SessionMessageSnapshot(
+            eventID: "rail-session-message", role: "user", text: "Known chat title")]
+        railSessionSnapshot.attachments[railAttachment.attachmentID] = SessionAttachmentSnapshot(
+            attachment: railAttachment, work: railWork, cursor: railRequestedCursor)
+        var railWorkSnapshot = WorkSnapshot()
+        railWorkSnapshot.journal = railWorkJournal
+        railWorkSnapshot.work = railWork
+        railWorkSnapshot.workHost = WorkHostRef(railWork.workHostID)
+        railWorkSnapshot.lifecycle = .active
+        railWorkSnapshot.execution = .running
+        railWorkSnapshot.lastEventID = "rail-work-attached"
+        railWorkSnapshot.lastSequence = 2
+        railWorkSnapshot.eventSequences = ["rail-work-created": 1, "rail-work-attached": 2]
+        let railActor = TimelineActor(actorID: "rail-catch-up-probe", kind: "test")
+        let railSessionCreated = TimelineEvent(
+            eventID: "rail-session-created", journal: railSessionJournal, sequence: 1,
+            session: railSession, actor: railActor, hostRecordedAt: Date(timeIntervalSince1970: 1),
+            type: "session.created")
+        let railSessionAttached = TimelineEvent(
+            eventID: "rail-session-attached", journal: railSessionJournal, sequence: 2,
+            previousEventID: "rail-session-created", session: railSession, work: railWork,
+            sessionAttachment: railAttachment, actor: railActor,
+            hostRecordedAt: Date(timeIntervalSince1970: 2), type: "session.attached")
+        let railWorkCreated = TimelineEvent(
+            eventID: "rail-work-created", journal: railWorkJournal, sequence: 1,
+            work: railWork, workHost: WorkHostRef(railWork.workHostID), actor: railActor,
+            hostRecordedAt: Date(timeIntervalSince1970: 1), type: "work.created")
+        let railWorkAttached = TimelineEvent(
+            eventID: "rail-work-attached", journal: railWorkJournal, sequence: 2,
+            previousEventID: "rail-work-created", session: railSession, work: railWork,
+            workHost: WorkHostRef(railWork.workHostID),
+            sessionAttachment: railAttachment, actor: railActor,
+            hostRecordedAt: Date(timeIntervalSince1970: 2), type: "session.attached")
+        func railRecord(_ event: TimelineEvent, byteStart: Int) throws -> TimelineJournalRecord {
+            var bytes = try JSONEncoder().encode(event)
+            bytes.append(0x0A)
+            return TimelineJournalRecord(
+                event: event, rawLineBytes: bytes, byteStart: byteStart,
+                byteEnd: byteStart + bytes.count)
+        }
+        func railRead(_ events: [TimelineEvent]) throws -> TimelineJournalReadResult {
+            var offset = 0
+            var records: [TimelineJournalRecord] = []
+            for event in events {
+                let record = try railRecord(event, byteStart: offset)
+                records.append(record)
+                offset = record.byteEnd
+            }
+            return TimelineJournalReadResult(records: records)
+        }
+        guard let railSummary = SessionCatalogCanonicalAdapter.summarize(
+            session: railSessionSnapshot, works: [railWorkSnapshot],
+            cursors: [railAttachment.attachmentID: railRequestedCursor],
+            sessionRead: try railRead([railSessionCreated, railSessionAttached]),
+            workReads: [railWorkJournal: try railRead([railWorkCreated, railWorkAttached])]) else {
+            throw Failure.assertion("rail catch-up fixture did not produce a canonical summary")
+        }
+        let railProjection = CanonicalAttentionInboxProjection(summary: railSummary)
+            .workspaceRail(summaries: [railSummary])
+        guard let railEntry = railProjection.entries.first else {
+            throw Failure.assertion("rail catch-up fixture did not produce a rail entry")
+        }
+        try require(
+            railEntry.join == .exact && !railEntry.isKnown && railEntry.state == .unknown
+                && railEntry.workEvidence.count == 1,
+            "Work cursor lag did not produce the exact unknown rail shape")
+        try require(CanonicalWorkspaceRailPresentation.attachedFallback(
+            entryIsKnown: railEntry.isKnown, entryJoin: railEntry.join,
+            attachedServiceBacked: true, attachedProjectionIsCanonical: true,
+            attachedTitle: "Known chat title", attachedCommandState: .running) != nil,
+                    "exact unknown rail shape discarded attached presentation identity")
         for flags in [(true, true, true), (false, false, true), (false, true, false)] {
             try require(CanonicalWorkspaceRailPresentation.attachedFallback(
                 entryIsKnown: flags.0, entryJoin: .incomplete,

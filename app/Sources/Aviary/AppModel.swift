@@ -3950,12 +3950,13 @@ final class AppModel {
 /// message prevents a successful safe-boundary cancellation from being rendered as a warning
 /// merely because failures and acknowledgements share the same compact slot in the run UI.
 struct RunCommandNotice: Equatable {
-    enum Level: Equatable { case warning, success }
+    enum Level: Equatable { case warning, uncertain, success }
 
     var level: Level
     var message: String
-    /// Present only for a service-backed success. Warnings deliberately carry no service
-    /// identity so a later refresh can never erase a local error or draft-storage failure.
+    /// Present only for a service-backed success or transport-uncertain command. Ordinary
+    /// warnings deliberately carry no service identity so a later refresh can never erase a
+    /// local error or draft-storage failure.
     var serviceAcknowledgement: ServiceBackedCommandNotice?
 
     static func warning(_ message: String) -> Self {
@@ -3968,6 +3969,15 @@ struct RunCommandNotice: Equatable {
     ) -> Self {
         .init(
             level: .success, message: message,
+            serviceAcknowledgement: serviceAcknowledgement)
+    }
+
+    static func uncertain(
+        _ message: String,
+        serviceAcknowledgement: ServiceBackedCommandNotice
+    ) -> Self {
+        .init(
+            level: .uncertain, message: message,
             serviceAcknowledgement: serviceAcknowledgement)
     }
 }
@@ -4239,6 +4249,9 @@ final class LiveRun: Identifiable {
     /// Mirrored from the non-observable service bridge so an open action sheet tracks canonical
     /// lifecycle changes instead of freezing the value that happened to be selected.
     private(set) var serviceActionPresentations: [WorkActionPresentation] = []
+    /// Mirrored explicitly so disconnect-only changes invalidate activity views even if every
+    /// retained action and child row is byte-identical to the preceding read.
+    private(set) var serviceActivitySourceIsCurrent = false
     /// Exact entity counts omitted from the bounded GUI projection. This is mirrored into the
     /// observable run because both Cockpit and Live must disclose omissions without an inspector.
     private(set) var serviceProjectionOmissions: [WorkServiceOmission] = []
@@ -4267,6 +4280,17 @@ final class LiveRun: Identifiable {
     private var visualFixtureStartedLabel: String?
     var currentServiceActions: [WorkActionPresentation] {
         serviceActionPresentations.filter { !$0.state.isTerminal }
+    }
+    var chatActivity: ChatActivityPresentation {
+        ChatActivityPresentation(
+            actions: serviceActionPresentations,
+            sourceIsComplete: serviceActivitySourceIsCurrent
+                && serviceProjectionOmissions.isEmpty)
+    }
+    var childActivity: ChatChildActivityPresentation {
+        ChatChildActivityPresentation(
+            workingState: canonicalWorkingState,
+            sourceIsCurrent: serviceActivitySourceIsCurrent)
     }
     var serviceProjectionOmissionSummary: String? {
         guard !serviceProjectionOmissions.isEmpty else { return nil }
@@ -4403,6 +4427,7 @@ final class LiveRun: Identifiable {
         self.serviceAttachmentKey = bridge.serviceAttachmentKey
         self.serviceReviewDescriptor = bridge.latestRepositoryReviewDescriptor
         self.serviceActionPresentations = bridge.actionPresentations
+        self.serviceActivitySourceIsCurrent = bridge.activitySourceIsCurrent
         self.serviceProjectionOmissions = bridge.projection.projectionOmissions
         self.servicePendingInputs = bridge.pendingInputs
         self.serviceInputDeliveryAttention = bridge.inputDeliveryAttention
@@ -4915,6 +4940,7 @@ final class LiveRun: Identifiable {
         publish(serviceBridge.modelLabel, to: \.modelLabel)
         publish(serviceBridge.thinkingLevel, to: \.thinkingLevel)
         publish(serviceBridge.actionPresentations, to: \.serviceActionPresentations)
+        publish(serviceBridge.activitySourceIsCurrent, to: \.serviceActivitySourceIsCurrent)
         publish(serviceBridge.projection.projectionOmissions, to: \.serviceProjectionOmissions)
         publish(serviceBridge.pendingInputs, to: \.servicePendingInputs)
         publish(serviceBridge.inputDeliveryAttention, to: \.serviceInputDeliveryAttention)
@@ -4935,14 +4961,26 @@ final class LiveRun: Identifiable {
 
     private func serviceAcknowledgement(
         kind: WorkServiceCommandKind,
-        receipt: WorkServiceCommandReceipt
+        commandID: String,
+        work: WorkRef,
+        evidence: ServiceBackedCommandNotice.Evidence
     ) -> ServiceBackedCommandNotice? {
         guard let serviceBridge else { return nil }
         let key = serviceBridge.serviceAttachmentKey
         return ServiceBackedCommandNotice(
-            work: receipt.work, commandID: receipt.commandID, kind: kind,
+            work: work, commandID: commandID, kind: kind,
             client: key.client, attachment: key.clientAttachment,
-            sessionAttachment: key.workSession.sessionAttachment)
+            sessionAttachment: key.workSession.sessionAttachment,
+            evidence: evidence)
+    }
+
+    private func serviceAcknowledgement(
+        kind: WorkServiceCommandKind,
+        receipt: WorkServiceCommandReceipt
+    ) -> ServiceBackedCommandNotice? {
+        serviceAcknowledgement(
+            kind: kind, commandID: receipt.commandID, work: receipt.work,
+            evidence: .acceptedReceipt)
     }
 
     private func setServiceSuccessNotice(
@@ -4964,7 +5002,7 @@ final class LiveRun: Identifiable {
     /// paths, including local draft failures, remain visible.
     private func reconcileServiceCommandNotice() {
         guard let notice = commandNotice,
-              notice.level == .success,
+              notice.level == .success || notice.level == .uncertain,
               let acknowledgement = notice.serviceAcknowledgement,
               let projection = serviceBridge?.projection else { return }
         if ServiceBackedCommandNoticePolicy.shouldClear(acknowledgement, from: projection) {
@@ -5177,6 +5215,7 @@ final class LiveRun: Identifiable {
         run.servicePendingInputs = pendingInputs
         run.serviceInputDeliveryAttention = deliveryAttention
         run.serviceActionPresentations = actions
+        run.serviceActivitySourceIsCurrent = true
         run.recordedModelContext = recordedModelContext
         run.canonicalWorkingState = canonicalWorkingState
         run.visualFixtureCommandCapabilities = SessionCommandCapabilities(
@@ -5668,15 +5707,29 @@ final class LiveRun: Identifiable {
                 return
             }
             isEnding = true
+            let commandID = UUID().uuidString.lowercased()
             do {
-                let receipt = try await serviceBridge.end()
+                let receipt = try await serviceBridge.end(commandID: commandID)
                 setServiceSuccessNotice(
                     "Agent service accepted the end request; updating this chat…",
                     kind: .end, receipt: receipt)
             } catch {
-                commandNotice = .warning(serviceBridge.errorBanner ?? "The Work Host did not accept End.")
+                let certainty = await serviceBridge.failureCertainty(
+                    for: error, commandID: commandID, kind: .end)
+                if certainty == .rejected {
+                    commandNotice = .warning(
+                        serviceBridge.errorBanner ?? "The Work Host rejected End.")
+                } else if let acknowledgement = serviceAcknowledgement(
+                    kind: .end, commandID: commandID, work: serviceBridge.work,
+                    evidence: .canonicalCommand) {
+                    commandNotice = .uncertain(
+                        "Confirmation of the End request was interrupted. Aviary will not send "
+                            + "another copy; canonical Work must settle the original command.",
+                        serviceAcknowledgement: acknowledgement)
+                }
             }
             syncServiceState()
+            reconcileServiceCommandNotice()
             return
         }
         await stop()

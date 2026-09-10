@@ -23,12 +23,16 @@ enum VisualFixtureRoute: String {
     case repositoryReviewFeedbackNearFull = "repository-review-feedback-near-full-fixture"
     case repositoryReviewFeedbackFull = "repository-review-feedback-full-fixture"
     case projectReconfirmation = "project-reconfirmation-fixture"
+    case activityOverview = "activity-overview-fixture"
+    case activityOverviewNarrow = "activity-overview-narrow-fixture"
+    case activityOverviewStale = "activity-overview-stale-fixture"
 
     var isNarrow: Bool {
         self == .serviceChatNarrow || self == .productionDeliveryNarrow
             || self == .productionInspectorNarrow
             || self == .conversationHistoryNarrow
             || self == .repositoryReviewNarrow
+            || self == .activityOverviewNarrow
     }
 }
 
@@ -60,7 +64,30 @@ struct VisualFixtureView: View {
                 throw WorkHostWorkspaceRegistryError.workspaceNotFound
             }, confirm: { _ in .confirmedNeedsRefresh })
                 .background(Color(nsColor: .windowBackgroundColor))
+        case .activityOverview, .activityOverviewNarrow, .activityOverviewStale:
+            ActivityOverviewFixture(isCurrent: route != .activityOverviewStale)
         }
+    }
+}
+
+private struct ActivityOverviewFixture: View {
+    let isCurrent: Bool
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Agent activity").font(.headline).padding(16)
+            Divider()
+            ScrollView {
+                ChatActivityContent(
+                    activity: ChatActivityPresentation(
+                        actions: WorkActionPresentation.project(FixtureData.activityOverviewActions),
+                        sourceIsComplete: isCurrent),
+                    children: ChatChildActivityPresentation(
+                        workingState: FixtureData.inspectorProjections.working,
+                        sourceIsCurrent: isCurrent))
+                    .padding(16)
+            }
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
@@ -235,6 +262,18 @@ private enum FixtureData {
         outcomeEvent: observation("event-action-outcome-000", sequence: 13, offset: 14))
 
     static let actions = [activeAction, completedAction]
+    static let activityOverviewActions = actions + [
+        WorkActionSnapshot(
+            action: ActionRef("activity-failed-search"), state: .failed,
+            failureKind: .timeout, retrySafety: .unknown, kind: .webSearch,
+            intent: "Look up the provider's retry behavior",
+            startedEvent: observation("activity-failed-start", sequence: 14, offset: 15),
+            outcomeEvent: observation("activity-failed-end", sequence: 15, offset: 20)),
+        WorkActionSnapshot(
+            action: ActionRef("activity-queued-check"), state: .queued, kind: .runtime,
+            intent: "Check the integration tests after the current step",
+            intentEvent: observation("activity-queued-intent", sequence: 21, offset: 45)),
+    ]
 
     static let inspectorProjections: (
         context: RecordedModelContextProjection,
@@ -332,7 +371,8 @@ private enum FixtureData {
         workSnapshot.handles = [
             "fixture-handle": WorkHandleSnapshot(handle: HandleRef("fixture-handle"), state: "running")
         ]
-        workSnapshot.childStates = ["fixture-child": "done"]
+        workSnapshot.childStates = ["fixture-child": "done", "fixture-child-running": "running",
+                                    "fixture-child-failed": "failed"]
         let recoveryCoverage = RecoveryCoverage(
             operation: .reattachLiveHost,
             planes: [

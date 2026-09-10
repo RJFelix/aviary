@@ -6,22 +6,28 @@ import SwiftUI
 struct WorkActivityStrip: View {
     let action: WorkActionPresentation
     let concurrentActions: [WorkActionPresentation]
+    var sourceIsCurrent: Bool = true
     let onInspect: (WorkActionPresentation) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 9) {
-            PulseDot(color: WorkActionVisuals.tint(for: action.state))
-                .padding(.top, 5)
+            Group {
+                if sourceIsCurrent && action.state == .running {
+                    PulseDot(color: WorkActionVisuals.tint(for: action.state))
+                } else {
+                    Circle().fill(.secondary).frame(width: 6, height: 6)
+                }
+            }.padding(.top, 5)
             VStack(alignment: .leading, spacing: 3) {
                 Text(action.intent ?? action.kindTitle)
                     .font(.system(size: 12, weight: .medium))
                     .lineLimit(2)
                 HStack(spacing: 5) {
-                    Text(action.kindTitle)
+                    Text(sourceIsCurrent ? action.kindTitle : "Last recorded activity")
                     Text("·")
                     Text(action.stateTitle)
                     if concurrentActions.count > 1 {
-                        Text("· \(concurrentActions.count) active actions")
+                        Text("· \(concurrentActions.count) unsettled in view")
                     }
                 }
                 .font(.system(size: 10.5)).foregroundStyle(.secondary)
@@ -61,7 +67,7 @@ struct ChatActivityHistoryView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Agent activity").font(.headline)
-                    Text("Current and recently recorded actions")
+                    Text("Current steps and recorded outcomes")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -74,19 +80,81 @@ struct ChatActivityHistoryView: View {
                     if let omissions = run.serviceProjectionOmissionSummary {
                         Text(omissions).font(.caption).foregroundStyle(.secondary)
                     }
-                    if run.serviceActionPresentations.isEmpty {
-                        Text("No recorded actions are available in this view.")
-                            .foregroundStyle(.secondary)
-                    }
-                    ForEach(run.serviceActionPresentations) { action in
-                        WorkActionLensRow(action: action)
-                        Divider()
-                    }
+                    ChatActivityContent(activity: run.chatActivity, children: run.childActivity)
                 }.padding(16)
             }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Agent activity")
+        .frame(minWidth: 420, idealWidth: 640, minHeight: 420, idealHeight: 660)
+    }
+}
+
+/// Shared by the live sheet and deterministic visual fixtures; every row is prepared in Core.
+struct ChatActivityContent: View {
+    let activity: ChatActivityPresentation
+    let children: ChatChildActivityPresentation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text(activity.summary)
+                .font(.subheadline).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if !activity.sourceIsComplete {
+                Label("Recorded view only · some activity may be unavailable or out of date",
+                      systemImage: "info.circle")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if children.hasRecords || !children.isAvailable {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Recorded child agents", systemImage: "person.2")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(children.summary).font(.system(size: 12))
+                    Text(children.disclosure).font(.caption).foregroundStyle(.secondary)
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Design.accent.opacity(0.05), in: RoundedRectangle(cornerRadius: 9))
+            }
+            actionSection(
+                activity.sourceIsComplete ? "In progress" : "Last recorded as unsettled",
+                subtitle: "Includes queued, proposed, and cancellation-requested steps; not every step is executing.",
+                actions: activity.current)
+            actionSection(
+                "Recorded problems",
+                subtitle: "Past failures or uncertain effects. These do not by themselves mean the agent is blocked or that you should retry.",
+                actions: activity.problems)
+            actionSection("Completed", subtitle: "Recorded outcomes, including canceled steps.",
+                          actions: activity.completed)
+            if activity.omittedCount > 0 {
+                Text("\(activity.omittedCount) additional action records are outside this view.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func actionSection(
+        _ title: String, subtitle: String, actions: [WorkActionPresentation]
+    ) -> some View {
+        if !actions.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(title).font(.system(size: 13, weight: .semibold))
+                    Text("\(actions.count) in view").font(.caption).foregroundStyle(.secondary)
+                }
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(actions) { action in
+                    WorkActionLensRow(action: action)
+                    Divider()
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(title)
+        }
     }
 }
 

@@ -91,6 +91,12 @@ for index, rid in enumerate((callback_rid, "missing-callback")):
         "result": {"answer": "late"},
     }) + "\n").encode())
     print(json.dumps(read_message()), flush=True)
+sock.sendall((json.dumps({
+    "id": "probe-result-invalid",
+    "op": "callback.result",
+    "rid": "missing-result-field",
+}) + "\n").encode())
+print(json.dumps(read_message()), flush=True)
 """#
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -797,11 +803,13 @@ func test_runtimeHostCallbacksReplayAfterDisconnectAndReconnect() async throws {
     XCTAssertEqual(recorded.map(\.client), ["original", "reattached"])
     let resolutionLines = try callbackResolutionProbe(
         endpoint: descriptor.endpoint, identity: descriptor.identity, callbackRID: firstDelivery.rid)
-    XCTAssertEqual(resolutionLines.count, 2)
+    XCTAssertEqual(resolutionLines.count, 3)
     XCTAssertEqual(resolutionLines[0].path("data.delivered")?.boolValue, false)
     XCTAssertEqual(resolutionLines[0].path("data.status")?.stringValue, "duplicate")
     XCTAssertEqual(resolutionLines[1].path("data.delivered")?.boolValue, false)
     XCTAssertEqual(resolutionLines[1].path("data.status")?.stringValue, "stale")
+    XCTAssertEqual(resolutionLines[2].path("data.delivered")?.boolValue, false)
+    XCTAssertEqual(resolutionLines[2].path("data.status")?.stringValue, "invalid")
     _ = try? await oldExecution.value
 
     releaseOldClient.signal()

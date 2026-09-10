@@ -6,12 +6,22 @@ import Foundation
 /// canonical projection retire the banner without allowing an unrelated command, client, or
 /// attachment to do so.
 public struct ServiceBackedCommandNotice: Equatable, Hashable, Sendable {
+    public enum Evidence: Equatable, Hashable, Sendable {
+        /// The caller received an accepted receipt. Preserve the receipt/cursor correlation that
+        /// prevents a later unrelated command from retiring its acknowledgement.
+        case acceptedReceipt
+        /// The response was lost or malformed. A complete canonical projection of this exact
+        /// client-qualified command is sufficient to settle uncertainty without replaying it.
+        case canonicalCommand
+    }
+
     public let work: WorkRef
     public let commandID: String
     public let kind: WorkServiceCommandKind
     public let client: ClientRef
     public let attachment: ClientAttachmentRef
     public let sessionAttachment: SessionAttachmentRef?
+    public let evidence: Evidence
 
     public init(
         work: WorkRef,
@@ -19,7 +29,8 @@ public struct ServiceBackedCommandNotice: Equatable, Hashable, Sendable {
         kind: WorkServiceCommandKind,
         client: ClientRef,
         attachment: ClientAttachmentRef,
-        sessionAttachment: SessionAttachmentRef?
+        sessionAttachment: SessionAttachmentRef?,
+        evidence: Evidence = .acceptedReceipt
     ) {
         self.work = work
         self.commandID = commandID
@@ -27,15 +38,17 @@ public struct ServiceBackedCommandNotice: Equatable, Hashable, Sendable {
         self.client = client
         self.attachment = attachment
         self.sessionAttachment = sessionAttachment
+        self.evidence = evidence
     }
 }
 
-/// Pure lifecycle policy for a service-backed success notice.
+/// Pure lifecycle policy for a service-backed acknowledgement or uncertainty notice.
 ///
 /// ``clear`` means the canonical Work journal has caught up with the exact accepted command;
-/// it does not mean that a provider has delivered a response. In particular, a canonical
-/// ``accepted`` command remains distinct from ``delivered``. An incomplete read, a foreign
-/// command, or a missing exact canonical record retains the acknowledgement.
+/// it does not mean that a provider has delivered a response. Receipt-backed notices retain the
+/// receipt/cursor correlation, while a notice created after lost confirmation can be settled by
+/// the exact canonical command alone. An incomplete read, a foreign command, or a missing exact
+/// canonical record retains the notice.
 /// Transport connectivity is intentionally not another gate: a complete canonical snapshot is
 /// valid evidence even while the host is offline. The attached controller marks a failed read's
 /// retained snapshot incomplete, which is covered by ``isCanonical`` and prevents stale clearing.
@@ -49,23 +62,50 @@ public enum ServiceBackedCommandNoticePolicy {
         for notice: ServiceBackedCommandNotice,
         projection: WorkServiceAttachedWorkProjection
     ) -> ServiceBackedCommandNoticeDisposition {
-        guard projection.isCanonical,
-              projection.descriptor.work == notice.work,
-              projection.attachment.client == notice.client,
-              projection.attachment.attachment == notice.attachment,
-              projection.pendingCommand == nil,
-              let receipt = projection.lastReceipt,
+        guard projection.pendingCommand == nil,
+              let command = exactCanonicalCommandEvidence(for: notice, in: projection)
+        else { return .retain }
+
+        if notice.evidence == .canonicalCommand {
+            return .clear
+        }
+
+        guard let receipt = projection.lastReceipt,
               (receipt.state == .accepted || receipt.state == .duplicate),
               receipt.work == notice.work,
               receipt.commandID == notice.commandID,
               outcomeMatches(receipt, kind: notice.kind),
               let resultingCursor = receipt.resultingWorkCursor,
               reaches(projection.workCursor, resulting: resultingCursor),
-              let eventID = resultingCursor.eventID
-        else {
-            return .retain
-        }
+              let eventID = resultingCursor.eventID,
+              command.acceptanceEventRef == EventRef(
+                  journal: resultingCursor.journal, eventID: eventID)
+        else { return .retain }
+        return .clear
+    }
 
+    /// Whether this complete projection contains a host-recorded acceptance/delivery of the
+    /// exact client-qualified command. Unlike notice retirement, this crossing predicate does
+    /// not require the controller's single pending slot to be empty: a later pending command
+    /// cannot erase evidence that this earlier command reached Work.
+    public static func hasExactCanonicalCommandEvidence(
+        for notice: ServiceBackedCommandNotice,
+        in projection: WorkServiceAttachedWorkProjection
+    ) -> Bool {
+        exactCanonicalCommandEvidence(for: notice, in: projection) != nil
+    }
+
+    private static func exactCanonicalCommandEvidence(
+        for notice: ServiceBackedCommandNotice,
+        in projection: WorkServiceAttachedWorkProjection
+    ) -> WorkCommandSnapshot? {
+        guard projection.isCanonical,
+              projection.descriptor.work == notice.work,
+              projection.attachment.client == notice.client,
+              projection.attachment.attachment == notice.attachment,
+              projection.workSnapshot.journal == projection.descriptor.journal,
+              projection.workCursor.journal == projection.descriptor.journal
+        else { return nil }
         let canonicalID = WorkServiceCommandLedgerIdentity.commandID(
             client: notice.client, commandID: notice.commandID)
         guard let command = projection.workSnapshot.commands[canonicalID],
@@ -73,14 +113,16 @@ public enum ServiceBackedCommandNoticePolicy {
               command.command.client == notice.client,
               command.command.sessionAttachment == notice.sessionAttachment,
               command.commandKind == canonicalKind(for: notice.kind),
-              command.state != .rejected,
-              command.state != .indeterminate,
-              command.acceptanceEventRef == EventRef(
-                  journal: resultingCursor.journal, eventID: eventID)
-        else {
-            return .retain
-        }
-        return .clear
+              command.state == .accepted || command.state == .delivered,
+              let acceptance = command.acceptanceEventRef,
+              acceptance.journal == projection.descriptor.journal,
+              !acceptance.eventID.isEmpty,
+              command.acceptanceHostSequence > 0,
+              command.acceptanceHostSequence <= projection.workCursor.sequence,
+              command.acceptanceHostSequence < projection.workCursor.sequence
+                  || projection.workCursor.eventID == acceptance.eventID
+        else { return nil }
+        return command
     }
 
     public static func shouldClear(

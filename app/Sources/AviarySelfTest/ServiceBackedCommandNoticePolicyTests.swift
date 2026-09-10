@@ -24,7 +24,9 @@ private func noticePolicyProjection(
     lastReceiptOutcome: WorkServiceCommandOutcome? = .inputAccepted,
     receiptEventID: String = "accepted-event",
     receiptSequence: Int = 2,
-    acceptanceEventID: String = "accepted-event",
+    acceptanceEventID: String? = "accepted-event",
+    acceptanceJournal: JournalRef = noticePolicyJournal,
+    acceptanceHostSequence: Int = 2,
     readDiagnostics: [String] = []
 ) throws -> WorkServiceAttachedWorkProjection {
     let workCursor = JournalCursor(journal: noticePolicyJournal, eventID: "accepted-event", sequence: 2)
@@ -72,8 +74,10 @@ private func noticePolicyProjection(
             commandID: canonicalID, client: commandClient,
             sessionAttachment: noticePolicySessionAttachment, causalCursor: causalCursor),
         state: commandState, actor: TimelineActor(actorID: "notice-host", kind: "host"),
-        hostSequence: 2, acceptanceEventRef: EventRef(
-            journal: noticePolicyJournal, eventID: acceptanceEventID),
+        hostSequence: acceptanceHostSequence,
+        acceptanceEventRef: acceptanceEventID.map {
+            EventRef(journal: acceptanceJournal, eventID: $0)
+        },
         commandKind: commandKind)
 
     var sessionSnapshot = SessionSnapshot()
@@ -102,11 +106,13 @@ private func noticePolicyProjection(
 private func noticePolicyNotice(
     commandID: String = noticePolicyCommandID,
     kind: WorkServiceCommandKind = .send,
-    client: ClientRef = noticePolicyClient
+    client: ClientRef = noticePolicyClient,
+    evidence: ServiceBackedCommandNotice.Evidence = .acceptedReceipt
 ) -> ServiceBackedCommandNotice {
     ServiceBackedCommandNotice(
         work: noticePolicyWork, commandID: commandID, kind: kind, client: client,
-        attachment: noticePolicyAttachment, sessionAttachment: noticePolicySessionAttachment)
+        attachment: noticePolicyAttachment, sessionAttachment: noticePolicySessionAttachment,
+        evidence: evidence)
 }
 
 func testServiceBackedCommandNoticePolicyRetainsReceiptUntilCanonicalCatchUp() throws {
@@ -216,6 +222,64 @@ func testServiceBackedCommandNoticePolicyUsesCanonicalEvidenceAcrossConnectivity
         ServiceBackedCommandNoticePolicy.shouldClear(noticePolicyNotice(), from: failedRefresh))
 }
 
+func testServiceBackedCommandNoticePolicySettlesLostEndConfirmationExactly() throws {
+    let notice = noticePolicyNotice(kind: .end, evidence: .canonicalCommand)
+    for state in [CommandDeliveryState.accepted, .delivered] {
+        let projection = try noticePolicyProjection(
+            commandKind: .end, commandState: state,
+            lastReceiptCommandID: "unrelated-receipt",
+            lastReceiptOutcome: .inputAccepted)
+        XCTAssertTrue(
+            ServiceBackedCommandNoticePolicy.shouldClear(notice, from: projection),
+            "exact canonical \(state.rawValue) must settle a lost End response")
+    }
+
+    let laterPending = WorkServiceAttachedWorkPendingCommand(
+        state: .indeterminate, kind: .send, commandID: "later-pending-command",
+        client: noticePolicyClient, attachment: noticePolicyAttachment,
+        sessionAttachment: noticePolicySessionAttachment,
+        causalWorkCursor: JournalCursor(
+            journal: noticePolicyJournal, eventID: "accepted-event", sequence: 2),
+        valueDigest: nil)
+    let crossedBeforeLaterPending = try noticePolicyProjection(
+        commandKind: .end, pending: laterPending)
+    XCTAssertTrue(ServiceBackedCommandNoticePolicy.hasExactCanonicalCommandEvidence(
+        for: notice, in: crossedBeforeLaterPending))
+    XCTAssertFalse(ServiceBackedCommandNoticePolicy.shouldClear(
+        notice, from: crossedBeforeLaterPending))
+
+    let incomplete = try noticePolicyProjection(commandKind: .end, canonical: false)
+    XCTAssertFalse(ServiceBackedCommandNoticePolicy.shouldClear(notice, from: incomplete))
+    let foreign = try noticePolicyProjection(commandID: "foreign-end", commandKind: .end)
+    XCTAssertFalse(ServiceBackedCommandNoticePolicy.shouldClear(notice, from: foreign))
+    let wrongKind = try noticePolicyProjection(commandKind: .send)
+    XCTAssertFalse(ServiceBackedCommandNoticePolicy.shouldClear(notice, from: wrongKind))
+
+    let missingProvenance = try noticePolicyProjection(
+        commandKind: .end, acceptanceEventID: nil)
+    XCTAssertFalse(
+        ServiceBackedCommandNoticePolicy.shouldClear(notice, from: missingProvenance))
+    let foreignJournal = try noticePolicyProjection(
+        commandKind: .end, acceptanceJournal: noticePolicySessionJournal)
+    XCTAssertFalse(ServiceBackedCommandNoticePolicy.shouldClear(notice, from: foreignJournal))
+    let futureAcceptance = try noticePolicyProjection(
+        commandKind: .end, acceptanceHostSequence: 3)
+    XCTAssertFalse(ServiceBackedCommandNoticePolicy.shouldClear(notice, from: futureAcceptance))
+    let invalidZeroSequence = try noticePolicyProjection(
+        commandKind: .end, acceptanceHostSequence: 0)
+    XCTAssertFalse(
+        ServiceBackedCommandNoticePolicy.shouldClear(notice, from: invalidZeroSequence))
+    let mismatchedTip = try noticePolicyProjection(
+        commandKind: .end, acceptanceEventID: "other-event")
+    XCTAssertFalse(ServiceBackedCommandNoticePolicy.shouldClear(notice, from: mismatchedTip))
+    for state in [CommandDeliveryState.rejected, .notDelivered, .indeterminate] {
+        let unsettled = try noticePolicyProjection(commandKind: .end, commandState: state)
+        XCTAssertFalse(
+            ServiceBackedCommandNoticePolicy.shouldClear(notice, from: unsettled),
+            "canonical \(state.rawValue) must not settle uncertain End presentation")
+    }
+}
+
 let casesServiceBackedCommandNoticePolicy: [Case] = [
     ("service command notice: recovered read diagnostics no longer block input", {
         let history = ["earlier connection failed"]
@@ -247,5 +311,8 @@ let casesServiceBackedCommandNoticePolicy: [Case] = [
     }),
     ("service command notice uses canonical evidence across connectivity", {
         try testServiceBackedCommandNoticePolicyUsesCanonicalEvidenceAcrossConnectivity()
+    }),
+    ("service command notice settles lost End confirmation exactly", {
+        try testServiceBackedCommandNoticePolicySettlesLostEndConfirmationExactly()
     }),
 ]
