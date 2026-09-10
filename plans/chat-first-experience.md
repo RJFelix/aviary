@@ -480,7 +480,8 @@ Production verification found missing assistant-message provenance: the producer
 Session attachment even though Run and Turn were recorded. New `message.committed` events now
 carry the exact attachment; the producer/reducer regression passes 1 case / 16 assertions.
 Existing messages without that evidence remain picker-only rather than receiving guessed links.
-Signed verification of new-message turn links is pending helper deployment.
+Signed `477e819` verification confirms that newly produced assistant messages link to their exact
+saved review; two distinct turn links and independently loaded observations were inspected.
 
 The live startup journey also exposed an implicit-selection race: asynchronous restoration could
 reorder the chat list before any default focus was pinned. The first background attachment now
@@ -537,5 +538,23 @@ No canonical validation is weakened. A byte-identical SHA-256 hexadecimal format
 repeated Foundation formatting allocations (2 cases / 1,032 assertions). Its isolated 2,000-call
 measurement was 0.0042s versus 0.0387s for the prior formatter, not a whole-app speed claim.
 Before deployment, the unchanged helper consumed 18.56 CPU seconds over a 60-second idle window
-with the same five attached chats and no agent runtime. Post-deployment measurement, signed
-interaction checks, and the final whole-suite receipt are pending.
+with five attached chats and no agent runtime. The upgraded helper consumed 6.64 CPU seconds over
+74 seconds with the same attached chats (about 31% versus 9% of one core). This is one local
+spot-check of the combined changes, not an isolated scheduler benchmark or a general speedup claim.
+
+Signed `477e819` was signature-verified and deployed with a fresh helper. A disposable Git project
+completed two real read-only provider turns. The first linked review contains the quantity fix;
+the second additionally contains negative-quantity validation introduced by the test operator.
+Hunk selection focused the feedback editor; Keep editing preserved an existing hunk anchor.
+Place in composer retained the exact source prefix and did not Send (the canonical Session still
+had one input). That composer draft survived GUI-only relaunch on the same helper. Switching
+between two saved reviews retained the older review's in-sheet draft and hunk, without leaking
+it into the newer review. Explicit End produced `run.finished` and the runtime exited; Start/Send/
+End acknowledgements cleared without manual refresh. The five pre-existing request/Work files
+checked before the journey remained byte-identical.
+
+The final whole macOS suite for `477e819` passes 1,076 cases / 16,164 assertions in 521.42 seconds.
+Release GUI/helper builds pass in 186.24s / 2.31s, with strict bundle signature verification.
+No new Linux/remote runtime receipt is claimed. The live check exposed a separate navigation gap:
+GUI relaunch restored the draft correctly but focused an older chat; stable selection restoration
+and unambiguous accessibility targets are the next bounded correction.
