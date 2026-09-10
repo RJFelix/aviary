@@ -137,6 +137,10 @@ enum LinuxSelfTestMain {
             ("Work service: background refresh scheduling policy", {
                 try await runLinuxCases(casesServiceBackedRefreshSchedulingPolicy)
             }),
+            ("Work service: control acknowledgements and stop results", {
+                try await runLinuxCases(casesServiceBackedCommandNoticePolicy)
+                try await runLinuxCases(casesServiceBackedControlResultPolicy)
+            }),
             ("Work service: transport independent clients and ordered mutations", {
                 try await test_workServiceTransportSupportsIndependentClientsAndOrderedMutations()
             }),

@@ -169,6 +169,11 @@ final class ServiceBackedRunBridge {
         inputDeliveryProjection.unresolvedAcceptedCommands
     }
 
+    /// A canonical command result, deliberately weaker than a provider/turn outcome claim.
+    var controlResult: ServiceBackedControlResult? {
+        ServiceBackedControlResultPolicy.latestResult(in: projection)
+    }
+
     var repositoryReviewHistory: WorkServiceRepositoryReviewHistory {
         WorkServiceRepositoryReviewHistory(
             workSession: serviceAttachmentKey.workSession,

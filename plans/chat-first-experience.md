@@ -549,8 +549,9 @@ Hunk selection focused the feedback editor; Keep editing preserved an existing h
 Place in composer retained the exact source prefix and did not Send (the canonical Session still
 had one input). That composer draft survived GUI-only relaunch on the same helper. Switching
 between two saved reviews retained the older review's in-sheet draft and hunk, without leaking
-it into the newer review. Explicit End produced `run.finished` and the runtime exited; Start/Send/
-End acknowledgements cleared without manual refresh. The five pre-existing request/Work files
+it into the newer review. Explicit End produced `run.finished` and the runtime exited. Start/Send
+acknowledgements cleared; a later inspection found that the End acknowledgement still lingered
+despite complete canonical evidence (see follow-up below). The five pre-existing request/Work files
 checked before the journey remained byte-identical.
 
 The final whole macOS suite for `477e819` passes 1,076 cases / 16,164 assertions in 521.42 seconds.
@@ -558,3 +559,19 @@ Release GUI/helper builds pass in 186.24s / 2.31s, with strict bundle signature 
 No new Linux/remote runtime receipt is claimed. The live check exposed a separate navigation gap:
 GUI relaunch restored the draft correctly but focused an older chat; stable selection restoration
 and unambiguous accessibility targets are the next bounded correction.
+
+Signed `dd4b810` restores the selected chat by its exact durable attachment, scoped to AgentHome.
+The production AppModel chat-journey probe passes; GUI-only quit/relaunch returned to the selected
+disposable chat with its exact unsent draft while the helper PID stayed unchanged. Only the shown
+chat is accessibility-selected. Saved-review controls now have distinct artifact/message IDs and
+timestamp labels. Their live verification exposed a separate sheet-routing bug: clicking an older
+review could initialize the sheet with the latest descriptor. The correction captures the Run and
+descriptor together in one item-based presentation value; signed verification is pending.
+
+The next real-provider journey queued one follow-up during a 30-second read-only Python action.
+The UI showed host acceptance before runtime delivery, and both requested replies appeared in
+order. A subsequent Stop after step let the current Python action finish and recorded a canceled
+turn without another model response. No files were changed by these agent turns. Two presentation
+gaps are under correction: native `end_run`/`queue_follow_up` command kinds were not recognized by
+the acknowledgement policy, and a settled cancellation currently leaves only an Idle/Ready state
+without an explicit stopped-turn marker.

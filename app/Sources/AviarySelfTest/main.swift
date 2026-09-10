@@ -7163,6 +7163,7 @@ await Harness.run(
         + casesServiceBackedRefreshSchedulingPolicy
         + casesChatInteractionPresentation
         + casesServiceBackedCommandNoticePolicy
+        + casesServiceBackedControlResultPolicy
         + casesWorkServiceAttachedWorkController
         + casesAviaryDigestFormatting
         + casesRepositoryReviewDiffProjection

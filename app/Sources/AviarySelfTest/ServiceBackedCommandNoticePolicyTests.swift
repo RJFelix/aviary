@@ -125,6 +125,53 @@ private func noticePolicyNotice(
         evidence: evidence)
 }
 
+/// Reduce the same command-kind labels written by NativeSessionCommandJournal instead of
+/// constructing a typed WorkCommandSnapshot directly. This catches producer vocabulary which
+/// otherwise decodes to an unavailable command kind before notice policy sees it.
+private func noticePolicyReducedCommandKind(_ rawValue: String) throws -> CanonicalCommandKind? {
+    let commandID = WorkServiceCommandLedgerIdentity.commandID(
+        client: noticePolicyClient, commandID: noticePolicyCommandID)
+    let before = EventRef(journal: noticePolicyJournal, eventID: "attached-event")
+    let command = CommandRef(
+        commandID: commandID, client: noticePolicyClient,
+        sessionAttachment: noticePolicySessionAttachment,
+        causalCursor: JournalCursor(
+            journal: noticePolicyJournal, eventID: before.eventID, sequence: 2))
+    let events = [
+        TimelineEvent(
+            eventID: "created-event", journal: noticePolicyJournal, sequence: 1,
+            work: noticePolicyWork, workHost: WorkHostRef(noticePolicyWork.workHostID),
+            actor: TimelineActor(actorID: "notice-host", kind: "work-host"),
+            hostRecordedAt: Date(timeIntervalSince1970: 1),
+            type: TimelineEventType.workCreated),
+        TimelineEvent(
+            eventID: before.eventID, journal: noticePolicyJournal, sequence: 2,
+            previousEventID: "created-event", session: noticePolicySession,
+            work: noticePolicyWork, workHost: WorkHostRef(noticePolicyWork.workHostID),
+            sessionAttachment: noticePolicySessionAttachment,
+            actor: TimelineActor(actorID: "notice-host", kind: "work-host"),
+            hostRecordedAt: Date(timeIntervalSince1970: 2),
+            type: TimelineEventType.sessionAttached),
+        TimelineEvent(
+            eventID: "accepted-event", journal: noticePolicyJournal, sequence: 3,
+            hostSequence: 3, idempotencyKey: commandID, command: command,
+            previousEventID: before.eventID, causedByEventID: before,
+            session: noticePolicySession, work: noticePolicyWork,
+            workHost: WorkHostRef(noticePolicyWork.workHostID), client: noticePolicyClient,
+            sessionAttachment: noticePolicySessionAttachment,
+            actor: TimelineActor(actorID: "notice-host", kind: "work-host"),
+            hostRecordedAt: Date(timeIntervalSince1970: 3),
+            type: TimelineEventType.commandAccepted,
+            payload: .object([
+                "command_kind": .string(rawValue),
+                "delivery_mode": .string(RunInputDeliveryMode.queued.rawValue),
+                "carries_session_input": .bool(false),
+            ])),
+    ]
+    let snapshot = WorkReducer.reduce(events)
+    return try XCTUnwrap(snapshot.commands[commandID]).commandKind
+}
+
 func testServiceBackedCommandNoticePolicyRetainsReceiptUntilCanonicalCatchUp() throws {
     let causal = JournalCursor(journal: noticePolicyJournal, eventID: "before-event", sequence: 1)
     let pending = WorkServiceAttachedWorkPendingCommand(
@@ -312,6 +359,25 @@ func testServiceBackedCommandNoticePolicySettlesLostEndConfirmationExactly() thr
     }
 }
 
+func testServiceBackedCommandNoticePolicyMatchesNativeLifecycleAliases() throws {
+    let nativeEnd = try noticePolicyReducedCommandKind("end_run")
+    XCTAssertEqual(nativeEnd, .endRun)
+    let endProjection = try noticePolicyProjection(commandKind: nativeEnd)
+    XCTAssertTrue(ServiceBackedCommandNoticePolicy.shouldClear(
+        noticePolicyNotice(kind: .end), from: endProjection))
+
+    let nativeQueue = try noticePolicyReducedCommandKind("queue_follow_up")
+    XCTAssertEqual(nativeQueue, .queueFollowUp)
+    let queueProjection = try noticePolicyProjection(commandKind: nativeQueue)
+    XCTAssertTrue(ServiceBackedCommandNoticePolicy.shouldClear(
+        noticePolicyNotice(kind: .queue), from: queueProjection))
+
+    XCTAssertFalse(ServiceBackedCommandNoticePolicy.shouldClear(
+        noticePolicyNotice(kind: .end), from: queueProjection))
+    XCTAssertFalse(ServiceBackedCommandNoticePolicy.shouldClear(
+        noticePolicyNotice(kind: .queue), from: endProjection))
+}
+
 let casesServiceBackedCommandNoticePolicy: [Case] = [
     ("service command notice: recovered read diagnostics no longer block input", {
         let history = ["earlier connection failed"]
@@ -346,5 +412,8 @@ let casesServiceBackedCommandNoticePolicy: [Case] = [
     }),
     ("service command notice settles lost End confirmation exactly", {
         try testServiceBackedCommandNoticePolicySettlesLostEndConfirmationExactly()
+    }),
+    ("service command notice matches native lifecycle aliases", {
+        try testServiceBackedCommandNoticePolicyMatchesNativeLifecycleAliases()
     }),
 ]

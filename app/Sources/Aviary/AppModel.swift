@@ -4266,6 +4266,8 @@ final class LiveRun: Identifiable {
     var startedAt = Date()
     var errorBanner: String?
     var commandNotice: RunCommandNotice?
+    /// Durable Work-service control evidence that survives acknowledgement-banner retirement.
+    var serviceControlResult: ServiceBackedControlResult?
     var stderrTail: [String] = []
     var launchCommand = ""
     var title: String = "New run"
@@ -4583,6 +4585,7 @@ final class LiveRun: Identifiable {
                 .map { String($0.text.prefix(80)) }
             ?? bridge.workspaceLabel
         self.commandState = bridge.commandState
+        self.serviceControlResult = bridge.controlResult
         self.isStreaming = bridge.isStreaming
         self.hasExited = bridge.isTerminal
         self.isEnding = bridge.isEnding
@@ -5067,6 +5070,7 @@ final class LiveRun: Identifiable {
         publish(serviceBridge.isTerminal, to: \.hasExited)
         publish(serviceBridge.isEnding, to: \.isEnding)
         publish(serviceBridge.commandState, to: \.commandState)
+        publish(serviceBridge.controlResult, to: \.serviceControlResult)
         publish(serviceBridge.projection.commandInFlight, to: \.serviceCommandInFlight)
         publish(serviceBridge.errorBanner, to: \.errorBanner)
         publish(serviceBridge.modelLabel, to: \.modelLabel)

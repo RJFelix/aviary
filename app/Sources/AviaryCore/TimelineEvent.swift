@@ -123,6 +123,9 @@ public enum CanonicalCommandKind: String, Codable, CaseIterable, Hashable, Senda
     case hold
     case cancel
     case end
+    /// Native Session command journals name ending the current Run `end_run`. Work-service
+    /// callers expose the same operation as `end`. Both producer vocabularies are canonical.
+    case endRun = "end_run"
     case destroy
     case complete
 }

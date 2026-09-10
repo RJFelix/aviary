@@ -233,6 +233,15 @@ struct RunPane: View {
         let id: String
     }
 
+    /// One sheet value captures both sides of the review association at the tap boundary.
+    /// Keeping this as one item avoids an `isPresented` closure observing a newer descriptor
+    /// state than the transcript button that opened it.
+    private struct SelectedRepositoryReview: Identifiable {
+        let id = UUID()
+        let run: LiveRun
+        let descriptor: WorkServiceArtifactDescriptor
+    }
+
     @Environment(AppModel.self) private var model
     var run: LiveRun
     /// Cockpit owns its two-column layout, so it reuses the chat/composer without a third
@@ -246,8 +255,7 @@ struct RunPane: View {
     @State private var confirmEndRun = false
     @State private var showInputDeliveryReview = false
     @State private var showCockpitInspector = false
-    @State private var showRepositoryReview = false
-    @State private var selectedReviewDescriptor: WorkServiceArtifactDescriptor?
+    @State private var selectedRepositoryReview: SelectedRepositoryReview?
     @State private var showActivityHistory = false
     @State private var showProjectReconfirmation = false
     @State private var projectCheckError: String?
@@ -329,6 +337,13 @@ struct RunPane: View {
                     )
                         .padding(Design.gutter)
                 }
+                if run.serviceControlResult == .stopRequestDelivered {
+                    NoticeBanner(
+                        level: .info,
+                        title: "Stop request delivered",
+                        message: "Ready for your next message.")
+                        .padding(Design.gutter)
+                }
                 if let omissions = run.serviceProjectionOmissionSummary {
                     NoticeBanner(
                         level: .info,
@@ -403,8 +418,8 @@ struct RunPane: View {
                     reviewDescriptorsByMessageID: run.serviceReviewsByTranscriptID,
                     onReviewMessage: { id in
                         guard let descriptor = run.serviceReviewsByTranscriptID[id] else { return }
-                        selectedReviewDescriptor = descriptor
-                        showRepositoryReview = true
+                        selectedRepositoryReview = SelectedRepositoryReview(
+                            run: run, descriptor: descriptor)
                     },
                     onSelect: { selectedItem = $0 })
                 Divider()
@@ -458,8 +473,8 @@ struct RunPane: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Run context and working state")
         }
-        .sheet(isPresented: $showRepositoryReview) {
-            RepositoryReviewView(run: run, descriptor: selectedReviewDescriptor)
+        .sheet(item: $selectedRepositoryReview) { selection in
+            RepositoryReviewView(run: selection.run, descriptor: selection.descriptor)
                 .frame(minWidth: 560, idealWidth: 760, minHeight: 620, idealHeight: 780)
         }
         .sheet(isPresented: $showActivityHistory) {
@@ -515,14 +530,12 @@ struct RunPane: View {
                 if run.canLoadServiceRepositoryReview {
                     ViewThatFits(in: .horizontal) {
                         Button {
-                            selectedReviewDescriptor = nil
-                            showRepositoryReview = true
+                            presentLatestRepositoryReview()
                         } label: {
-                            Label("Review changes", systemImage: "doc.text.magnifyingglass")
+                            Label("Review latest", systemImage: "doc.text.magnifyingglass")
                         }
                         Button {
-                            selectedReviewDescriptor = nil
-                            showRepositoryReview = true
+                            presentLatestRepositoryReview()
                         } label: {
                             Image(systemName: "doc.text.magnifyingglass")
                                 .frame(width: 20, height: 20)
@@ -531,10 +544,10 @@ struct RunPane: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .keyboardShortcut("r", modifiers: [.command, .shift])
-                    .accessibilityLabel("Review changes")
+                    .accessibilityLabel("Review latest changes")
                     .accessibilityHint(
-                        "Opens the bounded current working-tree observation for this Work")
-                    .help("Review current working-tree changes")
+                        "Opens the latest saved working-tree observation for this Work")
+                    .help("Review latest saved working-tree changes")
                 }
                 if !showsInspector {
                     Button {
@@ -581,6 +594,12 @@ struct RunPane: View {
         .padding(.horizontal, Design.gutter)
         .padding(.vertical, 9)
         .background(.background.secondary)
+    }
+
+    private func presentLatestRepositoryReview() {
+        guard let descriptor = run.serviceReviewDescriptor else { return }
+        selectedRepositoryReview = SelectedRepositoryReview(
+            run: run, descriptor: descriptor)
     }
 
     private var runMetadata: some View {

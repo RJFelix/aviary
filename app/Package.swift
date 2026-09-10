@@ -69,6 +69,7 @@ let linuxCoreSources: [String] = [
     "RepositoryReviewDiffProjection.swift",
     "ChatInteractionPresentation.swift",
     "ServiceBackedCommandNoticePolicy.swift",
+    "ServiceBackedControlResultPolicy.swift",
     "ServiceBackedStartIntentStore.swift",
     "SkillGate.swift",
     "SubAgents.swift",
@@ -137,6 +138,7 @@ let linuxSelfTestSources: [String] = [
     "RepositoryReviewDiffProjectionTests.swift",
     "ChatInteractionPresentationTests.swift",
     "ServiceBackedCommandNoticePolicyTests.swift",
+    "ServiceBackedControlResultPolicyTests.swift",
     "LinuxSelfTestMain.swift",
 ]
 #else

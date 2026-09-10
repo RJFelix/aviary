@@ -108,7 +108,8 @@ public enum ServiceBackedCommandNoticePolicy {
               command.command.commandID == canonicalID,
               command.command.client == notice.client,
               command.command.sessionAttachment == notice.sessionAttachment,
-              command.commandKind == canonicalKind(for: notice.kind),
+              let commandKind = command.commandKind,
+              canonicalKinds(for: notice.kind).contains(commandKind),
               command.state == .accepted || command.state == .delivered,
               let acceptance = command.acceptanceEventRef,
               acceptance.journal == projection.descriptor.journal,
@@ -138,17 +139,22 @@ public enum ServiceBackedCommandNoticePolicy {
         return candidate.sequence > required.sequence || candidate.eventID == required.eventID
     }
 
-    private static func canonicalKind(for kind: WorkServiceCommandKind) -> CanonicalCommandKind {
+    /// Native Session journals and the Work-service API use different labels for two equivalent
+    /// operations. Accept only those explicit aliases; every other service command remains an
+    /// exact one-to-one vocabulary match.
+    private static func canonicalKinds(
+        for kind: WorkServiceCommandKind
+    ) -> Set<CanonicalCommandKind> {
         switch kind {
-        case .start: return .start
-        case .send: return .send
-        case .steer: return .steer
-        case .queue: return .queue
-        case .hold: return .hold
-        case .cancel: return .cancel
-        case .end: return .end
-        case .destroy: return .destroy
-        case .complete: return .complete
+        case .start: return [.start]
+        case .send: return [.send]
+        case .steer: return [.steer]
+        case .queue: return [.queue, .queueFollowUp]
+        case .hold: return [.hold]
+        case .cancel: return [.cancel]
+        case .end: return [.end, .endRun]
+        case .destroy: return [.destroy]
+        case .complete: return [.complete]
         }
     }
 }
