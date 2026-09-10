@@ -240,6 +240,42 @@ enum ChatJourneyProbe {
         try require(explicitFocus == ordinary.id,
                     "background restoration overrode an existing run focus")
 
+        // Relaunch selection is keyed by the exact durable attachment, never LiveRun's
+        // process-local UUID. Isolate UserDefaults so this probe cannot change real GUI choices.
+        let suiteName = "aviary-chat-journey-" + UUID().uuidString.lowercased()
+        guard let selectionDefaults = UserDefaults(suiteName: suiteName),
+              let guardedKey = guarded.serviceAttachmentKey,
+              let ordinaryKey = ordinary.serviceAttachmentKey else {
+            throw Failure.assertion("could not create an isolated selection preference")
+        }
+        defer { selectionDefaults.removePersistentDomain(forName: suiteName) }
+        let firstLaunch = AppModel(presentationDefaults: selectionDefaults)
+        firstLaunch.home = home
+        firstLaunch.focusRun(ordinary)
+        let reopenedLaunch = AppModel(presentationDefaults: selectionDefaults)
+        reopenedLaunch.home = home
+        try require(
+            reopenedLaunch.preferredServiceAttachmentKey == ordinaryKey
+                && reopenedLaunch.preferredServiceAttachmentKey != guardedKey,
+            "relaunch did not retain the exact selected service attachment")
+        try require(
+            AppModel.preferredServiceRestoreIndex(
+                candidates: [guardedKey, ordinaryKey],
+                preferred: reopenedLaunch.preferredServiceAttachmentKey) == 1,
+            "relaunch could not prioritize the selected attachment over catalog order")
+        try require(
+            AppModel.preferredServiceRestoreIndex(
+                candidates: [guardedKey], preferred: ordinaryKey) == nil,
+            "a missing or hidden attachment preference matched another candidate")
+        let pendingSelection = UUID()
+        reopenedLaunch.selectedPendingChatID = pendingSelection
+        reopenedLaunch.newChatRequested = true
+        reopenedLaunch.focusRun(guarded)
+        try require(
+            reopenedLaunch.selectedPendingChatID == pendingSelection
+                && reopenedLaunch.newChatRequested,
+            "background attachment focus erased pending or new-chat intent")
+
         // Model a response that was lost after the host recorded End. Exact canonical command
         // evidence retires only that uncertainty; a foreign command or ordinary local warning
         // must survive the same refresh path.

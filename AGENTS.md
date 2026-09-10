@@ -139,6 +139,11 @@ just shots    # every screen renders, against your real agent directory
 `AviarySelfTest` uses `AVIARY_SELFTEST_FILTER` for substring selection; it does not parse
 `--help` as a discovery command (that launches the full suite, including runtime processes).
 Inspect the registered case arrays with `rg`, then run with an explicit filter for focused work.
+The executable uses the small assertion API in `AviarySelfTest/Harness.swift`, not XCTest.
+Check that API before adding assertions: use `XCTAssertTrue(a <= b)` for ordering and explicit
+`do`/`catch` for throwing checks; XCTest's ordering/throwing convenience functions are absent.
+For shared-tree builds, a source freeze includes new files and test fixtures. Once a lane reports
+frozen, send further findings without editing until the verifier releases the freeze.
 Use `AVIARY_SELFTEST_TRACE=1` for unbuffered per-case begin/end markers on stderr when diagnosing
 a long or stalled run; redirected stdout alone can lag several cases behind the active test.
 For a generic GUI canonical-read failure, launch the signed executable with

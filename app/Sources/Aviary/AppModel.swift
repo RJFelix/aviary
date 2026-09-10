@@ -144,7 +144,12 @@ final class AppModel {
     var pendingChatDetails: [UUID: String] = [:]
     // MARK: Configuration
 
-    var home: AgentHome = .default
+    var home: AgentHome = .default {
+        didSet {
+            preferredServiceAttachmentKey = Self.loadPreferredServiceAttachment(
+                home: home, defaults: presentationDefaults)
+        }
+    }
     var engines: [EngineLocation] = []
     /// The harness build Aviary used to drive.
     ///
@@ -330,6 +335,8 @@ final class AppModel {
     /// Process-local cadence bookkeeping for the timer poll. Explicit refreshes bypass this
     /// policy and observe every attached row plus the authoritative catalog immediately.
     private var serviceRefreshSchedule = ServiceBackedRefreshSchedulingPolicy.State()
+    private let presentationDefaults: UserDefaults
+    private(set) var preferredServiceAttachmentKey: ServiceAttachmentKey?
     private var serviceCreateInFlight = false
     /// Process-level service work that can publish or mutate a GUI attachment. Shutdown closes
     /// admission and drains this set before taking its final `workRuns` snapshot, so an adoption
@@ -374,6 +381,12 @@ final class AppModel {
     var reloadInProgress = false
     var acceptsNewWork = true
 
+    init(presentationDefaults: UserDefaults = .standard) {
+        self.presentationDefaults = presentationDefaults
+        self.preferredServiceAttachmentKey = Self.loadPreferredServiceAttachment(
+            home: .default, defaults: presentationDefaults)
+    }
+
     @discardableResult
     func stopAllWork() async -> Bool {
         acceptsNewWork = false
@@ -411,6 +424,9 @@ final class AppModel {
                 self.localWorkServiceError =
                     "Quit or reload was canceled because an unsent draft could not be saved. Copy or repair the marked draft, then try again."
                 return false
+            }
+            if let focused = self.workRuns.first(where: { $0.id == self.focusedRunID }) {
+                self.rememberServiceAttachmentSelection(focused)
             }
             // Claude Code and the old in-process path still have an explicit process-owned
             // teardown.  A Work-service run is different: disconnecting this GUI must not
@@ -609,6 +625,50 @@ final class AppModel {
         current: UUID?, admitted: UUID
     ) -> UUID {
         current ?? admitted
+    }
+
+    static func preferredServiceRestoreIndex(
+        candidates: [ServiceAttachmentKey?], preferred: ServiceAttachmentKey?
+    ) -> Int? {
+        guard let preferred else { return nil }
+        return candidates.firstIndex { $0 == preferred }
+    }
+
+    private static func preferredServiceAttachmentDefaultsKey(home: AgentHome) -> String {
+        let pathDigest = AviarySHA256.hash(
+            data: Data(home.root.standardizedFileURL.path.utf8)).description
+        return "aviary.focused-service-attachment.v1." + String(pathDigest.prefix(24))
+    }
+
+    private static func loadPreferredServiceAttachment(
+        home: AgentHome, defaults: UserDefaults
+    ) -> ServiceAttachmentKey? {
+        guard let data = defaults.data(
+            forKey: preferredServiceAttachmentDefaultsKey(home: home)),
+              data.count <= 16_384,
+              let key = try? JSONDecoder().decode(ServiceAttachmentKey.self, from: data),
+              key.isValid else { return nil }
+        return key
+    }
+
+    private func savePreferredServiceAttachment(_ key: ServiceAttachmentKey?) {
+        let defaultsKey = Self.preferredServiceAttachmentDefaultsKey(home: home)
+        guard let key, let data = try? JSONEncoder().encode(key) else {
+            presentationDefaults.removeObject(forKey: defaultsKey)
+            return
+        }
+        presentationDefaults.set(data, forKey: defaultsKey)
+    }
+
+    func focusRun(_ run: LiveRun) {
+        focusedRunID = run.id
+        rememberServiceAttachmentSelection(run)
+    }
+
+    private func rememberServiceAttachmentSelection(_ run: LiveRun) {
+        guard let key = run.serviceAttachmentKey else { return }
+        preferredServiceAttachmentKey = key
+        savePreferredServiceAttachment(key)
     }
 
     // MARK: Lifecycle
@@ -853,19 +913,34 @@ final class AppModel {
                 || hasUnrepresentedOwnAttachment || hasUnattachedSemanticTarget
                 || canCreateSession
         }
-        for descriptor in catalog.works {
+        var restorationCandidates: [(WorkServiceWorkDescriptor, WorkServiceClientAttachment)] = []
+        for descriptor in catalog.works where descriptor.recordedDisposition == .reusable {
+            for attachment in descriptor.attachments where attachment.client == client {
+                restorationCandidates.append((descriptor, attachment))
+            }
+        }
+        if let preferredServiceAttachmentKey {
+            let keys = restorationCandidates.map {
+                ServiceAttachmentKey(work: $0.0.work, attachment: $0.1)
+            }
+            if let preferredIndex = Self.preferredServiceRestoreIndex(
+                candidates: keys, preferred: preferredServiceAttachmentKey) {
+                restorationCandidates.insert(
+                    restorationCandidates.remove(at: preferredIndex), at: 0)
+            } else if host.sourceCompleteness == .complete {
+                self.preferredServiceAttachmentKey = nil
+                savePreferredServiceAttachment(nil)
+            }
+        }
+        for (descriptor, attachment) in restorationCandidates {
             // Terminal Work remains available from Sessions/catalog and through the explicit
             // Attach action below, but relaunch should not flood Live with completed history.
-            guard descriptor.recordedDisposition == .reusable else { continue }
-            let attachments = descriptor.attachments.filter { $0.client == client }
-            for attachment in attachments {
-                guard let key = ServiceAttachmentKey(work: descriptor.work, attachment: attachment),
-                      !hiddenServiceAttachmentKeys.contains(key) else { continue }
-                await adoptServiceAttachment(
-                    descriptor: descriptor, attachment: attachment,
-                    session: session, client: client, focus: false,
-                    resumeInitialStart: resumeInitialStart)
-            }
+            guard let key = ServiceAttachmentKey(work: descriptor.work, attachment: attachment),
+                  !hiddenServiceAttachmentKeys.contains(key) else { continue }
+            await adoptServiceAttachment(
+                descriptor: descriptor, attachment: attachment,
+                session: session, client: client, focus: false,
+                resumeInitialStart: resumeInitialStart)
         }
         // A Start seed may outlive both its GUI and its Run. Terminal Work is not auto-opened
         // into Live, but its exact command evidence can still settle the local marker so a later

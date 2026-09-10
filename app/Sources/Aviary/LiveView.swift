@@ -36,7 +36,7 @@ struct LiveView: View {
             HStack(spacing: 6) {
                 ForEach(model.runs) { run in
                     Button {
-                        model.focusedRunID = run.id
+                        model.focusRun(run)
                     } label: {
                         HStack(spacing: 5) {
                             if run.isStreaming {
@@ -400,7 +400,7 @@ struct RunPane: View {
                     onJumpToLatestHistory: run.isServiceBacked ? {
                         await run.jumpServiceHistoryToLatest()
                     } : nil,
-                    reviewMessageIDs: Set(run.serviceReviewsByTranscriptID.keys),
+                    reviewDescriptorsByMessageID: run.serviceReviewsByTranscriptID,
                     onReviewMessage: { id in
                         guard let descriptor = run.serviceReviewsByTranscriptID[id] else { return }
                         selectedReviewDescriptor = descriptor

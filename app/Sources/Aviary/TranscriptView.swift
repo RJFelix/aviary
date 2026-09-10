@@ -29,7 +29,7 @@ struct TranscriptView: View {
     var earlierHistoryError: String?
     var onLoadEarlierHistory: (() -> Void)?
     var onJumpToLatestHistory: (() async -> Void)?
-    var reviewMessageIDs: Set<String> = []
+    var reviewDescriptorsByMessageID: [String: WorkServiceArtifactDescriptor] = [:]
     var onReviewMessage: ((String) -> Void)?
     var onSelect: ((TranscriptItem) -> Void)?
 
@@ -70,7 +70,8 @@ struct TranscriptView: View {
                                     hideThinking: hideThinking,
                                     isLast: item.id == visible.last?.id && isStreaming,
                                     onSelect: onSelect)
-                                if reviewMessageIDs.contains(item.id), let onReviewMessage {
+                                if let descriptor = reviewDescriptorsByMessageID[item.id],
+                                   let onReviewMessage {
                                     Button { onReviewMessage(item.id) } label: {
                                         Label("Saved changes after this turn", systemImage: "doc.text.magnifyingglass")
                                     }
@@ -78,6 +79,15 @@ struct TranscriptView: View {
                                     .font(.system(size: 11))
                                     .foregroundStyle(Design.accent)
                                     .padding(.leading, 30)
+                                    .accessibilityIdentifier(
+                                        "saved-review-\(descriptor.artifactID.utf8.count)-"
+                                            + descriptor.artifactID + "-" + item.id)
+                                    .accessibilityLabel(
+                                        item.timestamp == .distantPast
+                                            ? "Saved changes after this turn, time unknown"
+                                            : "Saved changes after the turn at "
+                                                + item.timestamp.formatted(
+                                                    date: .abbreviated, time: .standard))
                                 }
                             }.id(item.id)
                         }

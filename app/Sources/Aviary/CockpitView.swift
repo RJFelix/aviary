@@ -90,7 +90,8 @@ struct CockpitView: View {
     /// pane. Without this, an old selection would still look highlighted while the New
     /// Session card is the one open — two cards claiming the same state at once.
     private func isShowing(_ run: LiveRun) -> Bool {
-        !composingNewSession && run.id == selectedRun?.id
+        !composingNewSession && model.selectedPendingChatID == nil
+            && run.id == selectedRun?.id
     }
 
     private var runRail: some View {
@@ -106,9 +107,10 @@ struct CockpitView: View {
                         .foregroundStyle(.tertiary)
                     Button { showsConnections = true } label: {
                         Image(systemName: "ellipsis.circle")
-                    }.buttonStyle(.plain)
-                        .accessibilityLabel("Manage agent connections")
-                        .help("Manage agent connections and reopen detached chats")
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Manage agent connections")
+                    .help("Manage agent connections and reopen detached chats")
                 }
                 .padding(.horizontal, 12).padding(.top, 12)
 
@@ -135,7 +137,14 @@ struct CockpitView: View {
                         .background(RoundedRectangle(cornerRadius: 9).fill(
                             model.selectedPendingChatID == chat.id && !composingNewSession
                                 ? Design.accentSoft : Color.secondary.opacity(0.05)))
-                    }.buttonStyle(.plain)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(
+                        model.selectedPendingChatID == chat.id && !composingNewSession
+                            ? .isSelected : [])
+                    .accessibilityRemoveTraits(
+                        model.selectedPendingChatID == chat.id && !composingNewSession
+                            ? [] : .isSelected)
                 }
 
                 if !needsAttentionEntries.isEmpty {
@@ -148,7 +157,7 @@ struct CockpitView: View {
                 }
                 ForEach(unrepresentedRuns) { run in
                     RunRailCard(run: run, selected: isShowing(run)) {
-                        model.focusedRunID = run.id
+                        model.focusRun(run)
                         model.selectedPendingChatID = nil
                         selectedCanonicalEntryID = nil
                         selectedCanonicalWorkTarget = nil
@@ -293,6 +302,9 @@ struct CockpitView: View {
             selected: !composingNewSession && selectedCanonicalEntry?.id == entry.id
         ) {
             selectedCanonicalEntryID = entry.id
+            if attachedRuns.count == 1, let run = attachedRuns.first {
+                model.focusRun(run)
+            }
             model.selectedPendingChatID = nil
             selectedCanonicalWorkTarget = nil
             composingNewSession = false
@@ -430,6 +442,8 @@ private struct RunRailCard: View {
                         lineWidth: 1))
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityRemoveTraits(selected ? [] : .isSelected)
     }
 }
 
@@ -510,6 +524,8 @@ private struct CanonicalWorkspaceRailCard: View {
                         lineWidth: 1))
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityRemoveTraits(selected ? [] : .isSelected)
         .accessibilityLabel(
             "\(displayTitle), \(entry.state.label), authority \(entry.authorityID)")
         .accessibilityValue(
@@ -893,6 +909,8 @@ private struct NewRunRailCard: View {
                         style: StrokeStyle(lineWidth: 1, dash: selected ? [] : [4, 3])))
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityRemoveTraits(selected ? [] : .isSelected)
     }
 }
 
