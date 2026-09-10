@@ -61,7 +61,10 @@ what it does; this file is how to work on it without relearning the traps.
 - **The catalog cache keys on file size and mtime**, so it detects a changed transcript and
   completely misses a changed parser. Bump `SessionCatalog.schemaVersion` when you change
   how a summary is derived, or your improvement silently does nothing for every session
-  already indexed.
+  already indexed. Canonical reducer changes also require auditing the persistent Work exact
+  state, bounded reducer head, and attached-GUI checkpoint versions: suffix replay does not
+  reinterpret old derived rows. Prove obsolete-cache rejection and replay from unchanged
+  journal bytes, not just fresh-run behavior.
 - **`input_tokens` from Anthropic excludes cached context.** A cached turn reads
   `input 2, cacheRead 3953`, so summing input and output undercounts a long session by a
   factor of fifty. `ClaudeCode.usage` is cache-inclusive; `AnthropicMessagesProvider` is not,

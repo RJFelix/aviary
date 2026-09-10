@@ -344,10 +344,8 @@ public struct LocalTimelineProjectionReader: Sendable {
             // Keep malformed current-version roots fail-closed below rather than treating every
             // validation error as a migration.
             if kind == .work, try isLegacyWorkExactCheckpoint(cached.snapshot) {
-                return try coldRebuild(
-                    validationMetrics: validationMetrics,
-                    expectedGeneration: cached.snapshot.generation,
-                    exactNamespaceID: cached.snapshot.namespaceID)
+                _ = try store.clear()
+                return try coldRebuild(validationMetrics: validationMetrics)
             }
             if cached.snapshot.cursor.sequence > 0 {
                 // A bounded reducer head is not sufficient evidence for either journal. Validate
@@ -401,9 +399,7 @@ public struct LocalTimelineProjectionReader: Sendable {
     // MARK: Cold and growth operations
 
     private func coldRebuild(
-        validationMetrics: LocalTimelineProjectionSourceLease.Metrics,
-        expectedGeneration: Int? = nil,
-        exactNamespaceID: String? = nil
+        validationMetrics: LocalTimelineProjectionSourceLease.Metrics
     ) throws -> Result {
         let before = try observeSource()
         guard before.source.sourceByteCount >= 0 else { throw ReaderError.sourceChanged }
@@ -424,8 +420,7 @@ public struct LocalTimelineProjectionReader: Sendable {
         if kind == .work {
             let prepared = try makeWorkExactState(
                 source: before.source,
-                namespaceID: exactNamespaceID
-                    ?? defaultWorkExactNamespaceID(source: before.source))
+                namespaceID: defaultWorkExactNamespaceID(source: before.source))
             workMap = prepared.map
             workExactState = prepared.state
         } else {
@@ -524,7 +519,7 @@ public struct LocalTimelineProjectionReader: Sendable {
         }
         let commit = try index.makeCommit(
             source: finalSource, cursor: cursor, prefixSeed: prefixSeed,
-            reducerHead: head.opaque, expectedGeneration: expectedGeneration,
+            reducerHead: head.opaque, expectedGeneration: nil,
             recentPages: index.recentPages,
             exactStateCheckpoint: exactCheckpoint)
         let snapshot = try commitStore(
@@ -558,6 +553,11 @@ public struct LocalTimelineProjectionReader: Sendable {
         guard before.source.sourceByteCount <= limits.maximumBootstrapSourceBytes else {
             throw ReaderError.sourceTooLarge
         }
+        if kind == .work, cached.exactStateCheckpoint != nil,
+           try isLegacyWorkExactCheckpoint(cached) {
+            _ = try store.clear()
+            return try coldRebuild(validationMetrics: validationMetrics)
+        }
         let prefixSeed = cached.prefixSeed
         guard prefixSeed.sequence == 0, prefixSeed.byteCount == 0,
               prefixSeed.previousEventID == nil,
@@ -584,33 +584,20 @@ public struct LocalTimelineProjectionReader: Sendable {
         let suffixPreviousEventID: String?
         let suffixPrefixDigest: String
         if cached.exactStateCheckpoint != nil {
-            if try isLegacyWorkExactCheckpoint(cached) {
-                let prepared = try makeWorkExactState(
-                    source: before.source,
-                    namespaceID: cached.namespaceID)
-                workMap = prepared.map
-                workExactState = prepared.state
-                suffixStartByte = 0
-                suffixStartSequence = 1
-                suffixPreviousEventID = nil
-                suffixPrefixDigest = DisposableTimelineProjectionStore.canonicalPrefixSeed(
-                    for: journal)
-            } else {
-                let loaded = try loadWorkExactState(from: cached, source: cached.source)
-                workMap = loaded.map
-                workExactState = loaded.state
-                exactValidation = loaded.validationMetrics
-                guard cached.source.prefixByteCount == cached.source.sourceByteCount,
-                      cached.cursor.sequence > 0,
-                      cached.cursor.sequence < Int.max,
-                      cached.cursor.eventID != nil else {
-                    throw ReaderError.invalidCachedProjection
-                }
-                suffixStartByte = cached.source.prefixByteCount
-                suffixStartSequence = cached.cursor.sequence + 1
-                suffixPreviousEventID = cached.cursor.eventID
-                suffixPrefixDigest = cached.source.prefixDigest
+            let loaded = try loadWorkExactState(from: cached, source: cached.source)
+            workMap = loaded.map
+            workExactState = loaded.state
+            exactValidation = loaded.validationMetrics
+            guard cached.source.prefixByteCount == cached.source.sourceByteCount,
+                  cached.cursor.sequence > 0,
+                  cached.cursor.sequence < Int.max,
+                  cached.cursor.eventID != nil else {
+                throw ReaderError.invalidCachedProjection
             }
+            suffixStartByte = cached.source.prefixByteCount
+            suffixStartSequence = cached.cursor.sequence + 1
+            suffixPreviousEventID = cached.cursor.eventID
+            suffixPrefixDigest = cached.source.prefixDigest
         } else {
             // Only an empty Work cache may be upgraded without a persisted exact root. A
             // nonempty rootless cache would require guessing at omitted reducer membership.
@@ -852,8 +839,8 @@ public struct LocalTimelineProjectionReader: Sendable {
         let replayBytes: Int
     }
 
-    private static let exactWorkMapKind = "work-exact-v2"
-    private static let legacyWorkMapKind = "work-exact-v1"
+    private static let exactWorkMapKind = "work-exact-v3"
+    private static let legacyWorkMapKinds: Set<String> = ["work-exact-v1", "work-exact-v2"]
     private static let exactSessionMapKind = "session-exact-v1"
 
     /// The map is deliberately private to this projection store.  Its namespace is stable for a
@@ -879,8 +866,8 @@ public struct LocalTimelineProjectionReader: Sendable {
     private func defaultWorkExactNamespaceID(
         source: DisposableTimelineProjectionStore.SourceFingerprint
     ) -> String {
-        "work-exact-v2." + AviarySHA256.hash(data: Data(
-            "aviary-work-exact-namespace-v2\u{0}\(journal.stableKey)\u{0}"
+        "work-exact-v3." + AviarySHA256.hash(data: Data(
+            "aviary-work-exact-namespace-v3\u{0}\(journal.stableKey)\u{0}"
                 .appending(source.sourceGeneration)
                 .appending("\u{0}\(source.sourceByteCount)\u{0}")
                 .appending(source.fingerprint)
@@ -956,7 +943,7 @@ public struct LocalTimelineProjectionReader: Sendable {
               let descriptor = checkpoint.roots.first else {
             return false
         }
-        return descriptor.mapKind == Self.legacyWorkMapKind
+        return Self.legacyWorkMapKinds.contains(descriptor.mapKind)
     }
 
     private func makeWorkExactCheckpoint(

@@ -2932,6 +2932,64 @@ func testWorkServiceAttachedCheckpointStoreDetectsTornAndAlteredRecords() async 
     }
 }
 
+func testWorkServiceAttachedControllerRejectsV5SnapshotAndRebuildsNativeEndKind() async throws {
+    let fixture = try AttachedControllerFixture()
+    let service = AttachedControllerTestService(fixture: fixture)
+    let prior = fixture.workEvents.last!
+    let command = CommandRef(
+        commandID: "controller-native-end", client: fixture.client,
+        sessionAttachment: fixture.sessionAttachment,
+        causalCursor: JournalCursor(
+            journal: fixture.workJournal, eventID: prior.eventID,
+            sequence: prior.sequence))
+    let accepted = TimelineEvent(
+        eventID: "controller-native-end-accepted", journal: fixture.workJournal,
+        sequence: prior.sequence + 1, hostSequence: 1,
+        idempotencyKey: command.commandID, command: command,
+        previousEventID: prior.eventID,
+        causedByEventID: EventRef(journal: fixture.workJournal, eventID: prior.eventID),
+        session: fixture.session, work: fixture.work, workHost: fixture.host,
+        client: fixture.client, sessionAttachment: fixture.sessionAttachment,
+        actor: prior.actor, hostRecordedAt: Date(timeIntervalSince1970: 3),
+        type: TimelineEventType.commandAccepted,
+        payload: .object([
+            "command_kind": .string("end_run"),
+            "delivery_mode": .string(RunInputDeliveryMode.queued.rawValue),
+            "carries_session_input": .bool(false),
+        ]))
+    await service.replaceWorkEvents(fixture.workEvents + [accepted])
+
+    let box = AttachedControllerCheckpointBox()
+    let checkpointStore = AttachedControllerCheckpointStore(box: box)
+    let first = try makeAttachedController(
+        fixture: fixture, service: service, checkpointStore: checkpointStore)
+    let current = try await first.refresh()
+    XCTAssertEqual(
+        current.workSnapshot.commands[command.commandID]?.commandKind, .endRun)
+    let currentRecord = try XCTUnwrap(box.record)
+    var oldObject = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: JSONEncoder().encode(currentRecord))
+            as? [String: Any])
+    oldObject["schemaVersion"] = 5
+    box.record = try JSONDecoder().decode(
+        WorkServiceAttachedWorkCheckpointStore.Record.self,
+        from: JSONSerialization.data(withJSONObject: oldObject, options: [.sortedKeys]))
+
+    let requestsBeforeRestart = await service.snapshotRequestCursors().count
+    let replacement = try makeAttachedController(
+        fixture: fixture, service: service, checkpointStore: checkpointStore)
+    let unrestored = await replacement.projection()
+    XCTAssertEqual(unrestored.workSnapshot.lastSequence, 0)
+    let rebuilt = try await replacement.refresh()
+    XCTAssertEqual(
+        rebuilt.workSnapshot.commands[command.commandID]?.commandKind, .endRun)
+    let allRequests = await service.snapshotRequestCursors()
+    let restartRequests = allRequests.dropFirst(requestsBeforeRestart)
+    XCTAssertTrue(restartRequests.contains(0))
+    XCTAssertEqual(box.record?.schemaVersion,
+                   WorkServiceAttachedWorkCheckpointStore.Record.currentSchemaVersion)
+}
+
 func testWorkServiceAttachedControllerSkipsCheckpointWriteForNoOpRefresh() async throws {
     let fixture = try AttachedControllerFixture()
     let service = AttachedControllerTestService(fixture: fixture)
@@ -3232,6 +3290,9 @@ let casesWorkServiceAttachedWorkController: [Case] = [
     }),
     ("phase3 Work controller detects torn and altered checkpoints", {
         try await testWorkServiceAttachedCheckpointStoreDetectsTornAndAlteredRecords()
+    }),
+    ("phase3 Work controller rejects v5 checkpoint and rebuilds native End kind", {
+        try await testWorkServiceAttachedControllerRejectsV5SnapshotAndRebuildsNativeEndKind()
     }),
     ("phase3 Work controller skips no-op checkpoint writes", {
         try await testWorkServiceAttachedControllerSkipsCheckpointWriteForNoOpRefresh()

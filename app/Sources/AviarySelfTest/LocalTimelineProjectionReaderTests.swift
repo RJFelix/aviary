@@ -401,7 +401,7 @@ func testLocalTimelineProjectionReaderContinuesStatefulActionFromExactRoot() thr
             path: "work-exact-state", directoryHint: .isDirectory),
         namespaceID: grown.snapshot.namespaceID, journal: localReaderWorkJournal,
         sourceGeneration: grown.snapshot.source.sourceGeneration,
-        mapKind: "work-exact-v2")
+        mapKind: "work-exact-v3")
     let state = try PersistentWorkExactState(map: map, root: checkpoint.roots[0].root)
     let outcome = localReaderDetailedEvent(
         sequence: 6, type: TimelineEventType.actionOutcome, previous: "w-5",
@@ -877,7 +877,7 @@ func testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState() thro
     XCTAssertEqual(coldCheckpoint.prefixByteCount, cold.snapshot.source.prefixByteCount)
     XCTAssertEqual(coldCheckpoint.prefixDigest, cold.snapshot.source.prefixDigest)
     XCTAssertEqual(coldCheckpoint.roots.count, 1)
-    XCTAssertEqual(coldCheckpoint.roots[0].mapKind, "work-exact-v2")
+    XCTAssertEqual(coldCheckpoint.roots[0].mapKind, "work-exact-v3")
     XCTAssertEqual(coldCheckpoint.roots[0].namespaceID, cold.snapshot.namespaceID)
 
     let fourth = localReaderWorkEvents(count: 1, start: 4)[0]
@@ -899,12 +899,123 @@ func testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState() thro
         namespaceID: grown.snapshot.namespaceID,
         journal: localReaderWorkJournal,
         sourceGeneration: grown.snapshot.source.sourceGeneration,
-        mapKind: "work-exact-v2")
+        mapKind: "work-exact-v3")
     try map.validate(root: grownCheckpoint.roots[0].root)
     let state = try PersistentWorkExactState(
         map: map, root: grownCheckpoint.roots[0].root)
     XCTAssertEqual(state.eventLocalSnapshot.lastSequence, 4)
     XCTAssertEqual(state.eventLocalSnapshot.lastEventID, fourth.eventID)
+}
+
+func testLocalTimelineProjectionReaderRebuildsV2WorkStateWithNativeEndKind() throws {
+    let session = SessionRef("reader-v2-session")
+    let attachment = SessionAttachmentRef("reader-v2-attachment")
+    let client = ClientRef("reader-v2-client")
+    let command = CommandRef(
+        commandID: "reader-v2-end", client: client, sessionAttachment: attachment,
+        causalCursor: JournalCursor(
+            journal: localReaderWorkJournal, eventID: "w-2", sequence: 2))
+    let events = [
+        localReaderDetailedEvent(
+            sequence: 1, type: TimelineEventType.workCreated, previous: nil),
+        localReaderDetailedEvent(
+            sequence: 2, type: TimelineEventType.sessionAttached, previous: "w-1",
+            session: session, attachment: attachment),
+        TimelineEvent(
+            eventID: "w-3", journal: localReaderWorkJournal, sequence: 3,
+            hostSequence: 3, idempotencyKey: command.commandID, command: command,
+            previousEventID: "w-2",
+            causedByEventID: EventRef(journal: localReaderWorkJournal, eventID: "w-2"),
+            session: session, work: localReaderWork, workHost: localReaderHost,
+            client: client, sessionAttachment: attachment,
+            actor: localReaderActor, hostRecordedAt: Date(timeIntervalSince1970: 3),
+            type: TimelineEventType.commandAccepted,
+            payload: .object([
+                "command_kind": .string("end_run"),
+                "delivery_mode": .string(RunInputDeliveryMode.queued.rawValue),
+                "carries_session_input": .bool(false),
+            ])),
+    ]
+    let sourceFixture = try LocalReaderFixture(events: events)
+    defer { sourceFixture.remove() }
+    let canonicalJournalBytes = try Data(contentsOf: sourceFixture.file)
+    let current = try sourceFixture.reader.read()
+    let currentBucket = try sourceFixture.store.loadBucket(
+        containingSequence: current.snapshot.cursor.sequence, proving: current.source)
+    let recentPages = try current.snapshot.recentPages.map {
+        try sourceFixture.store.loadRecentPage(id: $0.pageID, proving: current.source)
+    }
+    let currentHead = try sourceFixture.store.loadReducerHead(proving: current.source)
+    var legacyHeadObject = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: currentHead) as? [String: Any])
+    legacyHeadObject["schemaVersion"] = 2
+    let legacyHead = try JSONSerialization.data(
+        withJSONObject: legacyHeadObject, options: [.sortedKeys])
+
+    // This is intentionally an obsolete disposable-cache fixture, not a second implementation
+    // of the v2 reducer. The reader must identify the prior map generation before validating its
+    // typed root, discard the projection, and derive current semantics from the unchanged journal.
+    let legacyDirectory = sourceFixture.root.appending(
+        path: "legacy-projection", directoryHint: .isDirectory)
+    let legacyNamespace = "work-exact-v2." + String(repeating: "a", count: 64)
+    let legacyStore = try DisposableTimelineProjectionStore(
+        directory: legacyDirectory, journal: localReaderWorkJournal)
+    let legacyMap = try PersistentProjectionRadixMap(
+        directory: legacyDirectory.appending(
+            path: "work-exact-state", directoryHint: .isDirectory),
+        namespaceID: legacyNamespace, journal: localReaderWorkJournal,
+        sourceGeneration: current.source.sourceGeneration, mapKind: "work-exact-v2")
+    let legacyRoot = try XCTUnwrap(try legacyMap.setting(
+        root: nil, key: "work-exact-v2/scalar", value: Data("legacy-v2".utf8)).newRoot)
+    let legacyCheckpoint = DisposableTimelineProjectionStore.ExactStateCheckpoint(
+        namespaceID: legacyNamespace, journal: localReaderWorkJournal,
+        sourceGeneration: current.source.sourceGeneration,
+        cursor: current.snapshot.cursor,
+        prefixByteCount: current.source.prefixByteCount,
+        prefixDigest: current.source.prefixDigest,
+        roots: [.init(root: legacyRoot)])
+    let legacyCommit = DisposableTimelineProjectionStore.Commit(
+        source: current.source, cursor: current.snapshot.cursor,
+        prefixSeed: current.snapshot.prefixSeed,
+        nextSequence: current.snapshot.nextSequence,
+        nextPreviousEventID: current.snapshot.nextPreviousEventID,
+        currentBucket: currentBucket, anchors: current.snapshot.anchors,
+        recentPages: recentPages,
+        reducerHead: .init(
+            mediaType: BoundedWorkReducerHead.mediaType, schemaVersion: 2,
+            bytes: legacyHead),
+        exactStateCheckpoint: legacyCheckpoint)
+    _ = try legacyStore.commit(
+        legacyCommit, validatingExactStateCheckpoint: { _, _ in })
+
+    let migrated = try LocalTimelineProjectionReader(
+        store: legacyStore, home: sourceFixture.home).read()
+    XCTAssertTrue(migrated.didRebuild)
+    XCTAssertFalse(migrated.metrics.cacheHit)
+    XCTAssertEqual(try Data(contentsOf: sourceFixture.file), canonicalJournalBytes)
+    XCTAssertEqual(migrated.snapshot.generation, 1)
+    XCTAssertNotEqual(migrated.snapshot.namespaceID, legacyNamespace)
+    let migratedCheckpoint = try XCTUnwrap(
+        try legacyStore.loadExactStateCheckpoint(proving: migrated.source))
+    XCTAssertEqual(migratedCheckpoint.roots.first?.mapKind, "work-exact-v3")
+    let migratedMap = try PersistentProjectionRadixMap(
+        directory: legacyDirectory.appending(
+            path: "work-exact-state", directoryHint: .isDirectory),
+        namespaceID: migrated.snapshot.namespaceID, journal: localReaderWorkJournal,
+        sourceGeneration: migrated.source.sourceGeneration, mapKind: "work-exact-v3")
+    var migratedState = try PersistentWorkExactState(
+        map: migratedMap, root: try XCTUnwrap(migratedCheckpoint.roots.first).root)
+    let delivered = TimelineEvent(
+        eventID: "w-4", journal: localReaderWorkJournal, sequence: 4,
+        hostSequence: 4, command: command, previousEventID: "w-3",
+        causedByEventID: EventRef(journal: localReaderWorkJournal, eventID: "w-3"),
+        session: session, work: localReaderWork, workHost: localReaderHost,
+        client: client, sessionAttachment: attachment,
+        actor: localReaderActor, hostRecordedAt: Date(timeIntervalSince1970: 4),
+        type: TimelineEventType.commandDelivered)
+    let continued = try migratedState.apply(delivered)
+    XCTAssertEqual(
+        continued.eventLocalSnapshot.commands[command.commandID]?.commandKind, .endRun)
 }
 
 func testLocalTimelineProjectionReaderPersistsChildAndRecoveryAcrossGrowth() throws {
@@ -1025,5 +1136,8 @@ let casesLocalTimelineProjectionReader: [Case] = [
     }),
     ("phase3 local projection reader: Work exact state publishes and continues", {
         try testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState()
+    }),
+    ("phase3 local projection reader: v2 Work exact state rebuilds native End kind", {
+        try testLocalTimelineProjectionReaderRebuildsV2WorkStateWithNativeEndKind()
     }),
 ]

@@ -645,7 +645,7 @@ public enum BoundedChildState: String, Codable, Hashable, Sendable {
 }
 
 public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
-    public static let schemaVersion = 2
+    public static let schemaVersion = 3
     public static let mediaType = "application/x-aviary-bounded-work-reducer-head"
 
     public let schemaVersion: Int

@@ -3047,7 +3047,9 @@ public actor WorkServiceAttachedWorkController {
         sessionJournal: JournalRef,
         sessionAttachment: SessionAttachmentRef
     ) -> Bool {
-        guard record.client == attachment.client,
+        guard record.schemaVersion
+                == WorkServiceAttachedWorkCheckpointStore.Record.currentSchemaVersion,
+              record.client == attachment.client,
               record.work == descriptor.work,
               record.journal == descriptor.journal,
               record.session == session,

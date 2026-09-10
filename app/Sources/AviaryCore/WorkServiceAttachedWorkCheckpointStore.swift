@@ -103,10 +103,10 @@ public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
     }
 
     public struct Record: Codable, Hashable, Sendable {
-        // v5 requires exact source cursors on reducer-produced Session messages so an upgraded
-        // GUI cannot restore a large transcript that looks canonical but cannot page backward.
-        // Aviary-owned checkpoints are disposable; older records fail closed and rebuild.
-        public static let currentSchemaVersion = 5
+        // v6 invalidates Work snapshots reduced before native `end_run` was recognized as the
+        // typed `.endRun` command kind. Aviary-owned checkpoints are disposable; older records
+        // fail closed and rebuild from their canonical journals.
+        public static let currentSchemaVersion = 6
 
         public let schemaVersion: Int
         public let client: ClientRef
