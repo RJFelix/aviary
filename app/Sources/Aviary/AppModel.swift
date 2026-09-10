@@ -327,9 +327,9 @@ final class AppModel {
     }
     private var localWorkServiceBootstrapInFlight = false
     private var serviceRefreshInFlight = false
-    /// Cursor for the bounded central service poll. Stable ordering plus rotation prevents
-    /// Work rows after the first page of attached runs from being starved forever.
-    private var servicePollOffset = 0
+    /// Process-local cadence bookkeeping for the timer poll. Explicit refreshes bypass this
+    /// policy and observe every attached row plus the authoritative catalog immediately.
+    private var serviceRefreshSchedule = ServiceBackedRefreshSchedulingPolicy.State()
     private var serviceCreateInFlight = false
     /// Process-level service work that can publish or mutate a GUI attachment. Shutdown closes
     /// admission and drains this set before taking its final `workRuns` snapshot, so an adoption
@@ -2152,7 +2152,7 @@ final class AppModel {
     /// Refresh all attached service projections and discover attachments created by another
     /// GUI.  The Work service list is intentionally authoritative for reconstruction; local
     /// `runs` is only this process's current view.
-    func refreshServiceWork() async {
+    func refreshServiceWork(backgroundNow: Date? = nil) async {
         guard !serviceRefreshInFlight,
               let bootstrap = localWorkService,
               let client = localWorkServiceClient,
@@ -2184,24 +2184,45 @@ final class AppModel {
             let attachedServiceRuns = workRuns
                 .filter { $0.isServiceBacked && !$0.hasExited }
                 .sorted { lhs, rhs in lhs.id.uuidString < rhs.id.uuidString }
+            let candidates = attachedServiceRuns.map { run in
+                ServiceBackedRefreshSchedulingPolicy.Candidate(
+                    key: run.id.uuidString,
+                    needsPromptRefresh: run.id == focusedRunID
+                        || run.needsPromptServiceRefresh)
+            }
             let selectedServiceRuns: [LiveRun]
-            if attachedServiceRuns.isEmpty {
-                servicePollOffset = 0
-                selectedServiceRuns = []
-            } else {
-                let offset = servicePollOffset % attachedServiceRuns.count
-                let budget = min(32, attachedServiceRuns.count)
-                selectedServiceRuns = (0..<budget).map { index in
-                    attachedServiceRuns[(offset + index) % attachedServiceRuns.count]
+            let refreshCatalog: Bool
+            if let backgroundNow {
+                let plan = ServiceBackedRefreshSchedulingPolicy.plan(
+                    candidates: candidates, now: backgroundNow,
+                    previous: serviceRefreshSchedule,
+                    forceCatalogRefresh: !resumeInitialStart)
+                serviceRefreshSchedule = plan.state
+                let selectedKeys = Set(plan.selectedKeys)
+                selectedServiceRuns = attachedServiceRuns.filter {
+                    selectedKeys.contains($0.id.uuidString)
                 }
-                servicePollOffset = (offset + budget) % attachedServiceRuns.count
+                refreshCatalog = plan.refreshCatalog
+            } else {
+                selectedServiceRuns = attachedServiceRuns
+                refreshCatalog = true
+                serviceRefreshSchedule =
+                    ServiceBackedRefreshSchedulingPolicy.recordingExplicitRefresh(
+                        candidates: candidates, now: Date(),
+                        previous: serviceRefreshSchedule)
             }
             for run in selectedServiceRuns {
                 await run.refreshService(resumeInitialStart: resumeInitialStart)
             }
-            await restoreServiceWork(
-                session: session, client: client, handshake: handshake,
-                resumeInitialStart: resumeInitialStart)
+            if refreshCatalog {
+                await restoreServiceWork(
+                    session: session, client: client, handshake: handshake,
+                    resumeInitialStart: resumeInitialStart)
+            } else {
+                // Catalog restoration normally settles these markers. Keep that local bookkeeping
+                // active even when the expensive authoritative inventory read is not due.
+                settlePendingChats()
+            }
             if !sessionsReconciled, localWorkServiceObservationError == nil {
                 localWorkServiceObservationError = reconciliationWarning
             }
@@ -2811,7 +2832,7 @@ final class AppModel {
                 guard !Task.isCancelled else { return }
                 self.annotateLiveState()
                 self.tree = AgentTreeReader.read(home: self.home)
-                await self.refreshServiceWork()
+                await self.refreshServiceWork(backgroundNow: Date())
                 // The canonical journals are the notification producer's source of truth. A
                 // live run can finish or enter review between catalog refreshes, so polling
                 // must consume the projection as well as repainting the in-memory tree.
@@ -4233,6 +4254,21 @@ final class LiveRun: Identifiable {
     /// accidentally call a local stop path.
     private(set) var serviceBridge: ServiceBackedRunBridge? = nil
     var isServiceBacked: Bool { serviceBridge != nil }
+    /// Timer polling keeps active work and any unresolved command/input handoff on the prompt
+    /// cadence. This is process-local scheduling only; canonical admission still belongs to the
+    /// controller and Work Host.
+    var needsPromptServiceRefresh: Bool {
+        guard let projection = serviceBridge?.projection else { return false }
+        return projection.descriptor.currentRun != nil
+            || projection.pendingCommand != nil
+            || projection.commandInFlight
+            || projection.requiresRefresh
+            || initialStart != nil
+            || draftHandoff != nil
+            || serviceCommandInFlight
+            || !servicePendingInputs.isEmpty
+            || !serviceInputDeliveryAttention.isEmpty
+    }
     /// Stable identity for a service-backed run. The process-local UUID above is presentation
     /// state only; relaunch/reconstruction dedupes by this exact attachment relationship.
     private(set) var serviceAttachmentKey: ServiceAttachmentKey?
@@ -5000,9 +5036,10 @@ final class LiveRun: Identifiable {
         kind: WorkServiceCommandKind,
         receipt: WorkServiceCommandReceipt
     ) -> ServiceBackedCommandNotice? {
-        serviceAcknowledgement(
+        guard let resultingWorkCursor = receipt.resultingWorkCursor else { return nil }
+        return serviceAcknowledgement(
             kind: kind, commandID: receipt.commandID, work: receipt.work,
-            evidence: .acceptedReceipt)
+            evidence: .acceptedReceipt(resultingWorkCursor: resultingWorkCursor))
     }
 
     private func setServiceSuccessNotice(

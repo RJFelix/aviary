@@ -11,8 +11,13 @@ struct RepositoryReviewView: View {
     private enum LoadState {
         case ready
         case loading
-        case loaded(ObservedRepositoryReview)
+        case loaded(ObservedRepositoryReview, RepositoryReviewDiffProjection?)
         case failed(RepositoryReviewLoadError)
+    }
+
+    private struct ReviewDraft {
+        var feedback = ""
+        var anchor: RepositoryReviewFeedbackAnchor?
     }
 
     private let run: LiveRun?
@@ -20,10 +25,15 @@ struct RepositoryReviewView: View {
     private let fixtureRetryEnabled: Bool
     @State private var state: LoadState
     @State private var feedback = ""
+    @State private var selectedAnchor: RepositoryReviewFeedbackAnchor?
+    @State private var pendingAnchor: RepositoryReviewFeedbackAnchor?
+    @State private var drafts: [WorkServiceArtifactDescriptor: ReviewDraft] = [:]
     @State private var placedInComposer = false
     @State private var placedFeedbackCount = 0
     @State private var loadIdentity: UUID?
     @State private var showReviewLimits = false
+    @State private var feedbackScrollRequest = 0
+    @FocusState private var feedbackFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
     init(run: LiveRun, descriptor: WorkServiceArtifactDescriptor? = nil) {
@@ -35,14 +45,21 @@ struct RepositoryReviewView: View {
 
     /// Deterministic fixture entry point. Production views never use a preloaded review; this
     /// lets the snapshot harness render the same sheet content without a Work Host.
-    init(fixtureReview: ObservedRepositoryReview, fixtureDraft: String? = nil) {
+    init(
+        fixtureReview: ObservedRepositoryReview,
+        fixtureDraft: String? = nil,
+        fixtureDescriptor: WorkServiceArtifactDescriptor? = nil
+    ) {
         self.run = fixtureDraft.map {
             LiveRun.productionRunPaneVisualFixture(
                 items: [], pendingInputs: [], deliveryAttention: [], actions: [], draft: $0)
         }
-        _selectedDescriptor = State(initialValue: nil)
+        _selectedDescriptor = State(initialValue: fixtureDescriptor)
         self.fixtureRetryEnabled = false
-        _state = State(initialValue: .loaded(fixtureReview))
+        let projection = fixtureDescriptor.flatMap {
+            try? RepositoryReviewDiffProjection.prepare(review: fixtureReview, descriptor: $0)
+        }
+        _state = State(initialValue: .loaded(fixtureReview, projection))
     }
 
     /// Deterministic stale-state entry point for the snapshot harness. Production retry always
@@ -74,23 +91,31 @@ struct RepositoryReviewView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    if run?.isServiceBacked == true { historyPicker }
-                    boundaryNotice
-                    switch state {
-                    case .ready:
-                        loadPrompt
-                    case .loading:
-                        loadingView
-                    case .loaded(let review):
-                        reviewBody(review)
-                    case .failed(let error):
-                        failureView(error)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        if run?.isServiceBacked == true { historyPicker }
+                        boundaryNotice
+                        switch state {
+                        case .ready:
+                            loadPrompt
+                        case .loading:
+                            loadingView
+                        case .loaded(let review, let projection):
+                            reviewBody(review, projection: projection)
+                        case .failed(let error):
+                            failureView(error)
+                        }
                     }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .onChange(of: feedbackScrollRequest) { _, _ in
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        proxy.scrollTo("repository-review-feedback", anchor: .center)
+                    }
+                    Task { @MainActor in feedbackFocused = true }
+                }
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -98,6 +123,26 @@ struct RepositoryReviewView: View {
         .accessibilityLabel("Repository review")
         .onChange(of: run?.serviceReviewHistory) { _, _ in
             historyDidChange()
+        }
+        .onChange(of: feedback) { _, _ in
+            persistCurrentDraft()
+            placedInComposer = false
+            placedFeedbackCount = 0
+        }
+        .confirmationDialog(
+            "Move this feedback?",
+            isPresented: Binding(
+                get: { pendingAnchor != nil },
+                set: { if !$0 { pendingAnchor = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Move feedback") { moveFeedbackToPendingAnchor() }
+            Button("Keep editing", role: .cancel) { pendingAnchor = nil }
+        } message: {
+            if let pendingAnchor {
+                Text("Move the current draft from \(anchorLabel(selectedAnchor)) to \(anchorLabel(pendingAnchor))?")
+            }
         }
         .onDisappear { loadIdentity = nil }
     }
@@ -123,10 +168,8 @@ struct RepositoryReviewView: View {
                     Text("Selected review unavailable")
                         .tag(selectedDescriptor)
                 }
-                ForEach(Array(reviewRows.enumerated()), id: \.element.descriptor.artifactID) { index, row in
-                    Text(index == reviewRows.count - 1
-                        ? "Latest · Saved review \(index + 1)"
-                        : "Saved review \(index + 1)")
+                ForEach(Array(reviewRows.enumerated()), id: \.element.descriptor) { index, row in
+                    Text(reviewPickerLabel(index: index, descriptor: row.descriptor))
                         .tag(Optional(row.descriptor))
                 }
             }
@@ -138,6 +181,12 @@ struct RepositoryReviewView: View {
             if let omitted = run?.serviceReviewHistory?.omittedRowCount, omitted > 0 {
                 Text("\(omitted) review records are unavailable or outside this bounded list.")
                     .font(.caption).foregroundStyle(Design.warning)
+            }
+            if !feedback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || selectedAnchor != nil {
+                Label("Draft kept while this review is open", systemImage: "square.and.pencil")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -283,10 +332,13 @@ struct RepositoryReviewView: View {
     }
 
     @ViewBuilder
-    private func reviewBody(_ review: ObservedRepositoryReview) -> some View {
+    private func reviewBody(
+        _ review: ObservedRepositoryReview,
+        projection: RepositoryReviewDiffProjection?
+    ) -> some View {
         statusCard(review)
         filesCard(review)
-        diffsCard(review)
+        diffsCard(review, projection: projection)
         omissionsCard(review)
         feedbackCard
     }
@@ -355,35 +407,179 @@ struct RepositoryReviewView: View {
         }
     }
 
-    private func diffsCard(_ review: ObservedRepositoryReview) -> some View {
+    @ViewBuilder
+    private func diffsCard(
+        _ review: ObservedRepositoryReview,
+        projection: RepositoryReviewDiffProjection?
+    ) -> some View {
         Card("Unified diffs", symbol: "arrow.left.arrow.right") {
-            if review.diffs.isEmpty {
+            if let projection,
+               !projection.sections.isEmpty || !projection.rawFallbacks.isEmpty
+                    || !projection.omissions.isEmpty {
+                projectedDiffs(projection)
+            } else if review.diffs.isEmpty {
                 Text("No tracked diff body was retained.")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.tertiary)
+            } else if let projection {
+                projectedDiffs(projection)
             } else {
-                VStack(alignment: .leading, spacing: 9) {
-                    ForEach(Array(review.diffs.enumerated()), id: \.offset) { _, diff in
-                        VStack(alignment: .leading, spacing: 5) {
-                            HStack(spacing: 7) {
-                                Text(diff.kind.capitalized)
-                                    .font(.system(size: 10.5, weight: .semibold))
-                                Text("\(diff.byteCount) bytes")
-                                    .font(Design.numeric(9.5))
-                                    .foregroundStyle(.tertiary)
-                                if diff.truncated {
-                                    Chip(text: "bounded", tint: Design.warning)
-                                }
-                            }
-                            if let text = diff.text, !text.isEmpty {
-                                CodeBlock(text: text, language: "diff", maxLines: 14, tint: Design.accent)
-                                    .frame(maxHeight: 270)
-                            } else {
-                                Text("Diff text was excluded from this bounded observation.")
-                                    .font(.system(size: 10.5))
-                                    .foregroundStyle(.secondary)
+                rawDiffs(review)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func projectedDiffs(_ projection: RepositoryReviewDiffProjection) -> some View {
+        let visibleSections = projection.sections.filter {
+            $0.fallbackReason == nil || $0.kind == .binary || $0.kind == .submodule
+        }
+        VStack(alignment: .leading, spacing: 11) {
+            ForEach(Array(visibleSections.enumerated()), id: \.offset) { _, section in
+                projectedSection(section, identity: projection.identity)
+            }
+            ForEach(Array(projection.rawFallbacks.enumerated()), id: \.offset) { _, fallback in
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 7) {
+                        Text(fallback.diffKind.capitalized)
+                            .font(.system(size: 10.5, weight: .semibold))
+                        Chip(text: "raw fallback", tint: Design.warning)
+                    }
+                    Text(fallback.reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !fallback.text.isEmpty {
+                        CodeBlock(
+                            text: fallback.text,
+                            language: "diff",
+                            maxLines: 14,
+                            tint: Design.accent)
+                            .frame(maxHeight: 270)
+                    }
+                    if fallback.truncated {
+                        Text("Raw diff text is truncated to the review display limit.")
+                            .font(.caption)
+                            .foregroundStyle(Design.warning)
+                    }
+                }
+            }
+            ForEach(Array(projection.omissions.enumerated()), id: \.offset) { _, omission in
+                Label(omission, systemImage: "ellipsis.circle")
+                    .font(.caption)
+                    .foregroundStyle(Design.warning)
+            }
+        }
+    }
+
+    private func projectedSection(
+        _ section: RepositoryReviewDiffSection,
+        identity: RepositoryReviewFeedbackIdentity
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(section.path.map(sanitized) ?? "Path unavailable")
+                        .font(Design.mono(10.5, weight: .semibold))
+                        .textSelection(.enabled)
+                    HStack(spacing: 5) {
+                        Text(section.diffKind.capitalized)
+                        Text(section.kind.rawValue)
+                        if let originalPath = section.originalPath {
+                            Text("from \(sanitized(originalPath))")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 6)
+                if let anchor = section.fileAnchor(identity: identity) {
+                    Button("Comment on file") { requestAnchor(anchor) }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .accessibilityLabel("Comment on file \(sanitized(anchor.path))")
+                }
+            }
+
+            if section.kind == .binary || section.kind == .submodule {
+                Text(section.fallbackReason ?? "The file body is unavailable for review.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if section.hunks.isEmpty {
+                if !section.rawSection.isEmpty {
+                    CodeBlock(
+                        text: section.rawSection,
+                        language: "diff",
+                        maxLines: 14,
+                        tint: Design.accent)
+                        .frame(maxHeight: 270)
+                }
+                if section.rawSectionTruncated {
+                    Text("Raw file text is truncated to the review display limit.")
+                        .font(.caption)
+                        .foregroundStyle(Design.warning)
+                }
+            } else {
+                let anchors = section.hunkAnchors(identity: identity)
+                ForEach(Array(section.hunks.enumerated()), id: \.offset) { index, hunk in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(alignment: .firstTextBaseline, spacing: 7) {
+                            Text(sanitized(hunk.header))
+                                .font(Design.mono(9.5, weight: .semibold))
+                                .textSelection(.enabled)
+                            Spacer(minLength: 6)
+                            if anchors.indices.contains(index) {
+                                Button("Comment on hunk") { requestAnchor(anchors[index]) }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                    .accessibilityLabel(
+                                        "Comment on hunk \(sanitized(hunk.header)) in "
+                                            + "\(sanitized(section.path ?? "file"))")
                             }
                         }
+                        if !hunk.context.isEmpty {
+                            CodeBlock(
+                                text: hunk.context,
+                                language: "diff",
+                                maxLines: 10,
+                                tint: Design.accent)
+                                .frame(maxHeight: 220)
+                        }
+                        if hunk.contextTruncated {
+                            Text("Displayed hunk context was bounded.")
+                                .font(.caption)
+                                .foregroundStyle(Design.warning)
+                        }
+                    }
+                    .padding(8)
+                    .background(Design.accent.opacity(0.035))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+            }
+            Divider().opacity(0.35)
+        }
+    }
+
+    private func rawDiffs(_ review: ObservedRepositoryReview) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            ForEach(Array(review.diffs.enumerated()), id: \.offset) { _, diff in
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 7) {
+                        Text(diff.kind.capitalized)
+                            .font(.system(size: 10.5, weight: .semibold))
+                        Text("\(diff.byteCount) bytes")
+                            .font(Design.numeric(9.5))
+                            .foregroundStyle(.tertiary)
+                        if diff.truncated { Chip(text: "bounded", tint: Design.warning) }
+                    }
+                    if let text = diff.text, !text.isEmpty {
+                        CodeBlock(text: text, language: "diff", maxLines: 14, tint: Design.accent)
+                            .frame(maxHeight: 270)
+                    } else {
+                        Text("Diff text was excluded from this bounded observation.")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -458,6 +654,28 @@ struct RepositoryReviewView: View {
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                if let selectedAnchor {
+                    HStack(alignment: .firstTextBaseline, spacing: 7) {
+                        Label(anchorLabel(selectedAnchor), systemImage: "scope")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .lineLimit(2)
+                        Spacer(minLength: 4)
+                        Button("Clear location") { clearAnchor() }
+                            .buttonStyle(.plain)
+                            .font(.caption)
+                    }
+                    .foregroundStyle(selectedAnchorIsCurrent ? Design.accent : Design.warning)
+                    if !selectedAnchorIsCurrent {
+                        Text("This location is unavailable until its exact saved review is loaded and verified. The draft has not been retargeted.")
+                            .font(.caption)
+                            .foregroundStyle(Design.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    Label("General review feedback", systemImage: "text.bubble")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 TextEditor(text: $feedback)
                     .font(.system(size: 11.5))
                     .scrollContentBackground(.hidden)
@@ -468,7 +686,8 @@ struct RepositoryReviewView: View {
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .strokeBorder(.separator, lineWidth: 1))
                     .accessibilityLabel("Revision feedback")
-                HStack(spacing: 8) {
+                    .focused($feedbackFocused)
+                VStack(alignment: .leading, spacing: 6) {
                     Button("Place in composer") { placeFeedbackInComposer() }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
@@ -480,18 +699,16 @@ struct RepositoryReviewView: View {
                             .font(.system(size: 10))
                             .foregroundStyle(Design.success)
                     }
-                    Spacer()
-                    Text(
-                        "\(composerRemainingByteCapacity) composer bytes remaining · "
-                            + "accepts up to \(min(Self.maximumFeedbackBytes, feedbackByteCapacity)) "
-                            + "feedback bytes (\(feedback.utf8.count)/2,000 entered)")
+                    Text(feedbackCapacityLabel)
                         .font(Design.numeric(9.5))
                         .foregroundStyle(
-                            feedback.utf8.count > Self.maximumFeedbackBytes
+                            feedback.utf8.count > feedbackEntryByteCapacity
                                 ? Design.warning : Color.secondary.opacity(0.7))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
+        .id("repository-review-feedback")
     }
 
     private func gapRow(_ present: Bool, title: String, detail: String) -> some View {
@@ -525,7 +742,10 @@ struct RepositoryReviewView: View {
             guard loadIdentity == identity, selectedDescriptor == descriptor else { return }
             loadIdentity = nil
             switch result {
-            case .success(let review): state = .loaded(review)
+            case .success(let review):
+                let projection = try? RepositoryReviewDiffProjection.prepare(
+                    review: review, descriptor: descriptor)
+                state = .loaded(review, projection)
             case .failure(let error): state = .failed(error)
             }
         }
@@ -533,8 +753,13 @@ struct RepositoryReviewView: View {
 
     private func selectReview(_ descriptor: WorkServiceArtifactDescriptor) {
         guard descriptor != selectedDescriptor else { return }
+        persistCurrentDraft()
         loadIdentity = nil
         selectedDescriptor = descriptor
+        let draft = drafts[descriptor] ?? ReviewDraft()
+        feedback = draft.feedback
+        selectedAnchor = draft.anchor
+        pendingAnchor = nil
         state = .ready
         placedInComposer = false
         placedFeedbackCount = 0
@@ -549,23 +774,113 @@ struct RepositoryReviewView: View {
     }
 
     private func placeFeedbackInComposer() {
-        guard let run, canPlaceFeedback else { return }
-        let boundedFeedback = Self.prefix(
-            feedback,
-            fittingUTF8Bytes: min(Self.maximumFeedbackBytes, feedbackByteCapacity))
-        guard !boundedFeedback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return
-        }
+        guard let run, let composedFeedback else { return }
         let separator = run.draft.isEmpty ? "" : "\n\n"
-        let candidate = run.draft + separator + boundedFeedback
+        let candidate = run.draft + separator + composedFeedback
         run.setDraft(candidate)
         guard run.draft == candidate else {
             placedInComposer = false
             placedFeedbackCount = 0
             return
         }
-        placedFeedbackCount = boundedFeedback.count
+        placedFeedbackCount = Self.prefix(
+            feedback, fittingUTF8Bytes: feedbackEntryByteCapacity).count
         placedInComposer = true
+    }
+
+    private func requestAnchor(_ anchor: RepositoryReviewFeedbackAnchor) {
+        guard anchorBelongsToLoadedReview(anchor) else { return }
+        if selectedAnchor == anchor {
+            focusFeedback()
+            return
+        }
+        if !feedback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            pendingAnchor = anchor
+            return
+        }
+        setAnchor(anchor)
+        focusFeedback()
+    }
+
+    private func moveFeedbackToPendingAnchor() {
+        guard let pendingAnchor, anchorBelongsToLoadedReview(pendingAnchor) else {
+            self.pendingAnchor = nil
+            return
+        }
+        self.pendingAnchor = nil
+        setAnchor(pendingAnchor)
+        focusFeedback()
+    }
+
+    private func clearAnchor() {
+        selectedAnchor = nil
+        persistCurrentDraft()
+        placedInComposer = false
+        placedFeedbackCount = 0
+    }
+
+    private func setAnchor(_ anchor: RepositoryReviewFeedbackAnchor) {
+        selectedAnchor = anchor
+        persistCurrentDraft()
+        placedInComposer = false
+        placedFeedbackCount = 0
+    }
+
+    private func focusFeedback() {
+        feedbackScrollRequest &+= 1
+    }
+
+    private func persistCurrentDraft() {
+        guard let selectedDescriptor else { return }
+        let draft = ReviewDraft(feedback: feedback, anchor: selectedAnchor)
+        if draft.feedback.isEmpty && draft.anchor == nil {
+            drafts.removeValue(forKey: selectedDescriptor)
+        } else {
+            drafts[selectedDescriptor] = draft
+        }
+    }
+
+    private func reviewPickerLabel(
+        index: Int,
+        descriptor: WorkServiceArtifactDescriptor
+    ) -> String {
+        let base = index == reviewRows.count - 1
+            ? "Latest · Saved review \(index + 1)"
+            : "Saved review \(index + 1)"
+        let draft = descriptor == selectedDescriptor
+            ? ReviewDraft(feedback: feedback, anchor: selectedAnchor)
+            : drafts[descriptor]
+        let hasDraft = draft.map {
+            !$0.feedback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || $0.anchor != nil
+        } ?? false
+        return hasDraft ? base + " · draft" : base
+    }
+
+    private var loadedProjection: RepositoryReviewDiffProjection? {
+        guard case .loaded(_, let projection) = state else { return nil }
+        return projection
+    }
+
+    private var selectedAnchorIsCurrent: Bool {
+        guard let selectedAnchor else { return false }
+        return anchorBelongsToLoadedReview(selectedAnchor)
+    }
+
+    private func anchorBelongsToLoadedReview(_ anchor: RepositoryReviewFeedbackAnchor) -> Bool {
+        guard let descriptor = selectedDescriptor,
+              let descriptorIdentity = try? RepositoryReviewFeedbackIdentity(descriptor: descriptor),
+              descriptorIdentity == anchor.identity,
+              loadedProjection?.identity == descriptorIdentity else { return false }
+        return true
+    }
+
+    private func anchorLabel(_ anchor: RepositoryReviewFeedbackAnchor?) -> String {
+        guard let anchor else { return "general review feedback" }
+        if let hunk = anchor.hunkHeader {
+            return "\(sanitized(anchor.path)) · \(sanitized(hunk))"
+        }
+        return sanitized(anchor.path)
     }
 
     private var composerRemainingByteCapacity: Int {
@@ -577,12 +892,42 @@ struct RepositoryReviewView: View {
         return max(0, composerRemainingByteCapacity - separatorBytes)
     }
 
+    private var compositionMaximumBytes: Int {
+        min(Self.maximumFeedbackBytes, feedbackByteCapacity)
+    }
+
+    private var feedbackEntryByteCapacity: Int {
+        guard let selectedAnchor else { return compositionMaximumBytes }
+        guard selectedAnchorIsCurrent else { return 0 }
+        let prefixBytes = (selectedAnchor.renderedPrefix + "\n").utf8.count
+        return max(0, compositionMaximumBytes - prefixBytes)
+    }
+
+    private var feedbackCapacityLabel: String {
+        if selectedAnchor != nil && !selectedAnchorIsCurrent {
+            return "Load the matching review to place this anchored draft · \(feedback.utf8.count) feedback bytes entered"
+        }
+        return "\(composerRemainingByteCapacity) composer bytes remaining · "
+            + "\(feedbackEntryByteCapacity) feedback bytes available "
+            + "(\(feedback.utf8.count) entered)"
+    }
+
+    private var composedFeedback: String? {
+        guard !feedback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        if let selectedAnchor {
+            guard selectedAnchorIsCurrent else { return nil }
+            return try? selectedAnchor.composeFeedback(
+                feedback, maximumBytes: compositionMaximumBytes)
+        }
+        let bounded = Self.prefix(feedback, fittingUTF8Bytes: compositionMaximumBytes)
+        return bounded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? nil : bounded
+    }
+
     private var canPlaceFeedback: Bool {
-        run != nil
-            && !Self.prefix(
-                feedback,
-                fittingUTF8Bytes: min(Self.maximumFeedbackBytes, feedbackByteCapacity))
-                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        run != nil && composedFeedback != nil
     }
 
     /// Preserve extended-grapheme boundaries while applying the durable UTF-8 budget. Swift's

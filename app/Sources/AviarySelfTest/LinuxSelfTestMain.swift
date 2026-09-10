@@ -65,6 +65,12 @@ enum LinuxSelfTestMain {
             ("Linux platform: SHA-256 known vectors", {
                 test_linuxSHA256KnownVectors()
             }),
+            ("Linux platform: canonical digest formatting", {
+                try await runLinuxCases(casesAviaryDigestFormatting)
+            }),
+            ("Linux platform: repository review diff projection", {
+                try await runLinuxCases(casesRepositoryReviewDiffProjection)
+            }),
             ("Linux platform: secure random length and nonrepeat", {
                 try test_linuxSecureRandomUsesBoundedOSBytes()
             }),
@@ -127,6 +133,9 @@ enum LinuxSelfTestMain {
             }),
             ("Work service: GUI control policy", {
                 try await runLinuxCases(casesServiceBackedGUIControlPolicy)
+            }),
+            ("Work service: background refresh scheduling policy", {
+                try await runLinuxCases(casesServiceBackedRefreshSchedulingPolicy)
             }),
             ("Work service: transport independent clients and ordered mutations", {
                 try await test_workServiceTransportSupportsIndependentClientsAndOrderedMutations()

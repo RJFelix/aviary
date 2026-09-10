@@ -56,6 +56,7 @@ public enum WorkServiceTransportErrorCode: String, Codable, Hashable, Sendable {
     case handshakeRejected = "handshake_rejected"
     case identityMismatch = "identity_mismatch"
     case duplicateRequestID = "duplicate_request_id"
+    case connectionExhausted = "connection_exhausted"
     case unsupportedOperation = "unsupported_operation"
     case unsupportedVersion = "unsupported_version"
     case serviceUnavailable = "service_unavailable"
@@ -3262,7 +3263,7 @@ public actor WorkServiceUnixSocketServer {
                     WorkServiceTransportResponseEnvelope(
                         id: envelope.id, ok: false,
                         error: .init(
-                            code: .invalidRequest,
+                            code: .connectionExhausted,
                             detail: "connection request-id budget is exhausted; reconnect"),
                         hostInstance: hostInstances[connectionID]),
                     connectionID: connectionID, generation: generation)
@@ -3749,6 +3750,7 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
         case .remote(let code, _):
             return code == .identityMismatch || code == .transportClosed
                 || code == .serverStopping || code == .serviceUnavailable
+                || code == .connectionExhausted
         case .invalidEndpoint, .endpointUnavailable, .endpointOccupied, .alreadyConnected,
              .frameTooLarge,
              .tooManyPendingRequests, .timedOut, .canceled:

@@ -9,7 +9,7 @@ public struct ServiceBackedCommandNotice: Equatable, Hashable, Sendable {
     public enum Evidence: Equatable, Hashable, Sendable {
         /// The caller received an accepted receipt. Preserve the receipt/cursor correlation that
         /// prevents a later unrelated command from retiring its acknowledgement.
-        case acceptedReceipt
+        case acceptedReceipt(resultingWorkCursor: JournalCursor)
         /// The response was lost or malformed. A complete canonical projection of this exact
         /// client-qualified command is sufficient to settle uncertainty without replaying it.
         case canonicalCommand
@@ -30,7 +30,7 @@ public struct ServiceBackedCommandNotice: Equatable, Hashable, Sendable {
         client: ClientRef,
         attachment: ClientAttachmentRef,
         sessionAttachment: SessionAttachmentRef?,
-        evidence: Evidence = .acceptedReceipt
+        evidence: Evidence
     ) {
         self.work = work
         self.commandID = commandID
@@ -66,20 +66,16 @@ public enum ServiceBackedCommandNoticePolicy {
               let command = exactCanonicalCommandEvidence(for: notice, in: projection)
         else { return .retain }
 
-        if notice.evidence == .canonicalCommand {
+        if case .canonicalCommand = notice.evidence {
             return .clear
         }
 
-        guard let receipt = projection.lastReceipt,
-              (receipt.state == .accepted || receipt.state == .duplicate),
-              receipt.work == notice.work,
-              receipt.commandID == notice.commandID,
-              outcomeMatches(receipt, kind: notice.kind),
-              let resultingCursor = receipt.resultingWorkCursor,
+        guard case .acceptedReceipt(let resultingCursor) = notice.evidence,
               reaches(projection.workCursor, resulting: resultingCursor),
               let eventID = resultingCursor.eventID,
               command.acceptanceEventRef == EventRef(
-                  journal: resultingCursor.journal, eventID: eventID)
+                  journal: resultingCursor.journal, eventID: eventID),
+              projection.workSnapshot.eventSequences[eventID] == resultingCursor.sequence
         else { return .retain }
         return .clear
     }
@@ -117,9 +113,13 @@ public enum ServiceBackedCommandNoticePolicy {
               let acceptance = command.acceptanceEventRef,
               acceptance.journal == projection.descriptor.journal,
               !acceptance.eventID.isEmpty,
+              // Host execution order and journal position are independent domains. Locate the
+              // acceptance in the reduced journal before comparing it with the Work cursor.
+              let acceptanceSequence = projection.workSnapshot.eventSequences[acceptance.eventID],
+              acceptanceSequence > 0,
               command.acceptanceHostSequence > 0,
-              command.acceptanceHostSequence <= projection.workCursor.sequence,
-              command.acceptanceHostSequence < projection.workCursor.sequence
+              acceptanceSequence <= projection.workCursor.sequence,
+              acceptanceSequence < projection.workCursor.sequence
                   || projection.workCursor.eventID == acceptance.eventID
         else { return nil }
         return command
@@ -136,24 +136,6 @@ public enum ServiceBackedCommandNoticePolicy {
         guard candidate.journal == required.journal,
               candidate.sequence >= required.sequence else { return false }
         return candidate.sequence > required.sequence || candidate.eventID == required.eventID
-    }
-
-    private static func outcomeMatches(
-        _ receipt: WorkServiceCommandReceipt,
-        kind: WorkServiceCommandKind
-    ) -> Bool {
-        switch kind {
-        case .start:
-            return receipt.outcome == .started || receipt.outcome == .startRecoveryRequired
-        case .send: return receipt.outcome == .inputAccepted
-        case .steer: return receipt.outcome == .steeringAccepted
-        case .queue: return receipt.outcome == .queued
-        case .hold: return receipt.outcome == .holdRequested
-        case .cancel: return receipt.outcome == .cancellationRequested
-        case .end: return receipt.outcome == .endRequested
-        case .destroy: return receipt.outcome == .destroyed
-        case .complete: return receipt.outcome == .completed
-        }
     }
 
     private static func canonicalKind(for kind: WorkServiceCommandKind) -> CanonicalCommandKind {

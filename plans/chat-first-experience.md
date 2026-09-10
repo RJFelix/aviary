@@ -503,5 +503,39 @@ failure; targeted, metadata-only tracing and signed live verification remain pen
 The whole macOS regression run passes 1,064 cases / 15,058 assertions in 660.26 seconds.
 The opt-in fixed-category trace classifier separately passes 1 case / 8 assertions; remote
 error prose and local paths do not enter its output. A strict-signature-verified GUI build loads
-the prior coding review against the unchanged helper. The generic polling failure has not yet
-recurred in that traced process, so it remains open rather than being attributed to prefix drift.
+the prior coding review against the unchanged helper. That traced process subsequently reproduced
+the polling failure: a Session snapshot received `invalid_request`, followed by persistent
+handshake rejection on the same connection. The server exhausts its bounded 4,096-request identity
+set but formerly reported an ordinary invalid request, which neither client layer treated as
+connection-terminal. A new typed `connection_exhausted` response fences the socket; the next read
+can reconnect, while mutations are never auto-replayed. The actual-socket two-request-budget
+regression proves the rejected Create was not admitted or replayed (1 case / 6 assertions).
+Client and transport suites pass 9 / 53 and 30 / 363 respectively.
+
+### Anchored feedback and idle refresh — 2026-09-10
+
+Saved repository reviews now offer file and hunk feedback locations. Parsing is producer-scoped,
+bounded, and conservative: malformed or contradictory path/hunk evidence remains raw text without
+an anchor; binary/submodule observations offer file-only locations. The composer prefix retains
+the exact artifact digest, Work/Session attachment, Run, Turn, path, stream, and bounded hunk
+context. Identity is all-or-nothing when capacity is short; feedback is still only a draft and
+requires explicit Send. Switching saved reviews preserves separate in-sheet drafts, and moving
+nonempty feedback to another location requires confirmation. This is not durable review-comment
+storage or an attributed per-turn patch. The parser suite passes 4 cases / 46 assertions; the
+narrow production-content fixture was inspected.
+
+Live verification also exposed an acknowledgement sequence-domain bug: a host acceptance sequence
+of 92 was compared to Work journal position 79, although the acceptance event was at position 57.
+The notice now carries its accepted receipt cursor immutably and compares exact canonical journal
+positions, not the transient latest receipt or host ordering counter. The notice suite passes
+9 cases / 41 assertions, including wrong-event/sequence rejection and uncertain End reconciliation.
+
+Background refresh now keeps focused, active, and unsettled chats on the prompt cadence while
+sampling quiescent chats and catalog discovery every 12 seconds. Explicit refresh is immediate;
+the timer still rotates a bounded 32-row budget without starvation (4 cases / 15 assertions).
+No canonical validation is weakened. A byte-identical SHA-256 hexadecimal formatter removes
+repeated Foundation formatting allocations (2 cases / 1,032 assertions). Its isolated 2,000-call
+measurement was 0.0042s versus 0.0387s for the prior formatter, not a whole-app speed claim.
+Before deployment, the unchanged helper consumed 18.56 CPU seconds over a 60-second idle window
+with the same five attached chats and no agent runtime. Post-deployment measurement, signed
+interaction checks, and the final whole-suite receipt are pending.

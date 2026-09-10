@@ -97,7 +97,9 @@ private struct RepositoryReviewFixtureView: View {
     let narrow: Bool
 
     var body: some View {
-        RepositoryReviewView(fixtureReview: FixtureData.repositoryReview)
+        RepositoryReviewView(
+            fixtureReview: FixtureData.repositoryReview,
+            fixtureDescriptor: FixtureData.repositoryReviewDescriptor)
             .frame(minWidth: narrow ? 0 : 560, maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .windowBackgroundColor))
     }
@@ -471,14 +473,14 @@ private enum FixtureData {
               "byteCount": 114,
               "kind": "staged",
               "retainedSectionCount": 1,
-              "text": "diff --git a/Sources/review.swift b/Sources/review.swift\\n@@ -1,2 +1,3 @@\\n let current = true\\n+let observed = true\\n",
+              "text": "diff --git a/01-README.md b/01-README.md\\n--- a/01-README.md\\n+++ b/01-README.md\\n@@ -1 +1,2 @@\\n Keep review feedback attached to its source.\\n+Draft first; send only when ready.\\n",
               "truncated": false
             },
             {
               "byteCount": 71,
               "kind": "unstaged",
               "retainedSectionCount": 1,
-              "text": "diff --git a/README.md b/README.md\\n@@ -4,1 +4,1 @@\\n-old note\\n+new note\\n",
+              "text": "diff --git a/01-README.md b/01-README.md\\n--- a/01-README.md\\n+++ b/01-README.md\\n@@ -4 +4 @@\\n-Feedback applies to the latest review.\\n+Feedback applies to the exact selected review.\\n",
               "truncated": false
             }
           ],
@@ -497,7 +499,7 @@ private enum FixtureData {
               "isUntracked": false,
               "kind": "tracked",
               "path": "01-README.md",
-              "workTreeStatus": "."
+              "workTreeStatus": "M"
             },
             {
               "indexStatus": ".",
@@ -570,11 +572,36 @@ private enum FixtureData {
           "version": 2
         }
         """
-        let review = try! ObservedRepositoryReview.decode(Data(json.utf8))
+        var object = try! JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+        object["diffs"] = (object["diffs"] as! [[String: Any]]).map { diff in
+            var diff = diff
+            diff["byteCount"] = (diff["text"] as! String).utf8.count
+            return diff
+        }
+        let review = try! ObservedRepositoryReview.decode(
+            JSONSerialization.data(withJSONObject: object))
         precondition(
             review.exclusions == expectedExclusions,
             "repository review fixture exclusions drifted from the production observation contract")
         return review
+    }()
+
+    static let repositoryReviewDescriptor: WorkServiceArtifactDescriptor = {
+        let review = repositoryReview
+        let bytes = try! review.encoded()
+        let digest = "sha256:" + AviarySHA256.hash(data: bytes).description
+        let source = EventRef(journal: workJournal, eventID: "review-artifact-event")
+        return try! WorkServiceArtifactDescriptor(
+            artifactID: "review-fixture-artifact", work: work, label: "review.json",
+            mediaType: ObservedRepositoryReviewFormat.mediaType,
+            byteCount: bytes.count, digest: digest, available: true,
+            bodyReference: TimelineBodyReference(
+                authority: workJournal, referenceID: digest,
+                mediaType: ObservedRepositoryReviewFormat.mediaType,
+                byteCount: bytes.count, digest: digest),
+            sourceEvent: source, session: session, sessionAttachment: attachment,
+            run: RunRef(review.runID), turn: TurnRef(review.turnID),
+            action: ActionRef("review-fixture-action"), causedByEventID: source)
     }()
 
     static func deliveryRow(

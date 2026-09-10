@@ -7160,9 +7160,12 @@ await Harness.run(
         + casesPendingChatStore
         + casesServiceBackedGUIOrchestration
         + casesServiceBackedGUIControlPolicy
+        + casesServiceBackedRefreshSchedulingPolicy
         + casesChatInteractionPresentation
         + casesServiceBackedCommandNoticePolicy
         + casesWorkServiceAttachedWorkController
+        + casesAviaryDigestFormatting
+        + casesRepositoryReviewDiffProjection
         + casesWorkActionPresentation
         + casesChatActivityPresentation
         + casesDisposableTimelineProjectionStore

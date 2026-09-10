@@ -1137,6 +1137,9 @@ public actor WorkServiceAttachedWorkController {
             if let handshake {
                 guard Self.validHandshake(
                     handshake, expectedHost: WorkHostRef(work.workHostID)) else {
+                    Self.traceWorkReadFailure(
+                        operation: .handshake, target: "pair", sequence: nil,
+                        error: WorkServiceAttachedWorkControllerError.hostMismatch)
                     throw WorkServiceAttachedWorkControllerError.hostMismatch
                 }
                 controlCursorStorage = handshake.controlCursor

@@ -423,6 +423,53 @@ func testWorkServiceClientSessionDropsPoisonedIdentityConnection() async throws 
     await server.stop()
 }
 
+func testWorkServiceClientSessionReconnectsAfterConnectionRequestBudgetIsExhausted() async throws {
+    let host = WorkHostRef("client-session-request-budget-host")
+    let client = ClientRef("client-session-request-budget-gui")
+    let endpoint = clientSessionEndpoint()
+    defer { try? FileManager.default.removeItem(atPath: endpoint.path) }
+    let service = clientSessionService(host: host, client: client)
+    let server = WorkServiceUnixSocketServer(
+        endpoint: endpoint, service: service, maxRequestIDs: 2)
+    do {
+        try await server.start()
+        let instance = await service.hostInstance
+        let location = WorkServiceHostLocation(
+            host: host, expectedInstance: instance,
+            protocolVersion: WorkServiceProtocol.currentVersion,
+            transport: .unixSocket(endpoint))
+        let session = try WorkServiceClientSession(
+            locator: FixedWorkServiceHostLocator(location: location), client: client)
+
+        let handshake = try await session.connect()
+        let first = try await session.createWork(.init(
+            client: client, commandID: "request-budget-first",
+            causalControlCursor: handshake.controlCursor))
+        do {
+            _ = try await session.createWork(.init(
+                client: client, commandID: "request-budget-rejected",
+                causalControlCursor: first.controlCursor))
+            XCTFail("the exhausted connection must reject a request before service admission")
+        } catch WorkServiceTransportError.remote(let code, _) {
+            XCTAssertEqual(code, .connectionExhausted)
+        }
+        XCTAssertEqual(await session.state, .reconnecting(host))
+        XCTAssertNil(await session.negotiatedHandshake)
+
+        // Reconnection is explicit and opens a fresh socket. The rejected Create is neither
+        // admitted by the service nor replayed by the client session.
+        XCTAssertEqual(try await session.connect().hostInstance, instance)
+        let page = try await session.listWorks(WorkServiceListRequest(client: client))
+        XCTAssertEqual(page.works.map(\.work), [first.work.work])
+        XCTAssertEqual(await session.state, .connected(instance))
+        await session.disconnect()
+    } catch {
+        await server.stop()
+        throw error
+    }
+    await server.stop()
+}
+
 let casesWorkServiceClientSession: [Case] = [
     ("phase3 Work service client coalesces connect and disconnects only itself", {
         try await testWorkServiceClientSessionCoalescesConnectAndDisconnectsOnlyClient()
@@ -438,5 +485,8 @@ let casesWorkServiceClientSession: [Case] = [
     }),
     ("phase3 Work service client drops an identity-mismatch connection", {
         try await testWorkServiceClientSessionDropsPoisonedIdentityConnection()
+    }),
+    ("phase3 Work service client reconnects after its request-ID budget is exhausted", {
+        try await testWorkServiceClientSessionReconnectsAfterConnectionRequestBudgetIsExhausted()
     }),
 ]

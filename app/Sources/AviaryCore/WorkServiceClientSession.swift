@@ -390,6 +390,7 @@ public actor WorkServiceClientSession: WorkServiceClient {
             // handshake would make every subsequent request fail against an untrusted host.
             return code == .identityMismatch || code == .transportClosed
                 || code == .serverStopping || code == .serviceUnavailable
+                || code == .connectionExhausted
         case .invalidEndpoint, .endpointUnavailable, .endpointOccupied, .alreadyConnected,
              .frameTooLarge,
              .tooManyPendingRequests, .timedOut, .canceled:

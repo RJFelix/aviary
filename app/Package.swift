@@ -65,6 +65,8 @@ let linuxCoreSources: [String] = [
     "ServiceBackedDraftStore.swift",
     "ServiceBackedGUIOrchestration.swift",
     "ServiceBackedGUIControlPolicy.swift",
+    "ServiceBackedRefreshSchedulingPolicy.swift",
+    "RepositoryReviewDiffProjection.swift",
     "ChatInteractionPresentation.swift",
     "ServiceBackedCommandNoticePolicy.swift",
     "ServiceBackedStartIntentStore.swift",
@@ -100,6 +102,7 @@ let linuxCoreSources: [String] = [
 ]
 let linuxSelfTestSources: [String] = [
     "AttachmentQualifiedIdentityTests.swift",
+    "AviaryDigestFormattingTests.swift",
     "AviaryPlatformTests.swift",
     "BoundedTimelineReducerProjectionTests.swift",
     "DisposableTimelineProjectionStoreTests.swift",
@@ -130,6 +133,8 @@ let linuxSelfTestSources: [String] = [
     "ServiceBackedDraftStoreTests.swift",
     "ServiceBackedGUIOrchestrationTests.swift",
     "ServiceBackedGUIControlPolicyTests.swift",
+    "ServiceBackedRefreshSchedulingPolicyTests.swift",
+    "RepositoryReviewDiffProjectionTests.swift",
     "ChatInteractionPresentationTests.swift",
     "ServiceBackedCommandNoticePolicyTests.swift",
     "LinuxSelfTestMain.swift",

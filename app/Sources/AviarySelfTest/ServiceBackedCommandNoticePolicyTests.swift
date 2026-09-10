@@ -26,10 +26,15 @@ private func noticePolicyProjection(
     receiptSequence: Int = 2,
     acceptanceEventID: String? = "accepted-event",
     acceptanceJournal: JournalRef = noticePolicyJournal,
+    acceptanceEventSequence: Int = 2,
     acceptanceHostSequence: Int = 2,
+    workCursorEventID: String = "accepted-event",
+    workCursorSequence: Int = 2,
     readDiagnostics: [String] = []
 ) throws -> WorkServiceAttachedWorkProjection {
-    let workCursor = JournalCursor(journal: noticePolicyJournal, eventID: "accepted-event", sequence: 2)
+    let workCursor = JournalCursor(
+        journal: noticePolicyJournal, eventID: workCursorEventID,
+        sequence: workCursorSequence)
     let causalCursor = JournalCursor(journal: noticePolicyJournal, eventID: "before-event", sequence: 1)
     let sessionCursor = JournalCursor(
         journal: noticePolicySessionJournal, eventID: "session-event", sequence: 1)
@@ -67,6 +72,9 @@ private func noticePolicyProjection(
     workSnapshot.sessionAttachments[noticePolicySessionAttachment.attachmentID] =
         WorkSessionAttachmentSnapshot(
             attachment: noticePolicySessionAttachment, session: noticePolicySession)
+    if let acceptanceEventID {
+        workSnapshot.eventSequences[acceptanceEventID] = acceptanceEventSequence
+    }
     let canonicalID = WorkServiceCommandLedgerIdentity.commandID(
         client: commandClient, commandID: commandID)
     workSnapshot.commands[canonicalID] = WorkCommandSnapshot(
@@ -107,7 +115,9 @@ private func noticePolicyNotice(
     commandID: String = noticePolicyCommandID,
     kind: WorkServiceCommandKind = .send,
     client: ClientRef = noticePolicyClient,
-    evidence: ServiceBackedCommandNotice.Evidence = .acceptedReceipt
+    evidence: ServiceBackedCommandNotice.Evidence = .acceptedReceipt(
+        resultingWorkCursor: JournalCursor(
+            journal: noticePolicyJournal, eventID: "accepted-event", sequence: 2))
 ) -> ServiceBackedCommandNotice {
     ServiceBackedCommandNotice(
         work: noticePolicyWork, commandID: commandID, kind: kind, client: client,
@@ -172,30 +182,52 @@ func testServiceBackedCommandNoticePolicyRejectsIdentityAndCursorDrift() throws 
             ServiceBackedCommandNotice(
                 work: noticePolicyWork, commandID: noticePolicyCommandID, kind: .send,
                 client: noticePolicyClient, attachment: noticePolicyAttachment,
-                sessionAttachment: SessionAttachmentRef("foreign-session-attachment")),
+                sessionAttachment: SessionAttachmentRef("foreign-session-attachment"),
+                evidence: .acceptedReceipt(resultingWorkCursor: JournalCursor(
+                    journal: noticePolicyJournal, eventID: "accepted-event", sequence: 2))),
             from: wrongSessionAttachment))
 
     let wrongWorkNotice = ServiceBackedCommandNotice(
         work: WorkRef(workHostID: "notice-host", workID: "foreign-work"),
         commandID: noticePolicyCommandID, kind: .send, client: noticePolicyClient,
-        attachment: noticePolicyAttachment, sessionAttachment: noticePolicySessionAttachment)
+        attachment: noticePolicyAttachment, sessionAttachment: noticePolicySessionAttachment,
+        evidence: .acceptedReceipt(resultingWorkCursor: JournalCursor(
+            journal: noticePolicyJournal, eventID: "accepted-event", sequence: 2)))
     XCTAssertFalse(
         ServiceBackedCommandNoticePolicy.shouldClear(wrongWorkNotice, from: wrongSessionAttachment))
 
-    let wrongCursor = try noticePolicyProjection(receiptEventID: "later-event", receiptSequence: 3)
+    let wrongCursor = try noticePolicyProjection()
     XCTAssertFalse(
-        ServiceBackedCommandNoticePolicy.shouldClear(noticePolicyNotice(), from: wrongCursor))
+        ServiceBackedCommandNoticePolicy.shouldClear(
+            noticePolicyNotice(evidence: .acceptedReceipt(resultingWorkCursor: JournalCursor(
+                journal: noticePolicyJournal, eventID: "later-event", sequence: 3))),
+            from: wrongCursor))
 
-    let wrongEvent = try noticePolicyProjection(receiptEventID: "foreign-event")
+    let wrongEvent = try noticePolicyProjection()
     XCTAssertFalse(
-        ServiceBackedCommandNoticePolicy.shouldClear(noticePolicyNotice(), from: wrongEvent))
+        ServiceBackedCommandNoticePolicy.shouldClear(
+            noticePolicyNotice(evidence: .acceptedReceipt(resultingWorkCursor: JournalCursor(
+                journal: noticePolicyJournal, eventID: "foreign-event", sequence: 2))),
+            from: wrongEvent))
+
+    let wrongSequence = try noticePolicyProjection()
+    XCTAssertFalse(
+        ServiceBackedCommandNoticePolicy.shouldClear(
+            noticePolicyNotice(evidence: .acceptedReceipt(resultingWorkCursor: JournalCursor(
+                journal: noticePolicyJournal, eventID: "accepted-event", sequence: 1))),
+            from: wrongSequence))
 }
 
-func testServiceBackedCommandNoticePolicyRejectsLaterForeignReceipt() throws {
+func testServiceBackedCommandNoticePolicyUsesImmutableReceiptCorrelation() throws {
     let projection = try noticePolicyProjection(
-        lastReceiptCommandID: "later-command", lastReceiptOutcome: .inputAccepted)
-    XCTAssertFalse(
-        ServiceBackedCommandNoticePolicy.shouldClear(noticePolicyNotice(), from: projection))
+        lastReceiptCommandID: "later-command", lastReceiptOutcome: .inputAccepted,
+        acceptanceEventSequence: 57, acceptanceHostSequence: 92,
+        workCursorEventID: "later-tip", workCursorSequence: 79)
+    XCTAssertTrue(
+        ServiceBackedCommandNoticePolicy.shouldClear(
+            noticePolicyNotice(evidence: .acceptedReceipt(resultingWorkCursor: JournalCursor(
+                journal: noticePolicyJournal, eventID: "accepted-event", sequence: 57))),
+            from: projection))
 }
 
 func testServiceBackedCommandNoticePolicyUsesCanonicalEvidenceAcrossConnectivity() throws {
@@ -263,7 +295,7 @@ func testServiceBackedCommandNoticePolicySettlesLostEndConfirmationExactly() thr
         commandKind: .end, acceptanceJournal: noticePolicySessionJournal)
     XCTAssertFalse(ServiceBackedCommandNoticePolicy.shouldClear(notice, from: foreignJournal))
     let futureAcceptance = try noticePolicyProjection(
-        commandKind: .end, acceptanceHostSequence: 3)
+        commandKind: .end, acceptanceEventSequence: 3)
     XCTAssertFalse(ServiceBackedCommandNoticePolicy.shouldClear(notice, from: futureAcceptance))
     let invalidZeroSequence = try noticePolicyProjection(
         commandKind: .end, acceptanceHostSequence: 0)
@@ -306,8 +338,8 @@ let casesServiceBackedCommandNoticePolicy: [Case] = [
     ("service command notice rejects identity and cursor drift", {
         try testServiceBackedCommandNoticePolicyRejectsIdentityAndCursorDrift()
     }),
-    ("service command notice rejects later foreign receipt", {
-        try testServiceBackedCommandNoticePolicyRejectsLaterForeignReceipt()
+    ("service command notice uses immutable receipt correlation", {
+        try testServiceBackedCommandNoticePolicyUsesImmutableReceiptCorrelation()
     }),
     ("service command notice uses canonical evidence across connectivity", {
         try testServiceBackedCommandNoticePolicyUsesCanonicalEvidenceAcrossConnectivity()
