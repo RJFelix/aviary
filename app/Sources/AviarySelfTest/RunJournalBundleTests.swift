@@ -354,6 +354,13 @@ func test_runJournalBundleInputAndAssistantTipsRemainOneVisibleChain() async thr
     let reduced = SessionReducer.reduce(events)
     XCTAssertTrue(reduced.structuralIntegrityValid && reduced.semanticProjectionValid)
     XCTAssertEqual(reduced.messages.map(\.text), ["first", "answer-1", "second", "answer-2"])
+    let assistantEvents = events.filter { $0.type == TimelineEventType.messageCommitted }
+    XCTAssertEqual(assistantEvents.count, 2)
+    XCTAssertTrue(assistantEvents.allSatisfy { $0.sessionAttachment == bundleTestAttachment })
+    XCTAssertTrue(reduced.messages.filter { $0.role == ChatRole.assistant.rawValue }
+        .allSatisfy { $0.sessionAttachment == bundleTestAttachment })
+    XCTAssertTrue(assistantEvents.compactMap { SessionMessageSnapshot.canonicalMessage(from: $0) }
+        .allSatisfy { $0.sessionAttachment == bundleTestAttachment })
     XCTAssertEqual(reduced.compactionSummary, "first exchange established the answer")
     XCTAssertEqual(reduced.semanticTip?.eventID, reduced.messages.last?.eventID)
     let workEvents = try bundleEvents(home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))

@@ -141,6 +141,10 @@ just shots    # every screen renders, against your real agent directory
 Inspect the registered case arrays with `rg`, then run with an explicit filter for focused work.
 Use `AVIARY_SELFTEST_TRACE=1` for unbuffered per-case begin/end markers on stderr when diagnosing
 a long or stalled run; redirected stdout alone can lag several cases behind the active test.
+For a generic GUI canonical-read failure, launch the signed executable with
+`AVIARY_TRACE_WORK_READS=1` and capture stderr. `AVIARY_WORK_READ_FAILURE` records the failing
+operation, Work/Session target, sequence number, and fixed error category before error mapping.
+It deliberately excludes identities, paths, prompts, bodies, digests, and remote error detail.
 
 Both non-harness engines have a terminal entry point, and using them is how you verify a
 change without clicking: `Aviary --agent "<prompt>"` for the in-house engine, and

@@ -470,10 +470,38 @@ another review. Bodies remain on-demand, capability-checked, bounded, and digest
 These remain whole-working-tree observations, not attributed per-turn deltas or restorable
 checkpoints. Revision feedback is a composer draft, never an automatic Send. Write-capable
 checkpoint work and the separate Phase 5 Handle design remain outside this chat-first slice.
-Focused, visual, and signed-history verification is pending.
+The exact artifact/history suite passes 8 cases / 48 assertions. Signed `a182c8e` loads the two
+real coding observations independently: the first contains only the quantity fix in `cart.py`,
+the second includes negative-quantity validation and its regression test. The earlier observation
+remains selectable after the newer one exists. The picker and both bodies were inspected in the
+production sheet; reading them does not require repairing the original project folder.
+
+Production verification found missing assistant-message provenance: the producer omitted the
+Session attachment even though Run and Turn were recorded. New `message.committed` events now
+carry the exact attachment; the producer/reducer regression passes 1 case / 16 assertions.
+Existing messages without that evidence remain picker-only rather than receiving guessed links.
+Signed verification of new-message turn links is pending helper deployment.
 
 The live startup journey also exposed an implicit-selection race: asynchronous restoration could
 reorder the chat list before any default focus was pinned. The first background attachment now
 establishes default focus only if none exists. Later restoration cannot retarget the visible
 composer, and explicit chat/pending-request/new-chat choices retain priority. The AppModel journey
 probe covers a retained draft between the first and second restoration plus existing explicit focus.
+
+A second explicit End produced valid Work/Session terminal records but left the old GUI controller
+on an incomplete-read warning. Relaunching only the GUI restored the same completed chat on the
+same helper. Ordinary polling later reproduced the same warning on an already completed coding
+chat. This is an open read/reconciliation defect, not a failed End or lost reply. A bounded
+controller recovery now privately replays both journals after a typed incremental proof failure,
+requiring the previously published reducer boundaries to match before publishing. Failed replay
+is exhausted until a normal incremental read succeeds; retained commands are never dispatched
+again. Controller regressions pass 46 cases / 444 assertions, including rewritten/regressed
+sources and paged replay. A production second-Run live-to-cold prefix oracle passes 1 case / 64
+assertions. These establish recovery invariants, not the cause of the observed generic transport
+failure; targeted, metadata-only tracing and signed live verification remain pending.
+
+The whole macOS regression run passes 1,064 cases / 15,058 assertions in 660.26 seconds.
+The opt-in fixed-category trace classifier separately passes 1 case / 8 assertions; remote
+error prose and local paths do not enter its output. A strict-signature-verified GUI build loads
+the prior coding review against the unchanged helper. The generic polling failure has not yet
+recurred in that traced process, so it remains open rather than being attributed to prefix drift.

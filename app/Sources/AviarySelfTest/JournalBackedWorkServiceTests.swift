@@ -1378,8 +1378,17 @@ func testJournalBackedWorkServiceQualifiesRunOwnerAcrossSessionsAndRestart() asy
         "the replacement Session owner must be ready before its End is exercised")
     let afterBStart = try await service.describeWork(.init(
         work: createdWork, journal: created.work.journal, client: clientB))
+    let secondRun = try XCTUnwrap(afterBStart.currentRun)
     XCTAssertEqual(afterBStart.currentRunSession, secondarySession)
     XCTAssertEqual(afterBStart.currentRunSessionAttachment, secondarySessionAttachment)
+    let liveSecondRunPage = try await service.eventsAfterCursor(WorkServiceEventsRequest(
+        work: createdWork, journal: created.work.journal,
+        attachment: secondaryClient, client: clientB,
+        target: .work(journal: created.work.journal),
+        afterCursor: JournalCursor(journal: created.work.journal, sequence: 0),
+        limit: WorkServiceBounds.maxEventsPerPage))
+    let liveSecondRunCursor = try XCTUnwrap(liveSecondRunPage.servedCursor)
+    let liveSecondRunDigest = try XCTUnwrap(liveSecondRunPage.prefixDigest)
     let secondEnd = try await endRun(
         service: service,
         attachment: secondaryClient, sessionAttachment: secondarySessionAttachment,
@@ -1389,6 +1398,36 @@ func testJournalBackedWorkServiceQualifiesRunOwnerAcrossSessionsAndRestart() asy
             description: "second End was \(secondEnd.state), rejection=\(String(describing: secondEnd.rejection)), diagnostic=\(String(describing: secondEnd.diagnostic))")
     }
     XCTAssertEqual(secondEnd.state, .accepted)
+    var secondEndSettled = false
+    let secondEndDeadline = Date().addingTimeInterval(5)
+    while Date() < secondEndDeadline {
+        if let lookup = await service.registry.lookup(createdWork),
+           case .live(let entry) = lookup {
+            let snapshot = await entry.hostedWork.snapshot()
+            if snapshot.lifecycle == .ended && snapshot.journalHealth == .closed,
+               let settled = try? await service.describeWork(.init(
+                   work: createdWork, journal: created.work.journal, client: clientB)),
+               settled.currentRun == nil {
+                secondEndSettled = true
+                break
+            }
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    guard secondEndSettled else {
+        throw UnwrapFailure(description: "second End did not settle to a closed journal")
+    }
+    let coldAfterSecondEnd = try await service.eventsAfterCursor(WorkServiceEventsRequest(
+        work: createdWork, journal: created.work.journal,
+        attachment: secondaryClient, client: clientB,
+        target: .work(journal: created.work.journal),
+        afterCursor: liveSecondRunCursor, limit: WorkServiceBounds.maxEventsPerPage))
+    XCTAssertEqual(
+        coldAfterSecondEnd.basePrefixDigest, liveSecondRunDigest,
+        "the same second-Run prefix must retain one proof token across live-to-cold handoff")
+    XCTAssertTrue(coldAfterSecondEnd.events.contains {
+        $0.type == TimelineEventType.runFinished && $0.run == secondRun
+    })
     await service.controlJournal.close()
 
     let restarted = try JournalBackedWorkService(

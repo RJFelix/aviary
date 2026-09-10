@@ -3226,7 +3226,8 @@ public actor RunJournalBundle {
         }
         let message = try await appendSession(TimelineEventDraft(
             hostSequence: nextHostOrder(), conversationParent: lastMessage,
-            session: session, run: activeRun, turn: activeTurn,
+            session: session, sessionAttachment: sessionAttachment,
+            run: activeRun, turn: activeTurn,
             type: TimelineEventType.messageCommitted, declaredDomains: [.session],
             payload: .object([
                 "role": .string("assistant"), "text": .string(text),

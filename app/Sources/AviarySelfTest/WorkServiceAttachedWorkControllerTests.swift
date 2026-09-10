@@ -41,6 +41,8 @@ private enum AttachedControllerServiceMode: Sendable {
     case truncatedPage
     case transport
     case remoteStale
+    case remoteReadStale
+    case foreignSnapshot
     case forgedAcceptedReceipt
     case forgedHistoryPage
     case missingAttachment
@@ -501,9 +503,22 @@ private actor AttachedControllerTestService: WorkServiceClient {
     func snapshot(_ request: WorkServiceSnapshotRequest) async throws -> WorkServiceSnapshot {
         if mode == .transport { throw AttachedControllerTestError.transport }
         snapshotAfterSequences.append(request.afterCursor?.sequence ?? 0)
+        if mode == .remoteReadStale, (request.afterCursor?.sequence ?? 0) > 0 {
+            throw WorkServiceTransportError.remote(code: .staleCursor, detail: nil)
+        }
         let events = events(for: request.target)
-        let selected = Array(events.filter { $0.sequence > (request.afterCursor?.sequence ?? 0) }
+        var selected = Array(events.filter { $0.sequence > (request.afterCursor?.sequence ?? 0) }
             .prefix(request.limit))
+        if mode == .foreignSnapshot, let first = selected.first {
+            let foreignWork = WorkRef(workHostID: fixture.host.workHostID, workID: "foreign")
+            let foreignJournal = JournalRef.work(foreignWork, journalID: "foreign-journal")
+            selected[0] = TimelineEvent(
+                eventID: first.eventID, journal: foreignJournal, sequence: first.sequence,
+                previousEventID: first.previousEventID, session: first.session, work: first.work,
+                workHost: first.workHost, client: first.client,
+                sessionAttachment: first.sessionAttachment, actor: first.actor,
+                hostRecordedAt: first.hostRecordedAt, type: first.type, payload: first.payload)
+        }
         let served = selected.last.map {
             JournalCursor(journal: request.target.journal, eventID: $0.eventID, sequence: $0.sequence)
         } ?? request.afterCursor ?? JournalCursor(journal: request.target.journal, sequence: 0)
@@ -1054,6 +1069,19 @@ func testWorkServiceAttachedControllerFetchesExactOlderReviewAndLatestReview() a
         _ = try await controller.fetchArtifactBody(descriptor: wrongAttachment)
         XCTFail("a descriptor for another Session attachment must be rejected")
     } catch WorkServiceAttachedArtifactLoadError.malformed {
+        XCTAssertTrue(true)
+    }
+    let missing = try WorkServiceArtifactDescriptor(
+        artifactID: "review-missing", work: latest.work, label: latest.label,
+        mediaType: latest.mediaType, byteCount: latest.byteCount, digest: latest.digest,
+        available: latest.available, bodyReference: latest.bodyReference,
+        sourceEvent: latest.sourceEvent, session: latest.session,
+        sessionAttachment: latest.sessionAttachment, run: latest.run, turn: latest.turn,
+        action: latest.action, causedByEventID: latest.causedByEventID)
+    do {
+        _ = try await controller.fetchArtifactBody(descriptor: missing)
+        XCTFail("a descriptor absent from the authenticated index must not be fetched")
+    } catch WorkServiceAttachedArtifactLoadError.notFound {
         XCTAssertTrue(true)
     }
     do {
@@ -2666,6 +2694,162 @@ func testWorkServiceAttachedControllerRejectsMismatchedCheckpointPrefixBeforeRep
                    fixture.workEvents.count)
 }
 
+func testWorkServiceAttachedControllerReauthenticatesInvalidatedIncrementalReadWithoutReplayingCommand()
+    async throws {
+    let fixture = try AttachedControllerFixture(workID: "incremental-reauthentication")
+    let service = AttachedControllerTestService(fixture: fixture)
+    let controller = try makeAttachedController(fixture: fixture, service: service)
+    let initial = try await controller.refresh()
+    XCTAssertTrue(initial.isCanonical)
+
+    // The command crossed exactly once, but its response was lost. Its canonical acceptance is
+    // deliberately left in the newer Work prefix while the controller retains the exact intent.
+    await service.loseNextAcceptedResponse()
+    do {
+        _ = try await controller.start(
+            "retained during source reauthentication", commandID: "reauthenticated-command")
+        XCTFail("the accepted response must be lost")
+    } catch WorkServiceAttachedWorkControllerError.transportFailure {
+        XCTAssertEqual((await controller.pendingCommand())?.commandID, "reauthenticated-command")
+    }
+    XCTAssertEqual(await service.commandCount(), 1)
+
+    // Model an invalidated since-cursor proof such as a typed remote stale read during a source
+    // handoff. The published pair stays intact and the command remains retained.
+    await service.setMode(.remoteReadStale)
+    do {
+        _ = try await controller.refresh()
+        XCTFail("the incremental read must fail on its stale source cursor")
+    } catch WorkServiceAttachedWorkControllerError.staleCursor {
+        XCTAssertEqual((await controller.projection()).workCursor, initial.workCursor)
+        XCTAssertEqual((await controller.projection()).sessionCursor, initial.sessionCursor)
+        XCTAssertEqual((await controller.pendingCommand())?.commandID, "reauthenticated-command")
+    }
+
+    await service.setMode(.normal)
+    let recovered = try await controller.refresh()
+    XCTAssertTrue(recovered.isCanonical)
+    XCTAssertEqual(recovered.workCursor.sequence, fixture.workEvents.count + 1)
+    XCTAssertNil(await controller.pendingCommand())
+    XCTAssertEqual(await service.commandCount(), 1, "source recovery must never replay the command")
+    XCTAssertTrue(
+        (await service.snapshotRequestCursors()).filter { $0 == 0 }.count >= 4,
+        "the private recovery must reauthenticate both journals from zero")
+}
+
+func testWorkServiceAttachedControllerReadTraceClassifierOmitsErrorDetails() {
+    let sensitive = "private prompt /Users/example/.secret token=credential"
+    let samples: [(Error, String)] = [
+        (WorkServiceTransportError.remote(code: .internalError, detail: sensitive),
+         "transport.remote.internal_error"),
+        (WorkServiceTransportError.writeFailed(sensitive), "transport.write_failed"),
+        (WorkServiceProtocolError.invalidRequest(sensitive), "protocol.invalid_request"),
+        (AttachedControllerTestError.transport, "unknown"),
+    ]
+    for (error, expected) in samples {
+        let classified = WorkServiceAttachedWorkController.traceErrorCode(error)
+        XCTAssertEqual(classified, expected)
+        XCTAssertFalse(classified.contains(sensitive))
+    }
+}
+
+func testWorkServiceAttachedControllerAttemptsOnlyOneBaselineReplayForStableCorruption()
+    async throws {
+    let fixture = try AttachedControllerFixture(workID: "baseline-replay-exhaustion")
+    let service = AttachedControllerTestService(fixture: fixture)
+    let controller = try makeAttachedController(fixture: fixture, service: service)
+    let initial = try await controller.refresh()
+    XCTAssertTrue(initial.isCanonical)
+    await service.advanceWorkCursor()
+    await service.advanceSessionCursor()
+
+    await service.setMode(.remoteReadStale)
+    do {
+        _ = try await controller.refresh()
+        XCTFail("the incremental proof must be invalidated")
+    } catch WorkServiceAttachedWorkControllerError.staleCursor { }
+
+    await service.setMode(.foreignSnapshot)
+    do {
+        _ = try await controller.refresh()
+        XCTFail("the baseline replay must reject a malformed stable source")
+    } catch WorkServiceAttachedWorkControllerError.malformedResponse { }
+    let zeroReadsAfterReplay = (await service.snapshotRequestCursors()).filter { $0 == 0 }.count
+    XCTAssertTrue(zeroReadsAfterReplay >= 4)
+
+    do {
+        _ = try await controller.refresh()
+        XCTFail("the malformed incremental source must remain unavailable")
+    } catch WorkServiceAttachedWorkControllerError.malformedResponse { }
+    XCTAssertEqual(
+        (await service.snapshotRequestCursors()).filter { $0 == 0 }.count,
+        zeroReadsAfterReplay,
+        "a failed baseline replay must not restart full history on every poll")
+    let preserved = await controller.projection()
+    XCTAssertEqual(preserved.workCursor, initial.workCursor)
+    XCTAssertEqual(preserved.sessionCursor, initial.sessionCursor)
+}
+
+func testWorkServiceAttachedControllerRejectsRegressedOrRewrittenBaselinePrefix()
+    async throws {
+    for rewrite in [false, true] {
+        let fixture = try AttachedControllerFixture(
+            workID: rewrite ? "rewritten-baseline" : "regressed-baseline")
+        let service = AttachedControllerTestService(fixture: fixture)
+        if !rewrite {
+            await service.advanceWorkCursor()
+            await service.advanceSessionCursor()
+        }
+        let controller = try makeAttachedController(fixture: fixture, service: service)
+        let initial = try await controller.refresh()
+        XCTAssertTrue(initial.isCanonical)
+
+        await service.setMode(.remoteReadStale)
+        do {
+            _ = try await controller.refresh()
+            XCTFail("the incremental source must first invalidate its retained proof")
+        } catch WorkServiceAttachedWorkControllerError.staleCursor { }
+
+        if rewrite {
+            var rewritten = fixture.sessionEvents
+            let prior = rewritten.removeLast()
+            rewritten.append(TimelineEvent(
+                eventID: prior.eventID, journal: prior.journal, sequence: prior.sequence,
+                hostSequence: prior.hostSequence, idempotencyKey: prior.idempotencyKey,
+                command: prior.command, previousEventID: prior.previousEventID,
+                causedByEventID: prior.causedByEventID, parentActivityID: prior.parentActivityID,
+                conversationParent: prior.conversationParent, session: prior.session,
+                work: prior.work, workHost: prior.workHost, client: prior.client,
+                sessionAttachment: prior.sessionAttachment,
+                clientAttachment: prior.clientAttachment, run: prior.run, turn: prior.turn,
+                action: prior.action, handle: prior.handle, actor: prior.actor,
+                hostRecordedAt: prior.hostRecordedAt, clientTimestamp: prior.clientTimestamp,
+                schemaVersion: prior.schemaVersion, payloadVersion: prior.payloadVersion,
+                type: prior.type, declaredDomains: prior.declaredDomains,
+                provenance: prior.provenance, links: prior.links,
+                omittedEvidenceLinkCount: prior.omittedEvidenceLinkCount,
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string("same identity, rewritten canonical payload"),
+                ])))
+            await service.replaceSessionEvents(rewritten)
+        } else {
+            await service.replaceWorkEvents(fixture.workEvents)
+            await service.replaceSessionEvents(fixture.sessionEvents)
+        }
+        await service.setMode(.normal)
+        do {
+            _ = try await controller.refresh()
+            XCTFail("baseline replay must not replace the published prefix")
+        } catch WorkServiceAttachedWorkControllerError.sourceIncomplete { }
+        let preserved = await controller.projection()
+        XCTAssertEqual(preserved.workCursor, initial.workCursor)
+        XCTAssertEqual(preserved.sessionCursor, initial.sessionCursor)
+        XCTAssertEqual(preserved.workSnapshot, initial.workSnapshot)
+        XCTAssertEqual(preserved.sessionSnapshot, initial.sessionSnapshot)
+    }
+}
+
 func testWorkServiceAttachedControllerPreservesCheckpointAcrossHostRestart() async throws {
     let fixture = try AttachedControllerFixture()
     let service = AttachedControllerTestService(fixture: fixture)
@@ -2897,6 +3081,26 @@ func testWorkServiceAttachedControllerResumesMoreThan256PagesFromCheckpointCurso
     XCTAssertTrue(await service.pageRequestCursors().contains {
         $0 >= 257
     })
+
+    // The same hidden continuation machinery must carry a recovery replay across its page
+    // budget. Its intermediate prefixes never replace the already-published complete pair.
+    await service.setMode(.remoteReadStale)
+    do {
+        _ = try await controller.refresh()
+        XCTFail("the incremental proof must be invalidated before replay")
+    } catch WorkServiceAttachedWorkControllerError.staleCursor { }
+    await service.setMode(.normal)
+    var replayed = await controller.projection()
+    for _ in 0..<4 where !replayed.isCanonical {
+        replayed = try await controller.refresh()
+        if !replayed.isCanonical {
+            XCTAssertEqual(replayed.workCursor, final.workCursor)
+            XCTAssertEqual(replayed.sessionCursor, final.sessionCursor)
+        }
+    }
+    XCTAssertTrue(replayed.isCanonical)
+    XCTAssertEqual(replayed.workSnapshot, final.workSnapshot)
+    XCTAssertEqual(replayed.sessionSnapshot, final.sessionSnapshot)
 }
 
 let casesWorkServiceAttachedWorkController: [Case] = [
@@ -3010,6 +3214,18 @@ let casesWorkServiceAttachedWorkController: [Case] = [
     }),
     ("phase3 Work controller rejects a mismatched checkpoint prefix", {
         try await testWorkServiceAttachedControllerRejectsMismatchedCheckpointPrefixBeforeReplay()
+    }),
+    ("phase3 Work controller reauthenticates an invalidated incremental source", {
+        try await testWorkServiceAttachedControllerReauthenticatesInvalidatedIncrementalReadWithoutReplayingCommand()
+    }),
+    ("phase3 Work controller read tracing omits error details", {
+        testWorkServiceAttachedControllerReadTraceClassifierOmitsErrorDetails()
+    }),
+    ("phase3 Work controller bounds baseline replay for stable corruption", {
+        try await testWorkServiceAttachedControllerAttemptsOnlyOneBaselineReplayForStableCorruption()
+    }),
+    ("phase3 Work controller rejects regressed or rewritten baseline prefix", {
+        try await testWorkServiceAttachedControllerRejectsRegressedOrRewrittenBaselinePrefix()
     }),
     ("phase3 Work controller preserves exact checkpoint across host restart", {
         try await testWorkServiceAttachedControllerPreservesCheckpointAcrossHostRestart()

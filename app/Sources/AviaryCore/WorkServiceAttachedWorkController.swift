@@ -607,6 +607,15 @@ public actor WorkServiceAttachedWorkController {
         case session
     }
 
+    private enum WorkReadTraceOperation: String {
+        case handshake
+        case snapshot
+        case snapshotValidation = "snapshot_validation"
+        case page = "events_after_cursor"
+        case pageValidation = "event_page_validation"
+        case projectionValidation = "projection_validation"
+    }
+
     private struct PendingInternal: Sendable {
         let request: WorkServiceCommandRequest
         var state: WorkServiceAttachedWorkPendingState
@@ -668,6 +677,16 @@ public actor WorkServiceAttachedWorkController {
     private var sessionPrefixDigestStorage: String?
     private var stagedWorkReadStorage: StagedRead?
     private var stagedSessionReadStorage: StagedRead?
+    /// If the service explicitly rejects an incremental cursor/prefix proof, one private paired
+    /// replay from the baseline can reauthenticate that source without replacing the last
+    /// published pair. The replay must reproduce the formerly published reducer boundary below.
+    /// Once attempted, replay is exhausted until an ordinary incremental read succeeds,
+    /// preventing a permanently stale or malformed source from forcing repeated full-history
+    /// restarts.
+    private var pairedBaselineReplayStorage = false
+    private var pairedBaselineReplayExhaustedStorage = false
+    private var pairedBaselineWorkBoundaryValidatedStorage = false
+    private var pairedBaselineSessionBoundaryValidatedStorage = false
     private var pendingReadAcknowledgementsStorage: [ReadAcknowledgementKey: PendingReadAcknowledgement] = [:]
     /// A restored reducer checkpoint is kept out of all public projection fields until the host
     /// has returned matching base-prefix digests for both journals.  Once the first validated
@@ -1111,6 +1130,8 @@ public actor WorkServiceAttachedWorkController {
         refreshInProgress = true
         defer { refreshInProgress = false }
 
+        let replayingFromBaseline = pairedBaselineReplayStorage
+        var validatingProjection = false
         do {
             let handshake = try await establishConnectionIfNeeded()
             if let handshake {
@@ -1160,20 +1181,39 @@ public actor WorkServiceAttachedWorkController {
                 ?? self.sessionCursorStorage
             let activeWorkStage = self.stagedWorkReadStorage ?? restoredWorkStage
             let activeSessionStage = self.stagedSessionReadStorage ?? restoredSessionStage
-            let workCursor = activeWorkStage?.cursor ?? committedWorkCursor
-            let sessionCursor = activeSessionStage?.cursor ?? committedSessionCursor
-            let workPrefixDigest = activeWorkStage?.prefixDigest
-                ?? restoredCheckpoint?.committedWorkPrefixDigest
-                ?? self.workPrefixDigestStorage
-            let sessionPrefixDigest = activeSessionStage?.prefixDigest
-                ?? restoredCheckpoint?.committedSessionPrefixDigest
-                ?? self.sessionPrefixDigestStorage
-            let workSnapshot = Self.stagedWorkSnapshot(activeWorkStage)
-                ?? restoredCheckpoint?.committedWorkSnapshot
-                ?? self.workSnapshotStorage
-            let sessionSnapshot = Self.stagedSessionSnapshot(activeSessionStage)
-                ?? restoredCheckpoint?.committedSessionSnapshot
-                ?? self.sessionSnapshotStorage
+            let workCursor: JournalCursor
+            let sessionCursor: JournalCursor
+            let workPrefixDigest: String?
+            let sessionPrefixDigest: String?
+            let workSnapshot: WorkSnapshot
+            let sessionSnapshot: SessionSnapshot
+            if replayingFromBaseline {
+                workCursor = activeWorkStage?.cursor
+                    ?? JournalCursor(journal: journal, sequence: 0)
+                sessionCursor = activeSessionStage?.cursor
+                    ?? JournalCursor(journal: sessionJournal, sequence: 0)
+                workPrefixDigest = activeWorkStage?.prefixDigest
+                sessionPrefixDigest = activeSessionStage?.prefixDigest
+                workSnapshot = Self.stagedWorkSnapshot(activeWorkStage)
+                    ?? Self.baselineWorkSnapshot(work: descriptor.work, journal: journal)
+                sessionSnapshot = Self.stagedSessionSnapshot(activeSessionStage)
+                    ?? Self.baselineSessionSnapshot(session: session, journal: sessionJournal)
+            } else {
+                workCursor = activeWorkStage?.cursor ?? committedWorkCursor
+                sessionCursor = activeSessionStage?.cursor ?? committedSessionCursor
+                workPrefixDigest = activeWorkStage?.prefixDigest
+                    ?? restoredCheckpoint?.committedWorkPrefixDigest
+                    ?? self.workPrefixDigestStorage
+                sessionPrefixDigest = activeSessionStage?.prefixDigest
+                    ?? restoredCheckpoint?.committedSessionPrefixDigest
+                    ?? self.sessionPrefixDigestStorage
+                workSnapshot = Self.stagedWorkSnapshot(activeWorkStage)
+                    ?? restoredCheckpoint?.committedWorkSnapshot
+                    ?? self.workSnapshotStorage
+                sessionSnapshot = Self.stagedSessionSnapshot(activeSessionStage)
+                    ?? restoredCheckpoint?.committedSessionSnapshot
+                    ?? self.sessionSnapshotStorage
+            }
             let pageLimit = self.pageLimit
             let pageBytes = self.pageBytes
             // A live handshake is the transport-generation fence.  Host instance identity is
@@ -1202,6 +1242,7 @@ public actor WorkServiceAttachedWorkController {
                 expectedHostInstance: expectedHostInstance,
                 expectedBasePrefixDigest: sessionPrefixDigest)
             let (workDelta, sessionDelta) = try await (workRead, sessionRead)
+            validatingProjection = true
             // Both reads returned a validated base (possibly with a page-budget continuation), so
             // the restored disk record is no longer needed as a seed.  Keep the newly reduced
             // continuation private until the paired projection commits below.
@@ -1213,6 +1254,24 @@ public actor WorkServiceAttachedWorkController {
             let reducedSession = try Self.reduceRead(
                 sessionDelta, initial: sessionSnapshot, kind: .session,
                 expectedCursor: sessionCursor)
+            if replayingFromBaseline {
+                pairedBaselineWorkBoundaryValidatedStorage = try Self.validateBaselineBoundary(
+                    delta: workDelta, initial: workSnapshot,
+                    committedCursor: committedWorkCursor,
+                    committedSnapshot: self.workSnapshotStorage,
+                    alreadyValidated: pairedBaselineWorkBoundaryValidatedStorage)
+                pairedBaselineSessionBoundaryValidatedStorage = try Self.validateBaselineBoundary(
+                    delta: sessionDelta, initial: sessionSnapshot,
+                    committedCursor: committedSessionCursor,
+                    committedSnapshot: self.sessionSnapshotStorage,
+                    alreadyValidated: pairedBaselineSessionBoundaryValidatedStorage)
+                if workDelta.sourceCompleteness == .complete
+                    && sessionDelta.sourceCompleteness == .complete
+                    && (!pairedBaselineWorkBoundaryValidatedStorage
+                        || !pairedBaselineSessionBoundaryValidatedStorage) {
+                    throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+                }
+            }
             let newWork = workDelta
             let newSession = sessionDelta
             let stagedWork = StagedRead(
@@ -1330,6 +1389,13 @@ public actor WorkServiceAttachedWorkController {
             sessionOmissionsStorage = newSession.omissions
             stagedWorkReadStorage = nil
             stagedSessionReadStorage = nil
+            pairedBaselineReplayStorage = false
+            // A successful replay publishes the recovered pair, but it does not itself prove
+            // that the service can honor a since-cursor request again. Require one ordinary
+            // incremental success before another baseline replay may be scheduled.
+            pairedBaselineReplayExhaustedStorage = replayingFromBaseline
+            pairedBaselineWorkBoundaryValidatedStorage = false
+            pairedBaselineSessionBoundaryValidatedStorage = false
             checkpointAwaitingHostValidationStorage = false
             requiredWorkCursorStorage = nil
             requiresRefreshStorage = false
@@ -1339,6 +1405,11 @@ public actor WorkServiceAttachedWorkController {
             _ = persistCheckpointIfPossible()
             return projection()
         } catch let error as WorkServiceAttachedWorkControllerError {
+            if validatingProjection {
+                Self.traceWorkReadFailure(
+                    operation: .projectionValidation, target: "pair", sequence: nil,
+                    error: error)
+            }
             if restoredCheckpointStorage != nil {
                 // A checkpoint that cannot be reconciled against the host's exact prefix is only
                 // a failed cache hint.  Drop that hint so the next refresh safely replays from
@@ -1346,14 +1417,51 @@ public actor WorkServiceAttachedWorkController {
                 restoredCheckpointStorage = nil
                 stagedWorkReadStorage = nil
                 stagedSessionReadStorage = nil
+            } else if replayingFromBaseline {
+                // This source did not validate even from zero. Keep the last published pair and
+                // do not turn every later poll into another full-history replay, regardless of
+                // whether the failed proof was incomplete, malformed, or unavailable.
+                stagedWorkReadStorage = nil
+                stagedSessionReadStorage = nil
+                pairedBaselineReplayStorage = false
+                pairedBaselineReplayExhaustedStorage = true
+                pairedBaselineWorkBoundaryValidatedStorage = false
+                pairedBaselineSessionBoundaryValidatedStorage = false
+            } else if error == .sourceIncomplete || error == .staleCursor {
+                let retainedWorkCursor = stagedWorkReadStorage?.cursor ?? workCursorStorage
+                let retainedSessionCursor = stagedSessionReadStorage?.cursor ?? sessionCursorStorage
+                if !pairedBaselineReplayExhaustedStorage,
+                   retainedWorkCursor.sequence > 0 || retainedSessionCursor.sequence > 0 {
+                    // Discard only the private continuation. The committed snapshots remain
+                    // visible while the next refresh authenticates both journals from zero.
+                    stagedWorkReadStorage = nil
+                    stagedSessionReadStorage = nil
+                    pairedBaselineReplayStorage = true
+                    pairedBaselineWorkBoundaryValidatedStorage = false
+                    pairedBaselineSessionBoundaryValidatedStorage = false
+                }
             }
             markReadFailure(error)
             throw error
         } catch {
+            if validatingProjection {
+                Self.traceWorkReadFailure(
+                    operation: .projectionValidation, target: "pair", sequence: nil,
+                    error: error)
+            }
             if restoredCheckpointStorage != nil {
                 restoredCheckpointStorage = nil
                 stagedWorkReadStorage = nil
                 stagedSessionReadStorage = nil
+            } else if replayingFromBaseline {
+                // Transport and other non-controller failures exhaust this attempt too. Retrying
+                // the same full source on every poll would turn an outage into unbounded replay.
+                stagedWorkReadStorage = nil
+                stagedSessionReadStorage = nil
+                pairedBaselineReplayStorage = false
+                pairedBaselineReplayExhaustedStorage = true
+                pairedBaselineWorkBoundaryValidatedStorage = false
+                pairedBaselineSessionBoundaryValidatedStorage = false
             }
             markReadFailure(.transportFailure)
             throw WorkServiceAttachedWorkControllerError.transportFailure
@@ -2175,16 +2283,20 @@ public actor WorkServiceAttachedWorkController {
         guard let connectIfNeeded else { return nil }
         do {
             return try await connectIfNeeded()
-        } catch WorkServiceClientSessionError.notConnected {
-            throw WorkServiceAttachedWorkControllerError.notConnected
-        } catch WorkServiceClientSessionError.unavailable {
-            throw WorkServiceAttachedWorkControllerError.transportFailure
-        } catch WorkServiceClientSessionError.incompatibleProtocol {
-            throw WorkServiceAttachedWorkControllerError.hostMismatch
-        } catch WorkServiceClientSessionError.hostInstanceMismatch {
-            throw WorkServiceAttachedWorkControllerError.hostMismatch
         } catch {
-            throw WorkServiceAttachedWorkControllerError.transportFailure
+            Self.traceWorkReadFailure(
+                operation: .handshake, target: "pair", sequence: nil, error: error)
+            switch error {
+            case WorkServiceClientSessionError.notConnected:
+                throw WorkServiceAttachedWorkControllerError.notConnected
+            case WorkServiceClientSessionError.unavailable:
+                throw WorkServiceAttachedWorkControllerError.transportFailure
+            case WorkServiceClientSessionError.incompatibleProtocol,
+                 WorkServiceClientSessionError.hostInstanceMismatch:
+                throw WorkServiceAttachedWorkControllerError.hostMismatch
+            default:
+                throw WorkServiceAttachedWorkControllerError.transportFailure
+            }
         }
     }
 
@@ -2258,27 +2370,51 @@ public actor WorkServiceAttachedWorkController {
                 attachment: attachment.attachment, client: client, target: target,
                 afterCursor: after, limit: pageLimit, maxBytes: pageBytes))
         } catch {
+            traceWorkReadFailure(
+                operation: .snapshot, target: traceTarget(kind),
+                sequence: after.sequence, error: error)
             throw mapReadError(error)
         }
         guard first.target == target,
               validDescriptor(
                   first.work, expected: descriptor.work, expectedJournal: journal,
                   expectedHostInstance: expectedHostInstance) else {
+            traceWorkReadFailure(
+                operation: .snapshotValidation, target: traceTarget(kind),
+                sequence: after.sequence,
+                error: WorkServiceAttachedWorkControllerError.malformedResponse)
             throw WorkServiceAttachedWorkControllerError.malformedResponse
         }
         guard Self.validPrefixDigest(first.basePrefixDigest),
               Self.validPrefixDigest(first.prefixDigest),
               expectedBasePrefixDigest == nil || first.basePrefixDigest == expectedBasePrefixDigest else {
+            traceWorkReadFailure(
+                operation: .snapshotValidation, target: traceTarget(kind),
+                sequence: after.sequence,
+                error: WorkServiceAttachedWorkControllerError.sourceIncomplete)
             throw WorkServiceAttachedWorkControllerError.sourceIncomplete
         }
         if first.work.hostObservation?.sourceCompleteness == .incomplete
             || first.work.hostObservation?.sourceCompleteness == .unknown {
+            traceWorkReadFailure(
+                operation: .snapshotValidation, target: traceTarget(kind),
+                sequence: after.sequence,
+                error: WorkServiceAttachedWorkControllerError.sourceIncomplete)
             throw WorkServiceAttachedWorkControllerError.sourceIncomplete
         }
-        var cursor = try validateSnapshot(
-            first, target: target, targetJournal: targetJournal, expectedWork: descriptor.work,
-            expectedSession: session, expectedSessionAttachment: sessionAttachment,
-            after: after, pageLimit: pageLimit, pageBytes: pageBytes)
+        let validatedSnapshotCursor: JournalCursor
+        do {
+            validatedSnapshotCursor = try validateSnapshot(
+                first, target: target, targetJournal: targetJournal, expectedWork: descriptor.work,
+                expectedSession: session, expectedSessionAttachment: sessionAttachment,
+                after: after, pageLimit: pageLimit, pageBytes: pageBytes)
+        } catch {
+            traceWorkReadFailure(
+                operation: .snapshotValidation, target: traceTarget(kind),
+                sequence: after.sequence, error: error)
+            throw error
+        }
+        var cursor = validatedSnapshotCursor
         var events = first.events
         var prefixDigest = first.prefixDigest
         var omissions: [WorkServiceOmission] = []
@@ -2287,6 +2423,10 @@ public actor WorkServiceAttachedWorkController {
             if kind == .work,
                let advertised = first.work.hostObservation?.servedCursor,
                advertised != cursor {
+                traceWorkReadFailure(
+                    operation: .snapshotValidation, target: traceTarget(kind),
+                    sequence: after.sequence,
+                    error: WorkServiceAttachedWorkControllerError.sourceIncomplete)
                 throw WorkServiceAttachedWorkControllerError.sourceIncomplete
             }
         }
@@ -2315,21 +2455,45 @@ public actor WorkServiceAttachedWorkController {
                     attachment: attachment.attachment, client: client, target: target,
                     afterCursor: cursor, limit: pageLimit, maxBytes: pageBytes))
             } catch {
+                traceWorkReadFailure(
+                    operation: .page, target: traceTarget(kind),
+                    sequence: cursor.sequence, error: error)
                 throw mapReadError(error)
             }
             guard page.target == target else {
+                traceWorkReadFailure(
+                    operation: .pageValidation, target: traceTarget(kind),
+                    sequence: cursor.sequence,
+                    error: WorkServiceAttachedWorkControllerError.malformedResponse)
                 throw WorkServiceAttachedWorkControllerError.malformedResponse
             }
             guard Self.validPrefixDigest(page.basePrefixDigest),
                   Self.validPrefixDigest(page.prefixDigest),
                   page.basePrefixDigest == prefixDigest else {
+                traceWorkReadFailure(
+                    operation: .pageValidation, target: traceTarget(kind),
+                    sequence: cursor.sequence,
+                    error: WorkServiceAttachedWorkControllerError.sourceIncomplete)
                 throw WorkServiceAttachedWorkControllerError.sourceIncomplete
             }
-            let pageCursor = try validateEventPage(
-                page, target: target, targetJournal: targetJournal, expectedWork: descriptor.work,
-                expectedSession: session, expectedSessionAttachment: sessionAttachment,
-                after: cursor, pageLimit: pageLimit, pageBytes: pageBytes)
+            let pageCursor: JournalCursor
+            do {
+                pageCursor = try validateEventPage(
+                    page, target: target, targetJournal: targetJournal,
+                    expectedWork: descriptor.work, expectedSession: session,
+                    expectedSessionAttachment: sessionAttachment,
+                    after: cursor, pageLimit: pageLimit, pageBytes: pageBytes)
+            } catch {
+                traceWorkReadFailure(
+                    operation: .pageValidation, target: traceTarget(kind),
+                    sequence: cursor.sequence, error: error)
+                throw error
+            }
             guard pageCursor != cursor, seenCursors.insert(pageCursor).inserted else {
+                traceWorkReadFailure(
+                    operation: .pageValidation, target: traceTarget(kind),
+                    sequence: cursor.sequence,
+                    error: WorkServiceAttachedWorkControllerError.malformedResponse)
                 throw WorkServiceAttachedWorkControllerError.malformedResponse
             }
             events.append(contentsOf: page.events)
@@ -2341,12 +2505,20 @@ public actor WorkServiceAttachedWorkController {
             cursor = pageCursor
             if let next = page.nextCursor {
                 guard next == pageCursor else {
+                    traceWorkReadFailure(
+                        operation: .pageValidation, target: traceTarget(kind),
+                        sequence: cursor.sequence,
+                        error: WorkServiceAttachedWorkControllerError.malformedResponse)
                     throw WorkServiceAttachedWorkControllerError.malformedResponse
                 }
                 needsPage = true
             } else if hasPagingOmission(page.omissions) {
                 // A server that admits more data but does not provide a progressing cursor has
                 // exposed an incomplete source. Do not reduce or publish this candidate.
+                traceWorkReadFailure(
+                    operation: .pageValidation, target: traceTarget(kind),
+                    sequence: cursor.sequence,
+                    error: WorkServiceAttachedWorkControllerError.sourceIncomplete)
                 throw WorkServiceAttachedWorkControllerError.sourceIncomplete
             } else {
                 needsPage = false
@@ -2370,6 +2542,103 @@ public actor WorkServiceAttachedWorkController {
     private static func stagedSessionSnapshot(_ staged: StagedRead?) -> SessionSnapshot? {
         guard let staged, case .session(let snapshot) = staged.snapshot else { return nil }
         return snapshot
+    }
+
+    private static func baselineWorkSnapshot(
+        work: WorkRef, journal: JournalRef
+    ) -> WorkSnapshot {
+        var snapshot = WorkSnapshot()
+        snapshot.journal = journal
+        snapshot.work = work
+        snapshot.workHost = WorkHostRef(work.workHostID)
+        return snapshot
+    }
+
+    private static func baselineSessionSnapshot(
+        session: SessionRef, journal: JournalRef
+    ) -> SessionSnapshot {
+        var snapshot = SessionSnapshot()
+        snapshot.journal = journal
+        snapshot.session = session
+        return snapshot
+    }
+
+    private static func validateBaselineBoundary(
+        delta: ReadResult,
+        initial: WorkSnapshot,
+        committedCursor: JournalCursor,
+        committedSnapshot: WorkSnapshot,
+        alreadyValidated: Bool
+    ) throws -> Bool {
+        if alreadyValidated { return true }
+        guard initial.lastSequence <= committedCursor.sequence else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        if initial.lastSequence == committedCursor.sequence {
+            guard initial.lastEventID == committedCursor.eventID,
+                  initial == committedSnapshot else {
+                throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+            }
+            return true
+        }
+        guard delta.cursor.sequence >= committedCursor.sequence else {
+            if delta.sourceCompleteness == .complete {
+                throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+            }
+            return false
+        }
+        guard delta.events.contains(where: {
+            $0.sequence == committedCursor.sequence && $0.eventID == committedCursor.eventID
+        }) else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        var reducer = WorkReducer(snapshot: initial)
+        for event in delta.events where event.sequence <= committedCursor.sequence {
+            reducer.apply(event)
+        }
+        guard reducer.snapshot == committedSnapshot else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        return true
+    }
+
+    private static func validateBaselineBoundary(
+        delta: ReadResult,
+        initial: SessionSnapshot,
+        committedCursor: JournalCursor,
+        committedSnapshot: SessionSnapshot,
+        alreadyValidated: Bool
+    ) throws -> Bool {
+        if alreadyValidated { return true }
+        guard initial.lastSequence <= committedCursor.sequence else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        if initial.lastSequence == committedCursor.sequence {
+            guard initial.lastEventID == committedCursor.eventID,
+                  initial == committedSnapshot else {
+                throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+            }
+            return true
+        }
+        guard delta.cursor.sequence >= committedCursor.sequence else {
+            if delta.sourceCompleteness == .complete {
+                throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+            }
+            return false
+        }
+        guard delta.events.contains(where: {
+            $0.sequence == committedCursor.sequence && $0.eventID == committedCursor.eventID
+        }) else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        var reducer = SessionReducer(snapshot: initial)
+        for event in delta.events where event.sequence <= committedCursor.sequence {
+            reducer.apply(event)
+        }
+        guard reducer.snapshot == committedSnapshot else {
+            throw WorkServiceAttachedWorkControllerError.sourceIncomplete
+        }
+        return true
     }
 
     private static func reduceRead(
@@ -3579,6 +3848,97 @@ public actor WorkServiceAttachedWorkController {
             }
         }
         return .transportFailure
+    }
+
+    private static func traceTarget(_ kind: ReadKind) -> String {
+        switch kind {
+        case .work: return "work"
+        case .session: return "session"
+        }
+    }
+
+    /// Opt-in metadata-only tracing for diagnosing canonical read failures in a signed GUI.
+    /// The classifier deliberately emits only local enum labels and cursor sequence numbers:
+    /// remote detail, identities, paths, payloads, and digests never cross this boundary.
+    private static func traceWorkReadFailure(
+        operation: WorkReadTraceOperation,
+        target: String,
+        sequence: Int?,
+        error: Error
+    ) {
+        guard ProcessInfo.processInfo.environment["AVIARY_TRACE_WORK_READS"] == "1" else {
+            return
+        }
+        let cursor = sequence.map(String.init) ?? "none"
+        let line = "AVIARY_WORK_READ_FAILURE operation=\(operation.rawValue) "
+            + "target=\(target) cursor_sequence=\(cursor) error=\(traceErrorCode(error))\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    static func traceErrorCode(_ error: Error) -> String {
+        if let controller = error as? WorkServiceAttachedWorkControllerError {
+            switch controller {
+            case .invalidSeed: return "controller.invalid_seed"
+            case .invalidOptions: return "controller.invalid_options"
+            case .hostMismatch: return "controller.host_mismatch"
+            case .notConnected: return "controller.not_connected"
+            case .malformedResponse: return "controller.malformed_response"
+            case .sourceIncomplete: return "controller.source_incomplete"
+            case .pendingCommandExists: return "controller.pending_command_exists"
+            case .noPendingCommand: return "controller.no_pending_command"
+            case .commandNotAdmissible: return "controller.command_not_admissible"
+            case .capabilityDenied: return "controller.capability_denied"
+            case .terminalWork: return "controller.terminal_work"
+            case .recoveryRequired: return "controller.recovery_required"
+            case .staleCursor: return "controller.stale_cursor"
+            case .transportFailure: return "controller.transport_failure"
+            }
+        }
+        if let protocolError = error as? WorkServiceProtocolError {
+            switch protocolError {
+            case .unsupportedVersion: return "protocol.unsupported_version"
+            case .invalidRequest: return "protocol.invalid_request"
+            case .hostUnavailable: return "protocol.host_unavailable"
+            case .workNotFound: return "protocol.work_not_found"
+            case .journalMismatch: return "protocol.journal_mismatch"
+            case .attachmentNotFound: return "protocol.attachment_not_found"
+            case .capabilityDenied: return "protocol.capability_denied"
+            case .artifactNotFound: return "protocol.artifact_not_found"
+            case .eventPageCannotProgress: return "protocol.event_page_cannot_progress"
+            case .staleCursor: return "protocol.stale_cursor"
+            case .sourceIncomplete: return "protocol.source_incomplete"
+            }
+        }
+        if let transport = error as? WorkServiceTransportError {
+            switch transport {
+            case .invalidEndpoint: return "transport.invalid_endpoint"
+            case .endpointUnavailable: return "transport.endpoint_unavailable"
+            case .endpointOccupied: return "transport.endpoint_occupied"
+            case .notConnected: return "transport.not_connected"
+            case .alreadyConnected: return "transport.already_connected"
+            case .disconnected: return "transport.disconnected"
+            case .frameTooLarge: return "transport.frame_too_large"
+            case .invalidFrame: return "transport.invalid_frame"
+            case .invalidResponse: return "transport.invalid_response"
+            case .remote(let code, _): return "transport.remote.\(code.rawValue)"
+            case .duplicateResponseID: return "transport.duplicate_response_id"
+            case .tooManyPendingRequests: return "transport.too_many_pending_requests"
+            case .timedOut(let operation): return "transport.timed_out.\(operation.rawValue)"
+            case .canceled: return "transport.canceled"
+            case .writeFailed: return "transport.write_failed"
+            }
+        }
+        if let clientSession = error as? WorkServiceClientSessionError {
+            switch clientSession {
+            case .invalidClient: return "client_session.invalid_client"
+            case .unavailable: return "client_session.unavailable"
+            case .incompatibleProtocol: return "client_session.incompatible_protocol"
+            case .hostInstanceMismatch: return "client_session.host_instance_mismatch"
+            case .notConnected: return "client_session.not_connected"
+            case .superseded: return "client_session.superseded"
+            }
+        }
+        return "unknown"
     }
 
     private func currentArtifactProjectionFence()
