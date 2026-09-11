@@ -420,6 +420,9 @@ public actor RuntimeHost {
     /// The process is known to be ours only for a client that launched it. An adopted client does
     /// not infer process liveness from a PID or from a successful socket connect.
     public private(set) var hostProcessIsRunning = false
+    private var ownedProcessExitVerified = false
+    private var childExecutionOwnershipClaimed = false
+    private var teardownDepth = 0
 
     public var endpoint: SocketEndpoint? { endpointStorage }
     public var hostIdentity: HostIdentity? { identityStorage }
@@ -446,6 +449,7 @@ public actor RuntimeHost {
         self.expectedProtocolVersion = Self.protocolVersion
         self.endpointStorage = nil
         self.identityStorage = nil
+        self.ownedProcessExitVerified = true
     }
 
     /// Construct a client that can adopt an already-running host. `connect()` validates the
@@ -496,14 +500,35 @@ public actor RuntimeHost {
 
     // MARK: Lifecycle
 
+    /// A child executor may take ownership only of a fresh launcher, never an adopted,
+    /// already-started, or previously claimed runtime. This is an in-process ownership check,
+    /// not an authorization or sandbox boundary.
+    public func claimChildExecutionOwnership() -> Bool {
+        guard executable != nil, parentLifetimeLeaseEnabled,
+              process == nil, processGeneration == 0,
+              !isRunning, !isConnected, endpointStorage == nil,
+              !childExecutionOwnershipClaimed else { return false }
+        childExecutionOwnershipClaimed = true
+        return true
+    }
+
     /// Launch, and wait for the host to announce itself.
     ///
     /// The `ready` event doubles as a handshake: a host that cannot start its runtime never
     /// sends one, so a caller learns at launch rather than on first use.
     public func start(timeout: TimeInterval = 20) async throws -> Capabilities {
+        guard teardownDepth == 0 else {
+            throw HostError.launchFailed("The previous runtime is still stopping.")
+        }
         guard !isRunning else {
             if let capabilities { return capabilities }
             throw HostError.notRunning
+        }
+        if let process {
+            guard !process.isRunning else {
+                throw HostError.launchFailed("The previous owned runtime has not exited.")
+            }
+            self.process = nil
         }
         // A RuntimeHost may be restarted after a clean stop. A stopped instance starts a new
         // callback admission epoch only after its fresh ready identity is verified below.
@@ -571,6 +596,7 @@ public actor RuntimeHost {
         }
         process = p
         hostProcessIsRunning = true
+        ownedProcessExitVerified = false
 
         do {
             return try await connect(timeout: timeout)
@@ -750,6 +776,8 @@ public actor RuntimeHost {
     /// return, so the drain has a finite deadline; after it expires, close and owned-process
     /// termination proceed while the admitted callback remains truthfully observable.
     public func stop(callbackDrainTimeout: TimeInterval = 2) async {
+        teardownDepth += 1
+        defer { teardownDepth -= 1 }
         // Invalidate the current process handler before any suspension. A termination callback
         // from this process may already be queued, and must not race a subsequent start.
         processGeneration &+= 1
@@ -782,6 +810,20 @@ public actor RuntimeHost {
             identityStorage = nil
             endpointStorage = nil
         }
+    }
+
+    public struct StopReceipt: Sendable, Equatable {
+        public let ownedProcessExitVerified: Bool
+        public let callbacksQuiescent: Bool
+    }
+
+    /// A transport close or a sent signal alone is not resource quiescence. This receipt
+    /// distinguishes an observed owned-process exit from callbacks that remain in this host.
+    /// An adopted/disconnected process cannot be certified through this owned-process seam.
+    public func stopWithReceipt(callbackDrainTimeout: TimeInterval = 2) async -> StopReceipt {
+        await stop(callbackDrainTimeout: callbackDrainTimeout)
+        return StopReceipt(ownedProcessExitVerified: ownedProcessExitVerified,
+                           callbacksQuiescent: callbackTasks.isEmpty)
     }
 
     /// Drop this GUI client's transport while leaving the host and all Python namespaces alive.
@@ -918,6 +960,7 @@ public actor RuntimeHost {
 
     private func handleExit(generation: UInt64) {
         guard generation == processGeneration else { return }
+        ownedProcessExitVerified = true
         hostProcessIsRunning = false
         isRunning = false
         isConnected = false
@@ -1323,6 +1366,8 @@ public actor RuntimeHost {
 
     private func terminateOwnedProcess(gracePeriod: TimeInterval = 2) async {
         guard let process else { return }
+        teardownDepth += 1
+        defer { teardownDepth -= 1 }
         self.process = nil
         let checks = max(0, Int(gracePeriod / 0.1))
         for _ in 0..<checks where process.isRunning {
@@ -1331,7 +1376,19 @@ public actor RuntimeHost {
         if process.isRunning { process.terminate() }
         try? await Task.sleep(nanoseconds: 300_000_000)
         if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-        hostProcessIsRunning = false
+        // Keep the Foundation child-process object alive until its termination is observed.
+        // Cleanup often follows cancellation, so use an owned wait whose sleeps cannot be
+        // skipped by the canceled caller. Never convert a sent SIGKILL into an exit fact.
+        let exited = await Task.detached {
+            for _ in 0..<40 {
+                if !process.isRunning { return true }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            return !process.isRunning
+        }.value
+        ownedProcessExitVerified = exited
+        hostProcessIsRunning = !exited
+        if !exited { self.process = process }
     }
 
     public func hello() async throws -> Capabilities {

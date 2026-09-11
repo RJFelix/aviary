@@ -10,7 +10,7 @@ import Foundation
 /// event payload is never copied into this map; child state is classified and recovery caveats are
 /// represented by count/digest metadata.
 public struct PersistentWorkExactState: Sendable {
-    public static let schemaVersion = 3
+    public static let schemaVersion = 4
     public static let maximumIdentityBytes = 1_024
     /// One mutation may need to authenticate every active attachment in the affected Session.
     /// WorkService bounds those relationships to 64, leaving room for the event's other typed
@@ -30,7 +30,7 @@ public struct PersistentWorkExactState: Sendable {
             case .missingScalar: return "Persistent Work exact state has no scalar continuation."
             case .invalidRecord: return "Persistent Work exact state contains an invalid typed record."
             case .duplicateEvent(let id): return "Persistent Work event was already observed: \(id)."
-            case .unsupportedEvent(let type): return "Persistent Work event family is not exact in v3: \(type)."
+            case .unsupportedEvent(let type): return "Persistent Work event family is not exact in v4: \(type)."
             case .tooManyPrefetchedSlots: return "Persistent Work exact-state prefetch exceeds its bound."
             case .map(let error): return error.localizedDescription
             }
@@ -57,7 +57,7 @@ public struct PersistentWorkExactState: Sendable {
         }
     }
 
-    private static let scalarKey = "work-exact-v3/scalar"
+    private static let scalarKey = "work-exact-v4/scalar"
     private let map: PersistentProjectionRadixMap
     private var root: PersistentProjectionRadixMap.Root?
     private var lastSnapshot: WorkSnapshot
@@ -92,7 +92,8 @@ public struct PersistentWorkExactState: Sendable {
 
         var overlay = EventLocalOverlay(
             scalar: scalar, scope: map.journal.stableKey, seen: refs.seenRecords, runs: refs.runs,
-            actions: refs.actions, handles: refs.handles, attachments: refs.attachments,
+            actions: refs.actions, handles: refs.handles, agentHandles: refs.agentHandles,
+            attachments: refs.attachments,
             attachmentCounts: refs.attachmentCounts, commands: refs.commands,
             children: refs.children, recoveries: refs.recoveries,
             unknowns: refs.unknowns, quarantines: refs.quarantines)
@@ -155,6 +156,10 @@ public struct PersistentWorkExactState: Sendable {
         if let run = event.run, before.observedRunIDs != after.observedRunIDs, overlay.runs[run.runID] != nil { keys.append(slotKey(kind: "run", identity: run.runID)) }
         if let action = event.action, before.actions[action.actionID] != after.actions[action.actionID] { keys.append(slotKey(kind: "action", identity: action.actionID)) }
         if let handle = event.handle, before.handles[handle.handleID] != after.handles[handle.handleID] { keys.append(slotKey(kind: "handle", identity: handle.handleID)) }
+        if let handle = event.handle,
+           before.agentHandles[handle.handleID] != after.agentHandles[handle.handleID] {
+            keys.append(slotKey(kind: "agent-handle", identity: handle.handleID))
+        }
         if let attachment = event.sessionAttachment, overlay.attachments[attachment.attachmentID] != nil {
             if before.sessionAttachments[attachment.attachmentID] != after.sessionAttachments[attachment.attachmentID] {
                 keys.append(slotKey(kind: "attachment", identity: attachment.attachmentID))
@@ -188,7 +193,7 @@ public struct PersistentWorkExactState: Sendable {
 
     private static func slotKey(kind: String, identity: String) -> String {
         let material = "work-exact-slot-v1\0\(kind.count):\(kind)\0\(identity.utf8.count):\(identity)"
-        return "work-exact-v3/\(kind)/" + AviarySHA256.hash(data: Data(material.utf8)).description
+        return "work-exact-v4/\(kind)/" + AviarySHA256.hash(data: Data(material.utf8)).description
     }
 
     private static func validateIncomingIdentities(_ event: TimelineEvent) throws {
@@ -256,6 +261,8 @@ public struct PersistentWorkExactState: Sendable {
         let unknownDomains: Set<TimelineDomain>; let lastEventID: String?; let lastSequence: Int
         let causalOrderValid: Bool; let structuralIntegrityValid: Bool; let semanticProjectionValid: Bool
         let seenEventCount: Int; let activeActionCount: Int; let outstandingHandleCount: Int
+        let liveAgentHandleCount: Int; let unreapedAgentHandleCount: Int
+        let retainedAgentHandleCount: Int
         let lastUnknownEventID: String?; let lastQuarantineEventID: String?
 
         static func empty(journal: JournalRef) -> ScalarRecord {
@@ -269,11 +276,16 @@ public struct PersistentWorkExactState: Sendable {
                 BoundedWorkScalarContinuation(snapshot: snapshot),
                 seenEventCount: 0,
                 activeActionCount: 0,
-                outstandingHandleCount: 0)
+                outstandingHandleCount: 0,
+                liveAgentHandleCount: 0,
+                unreapedAgentHandleCount: 0,
+                retainedAgentHandleCount: 0)
         }
 
         init(_ scalar: BoundedWorkScalarContinuation, seenEventCount: Int,
              activeActionCount: Int, outstandingHandleCount: Int,
+             liveAgentHandleCount: Int, unreapedAgentHandleCount: Int,
+             retainedAgentHandleCount: Int,
              lastUnknownEventID: String? = nil, lastQuarantineEventID: String? = nil) {
             schemaVersion = PersistentWorkExactState.schemaVersion; kind = "scalar"; journal = scalar.journal; work = scalar.work
             workHost = scalar.workHost; lifecycle = scalar.lifecycle; execution = scalar.execution
@@ -285,6 +297,9 @@ public struct PersistentWorkExactState: Sendable {
             causalOrderValid = scalar.causalOrderValid; structuralIntegrityValid = scalar.structuralIntegrityValid
             semanticProjectionValid = scalar.semanticProjectionValid; self.seenEventCount = seenEventCount
             self.activeActionCount = activeActionCount; self.outstandingHandleCount = outstandingHandleCount
+            self.liveAgentHandleCount = liveAgentHandleCount
+            self.unreapedAgentHandleCount = unreapedAgentHandleCount
+            self.retainedAgentHandleCount = retainedAgentHandleCount
             self.lastUnknownEventID = lastUnknownEventID; self.lastQuarantineEventID = lastQuarantineEventID
         }
 
@@ -296,6 +311,11 @@ public struct PersistentWorkExactState: Sendable {
                   seenEventCount == lastSequence,
                   activeActionCount >= 0, activeActionCount <= seenEventCount,
                   outstandingHandleCount >= 0, outstandingHandleCount <= seenEventCount,
+                  liveAgentHandleCount >= 0,
+                  liveAgentHandleCount <= unreapedAgentHandleCount,
+                  unreapedAgentHandleCount <= retainedAgentHandleCount,
+                  retainedAgentHandleCount <= WorkAgentHandleSnapshot.maximumRetainedPerWork,
+                  retainedAgentHandleCount <= seenEventCount,
                   lastHostSequence.map({ $0 >= 0 && $0 < Int.max }) ?? true,
                   (activeRunSession == nil) == (activeRunSessionAttachment == nil),
                   (activeRun == nil) == (activeRunSession == nil),
@@ -319,6 +339,11 @@ public struct PersistentWorkExactState: Sendable {
     private struct RunRecord: Codable, Hashable, Sendable { let kind: String; let scope: String; let run: RunRef }
     private struct ActionRecord: Codable, Hashable, Sendable { let kind: String; let scope: String; let action: WorkActionSnapshot; let isActive: Bool }
     private struct HandleRecord: Codable, Hashable, Sendable { let kind: String; let scope: String; let handle: WorkHandleSnapshot }
+    private struct AgentHandleRecord: Codable, Hashable, Sendable {
+        let kind: String
+        let scope: String
+        let handle: WorkAgentHandleSnapshot
+    }
     private struct AttachmentRecord: Codable, Hashable, Sendable { let kind: String; let scope: String; let work: WorkRef; let attachment: WorkSessionAttachmentSnapshot }
     private struct CountRecord: Codable, Hashable, Sendable {
         let kind: String
@@ -364,7 +389,8 @@ public struct PersistentWorkExactState: Sendable {
     private struct Prefetch {
         let seen: SeenRecord?
         let seenRecords: [String: SeenRecord]; let runs: [String: RunRecord]; let actions: [String: ActionRecord]
-        let handles: [String: HandleRecord]; let attachments: [String: AttachmentRecord]; let attachmentCounts: [String: CountRecord]
+        let handles: [String: HandleRecord]; let agentHandles: [String: AgentHandleRecord]
+        let attachments: [String: AttachmentRecord]; let attachmentCounts: [String: CountRecord]
         let commands: [String: CommandRecord]; let children: [String: ChildRecord]
         let recoveries: [String: RecoveryRecord]
         let unknowns: [UnknownRecord]; let quarantines: [QuarantineRecord]
@@ -372,7 +398,8 @@ public struct PersistentWorkExactState: Sendable {
         init(map: PersistentProjectionRadixMap, root: PersistentProjectionRadixMap.Root?, event: TimelineEvent, scalar: ScalarRecord) throws {
             guard case .work(let expectedWork) = map.journal.owner else { throw Error.invalidRecord }
             var seenRecords: [String: SeenRecord] = [:]; var runs: [String: RunRecord] = [:]; var actions: [String: ActionRecord] = [:]
-            var handles: [String: HandleRecord] = [:]; var attachments: [String: AttachmentRecord] = [:]; var counts: [String: CountRecord] = [:]; var commands: [String: CommandRecord] = [:]
+            var handles: [String: HandleRecord] = [:]; var agentHandles: [String: AgentHandleRecord] = [:]
+            var attachments: [String: AttachmentRecord] = [:]; var counts: [String: CountRecord] = [:]; var commands: [String: CommandRecord] = [:]
             var children: [String: ChildRecord] = [:]; var recoveries: [String: RecoveryRecord] = [:]
             var slotCount = 0
             func load<T: Decodable>(_ key: String) throws -> T? { slotCount += 1; guard slotCount <= maximumOperationSlots else { throw Error.tooManyPrefetchedSlots }; return try PersistentWorkExactState.read(map: map, root: root, key: key) }
@@ -383,6 +410,25 @@ public struct PersistentWorkExactState: Sendable {
             if let run = event.run, let record: RunRecord = try load(slotKey(kind: "run", identity: run.runID)) { guard record.kind == "run", record.scope == map.journal.stableKey, record.run.runID == run.runID else { throw Error.invalidRecord }; runs[run.runID] = record }
             if let action = event.action, let record: ActionRecord = try load(slotKey(kind: "action", identity: action.actionID)) { guard record.kind == "action", record.scope == map.journal.stableKey, record.action.action.actionID == action.actionID else { throw Error.invalidRecord }; actions[action.actionID] = record }
             if let handle = event.handle, let record: HandleRecord = try load(slotKey(kind: "handle", identity: handle.handleID)) { guard record.kind == "handle", record.scope == map.journal.stableKey, record.handle.handle.handleID == handle.handleID else { throw Error.invalidRecord }; handles[handle.handleID] = record }
+            if let handle = event.handle,
+               let record: AgentHandleRecord = try load(slotKey(
+                   kind: "agent-handle", identity: handle.handleID)) {
+                guard record.kind == "agent-handle", record.scope == map.journal.stableKey,
+                      record.handle.handle.handleID == handle.handleID else {
+                    throw Error.invalidRecord
+                }
+                agentHandles[handle.handleID] = record
+            }
+            if let evidence = (event.type == TimelineEventType.agentHandleTerminal
+                ? (decodeTimelineValue(event.payload) as WorkAgentHandleTerminalPayload?)?.cleanup.evidence
+                : nil),
+               let record: SeenRecord = try load(slotKey(kind: "seen", identity: evidence.eventID)) {
+                guard record.kind == "seen", record.scope == map.journal.stableKey,
+                      record.eventID == evidence.eventID, record.sequence > 0 else {
+                    throw Error.invalidRecord
+                }
+                seenRecords[record.eventID] = record
+            }
             // Match the canonical transition's dependency footprint. A detach derives its
             // Session exclusively from the stored attachment; an arbitrary envelope Session is
             // not evidence and must not expand the bounded authentication set. An attach needs
@@ -396,6 +442,7 @@ public struct PersistentWorkExactState: Sendable {
             let needsStoredAttachment = isAttachmentMutation
                 || event.type == TimelineEventType.runStarted
                 || event.type == TimelineEventType.recoveryCoverage
+                || event.type == TimelineEventType.agentHandleQueued
             var affectedSessions = Set<SessionRef>()
             var storedAttachment: AttachmentRecord?
             if needsStoredAttachment, let attachment = event.sessionAttachment,
@@ -408,6 +455,17 @@ public struct PersistentWorkExactState: Sendable {
                 }
                 attachments[attachment.attachmentID] = record
                 storedAttachment = record
+            }
+            if event.type == TimelineEventType.agentHandleCancelRequested,
+               let caller = event.command?.sessionAttachment,
+               attachments[caller.attachmentID] == nil,
+               let record: AttachmentRecord = try load(slotKey(
+                   kind: "attachment", identity: caller.attachmentID)) {
+                guard record.kind == "attachment", record.scope == map.journal.stableKey,
+                      record.work == expectedWork,
+                      record.attachment.attachment == caller else { throw Error.invalidRecord }
+                attachments[caller.attachmentID] = record
+                affectedSessions.insert(record.attachment.session)
             }
             switch event.type {
             case TimelineEventType.sessionDetached,
@@ -433,6 +491,10 @@ public struct PersistentWorkExactState: Sendable {
                 // run.started authenticates its exact Session/attachment pair through the
                 // stored attachment. Prefetch that Session's bounded membership before the
                 // shared transition checks the attachment is currently attached.
+                if let session = storedAttachment?.attachment.session {
+                    affectedSessions.insert(session)
+                }
+            case TimelineEventType.agentHandleQueued:
                 if let session = storedAttachment?.attachment.session {
                     affectedSessions.insert(session)
                 }
@@ -510,14 +572,18 @@ public struct PersistentWorkExactState: Sendable {
             if let id = scalar.lastUnknownEventID, let record: UnknownRecord = try load(slotKey(kind: "unknown", identity: id)) { guard record.kind == "unknown", record.scope == map.journal.stableKey, record.journal == map.journal, record.eventID == id else { throw Error.invalidRecord }; unknowns.append(record) }
             var quarantines: [QuarantineRecord] = []
             if let id = scalar.lastQuarantineEventID, let record: QuarantineRecord = try load(slotKey(kind: "quarantine", identity: id)) { guard record.kind == "quarantine", record.scope == map.journal.stableKey, record.journal == map.journal, record.eventID == id else { throw Error.invalidRecord }; quarantines.append(record) }
-            self.seen = seen; self.seenRecords = seenRecords; self.runs = runs; self.actions = actions; self.handles = handles; self.attachments = attachments; self.attachmentCounts = counts; self.commands = commands; self.children = children; self.recoveries = recoveries; self.unknowns = unknowns; self.quarantines = quarantines
+            self.seen = seen; self.seenRecords = seenRecords; self.runs = runs; self.actions = actions
+            self.handles = handles; self.agentHandles = agentHandles
+            self.attachments = attachments; self.attachmentCounts = counts
+            self.commands = commands; self.children = children; self.recoveries = recoveries
+            self.unknowns = unknowns; self.quarantines = quarantines
         }
     }
 
     private struct EventLocalOverlay: WorkTransitionState {
-        var scalarState: BoundedWorkScalarContinuation; let scope: String; var seen: [String: SeenRecord]; var runs: [String: RunRecord]; var actions: [String: ActionRecord]; var handles: [String: HandleRecord]; var attachments: [String: AttachmentRecord]; var attachmentCounts: [String: CountRecord]; var commands: [String: CommandRecord]; var children: [String: ChildRecord]; var recoveries: [String: RecoveryRecord]; var unknownRecords: [UnknownRecord]; var quarantineRecords: [QuarantineRecord]; var seenCount: Int; var activeActions: Int; var outstandingHandles: Int; var invalidMutation = false
+        var scalarState: BoundedWorkScalarContinuation; let scope: String; var seen: [String: SeenRecord]; var runs: [String: RunRecord]; var actions: [String: ActionRecord]; var handles: [String: HandleRecord]; var agentHandles: [String: AgentHandleRecord]; var attachments: [String: AttachmentRecord]; var attachmentCounts: [String: CountRecord]; var commands: [String: CommandRecord]; var children: [String: ChildRecord]; var recoveries: [String: RecoveryRecord]; var unknownRecords: [UnknownRecord]; var quarantineRecords: [QuarantineRecord]; var seenCount: Int; var activeActions: Int; var outstandingHandles: Int; var liveAgentHandles: Int; var unreapedAgentHandles: Int; var retainedAgentHandles: Int; var invalidMutation = false
         let work: WorkRef
-        init(scalar: ScalarRecord, scope: String, seen: [String: SeenRecord], runs: [String: RunRecord], actions: [String: ActionRecord], handles: [String: HandleRecord], attachments: [String: AttachmentRecord], attachmentCounts: [String: CountRecord], commands: [String: CommandRecord], children: [String: ChildRecord], recoveries: [String: RecoveryRecord], unknowns: [UnknownRecord], quarantines: [QuarantineRecord]) {
+        init(scalar: ScalarRecord, scope: String, seen: [String: SeenRecord], runs: [String: RunRecord], actions: [String: ActionRecord], handles: [String: HandleRecord], agentHandles: [String: AgentHandleRecord], attachments: [String: AttachmentRecord], attachmentCounts: [String: CountRecord], commands: [String: CommandRecord], children: [String: ChildRecord], recoveries: [String: RecoveryRecord], unknowns: [UnknownRecord], quarantines: [QuarantineRecord]) {
             var continuation = BoundedWorkScalarContinuation(snapshot: WorkSnapshot())
             continuation.journal = scalar.journal; continuation.work = scalar.work; continuation.workHost = scalar.workHost
             continuation.lifecycle = scalar.lifecycle; continuation.execution = scalar.execution
@@ -531,7 +597,15 @@ public struct PersistentWorkExactState: Sendable {
             scalarState = continuation
             self.scope = scope
             self.work = scalar.work!
-            self.seen = seen; self.runs = runs; self.actions = actions; self.handles = handles; self.attachments = attachments; self.attachmentCounts = attachmentCounts; self.commands = commands; self.children = children; self.recoveries = recoveries; unknownRecords = unknowns; quarantineRecords = quarantines; seenCount = scalar.seenEventCount; activeActions = scalar.activeActionCount; outstandingHandles = scalar.outstandingHandleCount
+            self.seen = seen; self.runs = runs; self.actions = actions; self.handles = handles
+            self.agentHandles = agentHandles; self.attachments = attachments
+            self.attachmentCounts = attachmentCounts; self.commands = commands
+            self.children = children; self.recoveries = recoveries; unknownRecords = unknowns
+            quarantineRecords = quarantines; seenCount = scalar.seenEventCount
+            activeActions = scalar.activeActionCount; outstandingHandles = scalar.outstandingHandleCount
+            liveAgentHandles = scalar.liveAgentHandleCount
+            unreapedAgentHandles = scalar.unreapedAgentHandleCount
+            retainedAgentHandles = scalar.retainedAgentHandleCount
         }
         var scalar: BoundedWorkScalarContinuation { scalarState }
         var seenEventCount: Int { seenCount }
@@ -541,10 +615,14 @@ public struct PersistentWorkExactState: Sendable {
         func action(for id: String) -> WorkActionSnapshot? { actions[id]?.action }
         func isActionActive(_ id: String) -> Bool { actions[id]?.isActive == true }
         func handle(for id: String) -> WorkHandleSnapshot? { handles[id]?.handle }
+        func agentHandle(for id: String) -> WorkAgentHandleSnapshot? { agentHandles[id]?.handle }
         func sessionAttachment(for id: String) -> WorkSessionAttachmentSnapshot? { attachments[id]?.attachment }
         func activeSessionAttachmentCount(for session: SessionRef) -> Int { attachmentCounts[session.sessionID]?.count ?? 0 }
         func command(for id: String) -> WorkCommandSnapshot? { commands[id]?.command }
         var activeActionCount: Int { activeActions }; var outstandingHandleCount: Int { outstandingHandles }
+        var liveAgentHandleCount: Int { liveAgentHandles }
+        var unreapedAgentHandleCount: Int { unreapedAgentHandles }
+        var retainedAgentHandleCount: Int { retainedAgentHandles }
         mutating func stageScalar(_ value: BoundedWorkScalarContinuation) { scalarState = value }
         mutating func stageSeenEvent(_ event: TimelineEvent) {
             let (nextSeenCount, overflow) = seenCount.addingReportingOverflow(1)
@@ -605,6 +683,31 @@ public struct PersistentWorkExactState: Sendable {
             }
             handles[id] = HandleRecord(kind: "handle", scope: scope, handle: value)
         }
+        mutating func stageAgentHandle(_ value: WorkAgentHandleSnapshot) {
+            let id = value.handle.handleID
+            let old = agentHandles[id]?.handle
+            if old == nil {
+                guard retainedAgentHandles < WorkAgentHandleSnapshot.maximumRetainedPerWork else {
+                    invalidMutation = true; return
+                }
+                retainedAgentHandles += 1
+            }
+            if old?.blocksWorkCompletion != true && value.blocksWorkCompletion {
+                liveAgentHandles += 1
+            }
+            if old?.blocksWorkCompletion == true && !value.blocksWorkCompletion {
+                guard liveAgentHandles > 0 else { invalidMutation = true; return }
+                liveAgentHandles -= 1
+            }
+            if old != nil && old?.state != .reaped && value.state == .reaped {
+                guard unreapedAgentHandles > 0 else { invalidMutation = true; return }
+                unreapedAgentHandles -= 1
+            } else if old == nil && value.state != .reaped {
+                unreapedAgentHandles += 1
+            }
+            agentHandles[id] = AgentHandleRecord(
+                kind: "agent-handle", scope: scope, handle: value)
+        }
         mutating func stageCommand(_ value: WorkCommandSnapshot) { commands[value.command.commandID] = CommandRecord(kind: "command", scope: scope, command: value) }
         mutating func stageRecovery(_ coverage: RecoveryCoverage, recorded: RecordedRecoveryCoverage) {
             let caveats = coverage.caveats
@@ -648,7 +751,7 @@ public struct PersistentWorkExactState: Sendable {
                 kind: "attachment-count", scope: scope, session: session,
                 count: activeIDs.count, activeAttachmentIDs: activeIDs)
         }
-        var scalarRecord: ScalarRecord { ScalarRecord(scalarState, seenEventCount: seenCount, activeActionCount: activeActions, outstandingHandleCount: outstandingHandles, lastUnknownEventID: unknownRecords.last?.eventID, lastQuarantineEventID: quarantineRecords.last?.eventID) }
+        var scalarRecord: ScalarRecord { ScalarRecord(scalarState, seenEventCount: seenCount, activeActionCount: activeActions, outstandingHandleCount: outstandingHandles, liveAgentHandleCount: liveAgentHandles, unreapedAgentHandleCount: unreapedAgentHandles, retainedAgentHandleCount: retainedAgentHandles, lastUnknownEventID: unknownRecords.last?.eventID, lastQuarantineEventID: quarantineRecords.last?.eventID) }
         var snapshot: WorkSnapshot {
             var value = WorkSnapshot()
             value.journal = scalar.journal; value.work = scalar.work; value.workHost = scalar.workHost
@@ -666,6 +769,7 @@ public struct PersistentWorkExactState: Sendable {
             value.observedRunIDs = Set(runs.keys)
             value.actions = actions.reduce(into: [:]) { $0[$1.key] = $1.value.action }
             value.handles = handles.reduce(into: [:]) { $0[$1.key] = $1.value.handle }
+            value.agentHandles = agentHandles.reduce(into: [:]) { $0[$1.key] = $1.value.handle }
             value.sessionAttachments = attachments.reduce(into: [:]) { $0[$1.key] = $1.value.attachment }
             value.commands = commands.reduce(into: [:]) { $0[$1.key] = $1.value.command }
             value.childStates = children.reduce(into: [:]) { $0[$1.key] = $1.value.state }
@@ -715,6 +819,7 @@ public struct PersistentWorkExactState: Sendable {
             if kind == "run", let key = id(runs), let record = runs[key] { return try PersistentWorkExactState.encode(record) }
             if kind == "action", let key = id(actions), let record = actions[key] { return try PersistentWorkExactState.encode(record) }
             if kind == "handle", let key = id(handles), let record = handles[key] { return try PersistentWorkExactState.encode(record) }
+            if kind == "agent-handle", let key = id(agentHandles), let record = agentHandles[key] { return try PersistentWorkExactState.encode(record) }
             if kind == "attachment", let key = id(attachments), let record = attachments[key] { return try PersistentWorkExactState.encode(record) }
             if kind == "attachment-count", let key = id(attachmentCounts), let record = attachmentCounts[key] { return try PersistentWorkExactState.encode(record) }
             if kind == "command", let key = id(commands), let record = commands[key] { return try PersistentWorkExactState.encode(record) }

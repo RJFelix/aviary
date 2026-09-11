@@ -925,6 +925,34 @@ public actor TimelineJournalWriter {
         return try commit(prepared)
     }
 
+    /// Commit a Work-owned agent Handle transition only if the same canonical reducer accepts
+    /// the exact event about to be written. This uses this writer's existing owner lease; it
+    /// must never be called through a second writer while a Run bundle owns the journal.
+    /// The Work coordinator retains request/result bodies before calling this metadata seam.
+    public func appendAgentHandle(_ draft: TimelineEventDraft) throws -> TimelineJournalCommit {
+        try ensureAppendable()
+        guard case .work(let work) = journal.owner else {
+            throw WriterError.invalidDraft(reason: "agent Handles require a Work journal")
+        }
+        let canonical = try readCanonicalProjection(
+            expectedWork: work, expectedWorkHost: WorkHostRef(work.workHostID),
+            maximumResidentRecords: 0)
+        guard case .work(let head) = canonical.projection, head.coverage.isControlling,
+              let snapshot = canonical.workSnapshot else {
+            throw WriterError.invalidDraft(reason: "agent Handle state is incomplete")
+        }
+        var reservedEventIDs = eventIDs
+        let prepared = try prepareAppend(
+            draft, sequence: nextSequence, previousEventID: previousEventID,
+            reservedEventIDs: &reservedEventIDs)
+        do {
+            _ = try WorkAgentHandlePreflight.applying(prepared.event, to: snapshot)
+        } catch {
+            throw WriterError.invalidDraft(reason: "agent Handle transition was not canonically admissible")
+        }
+        return try commit(prepared)
+    }
+
     private struct PreparedAppend {
         let event: TimelineEvent
         let bytes: Data

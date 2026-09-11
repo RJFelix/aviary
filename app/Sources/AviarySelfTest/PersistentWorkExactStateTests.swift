@@ -28,7 +28,7 @@ private func persistentMap(at url: URL) throws -> PersistentProjectionRadixMap {
     try PersistentProjectionRadixMap(
         directory: url.appending(path: "map", directoryHint: .isDirectory),
         namespaceID: "persistent-work-namespace", journal: persistentJournal,
-        sourceGeneration: String(repeating: "b", count: 64), mapKind: "work-exact-v3")
+        sourceGeneration: String(repeating: "b", count: 64), mapKind: "work-exact-v4")
 }
 
 private func persistentValueFiles(
@@ -493,7 +493,7 @@ private func testPersistentWorkExactStateUnknownQuarantinePrivacy() throws {
                                                       previous: "privacy-2", payload: .object(["model_id": .string("m")])))
     XCTAssertEqual(evidence.eventLocalSnapshot.unknownDomains, [.runtime])
     XCTAssertFalse(evidence.eventLocalSnapshot.corruptionReasons.isEmpty)
-    let bytes = try map.lookup(root: evidence.root, key: "work-exact-v3/scalar").value
+    let bytes = try map.lookup(root: evidence.root, key: "work-exact-v4/scalar").value
     XCTAssertNotNil(bytes)
     XCTAssertFalse(String(data: bytes!, encoding: .utf8)?.contains("do-not-persist") == true)
     let enumerator = try XCTUnwrap(FileManager.default.enumerator(
@@ -576,7 +576,7 @@ private func testPersistentWorkExactStateRejectsScalarWithoutExactWorkIdentity()
     var state = try PersistentWorkExactState(map: map)
     let root = try state.apply(persistentEvent(
         TimelineEventType.workCreated, "scalar-identity-1", 1)).root
-    let key = "work-exact-v3/scalar"
+    let key = "work-exact-v4/scalar"
     let encoded = try XCTUnwrap(try map.lookup(root: root, key: key).value)
     guard case .object(var object) = try XCTUnwrap(JSONValue.parse(encoded)) else {
         XCTFail("scalar record was not an object")
@@ -616,7 +616,7 @@ private func testPersistentWorkExactStateRejectsImpossibleAttachmentCount() thro
     let kind = "attachment-count"
     let identity = session.sessionID
     let material = "work-exact-slot-v1\0\(kind.count):\(kind)\0\(identity.utf8.count):\(identity)"
-    let key = "work-exact-v3/\(kind)/"
+    let key = "work-exact-v4/\(kind)/"
         + AviarySHA256.hash(data: Data(material.utf8)).description
     let forged = try JSONEncoder().encode(ForgedCountRecord(
         kind: kind, scope: persistentJournal.stableKey,
@@ -658,7 +658,7 @@ private func testPersistentWorkExactStateRejectsFeasibleButFalseAttachmentMember
     let kind = "attachment-count"
     let identity = session.sessionID
     let material = "work-exact-slot-v1\0\(kind.count):\(kind)\0\(identity.utf8.count):\(identity)"
-    let key = "work-exact-v3/\(kind)/"
+    let key = "work-exact-v4/\(kind)/"
         + AviarySHA256.hash(data: Data(material.utf8)).description
     let forged = try JSONEncoder().encode(ForgedCountRecord(
         kind: kind, scope: persistentJournal.stableKey, session: session, count: 2,
@@ -698,6 +698,9 @@ private func testPersistentWorkExactStateRejectsSequenceBoundaryWithoutPublishin
         let seenEventCount: Int
         let activeActionCount: Int
         let outstandingHandleCount: Int
+        let liveAgentHandleCount: Int
+        let unreapedAgentHandleCount: Int
+        let retainedAgentHandleCount: Int
         let lastUnknownEventID: String?
         let lastQuarantineEventID: String?
     }
@@ -717,9 +720,10 @@ private func testPersistentWorkExactStateRejectsSequenceBoundaryWithoutPublishin
         causalOrderValid: true, structuralIntegrityValid: true,
         semanticProjectionValid: true, seenEventCount: Int.max - 1,
         activeActionCount: 0, outstandingHandleCount: 0,
+        liveAgentHandleCount: 0, unreapedAgentHandleCount: 0, retainedAgentHandleCount: 0,
         lastUnknownEventID: nil, lastQuarantineEventID: nil)
     let forgedRoot = try map.setting(
-        root: initialRoot, key: "work-exact-v3/scalar",
+        root: initialRoot, key: "work-exact-v4/scalar",
         value: try JSONEncoder().encode(forgedScalar)).newRoot
     for event in [
         persistentEvent(

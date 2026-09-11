@@ -55,6 +55,8 @@ public enum InHouseWorkFactory {
         public let modelContextMode: WorkLaunchContextMode
         public let peerDelegate: Agent.PeerDelegate?
         public let selfDelegate: Agent.SelfDelegate?
+        /// Host-private pilot opt-in; the public initializer leaves this unset.
+        internal var agentChildPilot: WorkAgentChildPilot?
         public let startAdmissionGate: (@Sendable () async -> Void)?
         public let adoptionEvidenceSink:
             (@Sendable (HostedInHouseWorkAdoptionEvidence) async throws -> Void)?
@@ -111,13 +113,14 @@ public enum InHouseWorkFactory {
             self.modelContextMode = modelContextMode
             self.peerDelegate = peerDelegate
             self.selfDelegate = selfDelegate
+            self.agentChildPilot = nil
             self.startAdmissionGate = startAdmissionGate
             self.adoptionEvidenceSink = adoptionEvidenceSink
             self.failureStage = nil
         }
 
         fileprivate var hostedConfiguration: HostedInHouseWorkConfiguration {
-            HostedInHouseWorkConfiguration(
+            var configuration = HostedInHouseWorkConfiguration(
                 home: home,
                 cwd: cwd,
                 model: model,
@@ -142,6 +145,8 @@ public enum InHouseWorkFactory {
                 selfDelegate: selfDelegate,
                 startAdmissionGate: startAdmissionGate,
                 adoptionEvidenceSink: adoptionEvidenceSink)
+            configuration.agentChildPilot = agentChildPilot
+            return configuration
         }
     }
 
@@ -151,6 +156,15 @@ public enum InHouseWorkFactory {
     static func open(configuration: Configuration) async throws -> HostedInHouseWork {
         let hostedConfiguration = configuration.hostedConfiguration
         try validate(hostedConfiguration)
+
+        if let pilot = hostedConfiguration.agentChildPilot {
+            try await pilot.coordinator.register(
+                work: hostedConfiguration.workRunBinding.workBinding.work,
+                home: hostedConfiguration.home,
+                actor: TimelineActor(
+                    actorID: hostedConfiguration.serviceActorID,
+                    kind: hostedConfiguration.actorKind))
+        }
 
         let identity = identity(for: hostedConfiguration.workRunBinding)
         let projectionURL = hostedConfiguration.home.sessionFile(id: identity.sessionID)
@@ -177,14 +191,29 @@ public enum InHouseWorkFactory {
                 configuration: hostedConfiguration, identity: identity)
             let canonicalBridge: NativeSessionCommandJournal
             do {
-                canonicalBridge = try await NativeSessionCommandJournal.openForRun(
-                    home: hostedConfiguration.home,
-                    binding: hostedConfiguration.workRunBinding,
-                    legacyProjection: placeholder.writer,
-                    actorID: hostedConfiguration.serviceActorID,
-                    actorKind: hostedConfiguration.actorKind,
-                    modelID: hostedConfiguration.model.qualifiedID,
-                    modelContextMode: hostedConfiguration.modelContextMode)
+                if let pilot = hostedConfiguration.agentChildPilot {
+                    canonicalBridge = try await pilot.coordinator.withRunOpen(
+                        work: hostedConfiguration.workRunBinding.workBinding.work) {
+                            let bridge = try await NativeSessionCommandJournal.openForRun(
+                                home: hostedConfiguration.home,
+                                binding: hostedConfiguration.workRunBinding,
+                                legacyProjection: placeholder.writer,
+                                actorID: hostedConfiguration.serviceActorID,
+                                actorKind: hostedConfiguration.actorKind,
+                                modelID: hostedConfiguration.model.qualifiedID,
+                                modelContextMode: hostedConfiguration.modelContextMode)
+                            return (bridge.nativeJournal, bridge)
+                        }
+                } else {
+                    canonicalBridge = try await NativeSessionCommandJournal.openForRun(
+                        home: hostedConfiguration.home,
+                        binding: hostedConfiguration.workRunBinding,
+                        legacyProjection: placeholder.writer,
+                        actorID: hostedConfiguration.serviceActorID,
+                        actorKind: hostedConfiguration.actorKind,
+                        modelID: hostedConfiguration.model.qualifiedID,
+                        modelContextMode: hostedConfiguration.modelContextMode)
+                }
             } catch {
                 try? await placeholder.writer.closeChecked()
                 removeStage(placeholder)
@@ -302,14 +331,30 @@ public enum InHouseWorkFactory {
                 // This is the sole execution-generation opener. `createIdleWork` has already
                 // closed its genesis writers; openForRun reopens that exact pair and appends this
                 // Run marker.
-                let bridge = try await NativeSessionCommandJournal.openForRun(
-                    home: hostedConfiguration.home,
-                    binding: hostedConfiguration.workRunBinding,
-                    legacyProjection: writer,
-                    actorID: hostedConfiguration.serviceActorID,
-                    actorKind: hostedConfiguration.actorKind,
-                    modelID: hostedConfiguration.model.qualifiedID,
-                    modelContextMode: hostedConfiguration.modelContextMode)
+                let bridge: NativeSessionCommandJournal
+                if let pilot = hostedConfiguration.agentChildPilot {
+                    bridge = try await pilot.coordinator.withRunOpen(
+                        work: hostedConfiguration.workRunBinding.workBinding.work) {
+                            let bridge = try await NativeSessionCommandJournal.openForRun(
+                                home: hostedConfiguration.home,
+                                binding: hostedConfiguration.workRunBinding,
+                                legacyProjection: writer,
+                                actorID: hostedConfiguration.serviceActorID,
+                                actorKind: hostedConfiguration.actorKind,
+                                modelID: hostedConfiguration.model.qualifiedID,
+                                modelContextMode: hostedConfiguration.modelContextMode)
+                            return (bridge.nativeJournal, bridge)
+                        }
+                } else {
+                    bridge = try await NativeSessionCommandJournal.openForRun(
+                        home: hostedConfiguration.home,
+                        binding: hostedConfiguration.workRunBinding,
+                        legacyProjection: writer,
+                        actorID: hostedConfiguration.serviceActorID,
+                        actorKind: hostedConfiguration.actorKind,
+                        modelID: hostedConfiguration.model.qualifiedID,
+                        modelContextMode: hostedConfiguration.modelContextMode)
+                }
                 let controller = SessionCommandController(
                     identity: identity,
                     capabilities: Agent.inHouseCommandCapabilities,
@@ -337,14 +382,30 @@ public enum InHouseWorkFactory {
         }
 
         do {
-            let stagedBridge = try await NativeSessionCommandJournal.openForRun(
-                home: hostedConfiguration.home,
-                binding: hostedConfiguration.workRunBinding,
-                legacyProjection: stage.writer,
-                actorID: hostedConfiguration.serviceActorID,
-                actorKind: hostedConfiguration.actorKind,
-                modelID: hostedConfiguration.model.qualifiedID,
-                modelContextMode: hostedConfiguration.modelContextMode)
+            let stagedBridge: NativeSessionCommandJournal
+            if let pilot = hostedConfiguration.agentChildPilot {
+                stagedBridge = try await pilot.coordinator.withRunOpen(
+                    work: hostedConfiguration.workRunBinding.workBinding.work) {
+                        let bridge = try await NativeSessionCommandJournal.openForRun(
+                            home: hostedConfiguration.home,
+                            binding: hostedConfiguration.workRunBinding,
+                            legacyProjection: stage.writer,
+                            actorID: hostedConfiguration.serviceActorID,
+                            actorKind: hostedConfiguration.actorKind,
+                            modelID: hostedConfiguration.model.qualifiedID,
+                            modelContextMode: hostedConfiguration.modelContextMode)
+                        return (bridge.nativeJournal, bridge)
+                    }
+            } else {
+                stagedBridge = try await NativeSessionCommandJournal.openForRun(
+                    home: hostedConfiguration.home,
+                    binding: hostedConfiguration.workRunBinding,
+                    legacyProjection: stage.writer,
+                    actorID: hostedConfiguration.serviceActorID,
+                    actorKind: hostedConfiguration.actorKind,
+                    modelID: hostedConfiguration.model.qualifiedID,
+                    modelContextMode: hostedConfiguration.modelContextMode)
+            }
             do {
                 try await stage.writer.closeChecked()
             } catch {
@@ -926,6 +987,14 @@ public enum InHouseWorkFactory {
             throw HostedInHouseWorkError.invalidConfiguration(
                 "systemPrompt and systemPromptAssembly contain different bytes")
         }
+
+        if let pilot = configuration.agentChildPilot {
+            guard pilot.deadline.timeIntervalSince1970.isFinite,
+                  pilot.deadline > Date() else {
+                throw HostedInHouseWorkError.invalidConfiguration(
+                    "agent child pilot deadline must be finite and in the future")
+            }
+        }
     }
 
     private static func bounded(_ value: String, limit: Int = 500) -> String {
@@ -961,5 +1030,6 @@ extension InHouseWorkFactory.Configuration {
             selfDelegate: configuration.selfDelegate,
             startAdmissionGate: configuration.startAdmissionGate,
             adoptionEvidenceSink: configuration.adoptionEvidenceSink)
+        self.agentChildPilot = configuration.agentChildPilot
     }
 }

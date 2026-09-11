@@ -592,6 +592,11 @@ public enum TimelineEventType {
     public static let actionOutcome = "action.outcome"
     public static let handleStarted = "handle.started"
     public static let handleOutcome = "handle.outcome"
+    public static let agentHandleQueued = "agent_handle.queued"
+    public static let agentHandleStarted = "agent_handle.started"
+    public static let agentHandleCancelRequested = "agent_handle.cancel_requested"
+    public static let agentHandleTerminal = "agent_handle.terminal"
+    public static let agentHandleReaped = "agent_handle.reaped"
     public static let recoveryCoverage = "recovery.coverage"
     public static let contextSourcesObserved = "context.sources_observed"
     public static let contextAssembled = "context.assembled"
@@ -1142,7 +1147,10 @@ public struct TimelineEvent: Codable, Hashable, Sendable {
         TimelineEventType.messageCommitted, TimelineEventType.actionStarted,
         TimelineEventType.actionIntent,
         TimelineEventType.actionOutcome, TimelineEventType.handleStarted,
-        TimelineEventType.handleOutcome, TimelineEventType.recoveryCoverage,
+        TimelineEventType.handleOutcome, TimelineEventType.agentHandleQueued,
+        TimelineEventType.agentHandleStarted, TimelineEventType.agentHandleCancelRequested,
+        TimelineEventType.agentHandleTerminal, TimelineEventType.agentHandleReaped,
+        TimelineEventType.recoveryCoverage,
         TimelineEventType.contextSourcesObserved,
         TimelineEventType.contextAssembled, TimelineEventType.sessionAttention,
         TimelineEventType.sessionCompleted, TimelineEventType.sessionArchived,
@@ -1784,6 +1792,189 @@ public struct WorkHandleSnapshot: Codable, Hashable, Sendable {
     }
 }
 
+/// Immutable provenance for a Work-owned agent Handle. A later lifecycle record repeats these
+/// identities in its event envelope and must match this tuple exactly; it does not borrow the
+/// Work's then-current Run or whichever Session happens to be attached when the child settles.
+public struct WorkAgentHandleOrigin: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let workHost: WorkHostRef
+    public let session: SessionRef
+    public let sessionAttachment: SessionAttachmentRef
+    public let run: RunRef
+
+    public init(
+        work: WorkRef, workHost: WorkHostRef, session: SessionRef,
+        sessionAttachment: SessionAttachmentRef, run: RunRef
+    ) {
+        self.work = work
+        self.workHost = workHost
+        self.session = session
+        self.sessionAttachment = sessionAttachment
+        self.run = run
+    }
+}
+
+/// Lifecycle and terminal outcome are separate so reaping cannot rewrite a completed result.
+public enum WorkAgentHandleState: String, Codable, Hashable, Sendable {
+    case queued
+    case running
+    case cancelRequested = "cancel_requested"
+    case terminal
+    case reaped
+
+    public var isLive: Bool {
+        switch self {
+        case .queued, .running, .cancelRequested: return true
+        case .terminal, .reaped: return false
+        }
+    }
+}
+
+public enum WorkAgentHandleTerminalOutcome: String, Codable, Hashable, Sendable {
+    case succeeded
+    case failed
+    case canceled
+    case expired
+    /// The prior host observed execution but cannot prove either its result or clean cancellation.
+    case indeterminate
+}
+
+public enum WorkAgentHandleCleanupState: String, Codable, Hashable, Sendable {
+    /// The queued child never crossed the execution boundary.
+    case notStarted = "not_started"
+    /// The Work Host proved that the child's owned runtime resources are quiescent.
+    case quiesced
+    /// Host loss left cleanup or external effects unprovable. This is never execution recovery.
+    case indeterminate
+}
+
+/// Bounded, typed cleanup evidence. Arbitrary diagnostic or provider text belongs in an
+/// addressable body, not in the canonical reducer or its persistent exact-state records.
+public struct WorkAgentHandleCleanupProof: Codable, Hashable, Sendable {
+    public let state: WorkAgentHandleCleanupState
+    public let evidence: EventRef?
+
+    public init(state: WorkAgentHandleCleanupState, evidence: EventRef? = nil) {
+        self.state = state
+        self.evidence = evidence
+    }
+}
+
+public enum WorkAgentHandleCancellationCause: String, Codable, Hashable, Sendable {
+    case client
+    case deadline
+    case workDestruction = "work_destruction"
+    case hostShutdown = "host_shutdown"
+}
+
+public enum WorkAgentHandleReapReason: String, Codable, Hashable, Sendable {
+    case workDestruction = "work_destruction"
+    case retentionExpired = "retention_expired"
+    case explicitPolicy = "explicit_policy"
+}
+
+public struct WorkAgentHandleQueuedPayload: Codable, Hashable, Sendable {
+    public let origin: WorkAgentHandleOrigin
+    public let label: String
+    public let deadline: Date
+    public let requestBody: TimelineBodyReference
+
+    public init(
+        origin: WorkAgentHandleOrigin, label: String, deadline: Date,
+        requestBody: TimelineBodyReference
+    ) {
+        self.origin = origin
+        self.label = label
+        self.deadline = deadline
+        self.requestBody = requestBody
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case origin, label, deadline, requestBody = "request_body"
+    }
+}
+
+public struct WorkAgentHandleCancelRequestedPayload: Codable, Hashable, Sendable {
+    public let cause: WorkAgentHandleCancellationCause
+
+    public init(cause: WorkAgentHandleCancellationCause) { self.cause = cause }
+}
+
+public struct WorkAgentHandleTerminalPayload: Codable, Hashable, Sendable {
+    public let outcome: WorkAgentHandleTerminalOutcome
+    public let resultBody: TimelineBodyReference?
+    public let cleanup: WorkAgentHandleCleanupProof
+
+    public init(
+        outcome: WorkAgentHandleTerminalOutcome,
+        resultBody: TimelineBodyReference? = nil,
+        cleanup: WorkAgentHandleCleanupProof
+    ) {
+        self.outcome = outcome
+        self.resultBody = resultBody
+        self.cleanup = cleanup
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case outcome, resultBody = "result_body", cleanup
+    }
+}
+
+public struct WorkAgentHandleReapedPayload: Codable, Hashable, Sendable {
+    public let reason: WorkAgentHandleReapReason
+
+    public init(reason: WorkAgentHandleReapReason) { self.reason = reason }
+}
+
+/// Exact Work-owned agent Handle state. Request/result bytes live in the body store; this value
+/// retains only bounded labels, typed outcomes, immutable provenance, and content addresses.
+public struct WorkAgentHandleSnapshot: Codable, Hashable, Sendable {
+    /// Includes reaped tombstones. The pilot deliberately bounds lifetime identity growth per
+    /// Work instead of letting retention policy turn this exact map into an unbounded directory.
+    public static let maximumRetainedPerWork = 256
+    public static let maximumLabelBytes = 256
+    public static let maximumBodyBytes = 8 * 1024 * 1024
+
+    public let handle: HandleRef
+    public let origin: WorkAgentHandleOrigin
+    public let label: String
+    public let deadline: Date
+    public let requestBody: TimelineBodyReference
+    public var state: WorkAgentHandleState
+    public var cancellationCause: WorkAgentHandleCancellationCause?
+    public var terminalOutcome: WorkAgentHandleTerminalOutcome?
+    public var resultBody: TimelineBodyReference?
+    public var cleanup: WorkAgentHandleCleanupProof?
+    public var reapReason: WorkAgentHandleReapReason?
+    public let queuedEvent: EventRef
+    public var startedEvent: EventRef?
+    public var latestLifecycleEvent: EventRef
+    public var terminalEvent: EventRef?
+    public var reapedEvent: EventRef?
+
+    /// Completion-policy liveness is intentionally stronger than execution lifecycle. A host-loss
+    /// terminal is addressable and write-once, but still blocks Work completion because runtime
+    /// quiescence is unknown and the record cannot yet be reaped.
+    public var blocksWorkCompletion: Bool {
+        state.isLive || cleanup?.state == .indeterminate
+    }
+
+    public init(
+        handle: HandleRef, origin: WorkAgentHandleOrigin, label: String, deadline: Date,
+        requestBody: TimelineBodyReference, queuedEvent: EventRef
+    ) {
+        self.handle = handle
+        self.origin = origin
+        self.label = label
+        self.deadline = deadline
+        self.requestBody = requestBody
+        self.state = .queued
+        self.queuedEvent = queuedEvent
+        self.startedEvent = nil
+        self.latestLifecycleEvent = queuedEvent
+    }
+}
+
 public struct SessionAttachmentSnapshot: Codable, Hashable, Sendable {
     public let attachment: SessionAttachmentRef
     public let work: WorkRef
@@ -1846,6 +2037,9 @@ public struct WorkSnapshot: Codable, Hashable, Sendable {
     public var activeActionIDs: Set<String> = []
     public var actions: [String: WorkActionSnapshot] = [:]
     public var handles: [String: WorkHandleSnapshot] = [:]
+    /// Work-owned agent-only children. This is deliberately separate from the legacy Run-owned
+    /// Handle map above because the two lifetimes have different Run and Work terminal gates.
+    public var agentHandles: [String: WorkAgentHandleSnapshot] = [:]
     public var commands: [String: WorkCommandSnapshot] = [:]
     /// Minimal typed projection for child lifecycle events. Keeping this in the Work snapshot
     /// prevents a Census/report reader from re-scanning opaque payloads.

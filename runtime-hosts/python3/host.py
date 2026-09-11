@@ -128,7 +128,7 @@ def encoded_frame_size(obj: dict) -> int:
 # hide exactly this set: the namespace belongs to the agent, and a host whose own helpers show
 # up in it is lying about what the agent put there. Adding a helper without adding it here is
 # how that contract quietly breaks.
-_AVIARY_INJECTED = frozenset({"sh", "cwd", "ask_app", "spawn", "conversation",
+_AVIARY_INJECTED = frozenset({"sh", "cwd", "ask_app", "spawn", "attach_agent", "conversation",
                               "remember", "recall", "artifact", "attach_image",
                               "agents", "message", "search", "read_url"})
 
@@ -468,6 +468,155 @@ class _AviaryFuture(__import__("concurrent.futures", fromlist=["Future"]).Future
         return self
 
 
+class _AviaryWorkFuture(_AviaryFuture):
+    """A local observer of a Work-owned Handle, not ownership of its execution."""
+
+    def result(self, timeout=None):
+        # Interest is a scheduling hint sent by the existing observer thread. A callback
+        # must not extend Future.result(timeout) or make an already-local result need a host.
+        with self._aviary_interest_lock:
+            self._aviary_waiters += 1
+        try:
+            return super().result(timeout=timeout)
+        finally:
+            with self._aviary_interest_lock:
+                self._aviary_waiters -= 1
+
+    def cancel(self):
+        # Future.cancel() must not imply a durable Work cancellation. The separately
+        # authorized service command owns that boundary, including uncertain outcomes.
+        return False
+
+
+def _aviary_work_result(handle_id):
+    import base64 as _b64, hashlib as _hash
+    body = bytearray()
+    expected_digest = None
+    expected_count = None
+    while True:
+        page = _aviary_call_app("agent_handle_result", id=handle_id, offset=len(body))
+        if not isinstance(page, dict) or "error" in page:
+            raise RuntimeError(page.get("error", "Invalid Handle body response")
+                               if isinstance(page, dict) else "Invalid Handle body response")
+        count = page.get("byte_count")
+        digest = page.get("body_digest")
+        if (type(count) is not int or not 0 <= count <= 8 * 1024 * 1024
+                or not isinstance(digest, str) or page.get("id") != handle_id
+                or page.get("offset") != len(body)):
+            raise RuntimeError("Invalid Handle body identity or bound")
+        if expected_digest is None:
+            expected_digest, expected_count = digest, count
+        if digest != expected_digest or count != expected_count:
+            raise RuntimeError("Handle body changed while reading")
+        chunk = _b64.b64decode(page.get("data_base64", ""), validate=True)
+        end = len(body) + len(chunk)
+        if (len(chunk) > 256 * 1024 or end > count or page.get("next_offset") != end
+                or type(page.get("eof")) is not bool or page["eof"] != (end == count)
+                or (not chunk and end != count)):
+            raise RuntimeError("Invalid Handle body progress")
+        body.extend(chunk)
+        if page["eof"]:
+            if _hash.sha256(body).hexdigest() != digest.removeprefix("sha256:"):
+                raise RuntimeError("Handle body digest mismatch")
+            return body.decode("utf-8")
+
+
+def _aviary_make_work_future(record):
+    import math as _math, threading as _th, time as _time, uuid as _uuid
+    handle_id, deadline = record.get("id"), record.get("deadline")
+    if (not isinstance(handle_id, str) or not handle_id or len(handle_id.encode()) > 256
+            or type(deadline) not in (float, int) or not _math.isfinite(deadline)):
+        raise RuntimeError("Invalid Work Handle admission response")
+    future = _AviaryWorkFuture()
+    future.aviary_id = handle_id
+    future.aviary_name = record.get("name")
+    future.aviary_deadline = deadline
+    future.aviary_ownership = "work"
+    future._aviary_observer_id = _uuid.uuid4().hex
+    future._aviary_interest_lock = _th.Lock()
+    future._aviary_waiters = 0
+    future.set_running_or_notify_cancel()
+
+    def watch():
+        try:
+            last_interest = False
+            while True:
+                with future._aviary_interest_lock:
+                    interest = future._aviary_waiters > 0
+                if interest != last_interest:
+                    _aviary_call_app("agent_handle_await", id=handle_id,
+                                     observer_id=future._aviary_observer_id, awaited=interest)
+                    last_interest = interest
+                row = _aviary_call_app("agent_handle_status", id=handle_id)
+                if not isinstance(row, dict) or "error" in row:
+                    raise RuntimeError(row.get("error", "Handle state unavailable")
+                                       if isinstance(row, dict) else "Handle state unavailable")
+                if (row.get("id") != handle_id or row.get("ownership") != "work"
+                        or row.get("deadline") != deadline):
+                    raise RuntimeError("Handle observation identity changed")
+                state = row.get("state")
+                if state == "terminal":
+                    if row.get("outcome") == "succeeded":
+                        future.set_result(_aviary_work_result(handle_id))
+                        return
+                    raise RuntimeError("Handle %s settled as %s; inspect its retained outcome" %
+                                       (handle_id, row.get("outcome", "unknown")))
+                if state == "reaped":
+                    raise RuntimeError("Handle %s was reaped; its tombstone remains recorded" % handle_id)
+                if state not in ("queued", "running", "cancel_requested"):
+                    raise RuntimeError("Handle state is unavailable or unknown")
+                # Scope expiry governs execution at the coordinator, not this observer.
+                # Persistence can lag an on-time completion. Only canonical terminal evidence
+                # settles the Future; result(timeout) bounds the caller's own wait.
+                _time.sleep(0.5)
+        except Exception as exc:
+            future.set_exception(exc)
+
+    _th.Thread(target=watch).start()
+    return future
+
+
+def __aviary_attach_agent(handle_id, name=None):
+    """Observe one explicitly named Work Handle, optionally binding it without overwriting."""
+    import keyword as _keyword, threading as _th
+    if (not isinstance(handle_id, str) or not handle_id or len(handle_id.encode()) > 256):
+        raise ValueError("attach_agent needs a bounded Handle ID")
+    if name is not None and (not isinstance(name, str) or not name.isidentifier()
+                             or _keyword.iskeyword(name)):
+        raise ValueError("an explicit binding name must be a Python identifier")
+    # The lock and sentinel are interpreter-local; no automatic rebinding on another Session.
+    lock = globals().setdefault("_aviary_work_binding_lock", _th.RLock())
+    sentinel = object()
+    if name is not None:
+        with lock:
+            if name in __aviary_ns:
+                raise ValueError("attach_agent will not overwrite existing binding: " + name)
+            __aviary_ns[name] = sentinel
+    try:
+        record = _aviary_call_app("agent_handle_status", id=handle_id)
+        if not isinstance(record, dict) or "error" in record:
+            raise RuntimeError(record.get("error", "Handle unavailable")
+                               if isinstance(record, dict) else "Handle unavailable")
+        if record.get("id") != handle_id or record.get("ownership") != "work":
+            raise RuntimeError("Handle attachment identity mismatch")
+        future = _aviary_make_work_future(record)
+        if name is not None:
+            with lock:
+                if __aviary_ns.get(name) is not sentinel:
+                    raise RuntimeError("Binding changed during Handle attachment; no value was overwritten")
+                __aviary_ns[name] = future
+        return future
+    except Exception:
+        if name is not None:
+            with lock:
+                if __aviary_ns.get(name) is sentinel:
+                    del __aviary_ns[name]
+        raise
+
+
+__aviary_ns["attach_agent"] = __aviary_attach_agent
+
+
 def __aviary_spawn(prompt, name=None, model=None):
     # Returns a real `concurrent.futures.Future`, not a bespoke handle.
     #
@@ -482,6 +631,8 @@ def __aviary_spawn(prompt, name=None, model=None):
     import time as _time
 
     started = __aviary_ask_app("spawn", prompt=prompt, name=name, model=model)
+    if isinstance(started, dict) and started.get("ownership") == "work" and "id" in started:
+        return _aviary_make_work_future(started)
     future = _AviaryFuture()
     if not isinstance(started, dict) or "id" not in started:
         future.set_result(started)

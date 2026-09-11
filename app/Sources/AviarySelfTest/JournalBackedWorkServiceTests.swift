@@ -5225,6 +5225,145 @@ func testJournalBackedWorkServiceRequiresExactCanonicalEvidenceForAcceptedReceip
     }
 }
 
+private func journalBackedAgentHandlePayload<T: Encodable>(_ value: T) throws -> JSONValue {
+    try XCTUnwrap(JSONValue.parse(try JSONEncoder().encode(value)))
+}
+
+private func journalBackedAgentHandleDraft(
+    type: String, origin: WorkAgentHandleOrigin, handle: HandleRef,
+    cause: EventRef? = nil, payload: JSONValue = .object([:])
+) -> TimelineEventDraft {
+    TimelineEventDraft(
+        causedByEventID: cause, session: origin.session, work: origin.work,
+        workHost: origin.workHost, sessionAttachment: origin.sessionAttachment,
+        run: origin.run, handle: handle, type: type,
+        declaredDomains: [.work, .runtime, .externalEffects], payload: payload)
+}
+
+/// A child Handle is Work-owned, so ending/closing the originating Run must not make the Work
+/// look idle to a cold service. The same real journal is then settled with an indeterminate child
+/// terminal, which remains a recovery blocker even though the Handle is no longer live.
+func testJournalBackedWorkServiceParentEndWithChildHandleRequiresRecovery() async throws {
+    let (home, root) = try journalBackedHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = ClientRef("child-recovery-client")
+    let store = JournalBackedTestManifestStore(productionCapable: true, home: home)
+    let service = try JournalBackedWorkService(
+        home: home,
+        authorizer: WorkServiceCapabilityPolicy(
+            grantsByClient: [client: journalBackedAllCapabilities()]),
+        manifestStore: store)
+    let cursor = try await service.handshake(
+        WorkServiceHandshakeRequest(client: client)).controlCursor
+    let created = try await service.createWork(WorkServiceCreateWorkRequest(
+        client: client, commandID: "create-child-recovery", causalControlCursor: cursor,
+        requestedCapabilities: [.observe, .control, .start, .complete]))
+    let work = created.work.work
+    let binding = WorkRunBinding(
+        workBinding: WorkBinding(
+            session: created.session, work: work, workHost: WorkHostRef(work.workHostID),
+            sessionAttachment: created.sessionAttachment),
+        run: RunRef("child-recovery-run"))
+    let route = try WorkAgentHandleJournal(
+        home: home, work: work,
+        actor: TimelineActor(actorID: "child-recovery-owner", kind: "work-host"))
+    let bundle = try await route.openRun {
+        try await RunJournalBundle.openForExecution(
+            home: home, binding: binding, actorID: "child-recovery-parent")
+    }
+    let origin = WorkAgentHandleOrigin(
+        work: work, workHost: WorkHostRef(work.workHostID), session: created.session,
+        sessionAttachment: created.sessionAttachment, run: binding.run)
+    let handle = HandleRef("blocking-child")
+    let requestBody = try ContextBodyStore(home: home).retain(
+        Data("child request".utf8), authority: bundle.workJournal, mediaType: "text/plain")
+    let queued = try await route.append(journalBackedAgentHandleDraft(
+        type: TimelineEventType.agentHandleQueued, origin: origin, handle: handle,
+        payload: journalBackedAgentHandlePayload(WorkAgentHandleQueuedPayload(
+            origin: origin, label: "Blocking child", deadline: Date().addingTimeInterval(300),
+            requestBody: requestBody))))
+    let started = try await route.append(journalBackedAgentHandleDraft(
+        type: TimelineEventType.agentHandleStarted, origin: origin, handle: handle,
+        cause: queued.eventRef))
+    _ = try await bundle.finishRun(outcome: .completed)
+    try await bundle.closeChecked()
+    await service.controlJournal.close()
+
+    let restarted = try JournalBackedWorkService(
+        home: home, instanceID: "child-recovery-instance", startIdentity: "child-recovery-start",
+        authorizer: WorkServiceCapabilityPolicy(
+            grantsByClient: [client: journalBackedAllCapabilities()]),
+        manifestStore: store)
+    let scan = try await restarted.scanRecovery()
+    XCTAssertEqual(scan.first(where: { $0.work == work })?.disposition, .recoveryRequired)
+    let descriptor = try await restarted.describeWork(
+        WorkServiceDescribeRequest(work: work, journal: created.work.journal, client: client))
+    XCTAssertEqual(descriptor.execution, .recoveryRequired)
+    let bootstrapLookup = await restarted.registry.lookup(work)
+    if case .recovering = bootstrapLookup {
+        XCTAssertTrue(true)
+    } else {
+        XCTAssertTrue(false, "bootstrap must not leave a child-blocked Work reconstructable")
+    }
+    XCTAssertTrue(queued.cursor.sequence >= 1)
+
+    // Isolate command admission from the registry's conservative negative observation. Even
+    // without that disposable fact, canonical child obligations must refuse new commands.
+    if case .recovering(let fact) = bootstrapLookup {
+        XCTAssertTrue(await restarted.registry.discardRecoveringFact(work, expected: fact))
+    }
+    let blockedCursor = try XCTUnwrap(scan.first(where: { $0.work == work })?.workCursor)
+    let journalURLs = [
+        home.timelineV2WorkJournalURL(work),
+        home.timelineV2SessionJournalURL(created.session),
+        home.timelineV2WorkHostControlJournalURL(WorkHostRef(work.workHostID)),
+    ]
+    let journalBytes = try journalURLs.map { try Data(contentsOf: $0) }
+    for kind: WorkServiceCommandKind in [.start, .complete] {
+        do {
+            _ = try await restarted.command(WorkServiceCommandRequest(
+                work: work, journal: created.work.journal,
+                attachment: created.attachment.attachment,
+                commandID: "blocked-child-\(kind.rawValue)", client: client,
+                sessionAttachment: created.sessionAttachment, causalWorkCursor: blockedCursor,
+                kind: kind, value: nil))
+            XCTAssertTrue(false, "unowned child obligation must refuse \(kind.rawValue)")
+        } catch WorkServiceProtocolError.sourceIncomplete {
+            XCTAssertTrue(true)
+        }
+    }
+    XCTAssertEqual(try journalURLs.map { try Data(contentsOf: $0) }, journalBytes)
+    XCTAssertNil(await restarted.registry.lookup(work), "refused commands must not open an actor")
+
+    // The parent Run is already closed, but the Work Handle remains a durable blocker. Once its
+    // cleanup is explicitly indeterminate, it must not be mistaken for settled execution.
+    let terminal = try await route.append(journalBackedAgentHandleDraft(
+        type: TimelineEventType.agentHandleTerminal, origin: origin, handle: handle,
+        cause: started.eventRef,
+        payload: journalBackedAgentHandlePayload(WorkAgentHandleTerminalPayload(
+            outcome: .indeterminate,
+            cleanup: WorkAgentHandleCleanupProof(state: .indeterminate)))))
+    XCTAssertNotEqual(terminal.eventRef, queued.eventRef)
+    await restarted.controlJournal.close()
+
+    let cold = try JournalBackedWorkService(
+        home: home, instanceID: "child-recovery-cold", startIdentity: "child-recovery-cold-start",
+        authorizer: WorkServiceCapabilityPolicy(
+            grantsByClient: [client: journalBackedAllCapabilities()]),
+        manifestStore: store)
+    let coldScan = try await cold.scanRecovery()
+    XCTAssertEqual(coldScan.first(where: { $0.work == work })?.disposition, .recoveryRequired)
+    let coldDescriptor = try await cold.describeWork(
+        WorkServiceDescribeRequest(work: work, journal: created.work.journal, client: client))
+    XCTAssertEqual(coldDescriptor.execution, .recoveryRequired)
+    if case .recovering = await cold.registry.lookup(work) {
+        XCTAssertTrue(true)
+    } else {
+        XCTAssertTrue(false, "indeterminate cleanup must also block idle reconstruction")
+    }
+    await cold.controlJournal.close()
+}
+
 let casesJournalBackedWorkService: [Case] = [
     ("journal-backed service qualifies Run ownership across Sessions and restart", {
         try await testJournalBackedWorkServiceQualifiesRunOwnerAcrossSessionsAndRestart()
@@ -5297,6 +5436,9 @@ let casesJournalBackedWorkService: [Case] = [
     }),
     ("journal-backed service never projects an unproven Run as live", {
         try await testJournalBackedWorkServiceRecoveryNeverProjectsUnprovenRunAsLive()
+    }),
+    ("journal-backed service keeps parent-ended child Handles in recovery", {
+        try await testJournalBackedWorkServiceParentEndWithChildHandleRequiresRecovery()
     }),
     ("journal-backed service retries post-template crash", {
         try await testJournalBackedWorkServiceRetriesCrashAfterTemplatePublication()

@@ -85,13 +85,19 @@ internal protocol WorkTransitionStateAccess {
     func action(for actionID: String) -> WorkActionSnapshot?
     func isActionActive(_ actionID: String) -> Bool
     func handle(for handleID: String) -> WorkHandleSnapshot?
+    func agentHandle(for handleID: String) -> WorkAgentHandleSnapshot?
     func sessionAttachment(for attachmentID: String) -> WorkSessionAttachmentSnapshot?
     func activeSessionAttachmentCount(for session: SessionRef) -> Int
     func command(for commandID: String) -> WorkCommandSnapshot?
 
     /// Checked cardinalities.  Adapters must never decrement either value below zero.
     var activeActionCount: Int { get }
+    /// Legacy runtime Handles are Run-owned and continue to gate `run.finished`.
     var outstandingHandleCount: Int { get }
+    /// Work-owned agent Handles have independent live, unreaped, and lifetime cardinalities.
+    var liveAgentHandleCount: Int { get }
+    var unreapedAgentHandleCount: Int { get }
+    var retainedAgentHandleCount: Int { get }
 }
 
 /// Typed, event-local staged writes used by the shared Work transition function.
@@ -111,6 +117,7 @@ internal protocol WorkTransitionStagedMutation {
     /// caller-supplied inconsistent snapshot: extraction must not silently normalize old state.
     mutating func stageAction(_ action: WorkActionSnapshot, active: Bool?)
     mutating func stageHandle(_ handle: WorkHandleSnapshot)
+    mutating func stageAgentHandle(_ handle: WorkAgentHandleSnapshot)
     mutating func stageCommand(_ command: WorkCommandSnapshot)
     mutating func stageRecovery(_ coverage: RecoveryCoverage, recorded: RecordedRecoveryCoverage)
     mutating func stageChildState(_ state: String, for childID: String)
@@ -132,6 +139,9 @@ internal struct InMemoryWorkTransitionState: WorkTransitionState, Sendable {
     private var activeAttachmentCounts: [String: Int]
     private var activeActionCounter: Int
     private var outstandingHandleCounter: Int
+    private var liveAgentHandleCounter: Int
+    private var unreapedAgentHandleCounter: Int
+    private var retainedAgentHandleCounter: Int
 
     init(snapshot: WorkSnapshot = WorkSnapshot()) {
         storedSnapshot = snapshot
@@ -146,6 +156,13 @@ internal struct InMemoryWorkTransitionState: WorkTransitionState, Sendable {
         outstandingHandleCounter = snapshot.handles.values.reduce(into: 0) { count, handle in
             if !Self.isTerminalHandleState(handle.state) { count += 1 }
         }
+        liveAgentHandleCounter = snapshot.agentHandles.values.reduce(into: 0) { count, handle in
+            if handle.blocksWorkCompletion { count += 1 }
+        }
+        unreapedAgentHandleCounter = snapshot.agentHandles.values.reduce(into: 0) { count, handle in
+            if handle.state != .reaped { count += 1 }
+        }
+        retainedAgentHandleCounter = snapshot.agentHandles.count
     }
 
     var snapshot: WorkSnapshot {
@@ -181,6 +198,10 @@ internal struct InMemoryWorkTransitionState: WorkTransitionState, Sendable {
         storedSnapshot.handles[handleID]
     }
 
+    func agentHandle(for handleID: String) -> WorkAgentHandleSnapshot? {
+        storedSnapshot.agentHandles[handleID]
+    }
+
     func sessionAttachment(for attachmentID: String) -> WorkSessionAttachmentSnapshot? {
         storedSnapshot.sessionAttachments[attachmentID]
     }
@@ -195,6 +216,9 @@ internal struct InMemoryWorkTransitionState: WorkTransitionState, Sendable {
 
     var activeActionCount: Int { activeActionCounter }
     var outstandingHandleCount: Int { outstandingHandleCounter }
+    var liveAgentHandleCount: Int { liveAgentHandleCounter }
+    var unreapedAgentHandleCount: Int { unreapedAgentHandleCounter }
+    var retainedAgentHandleCount: Int { retainedAgentHandleCounter }
 
     mutating func stageScalar(_ continuation: BoundedWorkScalarContinuation) {
         scalarContinuation = continuation
@@ -286,6 +310,22 @@ internal struct InMemoryWorkTransitionState: WorkTransitionState, Sendable {
         storedSnapshot.handles[handleID] = handle
     }
 
+    mutating func stageAgentHandle(_ handle: WorkAgentHandleSnapshot) {
+        let handleID = handle.handle.handleID
+        let old = storedSnapshot.agentHandles[handleID]
+        if old == nil {
+            retainedAgentHandleCounter += 1
+        }
+        let wasLive = old?.blocksWorkCompletion ?? false
+        if !wasLive && handle.blocksWorkCompletion { liveAgentHandleCounter += 1 }
+        if wasLive && !handle.blocksWorkCompletion { decrementLiveAgentHandleCount() }
+        let wasUnreaped = old.map { $0.state != .reaped } ?? false
+        let isUnreaped = handle.state != .reaped
+        if !wasUnreaped && isUnreaped { unreapedAgentHandleCounter += 1 }
+        if wasUnreaped && !isUnreaped { decrementUnreapedAgentHandleCount() }
+        storedSnapshot.agentHandles[handleID] = handle
+    }
+
     mutating func stageCommand(_ command: WorkCommandSnapshot) {
         storedSnapshot.commands[command.command.commandID] = command
     }
@@ -350,6 +390,22 @@ internal struct InMemoryWorkTransitionState: WorkTransitionState, Sendable {
             return
         }
         outstandingHandleCounter -= 1
+    }
+
+    private mutating func decrementLiveAgentHandleCount() {
+        guard liveAgentHandleCounter > 0 else {
+            liveAgentHandleCounter = 0
+            return
+        }
+        liveAgentHandleCounter -= 1
+    }
+
+    private mutating func decrementUnreapedAgentHandleCount() {
+        guard unreapedAgentHandleCounter > 0 else {
+            unreapedAgentHandleCounter = 0
+            return
+        }
+        unreapedAgentHandleCounter -= 1
     }
 
     private static func isTerminalHandleState(_ state: String) -> Bool {
@@ -422,7 +478,7 @@ internal enum WorkReducerTransition {
             }
             updateScalar(&state) { $0.lifecycle = .active }
         case TimelineEventType.workCompleted:
-            guard !isTerminalLifecycle(state), !hasOutstandingWork(state) else {
+            guard !isTerminalLifecycle(state), !hasOutstandingWorkForCompletion(state) else {
                 quarantine(event, state: &state,
                            reason: "Work completed while actions or Handles remain outstanding")
                 return
@@ -452,9 +508,9 @@ internal enum WorkReducerTransition {
                 $0.execution = .failed
             }
         case TimelineEventType.workDestroyed:
-            guard !isTerminalLifecycle(state), !hasOutstandingWork(state) else {
+            guard !isTerminalLifecycle(state), !hasOutstandingWorkForDestruction(state) else {
                 quarantine(event, state: &state,
-                           reason: "Work destroyed while actions or Handles remain outstanding")
+                           reason: "Work destroyed while actions, live Handles, or unreaped agent Handles remain")
                 return
             }
             let activeActionCount = state.activeActionCount
@@ -617,7 +673,8 @@ internal enum WorkReducerTransition {
             guard let run = event.run, run == state.scalar.activeRun,
                   let handle = event.handle,
                   !handle.handleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  state.handle(for: handle.handleID) == nil else {
+                  state.handle(for: handle.handleID) == nil,
+                  state.agentHandle(for: handle.handleID) == nil else {
                 quarantine(event, state: &state,
                            reason: "Handle start requires the active Run, a fresh non-empty identity, and no existing Handle")
                 return
@@ -644,6 +701,97 @@ internal enum WorkReducerTransition {
                 return
             }
             state.stageHandle(WorkHandleSnapshot(handle: handle, state: handleState))
+        case TimelineEventType.agentHandleQueued:
+            guard !isTerminalLifecycle(state),
+                  let handle = event.handle,
+                  validIdentity(handle.handleID),
+                  state.handle(for: handle.handleID) == nil,
+                  state.agentHandle(for: handle.handleID) == nil,
+                  state.retainedAgentHandleCount < WorkAgentHandleSnapshot.maximumRetainedPerWork,
+                  validAgentHandleDomains(event),
+                  let payload: WorkAgentHandleQueuedPayload = decodeExactTimelineValue(event.payload),
+                  validAgentHandleOrigin(payload.origin, event: event, state: state),
+                  validAgentHandleLabel(payload.label),
+                  payload.deadline > event.hostRecordedAt,
+                  validAgentHandleBody(payload.requestBody, journal: event.journal),
+                  event.command == nil, event.client == nil,
+                  event.causedByEventID == nil else {
+                quarantine(event, state: &state,
+                           reason: "agent Handle queue admission is malformed, over limit, or not owned by the active Run")
+                return
+            }
+            let source = EventRef(journal: event.journal, eventID: event.eventID)
+            state.stageAgentHandle(WorkAgentHandleSnapshot(
+                handle: handle, origin: payload.origin, label: payload.label,
+                deadline: payload.deadline, requestBody: payload.requestBody,
+                queuedEvent: source))
+        case TimelineEventType.agentHandleStarted:
+            guard let existing = validAgentHandleTransition(event, state: state),
+                  existing.state == .queued,
+                  event.hostRecordedAt < existing.deadline,
+                  event.payload == .object([:]),
+                  event.command == nil, event.client == nil else {
+                quarantine(event, state: &state,
+                           reason: "agent Handle start requires the exact queued origin and causal event")
+                return
+            }
+            var updated = existing
+            updated.state = .running
+            let source = EventRef(journal: event.journal, eventID: event.eventID)
+            updated.startedEvent = source
+            updated.latestLifecycleEvent = source
+            state.stageAgentHandle(updated)
+        case TimelineEventType.agentHandleCancelRequested:
+            guard let existing = validAgentHandleTransition(event, state: state),
+                  existing.state == .queued || existing.state == .running,
+                  let payload: WorkAgentHandleCancelRequestedPayload = decodeExactTimelineValue(event.payload),
+                  validAgentHandleCancellationEnvelope(event, cause: payload.cause, state: state) else {
+                quarantine(event, state: &state,
+                           reason: "agent Handle cancellation is malformed, stale, or already terminal")
+                return
+            }
+            var updated = existing
+            updated.state = .cancelRequested
+            updated.cancellationCause = payload.cause
+            updated.latestLifecycleEvent = EventRef(
+                journal: event.journal, eventID: event.eventID)
+            state.stageAgentHandle(updated)
+        case TimelineEventType.agentHandleTerminal:
+            guard let existing = validAgentHandleTransition(event, state: state),
+                  existing.state.isLive,
+                  event.command == nil, event.client == nil,
+                  let payload: WorkAgentHandleTerminalPayload = decodeExactTimelineValue(event.payload),
+                  validAgentHandleTerminal(payload, prior: existing, event: event, state: state) else {
+                quarantine(event, state: &state,
+                           reason: "agent Handle terminal outcome is malformed, conflicting, or lacks exact cleanup evidence")
+                return
+            }
+            let source = EventRef(journal: event.journal, eventID: event.eventID)
+            var updated = existing
+            updated.state = .terminal
+            updated.terminalOutcome = payload.outcome
+            updated.resultBody = payload.resultBody
+            updated.cleanup = payload.cleanup
+            updated.latestLifecycleEvent = source
+            updated.terminalEvent = source
+            state.stageAgentHandle(updated)
+        case TimelineEventType.agentHandleReaped:
+            guard let existing = validAgentHandleTransition(event, state: state),
+                  existing.state == .terminal,
+                  existing.cleanup?.state != .indeterminate,
+                  event.command == nil, event.client == nil,
+                  let payload: WorkAgentHandleReapedPayload = decodeExactTimelineValue(event.payload) else {
+                quarantine(event, state: &state,
+                           reason: "agent Handle reap requires one exact terminal outcome")
+                return
+            }
+            let source = EventRef(journal: event.journal, eventID: event.eventID)
+            var updated = existing
+            updated.state = .reaped
+            updated.reapReason = payload.reason
+            updated.latestLifecycleEvent = source
+            updated.reapedEvent = source
+            state.stageAgentHandle(updated)
         case TimelineEventType.recoveryCoverage:
             guard let coverage = decodeRecoveryCoverage(event.payload),
                   let session = event.session, !session.sessionID.isEmpty,
@@ -1136,6 +1284,120 @@ internal enum WorkReducerTransition {
             || state.activeActionCount > 0 || state.outstandingHandleCount > 0
     }
 
+    private static func hasOutstandingWorkForCompletion<State: WorkTransitionState>(
+        _ state: State
+    ) -> Bool {
+        hasOutstandingWork(state) || state.liveAgentHandleCount > 0
+    }
+
+    private static func hasOutstandingWorkForDestruction<State: WorkTransitionState>(
+        _ state: State
+    ) -> Bool {
+        hasOutstandingWorkForCompletion(state) || state.unreapedAgentHandleCount > 0
+    }
+
+    private static func validIdentity(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= PersistentWorkExactState.maximumIdentityBytes
+    }
+
+    private static func validAgentHandleLabel(_ value: String) -> Bool {
+        !value.isEmpty
+            && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value.utf8.count <= WorkAgentHandleSnapshot.maximumLabelBytes
+            && value.unicodeScalars.allSatisfy { $0.value > 0x1F && !(0x7F...0x9F).contains($0.value) }
+    }
+
+    private static func validAgentHandleBody(
+        _ reference: TimelineBodyReference, journal: JournalRef
+    ) -> Bool {
+        reference.authority == journal
+            && validIdentity(reference.referenceID)
+            && reference.referenceID == reference.digest
+            && reference.digest.map(ContextBodyStore.isValidDigest) == true
+            && reference.byteCount.map { (0...WorkAgentHandleSnapshot.maximumBodyBytes).contains($0) } == true
+            && reference.mediaType.map { !$0.isEmpty && $0.utf8.count <= 512 } ?? true
+    }
+
+    private static func validAgentHandleOrigin<State: WorkTransitionState>(
+        _ origin: WorkAgentHandleOrigin, event: TimelineEvent, state: State
+    ) -> Bool {
+        guard case .work(let owner) = event.journal.owner,
+              let work = state.scalar.work, let host = state.scalar.workHost,
+              origin.work == work, owner == work, event.work == work,
+              origin.workHost == host, event.workHost == host,
+              host.workHostID == work.workHostID,
+              origin.session == state.scalar.activeRunSession, event.session == origin.session,
+              origin.sessionAttachment == state.scalar.activeRunSessionAttachment,
+              event.sessionAttachment == origin.sessionAttachment,
+              origin.run == state.scalar.activeRun, event.run == origin.run,
+              state.sessionAttachment(for: origin.sessionAttachment.attachmentID)?.session == origin.session,
+              state.sessionAttachment(for: origin.sessionAttachment.attachmentID)?.isAttached == true else {
+            return false
+        }
+        return [work.workHostID, work.workID, host.workHostID, origin.session.sessionID,
+                origin.sessionAttachment.attachmentID, origin.run.runID].allSatisfy(validIdentity)
+    }
+
+    private static func validAgentHandleTransition<State: WorkTransitionState>(
+        _ event: TimelineEvent, state: State
+    ) -> WorkAgentHandleSnapshot? {
+        guard let handle = event.handle, let existing = state.agentHandle(for: handle.handleID),
+              validAgentHandleDomains(event),
+              event.work == existing.origin.work,
+              event.workHost == existing.origin.workHost,
+              event.session == existing.origin.session,
+              event.sessionAttachment == existing.origin.sessionAttachment,
+              event.run == existing.origin.run,
+              event.causedByEventID == existing.latestLifecycleEvent else { return nil }
+        return existing
+    }
+
+    private static func validAgentHandleDomains(_ event: TimelineEvent) -> Bool {
+        event.declaredDomains == [.work, .runtime, .externalEffects]
+    }
+
+    private static func validAgentHandleCancellationEnvelope<State: WorkTransitionState>(
+        _ event: TimelineEvent, cause: WorkAgentHandleCancellationCause, state: State
+    ) -> Bool {
+        if cause != .client { return event.command == nil && event.client == nil }
+        guard let command = event.command, validIdentity(command.commandID),
+              let client = command.client, event.client == client, validIdentity(client.clientID),
+              let callerAttachment = command.sessionAttachment,
+              state.sessionAttachment(for: callerAttachment.attachmentID)?.isAttached == true,
+              let cursor = command.causalCursor,
+              cursor.journal == event.journal,
+              cursor.eventID == event.previousEventID,
+              cursor.sequence == event.sequence - 1 else { return false }
+        return true
+    }
+
+    private static func validAgentHandleTerminal<State: WorkTransitionState>(
+        _ payload: WorkAgentHandleTerminalPayload, prior: WorkAgentHandleSnapshot,
+        event: TimelineEvent, state: State
+    ) -> Bool {
+        if let body = payload.resultBody, !validAgentHandleBody(body, journal: event.journal) {
+            return false
+        }
+        if payload.outcome == .succeeded && payload.resultBody == nil { return false }
+        if payload.outcome == .expired && event.hostRecordedAt < prior.deadline { return false }
+        if let evidence = payload.cleanup.evidence {
+            guard evidence.journal == event.journal,
+                  let sequence = state.eventSequence(for: evidence.eventID),
+                  sequence < event.sequence else { return false }
+        }
+        if prior.startedEvent == nil {
+            guard payload.cleanup.state == .notStarted,
+                  [.failed, .canceled, .expired].contains(payload.outcome) else { return false }
+        } else if payload.outcome == .indeterminate {
+            guard payload.cleanup.state == .indeterminate else { return false }
+        } else {
+            guard payload.cleanup.state == .quiesced else { return false }
+        }
+        if prior.state == .cancelRequested,
+           ![.canceled, .expired, .indeterminate].contains(payload.outcome) { return false }
+        return true
+    }
+
     private static func hasOutstandingRunWork<State: WorkTransitionState>(_ state: State) -> Bool {
         state.scalar.activeTurn != nil || state.activeActionCount > 0
             || state.outstandingHandleCount > 0
@@ -1221,4 +1483,14 @@ func decodeRecoveryCoverage(_ payload: JSONValue) -> RecoveryCoverage? {
 func decodeTimelineValue<T: Decodable>(_ value: JSONValue) -> T? {
     guard let data = try? JSONEncoder().encode(value) else { return nil }
     return try? JSONDecoder().decode(T.self, from: data)
+}
+
+/// Strict typed payload decoding for security-sensitive canonical families. Unlike the general
+/// compatibility decoder, this rejects ignored/unknown fields (including nested raw text) by
+/// requiring the decoded value's canonical JSON shape to equal the source shape exactly.
+func decodeExactTimelineValue<T: Codable>(_ value: JSONValue) -> T? {
+    guard let decoded: T = decodeTimelineValue(value),
+          let encoded = try? JSONEncoder().encode(decoded),
+          JSONValue.parse(encoded) == value else { return nil }
+    return decoded
 }

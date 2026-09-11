@@ -839,8 +839,8 @@ public struct LocalTimelineProjectionReader: Sendable {
         let replayBytes: Int
     }
 
-    private static let exactWorkMapKind = "work-exact-v3"
-    private static let legacyWorkMapKinds: Set<String> = ["work-exact-v1", "work-exact-v2"]
+    private static let exactWorkMapKind = "work-exact-v4"
+    private static let legacyWorkMapKinds: Set<String> = ["work-exact-v1", "work-exact-v2", "work-exact-v3"]
     private static let exactSessionMapKind = "session-exact-v1"
 
     /// The map is deliberately private to this projection store.  Its namespace is stable for a
@@ -866,8 +866,8 @@ public struct LocalTimelineProjectionReader: Sendable {
     private func defaultWorkExactNamespaceID(
         source: DisposableTimelineProjectionStore.SourceFingerprint
     ) -> String {
-        "work-exact-v3." + AviarySHA256.hash(data: Data(
-            "aviary-work-exact-namespace-v3\u{0}\(journal.stableKey)\u{0}"
+        "work-exact-v4." + AviarySHA256.hash(data: Data(
+            "aviary-work-exact-namespace-v4\u{0}\(journal.stableKey)\u{0}"
                 .appending(source.sourceGeneration)
                 .appending("\u{0}\(source.sourceByteCount)\u{0}")
                 .appending(source.fingerprint)

@@ -62,6 +62,9 @@ public actor AgentRunner {
         /// Puts a message back into this run's own conversation, for work that outlives the
         /// turn that started it.
         public var selfDelegate: Agent.SelfDelegate?
+        /// An externally owned child boundary. When supplied, child admission is delegated to
+        /// the Work Host rather than retained in this runner's process-local map.
+        public var childDelegate: Agent.SpawnDelegate?
 
         public init(
             home: AgentHome, cwd: String, model: ModelSpec, systemPrompt: String,
@@ -71,6 +74,7 @@ public actor AgentRunner {
             hookPaths: [String] = [], resume: String? = nil,
             peerDelegate: Agent.PeerDelegate? = nil,
             selfDelegate: Agent.SelfDelegate? = nil,
+            childDelegate: Agent.SpawnDelegate? = nil,
             identity: SessionWorkIdentity? = nil,
             reasoningEffort: String? = nil,
             writer: SessionWriter? = nil,
@@ -80,6 +84,7 @@ public actor AgentRunner {
         ) {
             self.peerDelegate = peerDelegate
             self.selfDelegate = selfDelegate
+            self.childDelegate = childDelegate
             self.home = home
             self.cwd = cwd
             self.model = model
@@ -414,7 +419,9 @@ public actor AgentRunner {
         // nobody else there.
         await agent.setPeerDelegate(settings.peerDelegate)
         await agent.setSelfDelegate(settings.selfDelegate)
-        await agent.setSpawnDelegate(Delegate(runner: self, parentSessionID: writer.sessionID))
+        await agent.setSpawnDelegate(
+            settings.childDelegate
+                ?? Delegate(runner: self, parentSessionID: writer.sessionID))
         await agent.setMemory(settings.memory)
         await agent.setArtifacts(
             ArtifactStore(home: settings.home, sessionID: writer.sessionID))

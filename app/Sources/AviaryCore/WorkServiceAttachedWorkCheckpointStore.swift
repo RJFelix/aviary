@@ -103,10 +103,8 @@ public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
     }
 
     public struct Record: Codable, Hashable, Sendable {
-        // v6 invalidates Work snapshots reduced before native `end_run` was recognized as the
-        // typed `.endRun` command kind. Aviary-owned checkpoints are disposable; older records
-        // fail closed and rebuild from their canonical journals.
-        public static let currentSchemaVersion = 6
+        // Work-owned agent Handle semantics require replay of older disposable snapshots.
+        public static let currentSchemaVersion = 7
 
         public let schemaVersion: Int
         public let client: ClientRef

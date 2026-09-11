@@ -3726,6 +3726,23 @@ public actor RunJournalBundle {
         guard type == TimelineEventType.workCompleted || type == TimelineEventType.workDestroyed else {
             throw RunJournalBundleError.invalidOperation("invalid Work terminal event")
         }
+        let canonical = try await workWriter.readCanonicalProjection(
+            expectedWork: work, expectedWorkHost: workHost, maximumResidentRecords: 0)
+        guard case .work(let head) = canonical.projection,
+              head.structuralIntegrityValid, head.semanticProjectionValid,
+              head.causalOrderValid, head.coverage.isControlling,
+              head.coverage.isIndexComplete(.agentHandles) else {
+            throw RunJournalBundleError.invalidOperation(
+                "Work terminalization requires a valid canonical projection")
+        }
+        guard head.liveAgentHandleCount == 0 else {
+            throw RunJournalBundleError.invalidOperation(
+                "Work cannot be terminalized while agent children remain outstanding")
+        }
+        if type == TimelineEventType.workDestroyed, head.unreapedAgentHandleCount != 0 {
+            throw RunJournalBundleError.invalidOperation(
+                "Work destruction requires agent child resources and retained results to be reaped")
+        }
         var payload: [String: JSONValue] = [:]
         // Preserve the optionality exactly. Empty/whitespace detail is still a caller-supplied
         // value and participates in the terminal idempotency key; omitting it here would make a
@@ -3975,9 +3992,10 @@ public actor RunJournalBundle {
                 reason: reduced.corruptionReasons.joined(separator: "; "))
         }
         let terminalHandleStates: Set<String> = ["succeeded", "failed", "canceled", "completed"]
-        let handles = reduced.handles.values
+        let handles = (reduced.handles.values
             .filter { !terminalHandleStates.contains($0.state) }
             .map(\.handle)
+            + reduced.agentHandles.values.filter { $0.blocksWorkCompletion }.map(\.handle))
             .sorted { $0.handleID < $1.handleID }
         return RunJournalBundleTerminalCommit(
             workEvent: workEvent, workCommit: workCommit,
@@ -4030,6 +4048,10 @@ public actor RunJournalBundle {
     }
 
     /// Close both files and report which durable prefix survived a partial close.
+    /// Separate from health: a prior ambiguous write remains failed even after both writer
+    /// close paths release their handles, allowing a later canonical read without replay.
+    public var writersClosed: Bool { isClosed }
+
     public func closeChecked() async throws {
         try await withSemanticGate(respectCancellation: false) {
             try await self.closeCheckedLocked()
@@ -4056,6 +4078,60 @@ public actor RunJournalBundle {
     }
 
     // MARK: - Private coordination
+
+    /// Bounded-output Handle lookup through this bundle's existing owner lease. The current
+    /// implementation replays the full Work journal; it is not a bounded-cost read. Reads and lifecycle
+    /// mutations share the semantic gate, including the transition to a closed bundle.
+    public func agentHandleHead() async throws -> BoundedWorkReducerHead {
+        try await withSemanticGate(respectCancellation: false) {
+            guard !self.isClosed, self.healthState == .healthy else {
+                throw RunJournalBundleError.unavailable("Work writer is unavailable")
+            }
+            let read = try await self.workWriter.readCanonicalProjection(
+                expectedWork: self.work, expectedWorkHost: self.workHost,
+                maximumResidentRecords: 0)
+            guard case .work(let head) = read.projection, head.coverage.isControlling,
+                  head.coverage.isIndexComplete(.agentHandles) else {
+                throw RunJournalBundleError.unavailable("Agent Handle projection is incomplete")
+            }
+            return head
+        }
+    }
+
+    /// Route ownership includes the canonical file location, not only copied logical IDs.
+    internal func ownsAgentHandleJournal(at url: URL) -> Bool {
+        workWriter.fileURL.standardizedFileURL == url.standardizedFileURL
+    }
+
+    /// Borrow the Run's existing Work writer for one host-owned child transition. The event
+    /// repeats its immutable origin; it need not belong to the current Run, and finishing this
+    /// Run does not forbid a child outcome while this bundle still owns the writer. After close,
+    /// the Work-level coordinator must explicitly acquire a new writer; this method never does.
+    @discardableResult
+    public func appendAgentHandle(_ draft: TimelineEventDraft) async throws -> TimelineJournalCommit {
+        try await withSemanticGate(respectCancellation: false) {
+            if self.workLifecycle == .completed && draft.type == TimelineEventType.agentHandleReaped {
+                guard !self.isClosed, self.healthState == .healthy else {
+                    throw RunJournalBundleError.unavailable("Work writer is unavailable")
+                }
+            } else {
+                try self.ensureUsable()
+            }
+            let commit: TimelineJournalCommit
+            do {
+                commit = try await self.workWriter.appendAgentHandle(draft)
+            } catch let error as TimelineJournalWriter.WriterError {
+                if case .failed = await self.workWriter.health {
+                    self.latch(error, journal: self.workJournal)
+                }
+                throw RunJournalBundleError.writer(error)
+            }
+            self.workCursor = commit.cursor
+            self.workEventCount += 1
+            if let order = draft.hostSequence { self.hostOrder = max(self.hostOrder, order) }
+            return commit
+        }
+    }
 
     /// Actor isolation alone is not sufficient here: every writer append awaits, and Swift
     /// actors may re-enter between those awaits. This FIFO gate keeps one semantic operation's

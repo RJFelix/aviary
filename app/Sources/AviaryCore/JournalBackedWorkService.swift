@@ -2772,6 +2772,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         }
         let executionRequiresRecovery = source.workState.execution == .failed
             || source.workState.execution == .unknown
+            || Self.childRequiresRecovery(source.workState)
             || (unstartedStartReservation && !inFlightStartAdmission)
             || (source.workState.activeRun != nil && !exactLiveActor)
             || (source.workState.activeRun == nil
@@ -3131,6 +3132,11 @@ public actor JournalBackedWorkService: WorkServiceClient {
                         // registration and the same canonical state is recovery-required.
                         disposition = lookup?.isLiveRegistration == true
                             ? .liveUnproven : .recoveryRequired
+                    } else if Self.childRequiresRecovery(source.workState) {
+                        // Parent End is not a shutdown proof for independently owned children.
+                        // Until this host's child coordinator provides a live observation, retain
+                        // the durable obligation as recovery-required.
+                        disposition = .recoveryRequired
                     } else if hasUnstartedStartReservation {
                         // A Run-bound selection or pending mutex without a canonical marker is
                         // an unfinished Start admission. It must never be projected as idle or
@@ -4370,6 +4376,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 let canReconstructIdle = source.workState.lifecycle == .active
                     && source.workState.execution == .idle
                     && source.workState.activeRun == nil
+                    && !Self.childRequiresRecovery(source.workState)
                     && !hasUnstartedStartReservation
                     && resolvedManifest != nil && hasHostedConfiguration
                 let canRecoverStartedReservation = hasUntouchedStartReservation
@@ -4788,6 +4795,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         // Unknown reducer facts are observable, but they are not a reason to guess a usable
         // execution state. The same is true of a durable active Run: a journal marker identifies
         // the Run, not a live actor capable of accepting commands.
+        let childRequiresRecovery = Self.childRequiresRecovery(source.workState)
         var execution: WorkServiceExecutionState
         if source.workState.execution == .unknown
                 || !source.workState.unknownEvents.isEmpty
@@ -4881,6 +4889,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 observation = nil
             }
         }
+        if childRequiresRecovery && execution != .unknown { execution = .recoveryRequired }
         // A durable pre-marker Start selection has no activeRun in the Work reducer yet, but it
         // is still an unfinished admission. Only its exact Start retry may cross the opener.
         let hasUnstartedReservation = try await hasUnstartedStartReservation(
@@ -5008,6 +5017,13 @@ public actor JournalBackedWorkService: WorkServiceClient {
         return await registry.discardRecoveringFact(work, expected: expectedFact)
     }
 
+    /// Parent Run ownership cannot prove liveness or cleanup of independently owned children.
+    /// Until the service has an exact child-owner observation, parent-ended obligations require
+    /// recovery in both admission and observation paths.
+    private static func childRequiresRecovery(_ work: WorkSnapshot) -> Bool {
+        work.activeRun == nil && work.agentHandles.values.contains(where: { $0.blocksWorkCompletion })
+    }
+
     private static func isReconstructableIdleSource(_ source: CanonicalSource) -> Bool {
         let work = source.workState
         let session = source.sessionState
@@ -5019,6 +5035,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
               work.activeTurn == nil,
               work.activeActionIDs.isEmpty,
               !work.handles.values.contains(where: { !Self.isSettledHandle($0) }),
+              !Self.childRequiresRecovery(work),
               work.unknownEvents.isEmpty,
               work.unknownDomains.isEmpty,
               work.quarantinedEvents.isEmpty,

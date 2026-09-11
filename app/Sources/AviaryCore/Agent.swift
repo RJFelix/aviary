@@ -204,6 +204,11 @@ public actor Agent {
     private var modelRequestOrdinal = 0
     /// How a child reports back to its parent, and who to notify.
     private var spawnDelegate: SpawnDelegate?
+    private struct WorkSpawnCallbackAttempt {
+        let payload: JSONValue
+        let task: Task<JSONValue, Never>
+    }
+    private var workSpawnCallbackAttempts: [String: WorkSpawnCallbackAttempt] = [:]
     private var peerDelegate: PeerDelegate?
     private var selfDelegate: SelfDelegate?
     /// Tasks the agent asked to be told about and stopped waiting for.
@@ -291,9 +296,8 @@ public actor Agent {
     /// `wait()`, `as_completed()` and every other stdlib idiom for free, none of which a
     /// blocking call could have offered.
     public protocol SpawnDelegate: Sendable {
-        /// The admission result is explicit: only `.running` means the runner created the
-        /// background task. `.refused` is a real, explainable outcome rather than an id that
-        /// makes the model believe a child exists when admission was closed.
+        /// Admission is explicit: a Work-owned Handle may still be queued or uncertain,
+        /// whereas `.running` identifies the Run-owned execution path.
         func startBackground(
             prompt: String, name: String?, model: String?, depth: Int
         ) async -> SpawnStartResult
@@ -305,6 +309,7 @@ public actor Agent {
 
     public enum SpawnStartResult: Hashable, Sendable {
         case running(childID: String, name: String)
+        case workOwned(handleID: String, name: String, deadline: Date, admissionUncertain: Bool)
         case refused(name: String, reason: String)
     }
 
@@ -454,11 +459,65 @@ public actor Agent {
     /// `rid` is stable across at-least-once transport replay. Durable callback effects can use it
     /// as their idempotency key; this method does not claim exactly-once semantics by itself.
     public func serveCallback(rid: String, kind: String, payload: JSONValue) async -> JSONValue {
+        if kind == "spawn" {
+            // Replayed transport callbacks must reach the already-admitted Handle even after
+            // the parent journal fails. The memo covers action admission and its outcome too.
+            if let prior = workSpawnCallbackAttempts[rid] {
+                guard prior.payload == payload else {
+                    return .object(["error": .string("This callback identity names another child request.")])
+                }
+                return await prior.task.value
+            }
+            if spawnDelegate is any WorkAgentSpawnDelegate {
+                func boundedOptionalText(_ value: JSONValue?, bytes: Int) -> Bool {
+                    switch value {
+                    case nil, .some(.null): return true
+                    case .some(.string(let text)): return text.utf8.count <= bytes
+                    default: return false
+                    }
+                }
+                guard !rid.isEmpty, rid.utf8.count <= 512,
+                      workSpawnCallbackAttempts.count < WorkAgentHandleSnapshot.maximumRetainedPerWork,
+                      let object = payload.objectValue,
+                      Set(object.keys).isSubset(of: ["prompt", "name", "model"]),
+                      let prompt = object["prompt"]?.stringValue,
+                      prompt.utf8.count <= WorkAgentChildCoordinator.maximumPromptBytes,
+                      boundedOptionalText(object["name"], bytes: 256),
+                      boundedOptionalText(object["model"], bytes: 512) else {
+                    return .object(["error": .string("Work child callback exceeds its request or retained-attempt bounds.")])
+                }
+                let task = Task { await self.serveCallbackOnce(rid: rid, kind: kind, payload: payload) }
+                workSpawnCallbackAttempts[rid] = WorkSpawnCallbackAttempt(payload: payload, task: task)
+                return await task.value
+            }
+        }
+        return await serveCallbackOnce(rid: rid, kind: kind, payload: payload)
+    }
+
+    private func serveCallbackOnce(rid: String, kind: String, payload: JSONValue) async -> JSONValue {
         guard await requireJournal("callback \(kind)") else {
             return .object(["error": .string(
                 journalFailureDetail ?? "The session journal is unavailable; stop this run.")])
         }
         switch kind {
+        case "agent_handle_status", "agent_handle_result", "agent_handle_await":
+            guard let delegate = spawnDelegate as? any WorkAgentSpawnDelegate,
+                  let id = payload["id"]?.stringValue else {
+                return .object(["error": .string("Work-owned agent Handles are not enabled for this run.")])
+            }
+            if kind == "agent_handle_status" { return await delegate.handleStatus(id: id) }
+            if kind == "agent_handle_await" {
+                guard case .bool(let awaited) = payload["awaited"],
+                      let observerID = payload["observer_id"]?.stringValue else {
+                    return .object(["error": .string("Await interest requires a boolean.")])
+                }
+                return await delegate.handleAwaitInterest(id: id, observerID: observerID, awaited: awaited)
+            }
+            guard let offset = payload["offset"]?.intValue else {
+                return .object(["error": .string("A result read requires an integer byte offset.")])
+            }
+            return await delegate.handleResult(id: id, offset: offset)
+
         case "children":
             guard let delegate = spawnDelegate else {
                 return .object(["error": .string("Sub-agents are not enabled for this run.")])
@@ -685,10 +744,35 @@ public actor Agent {
                 metadata: ["depth": .number(Double(config.depth + 1))])
             do { try requireNativePermit(permit, for: "child start") }
             catch { return .object(["error": .string(error.localizedDescription)]) }
-            let started = await delegate.startBackground(
-                prompt: prompt, name: name,
-                model: payload["model"]?.stringValue, depth: config.depth + 1)
+            let started: SpawnStartResult
+            if let workDelegate = delegate as? any WorkAgentSpawnDelegate {
+                started = await workDelegate.startWorkChild(
+                    callbackID: rid, prompt: prompt, name: name,
+                    model: payload["model"]?.stringValue, depth: config.depth + 1)
+            } else {
+                started = await delegate.startBackground(
+                    prompt: prompt, name: name,
+                    model: payload["model"]?.stringValue, depth: config.depth + 1)
+            }
             switch started {
+            case .workOwned(let handleID, let childName, let deadline, let uncertain):
+                let recorded = await finishNativeAction(
+                    permit, state: uncertain ? .indeterminateEffect : .succeeded,
+                    retrySafety: .unsafe, failureKind: uncertain ? .indeterminateEffect : nil)
+                // Parent Run closure cannot erase an independently owned, admitted Handle.
+                // Preserve its identity even if the parent action receipt could not commit.
+                var response: [String: JSONValue] = [
+                    "id": .string(handleID), "name": .string(childName),
+                    "ownership": .string("work"),
+                    "state": .string(uncertain ? "admission_uncertain" : "admitted"),
+                    "deadline": .number(deadline.timeIntervalSince1970),
+                ]
+                if uncertain || !recorded {
+                    response["warning"] = .string(
+                        "Admission confirmation is incomplete. Retain this Handle and inspect it; do not spawn another copy.")
+                }
+                return .object(response)
+
             case .running(let childID, let childName):
                 guard await finishNativeAction(
                     permit, state: .succeeded, retrySafety: .unsafe) else {

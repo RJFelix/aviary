@@ -7186,5 +7186,12 @@ await Harness.run(
         + casesRuntimeHostCallbackQuiescence + casesNativeTurnModel
         + casesObservedRepositoryReview + casesObservedRepositoryReviewAgent
         + casesNativeIndeterminateEffects + casesChildLifecycle
+        + casesAgentChildExecutionResource + casesWorkAgentChildAdmissionQueue
+        + casesRuntimeHostChildOwnership + casesWorkAgentHandleCanonical + casesWorkAgentHandleJournal
+        + casesWorkAgentHandleJournalLifecycle + casesWorkAgentChildCoordinator
+        + casesHostedWorkAgentChildPilot
+        + casesHostedWorkAgentChildIntegration
+        + casesRuntimeHostWorkAgentFuture
+        + casesWorkAgentSpawnCallback
         + casesCommandDeliveryOutcome + casesRuntimeHostParentLifetime
         + casesRuntimeHostAdoption)

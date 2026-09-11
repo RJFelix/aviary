@@ -401,7 +401,7 @@ func testLocalTimelineProjectionReaderContinuesStatefulActionFromExactRoot() thr
             path: "work-exact-state", directoryHint: .isDirectory),
         namespaceID: grown.snapshot.namespaceID, journal: localReaderWorkJournal,
         sourceGeneration: grown.snapshot.source.sourceGeneration,
-        mapKind: "work-exact-v3")
+        mapKind: "work-exact-v4")
     let state = try PersistentWorkExactState(map: map, root: checkpoint.roots[0].root)
     let outcome = localReaderDetailedEvent(
         sequence: 6, type: TimelineEventType.actionOutcome, previous: "w-5",
@@ -877,7 +877,7 @@ func testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState() thro
     XCTAssertEqual(coldCheckpoint.prefixByteCount, cold.snapshot.source.prefixByteCount)
     XCTAssertEqual(coldCheckpoint.prefixDigest, cold.snapshot.source.prefixDigest)
     XCTAssertEqual(coldCheckpoint.roots.count, 1)
-    XCTAssertEqual(coldCheckpoint.roots[0].mapKind, "work-exact-v3")
+    XCTAssertEqual(coldCheckpoint.roots[0].mapKind, "work-exact-v4")
     XCTAssertEqual(coldCheckpoint.roots[0].namespaceID, cold.snapshot.namespaceID)
 
     let fourth = localReaderWorkEvents(count: 1, start: 4)[0]
@@ -899,7 +899,7 @@ func testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState() thro
         namespaceID: grown.snapshot.namespaceID,
         journal: localReaderWorkJournal,
         sourceGeneration: grown.snapshot.source.sourceGeneration,
-        mapKind: "work-exact-v3")
+        mapKind: "work-exact-v4")
     try map.validate(root: grownCheckpoint.roots[0].root)
     let state = try PersistentWorkExactState(
         map: map, root: grownCheckpoint.roots[0].root)
@@ -907,7 +907,7 @@ func testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState() thro
     XCTAssertEqual(state.eventLocalSnapshot.lastEventID, fourth.eventID)
 }
 
-func testLocalTimelineProjectionReaderRebuildsV2WorkStateWithNativeEndKind() throws {
+func testLocalTimelineProjectionReaderRebuildsObsoleteWorkState(previousVersion: Int) throws {
     let session = SessionRef("reader-v2-session")
     let attachment = SessionAttachmentRef("reader-v2-attachment")
     let client = ClientRef("reader-v2-client")
@@ -948,25 +948,26 @@ func testLocalTimelineProjectionReaderRebuildsV2WorkStateWithNativeEndKind() thr
     let currentHead = try sourceFixture.store.loadReducerHead(proving: current.source)
     var legacyHeadObject = try XCTUnwrap(
         JSONSerialization.jsonObject(with: currentHead) as? [String: Any])
-    legacyHeadObject["schemaVersion"] = 2
+    legacyHeadObject["schemaVersion"] = previousVersion
     let legacyHead = try JSONSerialization.data(
         withJSONObject: legacyHeadObject, options: [.sortedKeys])
 
     // This is intentionally an obsolete disposable-cache fixture, not a second implementation
-    // of the v2 reducer. The reader must identify the prior map generation before validating its
+    // of an obsolete reducer. The reader must identify the prior map generation before validating its
     // typed root, discard the projection, and derive current semantics from the unchanged journal.
     let legacyDirectory = sourceFixture.root.appending(
         path: "legacy-projection", directoryHint: .isDirectory)
-    let legacyNamespace = "work-exact-v2." + String(repeating: "a", count: 64)
+    let legacyKind = "work-exact-v\(previousVersion)"
+    let legacyNamespace = legacyKind + "." + String(repeating: "a", count: 64)
     let legacyStore = try DisposableTimelineProjectionStore(
         directory: legacyDirectory, journal: localReaderWorkJournal)
     let legacyMap = try PersistentProjectionRadixMap(
         directory: legacyDirectory.appending(
             path: "work-exact-state", directoryHint: .isDirectory),
         namespaceID: legacyNamespace, journal: localReaderWorkJournal,
-        sourceGeneration: current.source.sourceGeneration, mapKind: "work-exact-v2")
+        sourceGeneration: current.source.sourceGeneration, mapKind: legacyKind)
     let legacyRoot = try XCTUnwrap(try legacyMap.setting(
-        root: nil, key: "work-exact-v2/scalar", value: Data("legacy-v2".utf8)).newRoot)
+        root: nil, key: legacyKind + "/scalar", value: Data("obsolete-scalar".utf8)).newRoot)
     let legacyCheckpoint = DisposableTimelineProjectionStore.ExactStateCheckpoint(
         namespaceID: legacyNamespace, journal: localReaderWorkJournal,
         sourceGeneration: current.source.sourceGeneration,
@@ -982,7 +983,7 @@ func testLocalTimelineProjectionReaderRebuildsV2WorkStateWithNativeEndKind() thr
         currentBucket: currentBucket, anchors: current.snapshot.anchors,
         recentPages: recentPages,
         reducerHead: .init(
-            mediaType: BoundedWorkReducerHead.mediaType, schemaVersion: 2,
+            mediaType: BoundedWorkReducerHead.mediaType, schemaVersion: previousVersion,
             bytes: legacyHead),
         exactStateCheckpoint: legacyCheckpoint)
     _ = try legacyStore.commit(
@@ -997,12 +998,12 @@ func testLocalTimelineProjectionReaderRebuildsV2WorkStateWithNativeEndKind() thr
     XCTAssertNotEqual(migrated.snapshot.namespaceID, legacyNamespace)
     let migratedCheckpoint = try XCTUnwrap(
         try legacyStore.loadExactStateCheckpoint(proving: migrated.source))
-    XCTAssertEqual(migratedCheckpoint.roots.first?.mapKind, "work-exact-v3")
+    XCTAssertEqual(migratedCheckpoint.roots.first?.mapKind, "work-exact-v4")
     let migratedMap = try PersistentProjectionRadixMap(
         directory: legacyDirectory.appending(
             path: "work-exact-state", directoryHint: .isDirectory),
         namespaceID: migrated.snapshot.namespaceID, journal: localReaderWorkJournal,
-        sourceGeneration: migrated.source.sourceGeneration, mapKind: "work-exact-v3")
+        sourceGeneration: migrated.source.sourceGeneration, mapKind: "work-exact-v4")
     var migratedState = try PersistentWorkExactState(
         map: migratedMap, root: try XCTUnwrap(migratedCheckpoint.roots.first).root)
     let delivered = TimelineEvent(
@@ -1138,6 +1139,9 @@ let casesLocalTimelineProjectionReader: [Case] = [
         try testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState()
     }),
     ("phase3 local projection reader: v2 Work exact state rebuilds native End kind", {
-        try testLocalTimelineProjectionReaderRebuildsV2WorkStateWithNativeEndKind()
+        try testLocalTimelineProjectionReaderRebuildsObsoleteWorkState(previousVersion: 2)
+    }),
+    ("phase3 local projection reader: v3 Work exact state rebuilds agent Handle semantics", {
+        try testLocalTimelineProjectionReaderRebuildsObsoleteWorkState(previousVersion: 3)
     }),
 ]

@@ -360,6 +360,10 @@ public struct HostedInHouseWorkConfiguration: Sendable {
     /// must carry them into the AgentRunner just as the GUI driver does.
     public let peerDelegate: Agent.PeerDelegate?
     public let selfDelegate: Agent.SelfDelegate?
+    /// Host-private pilot opt-in. The default Hosted path remains unchanged; when present the
+    /// factory admits this Work's Run through the coordinator and AgentRunner receives its child
+    /// delegate from the captured pilot configuration.
+    internal var agentChildPilot: WorkAgentChildPilot?
     /// Optional coordination hook run after the actor has reserved Start preparation but before
     /// durable command admission. It lets a service test or scheduler hold this narrow window
     /// without making the reservation invisible to a concurrent End command.
@@ -419,6 +423,7 @@ public struct HostedInHouseWorkConfiguration: Sendable {
         self.modelContextMode = modelContextMode
         self.peerDelegate = peerDelegate
         self.selfDelegate = selfDelegate
+        self.agentChildPilot = nil
         self.startAdmissionGate = startAdmissionGate
         self.adoptionEvidenceSink = adoptionEvidenceSink
     }
@@ -1031,6 +1036,8 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
                         ? identity.sessionID : nil,
                     peerDelegate: configuration.peerDelegate,
                     selfDelegate: configuration.selfDelegate,
+                    childDelegate: configuration.agentChildPilot?.makeDelegate(
+                        configuration: configuration),
                     identity: identity,
                     reasoningEffort: configuration.reasoningEffort,
                     writer: bridge.legacyProjection,

@@ -20,6 +20,7 @@ public enum BoundedReducerProjectionState: String, Codable, Hashable, Sendable {
 public enum BoundedReducerProjectionIndex: String, Codable, CaseIterable, Hashable, Sendable {
     case actions
     case handles
+    case agentHandles = "agent_handles"
     case commands
     case attachments
     case messages
@@ -317,6 +318,73 @@ public struct BoundedWorkHandleIndexRecord: Codable, Hashable, Sendable {
         self.state = BoundedTimelineReducerProjection.classifyHandleState(state)
         self.stateDigest = BoundedTimelineReducerProjection.digestTextValueForRecord(state)
         self.sourceEvent = sourceEvent
+    }
+}
+
+public struct BoundedWorkAgentHandleIndexRecord: Codable, Hashable, Sendable {
+    public let handle: HandleRef
+    public let origin: WorkAgentHandleOrigin
+    public let label: String
+    public let deadline: Date
+    public let requestBody: TimelineBodyReference
+    public let state: WorkAgentHandleState
+    public let cancellationCause: WorkAgentHandleCancellationCause?
+    public let terminalOutcome: WorkAgentHandleTerminalOutcome?
+    public let resultBody: TimelineBodyReference?
+    public let cleanup: WorkAgentHandleCleanupProof?
+    public let reapReason: WorkAgentHandleReapReason?
+    public let queuedEvent: EventRef
+    public let startedEvent: EventRef?
+    public let latestLifecycleEvent: EventRef
+    public let terminalEvent: EventRef?
+    public let reapedEvent: EventRef?
+
+    public var blocksWorkCompletion: Bool {
+        state.isLive || cleanup?.state == .indeterminate
+    }
+
+    public init(_ snapshot: WorkAgentHandleSnapshot) {
+        handle = snapshot.handle; origin = snapshot.origin; label = snapshot.label
+        deadline = snapshot.deadline; requestBody = snapshot.requestBody; state = snapshot.state
+        cancellationCause = snapshot.cancellationCause; terminalOutcome = snapshot.terminalOutcome
+        resultBody = snapshot.resultBody; cleanup = snapshot.cleanup; reapReason = snapshot.reapReason
+        queuedEvent = snapshot.queuedEvent; startedEvent = snapshot.startedEvent
+        latestLifecycleEvent = snapshot.latestLifecycleEvent
+        terminalEvent = snapshot.terminalEvent; reapedEvent = snapshot.reapedEvent
+    }
+
+}
+
+/// Append-time semantic check backed by the exact canonical Work snapshot returned alongside the
+/// bounded head. The writer still owns physical sequencing and commits; this prevents drafting an
+/// agent mutation that the canonical reducer would immediately quarantine. This intentionally
+/// consumes the full-scan result: bounded historical-index limits must never become admission
+/// limits, and cleanup evidence is authenticated through the snapshot's exact event map.
+internal enum WorkAgentHandlePreflight {
+    enum Error: Swift.Error, Equatable, Sendable { case invalidSnapshot; case rejected }
+
+    static func applying(
+        _ event: TimelineEvent, to snapshot: WorkSnapshot
+    ) throws -> WorkAgentHandleSnapshot {
+        let types: Set<String> = [
+            TimelineEventType.agentHandleQueued, TimelineEventType.agentHandleStarted,
+            TimelineEventType.agentHandleCancelRequested, TimelineEventType.agentHandleTerminal,
+            TimelineEventType.agentHandleReaped,
+        ]
+        guard types.contains(event.type), snapshot.causalOrderValid,
+              snapshot.structuralIntegrityValid, snapshot.semanticProjectionValid,
+              snapshot.agentHandles.count <= WorkAgentHandleSnapshot.maximumRetainedPerWork,
+              Set(snapshot.handles.keys).isDisjoint(with: Set(snapshot.agentHandles.keys)) else {
+            throw Error.invalidSnapshot
+        }
+        var transition = InMemoryWorkTransitionState(snapshot: snapshot)
+        WorkReducerTransition.apply(event, to: &transition)
+        let after = transition.snapshot
+        guard after.semanticProjectionValid, after.structuralIntegrityValid,
+              let handleID = event.handle?.handleID,
+              let result = after.agentHandles[handleID],
+              result.latestLifecycleEvent.eventID == event.eventID else { throw Error.rejected }
+        return result
     }
 }
 
@@ -645,7 +713,7 @@ public enum BoundedChildState: String, Codable, Hashable, Sendable {
 }
 
 public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
-    public static let schemaVersion = 3
+    public static let schemaVersion = 4
     public static let mediaType = "application/x-aviary-bounded-work-reducer-head"
 
     public let schemaVersion: Int
@@ -669,6 +737,11 @@ public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
     public let activeActionIDs: [String]
     public let actions: [BoundedWorkActionIndexRecord]
     public let handles: [BoundedWorkHandleIndexRecord]
+    /// Complete at the pilot's lifetime bound; this is never a sampled recent-history index.
+    public let agentHandles: [BoundedWorkAgentHandleIndexRecord]
+    public let liveAgentHandleCount: Int
+    public let unreapedAgentHandleCount: Int
+    public let retainedAgentHandleCount: Int
     public let attachments: [BoundedWorkAttachmentIndexRecord]
     public let commands: [BoundedCommandIndexRecord]
     public let children: [BoundedChildIndexRecord]
@@ -706,6 +779,12 @@ public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
     public func handle(for handleID: String) throws -> BoundedWorkHandleIndexRecord {
         try BoundedTimelineReducerProjection.lookup(
             handleID, index: .handles, rows: handles, coverage: coverage,
+            id: { $0.handle.handleID })
+    }
+
+    public func agentHandle(for handleID: String) throws -> BoundedWorkAgentHandleIndexRecord {
+        try BoundedTimelineReducerProjection.lookup(
+            handleID, index: .agentHandles, rows: agentHandles, coverage: coverage,
             id: { $0.handle.handleID })
     }
 
@@ -869,6 +948,7 @@ public struct BoundedTimelineReducerProjectionLimits: Codable, Hashable, Sendabl
     public let maximumTextBytes: Int
     public let maximumActions: Int
     public let maximumHandles: Int
+    public let maximumAgentHandles: Int
     public let maximumCommands: Int
     public let maximumAttachments: Int
     public let maximumMessages: Int
@@ -881,11 +961,12 @@ public struct BoundedTimelineReducerProjectionLimits: Codable, Hashable, Sendabl
     public let maximumDiagnostics: Int
 
     public init(
-        maximumHeadBytes: Int = 256 * 1_024,
+        maximumHeadBytes: Int = 1 * 1_024 * 1_024,
         maximumIdentifierBytes: Int = 512,
         maximumTextBytes: Int = 4_096,
         maximumActions: Int = 512,
         maximumHandles: Int = 512,
+        maximumAgentHandles: Int = WorkAgentHandleSnapshot.maximumRetainedPerWork,
         maximumCommands: Int = 512,
         maximumAttachments: Int = 256,
         maximumMessages: Int = 1_024,
@@ -902,6 +983,8 @@ public struct BoundedTimelineReducerProjectionLimits: Codable, Hashable, Sendabl
         self.maximumTextBytes = Self.clamp(maximumTextBytes, upper: 1 * 1_024 * 1_024)
         self.maximumActions = Self.clamp(maximumActions, upper: 16_384)
         self.maximumHandles = Self.clamp(maximumHandles, upper: 16_384)
+        self.maximumAgentHandles = Self.clamp(
+            maximumAgentHandles, upper: WorkAgentHandleSnapshot.maximumRetainedPerWork)
         self.maximumCommands = Self.clamp(maximumCommands, upper: 16_384)
         self.maximumAttachments = Self.clamp(maximumAttachments, upper: 16_384)
         self.maximumMessages = Self.clamp(maximumMessages, upper: 32_768)
@@ -1224,6 +1307,7 @@ public enum BoundedTimelineReducerProjection {
 
     private static func activeWorkItemCount(_ snapshot: WorkSnapshot) -> Int {
         activeActionCount(snapshot) + activeHandleCount(snapshot)
+            + snapshot.agentHandles.values.filter(\.blocksWorkCompletion).count
             + activeAttachmentCount(snapshot) + activeCommandCount(snapshot)
             + activeChildCount(snapshot)
     }
@@ -1231,12 +1315,14 @@ public enum BoundedTimelineReducerProjection {
     private static func activeWorkRowCount(
         actions: [BoundedWorkActionIndexRecord],
         handles: [BoundedWorkHandleIndexRecord],
+        agentHandles: [BoundedWorkAgentHandleIndexRecord],
         attachments: [BoundedWorkAttachmentIndexRecord],
         commands: [BoundedCommandIndexRecord],
         children: [BoundedChildIndexRecord]
     ) -> Int {
         actions.reduce(into: 0) { if actionIsUnsettled($1.state) { $0 += 1 } }
             + handles.reduce(into: 0) { if handleIsUnsettled($1.state) { $0 += 1 } }
+            + agentHandles.reduce(into: 0) { if $1.blocksWorkCompletion { $0 += 1 } }
             + attachments.reduce(into: 0) { if $1.isAttached { $0 += 1 } }
             + commands.reduce(into: 0) { if commandIsUnsettled($1.state) { $0 += 1 } }
             + children.reduce(into: 0) { if childIsUnsettled($1.state) { $0 += 1 } }
@@ -1246,6 +1332,7 @@ public enum BoundedTimelineReducerProjection {
         snapshot: WorkSnapshot,
         actions: [BoundedWorkActionIndexRecord],
         handles: [BoundedWorkHandleIndexRecord],
+        agentHandles: [BoundedWorkAgentHandleIndexRecord],
         attachments: [BoundedWorkAttachmentIndexRecord],
         commands: [BoundedCommandIndexRecord],
         children: [BoundedChildIndexRecord],
@@ -1263,6 +1350,7 @@ public enum BoundedTimelineReducerProjection {
             $0.intentEvent == nil && $0.startedEvent == nil && $0.outcomeEvent == nil
         }.count
         count += handles.filter { $0.sourceEvent == nil }.count
+        count += agentHandles.filter { $0.latestLifecycleEvent.eventID.isEmpty }.count
         count += attachments.filter { $0.sourceEvent == nil }.count
         count += commands.filter {
             $0.acceptanceEvent == nil && $0.deliveryEvent == nil
@@ -1329,6 +1417,15 @@ public enum BoundedTimelineReducerProjection {
                 sourceEvent: trace.handleEvents[value.handle.handleID])
         }.sorted(by: handleLess)
         let retainedHandleRows = Array(handleRows.prefix(limits.maximumHandles))
+        let agentHandleRows = snapshot.agentHandles.values.map(
+            BoundedWorkAgentHandleIndexRecord.init
+        ).sorted {
+            if $0.blocksWorkCompletion != $1.blocksWorkCompletion {
+                return $0.blocksWorkCompletion
+            }
+            return $0.handle.handleID < $1.handle.handleID
+        }
+        let retainedAgentHandleRows = Array(agentHandleRows.prefix(limits.maximumAgentHandles))
         let attachmentRows = snapshot.sessionAttachments.values.map { value in
             BoundedWorkAttachmentIndexRecord(
                 attachment: value.attachment, session: value.session,
@@ -1371,6 +1468,8 @@ public enum BoundedTimelineReducerProjection {
         var omissions: [BoundedReducerProjectionOmission] = []
         appendOmission(&omissions, .actions, snapshot.actions.count, retainedActionRows.count)
         appendOmission(&omissions, .handles, snapshot.handles.count, retainedHandleRows.count)
+        appendOmission(&omissions, .agentHandles, snapshot.agentHandles.count,
+                       retainedAgentHandleRows.count)
         appendOmission(&omissions, .attachments, snapshot.sessionAttachments.count, retainedAttachmentRows.count)
         appendOmission(&omissions, .commands, snapshot.commands.count, retainedCommandRows.count)
         appendOmission(&omissions, .children, childCount, childRows.count)
@@ -1379,12 +1478,14 @@ public enum BoundedTimelineReducerProjection {
         appendOmission(&omissions, .corruption, corruptionTotal, corruptionRows.count)
         let missingSourceEvidence = missingWorkSourceEvidence(
             snapshot: snapshot, actions: retainedActionRows, handles: retainedHandleRows,
+            agentHandles: retainedAgentHandleRows,
             attachments: retainedAttachmentRows, commands: retainedCommandRows, children: childRows,
             recovery: recoveryRows, corruption: corruptionRows, trace: trace)
         let activeItemCount = Swift.max(
             activeWorkItemCount(snapshot), snapshot.activeActionIDs.count)
         let retainedActiveItemCount = activeWorkRowCount(
             actions: retainedActionRows, handles: retainedHandleRows,
+            agentHandles: retainedAgentHandleRows,
             attachments: retainedAttachmentRows, commands: retainedCommandRows, children: childRows)
         let activeItemsOmitted = retainedActiveItemCount < activeItemCount
         let indexCoverage = [
@@ -1397,6 +1498,10 @@ public enum BoundedTimelineReducerProjection {
                               state: trace.overflowedIndexes.contains(.handles)
                                   || handleRows.contains(where: { $0.sourceEvent == nil })
                                   ? .sourceIncomplete : nil),
+            makeIndexCoverage(.agentHandles, total: snapshot.agentHandles.count,
+                              retained: retainedAgentHandleRows.count,
+                              state: snapshot.agentHandles.count
+                                  <= WorkAgentHandleSnapshot.maximumRetainedPerWork ? nil : .requiresRebuild),
             makeIndexCoverage(.attachments, total: snapshot.sessionAttachments.count,
                               retained: retainedAttachmentRows.count,
                               state: trace.overflowedIndexes.contains(.attachments)
@@ -1457,7 +1562,11 @@ public enum BoundedTimelineReducerProjection {
             activeActionIDs: Array(snapshot.activeActionIDs.sorted().prefix(limits.maximumActions)).map {
                 bounded($0, maxBytes: limits.maximumIdentifierBytes)
             }, actions: retainedActionRows,
-            handles: retainedHandleRows, attachments: retainedAttachmentRows, commands: retainedCommandRows,
+            handles: retainedHandleRows, agentHandles: retainedAgentHandleRows,
+            liveAgentHandleCount: snapshot.agentHandles.values.filter(\.blocksWorkCompletion).count,
+            unreapedAgentHandleCount: snapshot.agentHandles.values.filter { $0.state != .reaped }.count,
+            retainedAgentHandleCount: snapshot.agentHandles.count,
+            attachments: retainedAttachmentRows, commands: retainedCommandRows,
             children: childRows, recovery: recoveryRows, unknowns: unknownRows,
             corruption: corruptionRows, lastHostSequence: snapshot.lastHostSequence,
             lastEventID: snapshot.lastEventID, lastSequence: snapshot.lastSequence,
@@ -1948,11 +2057,22 @@ public enum BoundedTimelineReducerProjection {
         try validateRows(head.source, head.coverage.diagnostics.compactMap(\.sourceEvent), limits: limits)
         try validateUnique(head.actions.map { $0.action.actionID })
         try validateUnique(head.handles.map { $0.handle.handleID })
+        try validateUnique(head.agentHandles.map { $0.handle.handleID })
+        guard Set(head.handles.map { $0.handle.handleID }).isDisjoint(
+            with: Set(head.agentHandles.map { $0.handle.handleID })) else {
+            throw BoundedTimelineReducerProjectionError.invalidIdentity
+        }
         try validateUnique(head.attachments.map { $0.attachment.attachmentID })
         try validateUnique(head.commands.map { $0.command.commandID })
         try validateUnique(head.children.map(\.childID))
         guard head.actions == head.actions.sorted(by: actionLess),
               head.handles == head.handles.sorted(by: handleLess),
+              head.agentHandles == head.agentHandles.sorted(by: {
+                  if $0.blocksWorkCompletion != $1.blocksWorkCompletion {
+                      return $0.blocksWorkCompletion
+                  }
+                  return $0.handle.handleID < $1.handle.handleID
+              }),
               head.attachments == head.attachments.sorted(by: attachmentLess),
               head.commands == head.commands.sorted(by: commandLess),
               head.children == head.children.sorted(by: childLess) else {
@@ -1960,7 +2080,8 @@ public enum BoundedTimelineReducerProjection {
         }
         try validateCoverage(head.coverage, limits: limits)
         let workRequiredIndexes: Set<BoundedReducerProjectionIndex> = [
-            .actions, .handles, .commands, .attachments, .children, .recovery, .unknowns, .corruption
+            .actions, .handles, .agentHandles, .commands, .attachments, .children,
+            .recovery, .unknowns, .corruption
         ]
         var workSourceIncompleteIndexes: Set<BoundedReducerProjectionIndex> = []
         if head.actions.contains(where: {
@@ -1985,12 +2106,14 @@ public enum BoundedTimelineReducerProjection {
             head.coverage, requiredIndexes: workRequiredIndexes,
             retainedCounts: [
                 .actions: head.actions.count, .handles: head.handles.count,
+                .agentHandles: head.agentHandles.count,
                 .commands: head.commands.count, .attachments: head.attachments.count,
                 .children: head.children.count, .recovery: head.recovery.count,
                 .unknowns: head.unknowns.count, .corruption: head.corruption.count
             ],
             maximums: [
                 .actions: limits.maximumActions, .handles: limits.maximumHandles,
+                .agentHandles: limits.maximumAgentHandles,
                 .commands: limits.maximumCommands, .attachments: limits.maximumAttachments,
                 .children: limits.maximumChildren, .recovery: limits.maximumRecoveryClaims,
                 .unknowns: limits.maximumUnknowns, .corruption: limits.maximumCorruptionRecords
@@ -2002,7 +2125,7 @@ public enum BoundedTimelineReducerProjection {
                 structural: head.structuralIntegrityValid,
                 semantic: head.semanticProjectionValid))
         let retainedActiveItemCount = activeWorkRowCount(
-            actions: head.actions, handles: head.handles,
+            actions: head.actions, handles: head.handles, agentHandles: head.agentHandles,
             attachments: head.attachments, commands: head.commands, children: head.children)
         guard head.coverage.retainedActiveItemCount == retainedActiveItemCount,
               head.coverage.activeItemCount >= retainedActiveItemCount else {
@@ -2018,6 +2141,21 @@ public enum BoundedTimelineReducerProjection {
             let activeIDs = Set(head.actions.filter { actionIsActive($0.state) }
                 .map { $0.action.actionID })
             guard activeIDs == Set(head.activeActionIDs) else {
+                throw BoundedTimelineReducerProjectionError.invalidOffsets
+            }
+        }
+        let agentCoverage = head.coverage.coverage(for: .agentHandles)
+        guard head.retainedAgentHandleCount == agentCoverage?.totalCount,
+              head.retainedAgentHandleCount <= WorkAgentHandleSnapshot.maximumRetainedPerWork,
+              head.liveAgentHandleCount >= head.agentHandles.filter(\.blocksWorkCompletion).count,
+              head.unreapedAgentHandleCount >= head.agentHandles.filter({ $0.state != .reaped }).count,
+              head.liveAgentHandleCount <= head.unreapedAgentHandleCount else {
+            throw BoundedTimelineReducerProjectionError.invalidOffsets
+        }
+        if head.coverage.isIndexComplete(.agentHandles) {
+            guard head.retainedAgentHandleCount == head.agentHandles.count,
+                  head.liveAgentHandleCount == head.agentHandles.filter(\.blocksWorkCompletion).count,
+                  head.unreapedAgentHandleCount == head.agentHandles.filter({ $0.state != .reaped }).count else {
                 throw BoundedTimelineReducerProjectionError.invalidOffsets
             }
         }
@@ -2451,6 +2589,46 @@ public enum BoundedTimelineReducerProjection {
                 throw BoundedTimelineReducerProjectionError.invalidDigest
             }
             try validateProjectionEvent(handle.sourceEvent, source: head.source, limits: limits)
+        }
+        for handle in head.agentHandles {
+            try validateIdentifierValue(handle.handle.handleID, limits: limits)
+            try validateIdentifierValue(handle.origin.work.workID, limits: limits)
+            try validateIdentifierValue(handle.origin.work.workHostID, limits: limits)
+            try validateIdentifierValue(handle.origin.workHost.workHostID, limits: limits)
+            try validateIdentifierValue(handle.origin.session.sessionID, limits: limits)
+            try validateIdentifierValue(handle.origin.sessionAttachment.attachmentID, limits: limits)
+            try validateIdentifierValue(handle.origin.run.runID, limits: limits)
+            guard handle.origin.work == head.work,
+                  handle.origin.workHost == head.workHost,
+                  handle.label == handle.label.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !handle.label.isEmpty,
+                  handle.label.utf8.count <= WorkAgentHandleSnapshot.maximumLabelBytes,
+                  handle.requestBody.authority == head.source.journal,
+                  handle.requestBody.referenceID == handle.requestBody.digest,
+                  handle.requestBody.digest.map(validDigest) == true,
+                  handle.requestBody.byteCount.map({
+                      (0...WorkAgentHandleSnapshot.maximumBodyBytes).contains($0)
+                  }) == true else {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+            if let result = handle.resultBody {
+                guard result.authority == head.source.journal,
+                      result.referenceID == result.digest,
+                      result.digest.map(validDigest) == true,
+                      result.byteCount.map({
+                          (0...WorkAgentHandleSnapshot.maximumBodyBytes).contains($0)
+                      }) == true else {
+                    throw BoundedTimelineReducerProjectionError.invalidIdentity
+                }
+            }
+            for reference in [handle.queuedEvent, handle.latestLifecycleEvent,
+                              handle.startedEvent, handle.terminalEvent, handle.reapedEvent]
+                .compactMap({ $0 }) {
+                guard reference.journal == head.source.journal,
+                      !reference.eventID.isEmpty else {
+                    throw BoundedTimelineReducerProjectionError.invalidIdentity
+                }
+            }
         }
         for attachment in head.attachments {
             try validateIdentifierValue(attachment.attachment.attachmentID, limits: limits)
@@ -3074,6 +3252,10 @@ private extension BoundedWorkReducerHead {
         activeActionIDs: [String],
         actions: [BoundedWorkActionIndexRecord],
         handles: [BoundedWorkHandleIndexRecord],
+        agentHandles: [BoundedWorkAgentHandleIndexRecord],
+        liveAgentHandleCount: Int,
+        unreapedAgentHandleCount: Int,
+        retainedAgentHandleCount: Int,
         attachments: [BoundedWorkAttachmentIndexRecord],
         commands: [BoundedCommandIndexRecord],
         children: [BoundedChildIndexRecord],
@@ -3105,6 +3287,15 @@ private extension BoundedWorkReducerHead {
         self.activeActionIDs = activeActionIDs.sorted()
         self.actions = actions.sorted(by: BoundedTimelineReducerProjection.actionLess)
         self.handles = handles.sorted(by: BoundedTimelineReducerProjection.handleLess)
+        self.agentHandles = agentHandles.sorted {
+            if $0.blocksWorkCompletion != $1.blocksWorkCompletion {
+                return $0.blocksWorkCompletion
+            }
+            return $0.handle.handleID < $1.handle.handleID
+        }
+        self.liveAgentHandleCount = liveAgentHandleCount
+        self.unreapedAgentHandleCount = unreapedAgentHandleCount
+        self.retainedAgentHandleCount = retainedAgentHandleCount
         self.attachments = attachments.sorted(by: BoundedTimelineReducerProjection.attachmentLess)
         self.commands = commands.sorted(by: BoundedTimelineReducerProjection.commandLess)
         self.children = children.sorted(by: BoundedTimelineReducerProjection.childLess)
