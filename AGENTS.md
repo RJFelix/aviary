@@ -145,6 +145,9 @@ Inspect the registered case arrays with `rg`, then run with an explicit filter f
 The executable uses the small assertion API in `AviarySelfTest/Harness.swift`, not XCTest.
 Check that API before adding assertions: use `XCTAssertTrue(a <= b)` for ordering and explicit
 `do`/`catch` for throwing checks; XCTest's ordering/throwing convenience functions are absent.
+Keep Unix-socket fixture roots short (for example `/tmp/acs-<uuid>`): the generated endpoint
+filename also counts against the platform's socket-path limit. A descriptive temporary-directory
+prefix can make daemon startup fail before the behavior under test is reached.
 For shared-tree builds, a source freeze includes new files and test fixtures. Once a lane reports
 frozen, send further findings without editing until the verifier releases the freeze.
 Use `AVIARY_SELFTEST_TRACE=1` for unbuffered per-case begin/end markers on stderr when diagnosing

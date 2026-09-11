@@ -1463,9 +1463,11 @@ The approved [private agent-Handle pilot](phase5-agent-handle-pilot.md) is now b
 in bounded slices. Its first checkpoint proves independent child lifetime and retained results
 with real Python runtimes; subsequent slices add typed, authorized child cancellation over the
 Work service and privacy-safe recorded child activity/recovery projections. These do not enable
-the pilot in the installed app. Fresh owner-liveness and shutdown accounting, deadline policy,
-and physical retention remain activation gates. This is progress toward Phase 5, not completion
-of its broader exits.
+the pilot in the installed app. Coordinator-local ownership observation and child-admission
+shutdown fencing now distinguish live owners from recorded obligations, including pre-append
+admission and unconfirmed cleanup. This is not a public process-liveness or reconstruction claim.
+Default deadline policy and physical retention remain activation gates. This is progress toward
+Phase 5, not completion of its broader exits.
 
 Deliverables:
 

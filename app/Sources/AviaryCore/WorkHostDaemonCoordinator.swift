@@ -1,6 +1,24 @@
 import Foundation
 import Dispatch
 
+/// Process-local admission lease, not a durable cleanup or process-liveness proof.
+internal struct WorkAgentChildShutdownLease: Sendable {
+    let blockingWorks: [WorkRef]
+    let reopen: @Sendable () async -> Void
+    let seal: @Sendable () -> Void
+}
+
+extension WorkAgentChildCoordinator {
+    internal func makeShutdownLease() throws -> WorkAgentChildShutdownLease {
+        let token = try freezeAdmissions()
+        let observation = ownerObservation()
+        return WorkAgentChildShutdownLease(
+            blockingWorks: observation.blockingWorks,
+            reopen: { _ = await self.thawAdmissions(token) },
+            seal: { self.sealAdmissions() })
+    }
+}
+
 /// The result of composing a Work Host service for one process generation.
 ///
 /// The coordinator owns this composition for the lifetime of the daemon.  In particular, the
@@ -13,6 +31,8 @@ public struct WorkHostDaemonServiceComposition: Sendable {
     /// journal-backed service may still expose an idle projection when its provider/workspace
     /// resolver is absent; the daemon must not treat that projection as safe-to-stop.
     public let executionMaterialAvailable: Bool
+    internal let freezeChildAdmission: @Sendable () async throws -> WorkAgentChildShutdownLease?
+    internal let sealChildAdmission: @Sendable () async -> Void
 
     public init(
         service: any WorkServiceClient,
@@ -22,6 +42,26 @@ public struct WorkHostDaemonServiceComposition: Sendable {
         self.service = service
         self.scanRecovery = scanRecovery
         self.executionMaterialAvailable = executionMaterialAvailable
+        self.freezeChildAdmission = {
+            guard let journalService = service as? JournalBackedWorkService else { return nil }
+            return try await journalService.freezeAgentChildAdmissionForShutdown()
+        }
+        self.sealChildAdmission = {
+            await (service as? JournalBackedWorkService)?.sealAgentChildAdmissionForShutdown()
+        }
+    }
+
+    internal init(
+        service: any WorkServiceClient,
+        scanRecovery: @escaping @Sendable () async throws -> [JournalBackedWorkRecoveryEntry],
+        executionMaterialAvailable: Bool = true,
+        childCoordinator: WorkAgentChildCoordinator
+    ) {
+        self.service = service
+        self.scanRecovery = scanRecovery
+        self.executionMaterialAvailable = executionMaterialAvailable
+        self.freezeChildAdmission = { try await childCoordinator.makeShutdownLease() }
+        self.sealChildAdmission = { childCoordinator.sealAdmissions() }
     }
 }
 
@@ -301,7 +341,7 @@ public enum WorkHostDaemonCoordinatorError: Error, LocalizedError, Equatable, Se
             return "The Work Host daemon could not start: \(detail)"
         case .shutdownRefused(let works):
             let names = works.map { $0.workID }.joined(separator: ", ")
-            return "Shutdown refused while canonical Work requires service recovery: \(names)."
+            return "Shutdown refused while Work ownership or recovery remains unresolved: \(names)."
         case .shutdownTimedOut:
             return "Shutdown refused because admitted service requests did not drain in time."
         case .noService:
@@ -355,6 +395,7 @@ public actor WorkHostDaemonCoordinator {
     private var runtime: WorkHostDaemonRuntime?
     private var recoveryStorage: [JournalBackedWorkRecoveryEntry] = []
     private var descriptorStorage: WorkHostDaemonDescriptor?
+    private var childShutdownLease: WorkAgentChildShutdownLease?
     /// Invalidates a suspended lifecycle mutation when a later force-stop takes ownership.
     /// Actor isolation does not prevent reentrancy across `await`, so state alone cannot
     /// distinguish the original shutdown from the force-stop's own `.stopping` transition.
@@ -417,6 +458,11 @@ public actor WorkHostDaemonCoordinator {
             let environment = ProcessEnvironment.shared.snapshot
             let composition = try await resolver.open(
                 home: home, host: host, instance: hostInstance, environment: environment)
+            guard stateStorage == .starting else {
+                await composition.sealChildAdmission()
+                throw WorkHostDaemonCoordinatorError.invalidState(stateStorage)
+            }
+            self.composition = composition
             try ensureStartupIsStillOwned()
             let recovery = normalizedRecovery(
                 try await composition.scanRecovery(), composition: composition)
@@ -441,6 +487,7 @@ public actor WorkHostDaemonCoordinator {
             stateStorage = .running
             return descriptor
         } catch let error as WorkHostDaemonCoordinatorError {
+            await composition?.sealChildAdmission()
             if let runtime { await runtime.stop() }
             runtime = nil
             admissionGate = nil
@@ -448,6 +495,7 @@ public actor WorkHostDaemonCoordinator {
             if stateStorage == .starting { stateStorage = .failed }
             throw error
         } catch {
+            await composition?.sealChildAdmission()
             if let runtime { await runtime.stop() }
             runtime = nil
             admissionGate = nil
@@ -503,14 +551,29 @@ public actor WorkHostDaemonCoordinator {
         }
         guard ownsShutdown(shutdownEpoch) else { return }
         let recovery: [JournalBackedWorkRecoveryEntry]
+        var childLease: WorkAgentChildShutdownLease?
         do {
             guard let composition else { throw WorkHostDaemonCoordinatorError.noService }
+            childLease = try await composition.freezeChildAdmission()
+            childShutdownLease = childLease
+            guard ownsShutdown(shutdownEpoch) else {
+                childLease?.seal()
+                return
+            }
+            // A private spawn may already own a reservation before its first journal append.
+            // Do not wait for that mutation's journal lock just to rediscover the same blocker.
+            if let childLease, !childLease.blockingWorks.isEmpty {
+                throw WorkHostDaemonCoordinatorError.shutdownRefused(childLease.blockingWorks)
+            }
             recovery = normalizedRecovery(
                 try await composition.scanRecovery(), composition: composition)
         } catch {
             guard ownsShutdown(shutdownEpoch) else { return }
+            await childLease?.reopen()
+            guard ownsShutdown(shutdownEpoch) else { return }
             await gate?.reopen()
             guard ownsShutdown(shutdownEpoch) else { return }
+            childShutdownLease = nil
             stateStorage = .running
             throw error
         }
@@ -530,11 +593,17 @@ public actor WorkHostDaemonCoordinator {
         }.map(\.work)
         guard blockers.isEmpty else {
             guard ownsShutdown(shutdownEpoch) else { return }
+            await childLease?.reopen()
+            guard ownsShutdown(shutdownEpoch) else { return }
             await gate?.reopen()
             guard ownsShutdown(shutdownEpoch) else { return }
+            childShutdownLease = nil
             stateStorage = .running
             throw WorkHostDaemonCoordinatorError.shutdownRefused(blockers)
         }
+        childShutdownLease?.seal()
+        await composition?.sealChildAdmission()
+        guard ownsShutdown(shutdownEpoch) else { return }
         await ownedRuntime?.stop(drainTimeout: drainTimeout)
         guard ownsShutdown(shutdownEpoch) else { return }
         runtime = nil
@@ -575,6 +644,10 @@ public actor WorkHostDaemonCoordinator {
         }
         lifecycleEpoch &+= 1
         stateStorage = .stopping
+        childShutdownLease?.seal()
+        // An older graceful-shutdown continuation may already be awaiting its own thaw.
+        // Irreversible sealing, independent of token capacity, makes that thaw harmless.
+        await composition?.sealChildAdmission()
         await runtime?.stop(drainTimeout: drainTimeout)
         runtime = nil
         descriptorStorage = nil

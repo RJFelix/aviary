@@ -7195,6 +7195,7 @@ await Harness.run(
         + casesAgentChildExecutionResource + casesWorkAgentChildAdmissionQueue
         + casesRuntimeHostChildOwnership + casesWorkAgentHandleCanonical + casesWorkAgentHandleJournal
         + casesWorkAgentHandleJournalLifecycle + casesWorkAgentChildCoordinator
+        + casesWorkAgentChildShutdown
         + casesHostedWorkAgentChildPilot
         + casesHostedWorkAgentChildIntegration
         + casesRuntimeHostWorkAgentFuture

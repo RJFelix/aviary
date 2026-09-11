@@ -1307,6 +1307,20 @@ public actor JournalBackedWorkService: WorkServiceClient {
         agentHandleCanceller = canceller
     }
 
+    /// Shutdown must consult the same private owner that receives child control commands.
+    /// A cancellation adapter without an ownership barrier is not evidence of quiescence.
+    internal func freezeAgentChildAdmissionForShutdown() async throws -> WorkAgentChildShutdownLease? {
+        guard let agentHandleCanceller else { return nil }
+        guard let coordinator = agentHandleCanceller as? WorkAgentChildCoordinator else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return try await coordinator.makeShutdownLease()
+    }
+
+    internal func sealAgentChildAdmissionForShutdown() async {
+        (agentHandleCanceller as? WorkAgentChildCoordinator)?.sealAdmissions()
+    }
+
     /// Return source-reader instrumentation without exposing cache contents or filesystem paths.
     /// A caller may use the delta between two samples to verify that a steady-state poll consumed
     /// only an append suffix rather than rereading the complete journal.
@@ -4317,6 +4331,10 @@ public actor JournalBackedWorkService: WorkServiceClient {
         binding: WorkRunBinding,
         policy: WorkLaunchExecutionPolicy
     ) -> Bool {
+        if let pilot = configuration.agentChildPilot {
+            guard let owner = agentHandleCanceller as? WorkAgentChildCoordinator,
+                  owner === pilot.coordinator else { return false }
+        }
         guard configuration.home == home,
               configuration.workRunBinding == binding,
               configuration.projectionMode == policy.projection,

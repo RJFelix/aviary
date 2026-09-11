@@ -263,3 +263,47 @@ with a live child; terminal outcome before quiescent cleanup; ambiguous started/
 append without replaying a factory; and a fresh coordinator over recorded running work. Keep the
 pilot opt-in while proving these seams. Default deadline policy and physical retention remain
 separate from the recorded-view and ownership-observation checkpoints.
+
+#### Owner observation and daemon shutdown
+
+The coordinator now exposes bounded, process-local counts for admitting, queued, starting,
+running, cancellation-requested, settling, ambiguous, and terminal-unquiesced ownership. It
+does not serialize these as durable liveness evidence. Freeze tokens close only new admission;
+existing children continue independently. Token-qualified thaw cannot release another caller's
+freeze, and terminal sealing is irreversible for that coordinator instance.
+
+Graceful daemon shutdown drains service admission, atomically freezes private child admission,
+and refuses immediately on local ownership before attempting a potentially locked canonical
+scan. An empty owner observation still requires the existing durable recovery check. Refusal
+reopens only the attempt's own freeze. Successful stop, forced stop, and failed startup seal
+child admission; they do not fabricate child cleanup or End events. Parent End is unchanged.
+The journal-backed composition obtains this barrier from its installed private child canceller;
+an adapter without the actual ownership barrier fails closed. No default pilot activation,
+public liveness wire contract, deadline policy, or retention policy is introduced here.
+
+The synchronous, lock-backed irreversible seal is shared by admission and thaw. The daemon
+retains the freeze lease and seals it before the first forced-stop suspension; a delayed thaw
+therefore cannot admit a child in the gap before an asynchronous coordinator call. Hosted pilot
+configuration must name the exact coordinator installed in the journal-backed service.
+
+Focused verification passes: 77 Phase 5 cases / 1,064 assertions and 16 daemon cases / 133
+assertions. These cover admission/start boundaries, ambiguous ownership, bounded independent
+freeze tokens, indeterminate cleanup, fresh-owner absence, refusal/reopen, graceful sealing,
+and forced-stop overtaking a suspended shutdown. The final complete traced macOS suite passes
+1,185 cases / 18,214 assertions in 515.55 seconds under process-scoped `caffeinate -i`.
+`just compile` builds Aviary and aviaryd, and the SelfTest product build passes without warnings.
+Installed app/helper remain unchanged; no new Linux runtime receipt or public pilot activation
+is claimed by this checkpoint.
+
+#### Physical retention remains separate
+
+The existing `agent_handle.reaped` transition preserves body references and readable retained
+content. It is not proof of unlinking body files. There is no production coordinator/service
+reaper; `ContextBodyStore` is shared by digest and has no reference-ownership deletion protocol.
+Do not turn metadata reaping into a shortcut around physical-cleanup or destruction requirements.
+
+The next bounded work is to define exact, explicit reap intent and body ownership evidence,
+including other references to the same digest and crash ordering. Keep the 256-identity bound
+and refuse further admission instead of silently evicting results. Execution deadline expiry
+must not imply result-retention expiry. Any automatic deletion/default deadline remains a
+separate product decision before broader activation.

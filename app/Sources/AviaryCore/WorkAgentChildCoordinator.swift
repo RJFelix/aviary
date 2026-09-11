@@ -7,23 +7,75 @@ internal protocol WorkAgentChildExecution: Sendable {
 
 extension AgentChildExecutionResource: WorkAgentChildExecution {}
 
+private final class WorkAgentAdmissionSeal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sealed = false
+
+    func seal() {
+        lock.lock()
+        sealed = true
+        lock.unlock()
+    }
+
+    var isSealed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return sealed
+    }
+}
+
 /// Host-internal owner for admission, execution lifetime, and canonical agent Handle records.
 /// This actor has no durable registry of its own: after process loss a live canonical Handle is
 /// explicitly unavailable, never reconstructed or reported as terminal.
 internal actor WorkAgentChildCoordinator {
     typealias ExecutionFactory = @Sendable (HandleRef, Date) -> any WorkAgentChildExecution
+    typealias BeforeAdmissionCommit = @Sendable () async -> Void
     typealias BeforeStartCommit = @Sendable () async -> Void
 
     static let maximumPromptBytes = 64 * 1_024
     static let maximumRegisteredWorks = 256
     static let maximumAwaitObserversPerHandle = 64
     static let maximumAwaitObserverIDBytes = 512
+    static let maximumAdmissionFreezeTokens = 64
 
     enum Failure: Error, Equatable, Sendable {
         case unregisteredWork, wrongOrigin, capacity, alreadyTerminal, notCancelable
         case commandNotQualified, bodyUnavailable, ambiguous
         case admissionUncertain(HandleRef)
+        case admissionsFrozen
         case invalidRequest(String)
+    }
+
+    /// A capability to reopen admission after one coordinator-local shutdown freeze. Tokens are
+    /// independent so stale or duplicate thaw requests cannot accidentally reopen a later freeze.
+    struct AdmissionFreezeToken: Hashable, Sendable {
+        fileprivate let rawValue: UUID
+    }
+
+    /// Bounded in-memory ownership facts for shutdown coordination. These counts describe only
+    /// this coordinator's admitted entries; they are not process liveness, durable canonical
+    /// state, or proof that a Work Host can safely terminate.
+    struct OwnerObservation: Equatable, Sendable {
+        let admissionsFrozen: Bool
+        let admissionsSealed: Bool
+        let activeFreezeTokenCount: Int
+        let admittingCount: Int
+        let queuedCount: Int
+        let startingCount: Int
+        let runningCount: Int
+        let cancelRequestedCount: Int
+        let settlingCount: Int
+        let terminalUnquiescedCount: Int
+        let ambiguousCount: Int
+        let blockingWorks: [WorkRef]
+
+        var totalOwnedEntryCount: Int {
+            admittingCount + queuedCount + startingCount + runningCount
+                + cancelRequestedCount + settlingCount + terminalUnquiescedCount
+                + ambiguousCount
+        }
+
+        var hasOwnedEntries: Bool { totalOwnedEntryCount > 0 }
     }
 
     struct Admission: Sendable, Equatable { let handle: HandleRef; let deadline: Date }
@@ -50,7 +102,7 @@ internal actor WorkAgentChildCoordinator {
         let bodyStore: ContextBodyStore
     }
     private struct Key: Hashable, Sendable { let work: WorkRef; let handle: HandleRef }
-    private enum Phase: Sendable {
+    private enum Phase: Sendable, Hashable {
         case admitting, queued, starting, running, cancelRequested, settling
         case terminalUnquiesced, ambiguous
     }
@@ -84,22 +136,86 @@ internal actor WorkAgentChildCoordinator {
     }
 
     private let limits: WorkAgentChildAdmissionQueue.Limits
+    private nonisolated let admissionSeal: WorkAgentAdmissionSeal
+    private let beforeAdmissionCommit: BeforeAdmissionCommit?
     private let beforeStartCommit: BeforeStartCommit?
     private var queue: WorkAgentChildAdmissionQueue
     private var routes: [WorkRef: Route] = [:]
     private var entries: [Key: Entry] = [:]
     private var awaitObservers: [Key: Set<String>] = [:]
+    private var admissionFreezeTokens: Set<AdmissionFreezeToken> = []
     private var lifecycleGateHeld = false
     private var lifecycleWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         limits: WorkAgentChildAdmissionQueue.Limits? = nil,
+        beforeAdmissionCommit: BeforeAdmissionCommit? = nil,
         beforeStartCommit: BeforeStartCommit? = nil
     ) throws {
         let chosen = try limits ?? WorkAgentChildAdmissionQueue.Limits()
         self.limits = chosen
+        self.admissionSeal = WorkAgentAdmissionSeal()
+        self.beforeAdmissionCommit = beforeAdmissionCommit
         self.beforeStartCommit = beforeStartCommit
         queue = WorkAgentChildAdmissionQueue(limits: chosen)
+    }
+
+    /// Freeze new admissions immediately in this actor's state. This intentionally does not
+    /// acquire the lifecycle gate or await journal work: a caller can freeze while an admission
+    /// is paused at an external boundary, and that admission will re-check the freeze after it
+    /// acquires the gate.
+    func freezeAdmissions() throws -> AdmissionFreezeToken {
+        guard !admissionSeal.isSealed else { throw Failure.admissionsFrozen }
+        guard admissionFreezeTokens.count < Self.maximumAdmissionFreezeTokens else {
+            throw Failure.capacity
+        }
+        let token = AdmissionFreezeToken(rawValue: UUID())
+        admissionFreezeTokens.insert(token)
+        return token
+    }
+
+    /// Remove exactly one freeze capability. A stale token is a no-op; other active tokens keep
+    /// admission frozen, so repeated freeze/thaw races cannot accidentally reopen the gate.
+    @discardableResult
+    func thawAdmissions(_ token: AdmissionFreezeToken) -> Bool {
+        guard !admissionSeal.isSealed else { return false }
+        return admissionFreezeTokens.remove(token) != nil
+    }
+
+    /// Permanently seal new admissions synchronously. This is deliberately nonisolated so a
+    /// shutdown caller can fence a concurrently scheduled thaw before its first await. The actor
+    /// token set remains intact for bounded observation; the sealed bit makes every thaw a no-op.
+    nonisolated func sealAdmissions() {
+        admissionSeal.seal()
+    }
+
+    /// Snapshot coordinator-local ownership before shutdown. An empty observation is not durable
+    /// quiescence and says nothing about children recorded by another coordinator or Work Host.
+    func ownerObservation() -> OwnerObservation {
+        var counts: [Phase: Int] = [:]
+        var works = Set<WorkRef>()
+        for entry in entries.values {
+            counts[entry.phase, default: 0] += 1
+            works.insert(entry.work)
+        }
+        let blockingWorks = works.sorted {
+            if $0.workHostID != $1.workHostID { return $0.workHostID < $1.workHostID }
+            return $0.workID < $1.workID
+        }
+        let sealed = admissionSeal.isSealed
+        return OwnerObservation(
+            admissionsFrozen: sealed || !admissionFreezeTokens.isEmpty,
+            admissionsSealed: sealed,
+            activeFreezeTokenCount: admissionFreezeTokens.count,
+            admittingCount: counts[.admitting, default: 0],
+            queuedCount: counts[.queued, default: 0],
+            startingCount: counts[.starting, default: 0],
+            runningCount: counts[.running, default: 0],
+            cancelRequestedCount: counts[.cancelRequested, default: 0],
+            settlingCount: counts[.settling, default: 0],
+            terminalUnquiescedCount: counts[.terminalUnquiesced, default: 0],
+            ambiguousCount: counts[.ambiguous, default: 0],
+            blockingWorks: blockingWorks)
     }
 
     func register(work: WorkRef, home: AgentHome, actor: TimelineActor) async throws {
@@ -142,6 +258,9 @@ internal actor WorkAgentChildCoordinator {
     ) async throws -> Admission {
         await acquireLifecycleGate()
         defer { releaseLifecycleGate() }
+        guard !admissionSeal.isSealed, admissionFreezeTokens.isEmpty else {
+            throw Failure.admissionsFrozen
+        }
         let work = binding.workBinding.work
         guard let route = routes[work] else { throw Failure.unregisteredWork }
         guard binding.workBinding.workHost == WorkHostRef(work.workHostID) else {
@@ -189,6 +308,7 @@ internal actor WorkAgentChildCoordinator {
             latestLifecycleEvent: nil, phase: .admitting, cancellationCause: nil,
             resource: nil, terminalOutcome: nil, executionSettlement: nil,
             executionTask: nil, deadlineTask: nil)
+        await beforeAdmissionCommit?()
         do {
             let commit = try await route.journal.append(draft(
                 type: TimelineEventType.agentHandleQueued, entry: entries[key]!,

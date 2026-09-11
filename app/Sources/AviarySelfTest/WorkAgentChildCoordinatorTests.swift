@@ -283,6 +283,11 @@ func testWorkAgentChildCoordinatorReturnsHandleForUncertainAdmission() async thr
     } catch WorkAgentChildCoordinator.Failure.admissionUncertain(let handle) {
         retainedHandle = handle
     }
+    let ownership = await coordinator.ownerObservation()
+    XCTAssertEqual(ownership.ambiguousCount, 1)
+    let shutdownLease = try await coordinator.makeShutdownLease()
+    XCTAssertEqual(shutdownLease.blockingWorks, [fixture.binding.workBinding.work])
+    await shutdownLease.reopen()
     try? await fixture.bundle.closeChecked()
     let canonical = try await coordinator.read(
         work: fixture.binding.workBinding.work, handle: retainedHandle)
@@ -830,6 +835,174 @@ func testWorkAgentChildCoordinatorRetainsIndeterminateCleanupAndExecutionSlot() 
     XCTAssertEqual(coldCancel, .alreadyTerminal(.indeterminate))
 }
 
+func testWorkAgentChildCoordinatorFreezesAdmissionBeforeStartingAwait() async throws {
+    let home = scratchHome()
+    let startGate = CoordinatorStartCommitGate()
+    let coordinator = try WorkAgentChildCoordinator(beforeStartCommit: {
+        await startGate.pause()
+    })
+    let fixture = try await coordinatorFixture(
+        coordinator: coordinator, home: home, suffix: "freeze-starting")
+    let manual = CoordinatorManualExecution()
+    let admissionTask = Task {
+        try await coordinator.admit(
+            origin: fixture.binding, prompt: "freeze before start commit",
+            label: "freeze-starting", deadline: Date().addingTimeInterval(60),
+            makeExecution: { _, _ in manual })
+    }
+    for _ in 0..<600 {
+        if await startGate.wasEntered { break }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTAssertTrue(await startGate.wasEntered)
+    let token = try await coordinator.freezeAdmissions()
+    let observation = await coordinator.ownerObservation()
+    XCTAssertTrue(observation.admissionsFrozen)
+    XCTAssertEqual(observation.startingCount, 1)
+    XCTAssertEqual(observation.blockingWorks, [fixture.binding.workBinding.work])
+
+    let refusedTask = Task {
+        do {
+            _ = try await coordinator.admit(
+                origin: fixture.binding, prompt: "must refuse while frozen",
+                label: "frozen", deadline: Date().addingTimeInterval(60),
+                makeExecution: { _, _ in CoordinatorManualExecution() })
+            return false
+        } catch WorkAgentChildCoordinator.Failure.admissionsFrozen {
+            return true
+        } catch {
+            return false
+        }
+    }
+    await startGate.release()
+    let admission = try await admissionTask.value
+    XCTAssertTrue(await refusedTask.value)
+    XCTAssertTrue(await coordinator.thawAdmissions(token))
+    await manual.release()
+    _ = try await coordinatorWaitForRecord(
+        coordinator, work: fixture.binding.workBinding.work, handle: admission.handle,
+        matching: { $0.state == .terminal })
+    _ = try await fixture.bundle.finishRun(outcome: .completed)
+    try await fixture.bundle.closeChecked()
+}
+
+func testWorkAgentChildCoordinatorFreezesAdmissionBeforeFirstJournalAppend() async throws {
+    let home = scratchHome()
+    let admissionGate = CoordinatorStartCommitGate()
+    let coordinator = try WorkAgentChildCoordinator(beforeAdmissionCommit: {
+        await admissionGate.pause()
+    })
+    let fixture = try await coordinatorFixture(
+        coordinator: coordinator, home: home, suffix: "freeze-admitting")
+    let manual = CoordinatorManualExecution()
+    let admissionTask = Task {
+        try await coordinator.admit(
+            origin: fixture.binding, prompt: "freeze before first journal append",
+            label: "freeze-admitting", deadline: Date().addingTimeInterval(60),
+            makeExecution: { _, _ in manual })
+    }
+    for _ in 0..<600 {
+        if await admissionGate.wasEntered { break }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTAssertTrue(await admissionGate.wasEntered)
+    let token = try await coordinator.freezeAdmissions()
+    let observation = await coordinator.ownerObservation()
+    XCTAssertTrue(observation.admissionsFrozen)
+    XCTAssertEqual(observation.admittingCount, 1)
+    XCTAssertEqual(observation.queuedCount, 0)
+    XCTAssertEqual(observation.blockingWorks, [fixture.binding.workBinding.work])
+
+    let refusedTask = Task {
+        do {
+            _ = try await coordinator.admit(
+                origin: fixture.binding, prompt: "must refuse while frozen",
+                label: "frozen-admitting", deadline: Date().addingTimeInterval(60),
+                makeExecution: { _, _ in CoordinatorManualExecution() })
+            return false
+        } catch WorkAgentChildCoordinator.Failure.admissionsFrozen {
+            return true
+        } catch {
+            return false
+        }
+    }
+    await admissionGate.release()
+    let admission = try await admissionTask.value
+    XCTAssertTrue(await refusedTask.value)
+    XCTAssertTrue(await coordinator.thawAdmissions(token))
+    await manual.release()
+    _ = try await coordinatorWaitForRecord(
+        coordinator, work: fixture.binding.workBinding.work, handle: admission.handle,
+        matching: { $0.state == .terminal })
+    _ = try await fixture.bundle.finishRun(outcome: .completed)
+    try await fixture.bundle.closeChecked()
+}
+
+func testWorkAgentChildCoordinatorFreezeTokensDoNotReopenOnStaleThaw() async throws {
+    let home = scratchHome()
+    let coordinator = try WorkAgentChildCoordinator()
+    let fixture = try await coordinatorFixture(
+        coordinator: coordinator, home: home, suffix: "freeze-tokens")
+    let manual = CoordinatorManualExecution()
+    let first = try await coordinator.admit(
+        origin: fixture.binding, prompt: "running owner",
+        label: "running-owner", deadline: Date().addingTimeInterval(60),
+        makeExecution: { _, _ in manual })
+    let running = try await coordinatorWaitForRecord(
+        coordinator, work: fixture.binding.workBinding.work, handle: first.handle,
+        matching: { $0.state == .running })
+    XCTAssertEqual(running.record.state, .running)
+
+    // A new process owner cannot borrow the original Run's in-memory writer route.
+    _ = try await fixture.bundle.finishRun(outcome: .completed)
+    try await fixture.bundle.closeChecked()
+    let cold = try WorkAgentChildCoordinator()
+    try await cold.register(
+        work: fixture.binding.workBinding.work, home: home,
+        actor: TimelineActor(actorID: "cold-coordinator", kind: "work-host"))
+    let coldObservation = await cold.ownerObservation()
+    XCTAssertFalse(coldObservation.hasOwnedEntries)
+    XCTAssertEqual(coldObservation.blockingWorks, [])
+    XCTAssertEqual(
+        try await cold.inspect(work: fixture.binding.workBinding.work, handle: first.handle).state,
+        .running)
+    let coldCursor = try XCTUnwrap(await fixture.bundle.status.durablePrefix.workCursor)
+    XCTAssertEqual(
+        try await cold.cancel(
+            work: fixture.binding.workBinding.work, handle: first.handle,
+            command: CommandRef(
+                commandID: "cold-coordinator-cancel", client: ClientRef("cold-client"),
+                sessionAttachment: fixture.binding.workBinding.sessionAttachment,
+                causalCursor: coldCursor)),
+        .unavailable)
+
+    let firstToken = try await coordinator.freezeAdmissions()
+    let secondToken = try await coordinator.freezeAdmissions()
+    XCTAssertTrue(await coordinator.thawAdmissions(firstToken))
+    var observation = await coordinator.ownerObservation()
+    XCTAssertTrue(observation.admissionsFrozen)
+    XCTAssertEqual(observation.activeFreezeTokenCount, 1)
+    XCTAssertEqual(observation.runningCount, 1)
+
+    XCTAssertFalse(await coordinator.thawAdmissions(firstToken))
+    XCTAssertTrue(await coordinator.thawAdmissions(secondToken))
+    observation = await coordinator.ownerObservation()
+    XCTAssertFalse(observation.admissionsFrozen)
+    XCTAssertEqual(observation.activeFreezeTokenCount, 0)
+    XCTAssertEqual(observation.runningCount, 1,
+                   "thaw reopens admission without canceling already admitted work")
+
+    coordinator.sealAdmissions()
+    observation = await coordinator.ownerObservation()
+    XCTAssertTrue(observation.admissionsFrozen)
+    XCTAssertTrue(observation.admissionsSealed)
+    XCTAssertFalse(await coordinator.thawAdmissions(secondToken))
+    await manual.release()
+    _ = try await coordinatorWaitForRecord(
+        coordinator, work: fixture.binding.workBinding.work, handle: first.handle,
+        matching: { $0.state == .terminal })
+}
+
 let casesWorkAgentChildCoordinator: [Case] = [
     ("phase5 child coordinator: bounded admission validation", {
         try await testWorkAgentChildCoordinatorRejectsExpiredAndOversizedAdmission()
@@ -866,5 +1039,14 @@ let casesWorkAgentChildCoordinator: [Case] = [
     }),
     ("phase5 child coordinator: indeterminate cleanup retains execution capacity", {
         try await testWorkAgentChildCoordinatorRetainsIndeterminateCleanupAndExecutionSlot()
+    }),
+    ("phase5 child coordinator: freeze before first journal append", {
+        try await testWorkAgentChildCoordinatorFreezesAdmissionBeforeFirstJournalAppend()
+    }),
+    ("phase5 child coordinator: freeze before started commit", {
+        try await testWorkAgentChildCoordinatorFreezesAdmissionBeforeStartingAwait()
+    }),
+    ("phase5 child coordinator: stale thaw and cold ownership", {
+        try await testWorkAgentChildCoordinatorFreezeTokensDoNotReopenOnStaleThaw()
     }),
 ]
