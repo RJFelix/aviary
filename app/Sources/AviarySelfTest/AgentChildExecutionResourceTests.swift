@@ -93,7 +93,8 @@ private func childExecutionConfiguration(
     suffix: String,
     provider: any ChatProvider,
     makeHost: @escaping @Sendable () -> RuntimeHost,
-    deadline: Date = Date().addingTimeInterval(30)
+    deadline: Date? = Date().addingTimeInterval(30),
+    maxIterations: Int? = 3
 ) -> AgentChildExecutionConfiguration {
     AgentChildExecutionConfiguration(
         origin: childExecutionBinding(suffix),
@@ -104,8 +105,55 @@ private func childExecutionConfiguration(
         model: fakeModel(),
         provider: provider,
         systemPrompt: "You are a focused child agent.",
-        maxIterations: 3,
+        maxIterations: maxIterations,
         makeRuntimeHost: makeHost)
+}
+
+private func repeatedChildToolScript(count: Int) -> [[String: Any]] {
+    (0..<count).map { _ in
+        ["tool": ["name": "python", "arguments": ["code": "1"]]] as [String: Any]
+    }
+}
+
+func test_agentChildExecutionAllowsMoreThanTwentyCallsWithoutAnImplicitLimit() async throws {
+    guard let makeHost = childExecutionHostFactory() else { return }
+    var script = repeatedChildToolScript(count: 21)
+    script.append(["text": "completed after twenty-one tool turns"])
+    guard let server = try FakeProviderServer(script: script) else { return }
+    defer { server.stop() }
+
+    let resource = AgentChildExecutionResource(configuration: childExecutionConfiguration(
+        home: scratchHome(), suffix: "unbounded-iterations",
+        provider: OpenAICompletionsProvider(
+            id: "fake", baseURL: server.baseURL, apiKey: nil),
+        makeHost: makeHost, deadline: nil, maxIterations: nil),
+        prompt: "keep working until the scripted answer")
+    let result = await resource.execute()
+
+    XCTAssertEqual(result.state, .succeeded)
+    XCTAssertEqual(result.answer, "completed after twenty-one tool turns")
+    XCTAssertTrue(result.cleanup.isComplete)
+}
+
+func test_agentChildExecutionExplicitIterationLimitIsFailure() async throws {
+    guard let makeHost = childExecutionHostFactory() else { return }
+    let script = repeatedChildToolScript(count: 21)
+        + [["text": "unreachable final answer"] as [String: Any]]
+    guard let server = try FakeProviderServer(script: script) else { return }
+    defer { server.stop() }
+
+    let resource = AgentChildExecutionResource(configuration: childExecutionConfiguration(
+        home: scratchHome(), suffix: "bounded-iterations",
+        provider: OpenAICompletionsProvider(
+            id: "fake", baseURL: server.baseURL, apiKey: nil),
+        makeHost: makeHost, deadline: nil, maxIterations: 20),
+        prompt: "stop at the explicit iteration ceiling")
+    let result = await resource.execute()
+
+    XCTAssertEqual(result.state, .failed)
+    XCTAssertTrue(result.answer?.isEmpty != false, "the final scripted answer must remain unreachable")
+    XCTAssertTrue(result.detail?.contains("Stopped after 20 model calls") == true)
+    XCTAssertTrue(result.cleanup.isComplete)
 }
 
 func test_agentChildExecutionOwnsDistinctRuntimeAndTranscript() async throws {
@@ -282,5 +330,11 @@ let casesAgentChildExecutionResource: [Case] = [
     }),
     ("phase5 child resource rejects expired and invalid configuration", {
         try await test_agentChildExecutionRejectsExpiredAndInvalidConfigurationBeforeHostStart()
+    }),
+    ("phase5 child resource: nil limits allow more than twenty model calls", {
+        try await test_agentChildExecutionAllowsMoreThanTwentyCallsWithoutAnImplicitLimit()
+    }),
+    ("phase5 child resource: explicit iteration limit is a failure", {
+        try await test_agentChildExecutionExplicitIterationLimitIsFailure()
     }),
 ]

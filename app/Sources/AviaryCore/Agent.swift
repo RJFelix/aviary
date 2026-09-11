@@ -43,9 +43,8 @@ public actor Agent {
         /// ``systemPrompt`` and remains nil for legacy/native-resume configurations whose
         /// durable prefix only retained an opaque aggregate message.
         public var systemPromptAssembly: SystemPromptAssembly?
-        /// A ceiling on model round trips per prompt. Not a budget — a stop, so a tool-calling
-        /// loop that never converges cannot spend indefinitely while nobody is watching.
-        public var maxIterations: Int
+        /// Optional ceiling on model round trips per prompt. Nil does not impose a turn budget.
+        public var maxIterations: Int?
         public var maxTokens: Int?
         public var reasoningEffort: String?
         /// Compact when the conversation passes this share of the model's context window.
@@ -84,7 +83,7 @@ public actor Agent {
         public init(
             model: ModelSpec, cwd: String, systemPrompt: String,
             systemPromptAssembly: SystemPromptAssembly? = nil,
-            maxIterations: Int = 40, maxTokens: Int? = nil, reasoningEffort: String? = nil,
+            maxIterations: Int? = 40, maxTokens: Int? = nil, reasoningEffort: String? = nil,
             compactAtContextShare: Double = 0.7, maxDepth: Int = 3, depth: Int = 0,
             goal: Goal? = nil, resumedHistory: [ChatMessage] = [],
             expectedResumeTools: [ChatTool]? = nil,
@@ -309,7 +308,7 @@ public actor Agent {
 
     public enum SpawnStartResult: Hashable, Sendable {
         case running(childID: String, name: String)
-        case workOwned(handleID: String, name: String, deadline: Date, admissionUncertain: Bool)
+        case workOwned(handleID: String, name: String, deadline: Date?, admissionUncertain: Bool)
         case refused(name: String, reason: String)
     }
 
@@ -765,7 +764,7 @@ public actor Agent {
                     "id": .string(handleID), "name": .string(childName),
                     "ownership": .string("work"),
                     "state": .string(uncertain ? "admission_uncertain" : "admitted"),
-                    "deadline": .number(deadline.timeIntervalSince1970),
+                    "deadline": deadline.map { .number($0.timeIntervalSince1970) } ?? .null,
                 ]
                 if uncertain || !recorded {
                     response["warning"] = .string(
@@ -1567,14 +1566,14 @@ public actor Agent {
 
         return await withNativeTurn {
             var iterations = 0
-            while iterations < config.maxIterations {
+            while config.maxIterations.map({ iterations < $0 }) ?? true {
             if cancelled || Task.isCancelled {
                 _ = await appendJournalNote("Stopped at your request.")
                 await recordOutcome(.cancelled, detail: "Stopped at your request.")
                 emit(.finished(reason: "cancelled"))
                 return .cancelled
             }
-            iterations += 1
+            if iterations < Int.max { iterations += 1 }
 
             // Refreshed per model call, so a run that opens beside this one is describable by
             // the next request. Cheap: the app already holds the list.
@@ -1776,11 +1775,12 @@ public actor Agent {
 
         // Hitting the ceiling is a real outcome, not a silent stop: the transcript says so,
         // because a run that quietly stopped looks identical to one that finished.
-            let note = "Stopped after \(config.maxIterations) model calls without finishing. "
+            let note = "Stopped after \(iterations) model calls without finishing. "
                 + "Raise maxIterations, or narrow the task."
             _ = await appendJournalNote(note)
+            await recordOutcome(.failed, detail: note)
             emit(.finished(reason: "iteration limit"))
-            return .completed
+            return .failed(note)
         }
     }
 

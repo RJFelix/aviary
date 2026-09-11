@@ -412,6 +412,31 @@ func testWorkAgentChildCoordinatorCompletesAfterParentEndAndReadsCold() async th
         stableBytes)
 }
 
+func testWorkAgentChildCoordinatorNoDeadlineSurvivesParentEnd() async throws {
+    let home = scratchHome()
+    let coordinator = try WorkAgentChildCoordinator()
+    let fixture = try await coordinatorFixture(
+        coordinator: coordinator, home: home, suffix: "no-deadline-parent-end")
+    let manual = CoordinatorManualExecution()
+    let admission = try await coordinator.admit(
+        origin: fixture.binding, prompt: "continue without a deadline",
+        label: "No deadline child", deadline: nil,
+        makeExecution: { _, _ in manual })
+    _ = try await coordinatorWaitForRecord(
+        coordinator, work: fixture.binding.workBinding.work, handle: admission.handle,
+        matching: { $0.state == .running })
+
+    _ = try await fixture.bundle.finishRun(outcome: .completed)
+    try await fixture.bundle.closeChecked()
+    await manual.release()
+
+    let terminal = try await coordinatorWaitForRecord(
+        coordinator, work: fixture.binding.workBinding.work, handle: admission.handle,
+        matching: { $0.state == .terminal })
+    XCTAssertEqual(terminal.record.terminalOutcome, .succeeded)
+    XCTAssertNil(admission.deadline)
+}
+
 func testWorkAgentChildCoordinatorExpiresAcrossStartedCommitBoundary() async throws {
     let home = scratchHome()
     let startGate = CoordinatorStartCommitGate()
@@ -1018,6 +1043,9 @@ let casesWorkAgentChildCoordinator: [Case] = [
     }),
     ("phase5 child coordinator: post-End completion and cold retained reads", {
         try await testWorkAgentChildCoordinatorCompletesAfterParentEndAndReadsCold()
+    }),
+    ("phase5 child coordinator: no-deadline child survives parent End", {
+        try await testWorkAgentChildCoordinatorNoDeadlineSurvivesParentEnd()
     }),
     ("phase5 child coordinator: queued and running deadlines", {
         try await testWorkAgentChildCoordinatorExpiresQueuedAndRunningChildren()

@@ -8,7 +8,7 @@ import Foundation
 public struct AgentChildExecutionConfiguration: Sendable {
     public let origin: WorkRunBinding
     public let childID: String
-    public let deadline: Date
+    public let deadline: Date?
     public let home: AgentHome
     public let cwd: String
     public let model: ModelSpec
@@ -16,7 +16,7 @@ public struct AgentChildExecutionConfiguration: Sendable {
     public let systemPrompt: String
     public let systemPromptAssembly: SystemPromptAssembly?
     public let reasoningEffort: String?
-    public let maxIterations: Int
+    public let maxIterations: Int?
     public let memory: MemoryStore?
     public let recordPayloads: Bool
     public let makeRuntimeHost: @Sendable () -> RuntimeHost
@@ -24,7 +24,7 @@ public struct AgentChildExecutionConfiguration: Sendable {
     public init(
         origin: WorkRunBinding,
         childID: String,
-        deadline: Date,
+        deadline: Date? = nil,
         home: AgentHome,
         cwd: String,
         model: ModelSpec,
@@ -32,7 +32,7 @@ public struct AgentChildExecutionConfiguration: Sendable {
         systemPrompt: String,
         systemPromptAssembly: SystemPromptAssembly? = nil,
         reasoningEffort: String? = nil,
-        maxIterations: Int = 20,
+        maxIterations: Int? = nil,
         memory: MemoryStore? = nil,
         recordPayloads: Bool = false,
         makeRuntimeHost: @escaping @Sendable () -> RuntimeHost
@@ -370,18 +370,22 @@ public actor AgentChildExecutionResource {
         guard prompt.utf8.count <= Self.maxPromptBytes else {
             throw AgentChildExecutionError.invalidConfiguration("child prompt is too large")
         }
-        guard (1...1_000).contains(configuration.maxIterations) else {
-            throw AgentChildExecutionError.invalidConfiguration(
-                "maxIterations must be between 1 and 1000")
+        if let maxIterations = configuration.maxIterations {
+            guard (1...1_000).contains(maxIterations) else {
+                throw AgentChildExecutionError.invalidConfiguration(
+                    "maxIterations must be between 1 and 1000")
+            }
         }
-        guard configuration.deadline.timeIntervalSince1970.isFinite else {
-            throw AgentChildExecutionError.invalidConfiguration("child deadline is not finite")
+        if let deadline = configuration.deadline {
+            guard deadline.timeIntervalSince1970.isFinite else {
+                throw AgentChildExecutionError.invalidConfiguration("child deadline is not finite")
+            }
         }
     }
 
     private func checkCancellationOrDeadline() throws {
         if cancellationRequested { throw AgentChildExecutionCancellation() }
-        if Date() >= configuration.deadline {
+        if let deadline = configuration.deadline, Date() >= deadline {
             throw AgentChildExecutionError.deadlineExpired
         }
     }

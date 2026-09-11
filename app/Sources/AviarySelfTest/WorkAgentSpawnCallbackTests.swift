@@ -6,6 +6,9 @@ let casesWorkAgentSpawnCallback: [Case] = [
     ("phase5 Work agent spawn: callback replay retains one Handle", {
         try await testWorkAgentSpawnCallbackReplayRetainsHandleAfterJournalFailure()
     }),
+    ("phase5 Work agent spawn: callback replay retains explicit no deadline", {
+        try await testWorkAgentSpawnCallbackReplayRetainsHandleAfterJournalFailure(deadline: nil)
+    }),
 ]
 
 private struct WorkSpawnUnusedProvider: ChatProvider {
@@ -19,14 +22,14 @@ private struct WorkSpawnUnusedProvider: ChatProvider {
 private actor WorkSpawnReplayDelegate: WorkAgentSpawnDelegate {
     private let bundle: RunJournalBundle
     private let handleID: String
-    private let deadline: Date
+    private let deadline: Date?
     private var admissionCountStorage = 0
     private var admitted = false
     private var admittedWaiters: [CheckedContinuation<Void, Never>] = []
     private var released = false
     private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
-    init(bundle: RunJournalBundle, handleID: String, deadline: Date) {
+    init(bundle: RunJournalBundle, handleID: String, deadline: Date?) {
         self.bundle = bundle
         self.handleID = handleID
         self.deadline = deadline
@@ -102,7 +105,9 @@ private func workSpawnCallbackEvents(
     return read.records.map(\.event)
 }
 
-private func testWorkAgentSpawnCallbackReplayRetainsHandleAfterJournalFailure() async throws {
+private func testWorkAgentSpawnCallbackReplayRetainsHandleAfterJournalFailure(
+    deadline: Date? = Date().addingTimeInterval(60)
+) async throws {
     let home = scratchHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
     let hostID = try home.requirePersistedWorkHostID()
@@ -125,7 +130,6 @@ private func testWorkAgentSpawnCallbackReplayRetainsHandleAfterJournalFailure() 
             maxIterations: 1, maxDepth: 1),
         nativeJournal: bundle)
     let handleID = "agent-child-retained-after-replay"
-    let deadline = Date().addingTimeInterval(60)
     let delegate = WorkSpawnReplayDelegate(
         bundle: bundle, handleID: handleID, deadline: deadline)
     await agent.setSpawnDelegate(delegate)
@@ -151,6 +155,7 @@ private func testWorkAgentSpawnCallbackReplayRetainsHandleAfterJournalFailure() 
     XCTAssertEqual(firstReply, concurrentReply)
     XCTAssertEqual(firstReply["id"]?.stringValue, handleID)
     XCTAssertEqual(firstReply["ownership"]?.stringValue, "work")
+    XCTAssertEqual(firstReply["deadline"], deadline.map { .number($0.timeIntervalSince1970) } ?? .null)
     XCTAssertNotNil(firstReply["warning"], "failed action terminalization must remain visible")
     XCTAssertEqual(await delegate.admissionCount, 1)
     if case .failed = (await bundle.status).health {} else {

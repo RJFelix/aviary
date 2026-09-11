@@ -325,7 +325,7 @@ public struct BoundedWorkAgentHandleIndexRecord: Codable, Hashable, Sendable {
     public let handle: HandleRef
     public let origin: WorkAgentHandleOrigin
     public let label: String
-    public let deadline: Date
+    public let deadline: Date?
     public let requestBody: TimelineBodyReference
     public let state: WorkAgentHandleState
     public let cancellationEvidence: WorkAgentHandleCancellationEvidence?
@@ -719,7 +719,7 @@ public enum BoundedChildState: String, Codable, Hashable, Sendable {
 }
 
 public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
-    public static let schemaVersion = 5
+    public static let schemaVersion = 6
     public static let mediaType = "application/x-aviary-bounded-work-reducer-head"
 
     public let schemaVersion: Int
@@ -2569,6 +2569,13 @@ public enum BoundedTimelineReducerProjection {
                     == (handle.startedEvent ?? handle.queuedEvent) else {
                 throw BoundedTimelineReducerProjectionError.invalidIdentity
             }
+            if cancellation.cause == .deadline {
+                guard let deadline = handle.deadline,
+                      deadline.timeIntervalSince1970.isFinite,
+                      cancellation.event.hostRecordedAt >= deadline else {
+                    throw BoundedTimelineReducerProjectionError.invalidIdentity
+                }
+            }
             if cancellation.cause == .client {
                 guard let command = cancellation.command,
                       let client = command.client,
@@ -2603,6 +2610,13 @@ public enum BoundedTimelineReducerProjection {
                   terminal.outcome != .succeeded || terminal.resultBody != nil else {
                 throw BoundedTimelineReducerProjectionError.invalidIdentity
             }
+            if terminal.outcome == .expired {
+                guard let deadline = handle.deadline,
+                      deadline.timeIntervalSince1970.isFinite,
+                      terminal.event.hostRecordedAt >= deadline else {
+                    throw BoundedTimelineReducerProjectionError.invalidIdentity
+                }
+            }
             if let cancellation = handle.cancellationEvidence {
                 guard cancellation.event.sequence < terminal.event.sequence else {
                     throw BoundedTimelineReducerProjectionError.invalidCursor
@@ -2621,7 +2635,8 @@ public enum BoundedTimelineReducerProjection {
                 throw BoundedTimelineReducerProjectionError.invalidIdentity
             }
             if handle.cancellationEvidence != nil,
-               ![.canceled, .expired, .indeterminate].contains(terminal.outcome) {
+               !cancellationAllowsTerminalOutcome(
+                   handle.cancellationCause, outcome: terminal.outcome) {
                 throw BoundedTimelineReducerProjectionError.invalidIdentity
             }
             if let cleanupEvidence = terminal.cleanup.evidence {
@@ -2660,6 +2675,20 @@ public enum BoundedTimelineReducerProjection {
                   handle.cleanup?.state != .indeterminate else {
                 throw BoundedTimelineReducerProjectionError.invalidIdentity
             }
+        }
+    }
+
+    private static func cancellationAllowsTerminalOutcome(
+        _ cause: WorkAgentHandleCancellationCause?,
+        outcome: WorkAgentHandleTerminalOutcome
+    ) -> Bool {
+        switch cause {
+        case .deadline:
+            return [.expired, .indeterminate].contains(outcome)
+        case .client, .workDestruction, .hostShutdown:
+            return [.canceled, .indeterminate].contains(outcome)
+        case nil:
+            return true
         }
     }
 
@@ -2746,6 +2775,7 @@ public enum BoundedTimelineReducerProjection {
             try validateIdentifierValue(handle.origin.run.runID, limits: limits)
             guard handle.origin.work == head.work,
                   handle.origin.workHost == head.workHost,
+                  handle.deadline.map({ $0.timeIntervalSince1970.isFinite }) ?? true,
                   handle.label == handle.label.trimmingCharacters(in: .whitespacesAndNewlines),
                   !handle.label.isEmpty,
                   handle.label.utf8.count <= WorkAgentHandleSnapshot.maximumLabelBytes,

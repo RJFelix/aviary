@@ -712,7 +712,9 @@ internal enum WorkReducerTransition {
                   let payload: WorkAgentHandleQueuedPayload = decodeExactTimelineValue(event.payload),
                   validAgentHandleOrigin(payload.origin, event: event, state: state),
                   validAgentHandleLabel(payload.label),
-                  payload.deadline > event.hostRecordedAt,
+                  payload.deadline.map({
+                      $0.timeIntervalSince1970.isFinite && $0 > event.hostRecordedAt
+                  }) ?? true,
                   validAgentHandleBody(payload.requestBody, journal: event.journal),
                   event.command == nil, event.client == nil,
                   event.causedByEventID == nil else {
@@ -728,7 +730,9 @@ internal enum WorkReducerTransition {
         case TimelineEventType.agentHandleStarted:
             guard let existing = validAgentHandleTransition(event, state: state),
                   existing.state == .queued,
-                  event.hostRecordedAt < existing.deadline,
+                  existing.deadline.map({
+                      $0.timeIntervalSince1970.isFinite && event.hostRecordedAt < $0
+                  }) ?? true,
                   event.payload == .object([:]),
                   event.command == nil, event.client == nil else {
                 quarantine(event, state: &state,
@@ -745,7 +749,8 @@ internal enum WorkReducerTransition {
             guard let existing = validAgentHandleTransition(event, state: state),
                   existing.state == .queued || existing.state == .running,
                   let payload: WorkAgentHandleCancelRequestedPayload = decodeExactTimelineValue(event.payload),
-                  validAgentHandleCancellationEnvelope(event, cause: payload.cause, state: state) else {
+                  validAgentHandleCancellationEnvelope(
+                      event, cause: payload.cause, prior: existing, state: state) else {
                 quarantine(event, state: &state,
                            reason: "agent Handle cancellation is malformed, stale, or already terminal")
                 return
@@ -1356,6 +1361,9 @@ internal enum WorkReducerTransition {
         _ handle: WorkAgentHandleSnapshot, state: State
     ) -> Bool {
         guard let journal = state.scalar.journal else { return false }
+        guard handle.deadline.map({ $0.timeIntervalSince1970.isFinite }) ?? true else {
+            return false
+        }
         func validEvent(_ proof: WorkAgentHandleEventEvidence) -> Bool {
             guard proof.event.journal == journal,
                   validIdentity(proof.event.eventID), proof.sequence > 0,
@@ -1401,6 +1409,10 @@ internal enum WorkReducerTransition {
                       cursor.journal == journal,
                       cursor.eventID == cancellation.event.previousEventID,
                       cursor.sequence == cancellation.event.sequence - 1 else { return false }
+            } else if cancellation.cause == .deadline {
+                guard cancellation.command == nil, cancellation.event.client == nil,
+                      let deadline = handle.deadline,
+                      cancellation.event.hostRecordedAt >= deadline else { return false }
             } else if cancellation.command != nil || cancellation.event.client != nil {
                 return false
             }
@@ -1413,6 +1425,10 @@ internal enum WorkReducerTransition {
                   terminal.resultBody.map({ validAgentHandleBody($0, journal: journal) }) ?? true
             else { return false }
             guard terminal.event.client == nil else { return false }
+            if terminal.outcome == .expired {
+                guard let deadline = handle.deadline,
+                      terminal.event.hostRecordedAt >= deadline else { return false }
+            }
             if let cleanupEvidence = terminal.cleanup.evidence {
                 guard cleanupEvidence.journal == journal,
                       state.eventSequence(for: cleanupEvidence.eventID).map({
@@ -1426,7 +1442,8 @@ internal enum WorkReducerTransition {
                 guard terminal.cleanup.state == .indeterminate else { return false }
             } else if terminal.cleanup.state != .quiesced { return false }
             if handle.cancellationEvidence != nil,
-               ![.canceled, .expired, .indeterminate].contains(terminal.outcome) { return false }
+               !cancellationAllowsTerminalOutcome(
+                   handle.cancellationCause, outcome: terminal.outcome) { return false }
         }
         switch handle.state {
         case .queued:
@@ -1461,9 +1478,19 @@ internal enum WorkReducerTransition {
     }
 
     private static func validAgentHandleCancellationEnvelope<State: WorkTransitionState>(
-        _ event: TimelineEvent, cause: WorkAgentHandleCancellationCause, state: State
+        _ event: TimelineEvent, cause: WorkAgentHandleCancellationCause,
+        prior: WorkAgentHandleSnapshot, state: State
     ) -> Bool {
-        if cause != .client { return event.command == nil && event.client == nil }
+        if cause != .client {
+            guard event.command == nil, event.client == nil else { return false }
+            if cause == .deadline {
+                guard let deadline = prior.deadline,
+                      deadline.timeIntervalSince1970.isFinite,
+                      event.hostRecordedAt.timeIntervalSince1970.isFinite,
+                      event.hostRecordedAt >= deadline else { return false }
+            }
+            return true
+        }
         guard let command = event.command, validIdentity(command.commandID),
               let client = command.client, event.client == client, validIdentity(client.clientID),
               let callerAttachment = command.sessionAttachment,
@@ -1483,7 +1510,14 @@ internal enum WorkReducerTransition {
             return false
         }
         if payload.outcome == .succeeded && payload.resultBody == nil { return false }
-        if payload.outcome == .expired && event.hostRecordedAt < prior.deadline { return false }
+        if payload.outcome == .expired {
+            guard let deadline = prior.deadline,
+                  deadline.timeIntervalSince1970.isFinite,
+                  event.hostRecordedAt.timeIntervalSince1970.isFinite,
+                  event.hostRecordedAt >= deadline else {
+                return false
+            }
+        }
         if let evidence = payload.cleanup.evidence {
             guard evidence.journal == event.journal,
                   let sequence = state.eventSequence(for: evidence.eventID),
@@ -1498,8 +1532,23 @@ internal enum WorkReducerTransition {
             guard payload.cleanup.state == .quiesced else { return false }
         }
         if prior.state == .cancelRequested,
-           ![.canceled, .expired, .indeterminate].contains(payload.outcome) { return false }
+           !cancellationAllowsTerminalOutcome(
+               prior.cancellationCause, outcome: payload.outcome) { return false }
         return true
+    }
+
+    private static func cancellationAllowsTerminalOutcome(
+        _ cause: WorkAgentHandleCancellationCause?,
+        outcome: WorkAgentHandleTerminalOutcome
+    ) -> Bool {
+        switch cause {
+        case .deadline:
+            return [.expired, .indeterminate].contains(outcome)
+        case .client, .workDestruction, .hostShutdown:
+            return [.canceled, .indeterminate].contains(outcome)
+        case nil:
+            return true
+        }
     }
 
     private static func hasOutstandingRunWork<State: WorkTransitionState>(_ state: State) -> Bool {

@@ -28,7 +28,7 @@ private final class WorkAgentAdmissionSeal: @unchecked Sendable {
 /// This actor has no durable registry of its own: after process loss a live canonical Handle is
 /// explicitly unavailable, never reconstructed or reported as terminal.
 internal actor WorkAgentChildCoordinator {
-    typealias ExecutionFactory = @Sendable (HandleRef, Date) -> any WorkAgentChildExecution
+    typealias ExecutionFactory = @Sendable (HandleRef, Date?) -> any WorkAgentChildExecution
     typealias BeforeAdmissionCommit = @Sendable () async -> Void
     typealias BeforeStartCommit = @Sendable () async -> Void
 
@@ -78,7 +78,7 @@ internal actor WorkAgentChildCoordinator {
         var hasOwnedEntries: Bool { totalOwnedEntryCount > 0 }
     }
 
-    struct Admission: Sendable, Equatable { let handle: HandleRef; let deadline: Date }
+    struct Admission: Sendable, Equatable { let handle: HandleRef; let deadline: Date? }
     enum BodyAvailability: Sendable, Equatable {
         case available(Data)
         case absent
@@ -121,7 +121,7 @@ internal actor WorkAgentChildCoordinator {
         let origin: WorkAgentHandleOrigin
         let handle: HandleRef
         let label: String
-        let deadline: Date
+        let deadline: Date?
         let requestBody: TimelineBodyReference
         let reservation: WorkAgentChildAdmissionQueue.Reservation
         var factory: ExecutionFactory?
@@ -252,7 +252,7 @@ internal actor WorkAgentChildCoordinator {
         origin binding: WorkRunBinding,
         prompt: String,
         label: String,
-        deadline: Date,
+        deadline: Date? = nil,
         makeExecution: @escaping ExecutionFactory,
         now: Date = Date()
     ) async throws -> Admission {
@@ -266,9 +266,11 @@ internal actor WorkAgentChildCoordinator {
         guard binding.workBinding.workHost == WorkHostRef(work.workHostID) else {
             throw Failure.wrongOrigin
         }
-        guard now.timeIntervalSince1970.isFinite,
-              deadline.timeIntervalSince1970.isFinite, deadline > now else {
-            throw Failure.invalidRequest("deadline must be finite and in the future")
+        if let deadline {
+            guard now.timeIntervalSince1970.isFinite,
+                  deadline.timeIntervalSince1970.isFinite, deadline > now else {
+                throw Failure.invalidRequest("deadline must be finite and in the future")
+            }
         }
         guard !label.isEmpty,
               label == label.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -751,7 +753,7 @@ internal actor WorkAgentChildCoordinator {
             outcome = .indeterminate
         } else if let cause = entry.cancellationCause {
             outcome = cause == .deadline ? .expired : .canceled
-        } else if settlement.settledAt >= entry.deadline {
+        } else if let deadline = entry.deadline, settlement.settledAt >= deadline {
             outcome = .expired
         } else {
             switch result.state {
@@ -810,7 +812,9 @@ internal actor WorkAgentChildCoordinator {
     /// child never left `queued` and its absolute deadline has now elapsed. The executing queue
     /// reservation is retained until the terminal write is canonically proven.
     private func settleExpiredRefusedStartLocked(key: Key, route: Route) async -> Bool {
-        guard let entry = entries[key], Date() >= entry.deadline else { return false }
+        guard let entry = entries[key], let deadline = entry.deadline, Date() >= deadline else {
+            return false
+        }
         let canonical: BoundedWorkAgentHandleIndexRecord?
         do { canonical = try await canonicalRecord(route: route, handle: entry.handle) }
         catch { return false }

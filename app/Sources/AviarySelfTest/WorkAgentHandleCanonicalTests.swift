@@ -61,7 +61,7 @@ private func agentPrefix() -> (events: [TimelineEvent], origin: WorkAgentHandleO
 
 private func queuedAgentEvent(
     origin: WorkAgentHandleOrigin, id: String = "agent-4", sequence: Int = 4,
-    previous: String = "agent-3"
+    previous: String = "agent-3", deadline: Date? = Date(timeIntervalSince1970: 100)
 ) -> TimelineEvent {
     agentEvent(
         TimelineEventType.agentHandleQueued, id: id, sequence: sequence, previous: previous,
@@ -69,7 +69,7 @@ private func queuedAgentEvent(
         handle: agentHandle,
         payload: agentJSON(WorkAgentHandleQueuedPayload(
             origin: origin, label: "background review",
-            deadline: Date(timeIntervalSince1970: 100), requestBody: agentBody("a"))))
+            deadline: deadline, requestBody: agentBody("a"))))
 }
 
 private func startedAgentEvent(
@@ -243,9 +243,9 @@ func test_workAgentHandleEvidenceSurvivesTerminalReapAndRoundTrips() throws {
                 schemaVersion: 4, bytes: head.encodedMetadata()))
         XCTAssertTrue(false, "the pre-evidence bounded Work schema must be rejected")
     } catch { XCTAssertTrue(true) }
-    XCTAssertEqual(PersistentWorkExactState.schemaVersion, 5)
-    XCTAssertEqual(BoundedWorkReducerHead.schemaVersion, 5)
-    XCTAssertEqual(WorkServiceAttachedWorkCheckpointStore.Record.currentSchemaVersion, 8)
+    XCTAssertEqual(PersistentWorkExactState.schemaVersion, 6)
+    XCTAssertEqual(BoundedWorkReducerHead.schemaVersion, 6)
+    XCTAssertEqual(WorkServiceAttachedWorkCheckpointStore.Record.currentSchemaVersion, 9)
 }
 
 func test_workAgentHandleDeadlineCancellationRetainsNilCommandEvidence() {
@@ -272,6 +272,140 @@ func test_workAgentHandleDeadlineCancellationRetainsNilCommandEvidence() {
     XCTAssertEqual(evidence?.event, WorkAgentHandleEventEvidence(canceled))
     XCTAssertEqual(snapshot.agentHandles[agentHandle.handleID]?.terminalOutcome, .expired)
     XCTAssertTrue(snapshot.semanticProjectionValid)
+}
+
+func test_workAgentHandleDeadlineCancellationConstrainsTerminalOutcome() {
+    let prefix = agentPrefix()
+    let queued = queuedAgentEvent(origin: prefix.origin)
+    let canceled = agentEvent(
+        TimelineEventType.agentHandleCancelRequested, id: "agent-5", sequence: 5,
+        previous: queued.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: queued.eventID), at: 101,
+        payload: agentJSON(WorkAgentHandleCancelRequestedPayload(cause: .deadline)))
+    let mismatchedTerminal = agentEvent(
+        TimelineEventType.agentHandleTerminal, id: "agent-6", sequence: 6,
+        previous: canceled.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: canceled.eventID), at: 102,
+        payload: agentJSON(WorkAgentHandleTerminalPayload(
+            outcome: .canceled, cleanup: .init(state: .notStarted))))
+    let snapshot = WorkReducer.reduce(prefix.events + [queued, canceled, mismatchedTerminal])
+    XCTAssertEqual(snapshot.agentHandles[agentHandle.handleID]?.state, .cancelRequested)
+    XCTAssertNil(snapshot.agentHandles[agentHandle.handleID]?.terminalEvidence)
+    XCTAssertFalse(snapshot.semanticProjectionValid)
+}
+
+func test_workAgentHandleDeadlineCancellationRequiresStoredDeadline() {
+    let prefix = agentPrefix()
+    let queued = queuedAgentEvent(origin: prefix.origin)
+    let early = agentEvent(
+        TimelineEventType.agentHandleCancelRequested, id: "agent-5", sequence: 5,
+        previous: queued.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: queued.eventID), at: 99,
+        payload: agentJSON(WorkAgentHandleCancelRequestedPayload(cause: .deadline)))
+    let earlySnapshot = WorkReducer.reduce(prefix.events + [queued, early])
+    XCTAssertEqual(earlySnapshot.agentHandles[agentHandle.handleID]?.state, .queued)
+    XCTAssertNil(earlySnapshot.agentHandles[agentHandle.handleID]?.cancellationEvidence)
+    XCTAssertFalse(earlySnapshot.semanticProjectionValid)
+
+    let noDeadlineQueued = queuedAgentEvent(origin: prefix.origin, deadline: nil)
+    let noDeadlineCancel = agentEvent(
+        TimelineEventType.agentHandleCancelRequested, id: "agent-5", sequence: 5,
+        previous: noDeadlineQueued.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: noDeadlineQueued.eventID), at: 10_000,
+        payload: agentJSON(WorkAgentHandleCancelRequestedPayload(cause: .deadline)))
+    let noDeadlineSnapshot = WorkReducer.reduce(prefix.events + [noDeadlineQueued, noDeadlineCancel])
+    XCTAssertEqual(noDeadlineSnapshot.agentHandles[agentHandle.handleID]?.state, .queued)
+    XCTAssertNil(noDeadlineSnapshot.agentHandles[agentHandle.handleID]?.cancellationEvidence)
+    XCTAssertFalse(noDeadlineSnapshot.semanticProjectionValid)
+}
+
+func test_workAgentHandleBoundedRejectsForgedDeadlineEvidence() throws {
+    let prefix = agentPrefix()
+    let queued = queuedAgentEvent(origin: prefix.origin)
+    let canceled = agentEvent(
+        TimelineEventType.agentHandleCancelRequested, id: "agent-5", sequence: 5,
+        previous: queued.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: queued.eventID), at: 101,
+        payload: agentJSON(WorkAgentHandleCancelRequestedPayload(cause: .deadline)))
+    let source = BoundedReducerProjectionSource(
+        journal: agentJournal,
+        cursor: JournalCursor(
+            journal: agentJournal, eventID: canceled.eventID, sequence: canceled.sequence),
+        sourceID: "agent-handle-forged-deadline-source",
+        sourceGeneration: String(repeating: "a", count: 64),
+        sourceFingerprint: String(repeating: "b", count: 64), sourceByteCount: 1,
+        prefixByteCount: 1, prefixDigest: String(repeating: "c", count: 64))
+    let head = try BoundedWorkReducerHead.build(
+        events: prefix.events + [queued, canceled], source: source)
+    var object = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: head.encodedMetadata()) as? [String: Any])
+    var handles = try XCTUnwrap(object["agentHandles"] as? [[String: Any]])
+    var row = handles[0]
+    var cancellationEvidence = try XCTUnwrap(row["cancellationEvidence"] as? [String: Any])
+    var event = try XCTUnwrap(cancellationEvidence["event"] as? [String: Any])
+    event["hostRecordedAt"] = Date(timeIntervalSince1970: 99).timeIntervalSinceReferenceDate
+    cancellationEvidence["event"] = event
+    row["cancellationEvidence"] = cancellationEvidence
+    handles[0] = row
+    object["agentHandles"] = handles
+    let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    do {
+        _ = try BoundedWorkReducerHead.decodeOpaqueReducerHead(
+            DisposableTimelineProjectionStore.OpaqueReducerHead(
+                mediaType: BoundedWorkReducerHead.mediaType,
+                schemaVersion: BoundedWorkReducerHead.schemaVersion, bytes: bytes))
+        XCTAssertTrue(false, "bounded decode must reject early deadline cancellation evidence")
+    } catch { XCTAssertTrue(true) }
+}
+
+func test_workAgentHandleBoundedRejectsCancellationOutcomeMismatch() throws {
+    let prefix = agentPrefix()
+    let queued = queuedAgentEvent(origin: prefix.origin)
+    let canceled = agentEvent(
+        TimelineEventType.agentHandleCancelRequested, id: "agent-5", sequence: 5,
+        previous: queued.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: queued.eventID), at: 101,
+        payload: agentJSON(WorkAgentHandleCancelRequestedPayload(cause: .deadline)))
+    let terminal = agentEvent(
+        TimelineEventType.agentHandleTerminal, id: "agent-6", sequence: 6,
+        previous: canceled.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: canceled.eventID), at: 102,
+        payload: agentJSON(WorkAgentHandleTerminalPayload(
+            outcome: .expired, cleanup: .init(state: .notStarted))))
+    let source = BoundedReducerProjectionSource(
+        journal: agentJournal,
+        cursor: JournalCursor(
+            journal: agentJournal, eventID: terminal.eventID, sequence: terminal.sequence),
+        sourceID: "agent-handle-mismatched-outcome-source",
+        sourceGeneration: String(repeating: "d", count: 64),
+        sourceFingerprint: String(repeating: "e", count: 64), sourceByteCount: 1,
+        prefixByteCount: 1, prefixDigest: String(repeating: "f", count: 64))
+    let head = try BoundedWorkReducerHead.build(
+        events: prefix.events + [queued, canceled, terminal], source: source)
+    var object = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: head.encodedMetadata()) as? [String: Any])
+    var handles = try XCTUnwrap(object["agentHandles"] as? [[String: Any]])
+    var row = handles[0]
+    var terminalEvidence = try XCTUnwrap(row["terminalEvidence"] as? [String: Any])
+    terminalEvidence["outcome"] = WorkAgentHandleTerminalOutcome.canceled.rawValue
+    row["terminalEvidence"] = terminalEvidence
+    handles[0] = row
+    object["agentHandles"] = handles
+    let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    do {
+        _ = try BoundedWorkReducerHead.decodeOpaqueReducerHead(
+            DisposableTimelineProjectionStore.OpaqueReducerHead(
+                mediaType: BoundedWorkReducerHead.mediaType,
+                schemaVersion: BoundedWorkReducerHead.schemaVersion, bytes: bytes))
+        XCTAssertTrue(false, "bounded decode must reject a mismatched cancellation outcome")
+    } catch { XCTAssertTrue(true) }
 }
 
 func test_workAgentHandleRejectsForgedStoredEvidence() throws {
@@ -409,6 +543,61 @@ func test_workAgentHandleDeadlineRejectsLateStartAndAllowsTypedExpiry() {
     XCTAssertEqual(snapshot.agentHandles[agentHandle.handleID]?.state, .terminal)
     XCTAssertEqual(snapshot.agentHandles[agentHandle.handleID]?.terminalOutcome, .expired)
     XCTAssertEqual(snapshot.quarantinedEvents.map(\.eventID), [lateStart.eventID])
+}
+
+func test_workAgentHandleNilDeadlineIsExplicitAndNeverExpires() throws {
+    let prefix = agentPrefix()
+    let origin = prefix.origin
+    let payload = WorkAgentHandleQueuedPayload(
+        origin: origin, label: "no deadline", requestBody: agentBody("a"))
+    let encoded = try XCTUnwrap(JSONValue.parse(try JSONEncoder().encode(payload)))
+    XCTAssertEqual(encoded.objectValue?["deadline"], .null)
+    var missingDeadline = try XCTUnwrap(encoded.objectValue)
+    missingDeadline.removeValue(forKey: "deadline")
+    let missingDeadlineEvent = agentEvent(
+        TimelineEventType.agentHandleQueued, id: "agent-missing-deadline", sequence: 4,
+        previous: "agent-3", session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle, at: 4,
+        payload: .object(missingDeadline))
+    let missingDeadlineSnapshot = WorkReducer.reduce(prefix.events + [missingDeadlineEvent])
+    XCTAssertNil(missingDeadlineSnapshot.agentHandles[agentHandle.handleID])
+    XCTAssertFalse(missingDeadlineSnapshot.semanticProjectionValid)
+    let queued = agentEvent(
+        TimelineEventType.agentHandleQueued, id: "agent-4", sequence: 4, previous: "agent-3",
+        session: agentSession, attachment: agentAttachment, run: agentRun, handle: agentHandle,
+        at: 4, payload: encoded)
+    let started = agentEvent(
+        TimelineEventType.agentHandleStarted, id: "agent-5", sequence: 5,
+        previous: queued.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: queued.eventID), at: 10_000)
+    let expired = agentEvent(
+        TimelineEventType.agentHandleTerminal, id: "agent-6", sequence: 6,
+        previous: started.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: started.eventID), at: 20_000,
+        payload: agentJSON(WorkAgentHandleTerminalPayload(
+            outcome: .expired, cleanup: .init(state: .quiesced))))
+
+    let snapshot = WorkReducer.reduce(prefix.events + [queued, started, expired])
+    XCTAssertEqual(snapshot.agentHandles[agentHandle.handleID]?.deadline, nil)
+    XCTAssertEqual(snapshot.agentHandles[agentHandle.handleID]?.state, .running)
+    XCTAssertEqual(snapshot.quarantinedEvents.map(\.eventID), [expired.eventID])
+    XCTAssertFalse(snapshot.semanticProjectionValid)
+
+    let source = BoundedReducerProjectionSource(
+        journal: agentJournal,
+        cursor: JournalCursor(
+            journal: agentJournal, eventID: started.eventID, sequence: started.sequence),
+        sourceID: "agent-handle-no-deadline-source",
+        sourceGeneration: String(repeating: "7", count: 64),
+        sourceFingerprint: String(repeating: "8", count: 64), sourceByteCount: 1,
+        prefixByteCount: 1, prefixDigest: String(repeating: "9", count: 64))
+    let head = try BoundedWorkReducerHead.build(
+        events: prefix.events + [queued, started], source: source)
+    XCTAssertNil(try XCTUnwrap(head.agentHandles.first).deadline)
+    let restored = try BoundedWorkReducerHead.decodeOpaqueReducerHead(head.opaqueReducerHead())
+    XCTAssertNil(try XCTUnwrap(restored.agentHandles.first).deadline)
 }
 
 func test_workAgentHandleReapsAfterCompletedWorkWithoutLosingOutcome() {
@@ -604,11 +793,11 @@ func test_workAgentHandlePersistentExactStateColdParityAndPrivacy() throws {
     defer { try? FileManager.default.removeItem(at: directory) }
     let map = try PersistentProjectionRadixMap(
         directory: directory.appending(path: "map", directoryHint: .isDirectory),
-        namespaceID: "agent-handle-exact-v5", journal: agentJournal,
-        sourceGeneration: String(repeating: "c", count: 64), mapKind: "work-exact-v5")
+        namespaceID: "agent-handle-exact-v6", journal: agentJournal,
+        sourceGeneration: String(repeating: "c", count: 64), mapKind: "work-exact-v6")
 
     let prefix = agentPrefix()
-    let queued = queuedAgentEvent(origin: prefix.origin)
+    let queued = queuedAgentEvent(origin: prefix.origin, deadline: nil)
     let started = startedAgentEvent()
     let ended = agentEvent(
         TimelineEventType.runFinished, id: "agent-6", sequence: 6, previous: started.eventID,
@@ -672,6 +861,18 @@ let casesWorkAgentHandleCanonical: [Case] = [
     ("Work-owned agent Handle deadline cancellation retains nil command evidence", {
         test_workAgentHandleDeadlineCancellationRetainsNilCommandEvidence()
     }),
+    ("Work-owned agent Handle deadline cancellation constrains terminal outcome", {
+        test_workAgentHandleDeadlineCancellationConstrainsTerminalOutcome()
+    }),
+    ("Work-owned agent Handle deadline cancellation requires reached deadline", {
+        test_workAgentHandleDeadlineCancellationRequiresStoredDeadline()
+    }),
+    ("Work-owned agent Handle bounded projection rejects forged deadline evidence", {
+        try test_workAgentHandleBoundedRejectsForgedDeadlineEvidence()
+    }),
+    ("Work-owned agent Handle bounded projection rejects outcome mismatch", {
+        try test_workAgentHandleBoundedRejectsCancellationOutcomeMismatch()
+    }),
     ("Work-owned agent Handle rejects forged retained event evidence", {
         try test_workAgentHandleRejectsForgedStoredEvidence()
     }),
@@ -680,6 +881,9 @@ let casesWorkAgentHandleCanonical: [Case] = [
     }),
     ("Work-owned agent Handle deadline refuses late start and records expiry", {
         test_workAgentHandleDeadlineRejectsLateStartAndAllowsTypedExpiry()
+    }),
+    ("Work-owned agent Handle nil deadline is explicit and never expires", {
+        try test_workAgentHandleNilDeadlineIsExplicitAndNeverExpires()
     }),
     ("Work-owned agent Handle can reap after completed Work", {
         test_workAgentHandleReapsAfterCompletedWorkWithoutLosingOutcome()

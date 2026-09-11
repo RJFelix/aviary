@@ -20,7 +20,7 @@ public actor AgentRunner {
         /// The user-selected reasoning level for provider routes that support it.
         public var reasoningEffort: String?
         public var maxDepth: Int
-        public var maxIterations: Int
+        public var maxIterations: Int?
         /// Children get a tighter ceiling than their parent. A delegated task is meant to be
         /// narrower, and an unbounded child is how a fan-out becomes a runaway.
         public var childMaxIterations: Int
@@ -69,7 +69,7 @@ public actor AgentRunner {
         public init(
             home: AgentHome, cwd: String, model: ModelSpec, systemPrompt: String,
             systemPromptAssembly: SystemPromptAssembly? = nil,
-            maxDepth: Int = 3, maxIterations: Int = 40, childMaxIterations: Int = 20,
+            maxDepth: Int = 3, maxIterations: Int? = 40, childMaxIterations: Int = 20,
             memory: MemoryStore? = nil, recordPayloads: Bool = false, goal: Goal? = nil,
             hookPaths: [String] = [], resume: String? = nil,
             peerDelegate: Agent.PeerDelegate? = nil,

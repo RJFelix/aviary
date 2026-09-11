@@ -1467,9 +1467,10 @@ the pilot in the installed app. Coordinator-local ownership observation and chil
 shutdown fencing now distinguish live owners from recorded obligations, including pre-append
 admission and unconfirmed cleanup. This is not a public process-liveness or reconstruction claim.
 Ryan's lifetime policy is now explicit: background agents default to running until finished or
-stopped, with optional time, token, and spend limits. Implementing those optional limits (including
-removing hidden default iteration ceilings) and physical retention remain activation gates. This
-is progress toward Phase 5, not completion of its broader exits.
+stopped, with optional time, token, and spend limits. The private Work-owned path now carries an
+explicit absent deadline and no default model-call ceiling; selected time limits still cover queue
+and execution. Cumulative token/spend accounting, public activation, and physical retention remain
+unfinished. This is progress toward Phase 5, not completion of its broader exits.
 
 Deliverables:
 

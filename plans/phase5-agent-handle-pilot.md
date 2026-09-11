@@ -6,8 +6,9 @@ is being verified; public service control and production activation remain incom
 Lifetime policy decided by Ryan, 2026-09-11: background agents run until they finish or are
 explicitly stopped by default. Time, token, and spend limits are optional. This supersedes the
 initial pilot's mandatory deadline and the unresolved-default references in older checkpoint
-notes below. The existing runtime still requires a deadline; this decision is not an implementation
-or activation receipt.
+notes below. The private Work-owned path now represents no deadline explicitly and removes its
+default model-call ceiling; verification is recorded below. Optional cumulative token/spend
+enforcement and public activation remain separate unfinished work.
 
 The chat-first work has now exercised real Start, queued input, Stop after step, End,
 GUI-only relaunch, retained drafts, and saved-review feedback. This supplies useful evidence
@@ -322,8 +323,8 @@ decision before broader activation; lifetime defaults are now decided above.
 - Represent absence explicitly in the canonical record, coordinator, queue, executor, and Python
   Future payload. Do not replace an absent deadline with a distant timestamp or a large sentinel.
   Invalidate disposable derived caches when changing the canonical contract.
-- Remove hidden child-turn/model-call ceilings from the default Work-owned path. The current
-  executor's default `maxIterations = 20` would otherwise contradict "until finished or stopped."
+- Remove hidden child-turn/model-call ceilings from the default Work-owned path. The former
+  executor default `maxIterations = 20` contradicted "until finished or stopped."
   Concurrency, admission, frame/body size, and per-operation failure bounds remain distinct
   operational protections, not implicit lifetime budgets.
 - Time is wall-clock scope time, including queueing. Token and spend limits cover cumulative
@@ -340,3 +341,44 @@ decision before broader activation; lifetime defaults are now decided above.
 - Test no-limit execution beyond the former iteration ceiling, every optional limit separately,
   combined-limit precedence, queued time expiry, delayed/missing usage, cancellation races, and
   cold/live record parity. Existing parent-End and daemon-shutdown proofs must continue to pass.
+
+#### Next slice: cumulative model accounting
+
+Before exposing token/spend controls, normalize provider usage and introduce one child-scoped
+accounting ledger covering normal model calls and compaction. Current compaction ignores usage;
+normal-turn usage can be lost on a stream error, cancellation, or transcript-write failure.
+Anthropic's cache-exclusive input and other providers' cache-inclusive input must not share a
+generic add-cache formula. Preserve partial/missing accounting explicitly, reconcile a crossing
+exactly once, and stop further budgeted dispatch when accounting cannot be established.
+
+Use a typed finite/nonnegative price estimate, not zero for a missing rate. Configured prices
+are not invoice measurements. Persist immutable token/spend policy and a typed non-success limit
+settlement, including all limits crossed by one response and any single-request overshoot.
+Per-request output truncation (`length`/`max_tokens`) also needs a non-success or explicit
+continuation path: a no-tool truncated response must not count as task completion.
+
+The reference Python host currently provides Work-owned Futures; the shared Python host does
+not. The private integration proofs below must not be read as shared-host capability or public
+pilot activation.
+
+#### No-limit default checkpoint (2026-09-11)
+
+The private Work-owned child path now defaults to `deadline: nil` and `maxIterations: nil`.
+The queue, coordinator, executor, durable Handle, callback replay, and reference Python Future
+preserve absence rather than substituting a distant date. Selected deadlines still cover queue
+and execution. Explicit iteration exhaustion records failure instead of successful completion.
+Deadline cancellation/expiry require an actual reached deadline; cancellation causes and terminal
+outcomes must agree. Exact Work state and bounded heads are v6, the reader rebuilds older Work
+maps, and attached-GUI checkpoints are v9.
+
+Verification: warning-free SelfTest product build and `just compile` (Aviary + aviaryd). Focused
+Phase 5: 83 cases / 1,100 assertions; canonical Handle: 16 / 890; reference Python Work Futures:
+8 / 32. The full traced macOS suite passes 1,197 cases / 18,283 assertions in 621.19 seconds
+with process-scoped `caffeinate -i`. Tests cover more than twenty model calls without an implicit
+limit, explicit-limit failure, no-deadline parent End survival, nullable callback replay and Future
+completion, forbidden early/absent deadline expiry, and obsolete-cache rebuilding.
+
+This does not enable the private pilot in the installed app, change the older Run-owned spawn
+path's defaults, add cumulative token/spend enforcement, or provide new Linux runtime evidence.
+Installed bundle/helper remain unchanged. Physical retention and shared-host Work Futures remain
+separate work.

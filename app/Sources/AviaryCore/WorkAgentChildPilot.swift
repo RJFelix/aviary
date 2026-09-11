@@ -3,8 +3,17 @@ import Foundation
 /// Host-private opt-in. No persisted or remote configuration can enable this pilot yet.
 internal struct WorkAgentChildPilot: Sendable {
     let coordinator: WorkAgentChildCoordinator
-    let deadline: Date
+    let deadline: Date?
     let makeRuntimeHost: @Sendable () -> RuntimeHost
+
+    init(
+        coordinator: WorkAgentChildCoordinator, deadline: Date? = nil,
+        makeRuntimeHost: @escaping @Sendable () -> RuntimeHost
+    ) {
+        self.coordinator = coordinator
+        self.deadline = deadline
+        self.makeRuntimeHost = makeRuntimeHost
+    }
 
     func makeDelegate(configuration: HostedInHouseWorkConfiguration) -> Agent.SpawnDelegate {
         WorkAgentChildSpawnDelegate(pilot: self, configuration: configuration)
@@ -93,7 +102,7 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
                                 systemPrompt: configuration.systemPrompt,
                                 systemPromptAssembly: configuration.systemPromptAssembly,
                                 reasoningEffort: configuration.reasoningEffort,
-                                maxIterations: configuration.childMaxIterations,
+                                maxIterations: nil,
                                 memory: configuration.memory, recordPayloads: configuration.recordPayloads,
                                 makeRuntimeHost: pilot.makeRuntimeHost), prompt: prompt)
                     })
@@ -135,7 +144,7 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
             var payload: [String: JSONValue] = [
                 "id": .string(id), "name": .string(row.label), "ownership": .string("work"),
                 "state": .string(row.state.rawValue),
-                "deadline": .number(row.deadline.timeIntervalSince1970),
+                "deadline": row.deadline.map { .number($0.timeIntervalSince1970) } ?? .null,
                 "result_recorded": .bool(row.resultBody != nil),
                 "source_event_id": .string(row.latestLifecycleEvent.eventID),
             ]

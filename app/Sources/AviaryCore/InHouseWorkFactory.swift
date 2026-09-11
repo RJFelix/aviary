@@ -988,9 +988,9 @@ public enum InHouseWorkFactory {
                 "systemPrompt and systemPromptAssembly contain different bytes")
         }
 
-        if let pilot = configuration.agentChildPilot {
-            guard pilot.deadline.timeIntervalSince1970.isFinite,
-                  pilot.deadline > Date() else {
+        if let deadline = configuration.agentChildPilot?.deadline {
+            guard deadline.timeIntervalSince1970.isFinite,
+                  deadline > Date() else {
                 throw HostedInHouseWorkError.invalidConfiguration(
                     "agent child pilot deadline must be finite and in the future")
             }

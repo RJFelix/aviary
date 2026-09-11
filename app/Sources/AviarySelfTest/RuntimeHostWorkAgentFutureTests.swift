@@ -79,7 +79,7 @@ private func withWorkFutureHost<Value: Sendable>(
 }
 
 private func workFutureRecord(
-    id: String, deadline: Double = Date().addingTimeInterval(60).timeIntervalSince1970,
+    id: String, deadline: Double? = Date().addingTimeInterval(60).timeIntervalSince1970,
     state: String = "terminal", outcome: String? = "succeeded"
 ) -> JSONValue {
     var value: [String: JSONValue] = [
@@ -87,7 +87,7 @@ private func workFutureRecord(
         "name": .string("future-child"),
         "ownership": .string("work"),
         "state": .string(state),
-        "deadline": .number(deadline),
+        "deadline": deadline.map { .number($0) } ?? .null,
     ]
     if let outcome { value["outcome"] = .string(outcome) }
     return .object(value)
@@ -343,6 +343,57 @@ func test_runtimeHostWorkFutureCanSettleAfterPastDeadline() async throws {
     }
 }
 
+func test_runtimeHostWorkFutureWithoutDeadlineUsesCanonicalCompletion() async throws {
+    guard let root = workFuturePythonRoot() else { return }
+    try await withWorkFutureHost(root: root) { host, session in
+        let body = Data("unlimited-child-finished".utf8)
+        let counter = WorkFutureSpawnCounter()
+        await host.onCallback { _, _, kind, _ in
+            switch kind {
+            case "agent_handle_status":
+                let state = counter.next() < 3 ? "running" : "terminal"
+                return workFutureRecord(
+                    id: "no-deadline-child", deadline: nil, state: state,
+                    outcome: state == "terminal" ? "succeeded" : nil)
+            case "agent_handle_result":
+                return .object([
+                    "id": .string("no-deadline-child"), "offset": .number(0),
+                    "next_offset": .number(Double(body.count)),
+                    "byte_count": .number(Double(body.count)),
+                    "body_digest": .string("sha256:" + AviarySHA256.hash(data: body).description),
+                    "data_base64": .string(body.base64EncodedString()), "eof": .bool(true),
+                ])
+            case "agent_handle_await": return .object(["accepted": .bool(true)])
+            default: return .object(["error": .string("unexpected callback")])
+            }
+        }
+        let result = try await host.execute(
+            "f = attach_agent('no-deadline-child')\n(f.aviary_deadline, f.result(timeout=3))",
+            in: session, timeout: 5)
+        XCTAssertNil(result.exception)
+        XCTAssertEqual(result.value, "(None, 'unlimited-child-finished')")
+        await host.onCallback { _, _, _, payload in
+            let id = payload["id"]?.stringValue ?? "bad"
+            var row: [String: JSONValue] = ["id": .string(id), "ownership": .string("work")]
+            if id == "bad-bool" { row["deadline"] = .bool(false) }
+            if id == "bad-string" { row["deadline"] = .string("unlimited") }
+            return .object(row)
+        }
+        let malformed = try await host.execute("""
+        rejected = []
+        for handle in ['bad-missing', 'bad-bool', 'bad-string']:
+            try:
+                attach_agent(handle)
+                rejected.append(False)
+            except RuntimeError:
+                rejected.append(True)
+        rejected
+        """, in: session, timeout: 5)
+        XCTAssertNil(malformed.exception)
+        XCTAssertEqual(malformed.value, "[True, True, True]")
+    }
+}
+
 func test_runtimeHostWorkFutureAttachAgentIsHiddenFromNamespaceInspection() async throws {
     guard let root = workFuturePythonRoot() else { return }
     try await withWorkFutureHost(root: root) { host, session in
@@ -366,6 +417,9 @@ func test_runtimeHostWorkFutureAttachAgentIsHiddenFromNamespaceInspection() asyn
 }
 
 let casesRuntimeHostWorkAgentFuture: [Case] = [
+    ("runtimeHost work Future with no deadline waits for canonical completion", {
+        try await test_runtimeHostWorkFutureWithoutDeadlineUsesCanonicalCompletion()
+    }),
     ("runtimeHost work Future preserves admitted and uncertain IDs", {
         try await test_runtimeHostWorkFuturePreservesAdmittedAndUncertainIDs()
     }),

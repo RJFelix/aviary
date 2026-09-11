@@ -48,7 +48,7 @@ public struct WorkAgentChildAdmissionQueue: Sendable {
     private enum State: Sendable { case admitting, queued, executing, settling }
     private struct Entry: Sendable {
         let reservation: Reservation
-        let deadline: Date
+        let deadline: Date?
         var state: State
         var awaited: Bool
     }
@@ -73,13 +73,15 @@ public struct WorkAgentChildAdmissionQueue: Sendable {
     /// A caller must either commit it after persistence or abandon it after a proven failure.
     /// An uncertain append must keep its reservation until canonical reconciliation.
     public mutating func reserve(
-        work: WorkRef, handle: HandleRef, deadline: Date, now: Date
+        work: WorkRef, handle: HandleRef, deadline: Date? = nil, now: Date = Date()
     ) throws -> Reservation {
         guard Self.validID(work.workHostID), Self.validID(work.workID),
               Self.validID(handle.handleID) else { throw Failure.invalidIdentity }
-        guard deadline.timeIntervalSince1970.isFinite,
-              now.timeIntervalSince1970.isFinite, deadline > now else {
-            throw Failure.invalidDeadline
+        if let deadline {
+            guard deadline.timeIntervalSince1970.isFinite,
+                  now.timeIntervalSince1970.isFinite, deadline > now else {
+                throw Failure.invalidDeadline
+            }
         }
         guard !entries.contains(where: {
             $0.reservation.work == work && $0.reservation.handle == handle
@@ -121,7 +123,9 @@ public struct WorkAgentChildAdmissionQueue: Sendable {
     /// it requests resource cancellation and keeps the execution slot until quiescent.
     public mutating func next(now: Date) throws -> Decision? {
         guard now.timeIntervalSince1970.isFinite else { throw Failure.invalidDeadline }
-        if let expired = entries.firstIndex(where: { $0.state == .queued && $0.deadline <= now }) {
+        if let expired = entries.firstIndex(where: {
+            $0.state == .queued && $0.deadline.map { $0 <= now } == true
+        }) {
             entries[expired].state = .settling
             return .expireBeforeExecution(entries[expired].reservation)
         }

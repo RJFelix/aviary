@@ -1876,11 +1876,12 @@ public enum WorkAgentHandleReapReason: String, Codable, Hashable, Sendable {
 public struct WorkAgentHandleQueuedPayload: Codable, Hashable, Sendable {
     public let origin: WorkAgentHandleOrigin
     public let label: String
-    public let deadline: Date
+    /// Optional deadline policy. Nil means the child is not eligible for deadline expiry.
+    public let deadline: Date?
     public let requestBody: TimelineBodyReference
 
     public init(
-        origin: WorkAgentHandleOrigin, label: String, deadline: Date,
+        origin: WorkAgentHandleOrigin, label: String, deadline: Date? = nil,
         requestBody: TimelineBodyReference
     ) {
         self.origin = origin
@@ -1891,6 +1892,32 @@ public struct WorkAgentHandleQueuedPayload: Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case origin, label, deadline, requestBody = "request_body"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.origin = try container.decode(WorkAgentHandleOrigin.self, forKey: .origin)
+        self.label = try container.decode(String.self, forKey: .label)
+        guard container.contains(.deadline) else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.deadline,
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "agent Handle queue payload must record deadline or null"))
+        }
+        self.deadline = try container.decodeIfPresent(Date.self, forKey: .deadline)
+        self.requestBody = try container.decode(
+            TimelineBodyReference.self, forKey: .requestBody)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(origin, forKey: .origin)
+        try container.encode(label, forKey: .label)
+        // Encode an absent policy as an explicit JSON null so bridge payloads have a stable
+        // schema and never confuse omission with an older payload shape.
+        try container.encode(deadline, forKey: .deadline)
+        try container.encode(requestBody, forKey: .requestBody)
     }
 }
 
@@ -2030,7 +2057,8 @@ public struct WorkAgentHandleSnapshot: Codable, Hashable, Sendable {
     public let handle: HandleRef
     public let origin: WorkAgentHandleOrigin
     public let label: String
-    public let deadline: Date
+    /// Optional deadline policy. Nil means the child is not eligible for deadline expiry.
+    public let deadline: Date?
     public let requestBody: TimelineBodyReference
     public var state: WorkAgentHandleState
     public var cancellationEvidence: WorkAgentHandleCancellationEvidence?
@@ -2058,7 +2086,7 @@ public struct WorkAgentHandleSnapshot: Codable, Hashable, Sendable {
     }
 
     public init(
-        handle: HandleRef, origin: WorkAgentHandleOrigin, label: String, deadline: Date,
+        handle: HandleRef, origin: WorkAgentHandleOrigin, label: String, deadline: Date? = nil,
         requestBody: TimelineBodyReference, queuedEvent: EventRef
     ) {
         self.handle = handle

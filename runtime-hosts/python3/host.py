@@ -525,7 +525,9 @@ def _aviary_make_work_future(record):
     import math as _math, threading as _th, time as _time, uuid as _uuid
     handle_id, deadline = record.get("id"), record.get("deadline")
     if (not isinstance(handle_id, str) or not handle_id or len(handle_id.encode()) > 256
-            or type(deadline) not in (float, int) or not _math.isfinite(deadline)):
+            or "deadline" not in record
+            or (deadline is not None
+                and (type(deadline) not in (float, int) or not _math.isfinite(deadline)))):
         raise RuntimeError("Invalid Work Handle admission response")
     future = _AviaryWorkFuture()
     future.aviary_id = handle_id
@@ -552,6 +554,10 @@ def _aviary_make_work_future(record):
                     raise RuntimeError(row.get("error", "Handle state unavailable")
                                        if isinstance(row, dict) else "Handle state unavailable")
                 if (row.get("id") != handle_id or row.get("ownership") != "work"
+                        or "deadline" not in row
+                        or (row["deadline"] is not None
+                            and (type(row["deadline"]) not in (float, int)
+                                 or not _math.isfinite(row["deadline"])))
                         or row.get("deadline") != deadline):
                     raise RuntimeError("Handle observation identity changed")
                 state = row.get("state")

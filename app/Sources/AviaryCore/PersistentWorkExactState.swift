@@ -10,7 +10,7 @@ import Foundation
 /// event payload is never copied into this map; child state is classified and recovery caveats are
 /// represented by count/digest metadata.
 public struct PersistentWorkExactState: Sendable {
-    public static let schemaVersion = 5
+    public static let schemaVersion = 6
     public static let maximumIdentityBytes = 1_024
     /// One mutation may need to authenticate every active attachment in the affected Session.
     /// WorkService bounds those relationships to 64, leaving room for the event's other typed
@@ -30,7 +30,7 @@ public struct PersistentWorkExactState: Sendable {
             case .missingScalar: return "Persistent Work exact state has no scalar continuation."
             case .invalidRecord: return "Persistent Work exact state contains an invalid typed record."
             case .duplicateEvent(let id): return "Persistent Work event was already observed: \(id)."
-            case .unsupportedEvent(let type): return "Persistent Work event family is not exact in v5: \(type)."
+            case .unsupportedEvent(let type): return "Persistent Work event family is not exact in v6: \(type)."
             case .tooManyPrefetchedSlots: return "Persistent Work exact-state prefetch exceeds its bound."
             case .map(let error): return error.localizedDescription
             }
@@ -57,7 +57,7 @@ public struct PersistentWorkExactState: Sendable {
         }
     }
 
-    private static let scalarKey = "work-exact-v5/scalar"
+    private static let scalarKey = "work-exact-v6/scalar"
     private let map: PersistentProjectionRadixMap
     private var root: PersistentProjectionRadixMap.Root?
     private var lastSnapshot: WorkSnapshot
@@ -193,7 +193,7 @@ public struct PersistentWorkExactState: Sendable {
 
     private static func slotKey(kind: String, identity: String) -> String {
         let material = "work-exact-slot-v1\0\(kind.count):\(kind)\0\(identity.utf8.count):\(identity)"
-        return "work-exact-v5/\(kind)/" + AviarySHA256.hash(data: Data(material.utf8)).description
+        return "work-exact-v6/\(kind)/" + AviarySHA256.hash(data: Data(material.utf8)).description
     }
 
     private static func validateIncomingIdentities(_ event: TimelineEvent) throws {
@@ -209,6 +209,51 @@ public struct PersistentWorkExactState: Sendable {
         guard values.allSatisfy({ !$0.isEmpty && $0.utf8.count <= maximumIdentityBytes }) else {
             throw Error.invalidRecord
         }
+    }
+
+    private static func validStoredAgentHandle(_ handle: WorkAgentHandleSnapshot) -> Bool {
+        guard handle.deadline.map({ $0.timeIntervalSince1970.isFinite }) ?? true else {
+            return false
+        }
+        if let cancellation = handle.cancellationEvidence, cancellation.cause != .client,
+           (cancellation.command != nil || cancellation.event.client != nil) {
+            return false
+        }
+        if let cancellation = handle.cancellationEvidence, cancellation.cause == .deadline,
+           !validDeadlineEvidence(handle.deadline, recordedAt: cancellation.event.hostRecordedAt) {
+            return false
+        }
+        if let terminal = handle.terminalEvidence, terminal.outcome == .expired,
+           !validDeadlineEvidence(handle.deadline, recordedAt: terminal.event.hostRecordedAt) {
+            return false
+        }
+        if let cancellation = handle.cancellationEvidence,
+           let terminal = handle.terminalEvidence,
+           !cancellationAllowsTerminalOutcome(
+               cancellation.cause, outcome: terminal.outcome) {
+            return false
+        }
+        return true
+    }
+
+    private static func cancellationAllowsTerminalOutcome(
+        _ cause: WorkAgentHandleCancellationCause?,
+        outcome: WorkAgentHandleTerminalOutcome
+    ) -> Bool {
+        switch cause {
+        case .deadline:
+            return [.expired, .indeterminate].contains(outcome)
+        case .client, .workDestruction, .hostShutdown:
+            return [.canceled, .indeterminate].contains(outcome)
+        case nil:
+            return true
+        }
+    }
+
+    private static func validDeadlineEvidence(_ deadline: Date?, recordedAt: Date) -> Bool {
+        guard let deadline, deadline.timeIntervalSince1970.isFinite,
+              recordedAt.timeIntervalSince1970.isFinite else { return false }
+        return recordedAt >= deadline
     }
 
     private static func encode<T: Encodable>(_ value: T) throws -> Data {
@@ -414,7 +459,8 @@ public struct PersistentWorkExactState: Sendable {
                let record: AgentHandleRecord = try load(slotKey(
                    kind: "agent-handle", identity: handle.handleID)) {
                 guard record.kind == "agent-handle", record.scope == map.journal.stableKey,
-                      record.handle.handle.handleID == handle.handleID else {
+                      record.handle.handle.handleID == handle.handleID,
+                      PersistentWorkExactState.validStoredAgentHandle(record.handle) else {
                     throw Error.invalidRecord
                 }
                 agentHandles[handle.handleID] = record

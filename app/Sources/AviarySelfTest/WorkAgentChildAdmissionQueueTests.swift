@@ -127,10 +127,25 @@ func testWorkAgentChildQueueRejectsInvalidInputs() throws {
     XCTAssertEqual(queue.counts.queued, 0)
 }
 
+func testWorkAgentChildQueueAllowsAnUnboundedDeadline() throws {
+    var queue = WorkAgentChildAdmissionQueue(limits: try .init(executing: 1))
+    let reservation = try queue.reserve(
+        work: childQueueWork("unbounded"), handle: HandleRef("no-deadline"), deadline: nil,
+        now: childQueueNow)
+    try queue.commit(reservation)
+
+    XCTAssertEqual(
+        try queue.next(now: childQueueNow.addingTimeInterval(24 * 60 * 60)),
+        .execute(reservation),
+        "nil does not become an implicit expiry timestamp")
+    try queue.finish(reservation)
+}
+
 let casesWorkAgentChildAdmissionQueue: [Case] = [
     ("phase5 child queue: bounded durable reservations", testWorkAgentChildQueueReservationsAreBounded),
     ("phase5 child queue: round robin and bounded await promotion", testWorkAgentChildQueueRoundRobinAndAwaitFairness),
     ("phase5 child queue: one executing child per Work", testWorkAgentChildQueueOneExecutingChildPerWork),
     ("phase5 child queue: expiry and cancellation retain capacity", testWorkAgentChildQueueExpiryAndCancellationHoldCapacity),
     ("phase5 child queue: rejects invalid inputs", testWorkAgentChildQueueRejectsInvalidInputs),
+    ("phase5 child queue: nil deadline has no expiry", testWorkAgentChildQueueAllowsAnUnboundedDeadline),
 ]

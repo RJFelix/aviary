@@ -71,7 +71,7 @@ func testHostedPilotChildSurvivesEndAndSecondSessionReadsColdResult() async thro
     let coordinator = try WorkAgentChildCoordinator()
     let provider = PilotSpawningProvider()
     let pilot = WorkAgentChildPilot(
-        coordinator: coordinator, deadline: Date().addingTimeInterval(120),
+        coordinator: coordinator,
         makeRuntimeHost: { RuntimeHost.bundledPython(repoRoot: root, parentLifetimeLease: true)! })
     func configuration(_ selected: WorkBinding, run: String, runtime: RuntimeHost,
                        policy: WorkAgentChildPilot) -> HostedInHouseWorkConfiguration {
@@ -103,6 +103,7 @@ func testHostedPilotChildSurvivesEndAndSecondSessionReadsColdResult() async thro
         XCTAssertTrue(handle.handleID.hasPrefix("agent-child-"))
         let running = try await coordinator.inspect(work: binding.work, handle: handle)
         XCTAssertEqual(running.state, .running)
+        XCTAssertNil(running.deadline, "the Work-owned pilot has no implicit lifetime deadline")
         XCTAssertEqual(running.origin.session, binding.session)
 
         await parent.unsubscribe(observer.id)
