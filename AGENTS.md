@@ -149,6 +149,9 @@ For shared-tree builds, a source freeze includes new files and test fixtures. On
 frozen, send further findings without editing until the verifier releases the freeze.
 Use `AVIARY_SELFTEST_TRACE=1` for unbuffered per-case begin/end markers on stderr when diagnosing
 a long or stalled run; redirected stdout alone can lag several cases behind the active test.
+For unattended full runs on macOS, scope `caffeinate -i` to the test executable so idle sleep
+does not expire process/RPC fixture deadlines. Do not dismiss failures in a sleep-spanning run;
+rerun the affected cases and the complete suite before recording a green verification receipt.
 For a generic GUI canonical-read failure, launch the signed executable with
 `AVIARY_TRACE_WORK_READS=1` and capture stderr. `AVIARY_WORK_READ_FAILURE` records the failing
 operation, Work/Session target, sequence number, and fixed error category before error mapping.

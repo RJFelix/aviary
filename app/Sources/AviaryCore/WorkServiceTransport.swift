@@ -27,6 +27,7 @@ public enum WorkServiceTransportOperation: String, Codable, Hashable, Sendable {
     case fetchArtifact = "fetch_artifact"
     case fetchBody = "fetch_body"
     case command
+    case cancelAgentHandle = "cancel_agent_handle"
 }
 
 /// The endpoint is an address only.  The host identity returned by the handshake is the
@@ -360,6 +361,13 @@ public enum WorkServiceTransportCodec {
                 try validateDiagnostic(data["diagnostic"])
             case .completeWork, .command:
                 try validateReceipt(data)
+            case .cancelAgentHandle:
+                let result = try decodeResponseValue(
+                    WorkServiceAgentHandleCancelResponse.self, from: data)
+                do { try result.validate() }
+                catch { throw WorkServiceTransportError.invalidResponse }
+                try validateHostInstance(data["responder"], required: true)
+                try validateDiagnostic(data["diagnostic"])
             case .updateCapabilities:
                 try validateIdentity(data["work"]?["workHostID"], required: true)
                 try validateIdentity(data["work"]?["workID"], required: true)
@@ -980,6 +988,20 @@ public enum WorkServiceTransportCodec {
                 }
             }
             try validateBodyProgress(response, request: request)
+        case .cancelAgentHandle:
+            let response = try decodeResponseValue(
+                WorkServiceAgentHandleCancelResponse.self, from: data)
+            let request = try decodeRequestValue(
+                WorkServiceAgentHandleCancelRequest.self, from: request.payload)
+            do { try response.validate(for: request) }
+            catch { throw WorkServiceTransportError.invalidResponse }
+            if let expectedHostInstance {
+                guard response.responder == expectedHostInstance,
+                      request.work.workHostID == expectedHostInstance.host.workHostID,
+                      request.journal.authority.authorityID == expectedHostInstance.host.workHostID else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
+            }
         case .command:
             let response: WorkServiceCommandReceipt = try decodeResponseValue(
                 WorkServiceCommandReceipt.self, from: data)
@@ -3549,6 +3571,13 @@ public actor WorkServiceUnixSocketServer {
                     WorkServiceCommandRequest.self, from: envelope.payload)
                 guard request.command.client == client else { throw identityMismatch() }
                 return try success(id: envelope.id, value: try await service.command(request), connectionID: connectionID)
+            case .cancelAgentHandle:
+                let request = try WorkServiceTransportCodec.decodePayload(
+                    WorkServiceAgentHandleCancelRequest.self, from: envelope.payload)
+                guard request.command.client == client else { throw identityMismatch() }
+                return try success(
+                    id: envelope.id, value: try await service.cancelAgentHandle(request),
+                    connectionID: connectionID)
             case .handshake:
                 // Handshakes are handled above so that the same client can refresh the
                 // control-journal cursor on an established connection.  This branch remains
@@ -3836,6 +3865,12 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
 
     public func fetchBody(_ request: WorkServiceBodyRequest) async throws -> WorkServiceBodyResponse {
         try await call(.fetchBody, request)
+    }
+
+    public func cancelAgentHandle(
+        _ request: WorkServiceAgentHandleCancelRequest
+    ) async throws -> WorkServiceAgentHandleCancelResponse {
+        try await call(.cancelAgentHandle, request)
     }
 
     public func command(

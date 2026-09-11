@@ -716,6 +716,11 @@ private actor AttachedControllerTestService: WorkServiceClient {
             data: chunk, nextOffset: next)
     }
 
+    func cancelAgentHandle(_ request: WorkServiceAgentHandleCancelRequest) async throws
+        -> WorkServiceAgentHandleCancelResponse {
+        throw WorkServiceProtocolError.invalidRequest("child cancellation is not modeled by this fixture")
+    }
+
     func command(_ request: WorkServiceCommandRequest) async throws -> WorkServiceCommandReceipt {
         commandRequests.append(request)
         if let commandGate { await commandGate.enter() }

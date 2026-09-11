@@ -752,9 +752,10 @@ internal enum WorkReducerTransition {
             }
             var updated = existing
             updated.state = .cancelRequested
-            updated.cancellationCause = payload.cause
-            updated.latestLifecycleEvent = EventRef(
-                journal: event.journal, eventID: event.eventID)
+            updated.cancellationEvidence = WorkAgentHandleCancellationEvidence(
+                cause: payload.cause, event: WorkAgentHandleEventEvidence(event),
+                command: event.command)
+            updated.latestLifecycleEvent = updated.cancellationEvidence!.event.event
             state.stageAgentHandle(updated)
         case TimelineEventType.agentHandleTerminal:
             guard let existing = validAgentHandleTransition(event, state: state),
@@ -766,14 +767,12 @@ internal enum WorkReducerTransition {
                            reason: "agent Handle terminal outcome is malformed, conflicting, or lacks exact cleanup evidence")
                 return
             }
-            let source = EventRef(journal: event.journal, eventID: event.eventID)
             var updated = existing
             updated.state = .terminal
-            updated.terminalOutcome = payload.outcome
-            updated.resultBody = payload.resultBody
-            updated.cleanup = payload.cleanup
-            updated.latestLifecycleEvent = source
-            updated.terminalEvent = source
+            updated.terminalEvidence = WorkAgentHandleTerminalEvidence(
+                outcome: payload.outcome, resultBody: payload.resultBody,
+                cleanup: payload.cleanup, event: WorkAgentHandleEventEvidence(event))
+            updated.latestLifecycleEvent = updated.terminalEvidence!.event.event
             state.stageAgentHandle(updated)
         case TimelineEventType.agentHandleReaped:
             guard let existing = validAgentHandleTransition(event, state: state),
@@ -1342,6 +1341,7 @@ internal enum WorkReducerTransition {
         _ event: TimelineEvent, state: State
     ) -> WorkAgentHandleSnapshot? {
         guard let handle = event.handle, let existing = state.agentHandle(for: handle.handleID),
+              validStoredAgentHandleEvidence(existing, state: state),
               validAgentHandleDomains(event),
               event.work == existing.origin.work,
               event.workHost == existing.origin.workHost,
@@ -1352,8 +1352,112 @@ internal enum WorkReducerTransition {
         return existing
     }
 
+    private static func validStoredAgentHandleEvidence<State: WorkTransitionState>(
+        _ handle: WorkAgentHandleSnapshot, state: State
+    ) -> Bool {
+        guard let journal = state.scalar.journal else { return false }
+        func validEvent(_ proof: WorkAgentHandleEventEvidence) -> Bool {
+            guard proof.event.journal == journal,
+                  validIdentity(proof.event.eventID), proof.sequence > 0,
+                  proof.sequence <= state.scalar.lastSequence,
+                  state.eventSequence(for: proof.event.eventID) == proof.sequence,
+                  proof.hostSequence.map({ $0 >= 0 }) ?? true,
+                  validIdentity(proof.actor.actorID),
+                  !proof.actor.kind.isEmpty,
+                  proof.actor.kind.utf8.count <= PersistentWorkExactState.maximumIdentityBytes,
+                  proof.work == handle.origin.work,
+                  proof.workHost == handle.origin.workHost,
+                  proof.session == handle.origin.session,
+                  proof.sessionAttachment == handle.origin.sessionAttachment,
+                  proof.run == handle.origin.run,
+                  proof.handle == handle.handle,
+                  proof.hostRecordedAt.timeIntervalSince1970.isFinite,
+                  proof.provenance == .native else { return false }
+            if proof.sequence == 1 {
+                guard proof.previousEventID == nil else { return false }
+            } else {
+                guard let previous = proof.previousEventID, validIdentity(previous),
+                      state.eventSequence(for: previous) == proof.sequence - 1 else { return false }
+            }
+            if let cause = proof.causedByEventID {
+                guard cause.journal == journal, validIdentity(cause.eventID),
+                      state.eventSequence(for: cause.eventID).map({ $0 < proof.sequence }) == true
+                else { return false }
+            }
+            return true
+        }
+        if let cancellation = handle.cancellationEvidence {
+            guard validEvent(cancellation.event),
+                  cancellation.event.causedByEventID
+                    == (handle.startedEvent ?? handle.queuedEvent) else { return false }
+            if cancellation.cause == .client {
+                guard let command = cancellation.command,
+                      validIdentity(command.commandID),
+                      let client = command.client, validIdentity(client.clientID),
+                      cancellation.event.client == client,
+                      let attachment = command.sessionAttachment,
+                      validIdentity(attachment.attachmentID),
+                      let cursor = command.causalCursor,
+                      cursor.journal == journal,
+                      cursor.eventID == cancellation.event.previousEventID,
+                      cursor.sequence == cancellation.event.sequence - 1 else { return false }
+            } else if cancellation.command != nil || cancellation.event.client != nil {
+                return false
+            }
+        }
+        if let terminal = handle.terminalEvidence {
+            guard validEvent(terminal.event),
+                  terminal.event.causedByEventID
+                    == (handle.cancellationEvent ?? handle.startedEvent ?? handle.queuedEvent),
+                  terminal.outcome != .succeeded || terminal.resultBody != nil,
+                  terminal.resultBody.map({ validAgentHandleBody($0, journal: journal) }) ?? true
+            else { return false }
+            guard terminal.event.client == nil else { return false }
+            if let cleanupEvidence = terminal.cleanup.evidence {
+                guard cleanupEvidence.journal == journal,
+                      state.eventSequence(for: cleanupEvidence.eventID).map({
+                          $0 < terminal.event.sequence
+                      }) == true else { return false }
+            }
+            if handle.startedEvent == nil {
+                guard terminal.cleanup.state == .notStarted,
+                      [.failed, .canceled, .expired].contains(terminal.outcome) else { return false }
+            } else if terminal.outcome == .indeterminate {
+                guard terminal.cleanup.state == .indeterminate else { return false }
+            } else if terminal.cleanup.state != .quiesced { return false }
+            if handle.cancellationEvidence != nil,
+               ![.canceled, .expired, .indeterminate].contains(terminal.outcome) { return false }
+        }
+        switch handle.state {
+        case .queued:
+            return handle.cancellationEvidence == nil && handle.terminalEvidence == nil
+                && handle.startedEvent == nil
+                && handle.latestLifecycleEvent == handle.queuedEvent
+        case .running:
+            return handle.cancellationEvidence == nil && handle.terminalEvidence == nil
+                && handle.startedEvent != nil
+                && handle.latestLifecycleEvent == handle.startedEvent
+        case .cancelRequested:
+            return handle.cancellationEvidence != nil && handle.terminalEvidence == nil
+                && handle.latestLifecycleEvent == handle.cancellationEvent
+        case .terminal:
+            return handle.terminalEvidence != nil
+                && handle.latestLifecycleEvent == handle.terminalEvent
+        case .reaped:
+            return handle.terminalEvidence != nil && handle.reapedEvent != nil
+                && handle.reapReason != nil
+                && handle.latestLifecycleEvent == handle.reapedEvent
+                && handle.cleanup?.state != .indeterminate
+        }
+    }
+
     private static func validAgentHandleDomains(_ event: TimelineEvent) -> Bool {
         event.declaredDomains == [.work, .runtime, .externalEffects]
+            && event.provenance == .native
+            && (event.hostSequence.map({ $0 >= 0 }) ?? true)
+            && event.hostRecordedAt.timeIntervalSince1970.isFinite
+            && validIdentity(event.actor.actorID)
+            && validIdentity(event.actor.kind)
     }
 
     private static func validAgentHandleCancellationEnvelope<State: WorkTransitionState>(

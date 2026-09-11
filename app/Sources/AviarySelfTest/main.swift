@@ -7193,5 +7193,6 @@ await Harness.run(
         + casesHostedWorkAgentChildIntegration
         + casesRuntimeHostWorkAgentFuture
         + casesWorkAgentSpawnCallback
+        + casesWorkAgentHandleCancelService
         + casesCommandDeliveryOutcome + casesRuntimeHostParentLifetime
         + casesRuntimeHostAdoption)

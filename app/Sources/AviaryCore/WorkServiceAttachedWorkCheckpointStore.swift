@@ -104,7 +104,7 @@ public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
 
     public struct Record: Codable, Hashable, Sendable {
         // Work-owned agent Handle semantics require replay of older disposable snapshots.
-        public static let currentSchemaVersion = 7
+        public static let currentSchemaVersion = 8
 
         public let schemaVersion: Int
         public let client: ClientRef

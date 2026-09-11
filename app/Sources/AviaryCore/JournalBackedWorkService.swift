@@ -1082,6 +1082,16 @@ enum JournalBackedWorkServiceCommandEvidence {
 /// The control journal owns client relationships and control cursors.  RunJournalBundle owns
 /// Session/Work source truth, while WorkHostRegistry owns the live HostedInHouseWork actor.  No
 /// client reference is used as actor ownership, so detaching the final GUI leaves Work alive.
+/// Narrow host-private effect seam. The service owns authentication and canonical reconciliation;
+/// the coordinator owns only the live Work Host resource and append attempt.
+internal protocol WorkServiceAgentHandleCancelling: Sendable {
+    func cancel(
+        work: WorkRef, handle: HandleRef, command: CommandRef
+    ) async throws -> WorkAgentChildCoordinator.CancellationResult
+}
+
+extension WorkAgentChildCoordinator: WorkServiceAgentHandleCancelling {}
+
 public actor JournalBackedWorkService: WorkServiceClient {
     public typealias LaunchManifestStore = JournalBackedWorkServiceLaunchManifestStore
 
@@ -1104,6 +1114,10 @@ public actor JournalBackedWorkService: WorkServiceClient {
     /// Testable bound for raw live envelopes. Production keeps the one-million-record ceiling;
     /// crossing it changes storage strategy, never source availability.
     private let canonicalResidentRecordLimit: Int
+    /// Installed only by the host-private pilot composition before this service is first used.
+    /// The production resolver leaves it nil, so a live canonical child is unavailable rather
+    /// than reconstructed from journal metadata or assigned to a new process owner.
+    private var agentHandleCanceller: (any WorkServiceAgentHandleCancelling)?
     private var loaded = false
     private var manifests: [WorkRef: JournalBackedWorkLaunchManifest] = [:]
 
@@ -1219,6 +1233,18 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let ownsTask: Bool
     }
     private var startsInProgress: [StartAdmissionKey: Task<WorkHostRegistryLiveEntry, Error>] = [:]
+    /// One cancel operation per Work owns its canonical read -> live effect -> canonical reread
+    /// sequence. Swift actor reentrancy would otherwise admit two requests from the same Work
+    /// cursor across the awaited owner call. This is a narrow FIFO linearization gate, not a
+    /// command replay queue; every waiter reruns canonical preflight when admitted. Cancellation
+    /// of a transport task does not withdraw an admitted command, so a queued continuation is
+    /// deliberately resumed and allowed to reconcile canonical state.
+    private var agentHandleCancelGateHolders: Set<WorkRef> = []
+    private var agentHandleCancelWaiters:
+        [WorkRef: [CheckedContinuation<Void, Never>]] = [:]
+    private var agentHandleCancelWaiterCount = 0
+    private static let maximumAgentHandleCancelWaiters =
+        WorkAgentHandleSnapshot.maximumRetainedPerWork
 
     public init(
         home: AgentHome,
@@ -1254,6 +1280,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         self.bounds = bounds
         self.canonicalResidentRecordLimit = max(
             1, min(canonicalResidentRecordLimit, JournalReadLimits.maximumResidentRecords))
+        self.agentHandleCanceller = nil
         let instance = WorkHostInstanceRef(
             host: persistedHost, instanceID: instanceID, startIdentity: startIdentity)
         self.hostInstance = instance
@@ -1268,6 +1295,16 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 home: home, workHost: persistedHost, actor: actor,
                 creationIdentityMinter: creationIdentityMinter)
         }
+    }
+
+    internal func installAgentHandleCanceller(
+        _ canceller: any WorkServiceAgentHandleCancelling
+    ) throws {
+        guard !loaded, agentHandleCanceller == nil else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "agent Handle canceller must be installed once before service use")
+        }
+        agentHandleCanceller = canceller
     }
 
     /// Return source-reader instrumentation without exposing cache contents or filesystem paths.
@@ -2590,6 +2627,210 @@ public actor JournalBackedWorkService: WorkServiceClient {
             data: body.subdata(in: request.offset..<end), nextOffset: end < body.count ? end : nil)
     }
 
+    public func cancelAgentHandle(
+        _ request: WorkServiceAgentHandleCancelRequest
+    ) async throws -> WorkServiceAgentHandleCancelResponse {
+        try await acquireAgentHandleCancelGate(for: request.work)
+        defer { releaseAgentHandleCancelGate(for: request.work) }
+        try await ensureLoaded()
+        try validateClient(request.command.client)
+        guard let client = request.command.client,
+              validArtifactIdentity(request.command.commandID),
+              validArtifactIdentity(request.handle.handleID),
+              validArtifactIdentity(request.work.workHostID),
+              validArtifactIdentity(request.work.workID),
+              validArtifactIdentity(request.journal.journalID),
+              validArtifactIdentity(request.journal.authority.authorityID),
+              request.command.causalCursor == request.causalWorkCursor,
+              request.causalWorkCursor.sequence >= 0,
+              (request.causalWorkCursor.eventID.map(validArtifactIdentity)
+                    ?? (request.causalWorkCursor.sequence == 0)),
+              request.causalWorkCursor.journal == request.journal,
+              request.journal.owner == .work(request.work),
+              request.journal.authority.authorityID == request.work.workHostID,
+              let commandAttachment = request.command.sessionAttachment,
+              validArtifactIdentity(commandAttachment.attachmentID) else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "agent Handle cancellation request is malformed")
+        }
+        let controlAttachment = try await requireAttached(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            client: client, capability: .control)
+        // Both grants must coexist in one canonical control snapshot. A second awaited lookup
+        // could combine `.control` from one attachment generation with `.cancel` from another.
+        guard controlAttachment.authorization.allows(.cancel) else {
+            throw WorkServiceProtocolError.capabilityDenied(.cancel)
+        }
+        let authorization = WorkServiceAuthorizationOutcome(
+            requested: [.control, .cancel], granted: [.control, .cancel], denied: [])
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        let caller = try callerWorkBinding(
+            controlAttachment, source: source, work: request.work)
+        guard request.command.sessionAttachment == caller.sessionAttachment else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "agent Handle cancellation Session attachment does not match the caller")
+        }
+        let canonicalCommand = WorkServiceCommandLedgerIdentity.command(
+            from: request.command, client: client)
+        let commandID = canonicalCommand.commandID
+
+        if source.workState.commands[commandID] != nil {
+            return try agentHandleCancelResponse(
+                request, disposition: .rejected, authorization: authorization,
+                rejection: .conflictingCommand,
+                diagnostic: "command identity already names a Run or Work command")
+        }
+        let claimedCancellations = source.workState.agentHandles.values.filter {
+            $0.cancellationEvidence?.command?.commandID == commandID
+        }
+        if let claimed = claimedCancellations.first {
+            guard claimedCancellations.count == 1,
+                  claimed.handle == request.handle,
+                  claimed.cancellationEvidence?.command == canonicalCommand else {
+                return try agentHandleCancelResponse(
+                    request, disposition: .rejected, authorization: authorization,
+                    rejection: .conflictingCommand,
+                    diagnostic: "command identity already names another agent Handle cancellation")
+            }
+            return try agentHandleCancelResponse(
+                request, disposition: .duplicate, authorization: authorization,
+                cancellation: claimed.cancellationEvidence,
+                terminal: claimed.terminalEvidence)
+        }
+        guard let record = source.workState.agentHandles[request.handle.handleID] else {
+            return try agentHandleCancelResponse(
+                request, disposition: .rejected, authorization: authorization,
+                rejection: .invalidState,
+                diagnostic: "agent Handle is not present in canonical Work state")
+        }
+        switch record.state {
+        case .cancelRequested:
+            guard let cancellation = record.cancellationEvidence else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            return try agentHandleCancelResponse(
+                request, disposition: .alreadyRequested, authorization: authorization,
+                cancellation: cancellation, terminal: record.terminalEvidence)
+        case .terminal, .reaped:
+            guard let terminal = record.terminalEvidence else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            return try agentHandleCancelResponse(
+                request, disposition: .alreadyTerminal, authorization: authorization,
+                cancellation: record.cancellationEvidence, terminal: terminal)
+        case .queued, .running:
+            break
+        }
+        guard request.causalWorkCursor == source.workCursor else {
+            throw WorkServiceProtocolError.staleCursor(
+                expected: source.workCursor, actual: request.causalWorkCursor)
+        }
+        guard let agentHandleCanceller else {
+            return try agentHandleCancelResponse(
+                request, disposition: .unavailable, authorization: authorization,
+                diagnostic: "the canonical agent Handle has no live owner in this Work Host")
+        }
+
+        let result: WorkAgentChildCoordinator.CancellationResult?
+        do {
+            result = try await agentHandleCanceller.cancel(
+                work: request.work, handle: request.handle, command: canonicalCommand)
+        } catch {
+            // Any append error may follow a durable write. Reconcile exactly once and never call
+            // the effect boundary again from this request.
+            result = nil
+        }
+        let reconciled: CanonicalSource?
+        do {
+            reconciled = try await requireCanonical(
+                work: request.work, journal: request.journal)
+        } catch {
+            reconciled = nil
+        }
+        if let reconciled,
+           reconciled.workState.commands[commandID] != nil
+                || reconciled.workState.agentHandles.values.contains(where: { claimed in
+                    guard let command = claimed.cancellationEvidence?.command,
+                          command.commandID == commandID else { return false }
+                    return claimed.handle != request.handle || command != canonicalCommand
+                }) {
+            return try agentHandleCancelResponse(
+                request, disposition: .rejected, authorization: authorization,
+                rejection: .conflictingCommand,
+                diagnostic: "command identity was claimed by a concurrent Work mutation")
+        }
+        guard let latestRecord = reconciled?.workState.agentHandles[request.handle.handleID] else {
+            return try agentHandleCancelResponse(
+                request, disposition: .ambiguous, authorization: authorization,
+                diagnostic: "agent Handle cancellation could not be reconciled canonically")
+        }
+        if let cancellation = latestRecord.cancellationEvidence,
+           cancellation.command == canonicalCommand {
+            let disposition: WorkServiceAgentHandleCancelDisposition
+            switch result {
+            case .alreadyRequested?: disposition = .duplicate
+            default: disposition = .accepted
+            }
+            return try agentHandleCancelResponse(
+                request, disposition: disposition, authorization: authorization,
+                cancellation: cancellation, terminal: latestRecord.terminalEvidence)
+        }
+        if let terminal = latestRecord.terminalEvidence {
+            return try agentHandleCancelResponse(
+                request, disposition: .alreadyTerminal, authorization: authorization,
+                cancellation: latestRecord.cancellationEvidence, terminal: terminal)
+        }
+        if let cancellation = latestRecord.cancellationEvidence {
+            return try agentHandleCancelResponse(
+                request, disposition: .alreadyRequested, authorization: authorization,
+                cancellation: cancellation)
+        }
+        switch result {
+        case .some(.unavailable):
+            return try agentHandleCancelResponse(
+                request, disposition: .unavailable, authorization: authorization,
+                diagnostic: "the canonical agent Handle is not owned by this process")
+        case .some(.alreadyTerminal):
+            // A terminal claim without its canonical terminal proof is not a receipt.
+            fallthrough
+        case .some(.accepted), .some(.alreadyRequested), .some(.ambiguous), nil:
+            return try agentHandleCancelResponse(
+                request, disposition: .ambiguous, authorization: authorization,
+                diagnostic: "agent Handle cancellation has no matching canonical proof")
+        }
+    }
+
+    private func acquireAgentHandleCancelGate(for work: WorkRef) async throws {
+        if !agentHandleCancelGateHolders.contains(work) {
+            guard agentHandleCancelGateHolders.count
+                    < WorkAgentHandleSnapshot.maximumRetainedPerWork else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            agentHandleCancelGateHolders.insert(work)
+            return
+        }
+        guard agentHandleCancelWaiterCount < Self.maximumAgentHandleCancelWaiters else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        agentHandleCancelWaiterCount += 1
+        await withCheckedContinuation { continuation in
+            agentHandleCancelWaiters[work, default: []].append(continuation)
+        }
+    }
+
+    private func releaseAgentHandleCancelGate(for work: WorkRef) {
+        guard var waiters = agentHandleCancelWaiters[work], !waiters.isEmpty else {
+            agentHandleCancelWaiters.removeValue(forKey: work)
+            agentHandleCancelGateHolders.remove(work)
+            return
+        }
+        let next = waiters.removeFirst()
+        agentHandleCancelWaiterCount -= 1
+        if waiters.isEmpty { agentHandleCancelWaiters.removeValue(forKey: work) }
+        else { agentHandleCancelWaiters[work] = waiters }
+        next.resume()
+    }
+
     public func command(_ request: WorkServiceCommandRequest) async throws
         -> WorkServiceCommandReceipt {
         try await ensureLoaded()
@@ -2644,6 +2885,16 @@ public actor JournalBackedWorkService: WorkServiceClient {
         let callerBinding = try callerWorkBinding(attachment, source: source, work: request.work)
         let commandLedgerID = qualifiedCommandID(clientID: client.clientID,
                                                   commandID: request.command.commandID)
+        if source.workState.agentHandles.values.contains(where: {
+            $0.cancellationEvidence?.command?.commandID == commandLedgerID
+        }) {
+            return WorkServiceCommandReceipt(
+                work: request.work, commandID: request.command.commandID, state: .rejected,
+                host: hostInstance, causalWorkCursor: request.causalWorkCursor,
+                resultingWorkCursor: nil, authorization: attachment.authorization,
+                rejection: .conflictingCommand,
+                diagnostic: "command identity already names an agent Handle cancellation")
+        }
         let priorCommand = source.workState.commands[commandLedgerID]
         switch request.kind {
         case .start:
@@ -6597,10 +6848,10 @@ public actor JournalBackedWorkService: WorkServiceClient {
         return result
     }
 
-    /// Work journals have two body-bearing producer shapes.  Artifact bodies must come from a
-    /// valid bounded artifact descriptor; observe-only command bodies must be direct references
-    /// on a recognized input command that explicitly carries session input.  A reference in any
-    /// other Work event is intentionally unknown, even when the retained body itself exists.
+    /// Work journals have a small typed body-bearing producer vocabulary. Artifact bodies must
+    /// come from a valid bounded descriptor; observe-only command and Work-owned agent child
+    /// bodies must be direct references in their exact producer payload. A reference in any
+    /// other Work event is intentionally unknown, even when the retained bytes exist.
     private func workBodyReferenceKind(
         in event: TimelineEvent, work: WorkRef, reference: TimelineBodyReference
     ) -> CanonicalBodyReferenceKind? {
@@ -6612,6 +6863,28 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 return .unknown
             }
             return .artifact
+        }
+        if event.type == TimelineEventType.agentHandleQueued {
+            guard event.work == work,
+                  let data = try? JSONEncoder().encode(event.payload),
+                  let payload = try? JSONDecoder().decode(
+                      WorkAgentHandleQueuedPayload.self, from: data),
+                  payload.requestBody == reference,
+                  validArtifactBodyReference(reference, journal: event.journal) else {
+                return .unknown
+            }
+            return .context
+        }
+        if event.type == TimelineEventType.agentHandleTerminal {
+            guard event.work == work,
+                  let data = try? JSONEncoder().encode(event.payload),
+                  let payload = try? JSONDecoder().decode(
+                      WorkAgentHandleTerminalPayload.self, from: data),
+                  payload.resultBody == reference,
+                  validArtifactBodyReference(reference, journal: event.journal) else {
+                return .unknown
+            }
+            return .context
         }
         guard event.type == TimelineEventType.commandAccepted,
               let object = event.payload.objectValue,
@@ -7013,6 +7286,37 @@ public actor JournalBackedWorkService: WorkServiceClient {
             return false
         }
         return (try? ContextBodyStore(home: home).read(reference)) == bytes
+    }
+
+    private func agentHandleCancelResponse(
+        _ request: WorkServiceAgentHandleCancelRequest,
+        disposition: WorkServiceAgentHandleCancelDisposition,
+        authorization: WorkServiceAuthorizationOutcome,
+        cancellation: WorkAgentHandleCancellationEvidence? = nil,
+        terminal: WorkAgentHandleTerminalEvidence? = nil,
+        rejection: WorkServiceCommandRejection? = nil,
+        diagnostic: String? = nil
+    ) throws -> WorkServiceAgentHandleCancelResponse {
+        let resulting: JournalCursor?
+        if disposition == .accepted || disposition == .duplicate {
+            guard let event = cancellation?.event else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            resulting = JournalCursor(
+                journal: event.event.journal, eventID: event.event.eventID,
+                sequence: event.sequence)
+        } else {
+            resulting = nil
+        }
+        let response = try WorkServiceAgentHandleCancelResponse(
+            work: request.work, handle: request.handle,
+            commandID: request.command.commandID, disposition: disposition,
+            responder: hostInstance, causalWorkCursor: request.causalWorkCursor,
+            resultingWorkCursor: resulting, authorization: authorization,
+            cancellationEvidence: cancellation, terminalEvidence: terminal,
+            rejection: rejection, diagnostic: diagnostic)
+        try response.validate(for: request)
+        return response
     }
 
     private func validConfigurationBounds(_ configuration: WorkServiceWorkConfiguration) -> Bool {

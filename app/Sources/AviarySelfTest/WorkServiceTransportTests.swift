@@ -1665,6 +1665,11 @@ private final class DelayedWorkService: WorkServiceClient, @unchecked Sendable {
         -> WorkServiceCommandReceipt {
         try await base.command(request)
     }
+
+    func cancelAgentHandle(_ request: WorkServiceAgentHandleCancelRequest) async throws
+        -> WorkServiceAgentHandleCancelResponse {
+        try await base.cancelAgentHandle(request)
+    }
 }
 
 private func transportDelayedFixture(
@@ -3197,7 +3202,287 @@ func test_workServiceHistoryInitialNilAndStaleBranchAreTruthful() async throws {
     }
 }
 
+func test_workServiceTransportAgentHandleCancellationIsExplicit() async throws {
+    let fixture = try await transportFixture(path: transportSocketPath())
+    do {
+        let handshake = try await fixture.clientA.connect(build: "child-cancel-test")
+        XCTAssertEqual(handshake.negotiatedVersion, 4)
+        let created = try await fixture.clientA.createWork(.init(
+            client: transportClientA, commandID: "child-control-create",
+            causalControlCursor: handshake.controlCursor,
+            requestedCapabilities: [.observe, .control, .cancel]))
+        let request = WorkServiceAgentHandleCancelRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, handle: HandleRef("unknown-child"),
+            commandID: "cancel-unknown-child", client: transportClientA,
+            sessionAttachment: created.sessionAttachment, causalWorkCursor: created.workCursor)
+        let before = try await fixture.clientA.snapshot(.init(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: transportClientA,
+            target: .work(journal: created.work.journal)))
+        let result = try await fixture.clientA.cancelAgentHandle(request)
+        XCTAssertEqual(result.disposition, .rejected)
+        XCTAssertNil(result.resultingWorkCursor)
+        XCTAssertNil(result.cancellationEvidence)
+        XCTAssertEqual(result.responder, handshake.hostInstance)
+        let after = try await fixture.clientA.snapshot(.init(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, client: transportClientA,
+            target: .work(journal: created.work.journal)))
+        XCTAssertEqual(after.servedCursor, before.servedCursor)
+        XCTAssertEqual(after.events, before.events)
+
+        let foreignClient = WorkServiceAgentHandleCancelRequest(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            handle: request.handle, commandID: "wrong-client", client: transportClientB,
+            sessionAttachment: created.sessionAttachment, causalWorkCursor: request.causalWorkCursor)
+        do {
+            _ = try await fixture.clientA.cancelAgentHandle(foreignClient)
+            XCTAssertTrue(false, "child cancellation must bind the request client to the connection")
+        } catch WorkServiceTransportError.remote(let code, _) {
+            XCTAssertEqual(code, .identityMismatch)
+        }
+        await stopTransport(fixture.server, [fixture.clientA])
+    } catch {
+        await stopTransport(fixture.server, [fixture.clientA])
+        throw error
+    }
+}
+
+func test_workServiceTransportAgentHandleCancellationRejectsInventedReceipts() throws {
+    let host = WorkHostInstanceRef(
+        host: transportHost, instanceID: "child-proof-instance", startIdentity: "child-proof-start")
+    let cursor = JournalCursor(journal: transportJournal, eventID: "before-child-cancel", sequence: 10)
+    let request = WorkServiceAgentHandleCancelRequest(
+        work: transportWork, journal: transportJournal,
+        attachment: ClientAttachmentRef("child-client-attachment"), handle: HandleRef("child-proof"),
+        commandID: "child-proof-command", client: transportClientA,
+        sessionAttachment: SessionAttachmentRef("child-session-attachment"), causalWorkCursor: cursor)
+    let result = try WorkServiceAgentHandleCancelResponse(
+        work: transportWork, handle: request.handle, commandID: request.command.commandID,
+        disposition: .unavailable, responder: host, causalWorkCursor: cursor,
+        authorization: .init(requested: [.control, .cancel], granted: [.control, .cancel], denied: []))
+    let requestEnvelope = WorkServiceTransportRequestEnvelope(
+        id: "child-proof-envelope", operation: .cancelAgentHandle, client: transportClientA,
+        payload: try transportEnvelopePayload(request))
+    let payload = try transportEnvelopePayload(result)
+    func validate(_ data: JSONValue) throws {
+        let envelope = WorkServiceTransportResponseEnvelope(
+            id: requestEnvelope.id, ok: true, data: data, hostInstance: host)
+        try WorkServiceTransportCodec.validateResponseSemantics(envelope, operation: .cancelAgentHandle)
+        try WorkServiceTransportCodec.validateResponseCorrelation(
+            envelope, request: requestEnvelope, expectedHostInstance: host)
+    }
+    try validate(payload)
+    XCTAssertTrue(true, "unavailable is an observation, not a fabricated command receipt")
+    guard case .object(let original) = payload else {
+        XCTAssertTrue(false, "cancel response must encode as an object"); return
+    }
+    let mutations: [(String, JSONValue)] = [
+        ("disposition", .string("accepted")),
+        ("disposition", .string("duplicate")),
+        ("disposition", .string("already_requested")),
+        ("disposition", .string("already_terminal")),
+        ("resultingWorkCursor", try transportEnvelopePayload(cursor)),
+        ("commandID", .string("another-command")),
+        ("handle", try transportEnvelopePayload(HandleRef("another-child"))),
+        ("authorization", try transportEnvelopePayload(WorkServiceAuthorizationOutcome(
+            requested: [.control], granted: [.control], denied: []))),
+        ("responder", try transportEnvelopePayload(WorkHostInstanceRef(
+            host: transportHost, instanceID: "another-instance", startIdentity: "another-start"))),
+    ]
+    for (key, value) in mutations {
+        var changed = original
+        changed[key] = value
+        do {
+            try validate(.object(changed))
+            XCTAssertTrue(false, "invalid child cancellation response accepted: \(key)")
+        } catch WorkServiceTransportError.invalidResponse {
+            XCTAssertTrue(true)
+        }
+    }
+}
+
+func test_workServiceTransportAgentHandleCanonicalProofCorrelation() throws {
+    let host = WorkHostInstanceRef(
+        host: transportHost, instanceID: "child-reply-current", startIdentity: "child-reply-start")
+    let cursor = JournalCursor(journal: transportJournal, eventID: "unrelated-work-event", sequence: 10)
+    let request = WorkServiceAgentHandleCancelRequest(
+        work: transportWork, journal: transportJournal,
+        attachment: ClientAttachmentRef("second-gui"), handle: HandleRef("owned-child"),
+        commandID: "cancel-once", client: transportClientA,
+        sessionAttachment: SessionAttachmentRef("second-session"), causalWorkCursor: cursor)
+    let canonicalCommand = WorkServiceCommandLedgerIdentity.command(
+        from: request.command, client: transportClientA)
+    let cancelEvent = TimelineEvent(
+        eventID: "canonical-child-cancel", journal: transportJournal, sequence: 11,
+        command: canonicalCommand, previousEventID: cursor.eventID,
+        causedByEventID: EventRef(journal: transportJournal, eventID: "child-queued-earlier"),
+        session: SessionRef("origin-session"), work: transportWork, workHost: transportHost,
+        client: transportClientA, sessionAttachment: SessionAttachmentRef("origin-attachment"),
+        run: RunRef("origin-run"), handle: request.handle,
+        actor: TimelineActor(actorID: "prior-host-writer", kind: "work-host"),
+        hostRecordedAt: Date(timeIntervalSince1970: 1_700_000_000),
+        type: TimelineEventType.agentHandleCancelRequested,
+        declaredDomains: [.work, .runtime, .externalEffects])
+    let cancellation = WorkAgentHandleCancellationEvidence(
+        cause: .client, event: WorkAgentHandleEventEvidence(cancelEvent), command: canonicalCommand)
+    let terminalEvent = TimelineEvent(
+        eventID: "canonical-child-terminal", journal: transportJournal, sequence: 12,
+        previousEventID: cancelEvent.eventID,
+        causedByEventID: EventRef(journal: transportJournal, eventID: cancelEvent.eventID),
+        session: cancelEvent.session, work: transportWork, workHost: transportHost,
+        sessionAttachment: cancelEvent.sessionAttachment, run: cancelEvent.run, handle: request.handle,
+        actor: cancelEvent.actor, hostRecordedAt: Date(timeIntervalSince1970: 1_700_000_001),
+        type: TimelineEventType.agentHandleTerminal, declaredDomains: [.work, .runtime, .externalEffects])
+    let terminal = WorkAgentHandleTerminalEvidence(
+        outcome: .canceled, cleanup: .init(state: .notStarted),
+        event: WorkAgentHandleEventEvidence(terminalEvent))
+    let response = try WorkServiceAgentHandleCancelResponse(
+        work: transportWork, handle: request.handle, commandID: request.command.commandID,
+        disposition: .duplicate, responder: host, causalWorkCursor: cursor,
+        resultingWorkCursor: JournalCursor(
+            journal: transportJournal, eventID: cancelEvent.eventID, sequence: cancelEvent.sequence),
+        authorization: .init(requested: [.control, .cancel], granted: [.control, .cancel], denied: []),
+        cancellationEvidence: cancellation, terminalEvidence: terminal)
+    let requestEnvelope = WorkServiceTransportRequestEnvelope(
+        id: "child-canonical-correlation", operation: .cancelAgentHandle,
+        client: transportClientA, payload: try transportEnvelopePayload(request))
+    func validate(_ data: JSONValue) throws {
+        let envelope = WorkServiceTransportResponseEnvelope(
+            id: requestEnvelope.id, ok: true, data: data, hostInstance: host)
+        try WorkServiceTransportCodec.validateResponseSemantics(envelope, operation: .cancelAgentHandle)
+        try WorkServiceTransportCodec.validateResponseCorrelation(
+            envelope, request: requestEnvelope, expectedHostInstance: host)
+    }
+    let payload = try transportEnvelopePayload(response)
+    try validate(payload)
+    XCTAssertNil(cancellation.event.hostSequence, "journal sequence is sufficient; host sequence is optional")
+    XCTAssertNotEqual(canonicalCommand.sessionAttachment, cancelEvent.sessionAttachment)
+    XCTAssertNotEqual(cancelEvent.previousEventID, cancelEvent.causedByEventID?.eventID)
+    guard case .object(let original) = payload,
+          case .object(let cancel) = original["cancellationEvidence"],
+          case .object(let event) = cancel["event"] else {
+        XCTAssertTrue(false, "canonical cancellation evidence must be retained"); return
+    }
+    let eventMutations: [(String, JSONValue)] = [
+        ("handle", try transportEnvelopePayload(HandleRef("wrong-child"))),
+        ("work", try transportEnvelopePayload(WorkRef(workHostID: transportHost.workHostID, workID: "wrong-work"))),
+        ("sequence", .number(12)),
+        ("previousEventID", .string("wrong-predecessor")),
+        ("client", try transportEnvelopePayload(transportClientB)),
+        ("provenance", .string("legacy_adapted")),
+        ("causedByEventID", try transportEnvelopePayload(EventRef(
+            journal: .work(WorkRef(workHostID: "foreign-host", workID: "foreign-work")),
+            eventID: "foreign-cause"))),
+        ("causedByEventID", try transportEnvelopePayload(EventRef(
+            journal: transportJournal, eventID: cancelEvent.eventID))),
+        ("actor", .object([
+            "actorID": .string(String(repeating: "x", count: 8_192)), "kind": .string("work-host"),
+        ])),
+    ]
+    for (key, value) in eventMutations {
+        var changedEvent = event
+        changedEvent[key] = value
+        var changedCancellation = cancel
+        changedCancellation["event"] = .object(changedEvent)
+        var changed = original
+        changed["cancellationEvidence"] = .object(changedCancellation)
+        do {
+            try validate(.object(changed))
+            XCTAssertTrue(false, "invalid exact child proof accepted: \(key)")
+        } catch WorkServiceTransportError.invalidResponse { XCTAssertTrue(true) }
+    }
+    guard case .object(let terminalObject) = original["terminalEvidence"] else {
+        XCTAssertTrue(false, "terminal evidence must be retained"); return
+    }
+    var selfPreviousEvent = event
+    selfPreviousEvent["event"] = try transportEnvelopePayload(EventRef(
+        journal: transportJournal, eventID: cursor.eventID!))
+    var selfPreviousCancellation = cancel
+    selfPreviousCancellation["event"] = .object(selfPreviousEvent)
+    var selfPrevious = original
+    selfPrevious["cancellationEvidence"] = .object(selfPreviousCancellation)
+    selfPrevious.removeValue(forKey: "terminalEvidence")
+    selfPrevious["resultingWorkCursor"] = try transportEnvelopePayload(JournalCursor(
+        journal: transportJournal, eventID: cursor.eventID, sequence: cancelEvent.sequence))
+    do {
+        try validate(.object(selfPrevious))
+        XCTAssertTrue(false, "a cancellation event cannot be its own physical predecessor")
+    } catch WorkServiceTransportError.invalidResponse { XCTAssertTrue(true) }
+
+    var selfCleanupTerminal = terminalObject
+    selfCleanupTerminal["cleanup"] = try transportEnvelopePayload(
+        WorkAgentHandleCleanupProof(state: .quiesced, evidence: EventRef(
+            journal: transportJournal, eventID: terminalEvent.eventID)))
+    var selfCleanup = original
+    selfCleanup["terminalEvidence"] = .object(selfCleanupTerminal)
+    do {
+        try validate(.object(selfCleanup))
+        XCTAssertTrue(false, "terminal cleanup evidence must precede the terminal event")
+    } catch WorkServiceTransportError.invalidResponse { XCTAssertTrue(true) }
+
+    if case .object(var terminalProofEvent) = terminalObject["event"] {
+        var orderedCancellationEvent = event
+        orderedCancellationEvent["hostSequence"] = .number(40)
+        var orderedCancellation = cancel
+        orderedCancellation["event"] = .object(orderedCancellationEvent)
+        terminalProofEvent["hostSequence"] = .number(40)
+        var unorderedTerminal = terminalObject
+        unorderedTerminal["event"] = .object(terminalProofEvent)
+        var unordered = original
+        unordered["cancellationEvidence"] = .object(orderedCancellation)
+        unordered["terminalEvidence"] = .object(unorderedTerminal)
+        do {
+            try validate(.object(unordered))
+            XCTAssertTrue(false, "terminal host sequence must advance beyond cancellation")
+        } catch WorkServiceTransportError.invalidResponse { XCTAssertTrue(true) }
+    } else { XCTFail("terminal event proof must encode as an object") }
+    var forgedTerminal = terminalObject
+    forgedTerminal["outcome"] = .string("succeeded")
+    var succeededWithoutBody = original
+    succeededWithoutBody["terminalEvidence"] = .object(forgedTerminal)
+    do {
+        try validate(.object(succeededWithoutBody))
+        XCTAssertTrue(false, "success requires a retained canonical result body")
+    } catch WorkServiceTransportError.invalidResponse { XCTAssertTrue(true) }
+    // Supplying a well-formed body must not turn a canceled child into a successful one.
+    let bodyDigest = "sha256:" + AviarySHA256.hash(data: Data("result".utf8))
+        .map { String(format: "%02x", $0) }.joined()
+    forgedTerminal["resultBody"] = try transportEnvelopePayload(TimelineBodyReference(
+        authority: transportJournal, referenceID: bodyDigest, mediaType: "text/plain",
+        byteCount: 6, digest: bodyDigest))
+    forgedTerminal["cleanup"] = try transportEnvelopePayload(
+        WorkAgentHandleCleanupProof(state: .quiesced))
+    var canceledThenSucceeded = original
+    canceledThenSucceeded["terminalEvidence"] = .object(forgedTerminal)
+    do {
+        try validate(.object(canceledThenSucceeded))
+        XCTAssertTrue(false, "a canonical cancellation cannot lead to succeeded")
+    } catch WorkServiceTransportError.invalidResponse { XCTAssertTrue(true) }
+    forgedTerminal["cleanup"] = try transportEnvelopePayload(
+        WorkAgentHandleCleanupProof(state: .notStarted))
+    var unstartedSuccess = original
+    unstartedSuccess["disposition"] = .string("already_terminal")
+    unstartedSuccess.removeValue(forKey: "cancellationEvidence")
+    unstartedSuccess.removeValue(forKey: "resultingWorkCursor")
+    unstartedSuccess["terminalEvidence"] = .object(forgedTerminal)
+    do {
+        try validate(.object(unstartedSuccess))
+        XCTAssertTrue(false, "not-started cleanup cannot prove a successful execution")
+    } catch WorkServiceTransportError.invalidResponse { XCTAssertTrue(true) }
+}
+
 let casesWorkServiceTransport: [Case] = [
+    ("phase5 child cancellation transport: canonical proof survives terminalization", {
+        try test_workServiceTransportAgentHandleCanonicalProofCorrelation()
+    }),
+    ("phase5 child cancellation transport: explicit operation and connection identity", {
+        try await test_workServiceTransportAgentHandleCancellationIsExplicit()
+    }),
+    ("phase5 child cancellation transport: no invented receipt or authority", {
+        try test_workServiceTransportAgentHandleCancellationRejectsInventedReceipts()
+    }),
     ("phase3 Work service transport: history page boundaries and digest correlation", {
         try test_workServiceTransportHistoryPageCorrelationAndBoundaries()
     }),

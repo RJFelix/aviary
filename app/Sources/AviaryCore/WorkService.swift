@@ -9,9 +9,9 @@ public enum WorkServiceProtocol {
     // Version 3 adds authenticated reverse conversation-history pages. There is deliberately no
     // v2 compatibility path: an older daemon must fail the handshake instead of accepting a GUI
     // whose history operation it cannot decode.
-    public static let currentVersion = 3
-    public static let minimumSupportedVersion = 3
-    public static let maximumSupportedVersion = 3
+    public static let currentVersion = 4
+    public static let minimumSupportedVersion = 4
+    public static let maximumSupportedVersion = 4
 }
 
 /// A bounded surface is intentional: protocol values must be safe to render even when a remote
@@ -2229,6 +2229,394 @@ public struct WorkServiceCommandRequest: Codable, Hashable, Sendable {
     }
 }
 
+/// A Work-owned agent Handle cancellation is not a Run cancellation. Its authority is the
+/// caller's canonical Work attachment, and its effect remains addressable after the origin Run
+/// ends. Keeping the Handle typed also prevents a generic command value from becoming an
+/// unvalidated identity channel.
+public struct WorkServiceAgentHandleCancelRequest: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let journal: JournalRef
+    public let attachment: ClientAttachmentRef
+    public let handle: HandleRef
+    public let command: CommandRef
+    /// Required duplicate of the command envelope cursor. A decoder or adapter may not turn the
+    /// mutation into an unconditional cancellation by dropping either copy.
+    public let causalWorkCursor: JournalCursor
+
+    public init(
+        work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
+        handle: HandleRef, commandID: String, client: ClientRef,
+        sessionAttachment: SessionAttachmentRef, causalWorkCursor: JournalCursor
+    ) {
+        self.work = work
+        self.journal = journal
+        self.attachment = attachment
+        self.handle = handle
+        self.causalWorkCursor = causalWorkCursor
+        self.command = CommandRef(
+            commandID: commandID, client: client, sessionAttachment: sessionAttachment,
+            causalCursor: causalWorkCursor)
+    }
+}
+
+/// Only `accepted` and `duplicate` prove this caller's command. The remaining successful reads
+/// describe canonical Handle state without pretending that a new command was recorded.
+public enum WorkServiceAgentHandleCancelDisposition: String, Codable, Hashable, Sendable {
+    case accepted
+    case duplicate
+    case alreadyRequested = "already_requested"
+    case alreadyTerminal = "already_terminal"
+    case unavailable
+    case ambiguous
+    case rejected
+}
+
+public struct WorkServiceAgentHandleCancelResponse: Codable, Hashable, Sendable {
+    public let work: WorkRef
+    public let handle: HandleRef
+    /// The caller-local identity. Canonical evidence carries the client-qualified ledger ID.
+    public let commandID: String
+    public let disposition: WorkServiceAgentHandleCancelDisposition
+    /// The daemon answering now, not necessarily the process generation which wrote the proof.
+    public let responder: WorkHostInstanceRef
+    public let causalWorkCursor: JournalCursor
+    /// Present only when canonical evidence proves this exact caller command.
+    public let resultingWorkCursor: JournalCursor?
+    public let authorization: WorkServiceAuthorizationOutcome
+    public let cancellationEvidence: WorkAgentHandleCancellationEvidence?
+    public let terminalEvidence: WorkAgentHandleTerminalEvidence?
+    public let rejection: WorkServiceCommandRejection?
+    public let diagnostic: String?
+
+    public init(
+        work: WorkRef, handle: HandleRef, commandID: String,
+        disposition: WorkServiceAgentHandleCancelDisposition,
+        responder: WorkHostInstanceRef, causalWorkCursor: JournalCursor,
+        resultingWorkCursor: JournalCursor? = nil,
+        authorization: WorkServiceAuthorizationOutcome,
+        cancellationEvidence: WorkAgentHandleCancellationEvidence? = nil,
+        terminalEvidence: WorkAgentHandleTerminalEvidence? = nil,
+        rejection: WorkServiceCommandRejection? = nil,
+        diagnostic: String? = nil
+    ) throws {
+        self.work = work
+        self.handle = handle
+        self.commandID = commandID
+        self.disposition = disposition
+        self.responder = responder
+        self.causalWorkCursor = causalWorkCursor
+        self.resultingWorkCursor = resultingWorkCursor
+        self.authorization = authorization
+        self.cancellationEvidence = cancellationEvidence
+        self.terminalEvidence = terminalEvidence
+        self.rejection = rejection
+        let boundedDiagnostic = WorkServiceText.bound(diagnostic)
+        guard boundedDiagnostic == diagnostic else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "agent Handle cancellation diagnostic exceeds its protocol bound")
+        }
+        self.diagnostic = boundedDiagnostic
+        try validateShape()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case work, handle, commandID, disposition, responder, causalWorkCursor
+        case resultingWorkCursor, authorization, cancellationEvidence, terminalEvidence
+        case rejection, diagnostic
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            work: container.decode(WorkRef.self, forKey: .work),
+            handle: container.decode(HandleRef.self, forKey: .handle),
+            commandID: container.decode(String.self, forKey: .commandID),
+            disposition: container.decode(
+                WorkServiceAgentHandleCancelDisposition.self, forKey: .disposition),
+            responder: container.decode(WorkHostInstanceRef.self, forKey: .responder),
+            causalWorkCursor: container.decode(JournalCursor.self, forKey: .causalWorkCursor),
+            resultingWorkCursor: container.decodeIfPresent(
+                JournalCursor.self, forKey: .resultingWorkCursor),
+            authorization: container.decode(
+                WorkServiceAuthorizationOutcome.self, forKey: .authorization),
+            cancellationEvidence: container.decodeIfPresent(
+                WorkAgentHandleCancellationEvidence.self, forKey: .cancellationEvidence),
+            terminalEvidence: container.decodeIfPresent(
+                WorkAgentHandleTerminalEvidence.self, forKey: .terminalEvidence),
+            rejection: container.decodeIfPresent(
+                WorkServiceCommandRejection.self, forKey: .rejection),
+            diagnostic: container.decodeIfPresent(String.self, forKey: .diagnostic))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try validateShape()
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(work, forKey: .work)
+        try container.encode(handle, forKey: .handle)
+        try container.encode(commandID, forKey: .commandID)
+        try container.encode(disposition, forKey: .disposition)
+        try container.encode(responder, forKey: .responder)
+        try container.encode(causalWorkCursor, forKey: .causalWorkCursor)
+        try container.encodeIfPresent(resultingWorkCursor, forKey: .resultingWorkCursor)
+        try container.encode(authorization, forKey: .authorization)
+        try container.encodeIfPresent(cancellationEvidence, forKey: .cancellationEvidence)
+        try container.encodeIfPresent(terminalEvidence, forKey: .terminalEvidence)
+        try container.encodeIfPresent(rejection, forKey: .rejection)
+        try container.encodeIfPresent(diagnostic, forKey: .diagnostic)
+    }
+
+    /// Correlate an untrusted wire response to the exact request. The transport separately binds
+    /// `responder` to its negotiated host-instance generation.
+    public func validate() throws {
+        try validateShape()
+    }
+
+    public func validate(for request: WorkServiceAgentHandleCancelRequest) throws {
+        try validateShape()
+        let (expectedEvidenceSequence, overflow) = request.causalWorkCursor.sequence
+            .addingReportingOverflow(1)
+        guard work == request.work, handle == request.handle,
+              commandID == request.command.commandID,
+              causalWorkCursor == request.causalWorkCursor,
+              causalWorkCursor.journal == request.journal,
+              let client = request.command.client,
+              request.command.causalCursor == request.causalWorkCursor,
+              responder.host == WorkHostRef(request.work.workHostID), !overflow else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "agent Handle cancellation response does not match its request")
+        }
+        if disposition == .accepted || disposition == .duplicate {
+            let expected = WorkServiceCommandLedgerIdentity.command(
+                from: request.command, client: client)
+            guard cancellationEvidence?.cause == .client,
+                  cancellationEvidence?.command == expected,
+                  let evidence = cancellationEvidence?.event,
+                  evidence.event.journal == request.journal,
+                  evidence.sequence == expectedEvidenceSequence,
+                  evidence.previousEventID == request.causalWorkCursor.eventID,
+                  evidence.event.eventID == resultingWorkCursor?.eventID,
+                  evidence.sequence == resultingWorkCursor?.sequence else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "agent Handle cancellation response lacks exact command evidence")
+            }
+        }
+    }
+
+    private func validateShape() throws {
+        let requested: Set<WorkServiceCapability> = [.control, .cancel]
+        guard Self.validIdentity(commandID), Self.validIdentity(handle.handleID),
+              Self.validIdentity(work.workHostID), Self.validIdentity(work.workID),
+              Self.validIdentity(causalWorkCursor.journal.journalID),
+              Self.validIdentity(causalWorkCursor.journal.authority.authorityID),
+              Self.validIdentity(responder.host.workHostID),
+              Self.validIdentity(responder.instanceID),
+              Self.validIdentity(responder.startIdentity),
+              responder.host == WorkHostRef(work.workHostID),
+              causalWorkCursor.sequence >= 0,
+              (causalWorkCursor.eventID.map(Self.validIdentity)
+                    ?? (causalWorkCursor.sequence == 0)),
+              causalWorkCursor.journal.owner == .work(work),
+              authorization.requested == requested,
+              authorization.granted == requested,
+              authorization.denied.isEmpty,
+              authorization.diagnostic.map({
+                  $0.utf8.count <= WorkServiceBounds.maxDiagnosticCharacters
+              }) ?? true else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "agent Handle cancellation response is malformed")
+        }
+        if let cancellationEvidence {
+            let event = cancellationEvidence.event
+            let (priorSequence, underflow) = event.sequence.subtractingReportingOverflow(1)
+            guard try Self.validAgentHandleEvidence(
+                    event, work: work, handle: handle, journal: causalWorkCursor.journal),
+                  event.work == work, event.workHost == WorkHostRef(work.workHostID),
+                  event.handle == handle,
+                  event.sequence > 0, !underflow,
+                  !event.event.eventID.isEmpty,
+                  event.previousEventID != nil,
+                  event.causedByEventID != nil else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "agent Handle cancellation evidence is malformed")
+            }
+            if cancellationEvidence.cause == .client {
+                guard let command = cancellationEvidence.command,
+                      let commandClient = command.client, event.client == command.client,
+                      Self.validIdentity(command.commandID),
+                      Self.validIdentity(commandClient.clientID),
+                      let commandAttachment = command.sessionAttachment,
+                      Self.validIdentity(commandAttachment.attachmentID),
+                      let cursor = command.causalCursor,
+                      cursor.journal == event.event.journal,
+                      cursor.sequence >= 0,
+                      (cursor.eventID.map(Self.validIdentity)
+                        ?? (cursor.sequence == 0)),
+                      cursor.eventID == event.previousEventID,
+                      cursor.sequence == priorSequence else {
+                    throw WorkServiceProtocolError.invalidRequest(
+                        "client cancellation evidence lacks its exact command")
+                }
+            } else if cancellationEvidence.command != nil || event.client != nil {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "host cancellation evidence carries a client command")
+            }
+        }
+        if let terminalEvidence {
+            let event = terminalEvidence.event
+            guard try Self.validAgentHandleEvidence(
+                    event, work: work, handle: handle, journal: causalWorkCursor.journal),
+                  event.work == work, event.workHost == WorkHostRef(work.workHostID),
+                  event.handle == handle, event.client == nil,
+                  event.sequence > 0, !event.event.eventID.isEmpty,
+                  event.previousEventID != nil, event.causedByEventID != nil else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "agent Handle terminal evidence is malformed")
+            }
+            if let body = terminalEvidence.resultBody {
+                guard Self.validAgentHandleBody(body, journal: causalWorkCursor.journal) else {
+                    throw WorkServiceProtocolError.invalidRequest(
+                        "agent Handle terminal body reference is malformed")
+                }
+            }
+            if terminalEvidence.outcome == .succeeded && terminalEvidence.resultBody == nil {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "a successful agent Handle terminal proof lacks its result body")
+            }
+            let cleanup = terminalEvidence.cleanup
+            guard (terminalEvidence.outcome == .indeterminate)
+                    == (cleanup.state == .indeterminate),
+                  cleanup.state != .notStarted
+                    || [.failed, .canceled, .expired].contains(terminalEvidence.outcome),
+                  cleanup.evidence.map({
+                      $0.journal == causalWorkCursor.journal
+                          && Self.validIdentity($0.eventID)
+                          && $0 != event.event
+                  }) ?? true else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "agent Handle terminal cleanup evidence is malformed")
+            }
+        }
+        if let cancellationEvidence, let terminalEvidence {
+            let cancellation = cancellationEvidence.event
+            let terminal = terminalEvidence.event
+            guard [.canceled, .expired, .indeterminate].contains(terminalEvidence.outcome),
+                  terminal.sequence > cancellation.sequence,
+                  terminal.causedByEventID == cancellation.event,
+                  terminal.work == cancellation.work,
+                  terminal.workHost == cancellation.workHost,
+                  terminal.session == cancellation.session,
+                  terminal.sessionAttachment == cancellation.sessionAttachment,
+                  terminal.run == cancellation.run,
+                  terminal.handle == cancellation.handle else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "agent Handle cancellation and terminal proofs conflict")
+            }
+            if let canceledAt = cancellation.hostSequence,
+               let terminalAt = terminal.hostSequence, terminalAt <= canceledAt {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "agent Handle proof host ordering is inconsistent")
+            }
+        }
+        switch disposition {
+        case .accepted, .duplicate:
+            guard let cancellationEvidence, cancellationEvidence.cause == .client,
+                  cancellationEvidence.command != nil,
+                  let resultingWorkCursor,
+                  resultingWorkCursor.journal == causalWorkCursor.journal,
+                  resultingWorkCursor.eventID == cancellationEvidence.event.event.eventID,
+                  resultingWorkCursor.sequence == cancellationEvidence.event.sequence,
+                  rejection == nil else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "agent Handle command proof is incomplete")
+            }
+        case .alreadyRequested:
+            guard cancellationEvidence != nil, resultingWorkCursor == nil,
+                  terminalEvidence == nil, rejection == nil else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "already-requested Handle cancellation has invalid proof")
+            }
+        case .alreadyTerminal:
+            guard terminalEvidence != nil, resultingWorkCursor == nil,
+                  rejection == nil else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "terminal Handle cancellation has invalid proof")
+            }
+        case .unavailable, .ambiguous:
+            guard resultingWorkCursor == nil, cancellationEvidence == nil,
+                  terminalEvidence == nil, rejection == nil else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "unproven Handle cancellation carries a fabricated receipt")
+            }
+        case .rejected:
+            guard resultingWorkCursor == nil, rejection != nil,
+                  cancellationEvidence == nil, terminalEvidence == nil else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "rejected Handle cancellation carries canonical success evidence")
+            }
+        }
+    }
+
+    private static func validAgentHandleEvidence(
+        _ evidence: WorkAgentHandleEventEvidence,
+        work: WorkRef,
+        handle: HandleRef,
+        journal: JournalRef
+    ) throws -> Bool {
+        guard evidence.event.journal == journal,
+              evidence.provenance == .native,
+              evidence.work == work, evidence.workHost == WorkHostRef(work.workHostID),
+              evidence.handle == handle,
+              evidence.sequence > 0,
+              evidence.hostSequence.map({ $0 >= 0 }) ?? true,
+              evidence.hostRecordedAt.timeIntervalSince1970.isFinite,
+              validIdentity(evidence.event.eventID),
+              evidence.previousEventID.map(validIdentity) ?? false,
+              evidence.previousEventID != evidence.event.eventID,
+              evidence.causedByEventID.map({
+                  $0.journal == journal && validIdentity($0.eventID)
+                      && $0 != evidence.event
+              }) ?? false,
+              let session = evidence.session, validIdentity(session.sessionID),
+              let attachment = evidence.sessionAttachment,
+              validIdentity(attachment.attachmentID),
+              let run = evidence.run, validIdentity(run.runID),
+              validIdentity(evidence.actor.actorID),
+              validText(evidence.actor.kind, maximumBytes: WorkServiceBounds.maxDiagnosticCharacters)
+        else { return false }
+        return true
+    }
+
+    private static func validAgentHandleBody(
+        _ reference: TimelineBodyReference, journal: JournalRef
+    ) -> Bool {
+        reference.authority == journal
+            && validIdentity(reference.referenceID)
+            && (reference.mediaType.map {
+                validText($0, maximumBytes: WorkServiceBounds.maxDiagnosticCharacters)
+            } ?? true)
+            && (reference.byteCount.map {
+                (0...WorkAgentHandleSnapshot.maximumBodyBytes).contains($0)
+            } ?? false)
+            && (reference.digest.map(ContextBodyStore.isValidDigest) ?? false)
+            && (reference.digest.map { reference.referenceID == $0 } ?? false)
+    }
+
+    private static func validIdentity(_ value: String) -> Bool {
+        validText(value, maximumBytes: WorkServiceBounds.maxIdentityCharacters)
+    }
+
+    private static func validText(_ value: String, maximumBytes: Int) -> Bool {
+        !value.isEmpty
+            && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value.utf8.count <= maximumBytes
+            && value.unicodeScalars.allSatisfy { scalar in
+                scalar.value > 0x1F
+                    && !(0x7F...0x9F).contains(scalar.value)
+                    && scalar.value != 0x2028 && scalar.value != 0x2029
+            }
+    }
+}
+
 public enum WorkServiceCommandReceiptState: String, Codable, Hashable, Sendable {
     case accepted
     case duplicate
@@ -2345,6 +2733,8 @@ public protocol WorkServiceClient: Sendable {
     func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws
         -> WorkServiceArtifactDescriptor
     func fetchBody(_ request: WorkServiceBodyRequest) async throws -> WorkServiceBodyResponse
+    func cancelAgentHandle(_ request: WorkServiceAgentHandleCancelRequest) async throws
+        -> WorkServiceAgentHandleCancelResponse
     func command(_ request: WorkServiceCommandRequest) async throws -> WorkServiceCommandReceipt
 }
 
@@ -4013,6 +4403,51 @@ public actor InMemoryWorkService: WorkServiceClient {
         return WorkServiceBodyResponse(
             reference: request.reference, status: .retained, offset: request.offset,
             data: chunk, nextOffset: end < body.count ? end : nil)
+    }
+
+    public func cancelAgentHandle(
+        _ request: WorkServiceAgentHandleCancelRequest
+    ) async throws -> WorkServiceAgentHandleCancelResponse {
+        try requireReachable()
+        guard let client = request.command.client,
+              request.command.sessionAttachment != nil,
+              request.command.causalCursor == request.causalWorkCursor,
+              request.causalWorkCursor.journal == request.journal,
+              request.journal.owner == .work(request.work),
+              validIdentity(request.handle.handleID),
+              request.handle.handleID.utf8.count <= WorkServiceBounds.maxIdentityCharacters,
+              validIdentity(request.command.commandID),
+              request.command.commandID.utf8.count <= WorkServiceBounds.maxIdentityCharacters else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "agent Handle cancellation request is malformed")
+        }
+        guard let state = works[request.work] else {
+            throw WorkServiceProtocolError.workNotFound(request.work)
+        }
+        guard state.journal == request.journal else {
+            throw WorkServiceProtocolError.journalMismatch
+        }
+        guard let stored = state.attachments[request.attachment],
+              stored.attachment.client == client,
+              stored.attachment.sessionAttachment == request.command.sessionAttachment else {
+            throw WorkServiceProtocolError.attachmentNotFound
+        }
+        guard stored.attachment.authorization.allows(.control) else {
+            throw WorkServiceProtocolError.capabilityDenied(.control)
+        }
+        guard stored.attachment.authorization.allows(.cancel) else {
+            throw WorkServiceProtocolError.capabilityDenied(.cancel)
+        }
+        // This reference service has no child execution model. A refusal is not a receipt and
+        // does not advance the Work journal or claim that an execution was canceled.
+        return try WorkServiceAgentHandleCancelResponse(
+            work: request.work, handle: request.handle, commandID: request.command.commandID,
+            disposition: .rejected, responder: hostInstance,
+            causalWorkCursor: request.causalWorkCursor,
+            authorization: WorkServiceAuthorizationOutcome(
+                requested: [.control, .cancel], granted: [.control, .cancel], denied: []),
+            rejection: .invalidState,
+            diagnostic: "the reference service does not model this agent Handle")
     }
 
     public func command(_ request: WorkServiceCommandRequest) async throws -> WorkServiceCommandReceipt {

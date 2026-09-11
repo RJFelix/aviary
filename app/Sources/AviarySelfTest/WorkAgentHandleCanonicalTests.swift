@@ -160,9 +160,185 @@ func test_workAgentHandleClientCancellationUsesDurableCallerAttachment() {
         causedBy: EventRef(journal: agentJournal, eventID: queued.eventID),
         payload: agentJSON(WorkAgentHandleCancelRequestedPayload(cause: .client)))
     let snapshot = WorkReducer.reduce(prefix.events + [queued, attached, canceled])
-    XCTAssertEqual(snapshot.agentHandles[agentHandle.handleID]?.state, .cancelRequested)
-    XCTAssertEqual(snapshot.agentHandles[agentHandle.handleID]?.origin, prefix.origin)
+    let handle = snapshot.agentHandles[agentHandle.handleID]
+    XCTAssertEqual(handle?.state, .cancelRequested)
+    XCTAssertEqual(handle?.origin, prefix.origin)
+    XCTAssertEqual(handle?.cancellationEvidence?.cause, .client)
+    XCTAssertEqual(handle?.cancellationEvidence?.event, WorkAgentHandleEventEvidence(canceled))
+    XCTAssertEqual(handle?.cancellationEvidence?.command, command)
+    XCTAssertEqual(handle?.cancellationEvidence?.event.sessionAttachment, agentAttachment)
+    XCTAssertEqual(handle?.cancellationEvidence?.command?.sessionAttachment, controllerAttachment)
     XCTAssertTrue(snapshot.semanticProjectionValid)
+}
+
+func test_workAgentHandleEvidenceSurvivesTerminalReapAndRoundTrips() throws {
+    let prefix = agentPrefix()
+    let queued = queuedAgentEvent(origin: prefix.origin)
+    let command = CommandRef(
+        commandID: "evidence-cancel", client: ClientRef("evidence-client"),
+        sessionAttachment: agentAttachment,
+        causalCursor: JournalCursor(
+            journal: agentJournal, eventID: queued.eventID, sequence: queued.sequence))
+    let canceled = agentEvent(
+        TimelineEventType.agentHandleCancelRequested, id: "agent-5", sequence: 5,
+        previous: queued.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle, command: command, client: command.client,
+        causedBy: EventRef(journal: agentJournal, eventID: queued.eventID),
+        payload: agentJSON(WorkAgentHandleCancelRequestedPayload(cause: .client)))
+    let terminal = agentEvent(
+        TimelineEventType.agentHandleTerminal, id: "agent-6", sequence: 6,
+        previous: canceled.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: canceled.eventID),
+        payload: agentJSON(WorkAgentHandleTerminalPayload(
+            outcome: .canceled, resultBody: agentBody("b"),
+            cleanup: .init(state: .notStarted))))
+    let ended = agentEvent(
+        TimelineEventType.runFinished, id: "agent-7", sequence: 7,
+        previous: terminal.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun)
+    let reaped = agentEvent(
+        TimelineEventType.agentHandleReaped, id: "agent-8", sequence: 8,
+        previous: ended.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: terminal.eventID),
+        payload: agentJSON(WorkAgentHandleReapedPayload(reason: .explicitPolicy)))
+    let events = prefix.events + [queued, canceled, terminal, ended, reaped]
+    let snapshot = WorkReducer.reduce(events)
+    let handle = try XCTUnwrap(snapshot.agentHandles[agentHandle.handleID])
+    XCTAssertEqual(handle.state, .reaped)
+    XCTAssertEqual(handle.cancellationEvidence, WorkAgentHandleCancellationEvidence(
+        cause: .client, event: WorkAgentHandleEventEvidence(canceled), command: command))
+    XCTAssertEqual(handle.terminalEvidence, WorkAgentHandleTerminalEvidence(
+        outcome: .canceled, resultBody: agentBody("b"), cleanup: .init(state: .notStarted),
+        event: WorkAgentHandleEventEvidence(terminal)))
+    XCTAssertEqual(handle.cancellationEvent?.eventID, canceled.eventID)
+    XCTAssertEqual(handle.terminalEvent?.eventID, terminal.eventID)
+    XCTAssertEqual(
+        try JSONDecoder().decode(
+            WorkAgentHandleSnapshot.self, from: JSONEncoder().encode(handle)),
+        handle)
+
+    let source = BoundedReducerProjectionSource(
+        journal: agentJournal,
+        cursor: JournalCursor(
+            journal: agentJournal, eventID: reaped.eventID, sequence: reaped.sequence),
+        sourceID: "agent-handle-evidence-source",
+        sourceGeneration: String(repeating: "d", count: 64),
+        sourceFingerprint: String(repeating: "e", count: 64), sourceByteCount: 1,
+        prefixByteCount: 1, prefixDigest: String(repeating: "f", count: 64))
+    let head = try BoundedWorkReducerHead.build(events: events, source: source)
+    let restored = try BoundedWorkReducerHead.decodeOpaqueReducerHead(head.opaqueReducerHead())
+    let bounded = try XCTUnwrap(restored.agentHandles.first)
+    XCTAssertEqual(bounded.cancellationEvidence, handle.cancellationEvidence)
+    XCTAssertEqual(bounded.terminalEvidence, handle.terminalEvidence)
+    XCTAssertEqual(
+        try JSONDecoder().decode(
+            BoundedWorkAgentHandleIndexRecord.self, from: JSONEncoder().encode(bounded)),
+        bounded)
+    do {
+        _ = try BoundedWorkReducerHead.decodeOpaqueReducerHead(
+            DisposableTimelineProjectionStore.OpaqueReducerHead(
+                mediaType: BoundedWorkReducerHead.mediaType,
+                schemaVersion: 4, bytes: head.encodedMetadata()))
+        XCTAssertTrue(false, "the pre-evidence bounded Work schema must be rejected")
+    } catch { XCTAssertTrue(true) }
+    XCTAssertEqual(PersistentWorkExactState.schemaVersion, 5)
+    XCTAssertEqual(BoundedWorkReducerHead.schemaVersion, 5)
+    XCTAssertEqual(WorkServiceAttachedWorkCheckpointStore.Record.currentSchemaVersion, 8)
+}
+
+func test_workAgentHandleDeadlineCancellationRetainsNilCommandEvidence() {
+    let prefix = agentPrefix()
+    let queued = queuedAgentEvent(origin: prefix.origin)
+    let canceled = agentEvent(
+        TimelineEventType.agentHandleCancelRequested, id: "agent-5", sequence: 5,
+        previous: queued.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: queued.eventID), at: 101,
+        payload: agentJSON(WorkAgentHandleCancelRequestedPayload(cause: .deadline)))
+    let terminal = agentEvent(
+        TimelineEventType.agentHandleTerminal, id: "agent-6", sequence: 6,
+        previous: canceled.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: canceled.eventID), at: 102,
+        payload: agentJSON(WorkAgentHandleTerminalPayload(
+            outcome: .expired, cleanup: .init(state: .notStarted))))
+    let snapshot = WorkReducer.reduce(prefix.events + [queued, canceled, terminal])
+    let evidence = snapshot.agentHandles[agentHandle.handleID]?.cancellationEvidence
+    XCTAssertEqual(evidence?.cause, .deadline)
+    XCTAssertNil(evidence?.command)
+    XCTAssertNil(evidence?.event.client)
+    XCTAssertEqual(evidence?.event, WorkAgentHandleEventEvidence(canceled))
+    XCTAssertEqual(snapshot.agentHandles[agentHandle.handleID]?.terminalOutcome, .expired)
+    XCTAssertTrue(snapshot.semanticProjectionValid)
+}
+
+func test_workAgentHandleRejectsForgedStoredEvidence() throws {
+    let prefix = agentPrefix()
+    let queued = queuedAgentEvent(origin: prefix.origin)
+    let terminal = agentEvent(
+        TimelineEventType.agentHandleTerminal, id: "agent-5", sequence: 5,
+        previous: queued.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: queued.eventID),
+        payload: agentJSON(WorkAgentHandleTerminalPayload(
+            outcome: .failed, cleanup: .init(state: .notStarted))))
+    var forgedSnapshot = WorkReducer.reduce(prefix.events + [queued, terminal])
+    var forgedHandle = try XCTUnwrap(forgedSnapshot.agentHandles[agentHandle.handleID])
+    let exact = try XCTUnwrap(forgedHandle.terminalEvidence)
+    let proof = exact.event
+    let forgedEvent = WorkAgentHandleEventEvidence(
+        event: proof.event, sequence: proof.sequence,
+        previousEventID: proof.previousEventID, causedByEventID: proof.causedByEventID,
+        hostSequence: proof.hostSequence, work: proof.work, workHost: proof.workHost,
+        session: proof.session, sessionAttachment: proof.sessionAttachment, run: proof.run,
+        handle: HandleRef("other-agent-handle"), client: proof.client, actor: proof.actor,
+        hostRecordedAt: proof.hostRecordedAt, provenance: proof.provenance)
+    forgedHandle.terminalEvidence = WorkAgentHandleTerminalEvidence(
+        outcome: exact.outcome, resultBody: exact.resultBody, cleanup: exact.cleanup,
+        event: forgedEvent)
+    forgedSnapshot.agentHandles[agentHandle.handleID] = forgedHandle
+    var transition = InMemoryWorkTransitionState(snapshot: forgedSnapshot)
+    let reap = agentEvent(
+        TimelineEventType.agentHandleReaped, id: "agent-6", sequence: 6,
+        previous: terminal.eventID, session: agentSession, attachment: agentAttachment,
+        run: agentRun, handle: agentHandle,
+        causedBy: EventRef(journal: agentJournal, eventID: terminal.eventID),
+        payload: agentJSON(WorkAgentHandleReapedPayload(reason: .explicitPolicy)))
+    WorkReducerTransition.apply(reap, to: &transition)
+    XCTAssertEqual(transition.snapshot.agentHandles[agentHandle.handleID]?.state, .terminal)
+    XCTAssertFalse(transition.snapshot.semanticProjectionValid)
+
+    let events = prefix.events + [queued, terminal]
+    let source = BoundedReducerProjectionSource(
+        journal: agentJournal,
+        cursor: JournalCursor(
+            journal: agentJournal, eventID: terminal.eventID, sequence: terminal.sequence),
+        sourceID: "agent-handle-forged-source",
+        sourceGeneration: String(repeating: "1", count: 64),
+        sourceFingerprint: String(repeating: "2", count: 64), sourceByteCount: 1,
+        prefixByteCount: 1, prefixDigest: String(repeating: "3", count: 64))
+    let head = try BoundedWorkReducerHead.build(events: events, source: source)
+    var object = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: head.encodedMetadata()) as? [String: Any])
+    var handles = try XCTUnwrap(object["agentHandles"] as? [[String: Any]])
+    var row = handles[0]
+    var terminalEvidence = try XCTUnwrap(row["terminalEvidence"] as? [String: Any])
+    var proofObject = try XCTUnwrap(terminalEvidence["event"] as? [String: Any])
+    proofObject["handle"] = ["handleID": "other-agent-handle"]
+    terminalEvidence["event"] = proofObject
+    row["terminalEvidence"] = terminalEvidence
+    handles[0] = row
+    object["agentHandles"] = handles
+    let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    do {
+        _ = try BoundedWorkReducerHead.decodeOpaqueReducerHead(
+            DisposableTimelineProjectionStore.OpaqueReducerHead(
+                mediaType: BoundedWorkReducerHead.mediaType,
+                schemaVersion: BoundedWorkReducerHead.schemaVersion, bytes: bytes))
+        XCTAssertTrue(false, "bounded decode must reject evidence for another Handle")
+    } catch { XCTAssertTrue(true) }
 }
 
 func test_workAgentHandleCompletionAndDestructionUseDistinctGates() {
@@ -428,8 +604,8 @@ func test_workAgentHandlePersistentExactStateColdParityAndPrivacy() throws {
     defer { try? FileManager.default.removeItem(at: directory) }
     let map = try PersistentProjectionRadixMap(
         directory: directory.appending(path: "map", directoryHint: .isDirectory),
-        namespaceID: "agent-handle-exact-v4", journal: agentJournal,
-        sourceGeneration: String(repeating: "c", count: 64), mapKind: "work-exact-v4")
+        namespaceID: "agent-handle-exact-v5", journal: agentJournal,
+        sourceGeneration: String(repeating: "c", count: 64), mapKind: "work-exact-v5")
 
     let prefix = agentPrefix()
     let queued = queuedAgentEvent(origin: prefix.origin)
@@ -489,6 +665,15 @@ let casesWorkAgentHandleCanonical: [Case] = [
     }),
     ("Work-owned agent Handle client cancel uses durable caller attachment", {
         test_workAgentHandleClientCancellationUsesDurableCallerAttachment()
+    }),
+    ("Work-owned agent Handle evidence survives reap and exact bounded round trips", {
+        try test_workAgentHandleEvidenceSurvivesTerminalReapAndRoundTrips()
+    }),
+    ("Work-owned agent Handle deadline cancellation retains nil command evidence", {
+        test_workAgentHandleDeadlineCancellationRetainsNilCommandEvidence()
+    }),
+    ("Work-owned agent Handle rejects forged retained event evidence", {
+        try test_workAgentHandleRejectsForgedStoredEvidence()
     }),
     ("Work-owned agent Handle has distinct completion and destruction gates", {
         test_workAgentHandleCompletionAndDestructionUseDistinctGates()

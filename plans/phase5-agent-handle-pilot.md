@@ -149,3 +149,63 @@ admission, scan, descriptor, and idle reconstruction. Its real-journal regressio
 16 assertions: live and cleanup-indeterminate children remain recovery-required; Start and
 Complete refuse without Work/Session/control writes or actor creation, even after the disposable
 registry recovery fact is removed. This is not a service activation or child-owner liveness proof.
+
+## Service cancellation slice
+
+Expose a distinct typed `cancel_agent_handle` operation, not a new meaning for active-Run Stop.
+It requires the caller's exact attached Session relationship plus both Work `control` and
+`cancel` grants. The child lifecycle envelope retains its original Run/Session; the cancellation
+command separately identifies the authorized caller, which may be another attached Session.
+Client-qualified command IDs share the existing Work command namespace, so reusing an ID for a
+different Handle or Run command is a conflict, not another effect.
+
+Retain bounded cancellation and terminal evidence in the canonical/exact/bounded Handle state.
+The proof includes the actual Work/Handle envelope and append sequence/predecessor, not just a
+response label. Cancellation cause links and physical predecessor links remain separate. A cold
+duplicate can return its original cancellation cursor after terminalization without claiming
+that the responding daemon authored it or that the child is still alive. Already-requested,
+already-terminal, unavailable, and ambiguous responses must not fabricate a caller receipt.
+
+The client forwards one explicit request. Connection loss does not trigger automatic cancellation
+replay. The host admission drain includes this operation. Integration remains opt-in/internal;
+production daemon launch, default deadlines, owner-liveness projection, and physical body reaping
+are outside this slice's activation boundary.
+
+### Cancellation checkpoint verification (2026-09-11)
+
+The typed operation is implemented through the journal-backed service, socket transport, client
+session, and daemon admission drain. Per-Work cancellation admission serializes preflight, one
+owner call, and canonical reconciliation with bounded holders/waiters. Exact retries retain the
+original proof after terminalization; altered command envelopes conflict. The reference service
+explicitly refuses unmodeled children without advancing the Work cursor. Native child request and
+result bodies use the existing authorized body transport; unrelated nested references confer no
+read capability.
+
+- `just compile`: Aviary and aviaryd pass; SelfTest product build passes.
+- Phase 5 focused suite: 53 cases / 608 assertions pass, 22.24 seconds.
+- Concurrent duplicate cancellation: five consecutive passes, each 1 case / 13 assertions,
+  including exactly one durable cancellation event.
+- Full traced suite: 1,161 cases / 17,754 assertions pass, 519.62 seconds, with idle sleep
+  inhibited for the test executable. An earlier overnight run failed four assertions/errors
+  across three cases after 41,044 seconds; it is not a green receipt. Those cases passed unchanged
+  in isolation and in the fresh complete run.
+
+The installed signed app/helper were not replaced or restarted. This proves the Core/service
+boundary, not production child-owner liveness, a remote deployment, or GUI cancellation controls.
+
+### Next bounded slice: recorded child visibility
+
+Thread a privacy-safe Work-owned agent fact through `LocalTimelineCatalog.WorkRow`, per-Work
+canonical Session summaries, recovery projections, Reader Census, and the existing working-state/
+activity presentation. Keep it separate from Run-owned Handles and older child-lifecycle records.
+Retain origin, state, terminal outcome, cleanup state, and exact latest event; do not copy prompt,
+result bodies, or runtime values into catalog metadata. Bound presentation with completion
+blockers first and explicit omissions/unknown-domain behavior.
+
+Prove that parent End does not erase a child, indeterminate cleanup remains a completion blocker,
+and quiescent terminal/reaped records are not presented as live execution. Add a separate Census
+fixture for the lifecycle rather than weakening the existing unknown-domain fixture. Regenerate
+disposable reports with a projection-rules version bump; no compatibility decoding is needed.
+This slice requires no new RPC or lifecycle event and does not enable execution or cancellation
+controls. Fresh owner-liveness, shutdown accounting, deadlines, and physical retention remain
+separate activation gates.

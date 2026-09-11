@@ -117,6 +117,11 @@ private actor HangingWorkService: WorkServiceClient {
         -> WorkServiceCommandReceipt {
         fatalError("unused hanging-service operation")
     }
+
+    func cancelAgentHandle(_ request: WorkServiceAgentHandleCancelRequest) async throws
+        -> WorkServiceAgentHandleCancelResponse {
+        throw WorkServiceProtocolError.sourceIncomplete
+    }
 }
 
 /// Holds one mutating request after it has crossed the admission fence. The gate test uses this
@@ -124,6 +129,7 @@ private actor HangingWorkService: WorkServiceClient {
 /// recovery read or reopening admission while the mutation is still in flight.
 private actor HangingMutationWorkService: WorkServiceClient {
     private(set) var createEntered = false
+    private(set) var childCancelEntered = false
     private var released = false
 
     func release() { released = true }
@@ -205,6 +211,13 @@ private actor HangingMutationWorkService: WorkServiceClient {
     func command(_ request: WorkServiceCommandRequest) async throws
         -> WorkServiceCommandReceipt {
         fatalError("unused hanging-mutation operation")
+    }
+
+    func cancelAgentHandle(_ request: WorkServiceAgentHandleCancelRequest) async throws
+        -> WorkServiceAgentHandleCancelResponse {
+        childCancelEntered = true
+        while !released { try await Task.sleep(nanoseconds: 5_000_000) }
+        throw WorkServiceProtocolError.sourceIncomplete
     }
 }
 
@@ -487,6 +500,39 @@ func test_workHostDaemonAdmissionGateDrainsInFlightMutationBeforeReopening() asy
     }
     await gate.reopen()
     XCTAssertTrue(await gate.isAccepting)
+}
+
+func test_workHostDaemonAdmissionGateDrainsAgentChildCancellation() async throws {
+    let service = HangingMutationWorkService()
+    let gate = WorkHostDaemonAdmissionGate(service: service)
+    let work = WorkRef(workHostID: "child-drain-host", workID: "child-drain-work")
+    let request = WorkServiceAgentHandleCancelRequest(
+        work: work, journal: .work(work), attachment: ClientAttachmentRef("child-drain-client"),
+        handle: HandleRef("child-drain-handle"), commandID: "cancel-child-drain",
+        client: ClientRef("child-drain-gui"),
+        sessionAttachment: SessionAttachmentRef("child-drain-session"),
+        causalWorkCursor: JournalCursor(journal: .work(work), eventID: "child-started", sequence: 5))
+    let mutation = Task { try await gate.cancelAgentHandle(request) }
+    let deadline = Date().addingTimeInterval(2)
+    while !(await service.childCancelEntered) && Date() < deadline {
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    XCTAssertTrue(await service.childCancelEntered)
+    let result = GateResult()
+    let close = Task {
+        let drained = await gate.closeAndDrain(timeout: 1)
+        await result.set(drained)
+        return drained
+    }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    XCTAssertFalse(await gate.isAccepting)
+    XCTAssertNil(await result.value, "child cancellation must remain part of the admission drain")
+    await service.release()
+    XCTAssertTrue(await close.value)
+    do {
+        _ = try await mutation.value
+        XCTAssertTrue(false, "held fixture should fail after release")
+    } catch WorkServiceProtocolError.sourceIncomplete { XCTAssertTrue(true) }
 }
 
 func test_workHostDaemonAdmissionGateTimesOutOnHungRequest() async throws {
@@ -1365,6 +1411,9 @@ func test_aviarydSubprocessParentLeasePreventsOrphans() async throws {
 }
 
 let casesWorkHostDaemonProcess: [Case] = [
+    ("phase5 child cancellation admission gate drains the in-flight call", {
+        try await test_workHostDaemonAdmissionGateDrainsAgentChildCancellation()
+    }),
     ("phase3 Work Host daemon: one generation publishes after handshake", {
         try await test_workHostDaemonCoordinatorUsesOneGenerationAndPublishesAfterHandshake()
     }),

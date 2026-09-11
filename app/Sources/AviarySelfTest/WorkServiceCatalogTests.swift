@@ -38,6 +38,7 @@ private actor CatalogTestConnection: WorkServiceClientConnection {
     func fetchArtifact(_ request: WorkServiceArtifactRequest) async throws -> WorkServiceArtifactDescriptor { throw CatalogTestError.unsupported }
     func fetchBody(_ request: WorkServiceBodyRequest) async throws -> WorkServiceBodyResponse { throw CatalogTestError.unsupported }
     func command(_ request: WorkServiceCommandRequest) async throws -> WorkServiceCommandReceipt { throw CatalogTestError.unsupported }
+    func cancelAgentHandle(_ request: WorkServiceAgentHandleCancelRequest) async throws -> WorkServiceAgentHandleCancelResponse { throw CatalogTestError.unsupported }
 }
 
 private struct CatalogTestLocator: WorkServiceHostLocating {

@@ -48,16 +48,20 @@ private actor ClientSessionObservedConnection: WorkServiceClientConnection {
     let base: WorkServiceUnixSocketClient
     let createResponseGate: ClientSessionGate?
     let listError: WorkServiceTransportError?
+    let childCancelResponseError: WorkServiceTransportError?
     private(set) var closeCount = 0
+    private(set) var childCancelCallCount = 0
 
     init(
         base: WorkServiceUnixSocketClient,
         createResponseGate: ClientSessionGate? = nil,
-        listError: WorkServiceTransportError? = nil
+        listError: WorkServiceTransportError? = nil,
+        childCancelResponseError: WorkServiceTransportError? = nil
     ) {
         self.base = base
         self.createResponseGate = createResponseGate
         self.listError = listError
+        self.childCancelResponseError = childCancelResponseError
     }
 
     func close() async {
@@ -146,6 +150,14 @@ private actor ClientSessionObservedConnection: WorkServiceClientConnection {
 
     func fetchBody(_ request: WorkServiceBodyRequest) async throws -> WorkServiceBodyResponse {
         try await base.fetchBody(request)
+    }
+
+    func cancelAgentHandle(_ request: WorkServiceAgentHandleCancelRequest) async throws
+        -> WorkServiceAgentHandleCancelResponse {
+        childCancelCallCount += 1
+        let response = try await base.cancelAgentHandle(request)
+        if childCancelCallCount == 1, let childCancelResponseError { throw childCancelResponseError }
+        return response
     }
 
     func command(_ request: WorkServiceCommandRequest) async throws -> WorkServiceCommandReceipt {
@@ -470,7 +482,71 @@ func testWorkServiceClientSessionReconnectsAfterConnectionRequestBudgetIsExhaust
     await server.stop()
 }
 
+func testWorkServiceClientSessionDoesNotReplayChildCancellation() async throws {
+    let host = WorkHostRef("child-cancel-session-host")
+    let client = ClientRef("child-cancel-session-gui")
+    let endpoint = clientSessionEndpoint()
+    defer { try? FileManager.default.removeItem(atPath: endpoint.path) }
+    let service = clientSessionService(host: host, client: client)
+    let server = WorkServiceUnixSocketServer(endpoint: endpoint, service: service)
+    let observed = ClientSessionObservedConnection(
+        base: WorkServiceUnixSocketClient(endpoint: endpoint, client: client, expectedHost: host),
+        childCancelResponseError: .remote(code: .transportClosed, detail: "fixture lost confirmation"))
+    do {
+        try await server.start()
+        let instance = await service.hostInstance
+        let session = try WorkServiceClientSession(
+            locator: FixedWorkServiceHostLocator(location: .init(
+                host: host, expectedInstance: instance,
+                protocolVersion: WorkServiceProtocol.currentVersion, transport: .unixSocket(endpoint))),
+            client: client, connectionFactory: { _, _ in observed })
+        let handshake = try await session.connect()
+        let created = try await session.createWork(.init(
+            client: client, commandID: "child-cancel-session-create",
+            causalControlCursor: handshake.controlCursor,
+            requestedCapabilities: [.observe, .control, .cancel]))
+        let request = WorkServiceAgentHandleCancelRequest(
+            work: created.work.work, journal: created.work.journal,
+            attachment: created.attachment.attachment, handle: HandleRef("unknown-child"),
+            commandID: "one-child-cancel", client: client,
+            sessionAttachment: created.sessionAttachment, causalWorkCursor: created.workCursor)
+        do {
+            _ = try await session.cancelAgentHandle(request)
+            XCTAssertTrue(false, "lost response must remain a connection error")
+        } catch WorkServiceTransportError.remote(let code, _) {
+            XCTAssertEqual(code, .transportClosed)
+        }
+        XCTAssertEqual(await observed.childCancelCallCount, 1)
+        XCTAssertEqual(await session.state, .reconnecting(host))
+        _ = try await session.connect()
+        _ = try await session.listWorks(.init(client: client))
+        XCTAssertEqual(await observed.childCancelCallCount, 1, "reconnect must not replay cancellation")
+
+        let foreign = WorkServiceAgentHandleCancelRequest(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            handle: request.handle, commandID: "foreign", client: ClientRef("foreign-gui"),
+            sessionAttachment: created.sessionAttachment, causalWorkCursor: request.causalWorkCursor)
+        do {
+            _ = try await session.cancelAgentHandle(foreign)
+            XCTAssertTrue(false, "foreign client must be rejected before transport")
+        } catch WorkServiceClientSessionError.invalidClient { XCTAssertTrue(true) }
+        XCTAssertEqual(await observed.childCancelCallCount, 1)
+        let explicit = try await session.cancelAgentHandle(request)
+        XCTAssertEqual(explicit.disposition, .rejected)
+        XCTAssertEqual(await observed.childCancelCallCount, 2)
+        await session.disconnect()
+    } catch {
+        await observed.close()
+        await server.stop()
+        throw error
+    }
+    await server.stop()
+}
+
 let casesWorkServiceClientSession: [Case] = [
+    ("phase5 child cancellation client: explicit retry only after lost response", {
+        try await testWorkServiceClientSessionDoesNotReplayChildCancellation()
+    }),
     ("phase3 Work service client coalesces connect and disconnects only itself", {
         try await testWorkServiceClientSessionCoalescesConnectAndDisconnectsOnlyClient()
     }),

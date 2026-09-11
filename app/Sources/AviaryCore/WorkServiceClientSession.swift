@@ -286,6 +286,15 @@ public actor WorkServiceClientSession: WorkServiceClient {
         return try await perform { try await $0.fetchBody(request) }
     }
 
+    public func cancelAgentHandle(
+        _ request: WorkServiceAgentHandleCancelRequest
+    ) async throws -> WorkServiceAgentHandleCancelResponse {
+        guard request.command.client == client else {
+            throw WorkServiceClientSessionError.invalidClient
+        }
+        return try await perform { try await $0.cancelAgentHandle(request) }
+    }
+
     public func command(
         _ request: WorkServiceCommandRequest
     ) async throws -> WorkServiceCommandReceipt {

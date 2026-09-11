@@ -1459,6 +1459,13 @@ Decision gate: renew design approval of the central Handle/ownership semantics a
 real event, recovery, and attention evidence. The existing Handle plan is valuable shaping, not
 pre-authorized implementation of a global scheduler.
 
+The approved [private agent-Handle pilot](phase5-agent-handle-pilot.md) is now being implemented
+in bounded slices. Its first checkpoint proves independent child lifetime and retained results
+with real Python runtimes; the next adds typed, authorized child cancellation over the Work
+service. Neither enables the pilot in the installed app. Durable child activity/recovery
+projections, owner-liveness and shutdown accounting, deadline policy, and physical retention
+remain activation gates. This is progress toward Phase 5, not completion of its broader exits.
+
 Deliverables:
 
 - Implement the Handle/ownership model in `plans/handles-and-ownership.md` with explicit lifetime:

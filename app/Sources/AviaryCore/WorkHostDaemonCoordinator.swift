@@ -182,6 +182,12 @@ public actor WorkHostDaemonAdmissionGate: WorkServiceClient {
         return try await service.fetchBody(request)
     }
 
+    public func cancelAgentHandle(_ request: WorkServiceAgentHandleCancelRequest) async throws
+        -> WorkServiceAgentHandleCancelResponse {
+        try enter(); defer { leave() }
+        return try await service.cancelAgentHandle(request)
+    }
+
     public func command(_ request: WorkServiceCommandRequest) async throws
         -> WorkServiceCommandReceipt {
         try enter(); defer { leave() }

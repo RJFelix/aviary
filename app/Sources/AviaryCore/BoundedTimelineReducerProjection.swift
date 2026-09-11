@@ -328,16 +328,22 @@ public struct BoundedWorkAgentHandleIndexRecord: Codable, Hashable, Sendable {
     public let deadline: Date
     public let requestBody: TimelineBodyReference
     public let state: WorkAgentHandleState
-    public let cancellationCause: WorkAgentHandleCancellationCause?
-    public let terminalOutcome: WorkAgentHandleTerminalOutcome?
-    public let resultBody: TimelineBodyReference?
-    public let cleanup: WorkAgentHandleCleanupProof?
+    public let cancellationEvidence: WorkAgentHandleCancellationEvidence?
+    public let terminalEvidence: WorkAgentHandleTerminalEvidence?
     public let reapReason: WorkAgentHandleReapReason?
     public let queuedEvent: EventRef
     public let startedEvent: EventRef?
     public let latestLifecycleEvent: EventRef
-    public let terminalEvent: EventRef?
     public let reapedEvent: EventRef?
+
+    public var cancellationCause: WorkAgentHandleCancellationCause? {
+        cancellationEvidence?.cause
+    }
+    public var cancellationEvent: EventRef? { cancellationEvidence?.event.event }
+    public var terminalOutcome: WorkAgentHandleTerminalOutcome? { terminalEvidence?.outcome }
+    public var resultBody: TimelineBodyReference? { terminalEvidence?.resultBody }
+    public var cleanup: WorkAgentHandleCleanupProof? { terminalEvidence?.cleanup }
+    public var terminalEvent: EventRef? { terminalEvidence?.event.event }
 
     public var blocksWorkCompletion: Bool {
         state.isLive || cleanup?.state == .indeterminate
@@ -346,11 +352,11 @@ public struct BoundedWorkAgentHandleIndexRecord: Codable, Hashable, Sendable {
     public init(_ snapshot: WorkAgentHandleSnapshot) {
         handle = snapshot.handle; origin = snapshot.origin; label = snapshot.label
         deadline = snapshot.deadline; requestBody = snapshot.requestBody; state = snapshot.state
-        cancellationCause = snapshot.cancellationCause; terminalOutcome = snapshot.terminalOutcome
-        resultBody = snapshot.resultBody; cleanup = snapshot.cleanup; reapReason = snapshot.reapReason
+        cancellationEvidence = snapshot.cancellationEvidence
+        terminalEvidence = snapshot.terminalEvidence; reapReason = snapshot.reapReason
         queuedEvent = snapshot.queuedEvent; startedEvent = snapshot.startedEvent
         latestLifecycleEvent = snapshot.latestLifecycleEvent
-        terminalEvent = snapshot.terminalEvent; reapedEvent = snapshot.reapedEvent
+        reapedEvent = snapshot.reapedEvent
     }
 
 }
@@ -713,7 +719,7 @@ public enum BoundedChildState: String, Codable, Hashable, Sendable {
 }
 
 public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
-    public static let schemaVersion = 4
+    public static let schemaVersion = 5
     public static let mediaType = "application/x-aviary-bounded-work-reducer-head"
 
     public let schemaVersion: Int
@@ -2517,6 +2523,146 @@ public enum BoundedTimelineReducerProjection {
         try validateIdentifierValue(actor.kind, limits: limits)
     }
 
+    private static func validateAgentHandleEventEvidence(
+        _ proof: WorkAgentHandleEventEvidence,
+        source: BoundedReducerProjectionSource,
+        limits: BoundedTimelineReducerProjectionLimits
+    ) throws {
+        try validateReference(proof.event, source: source, limits: limits)
+        guard proof.sequence > 0, proof.sequence <= source.cursor.sequence,
+              proof.hostSequence.map({ $0 >= 0 }) ?? true,
+              proof.hostRecordedAt.timeIntervalSince1970.isFinite,
+              proof.provenance == .native else {
+            throw BoundedTimelineReducerProjectionError.invalidCursor
+        }
+        if proof.sequence == 1 {
+            guard proof.previousEventID == nil else {
+                throw BoundedTimelineReducerProjectionError.invalidCursor
+            }
+        } else {
+            guard let previous = proof.previousEventID else {
+                throw BoundedTimelineReducerProjectionError.invalidCursor
+            }
+            try validateIdentifierValue(previous, limits: limits)
+        }
+        if let cause = proof.causedByEventID {
+            try validateReference(cause, source: source, limits: limits)
+        }
+        try validateActor(proof.actor, limits: limits)
+    }
+
+    private static func validateAgentHandleEvidence(
+        _ handle: BoundedWorkAgentHandleIndexRecord,
+        source: BoundedReducerProjectionSource,
+        limits: BoundedTimelineReducerProjectionLimits
+    ) throws {
+        if let cancellation = handle.cancellationEvidence {
+            try validateAgentHandleEventEvidence(
+                cancellation.event, source: source, limits: limits)
+            guard cancellation.event.work == handle.origin.work,
+                  cancellation.event.workHost == handle.origin.workHost,
+                  cancellation.event.session == handle.origin.session,
+                  cancellation.event.sessionAttachment == handle.origin.sessionAttachment,
+                  cancellation.event.run == handle.origin.run,
+                  cancellation.event.handle == handle.handle,
+                  cancellation.event.causedByEventID
+                    == (handle.startedEvent ?? handle.queuedEvent) else {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+            if cancellation.cause == .client {
+                guard let command = cancellation.command,
+                      let client = command.client,
+                      cancellation.event.client == client,
+                      let attachment = command.sessionAttachment,
+                      let cursor = command.causalCursor,
+                      cursor.journal == source.journal,
+                      cursor.eventID == cancellation.event.previousEventID,
+                      cursor.sequence == cancellation.event.sequence - 1 else {
+                    throw BoundedTimelineReducerProjectionError.invalidCursor
+                }
+                try validateIdentifierValue(command.commandID, limits: limits)
+                try validateIdentifierValue(client.clientID, limits: limits)
+                try validateIdentifierValue(attachment.attachmentID, limits: limits)
+                try validateCursor(cursor, limits: limits)
+            } else if cancellation.command != nil || cancellation.event.client != nil {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+        }
+        if let terminal = handle.terminalEvidence {
+            try validateAgentHandleEventEvidence(
+                terminal.event, source: source, limits: limits)
+            guard terminal.event.work == handle.origin.work,
+                  terminal.event.workHost == handle.origin.workHost,
+                  terminal.event.session == handle.origin.session,
+                  terminal.event.sessionAttachment == handle.origin.sessionAttachment,
+                  terminal.event.run == handle.origin.run,
+                  terminal.event.handle == handle.handle,
+                  terminal.event.client == nil,
+                  terminal.event.causedByEventID
+                    == (handle.cancellationEvent ?? handle.startedEvent ?? handle.queuedEvent),
+                  terminal.outcome != .succeeded || terminal.resultBody != nil else {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+            if let cancellation = handle.cancellationEvidence {
+                guard cancellation.event.sequence < terminal.event.sequence else {
+                    throw BoundedTimelineReducerProjectionError.invalidCursor
+                }
+            }
+            if handle.startedEvent == nil {
+                guard terminal.cleanup.state == .notStarted,
+                      [.failed, .canceled, .expired].contains(terminal.outcome) else {
+                    throw BoundedTimelineReducerProjectionError.invalidIdentity
+                }
+            } else if terminal.outcome == .indeterminate {
+                guard terminal.cleanup.state == .indeterminate else {
+                    throw BoundedTimelineReducerProjectionError.invalidIdentity
+                }
+            } else if terminal.cleanup.state != .quiesced {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+            if handle.cancellationEvidence != nil,
+               ![.canceled, .expired, .indeterminate].contains(terminal.outcome) {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+            if let cleanupEvidence = terminal.cleanup.evidence {
+                try validateReference(cleanupEvidence, source: source, limits: limits)
+            }
+        }
+        switch handle.state {
+        case .queued:
+            guard handle.cancellationEvidence == nil, handle.terminalEvidence == nil else {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+            guard handle.startedEvent == nil,
+                  handle.latestLifecycleEvent == handle.queuedEvent else {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+        case .running:
+            guard handle.cancellationEvidence == nil, handle.terminalEvidence == nil,
+                  handle.startedEvent != nil,
+                  handle.latestLifecycleEvent == handle.startedEvent else {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+        case .cancelRequested:
+            guard handle.cancellationEvidence != nil, handle.terminalEvidence == nil,
+                  handle.latestLifecycleEvent == handle.cancellationEvent else {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+        case .terminal:
+            guard handle.terminalEvidence != nil,
+                  handle.latestLifecycleEvent == handle.terminalEvent else {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+        case .reaped:
+            guard handle.terminalEvidence != nil, handle.reapedEvent != nil,
+                  handle.reapReason != nil,
+                  handle.latestLifecycleEvent == handle.reapedEvent,
+                  handle.cleanup?.state != .indeterminate else {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+        }
+    }
+
     private static func validateStringList(
         _ values: [String], limits: BoundedTimelineReducerProjectionLimits
     ) throws {
@@ -2629,6 +2775,8 @@ public enum BoundedTimelineReducerProjection {
                     throw BoundedTimelineReducerProjectionError.invalidIdentity
                 }
             }
+            try validateAgentHandleEvidence(
+                handle, source: head.source, limits: limits)
         }
         for attachment in head.attachments {
             try validateIdentifierValue(attachment.attachment.attachmentID, limits: limits)

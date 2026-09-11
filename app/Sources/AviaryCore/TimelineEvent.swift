@@ -1900,6 +1900,79 @@ public struct WorkAgentHandleCancelRequestedPayload: Codable, Hashable, Sendable
     public init(cause: WorkAgentHandleCancellationCause) { self.cause = cause }
 }
 
+/// Exact canonical envelope evidence retained for a Work-owned agent Handle lifecycle fact.
+/// This is deliberately metadata-only: arbitrary payload and result bytes remain addressable.
+public struct WorkAgentHandleEventEvidence: Codable, Hashable, Sendable {
+    public let event: EventRef
+    public let sequence: Int
+    public let previousEventID: String?
+    public let causedByEventID: EventRef?
+    public let hostSequence: Int?
+    public let work: WorkRef?
+    public let workHost: WorkHostRef?
+    public let session: SessionRef?
+    public let sessionAttachment: SessionAttachmentRef?
+    public let run: RunRef?
+    public let handle: HandleRef?
+    public let client: ClientRef?
+    public let actor: TimelineActor
+    public let hostRecordedAt: Date
+    public let provenance: TimelineEventProvenance
+
+    public init(
+        event: EventRef, sequence: Int, previousEventID: String?,
+        causedByEventID: EventRef?, hostSequence: Int?, work: WorkRef?,
+        workHost: WorkHostRef?, session: SessionRef?,
+        sessionAttachment: SessionAttachmentRef?, run: RunRef?, handle: HandleRef?,
+        client: ClientRef?, actor: TimelineActor,
+        hostRecordedAt: Date, provenance: TimelineEventProvenance
+    ) {
+        self.event = event
+        self.sequence = sequence
+        self.previousEventID = previousEventID
+        self.causedByEventID = causedByEventID
+        self.hostSequence = hostSequence
+        self.work = work
+        self.workHost = workHost
+        self.session = session
+        self.sessionAttachment = sessionAttachment
+        self.run = run
+        self.handle = handle
+        self.client = client
+        self.actor = actor
+        self.hostRecordedAt = hostRecordedAt
+        self.provenance = provenance
+    }
+
+    public init(_ event: TimelineEvent) {
+        self.init(
+            event: EventRef(journal: event.journal, eventID: event.eventID),
+            sequence: event.sequence, previousEventID: event.previousEventID,
+            causedByEventID: event.causedByEventID, hostSequence: event.hostSequence,
+            work: event.work, workHost: event.workHost, session: event.session,
+            sessionAttachment: event.sessionAttachment, run: event.run,
+            handle: event.handle, client: event.client,
+            actor: event.actor, hostRecordedAt: event.hostRecordedAt,
+            provenance: event.provenance)
+    }
+}
+
+public struct WorkAgentHandleCancellationEvidence: Codable, Hashable, Sendable {
+    public let cause: WorkAgentHandleCancellationCause
+    public let event: WorkAgentHandleEventEvidence
+    public let command: CommandRef?
+
+    public init(
+        cause: WorkAgentHandleCancellationCause,
+        event: WorkAgentHandleEventEvidence,
+        command: CommandRef?
+    ) {
+        self.cause = cause
+        self.event = event
+        self.command = command
+    }
+}
+
 public struct WorkAgentHandleTerminalPayload: Codable, Hashable, Sendable {
     public let outcome: WorkAgentHandleTerminalOutcome
     public let resultBody: TimelineBodyReference?
@@ -1917,6 +1990,25 @@ public struct WorkAgentHandleTerminalPayload: Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case outcome, resultBody = "result_body", cleanup
+    }
+}
+
+public struct WorkAgentHandleTerminalEvidence: Codable, Hashable, Sendable {
+    public let outcome: WorkAgentHandleTerminalOutcome
+    public let resultBody: TimelineBodyReference?
+    public let cleanup: WorkAgentHandleCleanupProof
+    public let event: WorkAgentHandleEventEvidence
+
+    public init(
+        outcome: WorkAgentHandleTerminalOutcome,
+        resultBody: TimelineBodyReference? = nil,
+        cleanup: WorkAgentHandleCleanupProof,
+        event: WorkAgentHandleEventEvidence
+    ) {
+        self.outcome = outcome
+        self.resultBody = resultBody
+        self.cleanup = cleanup
+        self.event = event
     }
 }
 
@@ -1941,16 +2033,22 @@ public struct WorkAgentHandleSnapshot: Codable, Hashable, Sendable {
     public let deadline: Date
     public let requestBody: TimelineBodyReference
     public var state: WorkAgentHandleState
-    public var cancellationCause: WorkAgentHandleCancellationCause?
-    public var terminalOutcome: WorkAgentHandleTerminalOutcome?
-    public var resultBody: TimelineBodyReference?
-    public var cleanup: WorkAgentHandleCleanupProof?
+    public var cancellationEvidence: WorkAgentHandleCancellationEvidence?
+    public var terminalEvidence: WorkAgentHandleTerminalEvidence?
     public var reapReason: WorkAgentHandleReapReason?
     public let queuedEvent: EventRef
     public var startedEvent: EventRef?
     public var latestLifecycleEvent: EventRef
-    public var terminalEvent: EventRef?
     public var reapedEvent: EventRef?
+
+    public var cancellationCause: WorkAgentHandleCancellationCause? {
+        cancellationEvidence?.cause
+    }
+    public var cancellationEvent: EventRef? { cancellationEvidence?.event.event }
+    public var terminalOutcome: WorkAgentHandleTerminalOutcome? { terminalEvidence?.outcome }
+    public var resultBody: TimelineBodyReference? { terminalEvidence?.resultBody }
+    public var cleanup: WorkAgentHandleCleanupProof? { terminalEvidence?.cleanup }
+    public var terminalEvent: EventRef? { terminalEvidence?.event.event }
 
     /// Completion-policy liveness is intentionally stronger than execution lifecycle. A host-loss
     /// terminal is addressable and write-once, but still blocks Work completion because runtime
