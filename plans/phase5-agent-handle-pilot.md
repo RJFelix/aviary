@@ -3,6 +3,12 @@
 Status: approved for implementation by Ryan, 2026-09-10. Private Hosted/Python integration
 is being verified; public service control and production activation remain incomplete.
 
+Lifetime policy decided by Ryan, 2026-09-11: background agents run until they finish or are
+explicitly stopped by default. Time, token, and spend limits are optional. This supersedes the
+initial pilot's mandatory deadline and the unresolved-default references in older checkpoint
+notes below. The existing runtime still requires a deadline; this decision is not an implementation
+or activation receipt.
+
 The chat-first work has now exercised real Start, queued input, Stop after step, End,
 GUI-only relaunch, retained drafts, and saved-review feedback. This supplies useful evidence
 for the explicit Phase 5 design gate in `core-experience.md`; it does not complete every item
@@ -27,9 +33,11 @@ Moving this ownership is not merely renaming the existing Future or adding a Flo
   scope trees, and a general scheduler.
 - Give each child a **Work-owned lifetime**. Parent Run End, conversation archive, or GUI
   disconnect does not implicitly cancel it. Explicit Work destruction or scope expiry does.
-- Require an **explicit scope deadline** in the pilot configuration, covering queue and
-  execution together. Do not silently choose a product-wide expiration or add a second
-  independent hold timeout. Select user-facing defaults after exercising this pilot.
+- Default to **no lifetime budget**: run until the agent finishes or an authorized caller
+  explicitly stops it. GUI loss and parent End remain unrelated to child lifetime.
+- Allow optional time, token, and spend limits, individually or together. A selected time limit
+  covers queue and execution together; no hidden hold timeout substitutes for it. When multiple
+  limits are selected, the first reached stops further work under that scope.
 - Persist queued, started, terminal, and reaped states with immutable origin Run/Session
   references, bounded labels, and addressable request/result bodies. A terminal result is
   write-once and may be recorded after the originating Run ends. Retain results with their
@@ -68,7 +76,8 @@ and 32 queued children across the host. Admission refuses explicitly when a limi
 The queue selects eligible Works round-robin. Within a Work it normally selects FIFO; explicit
 await interest may promote a queued child, but at most one promoted child may pass the oldest
 non-awaited child before that oldest child gets the next eligible slot. An await cannot preempt
-running execution. Deadline expiry applies from original admission, including all queue time.
+running execution. An optional deadline applies from original admission, including all queue
+time. When no time limit is selected, there is no expiry timer.
 
 Retained terminal results are not automatically reaped to make room: initially a Work may retain
 256 agent Handle identities, including reap tombstones. Further admission refuses at that bound.
@@ -305,5 +314,29 @@ Do not turn metadata reaping into a shortcut around physical-cleanup or destruct
 The next bounded work is to define exact, explicit reap intent and body ownership evidence,
 including other references to the same digest and crash ordering. Keep the 256-identity bound
 and refuse further admission instead of silently evicting results. Execution deadline expiry
-must not imply result-retention expiry. Any automatic deletion/default deadline remains a
-separate product decision before broader activation.
+must not imply result-retention expiry. Any automatic deletion remains a separate product
+decision before broader activation; lifetime defaults are now decided above.
+
+#### Optional execution limits: implementation requirements
+
+- Represent absence explicitly in the canonical record, coordinator, queue, executor, and Python
+  Future payload. Do not replace an absent deadline with a distant timestamp or a large sentinel.
+  Invalidate disposable derived caches when changing the canonical contract.
+- Remove hidden child-turn/model-call ceilings from the default Work-owned path. The current
+  executor's default `maxIterations = 20` would otherwise contradict "until finished or stopped."
+  Concurrency, admission, frame/body size, and per-operation failure bounds remain distinct
+  operational protections, not implicit lifetime budgets.
+- Time is wall-clock scope time, including queueing. Token and spend limits cover cumulative
+  Aviary-owned model usage for that child. Show what is counted; provider output-token limits
+  per request are not cumulative child budgets.
+- Check a configured budget before dispatch and reconcile actual usage afterward. Record the
+  specific limit that stopped execution, consumed amounts, and any overshoot/unknown accounting.
+  A reached limit is not successful task completion, and cancellation still requires truthful
+  resource-quiescence evidence.
+- Spend controls must distinguish measured usage, price estimates, and unavailable prices.
+  Do not advertise an exact hard dollar ceiling when in-flight requests or missing accounting
+  prevent proving it. Arbitrary external effects/charges from trusted Python are not covered by
+  a model-spend limit or a new sandbox boundary.
+- Test no-limit execution beyond the former iteration ceiling, every optional limit separately,
+  combined-limit precedence, queued time expiry, delayed/missing usage, cancellation races, and
+  cold/live record parity. Existing parent-End and daemon-shutdown proofs must continue to pass.
