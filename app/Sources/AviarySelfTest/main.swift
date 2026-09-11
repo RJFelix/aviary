@@ -6613,6 +6613,12 @@ let casesPhase1Timeline: [Case] = [
     ("phase1 census: linked fixture reports canonical state planes", {
         try test_readerCensusFixtureProjectsCorePlanes()
     }),
+    ("phase5 census: recorded agents survive parent End", {
+        try test_readerCensusRecordedAgentsSurviveParentEnd()
+    }),
+    ("phase5 census: unknown agents block completed Work destructive actions", {
+        try test_readerCensusCompletedWorkWithUnknownAgentsBlocksDestructiveActions()
+    }),
     ("phase1 census: positive ready projection crosses delivery gate", {
         try test_readerCensusProjectsPositiveReadyNotificationAndDeliveryTransition()
     }),
@@ -7194,5 +7200,6 @@ await Harness.run(
         + casesRuntimeHostWorkAgentFuture
         + casesWorkAgentSpawnCallback
         + casesWorkAgentHandleCancelService
+        + casesWorkAgentHandleCatalog + casesWorkAgentHandleActivity
         + casesCommandDeliveryOutcome + casesRuntimeHostParentLifetime
         + casesRuntimeHostAdoption)

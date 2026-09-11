@@ -192,6 +192,7 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
         public let maxRunFactsPerRow: Int
         public let maxActionFactsPerRow: Int
         public let maxHandleFactsPerRow: Int
+        public let maxAgentHandleFactsPerRow: Int
         public let maxCommandFactsPerRow: Int
         public let maxUnknownRefsPerRow: Int
         public let maxCapabilitiesPerAttachment: Int
@@ -201,7 +202,7 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
             maxRows: Int = 512, maxAttachmentsPerRow: Int = 256,
             maxReasonsPerRow: Int = 16, maxObservationsPerRow: Int = 16,
             maxRecoveryCoveragePerRow: Int = 64, maxActionFactsPerRow: Int = 128,
-            maxRunFactsPerRow: Int = 256,
+            maxRunFactsPerRow: Int = 256, maxAgentHandleFactsPerRow: Int = 256,
             maxHandleFactsPerRow: Int = 128, maxCommandFactsPerRow: Int = 128,
             maxUnknownRefsPerRow: Int = 64, maxCapabilitiesPerAttachment: Int = 16,
             maxIdentityCharacters: Int = 512
@@ -214,6 +215,7 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
             self.maxRunFactsPerRow = max(1, maxRunFactsPerRow)
             self.maxActionFactsPerRow = max(1, maxActionFactsPerRow)
             self.maxHandleFactsPerRow = max(1, maxHandleFactsPerRow)
+            self.maxAgentHandleFactsPerRow = max(1, maxAgentHandleFactsPerRow)
             self.maxCommandFactsPerRow = max(1, maxCommandFactsPerRow)
             self.maxUnknownRefsPerRow = max(1, maxUnknownRefsPerRow)
             self.maxCapabilitiesPerAttachment = max(1, maxCapabilitiesPerAttachment)
@@ -256,12 +258,16 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
         public let omittedActionCount: Int
         public let handles: [LocalTimelineCatalog.HandleFact]
         public let omittedHandleCount: Int
+        public let agentHandles: [LocalTimelineCatalog.AgentHandleFact]
+        public let omittedAgentHandleCount: Int
         public let commands: [LocalTimelineCatalog.CommandFact]
         public let omittedCommandCount: Int
         public let outstandingActionIDs: [String]
         public let omittedOutstandingActionCount: Int
         public let outstandingHandleIDs: [String]
         public let omittedOutstandingHandleCount: Int
+        public let completionBlockingAgentHandleIDs: [String]
+        public let omittedCompletionBlockingAgentHandleCount: Int
         public let outstandingCommandIDs: [String]
         public let omittedOutstandingCommandCount: Int
         public let unknownEventRefs: [EventRef]
@@ -381,10 +387,13 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
                 observationReasons: [reason] + invalidClientReason
                     + (deduplicated.hasConflict ? ["conflicting observations lack a canonical Work join"] : []),
                 omittedObservationReasonCount: 0, actions: [],
-                omittedActionCount: 0, handles: [], omittedHandleCount: 0, commands: [],
-                omittedCommandCount: 0, outstandingActionIDs: [],
+                omittedActionCount: 0, handles: [], omittedHandleCount: 0,
+                agentHandles: [], omittedAgentHandleCount: 0,
+                commands: [], omittedCommandCount: 0, outstandingActionIDs: [],
                 omittedOutstandingActionCount: 0, outstandingHandleIDs: [],
-                omittedOutstandingHandleCount: 0, outstandingCommandIDs: [],
+                omittedOutstandingHandleCount: 0, completionBlockingAgentHandleIDs: [],
+                omittedCompletionBlockingAgentHandleCount: 0,
+                outstandingCommandIDs: [],
                 omittedOutstandingCommandCount: 0, unknownEventRefs: [],
                 omittedUnknownEventRefCount: 0, unknownDomains: [],
                 corruptionReasons: [reason], omittedCorruptionReasonCount: 0)
@@ -497,6 +506,33 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
         }
     }
 
+    private static func validAgentHandleFact(
+        _ fact: LocalTimelineCatalog.AgentHandleFact,
+        work: WorkRef?, journal: JournalRef?, maxCharacters: Int
+    ) -> Bool {
+        guard fact.isProjectionValid, let work, let journal,
+              fact.origin.work == work,
+              fact.origin.workHost == WorkHostRef(work.workHostID),
+              !fact.handleID.isEmpty,
+              case .work(let owner) = fact.latestLifecycleEvent.journal.owner,
+              owner == work,
+              fact.latestLifecycleEvent.journal == journal,
+              fact.latestLifecycleEvent.journal.authority.authorityID == work.workHostID,
+              !fact.latestLifecycleEvent.eventID.isEmpty
+        else { return false }
+        let values = [
+            fact.handleID, fact.origin.work.workHostID, fact.origin.work.workID,
+            fact.origin.workHost.workHostID, fact.origin.session.sessionID,
+            fact.origin.sessionAttachment.attachmentID, fact.origin.run.runID,
+            fact.latestLifecycleEvent.journal.journalID,
+            fact.latestLifecycleEvent.journal.authority.authorityID,
+            fact.latestLifecycleEvent.eventID,
+        ]
+        return values.allSatisfy {
+            !$0.isEmpty && $0.utf8.count <= maxCharacters
+        }
+    }
+
     private static func makeRow(
         identity: String, group: [LocalTimelineCatalog.WorkRow],
         representative: LocalTimelineCatalog.WorkRow?, sessions: [CanonicalSessionCatalogSummary],
@@ -511,6 +547,11 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
         let exact = row?.isAvailable == true && validIdentity
         let safeWork = validIdentity ? work : nil
         let safeJournal = validIdentity ? journal : nil
+        let invalidAgentHandleFacts = row?.agentHandles.contains {
+            !Self.validAgentHandleFact(
+                $0, work: work, journal: journal,
+                maxCharacters: limits.maxIdentityCharacters)
+        } ?? false
         var sessionFactsByKey: [String: [CanonicalWorkRecoverySessionAttachment]] = [:]
         var omittedSessionIdentityCount = 0
         // The Work journal is the first source of an attachment fact. A Session summary is an
@@ -806,6 +847,9 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
         } else if !validIdentity || !exact {
             disposition = row?.isAvailable == false ? .corrupt : .uncertain
             if !validIdentity { reasons.append("Work journal identity is invalid") }
+        } else if invalidAgentHandleFacts {
+            disposition = .uncertain
+            reasons.append("Work agent Handle fact is invalid or exceeds projection bounds")
         } else if row?.unknownDomains.contains(where: {
             [.work, .runtime, .externalEffects].contains($0)
         }) == true {
@@ -902,6 +946,34 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
         }.sorted { $0.handleID < $1.handleID }
         let handles = Array(validHandles.prefix(limits.maxHandleFactsPerRow))
         let omittedHandles = handleInput.count - handles.count
+        let agentHandleInput = row?.agentHandles ?? []
+        let validAgentHandles: [LocalTimelineCatalog.AgentHandleFact]
+        let invalidCompletionBlockingAgentHandleCount: Int
+        if let work, let journal {
+            validAgentHandles = agentHandleInput.filter {
+                Self.validAgentHandleFact(
+                    $0, work: work, journal: journal,
+                    maxCharacters: limits.maxIdentityCharacters)
+            }.sorted(by: LocalTimelineCatalog.agentHandleLess)
+            invalidCompletionBlockingAgentHandleCount = agentHandleInput.filter {
+                $0.blocksWorkCompletion && !Self.validAgentHandleFact(
+                    $0, work: work, journal: journal,
+                    maxCharacters: limits.maxIdentityCharacters)
+            }.count
+        } else {
+            validAgentHandles = []
+            invalidCompletionBlockingAgentHandleCount = agentHandleInput.filter(
+                \.blocksWorkCompletion).count
+        }
+        let retainedAgentHandles = Array(
+            validAgentHandles.prefix(limits.maxAgentHandleFactsPerRow))
+        let omittedAgentHandles = agentHandleInput.count - retainedAgentHandles.count
+        let completionBlockingAgentHandleIDs = retainedAgentHandles
+            .filter(\.blocksWorkCompletion).map(\.handleID)
+        let omittedCompletionBlockingAgentHandleCount = max(0,
+            validAgentHandles.filter(\.blocksWorkCompletion).count
+                - completionBlockingAgentHandleIDs.count)
+            + invalidCompletionBlockingAgentHandleCount
         let (commands, omittedCommands) = boundedFacts(
             row?.commands ?? [], limit: limits.maxCommandFactsPerRow,
             maxCharacters: limits.maxIdentityCharacters) { $0.commandID }
@@ -929,6 +1001,7 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
             count + (pair.0 != nil && pair.1 == nil ? 1 : 0)
         }
         let operationalFactsProjectable = disposition != .ambiguous && disposition != .corrupt
+            && !invalidAgentHandleFacts
         let sessionOmissions = max(0, sessionFacts.count - limitedSessions.count)
             + omittedSessionIdentityCount + (row?.omittedSessionAttachmentCount ?? 0)
         let limitedClientCount = limitedClients.count
@@ -979,6 +1052,9 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
             omittedActionCount: omittedActions + (operationalFactsProjectable ? 0 : actions.count),
             handles: operationalFactsProjectable ? handles : [],
             omittedHandleCount: omittedHandles + (operationalFactsProjectable ? 0 : handles.count),
+            agentHandles: operationalFactsProjectable ? retainedAgentHandles : [],
+            omittedAgentHandleCount: omittedAgentHandles
+                + (operationalFactsProjectable ? 0 : retainedAgentHandles.count),
             commands: operationalFactsProjectable ? commands : [],
             omittedCommandCount: omittedCommands + (operationalFactsProjectable ? 0 : commands.count),
             outstandingActionIDs: operationalFactsProjectable ? outstandingActions : [],
@@ -987,6 +1063,10 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
             outstandingHandleIDs: operationalFactsProjectable ? outstandingHandles : [],
             omittedOutstandingHandleCount: omittedOutstandingHandles
                 + (operationalFactsProjectable ? 0 : outstandingHandles.count),
+            completionBlockingAgentHandleIDs: operationalFactsProjectable
+                ? completionBlockingAgentHandleIDs : [],
+            omittedCompletionBlockingAgentHandleCount: omittedCompletionBlockingAgentHandleCount
+                + (operationalFactsProjectable ? 0 : completionBlockingAgentHandleIDs.count),
             outstandingCommandIDs: operationalFactsProjectable ? outstandingCommands : [],
             omittedOutstandingCommandCount: omittedOutstandingCommands
                 + (operationalFactsProjectable ? 0 : outstandingCommands.count),
@@ -1005,6 +1085,7 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
         let hasOutstanding = row.activeRun != nil || row.activeTurn != nil
             || row.actions.contains { $0.state.isTerminal == false }
             || row.handles.contains { !isTerminalHandleState($0.state) }
+            || row.agentHandles.contains(where: \.blocksWorkCompletion)
             || row.commands.contains { $0.state == .accepted }
         if [.completed, .destroyed].contains(lifecycle), execution == .idle, !hasOutstanding {
             return .completedEvidence

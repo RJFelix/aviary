@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 1,
-  "projectionRulesVersion": 1,
+  "schemaVersion": 2,
+  "projectionRulesVersion": 2,
   "fixtureID": "reader-census-v2-adversarial",
   "sessionJournal": "session.jsonl",
   "workJournal": "work.jsonl",

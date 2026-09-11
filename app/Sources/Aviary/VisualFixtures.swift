@@ -83,6 +83,9 @@ private struct ActivityOverviewFixture: View {
                         sourceIsComplete: isCurrent),
                     children: ChatChildActivityPresentation(
                         workingState: FixtureData.inspectorProjections.working,
+                        sourceIsCurrent: isCurrent),
+                    agentHandles: ChatAgentHandleActivityPresentation(
+                        workingState: FixtureData.inspectorProjections.working,
                         sourceIsCurrent: isCurrent))
                     .padding(16)
             }
@@ -375,6 +378,39 @@ private enum FixtureData {
         ]
         workSnapshot.childStates = ["fixture-child": "done", "fixture-child-running": "running",
                                     "fixture-child-failed": "failed"]
+        // Design-only records exercise the same prepared activity presentation as the live UI.
+        // Canonical lifecycle/cleanup validity is covered by the separate native journal fixtures.
+        for (index, state) in [WorkAgentHandleState.running, .terminal, .reaped].enumerated() {
+            let handle = HandleRef("fixture-background-agent-\(index)")
+            let queued = EventRef(journal: workJournal, eventID: "fixture-agent-queued-\(index)")
+            var value = WorkAgentHandleSnapshot(
+                handle: handle,
+                origin: WorkAgentHandleOrigin(
+                    work: work, workHost: host, session: session,
+                    sessionAttachment: attachment, run: run),
+                label: "not displayed", deadline: Date(timeIntervalSince1970: 100),
+                requestBody: TimelineBodyReference(
+                    authority: workJournal, referenceID: "fixture-agent-request-\(index)"),
+                queuedEvent: queued)
+            value.state = state
+            if state != .running {
+                let event = WorkAgentHandleEventEvidence(
+                    event: EventRef(journal: workJournal, eventID: "fixture-agent-terminal-\(index)"),
+                    sequence: 24, previousEventID: "fixture-agent-started-\(index)",
+                    causedByEventID: queued, hostSequence: nil,
+                    work: work, workHost: host, session: session,
+                    sessionAttachment: attachment, run: run, handle: handle, client: nil,
+                    actor: TimelineActor(actorID: "visual-fixture"),
+                    hostRecordedAt: Date(timeIntervalSince1970: 90), provenance: .native)
+                value.terminalEvidence = WorkAgentHandleTerminalEvidence(
+                    outcome: state == .terminal ? .indeterminate : .succeeded,
+                    resultBody: nil,
+                    cleanup: WorkAgentHandleCleanupProof(
+                        state: state == .terminal ? .indeterminate : .quiesced), event: event)
+                value.latestLifecycleEvent = event.event
+            }
+            workSnapshot.agentHandles[handle.handleID] = value
+        }
         let recoveryCoverage = RecoveryCoverage(
             operation: .reattachLiveHost,
             planes: [

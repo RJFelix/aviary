@@ -518,6 +518,7 @@ public enum CanonicalWorkingStateFailure: String, Codable, Hashable, Sendable {
 public struct CanonicalWorkingStateProjection: Codable, Hashable, Sendable {
     public static let maximumActions = 256
     public static let maximumHandles = 256
+    public static let maximumAgentHandles = 256
     public static let maximumChildren = 256
     public static let maximumArtifacts = 256
     public static let maximumRecoveryClaims = 32
@@ -535,6 +536,8 @@ public struct CanonicalWorkingStateProjection: Codable, Hashable, Sendable {
     public let activeActionIDs: [String]
     public let actions: [CanonicalWorkingAction]
     public let handles: [CanonicalWorkingHandle]
+    public let agentHandles: [LocalTimelineCatalog.AgentHandleFact]
+    public let agentHandleFactsAvailable: Bool
     public let children: [CanonicalWorkingChild]
     public let artifacts: [CanonicalWorkingArtifact]
     public let recovery: [CanonicalWorkingRecovery]
@@ -545,6 +548,7 @@ public struct CanonicalWorkingStateProjection: Codable, Hashable, Sendable {
     public let canonicalityFailures: [CanonicalWorkingStateFailure]
     public let omittedActionCount: Int
     public let omittedHandleCount: Int
+    public let omittedAgentHandleCount: Int
     public let omittedChildCount: Int
     public let omittedArtifactCount: Int
     public let omittedRecoveryCount: Int
@@ -715,12 +719,15 @@ public struct CanonicalWorkingStateProjection: Codable, Hashable, Sendable {
             activeActionIDs = []
             actions = []
             handles = []
+            agentHandles = []
+            agentHandleFactsAvailable = false
             children = []
             artifacts = []
             recovery = []
             self.namespace = CanonicalNamespaceMetadata(availability: .unavailable)
             omittedActionCount = 0
             omittedHandleCount = 0
+            omittedAgentHandleCount = 0
             omittedChildCount = 0
             omittedArtifactCount = 0
             omittedRecoveryCount = 0
@@ -753,6 +760,18 @@ public struct CanonicalWorkingStateProjection: Codable, Hashable, Sendable {
         let handleValues = workSnapshot.handles.values.sorted { $0.handle.handleID < $1.handle.handleID }
         handles = Array(handleValues.prefix(Self.maximumHandles)).map(CanonicalWorkingHandle.init)
         omittedHandleCount = max(0, handleValues.count - handles.count)
+        let agentHandleFactsKnown = !workSnapshot.unknownDomains.contains(.work)
+            && !workSnapshot.unknownDomains.contains(.session)
+            && !workSnapshot.unknownDomains.contains(.runtime)
+            && !workSnapshot.unknownDomains.contains(.externalEffects)
+            && sessionSnapshot.unknownDomains.isDisjoint(with: [.work, .session])
+        agentHandleFactsAvailable = agentHandleFactsKnown
+        let agentHandleValues = agentHandleFactsKnown
+            ? workSnapshot.agentHandles.values.map(LocalTimelineCatalog.AgentHandleFact.init)
+                .sorted(by: LocalTimelineCatalog.agentHandleLess)
+            : []
+        agentHandles = Array(agentHandleValues.prefix(Self.maximumAgentHandles))
+        omittedAgentHandleCount = max(0, agentHandleValues.count - agentHandles.count)
         let childValues = workSnapshot.childStates.sorted { $0.key < $1.key }
         children = Array(childValues.prefix(Self.maximumChildren)).map {
             CanonicalWorkingChild(id: $0.key, state: $0.value)

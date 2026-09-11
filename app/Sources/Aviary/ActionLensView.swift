@@ -80,7 +80,14 @@ struct ChatActivityHistoryView: View {
                     if let omissions = run.serviceProjectionOmissionSummary {
                         Text(omissions).font(.caption).foregroundStyle(.secondary)
                     }
-                    ChatActivityContent(activity: run.chatActivity, children: run.childActivity)
+                    ChatActivityContent(
+                        activity: run.chatActivity,
+                        children: run.childActivity,
+                        agentHandles: run.isServiceBacked
+                            ? ChatAgentHandleActivityPresentation(
+                                workingState: run.canonicalWorkingState,
+                                sourceIsCurrent: run.serviceActivitySourceIsCurrent)
+                            : nil)
                 }.padding(16)
             }
         }
@@ -94,6 +101,9 @@ struct ChatActivityHistoryView: View {
 struct ChatActivityContent: View {
     let activity: ChatActivityPresentation
     let children: ChatChildActivityPresentation
+    /// Optional keeps deterministic activity fixtures focused on their legacy child records;
+    /// service-backed callers pass the distinct Work-owned Handle presentation explicitly.
+    var agentHandles: ChatAgentHandleActivityPresentation? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -112,6 +122,18 @@ struct ChatActivityContent: View {
                         .font(.system(size: 12, weight: .semibold))
                     Text(children.summary).font(.system(size: 12))
                     Text(children.disclosure).font(.caption).foregroundStyle(.secondary)
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Design.accent.opacity(0.05), in: RoundedRectangle(cornerRadius: 9))
+            }
+            if let agentHandles, agentHandles.hasRecords || !agentHandles.isAvailable {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Recorded background agents", systemImage: "person.2.wave.2")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(agentHandles.summary).font(.system(size: 12))
+                    Text(agentHandles.disclosure).font(.caption).foregroundStyle(.secondary)
                 }
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(12)

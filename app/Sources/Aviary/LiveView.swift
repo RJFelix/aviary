@@ -400,6 +400,35 @@ struct RunPane: View {
                     .accessibilityHint("Shows recorded child lifecycle counts and their limits")
                     Divider()
                 }
+                let backgroundAgents = run.isServiceBacked
+                    ? ChatAgentHandleActivityPresentation(
+                        workingState: run.canonicalWorkingState,
+                        sourceIsCurrent: run.serviceActivitySourceIsCurrent)
+                    : nil
+                if let backgroundAgents,
+                   backgroundAgents.hasRecords || !backgroundAgents.isAvailable {
+                    Button { showActivityHistory = true } label: {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "person.2.wave.2")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Recorded background agents")
+                                    .font(.system(size: 11, weight: .medium))
+                                Text(backgroundAgents.summary)
+                                    .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer(minLength: 4)
+                            Image(systemName: "chevron.right").font(.caption)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .padding(.horizontal, Design.gutter).padding(.vertical, 8)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("chat-recorded-background-agents")
+                    .accessibilityHint("Shows recorded Work-owned agent states; this is not process liveness")
+                    Divider()
+                }
                 TranscriptView(
                     items: run.items,
                     hideThinking: model.hideThinking,
@@ -519,7 +548,11 @@ struct RunPane: View {
             runMetadata
 
             HStack(spacing: 8) {
-                if !run.serviceActionPresentations.isEmpty || run.childActivity.hasRecords {
+                if !run.serviceActionPresentations.isEmpty || run.childActivity.hasRecords
+                    || (run.isServiceBacked && ChatAgentHandleActivityPresentation(
+                        workingState: run.canonicalWorkingState,
+                        sourceIsCurrent: run.serviceActivitySourceIsCurrent).hasRecords)
+                    || (run.isServiceBacked && run.canonicalWorkingState?.agentHandleFactsAvailable != true) {
                     Button { showActivityHistory = true } label: {
                         Label("Activity", systemImage: "list.bullet.rectangle")
                     }

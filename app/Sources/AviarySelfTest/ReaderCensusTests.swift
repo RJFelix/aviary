@@ -36,6 +36,147 @@ private func prefixLines(_ data: Data, count: Int) -> Data {
     return result
 }
 
+func test_readerCensusRecordedAgentsSurviveParentEnd() throws {
+    let sessionData = prefixLines(try ReaderCensusFixtureFiles.data("session.jsonl"), count: 3)
+    let workData = try ReaderCensusFixtureFiles.data("variants/work-agent-handle-lifecycle.jsonl")
+    let sessionRead = ReaderCensus.read(sessionData, journal: censusSessionJournal)
+    for count in 5...12 {
+        let prefix = prefixLines(workData, count: count)
+        let workRead = ReaderCensus.read(prefix, journal: censusWorkJournal)
+        let report = ReaderCensus.report(
+            sessionRead: sessionRead, workRead: workRead,
+            sessionJournal: censusSessionJournal, workJournal: censusWorkJournal)
+        XCTAssertTrue(report.workIntegrityValid)
+        XCTAssertEqual(report.agentHandles.count, count < 7 ? 1 : 2)
+        XCTAssertTrue(report.outstandingHandleIDs.isEmpty,
+                      "Work-owned agents must not be conflated with Run-owned Handles")
+        XCTAssertTrue(report.childStates.isEmpty,
+                      "agent_handle events must not be inferred from child.lifecycle strings")
+        let incremental = ReaderCensus.report(
+            sessionRead: ReaderCensus.readIncrementally(
+                sessionData, journal: censusSessionJournal, chunkSizes: [1, 7, 31]),
+            workRead: ReaderCensus.readIncrementally(
+                prefix, journal: censusWorkJournal, chunkSizes: [2, 19, 3]),
+            sessionJournal: censusSessionJournal, workJournal: censusWorkJournal)
+        XCTAssertEqual(incremental, report)
+        let restored = try JSONDecoder().decode(
+            ReaderCensusReport.self, from: JSONEncoder().encode(report))
+        XCTAssertEqual(restored, report)
+        let recovery = try XCTUnwrap(report.canonicalWorkRecovery.rows.first)
+        XCTAssertEqual(recovery.agentHandles, report.agentHandles)
+        XCTAssertEqual(recovery.completionBlockingAgentHandleIDs,
+                       report.completionBlockingAgentHandleIDs)
+        if count >= 9 { XCTAssertNil(recovery.activeRun) }
+        let catalog = try XCTUnwrap(report.canonicalSessionCatalog)
+        XCTAssertFalse(catalog.work.isEmpty)
+        for work in catalog.work {
+            XCTAssertEqual(work.agentHandles, report.agentHandles)
+            XCTAssertEqual(work.completionBlockingAgentHandleIDs,
+                           report.completionBlockingAgentHandleIDs)
+        }
+        if count == 9 {
+            XCTAssertEqual(report.agentHandles.map(\.state), [.running, .running])
+            XCTAssertEqual(report.completionBlockingAgentHandleIDs, ["agent-a", "agent-b"])
+        }
+        if count == 12 {
+            XCTAssertEqual(report.agentHandles.map(\.handleID), ["agent-b", "agent-a"])
+            XCTAssertEqual(report.agentHandles.map(\.state), [.terminal, .reaped])
+            XCTAssertEqual(report.agentHandles.first?.cleanupState, .indeterminate)
+            XCTAssertEqual(report.completionBlockingAgentHandleIDs, ["agent-b"])
+        }
+        let metadata = String(decoding: try JSONEncoder().encode(report.agentHandles), as: UTF8.self)
+        XCTAssertFalse(metadata.contains("private-agent-label-secret"))
+        XCTAssertFalse(metadata.contains("request_body"))
+        XCTAssertFalse(metadata.contains("result_body"))
+        XCTAssertFalse(metadata.contains("deadline"))
+    }
+    // An unknown runtime event is preserved as an unknown, never interpreted as zero agents.
+    let lastLine = try XCTUnwrap(workData.split(separator: 0x0A).last)
+    var unknown = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(lastLine)) as? [String: Any])
+    unknown["event_id"] = "unknown-agent-runtime"
+    unknown["sequence"] = 13
+    unknown["previous_event_id"] = "b-terminal"
+    unknown["type"] = "runtime.future-agent-state"
+    unknown["declared_domains"] = ["runtime"]
+    unknown["payload"] = [:] as [String: String]
+    var unknownData = workData
+    unknownData.append(try JSONSerialization.data(withJSONObject: unknown, options: [.sortedKeys]))
+    unknownData.append(0x0A)
+    let unknownReport = ReaderCensus.report(
+        sessionData: sessionData, sessionJournal: censusSessionJournal,
+        workData: unknownData, workJournal: censusWorkJournal)
+    XCTAssertTrue(unknownReport.workIntegrityValid)
+    XCTAssertTrue(unknownReport.unknownDomains.contains(.runtime))
+    XCTAssertTrue(unknownReport.agentHandles.isEmpty)
+    XCTAssertTrue(unknownReport.completionBlockingAgentHandleIDs.isEmpty)
+    XCTAssertTrue(unknownReport.canonicalWorkRecovery.rows.first?.agentHandles.isEmpty == true)
+
+    var tailed = workData
+    tailed.append(Data("{\"event_id\":\"unfinished".utf8))
+    let tailedReport = ReaderCensus.report(
+        sessionData: sessionData, sessionJournal: censusSessionJournal,
+        workData: tailed, workJournal: censusWorkJournal)
+    XCTAssertFalse(tailedReport.workIntegrityValid)
+    XCTAssertTrue(tailedReport.agentHandles.isEmpty)
+}
+
+func test_readerCensusCompletedWorkWithUnknownAgentsBlocksDestructiveActions() throws {
+    let sessionRead = ReaderCensus.read(
+        prefixLines(try ReaderCensusFixtureFiles.data("session.jsonl"), count: 3),
+        journal: censusSessionJournal)
+    let fixtureRead = ReaderCensus.read(
+        try ReaderCensusFixtureFiles.data("variants/work-agent-handle-lifecycle.jsonl"),
+        journal: censusWorkJournal)
+    var events = Array(fixtureRead.records.prefix(6).map(\.event))
+    let terminal = try XCTUnwrap(fixtureRead.records.first { $0.event.eventID == "a-terminal" })
+    func append(_ id: String, type: String, domains: Set<TimelineDomain>,
+                handle: HandleRef? = nil, payload: JSONValue = .object([:])) {
+        events.append(TimelineEvent(
+            eventID: id, journal: censusWorkJournal, sequence: events.count + 1,
+            previousEventID: events.last?.eventID,
+            causedByEventID: handle.map { _ in EventRef(journal: censusWorkJournal, eventID: "a-started") },
+            session: SessionRef("census-session"),
+            work: WorkRef(workHostID: "census-host", workID: "census-work"),
+            workHost: WorkHostRef("census-host"), sessionAttachment: SessionAttachmentRef("sa-main"),
+            run: RunRef("run-1"), handle: handle,
+            actor: TimelineActor(actorID: "census-completion"),
+            hostRecordedAt: Date(timeIntervalSince1970: 30), type: type,
+            declaredDomains: domains, payload: payload))
+    }
+    append("ended", type: TimelineEventType.runFinished, domains: [.work, .runtime])
+    append("settled", type: TimelineEventType.agentHandleTerminal,
+           domains: [.work, .runtime, .externalEffects], handle: HandleRef("agent-a"),
+           payload: terminal.event.payload)
+    append("completed", type: TimelineEventType.workCompleted, domains: [.work])
+    func report() throws -> ReaderCensusReport {
+        var data = Data()
+        for event in events {
+            data.append(try JSONEncoder().encode(event))
+            data.append(0x0A)
+        }
+        return ReaderCensus.report(
+            sessionRead: sessionRead, workRead: ReaderCensus.read(data, journal: censusWorkJournal),
+            sessionJournal: censusSessionJournal, workJournal: censusWorkJournal)
+    }
+    let complete = try report()
+    XCTAssertTrue(complete.workIntegrityValid)
+    let summary = try XCTUnwrap(complete.canonicalSessionCatalog)
+    XCTAssertFalse(summary.hasOngoingOrUncertainAttachedWork)
+    XCTAssertTrue(summary.work.allSatisfy(\.agentHandleFactsAvailable))
+    for domain in [TimelineDomain.session, .runtime, .externalEffects] {
+        append("unknown-\(domain.rawValue)", type: "future.agent-state", domains: [domain])
+        let unknown = try report()
+        XCTAssertTrue(unknown.workIntegrityValid)
+        let unknownSummary = try XCTUnwrap(unknown.canonicalSessionCatalog)
+        XCTAssertTrue(unknownSummary.hasOngoingOrUncertainAttachedWork,
+                      "the Continue/Trash admission predicate must not infer safe absence")
+        XCTAssertTrue(unknownSummary.work.allSatisfy { !$0.agentHandleFactsAvailable })
+        XCTAssertTrue(unknownSummary.work.allSatisfy { $0.agentHandles.isEmpty })
+        events.removeLast()
+    }
+}
+
 func test_readerCensusFixtureProjectsCorePlanes() throws {
     let manifest = try ReaderCensusFixtureFiles.manifest()
     let controlData = try ReaderCensusFixtureFiles.data(manifest.controlJournal)
@@ -51,7 +192,9 @@ func test_readerCensusFixtureProjectsCorePlanes() throws {
         controlJournal: censusControlJournal,
         manifest: manifest)
 
-    XCTAssertEqual(report.projectionRulesVersion, 1)
+    XCTAssertEqual(report.projectionRulesVersion, 2)
+    XCTAssertTrue(report.agentHandles.isEmpty)
+    XCTAssertTrue(report.completionBlockingAgentHandleIDs.isEmpty)
     XCTAssertEqual(report.sessionCommittedEventIDs.count, 18)
     XCTAssertEqual(report.workCommittedEventIDs.count, 19)
     XCTAssertTrue(report.sessionIntegrityValid)

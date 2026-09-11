@@ -32,6 +32,7 @@ private func promptProjectionReport(
             + "credentials-token /private/secret/path",
         recovery: [], authoredAttention: .none, attention: .none,
         outstandingActionIDs: [], indeterminateActionIDs: [], outstandingHandleIDs: [],
+        agentHandles: [], completionBlockingAgentHandleIDs: [],
         outstandingCommandIDs: [], childStates: [:], modelIDs: [], runIDs: [], activeTip: nil,
         attachments: [], unknownEventRefs: unknownEventRefs, unknownDomains: [.context],
         unknownReferenceIDs: unknownReferenceIDs, unknownReferences: [], assemblerReady: false,

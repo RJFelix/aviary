@@ -17,8 +17,8 @@ public struct ReaderCensusManifest: Codable, Hashable, Sendable {
     public let intentionallyUnwiredConsumers: [String]
 
     public init(
-        schemaVersion: Int = 1,
-        projectionRulesVersion: Int = 1,
+        schemaVersion: Int = 2,
+        projectionRulesVersion: Int = 2,
         fixtureID: String,
         sessionJournal: String,
         workJournal: String,
@@ -140,7 +140,7 @@ public struct ReaderCensusRecovery: Codable, Hashable, Sendable {
 /// cursors; it does not mean Catalog, Flock, notifications, search, or a service have consumed
 /// the same journals.
 public struct ReaderCensusReport: Codable, Hashable, Sendable {
-    public static let currentProjectionRulesVersion = 1
+    public static let currentProjectionRulesVersion = 2
 
     public let projectionRulesVersion: Int
     public let sessionCursor: JournalCursor?
@@ -171,6 +171,10 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
     public let outstandingActionIDs: [String]
     public let indeterminateActionIDs: [String]
     public let outstandingHandleIDs: [String]
+    /// Recorded Work-owned agents, never process-liveness evidence. Empty is not a claim of
+    /// quiescence when Work integrity or the work/runtime/external-effects domains are unknown.
+    public let agentHandles: [LocalTimelineCatalog.AgentHandleFact]
+    public let completionBlockingAgentHandleIDs: [String]
     public let outstandingCommandIDs: [String]
     public let childStates: [String: String]
     public let modelIDs: [String]
@@ -249,6 +253,8 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         attention: SessionAttention,
         outstandingActionIDs: [String], indeterminateActionIDs: [String],
         outstandingHandleIDs: [String],
+        agentHandles: [LocalTimelineCatalog.AgentHandleFact],
+        completionBlockingAgentHandleIDs: [String],
         outstandingCommandIDs: [String], childStates: [String: String],
         modelIDs: [String], runIDs: [String],
         activeTip: EventRef?, attachments: [ReaderCensusAttachment],
@@ -290,6 +296,8 @@ public struct ReaderCensusReport: Codable, Hashable, Sendable {
         self.outstandingActionIDs = outstandingActionIDs
         self.indeterminateActionIDs = indeterminateActionIDs
         self.outstandingHandleIDs = outstandingHandleIDs
+        self.agentHandles = agentHandles
+        self.completionBlockingAgentHandleIDs = completionBlockingAgentHandleIDs
         self.outstandingCommandIDs = outstandingCommandIDs
         self.childStates = childStates
         self.modelIDs = modelIDs
@@ -481,6 +489,11 @@ public enum ReaderCensus {
         let outstandingHandles = work.handles.values
             .filter { !["succeeded", "failed", "canceled", "completed"].contains($0.state) }
             .map { $0.handle.handleID }
+        let agentFactsKnown = workIntegrity
+            && work.unknownDomains.isDisjoint(with: [.work, .runtime, .externalEffects])
+        let agentHandles = agentFactsKnown
+            ? work.agentHandles.values.map(LocalTimelineCatalog.AgentHandleFact.init)
+                .sorted(by: LocalTimelineCatalog.agentHandleLess) : []
         let outstandingCommands = work.commands.values
             .filter { $0.state == .accepted }
             .map { $0.command.commandID }
@@ -647,6 +660,8 @@ public enum ReaderCensus {
             outstandingActionIDs: work.activeActionIDs.sorted(),
             indeterminateActionIDs: indeterminateActions.sorted(),
             outstandingHandleIDs: outstandingHandles.sorted(),
+            agentHandles: agentHandles,
+            completionBlockingAgentHandleIDs: agentHandles.filter(\.blocksWorkCompletion).map(\.handleID),
             outstandingCommandIDs: outstandingCommands.sorted(),
             childStates: childStates,
             modelIDs: modelIDs.sorted(), runIDs: runIDs.sorted(),

@@ -193,7 +193,7 @@ read capability.
 The installed signed app/helper were not replaced or restarted. This proves the Core/service
 boundary, not production child-owner liveness, a remote deployment, or GUI cancellation controls.
 
-### Next bounded slice: recorded child visibility
+### Recorded child visibility
 
 Thread a privacy-safe Work-owned agent fact through `LocalTimelineCatalog.WorkRow`, per-Work
 canonical Session summaries, recovery projections, Reader Census, and the existing working-state/
@@ -209,3 +209,57 @@ disposable reports with a projection-rules version bump; no compatibility decodi
 This slice requires no new RPC or lifecycle event and does not enable execution or cancellation
 controls. Fresh owner-liveness, shutdown accounting, deadlines, and physical retention remain
 separate activation gates.
+
+The recorded projection now has one shared metadata fact across local Work rows, exact attached
+Session summaries, recovery rows, Census, and working-state presentation. Recovery and display
+bounds retain completion blockers before settled records and report omissions. Facts affected by
+unknown Work/runtime/external-effects domains are unavailable, not a claim that there are no
+background agents. A disconnected chat may retain its last canonical facts, but the activity
+disclosure explicitly separates that recorded state from current process liveness.
+Attached-Session readers additionally require known reciprocal attachment evidence on both
+journals. Work-only readers may retain child records when only attachment state is unknown;
+that does not grant a Session visibility or make Continue/Trash safe. Invalid lifecycle/cleanup
+metadata is rejected on decode and cannot produce a completed recovery disposition.
+
+The activity sheet and chat strip label this group **Recorded background agents**, separately from
+Run-owned Handles and older child-lifecycle counts. The Census projection rules and fixture manifest
+are version 2. Its `variants/work-agent-handle-lifecycle.jsonl` follows two children through parent
+End, a successful quiescent terminal and reap, and an indeterminate terminal that still blocks
+completion. Prefix, incremental, catalog/recovery parity, metadata privacy, unknown-domain, and
+incomplete-tail checks exercise the same records. This does not enable GUI cancellation controls.
+
+Next: establish fresh coordinator ownership/liveness evidence, include children in host shutdown
+accounting, and prove deadline/retention behavior before promoting the private execution pilot.
+Recorded queued/running state alone must never authorize reconstruction or claim a surviving
+process. The installed app/helper are a separate deployment boundary from source/test receipts.
+
+#### Recorded visibility verification
+
+Verification of recorded visibility (2026-09-11): `just compile` builds Aviary and aviaryd without
+warnings; the SelfTest product builds. The focused Phase 5 suite passes 66 cases / 947 assertions
+in 23.43 seconds. The final complete traced suite passes 1,174 cases / 18,095 assertions in
+516.16 seconds with process-scoped idle-sleep inhibition. Narrow (520-point) and stale activity
+fixtures were rendered from the debug app and visually inspected; these are deterministic
+presentation checks, not installed-app or public-pilot activation proof. The signed installed
+app and helper were not replaced or restarted. Independent review corrections cover unknown
+attachment-domain visibility, destructive-action gating, invalid metadata/identity bounds,
+Codable round trips, and the unavailable-only activity entry point.
+
+#### Next bounded slice: fresh owner observation and shutdown admission
+
+`WorkAgentChildCoordinator.Entry` is the live owner; neither a registry `.live` row nor a recorded
+Handle state proves that ownership. Add a bounded coordinator observation/freeze seam before
+any public liveness presentation. Distinguish locally owned queued/running/cancel-requested,
+ambiguous admission, and terminal-but-unquiesced entries. An empty fresh coordinator means no
+locally proven owner, not proof that recorded work is dead or reconstructable.
+
+Daemon shutdown already closes service admission and checks durable recovery obligations. It
+must also close child admission and atomically inspect coordinator obligations before stopping
+the host. Refuse shutdown while any ownership or cleanup remains unresolved. Parent End must
+not invoke this shutdown barrier: its independent children intentionally outlive the parent.
+
+Required race proofs: shutdown versus private admission/pump before its first append; parent End
+with a live child; terminal outcome before quiescent cleanup; ambiguous started/cancellation
+append without replaying a factory; and a fresh coordinator over recorded running work. Keep the
+pilot opt-in while proving these seams. Default deadline policy and physical retention remain
+separate from the recorded-view and ownership-observation checkpoints.

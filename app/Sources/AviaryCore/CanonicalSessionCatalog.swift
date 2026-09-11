@@ -53,6 +53,11 @@ public struct CanonicalWorkCatalogSummary: Codable, Hashable, Sendable, Identifi
     public let outstandingActionIDs: [String]
     public let indeterminateActionIDs: [String]
     public let outstandingHandleIDs: [String]
+    /// Work-owned agent children from this exact, reciprocal Session attachment only. These are
+    /// never flattened into a Session-wide child-ID set.
+    public let agentHandles: [LocalTimelineCatalog.AgentHandleFact]
+    public let agentHandleFactsAvailable: Bool
+    public let completionBlockingAgentHandleIDs: [String]
     public let outstandingCommandIDs: [String]
     public let structuralIntegrityValid: Bool
     public let semanticProjectionValid: Bool
@@ -82,6 +87,7 @@ public struct CanonicalWorkCatalogSummary: Codable, Hashable, Sendable, Identifi
 
     fileprivate init(
         attachment: SessionAttachmentSnapshot,
+        session: SessionRef?,
         work: WorkSnapshot?,
         cursor: JournalCursor?,
         workRead: TimelineJournalReadResult?,
@@ -145,6 +151,22 @@ public struct CanonicalWorkCatalogSummary: Codable, Hashable, Sendable, Identifi
             .filter { !["succeeded", "failed", "canceled", "completed"].contains($0.state) }
             .map { $0.handle.handleID }
             .sorted() ?? [] : []
+        let reciprocal = trustedWork?.sessionAttachments[attachment.attachment.attachmentID]
+        let reciprocalAttachment = session != nil && reciprocal?.session == session
+            && reciprocal?.attachment == attachment.attachment && reciprocal?.isAttached == true
+        let agentHandleFactsKnown = projectable && reciprocalAttachment
+            && trustedWork?.unknownDomains.contains(.session) == false
+            && trustedWork?.unknownDomains.contains(.runtime) == false
+            && trustedWork?.unknownDomains.contains(.externalEffects) == false
+        let alignedAgentHandles = agentHandleFactsKnown
+            ? (trustedWork?.agentHandles.values.map(LocalTimelineCatalog.AgentHandleFact.init)
+                .sorted(by: LocalTimelineCatalog.agentHandleLess) ?? [])
+            : []
+        self.agentHandleFactsAvailable = agentHandleFactsKnown
+        self.agentHandles = Array(alignedAgentHandles.prefix(
+            WorkAgentHandleSnapshot.maximumRetainedPerWork))
+        self.completionBlockingAgentHandleIDs = self.agentHandles
+            .filter(\.blocksWorkCompletion).map(\.handleID)
         self.outstandingCommandIDs = projectable ? trustedWork?.commands.values
             .filter { $0.state == .accepted }
             .map { $0.command.commandID }
@@ -546,7 +568,8 @@ public struct CanonicalSessionCatalogSummary: Codable, Hashable, Sendable, Ident
                 read = nil
             }
             return CanonicalWorkCatalogSummary(
-                attachment: attachment, work: suppliedSnapshot, cursor: cursor, workRead: read,
+                attachment: attachment, session: session.session,
+                work: suppliedSnapshot, cursor: cursor, workRead: read,
                 attachmentProjectionKnown: attachmentFactsKnown)
         }
         self.work = workRows
@@ -635,7 +658,8 @@ public extension CanonicalSessionCatalogSummary {
             return true
         }
         return work.contains {
-            $0.isAttached && (!$0.canProjectExecution || $0.lifecycle == .active)
+            $0.isAttached && (!$0.canProjectExecution || !$0.agentHandleFactsAvailable
+                || !$0.completionBlockingAgentHandleIDs.isEmpty || $0.lifecycle == .active)
         }
     }
 

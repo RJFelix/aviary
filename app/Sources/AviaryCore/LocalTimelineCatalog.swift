@@ -78,6 +78,176 @@ public enum LocalTimelineCatalog {
         }
     }
 
+    /// A privacy-safe projection of one Work-owned agent child. Request/result bodies, labels,
+    /// deadlines, and cancellation envelopes remain canonical Work facts and are not catalog
+    /// metadata.
+    public struct AgentHandleFact: Codable, Hashable, Sendable, Identifiable {
+        internal static let maximumIdentityBytes = PersistentWorkExactState.maximumIdentityBytes
+        public let handleID: String
+        public let origin: WorkAgentHandleOrigin
+        public let state: WorkAgentHandleState
+        public let terminalOutcome: WorkAgentHandleTerminalOutcome?
+        public let cleanupState: WorkAgentHandleCleanupState?
+        public let latestLifecycleEvent: EventRef
+        private let projectionValidity: Bool
+
+        public var id: String { handleID }
+
+        public var blocksWorkCompletion: Bool {
+            !projectionValidity || state.isLive || cleanupState == .indeterminate
+        }
+
+        internal var isProjectionValid: Bool { projectionValidity }
+
+        internal init(_ value: WorkAgentHandleSnapshot) {
+            handleID = value.handle.handleID
+            origin = value.origin
+            state = value.state
+            terminalOutcome = value.terminalOutcome
+            cleanupState = value.cleanup?.state
+            latestLifecycleEvent = value.latestLifecycleEvent
+            projectionValidity = Self.isStructurallyValid(
+                handleID: handleID, origin: origin, state: state,
+                terminalOutcome: terminalOutcome, cleanupState: cleanupState,
+                latestLifecycleEvent: latestLifecycleEvent)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case handleID, origin, state, terminalOutcome, cleanupState, latestLifecycleEvent
+        }
+
+        public init(from decoder: Decoder) throws {
+            do {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                let decodedHandleID = try container.decode(String.self, forKey: .handleID)
+                let decodedOrigin = try container.decode(WorkAgentHandleOrigin.self, forKey: .origin)
+                let decodedState = try container.decode(WorkAgentHandleState.self, forKey: .state)
+                let decodedOutcome = try container.decodeIfPresent(
+                    WorkAgentHandleTerminalOutcome.self, forKey: .terminalOutcome)
+                let decodedCleanup = try container.decodeIfPresent(
+                    WorkAgentHandleCleanupState.self, forKey: .cleanupState)
+                let decodedEvent = try container.decode(EventRef.self, forKey: .latestLifecycleEvent)
+                guard Self.isStructurallyValid(
+                    handleID: decodedHandleID, origin: decodedOrigin, state: decodedState,
+                    terminalOutcome: decodedOutcome, cleanupState: decodedCleanup,
+                    latestLifecycleEvent: decodedEvent) else {
+                    throw Self.invalidProjectionError(codingPath: container.codingPath)
+                }
+                handleID = decodedHandleID
+                origin = decodedOrigin
+                state = decodedState
+                terminalOutcome = decodedOutcome
+                cleanupState = decodedCleanup
+                latestLifecycleEvent = decodedEvent
+                projectionValidity = true
+            } catch {
+                throw Self.invalidProjectionError(codingPath: decoder.codingPath)
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            guard projectionValidity else {
+                throw EncodingError.invalidValue(self, .init(
+                    codingPath: encoder.codingPath,
+                    debugDescription: "invalid agent Handle catalog fact"))
+            }
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(handleID, forKey: .handleID)
+            try container.encode(origin, forKey: .origin)
+            try container.encode(state, forKey: .state)
+            try container.encodeIfPresent(terminalOutcome, forKey: .terminalOutcome)
+            try container.encodeIfPresent(cleanupState, forKey: .cleanupState)
+            try container.encode(latestLifecycleEvent, forKey: .latestLifecycleEvent)
+        }
+
+        private static func isStructurallyValid(
+            handleID: String, origin: WorkAgentHandleOrigin, state: WorkAgentHandleState,
+            terminalOutcome: WorkAgentHandleTerminalOutcome?,
+            cleanupState: WorkAgentHandleCleanupState?, latestLifecycleEvent: EventRef
+        ) -> Bool {
+            guard !handleID.isEmpty,
+                  !origin.work.workHostID.isEmpty, !origin.work.workID.isEmpty,
+                  origin.workHost == WorkHostRef(origin.work.workHostID),
+                  !origin.session.sessionID.isEmpty,
+                  !origin.sessionAttachment.attachmentID.isEmpty,
+                  !origin.run.runID.isEmpty,
+                  !latestLifecycleEvent.eventID.isEmpty,
+                  case .work(let owner) = latestLifecycleEvent.journal.owner,
+                  owner == origin.work,
+                  latestLifecycleEvent.journal.authority.authorityID == origin.work.workHostID
+            else { return false }
+            let identityValues = [
+                handleID, origin.work.workHostID, origin.work.workID,
+                origin.workHost.workHostID, origin.session.sessionID,
+                origin.sessionAttachment.attachmentID, origin.run.runID,
+                latestLifecycleEvent.journal.journalID,
+                latestLifecycleEvent.journal.authority.authorityID,
+                latestLifecycleEvent.eventID,
+            ]
+            guard identityValues.allSatisfy({
+                !$0.isEmpty && $0.utf8.count <= maximumIdentityBytes
+            }) else { return false }
+            switch state {
+            case .queued, .running, .cancelRequested:
+                return terminalOutcome == nil && cleanupState == nil
+            case .terminal:
+                guard let terminalOutcome, let cleanupState else { return false }
+                if terminalOutcome == .indeterminate {
+                    return cleanupState == .indeterminate
+                }
+                switch cleanupState {
+                case .notStarted:
+                    return [.failed, .canceled, .expired].contains(terminalOutcome)
+                case .quiesced:
+                    return [.succeeded, .failed, .canceled, .expired].contains(terminalOutcome)
+                case .indeterminate:
+                    return false
+                }
+            case .reaped:
+                guard let terminalOutcome, let cleanupState else { return false }
+                switch cleanupState {
+                case .notStarted:
+                    return [.failed, .canceled, .expired].contains(terminalOutcome)
+                case .quiesced:
+                    return [.succeeded, .failed, .canceled, .expired].contains(terminalOutcome)
+                case .indeterminate:
+                    return false
+                }
+            }
+        }
+
+        private static func invalidProjectionError(codingPath: [CodingKey]) -> DecodingError {
+            .dataCorrupted(.init(
+                codingPath: codingPath,
+                debugDescription: "invalid agent Handle catalog fact"))
+        }
+
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.handleID == rhs.handleID && lhs.origin == rhs.origin
+                && lhs.state == rhs.state && lhs.terminalOutcome == rhs.terminalOutcome
+                && lhs.cleanupState == rhs.cleanupState
+                && lhs.latestLifecycleEvent == rhs.latestLifecycleEvent
+        }
+
+        public func hash(into hasher: inout Hasher) {
+            hasher.combine(handleID)
+            hasher.combine(origin)
+            hasher.combine(state)
+            hasher.combine(terminalOutcome)
+            hasher.combine(cleanupState)
+            hasher.combine(latestLifecycleEvent)
+        }
+
+        /// Stable, privacy-preserving order for bounded agent-child presentation. Completion
+        /// blockers always survive a low presentation bound before terminal/quiescent facts.
+        internal static func less(_ lhs: Self, _ rhs: Self) -> Bool {
+            if lhs.blocksWorkCompletion != rhs.blocksWorkCompletion {
+                return lhs.blocksWorkCompletion
+            }
+            return lhs.handleID < rhs.handleID
+        }
+    }
+
     public struct CommandFact: Codable, Hashable, Sendable, Identifiable {
         public let commandID: String
         public let state: CommandDeliveryState
@@ -113,6 +283,7 @@ public enum LocalTimelineCatalog {
         public let activeTurn: TurnRef?
         public let actions: [ActionFact]
         public let handles: [HandleFact]
+        public let agentHandles: [AgentHandleFact]
         public let commands: [CommandFact]
         /// Child lifecycle facts from the exact Work journal, when one was supplied. This is
         /// deliberately separate from the legacy AgentTree; an unavailable or unaligned read
@@ -244,6 +415,14 @@ public enum LocalTimelineCatalog {
                         $0.handle.handleID < $1.handle.handleID
                     }.map(HandleFact.init)
                     : []
+                let agentHandleFactsKnown = workFactsKnown && runtimeFactsKnown
+                    && !snapshot.unknownDomains.contains(.externalEffects)
+                agentHandles = agentHandleFactsKnown
+                    ? Array(snapshot.agentHandles.values
+                        .map(AgentHandleFact.init)
+                        .sorted(by: LocalTimelineCatalog.agentHandleLess)
+                        .prefix(WorkAgentHandleSnapshot.maximumRetainedPerWork))
+                    : []
                 commands = workFactsKnown
                     ? snapshot.commands.values.sorted {
                         $0.command.commandID < $1.command.commandID
@@ -257,6 +436,7 @@ public enum LocalTimelineCatalog {
                 activeTurn = nil
                 actions = []
                 handles = []
+                agentHandles = []
                 commands = []
             }
             tailBytes = (read?.truncatedTail?.rawBytes.count ?? 0)
@@ -284,6 +464,14 @@ public enum LocalTimelineCatalog {
                 omittedControlClientAttachmentCount: omittedControlClientAttachmentCount,
                 attachmentLimit: attachmentLimit)
         }
+    }
+
+    /// Stable, privacy-preserving order for bounded agent-child presentation. Completion
+    /// blockers always survive a low presentation bound before terminal/quiescent facts.
+    internal static func agentHandleLess(
+        _ lhs: AgentHandleFact, _ rhs: AgentHandleFact
+    ) -> Bool {
+        AgentHandleFact.less(lhs, rhs)
     }
 
     /// One discovered Work Host control journal. Control rows remain visible when the journal
