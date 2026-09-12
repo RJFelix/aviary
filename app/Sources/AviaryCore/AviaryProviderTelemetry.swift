@@ -1,11 +1,10 @@
 import Foundation
 
-/// One bounded observation per provider crossing. Usage updates replace, rather than add to,
-/// the latest provider-adapter report. No streamed content is retained here.
+/// One bounded observation per crossing. Cumulative updates replace the latest report.
 internal struct AviaryProviderTelemetry {
     private let started: UInt64
     private var firstOutputSeconds: Double?
-    private var latestUsage: Usage?
+    private(set) var latestUsage: ProviderUsage.RawReport?
     private var usageUpdates = 0
     private var finished = false
 
@@ -29,89 +28,68 @@ internal struct AviaryProviderTelemetry {
         firstOutputSeconds = Double(now - started) / 1_000_000_000
     }
 
-    func record(model: ModelSpec, accounting: ProviderUsageAccounting = .unknown) {
+    func record(model: ModelSpec) {
+        let accounted = ProviderUsage.account(report: latestUsage, model: model)
         var attributes: [String: AviaryTraceValue] = [
             "aviary.usage.updates": .int(usageUpdates),
-            "aviary.usage.input_accounting": .string(accounting.rawValue),
+            "aviary.usage.input_accounting": .string(accounted.inputAccounting.rawValue),
             "aviary.provider.done_observed": .bool(finished),
         ]
         if let firstOutputSeconds {
-            // A delta is not necessarily one token; thinking and tool output count too.
             attributes["aviary.provider.first_output.seconds"] = .double(firstOutputSeconds)
         }
-        guard let usage = latestUsage else {
-            attributes["aviary.usage.state"] = .string("unreported")
-            AviaryTelemetry.event("aviary.agent.provider.measurements", attributes: attributes)
-            return
+        let fields: [(ProviderUsage.Field, String)] = [
+            (.inputTokens, "input_tokens"), (.outputTokens, "output_tokens"),
+            (.cacheReadTokens, "cache_read_tokens"), (.cacheWriteTokens, "cache_write_tokens"),
+            (.reasoningTokens, "reasoning_tokens"), (.reportedTotalTokens, "reported_total_tokens"),
+        ]
+        var invalid = false
+        var coverage: [String: AviaryTraceValue] = [
+            "aviary.usage.finality": .string(finished ? "final_report" : "unconfirmed")
+        ]
+        for (field, key) in fields {
+            let observation = accounted.observations[field]
+            coverage["aviary.usage.\(key).state"] = .string(observation.state.rawValue)
+            if let reason = observation.reason {
+                coverage["aviary.usage.\(key).reason"] = .string(reason.rawValue)
+            }
+            if let value = observation.value { attributes["aviary.usage.\(key)"] = .int(value) }
+            invalid = invalid || observation.state == .invalid
         }
-        guard [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.totalTokens]
-                .allSatisfy({ $0 >= 0 }), (usage.reasoning ?? 0) >= 0 else {
-            attributes["aviary.usage.state"] = .string("invalid")
-            AviaryTelemetry.event("aviary.agent.provider.measurements", attributes: attributes)
-            return
-        }
-        attributes["aviary.usage.state"] = .string("reported")
-        attributes["aviary.usage.input_tokens"] = .int(usage.input)
-        attributes["aviary.usage.output_tokens"] = .int(usage.output)
-        attributes["aviary.usage.cache_read_tokens"] = .int(usage.cacheRead)
-        attributes["aviary.usage.cache_write_tokens"] = .int(usage.cacheWrite)
-        attributes["aviary.usage.total_tokens"] = .int(usage.totalTokens)
-        if let reasoning = usage.reasoning {
-            attributes["aviary.usage.reasoning_tokens"] = .int(reasoning)
-        }
-        // These are adapter counts, not an independent billing meter. Zero fields
-        // may reflect absent upstream fields; the Usage type does not retain field presence.
+        attributes["aviary.usage.state"] = .string(latestUsage == nil ? "unreported"
+            : invalid ? "invalid" : accounted.totalTokens == nil ? "partial" : "reported")
+        if let value = accounted.totalTokens { attributes["aviary.usage.total_tokens"] = .int(value) }
+        if let value = accounted.contextTokens { attributes["aviary.usage.context_tokens"] = .int(value) }
+        if let value = accounted.ordinaryInputTokens { attributes["aviary.usage.ordinary_input_tokens"] = .int(value) }
+        attributes["aviary.usage.issue_count"] = .int(accounted.issues.count)
         AviaryTelemetry.event("aviary.agent.provider.measurements", attributes: attributes)
-        recordPriceEstimate(usage: usage, model: model, accounting: accounting)
-    }
+        // Keep each event within the SDK's 16-attribute limit. Numeric measurements and
+        // field-presence evidence belong to the same crossing span without silent truncation.
+        AviaryTelemetry.event("aviary.agent.provider.usage_coverage", attributes: coverage)
 
-    private func recordPriceEstimate(usage: Usage, model: ModelSpec, accounting: ProviderUsageAccounting) {
-        let rates = [model.costInput, model.costOutput,
-            model.costCacheRead ?? model.costInput, model.costCacheWrite ?? model.costInput]
-        let ordinaryInput: Int?
-        switch accounting {
-        case .cacheExclusive: ordinaryInput = usage.input
-        case .cacheInclusive:
-            if usage.cacheRead <= usage.input, usage.cacheWrite <= usage.input - usage.cacheRead {
-                ordinaryInput = usage.input - usage.cacheRead - usage.cacheWrite
-            } else { ordinaryInput = nil }
-        case .unknown: ordinaryInput = nil
-        }
-        let counts = [ordinaryInput ?? 0, usage.output, usage.cacheRead, usage.cacheWrite]
-        let hasRate = rates.contains { $0 != nil }
-        let usable = ordinaryInput != nil && zip(counts, rates).allSatisfy { count, rate in
-            if let rate { return rate.isFinite && rate >= 0 }
-            return count == 0
-        }
+        let completePrice = finished ? accounted.price.total : nil
         var price: [String: AviaryTraceValue] = [
             "aviary.pricing.source": .string("model_spec"),
-            "aviary.pricing.state": .string(hasRate && usable ? "estimated" : "unavailable"),
+            "aviary.pricing.state": .string(completePrice == nil
+                ? (accounted.price.completeness == .unavailable ? "unavailable" : "partial") : "estimated"),
+            "aviary.pricing.known_lower_bound_usd": .double(accounted.price.knownTotal),
+            "aviary.pricing.complete": .bool(completePrice != nil),
+            "aviary.pricing.issue_count": .int(accounted.price.issues.count),
         ]
-        guard hasRate, usable else {
-            AviaryTelemetry.event("aviary.agent.provider.price", attributes: price)
-            return
+        if let estimate = completePrice { price["aviary.pricing.estimated_usd"] = .double(estimate) }
+        let rates = [accounted.rateSnapshot.inputPerMillion, accounted.rateSnapshot.outputPerMillion,
+            accounted.rateSnapshot.cacheReadPerMillion, accounted.rateSnapshot.cacheWritePerMillion]
+        let categories: [ProviderUsage.PricingCategory] = [.input, .output, .cacheRead, .cacheWrite]
+        let identity = zip(categories, rates).map { category, rate in
+            accounted.rateSnapshot.invalidRates.contains(category)
+                ? "invalid" : rate.map { String($0.bitPattern, radix: 16) } ?? "absent"
+        }.joined(separator: ":")
+        price["aviary.pricing.id"] = .string(AviaryTelemetry.identity("configured-usd-per-million:v2:" + identity))
+        for (key, rate) in zip(["input", "output", "cache_read", "cache_write"], rates) {
+            if let rate, rate.isFinite, rate >= 0 {
+                price["aviary.pricing.\(key)_per_million_usd"] = .double(rate)
+            }
         }
-        let estimate = zip(counts, rates).reduce(0.0) { sum, pair in
-            sum + Double(pair.0) * ((pair.1 ?? 0) / 1_000_000)
-        }
-        guard estimate.isFinite else {
-            price["aviary.pricing.state"] = .string("unavailable")
-            AviaryTelemetry.event("aviary.agent.provider.price", attributes: price)
-            return
-        }
-        // Bit-pattern identity includes absent rates and the effective cache fallback; never
-        // claims these configured rates are published prices or the actual charged amount.
-        let rateIdentity = rates.map { $0.map { String($0.bitPattern, radix: 16) } ?? "absent" }
-            .joined(separator: ":")
-        price["aviary.pricing.id"] = .string(AviaryTelemetry.identity("usd-per-million:v1:" + rateIdentity))
-        price["aviary.pricing.estimated_usd"] = .double(estimate)
-        let rateKeys = ["input", "output", "cache_read", "cache_write"]
-        for (key, rate) in zip(rateKeys, rates) {
-            if let rate { price["aviary.pricing.\(key)_per_million_usd"] = .double(rate) }
-        }
-        price["aviary.pricing.cache_fallback"] = .bool(
-            (usage.cacheRead > 0 && model.costCacheRead == nil)
-                || (usage.cacheWrite > 0 && model.costCacheWrite == nil))
         AviaryTelemetry.event("aviary.agent.provider.price", attributes: price)
     }
 }

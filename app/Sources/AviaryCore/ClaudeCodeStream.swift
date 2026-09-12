@@ -227,7 +227,7 @@ extension ClaudeCode {
                 isError: json["is_error"]?.boolValue ?? false,
                 text: json["result"]?.stringValue ?? "",
                 turns: json["num_turns"]?.intValue ?? 0,
-                usage: usage(from: json["usage"]) ?? Usage(),
+                usage: usage(from: json["usage"]) ?? Usage.unclassifiedRecord,
                 permissionDenials: (json["permission_denials"]?.arrayValue ?? []).map {
                     $0["tool_name"]?.stringValue ?? "?"
                 },
@@ -255,35 +255,12 @@ extension ClaudeCode {
         }
     }
 
-    /// Claude Code's usage onto Aviary's.
-    ///
-    /// `cost` is left at zero on purpose. A subscription run's tokens were not billed at list
-    /// price — `total_cost_usd` in the stream is documented as a client-side estimate — so
-    /// carrying that number into Aviary's ledger would invent spending that never happened.
-    /// Tokens are the truth here; money is not.
+    /// Normalize reported counts without treating an absent field as zero. Subscription
+    /// billing is not established by the stream's list-price estimate, so rates stay unknown.
     static func usage(from value: JSONValue?) -> Usage? {
-        guard let value else { return nil }
-        var usage = Usage()
-        usage.input = value["input_tokens"]?.intValue ?? 0
-        usage.output = value["output_tokens"]?.intValue ?? 0
-        usage.cacheRead = value["cache_read_input_tokens"]?.intValue ?? 0
-        usage.cacheWrite = value["cache_creation_input_tokens"]?.intValue ?? 0
-        // Absent rather than zero when the route said nothing, matching how the in-house
-        // providers treat reasoning counts.
-        if let thinking = value.path("output_tokens_details.thinking_tokens")?.intValue {
-            usage.reasoning = thinking
-        }
-        // Cache-inclusive, and this one is worth spelling out because it diverges from
-        // `AnthropicMessagesProvider`, which sums `input + output` only.
-        //
-        // Claude Code caches aggressively, and Anthropic reports cached context *outside*
-        // `input_tokens`: a real driven turn came back as `input 2, cacheWrite 3953`, then
-        // `input 2, cacheRead 3953`. Summing input and output there reports 83 tokens for a
-        // turn that processed about four thousand — a fiftyfold undercount, which would make a
-        // driven run look free on the Usage screen. This matches what `Usage(json:)` already
-        // falls back to when no `totalTokens` was written, so it is the arithmetic the reader
-        // believes anyway. The Anthropic provider undercounting the same way is a separate bug.
-        usage.totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite
-        return usage
+        guard let report = ProviderUsageWire.claudeCode(value) else { return nil }
+        let unpriced = ModelSpec(rpc: .object([
+            "id": .string("reported"), "provider": .string("claude-code")]))
+        return Usage(finality: .finalReport, accounted: ProviderUsage.account(report: report, model: unpriced))
     }
 }

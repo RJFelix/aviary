@@ -42,7 +42,7 @@ private final class InteractionScriptProvider: ChatProvider, @unchecked Sendable
 
         if let thinking { continuation.yield(.thinkingDelta(thinking)) }
         continuation.yield(.textDelta(text))
-        continuation.yield(.usage(Usage()))
+        continuation.yield(.usage(ProviderUsage.RawReport()))
         continuation.yield(.done(stopReason: "stop"))
         continuation.finish()
     }

@@ -335,7 +335,7 @@ public enum AviaryTelemetry {
         return name
     }
     private static func safeAttributes(_ attributes: [String: AviaryTraceValue]) -> [String: AttributeValue] {
-        let strings: [String: Set<String>] = [
+        var strings: [String: Set<String>] = [
             "rpc.system": ["aviary.work", "aviary_work_service", "aviary_work"],
             "rpc.method": ["handshake", "list_works", "describe_work", "create_work", "create_session",
                 "complete_work", "attach", "detach", "update_capabilities", "acknowledge_read", "snapshot",
@@ -344,11 +344,12 @@ public enum AviaryTelemetry {
             "aviary.read.target": ["work", "session"],
             "aviary.repository.review.status": ["clean", "changes", "unstable_conflict", "not_repository",
                 "timed_out", "cancelled", "failed", "bounded"],
-            "aviary.usage.state": ["reported", "unreported", "invalid"],
+            "aviary.usage.state": ["reported", "unreported", "invalid", "partial"],
+            "aviary.usage.finality": ["final_report", "unconfirmed"],
             "aviary.usage.input_accounting": ["cache_inclusive", "cache_exclusive", "unknown"],
             "aviary.runtime.callback.reply_state": ["accepted", "duplicate", "stale", "invalid", "unknown"],
             "aviary.pricing.source": ["model_spec"],
-            "aviary.pricing.state": ["estimated", "unavailable"],
+            "aviary.pricing.state": ["estimated", "unavailable", "partial"],
             "aviary.command.kind": ["create", "start", "send", "steer", "queue", "cancel", "end"],
             "aviary.outcome": ["unknown", "completed", "succeeded", "failed", "cancelled", "canceled",
                 "rejected", "indeterminate", "accepted", "duplicate", "unavailable", "expired"],
@@ -362,6 +363,11 @@ public enum AviaryTelemetry {
             "aviary.failure.kind": ["task", "infrastructure", "policy", "timeout", "cancellation", "indeterminate_effect", "other"],
             "error.type": ["action_dispatch", "action_outcome", "canonical_delivery", "cancellation", "provider", "mcp", "hook", "runtime"],
         ]
+        for field in ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                      "reasoning_tokens", "reported_total_tokens"] {
+            strings["aviary.usage.\(field).state"] = Set(ProviderUsage.ObservationState.allCases.map(\.rawValue))
+            strings["aviary.usage.\(field).reason"] = Set(ProviderUsage.ObservationReason.allCases.map(\.rawValue))
+        }
         let identities: Set<String> = ["aviary.request.id", "aviary.command.id", "aviary.work.id",
             "aviary.chat.id", "aviary.create.command.id", "aviary.start.command.id",
             "aviary.command.ledger.id", "aviary.handle.id",
@@ -376,6 +382,8 @@ public enum AviaryTelemetry {
             "aviary.usage.updates", "aviary.usage.input_tokens", "aviary.usage.output_tokens",
             "aviary.usage.cache_read_tokens", "aviary.usage.cache_write_tokens",
             "aviary.usage.total_tokens", "aviary.usage.reasoning_tokens",
+            "aviary.usage.context_tokens", "aviary.usage.ordinary_input_tokens", "aviary.usage.reported_total_tokens",
+            "aviary.usage.issue_count", "aviary.pricing.issue_count",
             "aviary.input.bytes", "aviary.output.bytes", "aviary.action.started.sequence",
             "aviary.read.sequence", "aviary.control.sequence", "aviary.artifact.bytes",
             "aviary.repository.review.files", "aviary.repository.review.diffs",
@@ -397,12 +405,13 @@ public enum AviaryTelemetry {
                 result[key] = .string(value)
             case .int(let value): if integers.contains(key), value >= 0 { result[key] = .int(value) }
             case .bool(let value):
-                if ["aviary.exception.present", "aviary.provider.done_observed", "aviary.pricing.cache_fallback",
+                if ["aviary.exception.present", "aviary.provider.done_observed", "aviary.pricing.complete",
                     "aviary.repository.review.bounded", "aviary.read.slow"].contains(key) {
                     result[key] = .bool(value)
                 }
             case .double(let value):
                 if ["aviary.timeout.seconds", "aviary.queue.wait.seconds", "aviary.provider.first_output.seconds", "aviary.pricing.estimated_usd",
+                    "aviary.pricing.known_lower_bound_usd",
                     "aviary.read.duration.seconds",
                     "aviary.pricing.input_per_million_usd", "aviary.pricing.output_per_million_usd",
                     "aviary.pricing.cache_read_per_million_usd", "aviary.pricing.cache_write_per_million_usd"].contains(key),

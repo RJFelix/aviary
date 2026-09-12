@@ -150,7 +150,7 @@ enum ClaudeCodeCLI {
         }
         let usage = await run.totalUsage
         if !quiet {
-            note("\ntotal \(Fmt.tokens(usage.totalTokens)) tokens"
+            note("\ntotal \(Fmt.tokens(usage)) tokens"
                 + (usage.reasoning.map { " · \(Fmt.tokens($0)) reasoning" } ?? ""))
             let unmodelled = await run.unmodelledFrames
             if !unmodelled.isEmpty {

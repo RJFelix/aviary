@@ -648,10 +648,10 @@ struct RunPane: View {
                 }
                 if !run.usage.isEmpty {
                     Chip(
-                        text: Fmt.tokens(run.usage.totalTokens), symbol: "number", tint: .secondary)
+                        text: Fmt.tokens(run.usage), symbol: "number", tint: .secondary)
                 }
-                if run.usage.cost.total > 0 {
-                    Chip(text: Fmt.cost(run.usage.cost.total), tint: Design.accent)
+                if run.usage.cost.total > 0 || run.usage.completeness.cost != .neutral {
+                    Chip(text: Fmt.cost(run.usage), tint: Design.accent)
                 }
                 if run.hasCanonicalStartTime && run.elapsedLabel != "time unknown" {
                     Chip(text: run.elapsedLabel, symbol: "clock", tint: .secondary)
@@ -1866,13 +1866,16 @@ struct RunInspector: View {
                 Card("Tokens", symbol: "number") {
                     VStack(alignment: .leading, spacing: 7) {
                         HStack(spacing: 10) {
-                            StatTile(label: "in", value: Fmt.tokens(run.usage.input))
-                            StatTile(label: "out", value: Fmt.tokens(run.usage.output))
-                            StatTile(label: "cached", value: Fmt.tokens(run.usage.cacheRead))
+                            StatTile(label: "in", value: Fmt.tokens(
+                                run.usage.input, completeness: run.usage.completeness.breakdown))
+                            StatTile(label: "out", value: Fmt.tokens(
+                                run.usage.output, completeness: run.usage.completeness.breakdown))
+                            StatTile(label: "cached", value: Fmt.tokens(
+                                run.usage.cacheRead, completeness: run.usage.completeness.breakdown))
                         }
-                        if run.usage.cost.total > 0 {
+                        if run.usage.cost.total > 0 || run.usage.completeness.cost != .neutral {
                             DetailRow(
-                                label: "Cost", value: Fmt.cost(run.usage.cost.total), mono: true)
+                                label: "Cost", value: Fmt.cost(run.usage), mono: true)
                         }
                         if let rate = run.usage.cacheHitRate {
                             VStack(alignment: .leading, spacing: 3) {

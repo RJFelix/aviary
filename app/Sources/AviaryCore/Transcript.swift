@@ -3,6 +3,50 @@ import Foundation
 // MARK: - Usage
 
 public struct Usage: Sendable, Hashable, Codable {
+    /// Whether a numeric projection is exact, a known floor, absent, or from a record written
+    /// before Aviary retained accounting evidence. `neutral` is only the additive identity.
+    public enum Completeness: String, Sendable, Hashable, Codable {
+        case neutral
+        case complete
+        case lowerBound = "lower_bound"
+        case unavailable
+        case unclassified
+    }
+
+    /// Compact provenance for merging normalized cache-inclusive and cache-exclusive reports.
+    /// Numeric `Usage.input` is always ordinary (non-cache) input for classified records.
+    public enum InputAccountingSummary: String, Sendable, Hashable, Codable {
+        case neutral
+        case cacheInclusive = "cache_inclusive"
+        case cacheExclusive = "cache_exclusive"
+        case unknown
+        case mixed
+    }
+
+    public struct CompletenessMetadata: Sendable, Hashable, Codable {
+        public var tokenTotal: Completeness
+        public var breakdown: Completeness
+        public var cost: Completeness
+        public var inputAccounting: InputAccountingSummary
+
+        public init(
+            tokenTotal: Completeness, breakdown: Completeness, cost: Completeness,
+            inputAccounting: InputAccountingSummary
+        ) {
+            self.tokenTotal = tokenTotal
+            self.breakdown = breakdown
+            self.cost = cost
+            self.inputAccounting = inputAccounting
+        }
+
+        public static let neutral = CompletenessMetadata(
+            tokenTotal: .neutral, breakdown: .neutral, cost: .neutral,
+            inputAccounting: .neutral)
+        public static let unclassified = CompletenessMetadata(
+            tokenTotal: .unclassified, breakdown: .unclassified, cost: .unclassified,
+            inputAccounting: .unknown)
+    }
+
     public var input: Int = 0
     public var output: Int = 0
     public var cacheRead: Int = 0
@@ -15,6 +59,7 @@ public struct Usage: Sendable, Hashable, Codable {
     public var reasoning: Int?
     public var totalTokens: Int = 0
     public var cost: Cost = Cost()
+    public var completeness: CompletenessMetadata = .neutral
 
     public struct Cost: Sendable, Hashable, Codable {
         public var input: Double = 0
@@ -26,62 +71,545 @@ public struct Usage: Sendable, Hashable, Codable {
         public init() {}
 
         public init(json: JSONValue?) {
-            input = json?["input"]?.doubleValue ?? 0
-            output = json?["output"]?.doubleValue ?? 0
-            cacheRead = json?["cacheRead"]?.doubleValue ?? 0
-            cacheWrite = json?["cacheWrite"]?.doubleValue ?? 0
-            total = json?["total"]?.doubleValue ?? (input + output + cacheRead + cacheWrite)
+            func imported(_ value: JSONValue?) -> Double {
+                guard let value = value?.doubleValue, value.isFinite, value >= 0 else { return 0 }
+                return value
+            }
+            input = imported(json?["input"])
+            output = imported(json?["output"])
+            cacheRead = imported(json?["cacheRead"])
+            cacheWrite = imported(json?["cacheWrite"])
+            let first = Usage.saturatingAdd(input, output)
+            let second = Usage.saturatingAdd(first.value, cacheRead)
+            let sum = Usage.saturatingAdd(second.value, cacheWrite).value
+            if let reported = json?["total"]?.doubleValue,
+               reported.isFinite, reported >= 0 {
+                total = reported
+            } else {
+                total = sum
+            }
         }
 
         public static func + (a: Cost, b: Cost) -> Cost {
             var c = Cost()
-            c.input = a.input + b.input
-            c.output = a.output + b.output
-            c.cacheRead = a.cacheRead + b.cacheRead
-            c.cacheWrite = a.cacheWrite + b.cacheWrite
-            c.total = a.total + b.total
+            c.input = Usage.saturatingAdd(a.input, b.input).value
+            c.output = Usage.saturatingAdd(a.output, b.output).value
+            c.cacheRead = Usage.saturatingAdd(a.cacheRead, b.cacheRead).value
+            c.cacheWrite = Usage.saturatingAdd(a.cacheWrite, b.cacheWrite).value
+            c.total = Usage.saturatingAdd(a.total, b.total).value
             return c
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case input, output, cacheRead, cacheWrite, total
+        }
+
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            input = try values.decode(Double.self, forKey: .input)
+            output = try values.decode(Double.self, forKey: .output)
+            cacheRead = try values.decode(Double.self, forKey: .cacheRead)
+            cacheWrite = try values.decode(Double.self, forKey: .cacheWrite)
+            total = try values.decode(Double.self, forKey: .total)
+            guard Self.hasValidNumbers(self) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .total, in: values,
+                    debugDescription: "Usage cost must contain finite nonnegative values.")
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            guard Self.hasValidNumbers(self) else {
+                throw EncodingError.invalidValue(
+                    self, EncodingError.Context(
+                        codingPath: [],
+                        debugDescription: "Usage cost must contain finite nonnegative values."))
+            }
+            var values = encoder.container(keyedBy: CodingKeys.self)
+            try values.encode(input, forKey: .input)
+            try values.encode(output, forKey: .output)
+            try values.encode(cacheRead, forKey: .cacheRead)
+            try values.encode(cacheWrite, forKey: .cacheWrite)
+            try values.encode(total, forKey: .total)
+        }
+
+        private static func hasValidNumbers(_ value: Cost) -> Bool {
+            [value.input, value.output, value.cacheRead, value.cacheWrite, value.total]
+                .allSatisfy { $0.isFinite && $0 >= 0 }
         }
     }
 
     public init() {}
 
+    /// A compatibility record that had an assistant crossing but no Aviary completeness block.
+    /// Numeric fields remain untouched; callers may display them as reported, never exact.
+    static var unclassifiedRecord: Usage {
+        var usage = Usage()
+        usage.completeness = .unclassified
+        return usage
+    }
+
+    /// Project one validated provider crossing into non-overlapping, known-lower-bound values.
+    /// Raw reports, rates, and issue detail deliberately do not enter transcript persistence.
+    public init(finality: ProviderUsage.ReportFinality, accounted crossing: ProviderUsage.AccountedCrossing) {
+        let partitionInvalid = crossing.issues.contains(.inconsistentCachePartition)
+        input = crossing.ordinaryInputTokens ?? 0
+        output = crossing.outputTokens ?? 0
+        // A contradictory inclusive partition cannot contribute a defensible cache floor.
+        // The AccountedCrossing remains the audit record; Usage retains only safe projections.
+        cacheRead = partitionInvalid ? 0 : (crossing.cacheReadTokens ?? 0)
+        cacheWrite = partitionInvalid ? 0 : (crossing.cacheWriteTokens ?? 0)
+        reasoning = crossing.reasoningTokens
+
+        var componentOverflow = false
+        let cache = Self.saturatingAdd(cacheRead, cacheWrite)
+        componentOverflow = componentOverflow || cache.overflow
+        let contextLowerBound: Int
+        switch crossing.inputAccounting {
+        case .cacheInclusive:
+            // `input` could not be normalized when a cache field is missing, but the cache
+            // observations remain a disjoint known subset of that inclusive context.
+            contextLowerBound = crossing.ordinaryInputTokens.map {
+                let sum = Self.saturatingAdd($0, cache.value)
+                componentOverflow = componentOverflow || sum.overflow
+                return sum.value
+            } ?? cache.value
+        case .cacheExclusive:
+            let sum = Self.saturatingAdd(input, cache.value)
+            componentOverflow = componentOverflow || sum.overflow
+            contextLowerBound = sum.value
+        case .unknown:
+            // Input may include or exclude cache; max is a safe floor while addition is not.
+            contextLowerBound = max(crossing.inputTokens ?? 0, cache.value)
+        }
+        let components = Self.saturatingAdd(contextLowerBound, output)
+        componentOverflow = componentOverflow || components.overflow
+
+        let arithmeticInvalid = crossing.issues.contains(.arithmeticOverflow)
+        let totalConflicted = crossing.issues.contains(.reportedTotalMismatch)
+        if totalConflicted {
+            totalTokens = 0
+        } else if let exact = crossing.totalTokens, !arithmeticInvalid {
+            totalTokens = exact
+        } else {
+            totalTokens = components.value
+        }
+
+        cost.input = partitionInvalid ? 0 : (crossing.price.input.amount ?? 0)
+        cost.output = crossing.price.output.amount ?? 0
+        cost.cacheRead = partitionInvalid ? 0 : (crossing.price.cacheRead.amount ?? 0)
+        cost.cacheWrite = partitionInvalid ? 0 : (crossing.price.cacheWrite.amount ?? 0)
+        let safeCost = Self.saturatingAdd(cost.input, cost.output)
+        let safeCostWithRead = Self.saturatingAdd(safeCost.value, cost.cacheRead)
+        let safeCostTotal = Self.saturatingAdd(safeCostWithRead.value, cost.cacheWrite)
+        cost.total = safeCostTotal.value
+        let costProjectionOverflow = safeCost.overflow || safeCostWithRead.overflow
+            || safeCostTotal.overflow
+
+        let hasKnownToken = [crossing.inputTokens, crossing.outputTokens,
+                             crossing.cacheReadTokens, crossing.cacheWriteTokens]
+            .contains { $0 != nil }
+        let totalState: Completeness
+        if totalConflicted {
+            totalState = .unclassified
+        } else if crossing.totalTokens != nil, !arithmeticInvalid {
+            totalState = .complete
+        } else if hasKnownToken {
+            totalState = .lowerBound
+        } else {
+            totalState = .unavailable
+        }
+        let breakdownComplete = crossing.ordinaryInputTokens != nil
+            && crossing.outputTokens != nil && crossing.cacheReadTokens != nil
+            && crossing.cacheWriteTokens != nil && !arithmeticInvalid && !partitionInvalid
+            && !componentOverflow
+        let breakdownState: Completeness = breakdownComplete
+            ? .complete : (hasKnownToken ? .lowerBound : .unavailable)
+        var costState: Completeness
+        switch crossing.price.completeness {
+        case .complete: costState = arithmeticInvalid || partitionInvalid ? .lowerBound : .complete
+        case .partial: costState = .lowerBound
+        case .unavailable: costState = .unavailable
+        }
+        if costProjectionOverflow { costState = .lowerBound }
+        let accounting: InputAccountingSummary
+        switch crossing.inputAccounting {
+        case .cacheInclusive: accounting = .cacheInclusive
+        case .cacheExclusive: accounting = .cacheExclusive
+        case .unknown: accounting = .unknown
+        }
+        completeness = CompletenessMetadata(
+            tokenTotal: totalState, breakdown: breakdownState, cost: costState,
+            inputAccounting: accounting)
+        if finality == .unconfirmed {
+            if completeness.tokenTotal == .complete { completeness.tokenTotal = .lowerBound }
+            if completeness.breakdown == .complete { completeness.breakdown = .lowerBound }
+            if completeness.cost == .complete { completeness.cost = .lowerBound }
+        }
+    }
+
     public init(json: JSONValue?) {
         guard let json else { return }
-        input = json["input"]?.intValue ?? 0
-        output = json["output"]?.intValue ?? 0
-        cacheRead = json["cacheRead"]?.intValue ?? 0
-        cacheWrite = json["cacheWrite"]?.intValue ?? 0
-        reasoning = json["reasoning"]?.intValue
-        totalTokens = json["totalTokens"]?.intValue ?? (input + output + cacheRead + cacheWrite)
-        cost = Cost(json: json["cost"])
+        let inputField = Self.importedCount(json["input"])
+        let outputField = Self.importedCount(json["output"])
+        let cacheReadField = Self.importedCount(json["cacheRead"])
+        let cacheWriteField = Self.importedCount(json["cacheWrite"])
+        input = inputField.value
+        output = outputField.value
+        cacheRead = cacheReadField.value
+        cacheWrite = cacheWriteField.value
+        let importedReasoning = Self.importedOptionalCount(json["reasoning"])
+        let reasoningField: (value: Int?, valid: Bool)
+        if let value = importedReasoning.value, value > output {
+            reasoningField = (nil, false)
+        } else {
+            reasoningField = importedReasoning
+        }
+        reasoning = reasoningField.value
+        let first = Self.saturatingAdd(input, output)
+        let second = Self.saturatingAdd(cacheRead, cacheWrite)
+        let fallbackTotal = Self.saturatingAdd(first.value, second.value)
+        let totalField = Self.importedCount(json["totalTokens"])
+        totalTokens = totalField.present ? totalField.value : fallbackTotal.value
+        let costFields = Self.importedCost(json["cost"])
+        cost = costFields.cost
+        let fieldsValid = [inputField, outputField, cacheReadField, cacheWriteField]
+            .allSatisfy { $0.valid } && reasoningField.valid
+            && totalField.present && totalField.valid && !fallbackTotal.overflow
+            && costFields.valid
+        let decoded = Self.decodeCompleteness(json["completeness"])
+        if fieldsValid, let decoded,
+           Self.hasValidInvariants(
+               input: input, output: output, cacheRead: cacheRead,
+               cacheWrite: cacheWrite, reasoning: reasoning,
+               totalTokens: totalTokens, cost: cost, completeness: decoded) {
+            completeness = decoded
+        } else {
+            completeness = .unclassified
+        }
     }
 
     public static func + (a: Usage, b: Usage) -> Usage {
         var u = Usage()
-        u.input = a.input + b.input
-        u.output = a.output + b.output
-        u.cacheRead = a.cacheRead + b.cacheRead
-        u.cacheWrite = a.cacheWrite + b.cacheWrite
+        var overflow = false
+        let input = saturatingAdd(a.input, b.input); u.input = input.value; overflow = overflow || input.overflow
+        let output = saturatingAdd(a.output, b.output); u.output = output.value; overflow = overflow || output.overflow
+        let cacheRead = saturatingAdd(a.cacheRead, b.cacheRead)
+        u.cacheRead = cacheRead.value; overflow = overflow || cacheRead.overflow
+        let cacheWrite = saturatingAdd(a.cacheWrite, b.cacheWrite)
+        u.cacheWrite = cacheWrite.value; overflow = overflow || cacheWrite.overflow
         // nil + nil stays nil; a known value plus an unknown one is still the known part.
         if a.reasoning != nil || b.reasoning != nil {
-            u.reasoning = (a.reasoning ?? 0) + (b.reasoning ?? 0)
+            let reasoning = saturatingAdd(a.reasoning ?? 0, b.reasoning ?? 0)
+            u.reasoning = reasoning.value; overflow = overflow || reasoning.overflow
         }
-        u.totalTokens = a.totalTokens + b.totalTokens
-        u.cost = a.cost + b.cost
+        let total = saturatingAdd(a.totalTokens, b.totalTokens)
+        u.totalTokens = total.value; overflow = overflow || total.overflow
+        let costInput = saturatingAdd(a.cost.input, b.cost.input)
+        let costOutput = saturatingAdd(a.cost.output, b.cost.output)
+        let costRead = saturatingAdd(a.cost.cacheRead, b.cost.cacheRead)
+        let costWrite = saturatingAdd(a.cost.cacheWrite, b.cost.cacheWrite)
+        let costTotal = saturatingAdd(a.cost.total, b.cost.total)
+        u.cost.input = costInput.value; u.cost.output = costOutput.value
+        u.cost.cacheRead = costRead.value; u.cost.cacheWrite = costWrite.value
+        u.cost.total = costTotal.value
+        let costOverflow = [costInput, costOutput, costRead, costWrite, costTotal]
+            .contains { $0.overflow }
+        u.completeness = CompletenessMetadata(
+            tokenTotal: merge(a.completeness.tokenTotal, b.completeness.tokenTotal),
+            breakdown: merge(a.completeness.breakdown, b.completeness.breakdown),
+            cost: merge(a.completeness.cost, b.completeness.cost),
+            inputAccounting: merge(a.completeness.inputAccounting, b.completeness.inputAccounting))
+        if overflow {
+            u.completeness.tokenTotal = downgrade(u.completeness.tokenTotal)
+            u.completeness.breakdown = downgrade(u.completeness.breakdown)
+        }
+        if costOverflow { u.completeness.cost = downgrade(u.completeness.cost) }
         return u
     }
 
     public static func += (a: inout Usage, b: Usage) { a = a + b }
 
-    public var isEmpty: Bool { totalTokens == 0 && cost.total == 0 }
+    public var isEmpty: Bool {
+        guard totalTokens == 0, cost.total == 0 else { return false }
+        let visuallySettled: Set<Completeness> = [.neutral, .complete]
+        return visuallySettled.contains(completeness.tokenTotal)
+            && visuallySettled.contains(completeness.cost)
+    }
+    public var isTokenTotalComplete: Bool { completeness.tokenTotal == .complete }
+    public var isCostComplete: Bool { completeness.cost == .complete }
+    public var isBreakdownComplete: Bool { completeness.breakdown == .complete }
 
     /// Fraction of input tokens served from cache — the single most useful efficiency
     /// number in a long agent session, and one the harness never displays.
     public var cacheHitRate: Double? {
-        let considered = input + cacheRead
+        guard isBreakdownComplete else { return nil }
+        let first = Self.saturatingAdd(input, cacheRead)
+        let total = Self.saturatingAdd(first.value, cacheWrite)
+        guard !first.overflow, !total.overflow else { return nil }
+        let considered = total.value
         guard considered > 0 else { return nil }
         return Double(cacheRead) / Double(considered)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case input, output, cacheRead, cacheWrite, reasoning, totalTokens, cost, completeness
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        input = try values.decode(Int.self, forKey: .input)
+        output = try values.decode(Int.self, forKey: .output)
+        cacheRead = try values.decode(Int.self, forKey: .cacheRead)
+        cacheWrite = try values.decode(Int.self, forKey: .cacheWrite)
+        reasoning = try values.decodeIfPresent(Int.self, forKey: .reasoning)
+        totalTokens = try values.decode(Int.self, forKey: .totalTokens)
+        cost = try values.decode(Cost.self, forKey: .cost)
+        completeness = try values.decode(CompletenessMetadata.self, forKey: .completeness)
+        guard Self.hasValidInvariants(
+            input: input, output: output, cacheRead: cacheRead, cacheWrite: cacheWrite,
+            reasoning: reasoning, totalTokens: totalTokens, cost: cost,
+            completeness: completeness)
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .completeness, in: values,
+                debugDescription: "Usage violates its numeric or completeness invariants.")
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try validateForPersistence()
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(input, forKey: .input)
+        try values.encode(output, forKey: .output)
+        try values.encode(cacheRead, forKey: .cacheRead)
+        try values.encode(cacheWrite, forKey: .cacheWrite)
+        try values.encodeIfPresent(reasoning, forKey: .reasoning)
+        try values.encode(totalTokens, forKey: .totalTokens)
+        try values.encode(cost, forKey: .cost)
+        try values.encode(completeness, forKey: .completeness)
+    }
+
+    var completenessJSON: JSONValue {
+        .object([
+            "tokenTotal": .string(completeness.tokenTotal.rawValue),
+            "breakdown": .string(completeness.breakdown.rawValue),
+            "cost": .string(completeness.cost.rawValue),
+            "inputAccounting": .string(completeness.inputAccounting.rawValue),
+        ])
+    }
+
+    func validateForPersistence() throws {
+        guard Self.hasValidInvariants(
+            input: input, output: output, cacheRead: cacheRead, cacheWrite: cacheWrite,
+            reasoning: reasoning, totalTokens: totalTokens, cost: cost,
+            completeness: completeness)
+        else {
+            throw EncodingError.invalidValue(
+                self, EncodingError.Context(
+                    codingPath: [],
+                    debugDescription: "Usage violates its numeric or completeness invariants."))
+        }
+    }
+
+    func validateForTranscript() throws {
+        try validateForPersistence()
+        guard completeness != .neutral else {
+            throw EncodingError.invalidValue(
+                self, EncodingError.Context(
+                    codingPath: [],
+                    debugDescription: "A transcript usage entry cannot be the neutral accumulator."))
+        }
+    }
+
+    static func transcriptInteger(_ value: Int) -> JSONValue {
+        // JSONValue stores numbers as Double. Decimal strings retain exact Int identity outside
+        // the IEEE-754 integer range and are accepted only by Usage's strict integer reader.
+        value >= -9_007_199_254_740_991 && value <= 9_007_199_254_740_991
+            ? .number(Double(value)) : .string(String(value))
+    }
+
+    private static func decodeCompleteness(_ json: JSONValue?) -> CompletenessMetadata? {
+        guard let json,
+              let tokenValue = json["tokenTotal"]?.stringValue,
+              let breakdownValue = json["breakdown"]?.stringValue,
+              let costValue = json["cost"]?.stringValue,
+              let accountingValue = json["inputAccounting"]?.stringValue,
+              let token = Completeness(rawValue: tokenValue),
+              let breakdown = Completeness(rawValue: breakdownValue),
+              let cost = Completeness(rawValue: costValue),
+              let accounting = InputAccountingSummary(rawValue: accountingValue),
+              token != .neutral, breakdown != .neutral, cost != .neutral,
+              accounting != .neutral
+        else { return nil }
+        return CompletenessMetadata(
+            tokenTotal: token, breakdown: breakdown, cost: cost,
+            inputAccounting: accounting)
+    }
+
+    private static func importedCount(
+        _ json: JSONValue?
+    ) -> (value: Int, present: Bool, valid: Bool) {
+        guard let json else { return (0, false, false) }
+        let value: Int?
+        let exact: Bool
+        switch json {
+        case .number(let number):
+            value = json.intValue
+            exact = number.isFinite && number >= 0
+                && number <= 9_007_199_254_740_991
+        case .string(let string):
+            value = Int(string)
+            exact = value.map(String.init) == string
+        default:
+            value = nil
+            exact = false
+        }
+        guard let value, value >= 0 else { return (0, true, false) }
+        return (value, true, exact)
+    }
+
+    private static func importedOptionalCount(
+        _ json: JSONValue?
+    ) -> (value: Int?, valid: Bool) {
+        guard let json, !json.isNull else { return (nil, true) }
+        let field = importedCount(json)
+        return field.valid ? (field.value, true) : (nil, false)
+    }
+
+    private static func importedCost(
+        _ json: JSONValue?
+    ) -> (cost: Cost, valid: Bool) {
+        guard let json, !json.isNull else { return (Cost(), false) }
+        guard json.objectValue != nil else { return (Cost(), false) }
+        func field(_ key: String) -> (Double, Bool) {
+            switch json[key] {
+            case .number(let value) where value.isFinite && value >= 0:
+                return (value, true)
+            case .string(let string):
+                guard let value = Double(string), value.isFinite, value >= 0 else {
+                    return (0, false)
+                }
+                // Preserve an old numeric string for display, but it cannot authenticate
+                // current completeness metadata. Owned writers emit JSON numbers for cost.
+                return (value, false)
+            default:
+                return (0, false)
+            }
+        }
+        let input = field("input"), output = field("output")
+        let read = field("cacheRead"), write = field("cacheWrite"), total = field("total")
+        var cost = Cost()
+        cost.input = input.0; cost.output = output.0
+        cost.cacheRead = read.0; cost.cacheWrite = write.0; cost.total = total.0
+        return (cost, [input.1, output.1, read.1, write.1, total.1].allSatisfy { $0 })
+    }
+
+    private static func hasValidInvariants(
+        input: Int, output: Int, cacheRead: Int, cacheWrite: Int, reasoning: Int?,
+        totalTokens: Int, cost: Cost, completeness: CompletenessMetadata
+    ) -> Bool {
+        guard [input, output, cacheRead, cacheWrite, totalTokens].allSatisfy({ $0 >= 0 }),
+              reasoning.map({ $0 >= 0 && $0 <= output }) ?? true,
+              [cost.input, cost.output, cost.cacheRead, cost.cacheWrite, cost.total]
+                .allSatisfy({ $0.isFinite && $0 >= 0 })
+        else { return false }
+
+        let states = [completeness.tokenTotal, completeness.breakdown, completeness.cost]
+        if states.allSatisfy({ $0 == .neutral }) {
+            return completeness.inputAccounting == .neutral
+                && input == 0 && output == 0 && cacheRead == 0 && cacheWrite == 0
+                && reasoning == nil && totalTokens == 0
+                && cost.input == 0 && cost.output == 0 && cost.cacheRead == 0
+                && cost.cacheWrite == 0 && cost.total == 0
+        }
+        guard states.allSatisfy({ $0 != .neutral }),
+              completeness.inputAccounting != .neutral else { return false }
+        if completeness.tokenTotal == .unavailable, totalTokens != 0 { return false }
+        if completeness.breakdown == .unavailable,
+           input != 0 || output != 0 || cacheRead != 0 || cacheWrite != 0 { return false }
+        if completeness.cost == .unavailable,
+           cost.input != 0 || cost.output != 0 || cost.cacheRead != 0
+               || cost.cacheWrite != 0 || cost.total != 0 { return false }
+        if completeness.cost == .complete || completeness.cost == .lowerBound {
+            let costInputOutput = saturatingAdd(cost.input, cost.output)
+            let costWithRead = saturatingAdd(costInputOutput.value, cost.cacheRead)
+            let costSum = saturatingAdd(costWithRead.value, cost.cacheWrite)
+            let overflow = costInputOutput.overflow || costWithRead.overflow || costSum.overflow
+            if overflow {
+                guard completeness.cost == .lowerBound,
+                      cost.total == Double.greatestFiniteMagnitude else { return false }
+            } else {
+                if cost.total == 0 || costSum.value == 0 {
+                    guard cost.total == costSum.value else { return false }
+                } else {
+                    let scale = max(cost.total, costSum.value)
+                    guard abs(cost.total - costSum.value) <= scale * 1e-12 else { return false }
+                }
+            }
+        }
+        if completeness.tokenTotal == .complete {
+            let first = saturatingAdd(input, output)
+            let second = saturatingAdd(cacheRead, cacheWrite)
+            let sum = saturatingAdd(first.value, second.value)
+            guard !first.overflow, !second.overflow, !sum.overflow,
+                  totalTokens >= sum.value else { return false }
+        }
+        if completeness.breakdown == .complete {
+            guard completeness.inputAccounting != .unknown else { return false }
+            let first = saturatingAdd(input, output)
+            let second = saturatingAdd(cacheRead, cacheWrite)
+            let sum = saturatingAdd(first.value, second.value)
+            guard !first.overflow, !second.overflow, !sum.overflow else { return false }
+            if completeness.tokenTotal == .complete, sum.value != totalTokens { return false }
+        }
+        return true
+    }
+
+    private static func merge(_ a: Completeness, _ b: Completeness) -> Completeness {
+        if a == .neutral { return b }
+        if b == .neutral { return a }
+        if a == .unclassified || b == .unclassified { return .unclassified }
+        if a == .complete && b == .complete { return .complete }
+        if a == .unavailable && b == .unavailable { return .unavailable }
+        return .lowerBound
+    }
+
+    private static func merge(
+        _ a: InputAccountingSummary, _ b: InputAccountingSummary
+    ) -> InputAccountingSummary {
+        if a == .neutral { return b }
+        if b == .neutral { return a }
+        return a == b ? a : .mixed
+    }
+
+    private static func downgrade(_ value: Completeness) -> Completeness {
+        switch value {
+        case .neutral, .unavailable: return .unavailable
+        case .complete, .lowerBound: return .lowerBound
+        case .unclassified: return .unclassified
+        }
+    }
+
+    private static func saturatingAdd(_ a: Int, _ b: Int) -> (value: Int, overflow: Bool) {
+        let (value, overflow) = a.addingReportingOverflow(b)
+        guard overflow else { return (value, false) }
+        return (b >= 0 ? Int.max : Int.min, true)
+    }
+
+    private static func saturatingAdd(
+        _ a: Double, _ b: Double
+    ) -> (value: Double, overflow: Bool) {
+        guard a.isFinite, b.isFinite else {
+            return (a.sign == .minus || b.sign == .minus
+                    ? -Double.greatestFiniteMagnitude : Double.greatestFiniteMagnitude, true)
+        }
+        let value = a + b
+        guard value.isFinite else {
+            return (value.sign == .minus
+                    ? -Double.greatestFiniteMagnitude : Double.greatestFiniteMagnitude, true)
+        }
+        return (value, false)
     }
 }
 
@@ -452,7 +980,7 @@ public enum SessionParser {
                     item.blocks = ContentBlock.parse(msg["content"])
                     item.model = msg["model"]?.stringValue
                     item.provider = msg["provider"]?.stringValue
-                    let u = Usage(json: msg["usage"])
+                    let u = msg["usage"].map { Usage(json: $0) } ?? .unclassifiedRecord
                     item.usage = u
                     item.stopReason = msg["stopReason"]?.stringValue
                     item.errorMessage = msg["errorMessage"]?.stringValue
@@ -569,9 +1097,15 @@ public enum SessionParser {
                 var item = TranscriptItem(id: e.id, kind: .compaction, timestamp: ts)
                 item.text = v["summary"]?.stringValue ?? ""
                 item.usage = {
-                    var u = Usage()
-                    u.totalTokens = v["tokensBefore"]?.intValue ?? 0
-                    return u
+                    var fields: [String: JSONValue] = [
+                        "input": .number(0), "output": .number(0),
+                        "cacheRead": .number(0), "cacheWrite": .number(0),
+                    ]
+                    if let tokens = v["tokensBefore"] { fields["totalTokens"] = tokens }
+                    // This is retained context size, not a provider billing crossing.
+                    // The tolerant importer sanitizes malformed historical counts and leaves it
+                    // explicitly unclassified rather than manufacturing accounting evidence.
+                    return Usage(json: .object(fields))
                 }()
                 item.raw = v
                 t.items.append(item)
@@ -628,7 +1162,8 @@ public enum SessionParser {
                     timestamp: ts)
 
             case "child_usage_attributed":
-                t.childUsage += Usage(json: v["childUsage"])
+                t.childUsage += v["childUsage"].map { Usage(json: $0) }
+                    ?? .unclassifiedRecord
 
             case "label":
                 if let target = v["targetId"]?.stringValue {

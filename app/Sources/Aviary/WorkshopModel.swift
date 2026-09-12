@@ -739,7 +739,7 @@ extension AppModel {
         // Tab-specific detail: the "what data is there" half of the request.
         switch section {
         case .cockpit:
-            add("Cockpit", "Total tokens", Fmt.tokens(analytics.total.totalTokens))
+            add("Cockpit", "Token count", Fmt.tokens(analytics.total))
         case .sessions:
             add("Sessions", "Showing", "\(filteredSessions.count) of \(sessions.count)")
             if let s = selectedSession {
@@ -802,7 +802,7 @@ extension AppModel {
             }
         case .usage:
             add("Usage", "Sessions counted", "\(analytics.sessionCount)")
-            add("Usage", "Total tokens", Fmt.tokens(analytics.total.totalTokens))
+            add("Usage", "Token count", Fmt.tokens(analytics.total))
         case .library:
             add("Library", "Skills", "\(library.skills.count)")
             add("Library", "Prompts", "\(library.prompts.count)")
@@ -831,7 +831,7 @@ extension AppModel {
         case .workshop: return "\(board.openCount) open · \(board.requests.count) total"
         case .flock: return "\(tree.allNodes.count) sub-agents"
         case .models: return "\(runtimeModels.count) reachable"
-        case .usage: return Fmt.tokens(analytics.total.totalTokens) + " tokens"
+        case .usage: return Fmt.tokens(analytics.total) + " tokens"
         case .library: return "\(library.skills.count) skills"
         case .health: return runtimeProbes.contains(where: \.ok) ? "ready" : "runtime unavailable"
         }

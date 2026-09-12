@@ -89,7 +89,7 @@ struct RootView: View {
         case .models:
             return "\(model.runtimeModels.count) reachable · \(model.modelsConfig.providers.count) configured providers"
         case .usage:
-            return "\(Fmt.tokens(model.analytics.total.totalTokens)) tokens across \(model.analytics.sessionCount) sessions"
+            return "\(Fmt.tokens(model.analytics.total)) tokens across \(model.analytics.sessionCount) sessions"
         case .library:
             // Counted by what a run would get, not by what was found on disk: the engine
             // bundle's own skills are loaded by that engine, never by Aviary.

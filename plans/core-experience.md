@@ -9,6 +9,10 @@ the implementation queue, ahead of optional child token/spend limits. See
 [the tracing coverage and rollout plan](opentelemetry.md). Ryan selected backend-neutral OTLP.
 Operational traces supplement canonical records; they never authorize actions or prove delivery.
 
+Current follow-on: [provider accounting and optional execution limits](provider-usage-accounting.md).
+Normalize missing/partial usage and cache pricing before enforcing token or spend policies;
+background agents remain unlimited unless the user supplies a limit.
+
 Product steering, 2026-09-07: Ryan's first real signed-app journey exposed a startup failure,
 lost pre-launch prompt, overlapping navigation, and machinery-first vocabulary. Further
 checkpoint/restore expansion is paused for the [chat-first experience reset](chat-first-experience.md).

@@ -60,6 +60,8 @@ let linuxCoreSources: [String] = [
     "PersistentSessionExactState.swift",
     "PersistentWorkExactState.swift",
     "Providers.swift",
+    "ProviderUsage.swift",
+    "ProviderUsageWire.swift",
     "RecordedModelContextProjection.swift",
     "RunConfiguration.swift",
     "RunJournalBundle.swift",
@@ -111,6 +113,10 @@ let linuxCoreSources: [String] = [
     "WireLog.swift",
 ]
 let linuxSelfTestSources: [String] = [
+    "ProviderUsageTests.swift",
+    "ProviderUsageWireTests.swift",
+    "ProviderTerminalTests.swift",
+    "UsageCompletenessTests.swift",
     "AviaryTelemetryTests.swift",
     "AviaryTelemetryAgentTests.swift",
     "AviaryTelemetryContextTests.swift",

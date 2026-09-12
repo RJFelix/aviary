@@ -1924,8 +1924,8 @@ public actor Agent {
             }
             if let usage = turn.usage {
                 totalUsage += usage
-                if usage.input > 0 { lastInputTokens = usage.input + usage.cacheRead }
             }
+            if let contextTokens = turn.contextTokens { lastInputTokens = contextTokens }
             emit(.turnFinished(
                 messageID: messageID, usage: turn.usage, stopReason: turn.stopReason))
 
@@ -2243,11 +2243,18 @@ public actor Agent {
                 "aviary.agent.provider", kind: .client,
                 attributes: telemetryProviderAttributes(crossing: "compaction", permit: permit, model: crossingModel)) {
                     var measurements = AviaryProviderTelemetry()
-                    defer { measurements.record(model: crossingModel, accounting: crossingProvider.usageAccounting) }
+                    defer { measurements.record(model: crossingModel) }
                     do {
+                        var doneObserved = false
                         for try await event in crossingProvider.stream(ask) {
+                            try Task.checkCancellation()
                             measurements.observe(event)
                             if case .textDelta(let t) = event { summary += t }
+                            if case .done = event { doneObserved = true }
+                        }
+                        try Task.checkCancellation()
+                        guard doneObserved else {
+                            throw ChatError.transport("The compaction provider stream ended without completion evidence.")
                         }
                     } catch {
                         AviaryTelemetry.event(
@@ -2352,6 +2359,7 @@ public actor Agent {
         var thinking = ""
         var toolCalls: [(id: String, name: String, arguments: JSONValue)] = []
         var usage: Usage?
+        var contextTokens: Int?
         var stopReason: String?
     }
 
@@ -2421,14 +2429,19 @@ public actor Agent {
             targetModel: crossingModel.qualifiedID)
         try requireNativePermit(permit, for: "provider")
         var turn = Turn()
+        var latestReport: ProviderUsage.RawReport?
+        turn.usage = Usage(finality: .unconfirmed,
+            accounted: ProviderUsage.account(report: nil, model: crossingModel))
         do {
             try await AviaryTelemetry.withSpan(
                 "aviary.agent.provider", kind: .client,
                 attributes: telemetryProviderAttributes(crossing: "normal", permit: permit, model: crossingModel)) {
                     var measurements = AviaryProviderTelemetry()
-                    defer { measurements.record(model: crossingModel, accounting: crossingProvider.usageAccounting) }
+                    defer { measurements.record(model: crossingModel) }
                     do {
+                        var doneObserved = false
                         for try await event in crossingProvider.stream(request) {
+                            try Task.checkCancellation()
                             measurements.observe(event)
                             switch event {
                             case .textDelta(let t):
@@ -2442,13 +2455,21 @@ public actor Agent {
                             case .requestBody(let payload):
                                 record(payload)
                             case .usage(let u):
-                                // Priced here rather than at display time, so the transcript carries dollars
-                                // and every screen that reads it agrees without re-deriving them.
-                                turn.usage = crossingModel.priced(u)
+                                latestReport = u
+                                let accounted = ProviderUsage.account(report: u, model: crossingModel)
+                                turn.usage = Usage(finality: .unconfirmed, accounted: accounted)
+                                turn.contextTokens = accounted.contextTokens
                             case .done(let reason):
+                                doneObserved = true
                                 turn.stopReason = reason
                             }
                         }
+                        try Task.checkCancellation()
+                        guard doneObserved else {
+                            throw ChatError.transport("The provider stream ended without completion evidence.")
+                        }
+                        turn.usage = Usage(finality: .finalReport,
+                            accounted: ProviderUsage.account(report: latestReport, model: crossingModel))
                     } catch {
                         AviaryTelemetry.event(
                             "aviary.agent.exception",

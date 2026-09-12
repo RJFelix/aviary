@@ -533,10 +533,10 @@ struct TranscriptHeader: View {
                          symbol: "arrow.left.arrow.right.circle", tint: Design.agentMessage)
                         .help("agent-to-agent messages")
                 }
-                Chip(text: Fmt.tokens(transcript.usage.totalTokens), symbol: "number",
+                Chip(text: Fmt.tokens(transcript.usage), symbol: "number",
                      tint: .secondary)
-                if transcript.usage.cost.total > 0 {
-                    Chip(text: Fmt.cost(transcript.usage.cost.total), tint: Design.accent)
+                if transcript.usage.cost.total > 0 || transcript.usage.completeness.cost != .neutral {
+                    Chip(text: Fmt.cost(transcript.usage), tint: Design.accent)
                 }
                 if let d = transcript.duration {
                     Chip(text: Fmt.duration(d), symbol: "clock", tint: .secondary)
@@ -744,10 +744,13 @@ struct SessionInspector: View {
                 DetailRow(label: "Time", value: Fmt.timestamp(item.timestamp), mono: true)
                 if let m = item.model { DetailRow(label: "Model", value: m, mono: true) }
                 if let u = item.usage, !u.isEmpty {
-                    DetailRow(label: "Input", value: Fmt.tokens(u.input), mono: true)
-                    DetailRow(label: "Output", value: Fmt.tokens(u.output), mono: true)
+                    DetailRow(label: "Input", value: Fmt.tokens(
+                        u.input, completeness: u.completeness.breakdown), mono: true)
+                    DetailRow(label: "Output", value: Fmt.tokens(
+                        u.output, completeness: u.completeness.breakdown), mono: true)
                     if u.cacheRead > 0 {
-                        DetailRow(label: "Cache read", value: Fmt.tokens(u.cacheRead), mono: true)
+                        DetailRow(label: "Cache read", value: Fmt.tokens(
+                            u.cacheRead, completeness: u.completeness.breakdown), mono: true)
                     }
                     if let r = u.reasoning {
                         DetailRow(
@@ -755,7 +758,7 @@ struct SessionInspector: View {
                             tint: Design.thinking)
                     }
                     if u.cost.total > 0 {
-                        DetailRow(label: "Cost", value: Fmt.cost(u.cost.total), mono: true)
+                        DetailRow(label: "Cost", value: Fmt.cost(u), mono: true)
                     }
                 }
                 if let d = item.toolDuration {
@@ -875,8 +878,8 @@ struct SessionInspector: View {
         Card("Usage", symbol: "number") {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 10) {
-                    StatTile(label: "tokens", value: Fmt.tokens(s.usage.totalTokens))
-                    StatTile(label: "cost", value: Fmt.cost(s.usage.cost.total))
+                    StatTile(label: "tokens", value: Fmt.tokens(s.usage))
+                    StatTile(label: "cost", value: Fmt.cost(s.usage))
                 }
                 if let rate = s.usage.cacheHitRate {
                     VStack(alignment: .leading, spacing: 3) {
@@ -891,15 +894,15 @@ struct SessionInspector: View {
                 }
                 if !s.childUsage.isEmpty {
                     Divider().opacity(0.5)
-                    Text("Sub-agents added \(Fmt.tokens(s.childUsage.totalTokens)) tokens"
-                        + (s.childUsage.cost.total > 0
-                            ? " (\(Fmt.cost(s.childUsage.cost.total)))" : ""))
+                    Text("Sub-agents added \(Fmt.tokens(s.childUsage)) tokens"
+                        + (s.childUsage.cost.total > 0 || s.childUsage.completeness.cost != .neutral
+                            ? " (\(Fmt.cost(s.childUsage)))" : ""))
                         .font(.system(size: 10.5))
                         .foregroundStyle(Design.agentMessage)
                 }
-                if s.usage.totalTokens > 0, s.usage.cost.total == 0 {
-                    Text("This route reported no pricing, so cost shows as nothing. Token "
-                        + "counts are still real.")
+                if !s.usage.isCostComplete {
+                    Text("Cost is incomplete or unclassified. The displayed value is reported "
+                        + "or a known lower bound, not proof that this route was free.")
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)

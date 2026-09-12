@@ -133,7 +133,7 @@ public actor SessionCatalog {
     /// The cache keys on file size and mtime, which correctly detects a *changed
     /// transcript* and completely misses a changed *parser*. Without this, improving how
     /// titles are extracted silently does nothing for every session already indexed.
-    static let schemaVersion = 3
+    static let schemaVersion = 5
 
     private let home: AgentHome
     private let trashItem: @Sendable (URL) throws -> Void
@@ -336,7 +336,8 @@ public actor SessionCatalog {
                     timestamp: ISO8601.date(v["timestamp"]?.stringValue) ?? .distantPast)
 
             case "child_usage_attributed":
-                s.childUsage += Usage(json: v["childUsage"])
+                s.childUsage += v["childUsage"].map { Usage(json: $0) }
+                    ?? .unclassifiedRecord
 
             case "model_change":
                 s.provider = v["provider"]?.stringValue ?? s.provider
@@ -359,7 +360,8 @@ public actor SessionCatalog {
                     }
                 case "assistant":
                     s.counts.assistant += 1
-                    s.usage += Usage(json: msg["usage"])
+                    s.usage += msg["usage"].map { Usage(json: $0) }
+                        ?? .unclassifiedRecord
                     s.model = msg["model"]?.stringValue ?? s.model
                     s.provider = msg["provider"]?.stringValue ?? s.provider
                     let blocks = msg["content"]?.arrayValue ?? []

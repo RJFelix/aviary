@@ -490,29 +490,35 @@ public actor SessionWriter {
             "content": .array(blocks),
         ]
         if let usage {
+            try usage.validateForPersistence()
+            // `Usage()` is an in-memory additive identity, not evidence of a provider crossing.
+            // An explicitly present zero identity becomes a visible unclassified record; a
+            // numeric neutral was rejected by validation above.
+            let persistedUsage = usage.completeness == .neutral
+                ? Usage.unclassifiedRecord : usage
+            try persistedUsage.validateForTranscript()
             var u: [String: JSONValue] = [
-                "input": .number(Double(usage.input)),
-                "output": .number(Double(usage.output)),
-                "cacheRead": .number(Double(usage.cacheRead)),
-                "cacheWrite": .number(Double(usage.cacheWrite)),
-                "totalTokens": .number(Double(usage.totalTokens)),
+                "input": Usage.transcriptInteger(persistedUsage.input),
+                "output": Usage.transcriptInteger(persistedUsage.output),
+                "cacheRead": Usage.transcriptInteger(persistedUsage.cacheRead),
+                "cacheWrite": Usage.transcriptInteger(persistedUsage.cacheWrite),
+                "totalTokens": Usage.transcriptInteger(persistedUsage.totalTokens),
+                "completeness": persistedUsage.completenessJSON,
             ]
             // Written only when the provider said something. Absent and zero mean different
             // things on an encrypted-reasoning route, and flattening them loses the evidence.
-            if let reasoning = usage.reasoning { u["reasoning"] = .number(Double(reasoning)) }
-            // Cost, when the model published rates. Written into the transcript rather than
-            // derived at display time, so the Usage and Cockpit screens read the same numbers
-            // for an in-house run as for a harness one — and `sessionsWithoutPricing` keeps
-            // meaning "no rates published" rather than "cost zero".
-            if usage.cost.total > 0 {
-                u["cost"] = .object([
-                    "input": .number(usage.cost.input),
-                    "output": .number(usage.cost.output),
-                    "cacheRead": .number(usage.cost.cacheRead),
-                    "cacheWrite": .number(usage.cost.cacheWrite),
-                    "total": .number(usage.cost.total),
-                ])
+            if let reasoning = persistedUsage.reasoning {
+                u["reasoning"] = Usage.transcriptInteger(reasoning)
             }
+            // Persist all five fields even when zero. Completeness distinguishes known zero
+            // from unavailable pricing; omission must never authenticate an exact zero later.
+            u["cost"] = .object([
+                "input": .number(persistedUsage.cost.input),
+                "output": .number(persistedUsage.cost.output),
+                "cacheRead": .number(persistedUsage.cost.cacheRead),
+                "cacheWrite": .number(persistedUsage.cost.cacheWrite),
+                "total": .number(persistedUsage.cost.total),
+            ])
             message["usage"] = .object(u)
         }
         if let stopReason { message["stopReason"] = .string(stopReason) }

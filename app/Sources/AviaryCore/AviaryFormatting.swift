@@ -7,7 +7,7 @@ import Foundation
 /// these few renderings here avoids pulling ``RelativeDateTimeFormatter`` into the Linux daemon.
 public enum Fmt {
     public static func tokens(_ value: Int) -> String {
-        switch abs(value) {
+        switch value.magnitude {
         case 0: return "0"
         case 1..<1_000: return "\(value)"
         case 1_000..<1_000_000:

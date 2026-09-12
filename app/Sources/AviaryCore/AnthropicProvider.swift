@@ -12,7 +12,6 @@ import FoundationNetworking
 /// thinking is a first-class block type, and the stream is typed events rather than deltas on
 /// a choice.
 public struct AnthropicMessagesProvider: ChatProvider {
-    public var usageAccounting: ProviderUsageAccounting { .cacheExclusive }
     public let id: String
     public let baseURL: URL
     public let apiKey: String?
@@ -77,13 +76,22 @@ public struct AnthropicMessagesProvider: ChatProvider {
         // accumulated per block and only emitted once its block closes.
         var blocks: [Int: (type: String, id: String, name: String, buffer: String)] = [:]
         var stopReason: String?
-        var usage = Usage()
-        var sawUsage = false
+        var usage: ProviderUsage.RawReport?
+        var sawMessageStop = false
 
-        for try await line in bytes.sseLines {
-            guard let payload = parser.feed(line: line) else { continue }
-            guard let v = JSONValue.parse(Data(payload.utf8)) else { continue }
+        func processPayload(_ payload: String) throws {
+            guard let v = JSONValue.parse(Data(payload.utf8)) else { return }
             let type = v["type"]?.stringValue ?? ""
+
+            // Keep any usage carried by the same final/error frame observable before surfacing
+            // its failure. The ordinary message_start/message_delta frames are cumulative, so
+            // the latest report replaces the previous one rather than being added twice.
+            if let report = ProviderUsageWire.anthropicMessages(v.path("message.usage"), merging: usage)
+                ?? ProviderUsageWire.anthropicMessages(v["usage"], merging: usage)
+            {
+                usage = report
+                yield(.usage(report))
+            }
 
             switch type {
             case "error":
@@ -91,13 +99,7 @@ public struct AnthropicMessagesProvider: ChatProvider {
                     status: 200, body: v.path("error.message")?.stringValue ?? payload)
 
             case "message_start":
-                // Input tokens are reported here, at the start, and never repeated.
-                if let u = v.path("message.usage") {
-                    usage.input = u["input_tokens"]?.intValue ?? 0
-                    usage.cacheRead = u["cache_read_input_tokens"]?.intValue ?? 0
-                    usage.cacheWrite = u["cache_creation_input_tokens"]?.intValue ?? 0
-                    sawUsage = true
-                }
+                break
 
             case "content_block_start":
                 let index = v["index"]?.intValue ?? 0
@@ -129,34 +131,41 @@ public struct AnthropicMessagesProvider: ChatProvider {
                 if let block = blocks.removeValue(forKey: index), block.type == "tool_use" {
                     // An empty buffer means a tool with no arguments, which is legal — so an
                     // empty object rather than a failure.
-                    let parsed = block.buffer.isEmpty
-                        ? JSONValue.object([:])
-                        : (JSONValue.parse(Data(block.buffer.utf8)) ?? .object([:]))
+                    let parsed: JSONValue
+                    if block.buffer.isEmpty {
+                        parsed = .object([:])
+                    } else {
+                        guard let decoded = JSONValue.parse(Data(block.buffer.utf8)) else {
+                            throw ChatError.decoding(
+                                "the provider ended with malformed tool-call arguments")
+                        }
+                        parsed = decoded
+                    }
                     yield(.toolCall(id: block.id, name: block.name, arguments: parsed))
                 }
 
             case "message_delta":
                 if let reason = v.path("delta.stop_reason")?.stringValue { stopReason = reason }
-                if let u = v["usage"] {
-                    usage.output = u["output_tokens"]?.intValue ?? usage.output
-                    sawUsage = true
-                }
 
             case "message_stop":
-                if sawUsage {
-                    usage.totalTokens = usage.input + usage.output
-                    yield(.usage(usage))
-                }
-                yield(.done(stopReason: stopReason))
-                return
+                sawMessageStop = true
 
             default:
                 break
             }
         }
-        if sawUsage {
-            usage.totalTokens = usage.input + usage.output
-            yield(.usage(usage))
+
+        for try await line in bytes.sseLines {
+            guard let payload = parser.feed(line: line) else { continue }
+            try processPayload(payload)
+            if sawMessageStop { break }
+        }
+        if !sawMessageStop, let tail = parser.flush() {
+            try processPayload(tail)
+        }
+        try Task.checkCancellation()
+        guard sawMessageStop else {
+            throw ChatError.transport("the provider stream ended before message_stop")
         }
         yield(.done(stopReason: stopReason))
     }

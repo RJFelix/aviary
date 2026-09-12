@@ -168,11 +168,13 @@ func test_parsesFrontmatter() {
 }
 
 func test_usageArithmeticAndCacheRate() {
-    var a = Usage()
-    a.input = 100; a.cacheRead = 300; a.output = 50; a.totalTokens = 450
+    var a = Usage(finality: .finalReport, accounted: ProviderUsage.account(report: .init(
+        inputTokens: 100, outputTokens: 50, cacheReadTokens: 300, cacheWriteTokens: 0,
+        inputAccounting: .cacheExclusive), model: fakeModel()))
     a.cost.total = 1.5
-    var b = Usage()
-    b.input = 100; b.output = 50; b.totalTokens = 150
+    var b = Usage(finality: .finalReport, accounted: ProviderUsage.account(report: .init(
+        inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0,
+        inputAccounting: .cacheExclusive), model: fakeModel()))
     b.cost.total = 0.5
     let sum = a + b
     XCTAssertEqual(sum.totalTokens, 600)
@@ -195,9 +197,21 @@ func test_formatsNumbersForDenseTables() {
     XCTAssertEqual(Fmt.tokens(1_500), "1.5K")
     XCTAssertEqual(Fmt.tokens(2_000), "2K")
     XCTAssertEqual(Fmt.tokens(2_500_000), "2.50M")
+    XCTAssertFalse(Fmt.tokens(Int.min).isEmpty)
     XCTAssertEqual(Fmt.cost(0), "—")
     XCTAssertEqual(Fmt.cost(0.0004), "$0.0004")
     XCTAssertEqual(Fmt.cost(12.345), "$12.35")
+    XCTAssertEqual(Fmt.cost(.nan), "—")
+    XCTAssertEqual(Fmt.cost(.infinity), "—")
+    XCTAssertEqual(Fmt.cost(-1), "—")
+    var analytics = UsageAnalytics()
+    analytics.total.totalTokens = Int.max
+    analytics.childTotal.totalTokens = Int.max
+    analytics.total.completeness.tokenTotal = .complete
+    analytics.childTotal.completeness.tokenTotal = .complete
+    XCTAssertEqual(analytics.subagentShare, 0.5)
+    analytics.childTotal.completeness.tokenTotal = .unclassified
+    XCTAssertNil(analytics.subagentShare)
 }
 
 
@@ -595,39 +609,6 @@ func fakeModel() -> ModelSpec {
 func scratchHome() -> AgentHome {
     AgentHome(root: URL(fileURLWithPath: NSTemporaryDirectory())
         .appending(path: "aviary-agent-test-\(UUID().uuidString)"))
-}
-
-/// Collects agent events off whatever task emits them.
-final class EventLog: @unchecked Sendable {
-    private let lock = NSLock()
-    private var events: [String] = []
-    private var text = ""
-
-    func record(_ event: Agent.Event) {
-        lock.lock(); defer { lock.unlock() }
-        switch event {
-        case .imageAttached: events.append("imageAttached")
-        case .modelChanged: events.append("modelChanged")
-        case .awaitingDispatched: events.append("awaitingDispatched")
-        case .started: events.append("started")
-        case .inputCommitted: events.append("inputCommitted")
-        case .steered: events.append("steered")
-        case .goalExhausted: events.append("goal-exhausted")
-        case .textDelta(let t): text += t
-        case .thinkingDelta: events.append("thinking")
-        case .toolStarted(_, let name, _): events.append("tool:\(name)")
-        case .toolFinished(_, _, _, let isError): events.append(isError ? "tool-error" : "tool-ok")
-        case .turnFinished: events.append("turn")
-        case .compacted(let before, _, _): events.append("compacted:\(before)")
-        case .childStarted(_, let name, _): events.append("child:\(name)")
-        case .childFinished(_, _, _, let isError): events.append(isError ? "child-error" : "child-ok")
-        case .finished(let reason): events.append("finished:\(reason)")
-        case .failed: events.append("failed")
-        }
-    }
-
-    var names: [String] { lock.lock(); defer { lock.unlock() }; return events }
-    var assistantText: String { lock.lock(); defer { lock.unlock() }; return text }
 }
 
 /// A provider that deliberately ignores Agent cancellation until the test releases it with a
@@ -1346,14 +1327,15 @@ let cases2: [Case] = [
         // the distinction the harness fork existed to preserve.
         let quiet = try XCTUnwrap(JSONValue.parse(Data(
             #"{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}"#.utf8)))
-        XCTAssertNil(OpenAICompletionsProvider.usage(from: quiet).reasoning)
+        XCTAssertNil(ProviderUsageWire.openAICompletions(quiet)?.reasoningTokens)
 
         let loud = try XCTUnwrap(JSONValue.parse(Data(
             #"{"prompt_tokens":10,"completion_tokens":9,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens_details":{"cached_tokens":6}}"#.utf8)))
-        let u = OpenAICompletionsProvider.usage(from: loud)
-        XCTAssertEqual(u.reasoning, 0, "a reported zero is data, not silence")
-        XCTAssertEqual(u.cacheRead, 6)
-        XCTAssertEqual(u.totalTokens, 19, "computed when the provider omits a total")
+        let u = try XCTUnwrap(ProviderUsageWire.openAICompletions(loud))
+        XCTAssertEqual(u.reasoningTokens, 0, "a reported zero is data, not silence")
+        XCTAssertEqual(u.cacheReadTokens, 6)
+        XCTAssertNil(u.reportedTotalTokens, "the raw report does not invent a total")
+        XCTAssertEqual(ProviderUsage.account(report: u, model: fakeModel()).totalTokens, 19)
     }),
 
     ("provider: request encoding puts tools, calls and results where they belong", {
@@ -1433,7 +1415,8 @@ let cases2: [Case] = [
 
         // Usage accumulates across turns, and a reported reasoning count survives.
         let usage = await agent.totalUsage
-        XCTAssertEqual(usage.input, 350, "100 from turn one plus 250 from turn two")
+        XCTAssertEqual(usage.input, 270, "ordinary input excludes the 40 cached tokens in each turn")
+        XCTAssertEqual(usage.cacheRead, 80)
         XCTAssertEqual(usage.reasoning, 11)
 
         // The second request must carry the first turn's tool call *and* its result, or the
@@ -2406,27 +2389,22 @@ let cases3: [Case] = [
 
     ("pricing: rates are per million tokens, and silence is not zero", {
         var model = fakeModel()
-        var usage = Usage()
-        usage.input = 1_000_000
-        usage.output = 500_000
-        usage.cacheRead = 2_000_000
-        // No rates published: cost must stay empty so `sessionsWithoutPricing` keeps meaning
-        // "nothing published" rather than "free".
-        XCTAssertEqual(model.priced(usage).cost.total, 0)
+        let usage = ProviderUsage.RawReport(inputTokens: 1_000_000, outputTokens: 500_000,
+            cacheReadTokens: 2_000_000, cacheWriteTokens: 0, inputAccounting: .cacheExclusive)
+        XCTAssertNil(ProviderUsage.account(report: usage, model: model).price.total)
 
         model.costInput = 3
         model.costOutput = 15
         model.costCacheRead = 0.3
-        let priced = model.priced(usage)
-        XCTAssertEqual(priced.cost.input, 3, "1M input at $3/Mtok")
-        XCTAssertEqual(priced.cost.output, 7.5, "0.5M output at $15/Mtok")
-        XCTAssertEqual(priced.cost.cacheRead, 0.6, "2M cache reads at $0.30/Mtok")
-        XCTAssertEqual(priced.cost.total, 11.1)
+        let priced = ProviderUsage.account(report: usage, model: model)
+        XCTAssertEqual(priced.price.input.amount, 3, "1M input at $3/Mtok")
+        XCTAssertEqual(priced.price.output.amount, 7.5, "0.5M output at $15/Mtok")
+        XCTAssertEqual(priced.price.cacheRead.amount, 0.6, "2M cache reads at $0.30/Mtok")
+        XCTAssertEqual(priced.price.total, 11.1)
 
-        // A route that publishes no cache rate still charges something, so the input rate is
-        // the fallback rather than zero.
         model.costCacheRead = nil
-        XCTAssertEqual(model.priced(usage).cost.cacheRead, 6, "2M cache reads at the input rate")
+        XCTAssertNil(ProviderUsage.account(report: usage, model: model).price.cacheRead.amount,
+                     "missing cache pricing is unknown, not an input-rate fallback")
     }),
 
     ("agent: recorded payloads land in the shape the breakdown screen reads", {
@@ -3065,18 +3043,6 @@ let cases4: [Case] = [
         XCTAssertEqual(input[1]["type"]?.stringValue, "function_call_output")
         XCTAssertEqual(input[1]["call_id"]?.stringValue, "call_1")
         XCTAssertEqual(input[1]["output"]?.stringValue, "2")
-    }),
-
-    ("codex: retry classification matches the reference", {
-        for status in [429, 500, 502, 503, 504] {
-            XCTAssertTrue(CodexResponsesProvider.isRetryable(status: status, body: ""), "\(status)")
-        }
-        XCTAssertFalse(CodexResponsesProvider.isRetryable(status: 400, body: "bad request"))
-        XCTAssertFalse(CodexResponsesProvider.isRetryable(status: 401, body: "unauthorized"))
-        // And the body patterns, which catch a 200-with-error and an upstream failure.
-        XCTAssertTrue(CodexResponsesProvider.isRetryable(status: 400, body: "Rate limit hit"))
-        XCTAssertTrue(CodexResponsesProvider.isRetryable(status: 400, body: "upstream connect error"))
-        XCTAssertTrue(CodexResponsesProvider.isRetryable(status: 400, body: "service unavailable"))
     }),
 
     ("codex: a usage-limit error becomes something a person can act on", {
@@ -3980,6 +3946,8 @@ let cases6: [Case] = [
         // outside input_tokens, so summing input and output only would report 83 tokens for a
         // turn that really processed about four thousand.
         XCTAssertEqual(u.totalTokens, 3345 + 97 + 22 + 11)
+        XCTAssertTrue(u.isTokenTotalComplete)
+        XCTAssertEqual(u.completeness.cost, .unavailable)
         XCTAssertEqual(stop, "tool_use")
         // A route that says nothing about reasoning leaves it nil, which is not zero.
         let quiet = #"{"type":"stream_event","event":{"type":"message_delta","delta":{},"usage":{"input_tokens":5,"output_tokens":6}}}"#
@@ -3988,9 +3956,23 @@ let cases6: [Case] = [
             XCTFail("expected messageDone"); return
         }
         XCTAssertNil(try XCTUnwrap(plain).reasoning)
+        XCTAssertEqual(try XCTUnwrap(plain).completeness.tokenTotal, .lowerBound)
+        XCTAssertEqual((u + (try XCTUnwrap(plain))).completeness.tokenTotal, .lowerBound)
         // Cost stays zero: a subscription run's tokens were never billed at list price, and
         // total_cost_usd in the stream is documented as a client-side estimate.
         XCTAssertEqual(try XCTUnwrap(plain).cost.total, 0)
+        let malformed = #"{"type":"result","usage":{"input_tokens":9223372036854775807,"output_tokens":-1}}"#
+        guard case .result(let invalid) = try XCTUnwrap(ClaudeCode.decode(line: Data(malformed.utf8))) else {
+            XCTFail("expected result"); return
+        }
+        XCTAssertEqual(invalid.usage.totalTokens, 0)
+        XCTAssertFalse(invalid.usage.isTokenTotalComplete)
+        let missing = #"{"type":"result"}"#
+        guard case .result(let absent) = try XCTUnwrap(ClaudeCode.decode(line: Data(missing.utf8))) else {
+            XCTFail("expected result"); return
+        }
+        XCTAssertEqual(absent.usage.completeness, .unclassified)
+        XCTAssertFalse((u + absent.usage).isTokenTotalComplete)
     }),
 
     ("claude-code: text and thinking deltas both carry content", {
@@ -4125,7 +4107,7 @@ let cases6: [Case] = [
         // "cost zero" — which is the true thing to say about a subscription run.
         XCTAssertNil(spec.costInput)
         XCTAssertNil(spec.costOutput)
-        XCTAssertEqual(spec.priced(Usage()).cost.total, 0)
+        XCTAssertNil(ProviderUsage.account(report: nil, model: spec).price.total)
         XCTAssertEqual(ClaudeCodeRun.modelSpec(for: "haiku").contextWindow, 200_000)
         XCTAssertNil(ClaudeCodeRun.modelSpec(for: "some-future-model").contextWindow)
     }),
@@ -4453,7 +4435,7 @@ let cases6: [Case] = [
         // No prices, so `sessionsWithoutPricing` keeps meaning "no rates published" rather
         // than "cost zero" — the true thing to say about a subscription run.
         XCTAssertNil(sonnet.costInput)
-        XCTAssertEqual(sonnet.priced(Usage()).cost.total, 0)
+        XCTAssertNil(ProviderUsage.account(report: nil, model: sonnet).price.total)
     }),
 
     ("claude-code: its models order and disable like every other model", {
@@ -7205,6 +7187,8 @@ await Harness.run(
         + casesCommandDeliveryOutcome + casesRuntimeHostParentLifetime
         + casesRuntimeHostAdoption
         + casesAviaryTelemetry + casesAviaryTelemetryAgent + casesAviaryTelemetryTransport
+        + casesProviderUsage + casesProviderUsageWire + casesCodexUsageCrossing + casesProviderTerminal
+        + casesUsageCompleteness
         + casesAviaryTelemetryHTTPClient + casesAviaryTelemetryDelivery + casesAviaryTelemetrySavedChat
         + casesAviaryTelemetryDrain + casesAviaryTelemetryRepositoryReview
         + casesAviaryTelemetryContext + casesHostedDeferredDeliveryTelemetry

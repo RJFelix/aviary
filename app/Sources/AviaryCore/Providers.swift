@@ -30,38 +30,14 @@ public struct ModelSpec: Sendable, Identifiable, Hashable {
 
     public var supportsImages: Bool { inputModalities.contains("image") }
 
-    /// Blended cost of a million tokens at a typical 3:1 input:output split — a single
-    /// number you can actually sort a model list by.
-    /// Fill in `Usage.cost` from this model's published rates.
-    ///
-    /// The harness wrote costs into the transcript and Aviary's Usage and Cockpit screens read
-    /// them, so an in-house run that reported tokens and no dollars would show up as free —
-    /// worse than showing nothing, because `sessionsWithoutPricing` exists precisely to
-    /// distinguish "no pricing published" from "cost zero".
-    ///
-    /// Rates in `models.json` are dollars per million tokens.
-    public func priced(_ usage: Usage) -> Usage {
-        guard costInput != nil || costOutput != nil else { return usage }
-        var out = usage
-        let perToken = { (rate: Double?) in (rate ?? 0) / 1_000_000 }
-        out.cost.input = Double(usage.input) * perToken(costInput)
-        out.cost.output = Double(usage.output) * perToken(costOutput)
-        // Cache reads fall back to the input rate rather than to zero: a route that publishes
-        // no cache rate still charges *something*, and zero would understate it.
-        out.cost.cacheRead = Double(usage.cacheRead) * perToken(costCacheRead ?? costInput)
-        out.cost.cacheWrite = Double(usage.cacheWrite) * perToken(costCacheWrite ?? costInput)
-        out.cost.total = out.cost.input + out.cost.output + out.cost.cacheRead + out.cost.cacheWrite
-        return out
-    }
-
+    /// Blended cost of a million tokens at a typical 3:1 input:output split.
     public var blendedCostPerMTok: Double? {
-        guard let i = costInput, let o = costOutput else { return nil }
-        return (i * 3 + o) / 4
+        guard let i = costInput, let o = costOutput,
+              i.isFinite, o.isFinite, i >= 0, o >= 0 else { return nil }
+        return i * 0.75 + o * 0.25
     }
 
-    /// Thinking levels that this provider maps to nothing. On the ChatGPT/Codex route,
-    /// for instance, only `xhigh` and `max` map through — asking for `low` gets you
-    /// no reasoning at all, silently.
+    /// Thinking levels that this provider explicitly maps to no reasoning.
     public var deadThinkingLevels: [String] {
         guard let map = thinkingLevelMap else { return [] }
         return map.filter { $0.value == nil }.keys.sorted()

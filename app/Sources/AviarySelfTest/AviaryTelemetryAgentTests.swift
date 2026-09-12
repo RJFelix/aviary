@@ -31,6 +31,9 @@ let casesAviaryTelemetryAgent: [Case] = [
     ("telemetry native partial admission is indeterminate", {
         try await testAviaryTelemetryNativePartialAdmissionIndeterminate()
     }),
+    ("telemetry native provider without terminal done is indeterminate", {
+        try await testAviaryTelemetryNativeProviderWithoutTerminalDone()
+    }),
 ]
 
 private struct TelemetryAgentProvider: ChatProvider {
@@ -95,9 +98,8 @@ private actor TelemetryHeldProviderGate {
 private struct TelemetryHeldProvider: ChatProvider {
     let id = "telemetry-held-provider"
     let gate: TelemetryHeldProviderGate
-    let usage: Usage
+    let usage: ProviderUsage.RawReport
 
-    var usageAccounting: ProviderUsageAccounting { .cacheExclusive }
 
     func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -115,9 +117,8 @@ private struct TelemetryHeldProvider: ChatProvider {
 
 private struct TelemetryReplacementProvider: ChatProvider {
     let id = "telemetry-replacement-provider"
-    let usage: Usage
+    let usage: ProviderUsage.RawReport
 
-    var usageAccounting: ProviderUsageAccounting { .cacheExclusive }
 
     func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -141,7 +142,6 @@ private struct TelemetryAgentCompletingWriterFailureProvider: ChatProvider {
     let bundle: RunJournalBundle
     let calls: TelemetryProviderCallCounter
 
-    var usageAccounting: ProviderUsageAccounting { .cacheExclusive }
 
     func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -171,18 +171,30 @@ private struct TelemetryAgentFailingProvider: ChatProvider {
     }
 }
 
+private struct TelemetryAgentQuietEOFProvider: ChatProvider {
+    let id = "telemetry-agent-quiet-eof-provider"
+
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.yield(.usage(telemetryAgentUsage(input: 13, output: 5)))
+            continuation.yield(.textDelta("QUIET_EOF_RESPONSE"))
+            continuation.yield(.toolCall(
+                id: "quiet-eof-tool", name: "unknown_tool", arguments: .object([:])))
+            // A provider that closes without `.done` has not proved a terminal response.
+            continuation.finish()
+        }
+    }
+}
+
 private func telemetryAgentModel() -> ModelSpec {
     var model = ModelSpec(rpc: .object(["id": .string("test-model"), "provider": .string("fake")]))
     model.contextWindow = 100_000
     return model
 }
 
-private func telemetryAgentUsage(input: Int, output: Int) -> Usage {
-    var usage = Usage()
-    usage.input = input
-    usage.output = output
-    usage.totalTokens = input + output
-    return usage
+private func telemetryAgentUsage(input: Int, output: Int) -> ProviderUsage.RawReport {
+    ProviderUsage.RawReport(inputTokens: input, outputTokens: output, cacheReadTokens: 0,
+        cacheWriteTokens: 0, reportedTotalTokens: input + output, inputAccounting: .cacheExclusive)
 }
 
 private func telemetryAgentPricedModel(
@@ -755,4 +767,87 @@ private func testAviaryTelemetryNativePartialAdmissionIndeterminate() async thro
         hostRecordedAt: Date(timeIntervalSince1970: 0)).records.map(\.event)
     XCTAssertTrue(events.contains { $0.type == TimelineEventType.actionIntent })
     XCTAssertTrue(events.filter { $0.type == TimelineEventType.actionStarted }.isEmpty)
+}
+
+private func testAviaryTelemetryNativeProviderWithoutTerminalDone() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "aviary-telemetry-provider-quiet-eof-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
+                                             attributes: [.posixPermissions: NSNumber(value: 0o700)])
+    defer { try? FileManager.default.removeItem(at: root) }
+    let home = AgentHome(root: root)
+    let hostID = try home.requirePersistedWorkHostID()
+    let identity = SessionWorkIdentity(
+        sessionID: "telemetry-provider-quiet-eof-session",
+        work: WorkRef(workHostID: hostID, workID: "telemetry-provider-quiet-eof-work"),
+        runID: "telemetry-provider-quiet-eof-run")
+    let model = telemetryAgentModel()
+    let bundle = try await RunJournalBundle.openForExecution(
+        home: home, identity: identity, actorID: "telemetry-provider-quiet-eof-agent",
+        modelID: model.qualifiedID,
+        makeAttachmentID: { "telemetry-provider-quiet-eof-attachment" })
+    let writer = try SessionWriter(home: home, cwd: "/tmp", model: model, identity: identity)
+    let log = EventLog()
+
+    let (outcome, spans) = await AviaryTelemetry.withRecording {
+        let agent = Agent(
+            provider: TelemetryAgentQuietEOFProvider(),
+            host: RuntimeHost(executable: "/usr/bin/true", arguments: []),
+            writer: writer, hostSession: "telemetry-provider-quiet-eof-runtime",
+            config: .init(model: model, cwd: "/tmp", systemPrompt: "quiet EOF"),
+            nativeJournal: bundle, contextBodyStore: ContextBodyStore(home: home))
+        await agent.observe { log.record($0) }
+        let result = await agent.send("quiet EOF must not become an assistant turn")
+        _ = try? await bundle.finishRun()
+        try? await bundle.closeChecked()
+        try? await writer.closeChecked()
+        return result
+    }
+
+    guard case .failed = outcome else {
+        XCTFail("provider EOF without done must fail the send")
+        return
+    }
+    XCTAssertFalse(log.names.contains { $0.hasPrefix("tool:") },
+                   "an unterminated provider turn must not execute its tool call")
+    let provider = try XCTUnwrap(spans.first {
+        $0.name == "aviary.agent.provider"
+            && telemetryAgentAttributeString($0, key: "aviary.operation") == "normal"
+    })
+    XCTAssertEqual(telemetryAgentAttributeString(provider, key: "aviary.outcome"), "indeterminate")
+    XCTAssertEqual(
+        provider.events.first(where: { $0.name == "aviary.agent.provider.measurements" })?
+            .attributes["aviary.provider.done_observed"], .bool(false))
+
+    let workEvents = TimelineJournalReader.read(
+        try Data(contentsOf: home.timelineV2WorkJournalURL(identity.work)),
+        journal: bundle.workJournal,
+        actor: TimelineActor(actorID: "telemetry-provider-quiet-eof-work-reader", kind: "self-test"),
+        hostRecordedAt: Date(timeIntervalSince1970: 0)).records.map(\.event)
+    let started = try XCTUnwrap(workEvents.first {
+        $0.type == TimelineEventType.actionStarted
+            && $0.payload["kind"]?.stringValue == ActionKind.provider.rawValue
+    })
+    let action = try XCTUnwrap(started.action)
+    let terminal = try XCTUnwrap(workEvents.first {
+        $0.type == TimelineEventType.actionOutcome && $0.action == action
+    })
+    XCTAssertEqual(
+        terminal.payload["state"]?.stringValue,
+        ActionExecutionState.indeterminateEffect.rawValue)
+    XCTAssertFalse(workEvents.contains {
+        $0.type == TimelineEventType.actionOutcome
+            && $0.action == action
+            && $0.payload["state"]?.stringValue == ActionExecutionState.succeeded.rawValue
+    })
+
+    let sessionEvents = TimelineJournalReader.read(
+        try Data(contentsOf: home.timelineV2SessionJournalURL(bundle.session)),
+        journal: bundle.sessionJournal,
+        actor: TimelineActor(actorID: "telemetry-provider-quiet-eof-session-reader", kind: "self-test"),
+        hostRecordedAt: Date(timeIntervalSince1970: 0)).records.map(\.event)
+    XCTAssertFalse(sessionEvents.contains {
+        $0.type == TimelineEventType.messageCommitted
+            && $0.payload["role"]?.stringValue == ChatRole.assistant.rawValue
+    }, "an unterminated provider turn must not commit an assistant message")
 }

@@ -7,9 +7,9 @@ import Foundation
 /// cache is working, how much a fan-out of sub-agents added on top of the parent's own
 /// spend. All of it is already in the transcripts.
 ///
-/// One honest caveat the UI repeats: cost is whatever the provider's catalog entry said at
-/// the time, and several routes report zero (OAuth subscription routes bill quota, not
-/// dollars; some gateways don't return pricing at all). Token counts are always real.
+/// Numeric projections can be exact, known lower bounds, or unclassified historical estimates.
+/// Completeness travels with them so a missing provider field or price cannot turn zero into a
+/// claim that usage was free or absent.
 public struct UsageAnalytics: Sendable {
     public init() {}
 
@@ -42,8 +42,21 @@ public struct UsageAnalytics: Sendable {
     /// Sessions whose model reported no pricing at all — the reason a cost total can look
     /// implausibly low.
     public var sessionsWithoutPricing = 0
+    public var sessionsWithIncompleteCost = 0
+    public var sessionsWithIncompleteTokens = 0
 
-    public var costIsPartial: Bool { sessionsWithoutPricing > 0 }
+    public var costIsPartial: Bool { sessionsWithIncompleteCost > 0 }
+    public var tokensArePartial: Bool { sessionsWithIncompleteTokens > 0 }
+
+    public var subagentShare: Double? {
+        guard total.isTokenTotalComplete, childTotal.isTokenTotalComplete,
+              total.totalTokens >= 0, childTotal.totalTokens >= 0
+        else { return nil }
+        let denominator = Double(total.totalTokens) + Double(childTotal.totalTokens)
+        guard denominator.isFinite, denominator > 0 else { return nil }
+        let value = Double(childTotal.totalTokens) / denominator
+        return value.isFinite && value >= 0 && value <= 1 ? value : nil
+    }
 
     public var toolErrorRate: Double? {
         guard toolCallCount > 0 else { return nil }
@@ -65,7 +78,13 @@ public struct UsageAnalytics: Sendable {
             a.toolErrorCount += s.counts.toolErrors
             a.agentMessageCount += s.counts.agentMessages
             a.compactionCount += s.counts.compactions
-            if s.usage.totalTokens > 0, s.usage.cost.total == 0 { a.sessionsWithoutPricing += 1 }
+            if s.counts.assistant > 0, !s.usage.isCostComplete {
+                a.sessionsWithIncompleteCost += 1
+                if s.usage.cost.total == 0 { a.sessionsWithoutPricing += 1 }
+            }
+            if s.counts.assistant > 0, !s.usage.isTokenTotalComplete {
+                a.sessionsWithIncompleteTokens += 1
+            }
 
             let modelKey = s.model ?? "unknown"
             var mb = models[modelKey] ?? Bucket(key: modelKey, usage: Usage(), sessions: 0, messages: 0)
@@ -127,7 +146,9 @@ public struct UsageAnalytics: Sendable {
 /// a chart axis, a table cell, and a tooltip.
 public enum Fmt {
     public static func tokens(_ n: Int) -> String {
-        switch abs(n) {
+        // `abs(Int.min)` traps. Formatting is also used at import boundaries, so use the
+        // unsigned magnitude even though validated usage counts are nonnegative.
+        switch n.magnitude {
         case 0: return "0"
         case 1..<1_000: return "\(n)"
         case 1_000..<1_000_000:
@@ -139,12 +160,47 @@ public enum Fmt {
         }
     }
 
+    public static func tokens(_ usage: Usage) -> String {
+        switch usage.completeness.tokenTotal {
+        case .complete: return tokens(usage.totalTokens)
+        case .lowerBound:
+            return usage.totalTokens > 0 ? "≥" + tokens(usage.totalTokens) : "—"
+        case .unclassified:
+            return usage.totalTokens > 0 ? "reported " + tokens(usage.totalTokens) : "—"
+        case .neutral, .unavailable: return usage.totalTokens > 0
+            ? "≥" + tokens(usage.totalTokens) : "—"
+        }
+    }
+
+    public static func tokens(_ value: Int, completeness: Usage.Completeness) -> String {
+        switch completeness {
+        case .complete: return tokens(value)
+        case .lowerBound: return value > 0 ? "≥" + tokens(value) : "—"
+        case .unclassified: return value > 0 ? "reported " + tokens(value) : "—"
+        case .neutral, .unavailable: return value > 0 ? "≥" + tokens(value) : "—"
+        }
+    }
+
     public static func cost(_ d: Double) -> String {
+        guard d.isFinite, d >= 0 else { return "—" }
         if d == 0 { return "—" }
         if d < 0.01 { return String(format: "$%.4f", d) }
         if d < 1 { return String(format: "$%.3f", d) }
         if d < 1_000 { return String(format: "$%.2f", d) }
         return String(format: "$%.0f", d)
+    }
+
+    public static func cost(_ usage: Usage) -> String {
+        switch usage.completeness.cost {
+        case .complete:
+            return usage.cost.total == 0 ? "$0.00" : cost(usage.cost.total)
+        case .lowerBound:
+            return usage.cost.total > 0 ? "≥" + cost(usage.cost.total) : "—"
+        case .unclassified:
+            return usage.cost.total > 0 ? "reported " + cost(usage.cost.total) : "—"
+        case .neutral, .unavailable:
+            return usage.cost.total > 0 ? "≥" + cost(usage.cost.total) : "—"
+        }
     }
 
     public static func percent(_ f: Double?) -> String {

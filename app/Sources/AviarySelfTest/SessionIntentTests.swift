@@ -10,6 +10,7 @@ private func intentIdentity() -> SessionWorkIdentity {
 
 private enum CommandJournalTestError: Error, Sendable {
     case delivery
+    case intentCommit
 }
 
 private actor RecordingSessionCommandJournal: SessionCommandJournal {
@@ -50,6 +51,44 @@ private actor HeldDeliverySessionCommandJournal: SessionCommandJournal {
     func releaseDelivery() {
         releaseContinuation?.resume()
         releaseContinuation = nil
+    }
+}
+
+private enum HeldIntentCommitCompletion: Sendable {
+    case success
+    case failure
+}
+
+/// Holds one intent after the command journal has actually received it. Completion is latched so
+/// every test cleanup path releases a commit even if task scheduling has not reached the wait yet.
+private actor HeldIntentSessionCommandJournal: SessionCommandJournal {
+    private(set) var commitStarted = false
+    private var completion: HeldIntentCommitCompletion?
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func commitIntent(_ intent: SessionCommandIntent) async throws {
+        commitStarted = true
+        if completion == nil {
+            await withCheckedContinuation { continuation in
+                if completion == nil {
+                    self.continuation = continuation
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+        if case .failure = completion {
+            throw CommandJournalTestError.intentCommit
+        }
+    }
+
+    func markDelivered(_ intent: SessionCommandIntent, at timestamp: Date) async throws {}
+
+    func release(_ completion: HeldIntentCommitCompletion) {
+        guard self.completion == nil else { return }
+        self.completion = completion
+        continuation?.resume()
+        continuation = nil
     }
 }
 
@@ -445,34 +484,35 @@ func test_sessionCommandControllerEndBypassesHeldCommitAndStaysEnded() async thr
 }
 
 func test_sessionCommandControllerLateEndCannotDispatchAfterNewerEndCompletes() async throws {
-    let failurePoints: [SessionWriter.FailurePoint?] = [nil, .beforeWrite]
-    for failurePoint in failurePoints {
-        let home = scratchHome()
-        defer { try? FileManager.default.removeItem(at: home.root) }
+    for completion in [HeldIntentCommitCompletion.success, .failure] {
         let identity = intentIdentity()
-        let writer = try SessionWriter(home: home, cwd: "/tmp", model: nil, identity: identity)
-        let controller = SessionCommandController(identity: identity, writer: writer)
-        let gate = SessionWriter.IntentCommitGate()
-        await writer.installIntentCommitGate(gate)
+        let journal = HeldIntentSessionCommandJournal()
+        let controller = SessionCommandController(identity: identity, journal: journal)
 
         let first = Task {
             await controller.admitAndCommit(.endRun, actorID: "gui", commandID: "end-1")
         }
-        var sawCommitting = false
-        for _ in 0..<100 {
-            if await controller.state == .committing {
-                sawCommitting = true
+        var commitStarted = false
+        for _ in 0..<500 {
+            if await journal.commitStarted {
+                commitStarted = true
                 break
             }
-            await Task.yield()
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
-        XCTAssertTrue(sawCommitting, "End-1 should be held before its writer append")
+        guard commitStarted else {
+            XCTFail("End-1 journal commit should begin within the bounded wait")
+            await journal.release(.success)
+            _ = await first.value
+            continue
+        }
+        XCTAssertEqual(await controller.state, .committing)
 
         // End-2 supersedes the in-flight End-1 locally and is allowed to complete teardown.
         let second = await controller.admitAndCommit(.endRun, actorID: "gui", commandID: "end-2")
         guard case .accepted(let end2) = second else {
             XCTFail("newer End should obtain a degraded permit")
-            await gate.release()
+            await journal.release(.success)
             _ = await first.value
             continue
         }
@@ -483,10 +523,7 @@ func test_sessionCommandControllerLateEndCannotDispatchAfterNewerEndCompletes() 
         XCTAssertTrue(await controller.acknowledgeEnd(commandID: end2.commandID))
         XCTAssertEqual(await controller.state, .ended)
 
-        if let failurePoint {
-            await writer.injectFailure(failurePoint)
-        }
-        await gate.release()
+        await journal.release(completion)
         let firstResult = await first.value
         guard case .accepted = firstResult else {
             XCTFail("older End remains accepted even when its write is ambiguous")
@@ -496,7 +533,6 @@ func test_sessionCommandControllerLateEndCannotDispatchAfterNewerEndCompletes() 
         XCTAssertNil(await controller.awaitDispatch(commandID: "end-1"))
         XCTAssertFalse(await controller.acknowledgeDispatched(commandID: "end-1"))
         XCTAssertFalse(await controller.acknowledgeEnd(commandID: "end-1"))
-        try? await writer.closeChecked()
     }
 }
 

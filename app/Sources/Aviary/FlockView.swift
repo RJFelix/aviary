@@ -616,7 +616,7 @@ struct AgentNodeDetail: View {
                                 StatTile(label: "tools", value: "\(s.counts.toolCalls)")
                                 StatTile(label: "errors", value: "\(s.counts.toolErrors)",
                                          tint: s.counts.toolErrors > 0 ? Design.danger : .secondary)
-                                StatTile(label: "tokens", value: Fmt.tokens(s.usage.totalTokens))
+                                StatTile(label: "tokens", value: Fmt.tokens(s.usage))
                             }
                             if !s.lastAssistantText.isEmpty {
                                 Divider().opacity(0.5)

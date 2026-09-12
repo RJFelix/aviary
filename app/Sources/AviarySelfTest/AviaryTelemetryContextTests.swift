@@ -18,6 +18,9 @@ let casesAviaryTelemetryContext: [Case] = [
     ("telemetry canonical compaction survives legacy projection failure", {
         try await testAviaryTelemetryCanonicalCompactionLegacyFailure()
     }),
+    ("telemetry compaction provider without terminal done is not committed", {
+        try await testAviaryTelemetryCompactionWithoutTerminalDone()
+    }),
 ]
 
 private actor ContextTelemetryCallCounter {
@@ -74,16 +77,19 @@ private actor TelemetryCompactionProviderState {
 private struct TelemetryCompactionProvider: ChatProvider {
     let state: TelemetryCompactionProviderState
     let failCompaction: Bool
+    let quietEOF: Bool
     let legacyProjectionFailureWriter: SessionWriter?
     let id = "telemetry-compaction-provider"
 
     init(
         state: TelemetryCompactionProviderState,
         failCompaction: Bool,
+        quietEOF: Bool = false,
         legacyProjectionFailureWriter: SessionWriter? = nil
     ) {
         self.state = state
         self.failCompaction = failCompaction
+        self.quietEOF = quietEOF
         self.legacyProjectionFailureWriter = legacyProjectionFailureWriter
     }
 
@@ -93,6 +99,14 @@ private struct TelemetryCompactionProvider: ChatProvider {
                 let call = await state.next()
                 if call == 5, failCompaction {
                     continuation.finish(throwing: TelemetryCompactionFailure())
+                    return
+                }
+                if call == 5, quietEOF {
+                    continuation.yield(.usage(telemetryContextUsage(input: 50)))
+                    continuation.yield(.textDelta("QUIET_EOF_COMPACTION_SENTINEL"))
+                    // Compaction must not publish a replacement context without terminal
+                    // provider evidence.
+                    continuation.finish()
                     return
                 }
                 if call == 5, let writer = legacyProjectionFailureWriter {
@@ -115,11 +129,9 @@ private struct TelemetryCompactionProvider: ChatProvider {
     }
 }
 
-private func telemetryContextUsage(input: Int) -> Usage {
-    var usage = Usage()
-    usage.input = input
-    usage.totalTokens = input
-    return usage
+private func telemetryContextUsage(input: Int) -> ProviderUsage.RawReport {
+    ProviderUsage.RawReport(inputTokens: input, outputTokens: 0, cacheReadTokens: 0,
+        cacheWriteTokens: 0, reportedTotalTokens: input, inputAccounting: .cacheExclusive)
 }
 
 private func telemetryContextModel() -> ModelSpec {
@@ -402,4 +414,70 @@ private func testAviaryTelemetryCanonicalCompactionLegacyFailure() async throws 
     XCTAssertFalse(serializedSpans.contains("SYSTEM_TELEMETRY_SENTINEL"))
     XCTAssertFalse(serializedSpans.contains("USER_TELEMETRY_SENTINEL"))
     XCTAssertFalse(serializedSpans.contains("COMPACTION_SUMMARY_SENTINEL"))
+}
+
+private func testAviaryTelemetryCompactionWithoutTerminalDone() async throws {
+    var model = telemetryContextModel()
+    model.contextWindow = 1_000
+    let (home, identity, bundle, writer) = try await telemetryContextNativeFixture(
+        suffix: "quiet-eof", model: model)
+    defer { try? FileManager.default.removeItem(at: home.root) }
+    let state = TelemetryCompactionProviderState()
+    let provider = TelemetryCompactionProvider(
+        state: state, failCompaction: false, quietEOF: true)
+    let agent = Agent(
+        provider: provider,
+        host: RuntimeHost(executable: "/usr/bin/true", arguments: []),
+        writer: writer, hostSession: identity.sessionID,
+        config: .init(model: model, cwd: "/tmp", systemPrompt: "compaction quiet EOF",
+                      maxIterations: 12),
+        nativeJournal: bundle, contextBodyStore: ContextBodyStore(home: home))
+
+    let (outcome, spans) = await AviaryTelemetry.withRecording {
+        let outcome = await agent.send("grow context before quiet EOF compaction")
+        try? await writer.closeChecked()
+        return outcome
+    }
+    _ = try? await bundle.finishRun()
+    try? await bundle.closeChecked()
+
+    guard case .completed = outcome else {
+        XCTFail("a recoverable compaction EOF should allow the next ordinary call")
+        return
+    }
+    XCTAssertEqual(await state.value(), 6,
+                   "the sixth ordinary provider call should recover after failed compaction")
+    let compaction = try XCTUnwrap(spans.first { $0.name == "aviary.agent.compaction" })
+    XCTAssertEqual(compaction.attributes["aviary.outcome"], .string("failed"))
+    XCTAssertTrue(compaction.events.filter {
+        $0.name == "aviary.agent.compaction.committed"
+    }.isEmpty)
+
+    let sessionEvents = TimelineJournalReader.read(
+        try Data(contentsOf: home.timelineV2SessionJournalURL(bundle.session)),
+        journal: bundle.sessionJournal,
+        actor: TimelineActor(actorID: "context-quiet-eof-session-reader", kind: "self-test"),
+        hostRecordedAt: Date(timeIntervalSince1970: 0)).records.map(\.event)
+    XCTAssertTrue(sessionEvents.contains {
+        $0.type == TimelineEventType.messageCommitted
+            && $0.payload["role"]?.stringValue == ChatRole.assistant.rawValue
+    }, "the ordinary post-failure call should still commit its response")
+    XCTAssertTrue(sessionEvents.filter { $0.type == TimelineEventType.compaction }.isEmpty,
+                  "an unterminated compaction provider must not replace context")
+
+    let workEvents = TimelineJournalReader.read(
+        try Data(contentsOf: home.timelineV2WorkJournalURL(identity.work)),
+        journal: bundle.workJournal,
+        actor: TimelineActor(actorID: "context-quiet-eof-work-reader", kind: "self-test"),
+        hostRecordedAt: Date(timeIntervalSince1970: 0)).records.map(\.event)
+    let compactionStarted = try XCTUnwrap(workEvents.first {
+        $0.type == TimelineEventType.actionStarted
+            && $0.payload["kind"]?.stringValue == ActionKind.compactionProvider.rawValue
+    })
+    let compactionAction = try XCTUnwrap(compactionStarted.action)
+    XCTAssertTrue(workEvents.contains {
+        $0.type == TimelineEventType.actionOutcome
+            && $0.action == compactionAction
+            && $0.payload["state"]?.stringValue != ActionExecutionState.succeeded.rawValue
+    }, "an unterminated compaction crossing must not be marked succeeded")
 }

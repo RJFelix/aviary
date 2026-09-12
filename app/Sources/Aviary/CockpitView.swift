@@ -1092,10 +1092,10 @@ struct SessionRow: View {
                         .font(Design.numeric(11, weight: .semibold))
                         .foregroundStyle(.tertiary)
                 } else {
-                    Text(Fmt.tokens(session.usage.totalTokens))
+                    Text(Fmt.tokens(session.usage))
                         .font(Design.numeric(11, weight: .semibold))
-                    if session.usage.cost.total > 0 {
-                        Text(Fmt.cost(session.usage.cost.total))
+                    if session.usage.cost.total > 0 || session.usage.completeness.cost != .neutral {
+                        Text(Fmt.cost(session.usage))
                             .font(.system(size: 9.5))
                             .foregroundStyle(.tertiary)
                     } else if session.counts.assistant > 0 {

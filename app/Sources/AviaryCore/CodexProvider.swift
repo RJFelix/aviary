@@ -15,7 +15,6 @@ import Foundation
 /// documented path; the WebSocket route is an optimization, and implementing it half-way would
 /// be a novel client signature for no gain.
 public struct CodexResponsesProvider: ChatProvider {
-    public var usageAccounting: ProviderUsageAccounting { .cacheInclusive }
     public let id: String
     public let store: CodexAuth.Store
     public let baseURL: String?
@@ -37,8 +36,6 @@ public struct CodexResponsesProvider: ChatProvider {
     public let session: URLSession
 
     static let defaultBaseURL = "https://chatgpt.com/backend-api"
-    static let maxRetries = 3
-    static let baseDelayMs = 1000
 
     public init(
         id: String = "openai-codex", store: CodexAuth.Store, baseURL: String? = nil,
@@ -311,52 +308,28 @@ public struct CodexResponsesProvider: ChatProvider {
             for: request, sessionID: sessionID, model: model, serviceTier: serviceTier)
         yield(.requestBody(payload))
 
-        var lastError: Error?
-        // Same policy: up to three retries, 1s doubling, on the same status set.
-        for attempt in 0...Self.maxRetries {
-            var urlRequest = URLRequest(url: Self.resolveURL(baseURL))
-            urlRequest.httpMethod = "POST"
-            for (key, value) in Self.headers(
-                token: credentials.access, accountID: credentials.accountId,
-                sessionID: sessionID)
-            {
-                urlRequest.setValue(value, forHTTPHeaderField: key)
-            }
-            urlRequest.httpBody = try JSONEncoder().encode(payload)
-            urlRequest.timeoutInterval = 600
-
-            do {
-                let (bytes, response) = try await session.bytes(for: urlRequest)
-                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                if !(200..<300).contains(status) {
-                    var body = Data()
-                    for try await b in bytes { body.append(b); if body.count > 32_768 { break } }
-                    let text = String(data: body, encoding: .utf8) ?? ""
-                    if attempt < Self.maxRetries, Self.isRetryable(status: status, body: text) {
-                        try await Task.sleep(nanoseconds:
-                            UInt64(Double(Self.baseDelayMs) * pow(2, Double(attempt)) * 1_000_000))
-                        continue
-                    }
-                    throw ChatError.http(status: status, body: Self.friendlyError(text) ?? text)
-                }
-                try await consume(bytes: bytes, yield: yield)
-                return
-            } catch let error as ChatError {
-                throw error
-            } catch {
-                lastError = error
-                if attempt >= Self.maxRetries { break }
-                try await Task.sleep(nanoseconds:
-                    UInt64(Double(Self.baseDelayMs) * pow(2, Double(attempt)) * 1_000_000))
-            }
+        var urlRequest = URLRequest(url: Self.resolveURL(baseURL))
+        urlRequest.httpMethod = "POST"
+        for (key, value) in Self.headers(
+            token: credentials.access, accountID: credentials.accountId,
+            sessionID: sessionID)
+        {
+            urlRequest.setValue(value, forHTTPHeaderField: key)
         }
-        throw lastError ?? ChatError.transport("the Codex endpoint could not be reached")
-    }
+        urlRequest.httpBody = try JSONEncoder().encode(payload)
+        urlRequest.timeoutInterval = 600
 
-    static func isRetryable(status: Int, body: String) -> Bool {
-        if [429, 500, 502, 503, 504].contains(status) { return true }
-        let pattern = "rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused"
-        return body.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+        // A retry is a separate potentially billable crossing. Keep it visible to the Agent
+        // rather than silently dispatching again after partial or uncertain provider work.
+        let (bytes, response) = try await session.bytes(for: urlRequest)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if !(200..<300).contains(status) {
+            var body = Data()
+            for try await b in bytes { body.append(b); if body.count > 32_768 { break } }
+            let text = String(data: body, encoding: .utf8) ?? ""
+            throw ChatError.http(status: status, body: Self.friendlyError(text) ?? text)
+        }
+        try await consume(bytes: bytes, yield: yield)
     }
 
     /// Turn a usage-limit error into something a person can act on, as the reference does.
@@ -384,15 +357,21 @@ public struct CodexResponsesProvider: ChatProvider {
         var parser = SSEParser()
         var toolCalls: [String: (callID: String, name: String, arguments: String)] = [:]
         var stopReason: String?
-        var usage = Usage()
-        var sawUsage = false
+        var sawCompleted = false
+        var sawDoneSentinel = false
 
-        for try await line in bytes.sseLines {
-            guard let payload = parser.feed(line: line) else { continue }
-            if payload == "[DONE]" { break }
-            guard let v = JSONValue.parse(Data(payload.utf8)) else { continue }
+        func processPayload(_ payload: String) throws {
+            if payload == "[DONE]" {
+                sawDoneSentinel = true
+                return
+            }
+            guard let v = JSONValue.parse(Data(payload.utf8)) else { return }
+            // Responses usage is cumulative and may accompany a terminal/failure event. Yield
+            // it before throwing so an unsuccessful crossing is not mistaken for free work.
+            if let report = ProviderUsageWire.responses(v.path("response.usage")) {
+                yield(.usage(report))
+            }
             let type = v["type"]?.stringValue ?? ""
-
             switch type {
             case "response.output_text.delta":
                 if let delta = v["delta"]?.stringValue, !delta.isEmpty { yield(.textDelta(delta)) }
@@ -422,24 +401,27 @@ public struct CodexResponsesProvider: ChatProvider {
                 let name = item["name"]?.stringValue ?? entry?.name ?? ""
                 let callID = item["call_id"]?.stringValue ?? entry?.callID ?? key
                 let raw = item["arguments"]?.stringValue ?? entry?.arguments ?? ""
-                let parsed = raw.isEmpty
-                    ? JSONValue.object([:])
-                    : (JSONValue.parse(Data(raw.utf8)) ?? .object([:]))
-                yield(.toolCall(id: callID, name: name, arguments: parsed))
-            case "response.completed", "response.incomplete", "response.failed":
-                let response = v["response"] ?? .null
-                if let u = response["usage"] {
-                    usage.input = u["input_tokens"]?.intValue ?? 0
-                    usage.output = u["output_tokens"]?.intValue ?? 0
-                    usage.cacheRead = u.path("input_tokens_details.cached_tokens")?.intValue ?? 0
-                    // The one thing the fork of the harness existed to preserve: absent and
-                    // zero are different on this route, because reasoning is encrypted and this
-                    // count is the only evidence the tokens existed.
-                    usage.reasoning = u.path("output_tokens_details.reasoning_tokens")?.intValue
-                    usage.totalTokens = u["total_tokens"]?.intValue ?? (usage.input + usage.output)
-                    sawUsage = true
+                let parsed: JSONValue
+                if raw.isEmpty {
+                    parsed = .object([:])
+                } else {
+                    guard let decoded = JSONValue.parse(Data(raw.utf8)) else {
+                        throw ChatError.decoding(
+                            "the provider ended with malformed tool-call arguments")
+                    }
+                    parsed = decoded
                 }
-                stopReason = response["status"]?.stringValue ?? type
+                yield(.toolCall(id: callID, name: name, arguments: parsed))
+            case "response.completed":
+                if !sawCompleted {
+                    let response = v["response"] ?? .null
+                    stopReason = response["status"]?.stringValue ?? type
+                    sawCompleted = true
+                }
+            case "response.incomplete":
+                throw ChatError.transport("the provider reported an incomplete response")
+            case "response.failed":
+                throw ChatError.transport("the provider reported a failed response")
             case "error", "response.error":
                 let message = v.path("error.message")?.stringValue
                     ?? v["message"]?.stringValue ?? payload
@@ -448,7 +430,19 @@ public struct CodexResponsesProvider: ChatProvider {
                 break
             }
         }
-        if sawUsage { yield(.usage(usage)) }
+
+        for try await line in bytes.sseLines {
+            guard let payload = parser.feed(line: line) else { continue }
+            try processPayload(payload)
+            if sawDoneSentinel { break }
+        }
+        if !sawDoneSentinel, let tail = parser.flush() {
+            try processPayload(tail)
+        }
+        try Task.checkCancellation()
+        guard sawCompleted else {
+            throw ChatError.transport("the provider stream ended before response.completed")
+        }
         yield(.done(stopReason: stopReason))
     }
 }

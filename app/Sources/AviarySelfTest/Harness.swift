@@ -1,4 +1,38 @@
 import Foundation
+@testable import AviaryCore
+
+/// Collects agent events off whatever task emits them, on both supported test platforms.
+final class EventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+    private var text = ""
+
+    func record(_ event: Agent.Event) {
+        lock.lock(); defer { lock.unlock() }
+        switch event {
+        case .imageAttached: events.append("imageAttached")
+        case .modelChanged: events.append("modelChanged")
+        case .awaitingDispatched: events.append("awaitingDispatched")
+        case .started: events.append("started")
+        case .inputCommitted: events.append("inputCommitted")
+        case .steered: events.append("steered")
+        case .goalExhausted: events.append("goal-exhausted")
+        case .textDelta(let t): text += t
+        case .thinkingDelta: events.append("thinking")
+        case .toolStarted(_, let name, _): events.append("tool:\(name)")
+        case .toolFinished(_, _, _, let isError): events.append(isError ? "tool-error" : "tool-ok")
+        case .turnFinished: events.append("turn")
+        case .compacted(let before, _, _): events.append("compacted:\(before)")
+        case .childStarted(_, let name, _): events.append("child:\(name)")
+        case .childFinished(_, _, _, let isError): events.append(isError ? "child-error" : "child-ok")
+        case .finished(let reason): events.append("finished:\(reason)")
+        case .failed: events.append("failed")
+        }
+    }
+
+    var names: [String] { lock.lock(); defer { lock.unlock() }; return events }
+    var assistantText: String { lock.lock(); defer { lock.unlock() }; return text }
+}
 
 /// A three-hundred-byte test runner.
 ///

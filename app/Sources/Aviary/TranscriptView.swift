@@ -473,7 +473,7 @@ struct TranscriptRow: View {
                                     + "the only record that it happened.")
                         }
                         if let u = item.usage, !u.isEmpty {
-                            Chip(text: Fmt.tokens(u.totalTokens), symbol: "number", tint: .secondary)
+                            Chip(text: Fmt.tokens(u), symbol: "number", tint: .secondary)
                                 .help(usageTooltip(u))
                         }
                     }))
@@ -709,7 +709,7 @@ struct TranscriptRow: View {
                     .font(.system(size: 10, weight: .semibold))
                     .tracking(0.5)
                 if let u = item.usage, u.totalTokens > 0 {
-                    Text("· \(Fmt.tokens(u.totalTokens)) tokens before")
+                    Text("· \(Fmt.tokens(u)) tokens before")
                         .font(.system(size: 10))
                 }
                 Spacer()
@@ -751,13 +751,17 @@ struct TranscriptRow: View {
 
     private func usageTooltip(_ u: Usage) -> String {
         var parts = [
-            "in \(Fmt.tokens(u.input))",
-            "out \(Fmt.tokens(u.output))",
+            "in \(Fmt.tokens(u.input, completeness: u.completeness.breakdown))",
+            "out \(Fmt.tokens(u.output, completeness: u.completeness.breakdown))",
         ]
-        if u.cacheRead > 0 { parts.append("cache read \(Fmt.tokens(u.cacheRead))") }
-        if u.cacheWrite > 0 { parts.append("cache write \(Fmt.tokens(u.cacheWrite))") }
+        if u.cacheRead > 0 {
+            parts.append("cache read " + Fmt.tokens(u.cacheRead, completeness: u.completeness.breakdown))
+        }
+        if u.cacheWrite > 0 {
+            parts.append("cache write " + Fmt.tokens(u.cacheWrite, completeness: u.completeness.breakdown))
+        }
         if let r = u.reasoning, r > 0 { parts.append("reasoning \(Fmt.tokens(r))") }
-        if u.cost.total > 0 { parts.append(Fmt.cost(u.cost.total)) }
+        if u.cost.total > 0 || u.completeness.cost != .neutral { parts.append(Fmt.cost(u)) }
         if let rate = u.cacheHitRate, rate > 0 { parts.append("\(Fmt.percent(rate)) cached") }
         return parts.joined(separator: " · ")
     }

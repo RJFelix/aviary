@@ -101,7 +101,8 @@ public enum ChatEvent: Sendable {
     /// A tool call, only once its arguments are complete — the loop has no use for a partial
     /// argument string, and assembling fragments is the provider's problem, not the caller's.
     case toolCall(id: String, name: String, arguments: JSONValue)
-    case usage(Usage)
+    /// Latest cumulative usage observation for this crossing, never a delta to add.
+    case usage(ProviderUsage.RawReport)
     case done(stopReason: String?)
 }
 
@@ -126,7 +127,7 @@ public enum ChatError: LocalizedError {
 }
 
 /// Relationship between the adapter's input count and its separately reported cache counts.
-public enum ProviderUsageAccounting: String, Sendable {
+public enum ProviderUsageAccounting: String, Codable, Hashable, Sendable {
     case cacheInclusive = "cache_inclusive"
     case cacheExclusive = "cache_exclusive"
     case unknown
@@ -134,12 +135,7 @@ public enum ProviderUsageAccounting: String, Sendable {
 
 public protocol ChatProvider: Sendable {
     var id: String { get }
-    var usageAccounting: ProviderUsageAccounting { get }
     func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error>
-}
-
-public extension ChatProvider {
-    var usageAccounting: ProviderUsageAccounting { .unknown }
 }
 
 // MARK: - Server-sent events
@@ -227,7 +223,6 @@ extension AsyncSequence where Element == UInt8 {
 /// including the LiteLLM gateway that fronts the rest — so one implementation reaches every
 /// route that is actually in use, and keeps the gateway's metering intact.
 public struct OpenAICompletionsProvider: ChatProvider {
-    public var usageAccounting: ProviderUsageAccounting { .cacheInclusive }
     public let id: String
     public let baseURL: URL
     public let apiKey: String?
@@ -289,43 +284,62 @@ public struct OpenAICompletionsProvider: ChatProvider {
         // carries the id and name. Assembled here so the loop only ever sees whole calls.
         var callsByIndex: [Int: (id: String, name: String, arguments: String)] = [:]
         var stopReason: String?
-        var sawUsage = false
+        var hasTerminalProof = false
+        var sawDoneSentinel = false
 
-        func emitToolCalls() {
+        func emitToolCalls() throws {
             for index in callsByIndex.keys.sorted() {
                 guard let call = callsByIndex[index] else { continue }
-                let parsed = JSONValue.parse(Data(call.arguments.utf8))
-                    ?? .object([:])
+                // Never turn a truncated argument buffer into `{}`. That would make a transport
+                // failure look like a successful, actionable tool call. A length finish reason
+                // is a terminal proof for the response, but specifically not proof that a tool
+                // call was complete.
+                guard !call.id.isEmpty, !call.name.isEmpty else {
+                    throw ChatError.decoding("the provider ended with incomplete tool-call arguments")
+                }
+                let parsed: JSONValue
+                if call.arguments.isEmpty {
+                    // Some OpenAI-compatible routes encode a no-argument function call as an
+                    // empty argument string. It is actionable only now, after the terminal
+                    // proof and the provider's complete tool-call boundary above.
+                    parsed = .object([:])
+                } else {
+                    guard let decoded = JSONValue.parse(Data(call.arguments.utf8)) else {
+                        throw ChatError.decoding(
+                            "the provider ended with incomplete tool-call arguments")
+                    }
+                    parsed = decoded
+                }
                 yield(.toolCall(id: call.id, name: call.name, arguments: parsed))
             }
             callsByIndex.removeAll()
         }
 
-        // Raw bytes split by hand rather than `bytes.lines`.
-        //
-        // `AsyncLineSequence` **discards blank lines**, and in SSE the blank line *is* the
-        // record separator — measured: five `data:` events arrived as five lines with no
-        // separators between them, so a spec-correct parser emitted nothing at all and every
-        // turn came back empty. Framing the stream is this function's job, not the stdlib's.
-        for try await line in bytes.sseLines {
-            guard let payload = parser.feed(line: line) else { continue }
-            if payload == "[DONE]" { break }
-            guard let v = JSONValue.parse(Data(payload.utf8)) else { continue }
+        func processPayload(_ payload: String) throws {
+            if payload == "[DONE]" {
+                sawDoneSentinel = true
+                hasTerminalProof = true
+                return
+            }
+            guard let v = JSONValue.parse(Data(payload.utf8)) else { return }
+
+            if let usage = ProviderUsageWire.openAICompletions(v["usage"]) {
+                yield(.usage(usage))
+            }
 
             // An error can arrive mid-stream with a 200 status — LiteLLM does this when an
-            // upstream route fails after headers are sent.
+            // upstream route fails after headers are sent. Usage above remains observable.
             if let message = v.path("error.message")?.stringValue {
                 throw ChatError.http(status: v.path("error.code")?.intValue ?? 200, body: message)
             }
 
-            if let usage = v["usage"], !usage.isNull {
-                sawUsage = true
-                yield(.usage(Self.usage(from: usage)))
-            }
-
-            guard let choice = (v["choices"]?.arrayValue ?? []).first else { continue }
-            if let reason = choice["finish_reason"]?.stringValue, !reason.isEmpty {
-                stopReason = reason
+            guard let choice = (v["choices"]?.arrayValue ?? []).first else { return }
+            if let rawReason = choice["finish_reason"]?.stringValue {
+                let reason = rawReason.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !reason.isEmpty {
+                    stopReason = reason
+                    hasTerminalProof = true
+                }
             }
             let delta: JSONValue = choice["delta"] ?? choice["message"] ?? .null
 
@@ -351,13 +365,40 @@ public struct OpenAICompletionsProvider: ChatProvider {
                 callsByIndex[index] = entry
             }
         }
-        if let tail = parser.flush(), tail != "[DONE]", let v = JSONValue.parse(Data(tail.utf8)),
-           let usage = v["usage"], !usage.isNull, !sawUsage
-        {
-            yield(.usage(Self.usage(from: usage)))
-        }
 
-        emitToolCalls()
+        // Raw bytes split by hand rather than `bytes.lines`.
+        //
+        // `AsyncLineSequence` **discards blank lines**, and in SSE the blank line *is* the
+        // record separator — measured: five `data:` events arrived as five lines with no
+        // separators between them, so a spec-correct parser emitted nothing at all and every
+        // turn came back empty. Framing the stream is this function's job, not the stdlib's.
+        for try await line in bytes.sseLines {
+            guard let payload = parser.feed(line: line) else { continue }
+            try processPayload(payload)
+            if sawDoneSentinel { break }
+        }
+        if !sawDoneSentinel, let tail = parser.flush() {
+            try processPayload(tail)
+        }
+        try Task.checkCancellation()
+
+        guard hasTerminalProof else {
+            throw ChatError.transport("the provider stream ended before a terminal response")
+        }
+        // `length` and other non-tool terminal reasons prove only that the response ended. Do
+        // not expose a buffered call as actionable unless the provider explicitly identified a
+        // tool-call finish, or used the [DONE] sentinel without a reason.
+        if !callsByIndex.isEmpty, !sawDoneSentinel,
+           stopReason == "length" || stopReason == "content_filter"
+        {
+            throw ChatError.decoding("the provider ended before a complete tool-call response")
+        }
+        if !callsByIndex.isEmpty, !sawDoneSentinel,
+           stopReason != "tool_calls", stopReason != "function_call"
+        {
+            throw ChatError.decoding("the provider ended before a complete tool-call response")
+        }
+        try emitToolCalls()
         yield(.done(stopReason: stopReason))
     }
 
@@ -450,16 +491,4 @@ public struct OpenAICompletionsProvider: ChatProvider {
         return out
     }
 
-    public static func usage(from v: JSONValue) -> Usage {
-        var u = Usage()
-        u.input = v["prompt_tokens"]?.intValue ?? 0
-        u.output = v["completion_tokens"]?.intValue ?? 0
-        u.cacheRead = v.path("prompt_tokens_details.cached_tokens")?.intValue ?? 0
-        // Preserved rather than discarded — the one divergence the harness fork carried, for
-        // the same reason: on an encrypted-reasoning route this is the only evidence the
-        // tokens existed, and nil is not zero.
-        u.reasoning = v.path("completion_tokens_details.reasoning_tokens")?.intValue
-        u.totalTokens = v["total_tokens"]?.intValue ?? (u.input + u.output)
-        return u
-    }
 }

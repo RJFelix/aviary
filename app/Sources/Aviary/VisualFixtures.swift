@@ -27,6 +27,7 @@ enum VisualFixtureRoute: String {
     case activityOverviewNarrow = "activity-overview-narrow-fixture"
     case activityOverviewStale = "activity-overview-stale-fixture"
     case diagnostics = "diagnostics-fixture"
+    case usageAccounting = "usage-accounting-fixture"
 
     var isNarrow: Bool {
         self == .serviceChatNarrow || self == .productionDeliveryNarrow
@@ -69,7 +70,74 @@ struct VisualFixtureView: View {
             ActivityOverviewFixture(isCurrent: route != .activityOverviewStale)
         case .diagnostics:
             DiagnosticsFixture()
+        case .usageAccounting:
+            UsageAccountingFixture()
         }
+    }
+}
+
+/// Production analytics over disposable fixture records: complete, partial, unclassified,
+/// and absent reports. No user transcript, provider, or Work service is opened.
+private struct UsageAccountingFixture: View {
+    @State private var model: AppModel = {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aviary-usage-fixture-" + UUID().uuidString)
+        let suite = "aviary.usage-fixture." + UUID().uuidString
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            preconditionFailure("The isolated usage fixture preferences could not be constructed")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let model = AppModel(home: AgentHome(root: root), presentationDefaults: defaults,
+            modelPreferencesStore: ModelPreferencesStore(directory: root))
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let priced = ModelSpec(rpc: .object([
+                "id": .string("Fixture model"), "provider": .string("Fixture provider"),
+                "cost": .object(["input": .number(2), "output": .number(4),
+                    "cacheRead": .number(0.2), "cacheWrite": .number(3)])]))
+            let complete = Usage(finality: .finalReport, accounted: ProviderUsage.account(report: .init(
+                inputTokens: 2_000, outputTokens: 300, cacheReadTokens: 1_000,
+                cacheWriteTokens: 0, inputAccounting: .cacheInclusive), model: priced))
+            let partial = Usage(finality: .finalReport, accounted: ProviderUsage.account(report: .init(
+                inputTokens: 3_000, outputTokens: 500,
+                inputAccounting: .cacheInclusive), model: priced))
+            let imported = Usage(json: .object(["input": .number(2_000_000),
+                "output": .number(500_000), "totalTokens": .number(2_500_000),
+                "cost": .object(["total": .number(12.35)])]))
+            let missing = Usage(finality: .finalReport, accounted: ProviderUsage.account(report: nil, model: priced))
+            let stamp = ISO8601DateFormatter().string(from: Date())
+            for (index, usage) in [complete, partial, imported, missing].enumerated() {
+                let names = ["Complete report", "Partial report", "Recorded import", "Missing report"]
+                let usageValue = JSONValue.parse(try JSONEncoder().encode(usage)) ?? .null
+                let lines: [JSONValue] = [
+                    .object(["type": .string("session"), "id": .string("usage-\(index)"),
+                        "cwd": .string("/fixture/accounting"), "timestamp": .string(stamp)]),
+                    .object(["type": .string("session_info"), "name": .string(names[index])]),
+                    .object(["type": .string("message"), "timestamp": .string(stamp),
+                        "message": .object(["role": .string("assistant"),
+                            "model": .string(names[index]), "provider": .string("Fixture provider"),
+                            "usage": usageValue, "content": .array([])])]),
+                ]
+                var bytes = Data()
+                for line in lines { bytes.append(try JSONEncoder().encode(line)); bytes.append(10) }
+                let path = root.appendingPathComponent("usage-\(index).jsonl")
+                try bytes.write(to: path)
+                if var summary = SessionCatalog.summarize(fileURL: path) {
+                    summary.updatedAt = Date()
+                    model.sessions.append(summary)
+                }
+            }
+            model.analytics = UsageAnalytics.build(from: model.sessions)
+        } catch {
+            preconditionFailure("The isolated usage fixture could not be constructed")
+        }
+        return model
+    }()
+
+    var body: some View {
+        UsageView().environment(model)
+            .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 

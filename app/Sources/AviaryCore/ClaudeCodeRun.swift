@@ -623,7 +623,7 @@ public actor ClaudeCodeRun {
             emit(.failed(detail))
             await journalFailure(detail)
         }
-        if let usage = openUsage { totalUsage = totalUsage + usage }
+        totalUsage += openUsage ?? .unclassifiedRecord
         openMessageID = nil
         openBlocks = []
         openUsage = nil

@@ -67,8 +67,9 @@ what it does; this file is how to work on it without relearning the traps.
   journal bytes, not just fresh-run behavior.
 - **`input_tokens` from Anthropic excludes cached context.** A cached turn reads
   `input 2, cacheRead 3953`, so summing input and output undercounts a long session by a
-  factor of fifty. `ClaudeCode.usage` is cache-inclusive; `AnthropicMessagesProvider` is not,
-  and that is a known bug rather than a convention worth copying.
+  factor of fifty. Both the driven Claude Code stream and Anthropic provider now normalize
+  through `ProviderUsage`: ordinary input excludes cache, total context includes it. Missing
+  fields remain unknown; do not restore the old input-plus-output-only calculation.
 - **Anything that spawns `claude` must scrub the environment first.** `ANTHROPIC_API_KEY` and
   friends outrank subscription OAuth silently, so the run works and bills metered credit —
   a failure with no symptom. And Aviary is developed from inside Claude Code, so a child

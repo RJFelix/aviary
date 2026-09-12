@@ -491,7 +491,8 @@ enum AgentCLI {
                     + (output.split(separator: "\n").count > 12 ? "\n  …" : ""))
             case .turnFinished(_, let usage, _):
                 if let usage, !quiet {
-                    note("  · \(Fmt.tokens(usage.input)) in / \(Fmt.tokens(usage.output)) out"
+                    note("  · \(Fmt.tokens(usage.input, completeness: usage.completeness.breakdown)) in / "
+                        + "\(Fmt.tokens(usage.output, completeness: usage.completeness.breakdown)) out"
                         + (usage.reasoning.map { " / \(Fmt.tokens($0)) reasoning" } ?? ""))
                 }
             case .finished(let reason):
@@ -556,7 +557,7 @@ enum AgentCLI {
             }
             let total = await agent.totalUsage
             if !quiet {
-                note("total \(Fmt.tokens(total.totalTokens)) tokens"
+                note("total \(Fmt.tokens(total)) tokens"
                     + (total.cacheHitRate.map { String(format: " · %.0f%% cached", $0 * 100) } ?? ""))
                 note("transcript \(writer.fileURL.path)")
             }

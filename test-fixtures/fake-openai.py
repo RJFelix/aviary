@@ -108,7 +108,10 @@ class Handler(BaseHTTPRequestHandler):
                 "prompt_tokens": step.get("input_tokens", 100),
                 "completion_tokens": step.get("output_tokens", 20),
                 "total_tokens": step.get("input_tokens", 100) + step.get("output_tokens", 20),
-                "prompt_tokens_details": {"cached_tokens": step.get("cached_tokens", 40)},
+                "prompt_tokens_details": {
+                    "cached_tokens": step.get("cached_tokens", 40),
+                    "cache_write_tokens": step.get("cache_write_tokens", 0),
+                },
                 **({"completion_tokens_details": {"reasoning_tokens": step["reasoning_tokens"]}}
                    if "reasoning_tokens" in step else {}),
             },

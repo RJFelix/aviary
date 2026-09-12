@@ -225,19 +225,22 @@ let casesAviaryTelemetry: [Case] = [
         let (_, spans) = await AviaryTelemetry.withRecording {
             for accounting in [ProviderUsageAccounting.cacheInclusive, .cacheExclusive, .unknown] {
                 await AviaryTelemetry.withSpan("aviary.test.\(accounting.rawValue)") {
-                    var usage = Usage()
-                    usage.input = 100; usage.cacheRead = 50; usage.cacheWrite = 10
-                    usage.output = 20; usage.totalTokens = 120
+                    var usage = ProviderUsage.RawReport(inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, inputAccounting: .cacheExclusive)
+                    usage.inputTokens = 100; usage.cacheReadTokens = 50; usage.cacheWriteTokens = 10
+                    usage.outputTokens = 20; usage.reportedTotalTokens = 120
                     var measurement = AviaryProviderTelemetry()
+                    usage.inputAccounting = accounting
                     measurement.observe(.usage(usage))
-                    measurement.record(model: model, accounting: accounting)
+                    measurement.observe(.done(stopReason: "stop"))
+                    measurement.record(model: model)
                 }
             }
             await AviaryTelemetry.withSpan("aviary.test.inconsistent_cache") {
-                var usage = Usage(); usage.input = 1; usage.cacheRead = Int.max
+                var usage = ProviderUsage.RawReport(inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, inputAccounting: .cacheExclusive); usage.inputTokens = 1; usage.cacheReadTokens = Int.max
                 var measurement = AviaryProviderTelemetry()
+                usage.inputAccounting = .cacheInclusive
                 measurement.observe(.usage(usage))
-                measurement.record(model: model, accounting: .cacheInclusive)
+                measurement.record(model: model)
             }
         }
         for (kind, expected) in [("cache_inclusive", 0.0002), ("cache_exclusive", 0.00032)] {
@@ -248,13 +251,35 @@ let casesAviaryTelemetry: [Case] = [
             }
             XCTAssertTrue(abs(cost - expected) < 0.000000001)
             XCTAssertEqual(price.attributes["aviary.pricing.cache_read_per_million_usd"], .double(0.2))
+            XCTAssertEqual(price.attributes["aviary.pricing.complete"], .bool(true))
         }
         for name in ["unknown", "inconsistent_cache"] {
             let span = try XCTUnwrap(spans.first { $0.name == "aviary.test.\(name)" })
             let price = try XCTUnwrap(span.events.first { $0.name == "aviary.agent.provider.price" })
-            XCTAssertEqual(price.attributes["aviary.pricing.state"], .string("unavailable"))
+            XCTAssertNotEqual(price.attributes["aviary.pricing.state"], .string("estimated"))
             XCTAssertNil(price.attributes["aviary.pricing.estimated_usd"])
         }
+    }),
+    ("telemetry: unconfirmed provider reports cannot establish a complete crossing price", {
+        var model = ModelSpec(rpc: .object(["id": .string("model"), "provider": .string("provider")]))
+        model.costInput = 1; model.costOutput = 1
+        model.costCacheRead = 0; model.costCacheWrite = 0
+        let (_, spans) = await AviaryTelemetry.withRecording {
+            await AviaryTelemetry.withSpan("aviary.test.unconfirmed") {
+                var measurement = AviaryProviderTelemetry()
+                measurement.observe(.usage(.init(inputTokens: 10, outputTokens: 2,
+                    cacheReadTokens: 0, cacheWriteTokens: 0, inputAccounting: .cacheExclusive)))
+                measurement.record(model: model)
+            }
+        }
+        let span = try XCTUnwrap(spans.first)
+        let price = try XCTUnwrap(span.events.first { $0.name == "aviary.agent.provider.price" })
+        XCTAssertEqual(price.attributes["aviary.pricing.complete"], .bool(false))
+        XCTAssertEqual(price.attributes["aviary.pricing.state"], .string("partial"))
+        XCTAssertNil(price.attributes["aviary.pricing.estimated_usd"])
+        XCTAssertNotNil(price.attributes["aviary.pricing.known_lower_bound_usd"])
+        let coverage = try XCTUnwrap(span.events.first { $0.name == "aviary.agent.provider.usage_coverage" })
+        XCTAssertEqual(coverage.attributes["aviary.usage.finality"], .string("unconfirmed"))
     }),
     ("telemetry: provider measurements replace usage and retain pricing provenance", {
         let model = ModelSpec(rpc: .object([
@@ -267,14 +292,14 @@ let casesAviaryTelemetry: [Case] = [
                 measurement.observe(.textDelta(""), now: 300)
                 measurement.observe(.thinkingDelta("secret thinking"), now: 1_000_000_100)
                 measurement.observe(.textDelta("secret output"), now: 2_000_000_100)
-                var usage = Usage()
-                usage.input = 100; usage.output = 1; usage.cacheRead = 50; usage.cacheWrite = 10
-                usage.totalTokens = 161
+                var usage = ProviderUsage.RawReport(inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, inputAccounting: .cacheExclusive)
+                usage.inputTokens = 100; usage.outputTokens = 1; usage.cacheReadTokens = 50; usage.cacheWriteTokens = 10
+                usage.reportedTotalTokens = 161
                 measurement.observe(.usage(usage))
-                usage.output = 20; usage.totalTokens = 180; usage.reasoning = 5
+                usage.outputTokens = 20; usage.reportedTotalTokens = 180; usage.reasoningTokens = 5
                 measurement.observe(.usage(usage))
                 measurement.observe(.done(stopReason: "private stop reason"))
-                measurement.record(model: model, accounting: .cacheExclusive)
+                measurement.record(model: model)
             }
         }
         let span = try XCTUnwrap(spans.first)
@@ -286,14 +311,28 @@ let casesAviaryTelemetry: [Case] = [
         XCTAssertEqual(usage.attributes["aviary.usage.updates"], .int(2))
         XCTAssertEqual(usage.attributes["aviary.provider.first_output.seconds"], .double(1))
         XCTAssertEqual(usage.attributes["aviary.provider.done_observed"], .bool(true))
+        XCTAssertEqual(usage.attributes["aviary.usage.context_tokens"], .int(160))
+        XCTAssertEqual(usage.attributes["aviary.usage.ordinary_input_tokens"], .int(100))
+        XCTAssertEqual(usage.attributes["aviary.usage.issue_count"], .int(0))
+        let coverage = try XCTUnwrap(span.events.first { $0.name == "aviary.agent.provider.usage_coverage" })
+        for field in ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                      "reasoning_tokens", "reported_total_tokens"] {
+            XCTAssertEqual(coverage.attributes["aviary.usage.\(field).state"], .string("known"))
+            XCTAssertNil(coverage.attributes["aviary.usage.\(field).reason"])
+        }
+        XCTAssertTrue(usage.attributes.count <= 16)
+        XCTAssertTrue(coverage.attributes.count <= 16)
+        XCTAssertEqual(coverage.attributes["aviary.usage.finality"], .string("final_report"))
         let price = try XCTUnwrap(span.events.first { $0.name == "aviary.agent.provider.price" })
         XCTAssertEqual(price.attributes["aviary.pricing.source"], .string("model_spec"))
-        XCTAssertEqual(price.attributes["aviary.pricing.state"], .string("estimated"))
-        XCTAssertEqual(price.attributes["aviary.pricing.cache_fallback"], .bool(true))
-        guard case .double(let cost)? = price.attributes["aviary.pricing.estimated_usd"] else {
+        XCTAssertEqual(price.attributes["aviary.pricing.state"], .string("partial"))
+        XCTAssertEqual(price.attributes["aviary.pricing.complete"], .bool(false))
+        XCTAssertNil(price.attributes["aviary.pricing.cache_fallback"])
+        XCTAssertNil(price.attributes["aviary.pricing.estimated_usd"])
+        guard case .double(let cost)? = price.attributes["aviary.pricing.known_lower_bound_usd"] else {
             XCTFail("Missing configured-rate estimate"); return
         }
-        XCTAssertTrue(abs(cost - 0.0004) < 0.000000001)
+        XCTAssertTrue(abs(cost - 0.00028) < 0.000000001)
         XCTAssertNotNil(price.attributes["aviary.pricing.id"])
         XCTAssertFalse(String(describing: span.events).contains("secret"))
         XCTAssertFalse(String(describing: span.events).contains("private"))
@@ -305,14 +344,14 @@ let casesAviaryTelemetry: [Case] = [
                 await AviaryTelemetry.withSpan("aviary.test.\(mode)") {
                     var measurement = AviaryProviderTelemetry(now: 10)
                     if mode != "missing" {
-                        var usage = Usage()
-                        usage.input = mode == "invalid" ? -1 : 100
-                        usage.output = 20; usage.totalTokens = 120
+                        var usage = ProviderUsage.RawReport(inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, inputAccounting: .cacheExclusive)
+                        usage.inputTokens = mode == "invalid" ? -1 : 100
+                        usage.outputTokens = 20; usage.reportedTotalTokens = 120
                         measurement.observe(.usage(usage))
                     }
                     var configured = model
                     if mode == "partial" { configured.costInput = 2 }
-                    measurement.record(model: configured, accounting: .cacheExclusive)
+                    measurement.record(model: configured)
                 }
             }
         }
@@ -322,14 +361,23 @@ let casesAviaryTelemetry: [Case] = [
             XCTAssertEqual(usage.attributes["aviary.provider.done_observed"], .bool(false))
             XCTAssertNil(usage.attributes["aviary.provider.first_output.seconds"])
             XCTAssertNil(usage.attributes["aviary.usage.reasoning_tokens"])
+            let coverage = try XCTUnwrap(span.events.first { $0.name == "aviary.agent.provider.usage_coverage" })
+            XCTAssertEqual(coverage.attributes["aviary.usage.reasoning_tokens.state"], .string("missing"))
+            if mode == "missing" {
+                XCTAssertNil(usage.attributes["aviary.usage.cache_write_tokens"])
+                XCTAssertEqual(coverage.attributes["aviary.usage.cache_write_tokens.state"], .string("missing"))
+            } else {
+                XCTAssertEqual(usage.attributes["aviary.usage.cache_write_tokens"], .int(0))
+                XCTAssertEqual(coverage.attributes["aviary.usage.cache_write_tokens.state"], .string("known"))
+            }
             let price = span.events.first { $0.name == "aviary.agent.provider.price" }
             XCTAssertNil(price?.attributes["aviary.pricing.estimated_usd"])
             if mode == "missing" || mode == "invalid" {
-                XCTAssertNil(price)
+                XCTAssertNotNil(price)
                 XCTAssertNil(usage.attributes["aviary.usage.total_tokens"])
                 XCTAssertEqual(usage.attributes["aviary.usage.state"], .string(mode == "missing" ? "unreported" : "invalid"))
             } else {
-                XCTAssertEqual(price?.attributes["aviary.pricing.state"], .string("unavailable"))
+                XCTAssertNotEqual(price?.attributes["aviary.pricing.state"], .string("estimated"))
             }
         }
     }),
