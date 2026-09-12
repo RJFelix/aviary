@@ -143,6 +143,10 @@ just shots    # every screen renders, against your real agent directory
 `AviarySelfTest` uses `AVIARY_SELFTEST_FILTER` for substring selection; it does not parse
 `--help` as a discovery command (that launches the full suite, including runtime processes).
 Inspect the registered case arrays with `rg`, then run with an explicit filter for focused work.
+New cross-platform test files must not depend on helpers in the macOS-only `main.swift`;
+keep fixtures self-contained or in a shared file selected by both package configurations.
+When running the executable directly, rebuild `aviaryd` first as well as `AviarySelfTest`:
+the real-process tests otherwise exercise an older helper. `just test` already does both.
 The executable uses the small assertion API in `AviarySelfTest/Harness.swift`, not XCTest.
 Check that API before adding assertions: use `XCTAssertTrue(a <= b)` for ordering and explicit
 `do`/`catch` for throwing checks; XCTest's ordering/throwing convenience functions are absent.

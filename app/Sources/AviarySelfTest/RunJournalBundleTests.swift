@@ -459,6 +459,14 @@ func test_runJournalBundleAllActionKindsPermitOnlyAfterDurableStart() async thro
     } catch { }
     for (index, kind) in ActionKind.allCases.enumerated() {
         let before = await bundleStatus(bundle).durablePrefix.workEventCount
+        if kind == .provider || kind == .compactionProvider {
+            do {
+                _ = try await bundle.beginAction(kind: kind, intent: "unqualified model call")
+                XCTFail("model calls must require pinned context/accounting admission")
+            } catch { }
+            XCTAssertEqual(await bundleStatus(bundle).durablePrefix.workEventCount, before)
+            continue
+        }
         let permit = try await bundle.beginAction(
             action: ActionRef("action-\(index)"), kind: kind,
             intent: "perform \(kind.rawValue)", target: "target-\(index)", scope: "run")
@@ -476,9 +484,9 @@ func test_runJournalBundleAllActionKindsPermitOnlyAfterDurableStart() async thro
     let events = try bundleEvents(home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
     let work = WorkReducer.reduce(events)
     XCTAssertTrue(work.structuralIntegrityValid && work.semanticProjectionValid)
-    XCTAssertEqual(events.filter { $0.type == TimelineEventType.actionIntent }.count, ActionKind.allCases.count)
-    XCTAssertEqual(events.filter { $0.type == TimelineEventType.actionStarted }.count, ActionKind.allCases.count)
-    XCTAssertEqual(events.filter { $0.type == TimelineEventType.actionOutcome }.count, ActionKind.allCases.count)
+    XCTAssertEqual(events.filter { $0.type == TimelineEventType.actionIntent }.count, ActionKind.allCases.count - 2)
+    XCTAssertEqual(events.filter { $0.type == TimelineEventType.actionStarted }.count, ActionKind.allCases.count - 2)
+    XCTAssertEqual(events.filter { $0.type == TimelineEventType.actionOutcome }.count, ActionKind.allCases.count - 2)
     try await bundle.closeChecked()
 }
 
@@ -928,14 +936,14 @@ func test_runJournalBundleOutcomeFailureRequiresMetadataButCanContinue() async t
     let home = try bundleTestHome()
     defer { try? FileManager.default.removeItem(at: home.root) }
     let bundle = try await makeBundle(home: home)
-    let permit = try await bundle.beginAction(kind: .provider, intent: "call provider")
+    let permit = try await bundle.beginAction(kind: .providerSetup, intent: "construct provider")
     do {
         _ = try await bundle.finishAction(permit, state: .failed, retrySafety: .unknown)
         XCTFail("failed action must carry failure kind")
     } catch { }
     _ = try await bundle.finishAction(
         permit, state: .failed, retrySafety: .unknown, failureKind: .task)
-    let retry = try await bundle.beginAction(kind: .provider, intent: "retry safely")
+    let retry = try await bundle.beginAction(kind: .providerSetup, intent: "retry setup safely")
     _ = try await bundle.finishAction(retry, state: .succeeded, retrySafety: .idempotent)
     let events = try bundleEvents(home, bundle.workJournal, home.timelineV2WorkJournalURL(bundleTestWork))
     let reduced = WorkReducer.reduce(events)

@@ -257,6 +257,7 @@ public struct WorkActionPresentation: Codable, Hashable, Sendable, Identifiable 
         switch kind {
         case .provider: return "Provider request"
         case .compactionProvider: return "Compaction provider"
+        case .providerSetup: return "Provider setup"
         case .python: return "Python computation"
         case .mcp: return "MCP operation"
         case .runtime: return "Runtime operation"
@@ -352,6 +353,8 @@ public struct WorkActionPresentation: Codable, Hashable, Sendable, Identifiable 
             return "The MCP boundary is recorded, but server-side effects are not contained by this projection."
         case .provider, .compactionProvider:
             return "Provider input/output status is recorded at Aviary's boundary; provider-side effects are not independently proven."
+        case .providerSetup:
+            return "Provider configuration and credential resolution are recorded; this is not a model request."
         case .runtime, .nestedProcessCallback:
             return "Runtime activity is recorded at the host boundary; process internals are not contained by this projection."
         case .hook:

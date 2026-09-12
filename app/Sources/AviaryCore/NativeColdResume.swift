@@ -20,6 +20,8 @@ public struct NativeColdResumeResult: Sendable {
     public let contextBoundary: EventRef
     public let sessionCursor: JournalCursor
     public let workCursor: JournalCursor
+    /// Work-wide direct provider accounting at exactly `workCursor`, not a Session-message sum.
+    public let providerUsage: ProviderUsageAggregate
     /// The six state planes are always present.  In particular, a reconstructed conversation
     /// is not evidence that the Python namespace or an external effect survived.
     public let coverage: RecoveryCoverage
@@ -30,6 +32,7 @@ public struct NativeColdResumeResult: Sendable {
         modelID: String, contextManifest: ContextManifest,
         systemPromptAssembly: SystemPromptAssembly,
         contextBoundary: EventRef, sessionCursor: JournalCursor, workCursor: JournalCursor,
+        providerUsage: ProviderUsageAggregate,
         coverage: RecoveryCoverage, caveats: [String] = []
     ) {
         self.pinnedMessages = pinnedMessages
@@ -41,6 +44,7 @@ public struct NativeColdResumeResult: Sendable {
         self.contextBoundary = contextBoundary
         self.sessionCursor = sessionCursor
         self.workCursor = workCursor
+        self.providerUsage = providerUsage
         self.coverage = coverage
         self.caveats = caveats
     }
@@ -233,6 +237,20 @@ public enum NativeColdResume {
                 throw NativeColdResumeError.workStateUnavailable(
                     "the context provider action has no terminal outcome")
             }
+            guard let admission = crossing.providerAdmission,
+                  let settlement = crossing.providerSettlement else {
+                throw NativeColdResumeError.workStateUnavailable(
+                    "the context provider action has no accounting settlement")
+            }
+            do {
+                try admission.validate(
+                    contextModelID: manifest.modelID, targetModel: crossing.target)
+                try settlement.validate(admission: admission, kind: crossingKind, state: crossing.state)
+                try workSnapshot.providerUsage.validate()
+            } catch {
+                throw NativeColdResumeError.workStateUnavailable(
+                    "the context provider accounting does not match its admission")
+            }
             if crossing.state == .succeeded,
                !activeSuffixEvents.contains(where: {
                    $0.type == TimelineEventType.messageCommitted
@@ -268,6 +286,7 @@ public enum NativeColdResume {
             contextBoundary: boundary,
             sessionCursor: expectedSessionCursor,
             workCursor: expectedWorkCursor,
+            providerUsage: workSnapshot.providerUsage,
             coverage: RecoveryCoverage(
                 operation: .coldResume,
                 planes: [

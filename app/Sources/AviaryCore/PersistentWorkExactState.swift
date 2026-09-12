@@ -10,7 +10,7 @@ import Foundation
 /// event payload is never copied into this map; child state is classified and recovery caveats are
 /// represented by count/digest metadata.
 public struct PersistentWorkExactState: Sendable {
-    public static let schemaVersion = 6
+    public static let schemaVersion = 7
     public static let maximumIdentityBytes = 1_024
     /// One mutation may need to authenticate every active attachment in the affected Session.
     /// WorkService bounds those relationships to 64, leaving room for the event's other typed
@@ -30,7 +30,7 @@ public struct PersistentWorkExactState: Sendable {
             case .missingScalar: return "Persistent Work exact state has no scalar continuation."
             case .invalidRecord: return "Persistent Work exact state contains an invalid typed record."
             case .duplicateEvent(let id): return "Persistent Work event was already observed: \(id)."
-            case .unsupportedEvent(let type): return "Persistent Work event family is not exact in v6: \(type)."
+            case .unsupportedEvent(let type): return "Persistent Work event family is not exact in v7: \(type)."
             case .tooManyPrefetchedSlots: return "Persistent Work exact-state prefetch exceeds its bound."
             case .map(let error): return error.localizedDescription
             }
@@ -57,7 +57,7 @@ public struct PersistentWorkExactState: Sendable {
         }
     }
 
-    private static let scalarKey = "work-exact-v6/scalar"
+    private static let scalarKey = "work-exact-v7/scalar"
     private let map: PersistentProjectionRadixMap
     private var root: PersistentProjectionRadixMap.Root?
     private var lastSnapshot: WorkSnapshot
@@ -193,7 +193,7 @@ public struct PersistentWorkExactState: Sendable {
 
     private static func slotKey(kind: String, identity: String) -> String {
         let material = "work-exact-slot-v1\0\(kind.count):\(kind)\0\(identity.utf8.count):\(identity)"
-        return "work-exact-v6/\(kind)/" + AviarySHA256.hash(data: Data(material.utf8)).description
+        return "work-exact-v7/\(kind)/" + AviarySHA256.hash(data: Data(material.utf8)).description
     }
 
     private static func validateIncomingIdentities(_ event: TimelineEvent) throws {
@@ -209,6 +209,18 @@ public struct PersistentWorkExactState: Sendable {
         guard values.allSatisfy({ !$0.isEmpty && $0.utf8.count <= maximumIdentityBytes }) else {
             throw Error.invalidRecord
         }
+    }
+
+    private static func validStoredAction(_ action: WorkActionSnapshot) -> Bool {
+        guard !action.action.actionID.isEmpty,
+              action.action.actionID.utf8.count <= maximumIdentityBytes,
+              action.state != .unknown,
+              action.hasValidProviderEvidence else { return false }
+        return true
+    }
+
+    private static func isActiveActionState(_ state: ActionExecutionState) -> Bool {
+        state == .queued || state == .running || state == .cancelRequested
     }
 
     private static func validStoredAgentHandle(_ handle: WorkAgentHandleSnapshot) -> Bool {
@@ -278,6 +290,7 @@ public struct PersistentWorkExactState: Sendable {
         value.activeRunSession = scalar.activeRunSession
         value.activeRunSessionAttachment = scalar.activeRunSessionAttachment
         value.modelID = scalar.modelID; value.activeTurn = scalar.activeTurn
+        value.providerUsage = scalar.providerUsage
         value.lastHostSequence = scalar.lastHostSequence; value.unknownDomains = scalar.unknownDomains
         value.lastEventID = scalar.lastEventID; value.lastSequence = scalar.lastSequence
         value.causalOrderValid = scalar.causalOrderValid; value.structuralIntegrityValid = scalar.structuralIntegrityValid
@@ -302,7 +315,8 @@ public struct PersistentWorkExactState: Sendable {
         let work: WorkRef?; let workHost: WorkHostRef?; let lifecycle: WorkLifecycle; let execution: WorkExecution
         let activeRun: RunRef?; let activeRunSession: SessionRef?
         let activeRunSessionAttachment: SessionAttachmentRef?
-        let modelID: String?; let activeTurn: TurnRef?; let lastHostSequence: Int?
+        let modelID: String?; let activeTurn: TurnRef?; let providerUsage: ProviderUsageAggregate
+        let lastHostSequence: Int?
         let unknownDomains: Set<TimelineDomain>; let lastEventID: String?; let lastSequence: Int
         let causalOrderValid: Bool; let structuralIntegrityValid: Bool; let semanticProjectionValid: Bool
         let seenEventCount: Int; let activeActionCount: Int; let outstandingHandleCount: Int
@@ -337,6 +351,7 @@ public struct PersistentWorkExactState: Sendable {
             activeRun = scalar.activeRun; activeRunSession = scalar.activeRunSession
             activeRunSessionAttachment = scalar.activeRunSessionAttachment
             modelID = scalar.modelID; activeTurn = scalar.activeTurn
+            providerUsage = scalar.providerUsage
             lastHostSequence = scalar.lastHostSequence; unknownDomains = scalar.unknownDomains
             lastEventID = scalar.lastEventID; lastSequence = scalar.lastSequence
             causalOrderValid = scalar.causalOrderValid; structuralIntegrityValid = scalar.structuralIntegrityValid
@@ -377,6 +392,13 @@ public struct PersistentWorkExactState: Sendable {
                     .compactMap({ $0 })
                     .allSatisfy({ !$0.isEmpty && $0.utf8.count <= PersistentWorkExactState.maximumIdentityBytes })
             else { throw Error.invalidRecord }
+            do { try providerUsage.validate() }
+            catch { throw Error.invalidRecord }
+            guard providerUsage.started <= seenEventCount,
+                  providerUsage.settled <= providerUsage.started,
+                  providerUsage.started - providerUsage.settled <= activeActionCount else {
+                throw Error.invalidRecord
+            }
         }
     }
 
@@ -453,7 +475,14 @@ public struct PersistentWorkExactState: Sendable {
             if let prior = event.previousEventID, let record: SeenRecord = try load(slotKey(kind: "seen", identity: prior)) { guard record.kind == "seen", record.scope == map.journal.stableKey, record.eventID == prior, record.sequence > 0 else { throw Error.invalidRecord }; seenRecords[record.eventID] = record }
             if let cursor = event.command?.causalCursor, let prior = cursor.eventID, let record: SeenRecord = try load(slotKey(kind: "seen", identity: prior)) { guard record.kind == "seen", record.scope == map.journal.stableKey, record.eventID == prior, record.sequence == cursor.sequence else { throw Error.invalidRecord }; seenRecords[record.eventID] = record }
             if let run = event.run, let record: RunRecord = try load(slotKey(kind: "run", identity: run.runID)) { guard record.kind == "run", record.scope == map.journal.stableKey, record.run.runID == run.runID else { throw Error.invalidRecord }; runs[run.runID] = record }
-            if let action = event.action, let record: ActionRecord = try load(slotKey(kind: "action", identity: action.actionID)) { guard record.kind == "action", record.scope == map.journal.stableKey, record.action.action.actionID == action.actionID else { throw Error.invalidRecord }; actions[action.actionID] = record }
+            if let action = event.action, let record: ActionRecord = try load(slotKey(kind: "action", identity: action.actionID)) {
+                guard record.kind == "action", record.scope == map.journal.stableKey,
+                      record.action.action.actionID == action.actionID,
+                      PersistentWorkExactState.validStoredAction(record.action),
+                      record.isActive == PersistentWorkExactState.isActiveActionState(
+                        record.action.state) else { throw Error.invalidRecord }
+                actions[action.actionID] = record
+            }
             if let handle = event.handle, let record: HandleRecord = try load(slotKey(kind: "handle", identity: handle.handleID)) { guard record.kind == "handle", record.scope == map.journal.stableKey, record.handle.handle.handleID == handle.handleID else { throw Error.invalidRecord }; handles[handle.handleID] = record }
             if let handle = event.handle,
                let record: AgentHandleRecord = try load(slotKey(
@@ -658,6 +687,7 @@ public struct PersistentWorkExactState: Sendable {
             continuation.activeRun = scalar.activeRun; continuation.modelID = scalar.modelID; continuation.activeTurn = scalar.activeTurn
             continuation.activeRunSession = scalar.activeRunSession
             continuation.activeRunSessionAttachment = scalar.activeRunSessionAttachment
+            continuation.providerUsage = scalar.providerUsage
             continuation.lastHostSequence = scalar.lastHostSequence; continuation.unknownDomains = scalar.unknownDomains
             continuation.lastEventID = scalar.lastEventID; continuation.lastSequence = scalar.lastSequence
             continuation.causalOrderValid = scalar.causalOrderValid; continuation.structuralIntegrityValid = scalar.structuralIntegrityValid
@@ -827,6 +857,7 @@ public struct PersistentWorkExactState: Sendable {
             value.activeRunSession = scalar.activeRunSession
             value.activeRunSessionAttachment = scalar.activeRunSessionAttachment
             value.modelID = scalar.modelID; value.activeTurn = scalar.activeTurn
+            value.providerUsage = scalar.providerUsage
             value.lastHostSequence = scalar.lastHostSequence; value.unknownDomains = scalar.unknownDomains
             value.lastEventID = scalar.lastEventID; value.lastSequence = scalar.lastSequence
             value.causalOrderValid = scalar.causalOrderValid

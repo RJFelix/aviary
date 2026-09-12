@@ -1555,6 +1555,12 @@ public struct WorkActionSnapshot: Codable, Hashable, Sendable {
     /// are responsible for deciding whether a value is safe to record.
     public let metadata: [String: JSONValue]
     public let metadataWasTruncated: Bool
+    /// Immutable provider purpose and pinned rates admitted before a provider effect starts.
+    /// This is absent for every non-provider action kind.
+    public let providerAdmission: ProviderAdmission?
+    /// The provider's terminal report/finality observation. This is written exactly once by the
+    /// canonical terminal action event and is absent while the action is nonterminal.
+    public let providerSettlement: ProviderSettlement?
     public var state: ActionExecutionState
     public var failureKind: ActionFailureKind?
     public var retrySafety: ActionRetrySafety?
@@ -1573,6 +1579,8 @@ public struct WorkActionSnapshot: Codable, Hashable, Sendable {
         scope: String? = nil,
         metadata: [String: JSONValue] = [:],
         metadataWasTruncated: Bool = false,
+        providerAdmission: ProviderAdmission? = nil,
+        providerSettlement: ProviderSettlement? = nil,
         intentEvent: WorkActionObservation? = nil,
         startedEvent: WorkActionObservation? = nil,
         outcomeEvent: WorkActionObservation? = nil
@@ -1588,6 +1596,8 @@ public struct WorkActionSnapshot: Codable, Hashable, Sendable {
             || intent.map { Self.boundedText($0) != $0 } ?? false
             || target.map { Self.boundedText($0) != $0 } ?? false
             || scope.map { Self.boundedText($0) != $0 } ?? false
+        self.providerAdmission = providerAdmission
+        self.providerSettlement = providerSettlement
         self.state = state
         self.failureKind = failureKind
         self.retrySafety = retrySafety
@@ -1602,10 +1612,18 @@ public struct WorkActionSnapshot: Codable, Hashable, Sendable {
         let fields = Self.fields(from: event)
         guard let action = event.action, !action.actionID.isEmpty,
               let kind = fields.kind else { return nil }
+        let providerAdmission: ProviderAdmission?
+        if let value = event.payload["provider_admission"] {
+            guard let decoded = try? ProviderAdmission(timelineValue: value) else { return nil }
+            providerAdmission = decoded
+        } else {
+            providerAdmission = nil
+        }
         self.init(
             action: action, state: .proposed,
             kind: kind, intent: fields.intent, target: fields.target, scope: fields.scope,
             metadata: fields.metadata, metadataWasTruncated: fields.metadataWasTruncated,
+            providerAdmission: providerAdmission,
             intentEvent: WorkActionObservation(event))
     }
 
@@ -1615,6 +1633,7 @@ public struct WorkActionSnapshot: Codable, Hashable, Sendable {
             action: action, state: state, failureKind: failureKind, retrySafety: retrySafety,
             kind: kind, intent: intent, target: target, scope: scope, metadata: metadata,
             metadataWasTruncated: metadataWasTruncated,
+            providerAdmission: providerAdmission, providerSettlement: providerSettlement,
             intentEvent: intentEvent, startedEvent: WorkActionObservation(event),
             outcomeEvent: outcomeEvent)
     }
@@ -1622,14 +1641,34 @@ public struct WorkActionSnapshot: Codable, Hashable, Sendable {
     /// Return a copy with the canonical outcome observation while retaining intent/start facts.
     public func withOutcome(
         _ event: TimelineEvent, state: ActionExecutionState,
-        failureKind: ActionFailureKind?, retrySafety: ActionRetrySafety?
+        failureKind: ActionFailureKind?, retrySafety: ActionRetrySafety?,
+        providerSettlement: ProviderSettlement?
     ) -> WorkActionSnapshot {
         return WorkActionSnapshot(
             action: action, state: state, failureKind: failureKind, retrySafety: retrySafety,
             kind: kind, intent: intent, target: target, scope: scope, metadata: metadata,
             metadataWasTruncated: metadataWasTruncated,
+            providerAdmission: providerAdmission, providerSettlement: providerSettlement,
             intentEvent: intentEvent, startedEvent: startedEvent,
             outcomeEvent: WorkActionObservation(event))
+    }
+
+    /// Strict current-schema provider evidence. Older untyped provider actions are intentionally
+    /// invalid rather than interpreted through a parallel compatibility path.
+    internal var hasValidProviderEvidence: Bool {
+        switch kind {
+        case .provider, .compactionProvider:
+            guard let providerAdmission,
+                  (try? providerAdmission.validate(kind: kind)) != nil else { return false }
+            if state.isTerminal {
+                guard let providerSettlement else { return false }
+                return (try? providerSettlement.validate(
+                    admission: providerAdmission, kind: kind, state: state)) != nil
+            }
+            return providerSettlement == nil
+        default:
+            return providerAdmission == nil && providerSettlement == nil
+        }
     }
 
     private struct Fields {
@@ -1740,6 +1779,8 @@ public struct WorkActionSnapshot: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case action, kind, intent, target, scope, metadata
         case metadataWasTruncated = "metadata_was_truncated"
+        case providerAdmission = "provider_admission"
+        case providerSettlement = "provider_settlement"
         case state, failureKind = "failure_kind", retrySafety = "retry_safety"
         case intentEvent = "intent_event"
         case startedEvent = "started_event"
@@ -1759,6 +1800,10 @@ public struct WorkActionSnapshot: Codable, Hashable, Sendable {
             scope: try container.decodeIfPresent(String.self, forKey: .scope),
             metadata: try container.decodeIfPresent([String: JSONValue].self, forKey: .metadata) ?? [:],
             metadataWasTruncated: try container.decodeIfPresent(Bool.self, forKey: .metadataWasTruncated) ?? false,
+            providerAdmission: try container.decodeIfPresent(
+                ProviderAdmission.self, forKey: .providerAdmission),
+            providerSettlement: try container.decodeIfPresent(
+                ProviderSettlement.self, forKey: .providerSettlement),
             intentEvent: try container.decodeIfPresent(WorkActionObservation.self, forKey: .intentEvent),
             startedEvent: try container.decodeIfPresent(WorkActionObservation.self, forKey: .startedEvent),
             outcomeEvent: try container.decodeIfPresent(WorkActionObservation.self, forKey: .outcomeEvent))
@@ -1773,6 +1818,8 @@ public struct WorkActionSnapshot: Codable, Hashable, Sendable {
         try container.encodeIfPresent(scope, forKey: .scope)
         try container.encode(metadata, forKey: .metadata)
         try container.encode(metadataWasTruncated, forKey: .metadataWasTruncated)
+        try container.encodeIfPresent(providerAdmission, forKey: .providerAdmission)
+        try container.encodeIfPresent(providerSettlement, forKey: .providerSettlement)
         try container.encode(state, forKey: .state)
         try container.encodeIfPresent(failureKind, forKey: .failureKind)
         try container.encodeIfPresent(retrySafety, forKey: .retrySafety)
@@ -2162,6 +2209,9 @@ public struct WorkSnapshot: Codable, Hashable, Sendable {
     public var activeTurn: TurnRef?
     public var activeActionIDs: Set<String> = []
     public var actions: [String: WorkActionSnapshot] = [:]
+    /// Fixed, Work-lifetime provider accounting projection. Unresolved dimensions expose missing
+    /// terminal truth but do not represent live execution and therefore never gate Run End.
+    public var providerUsage = ProviderUsageAggregate()
     public var handles: [String: WorkHandleSnapshot] = [:]
     /// Work-owned agent-only children. This is deliberately separate from the legacy Run-owned
     /// Handle map above because the two lifetimes have different Run and Work terminal gates.
@@ -2187,6 +2237,119 @@ public struct WorkSnapshot: Codable, Hashable, Sendable {
     public var corruptionReasons: [String] = []
 
     public init() {}
+}
+
+internal enum CompleteProviderUsageProjectionError: Error {
+    case invalidActionEvidence
+    case invalidSequence
+    case aggregateMismatch
+}
+
+/// One ordered mutation of the fixed Work-lifetime provider aggregate. These steps are rebuilt
+/// only at boundaries which already prove they hold the complete action table (a full Work
+/// snapshot or a bounded head whose action coverage is complete).
+internal enum CompleteProviderUsageProjectionStep {
+    case started(sequence: Int, actionID: String)
+    case settled(sequence: Int, actionID: String, settlement: ProviderSettlement)
+
+    fileprivate var sequence: Int {
+        switch self {
+        case .started(let sequence, _), .settled(let sequence, _, _): return sequence
+        }
+    }
+
+    fileprivate var actionID: String {
+        switch self {
+        case .started(_, let actionID), .settled(_, let actionID, _): return actionID
+        }
+    }
+
+    fileprivate var order: Int {
+        switch self {
+        case .started: return 0
+        case .settled: return 1
+        }
+    }
+}
+
+internal func rebuildCompleteProviderUsage(
+    from steps: [CompleteProviderUsageProjectionStep]
+) throws -> ProviderUsageAggregate {
+    let ordered = steps.sorted {
+        if $0.sequence != $1.sequence { return $0.sequence < $1.sequence }
+        if $0.order != $1.order { return $0.order < $1.order }
+        return $0.actionID < $1.actionID
+    }
+    guard ordered.allSatisfy({ $0.sequence > 0 }),
+          Set(ordered.map(\.sequence)).count == ordered.count else {
+        throw CompleteProviderUsageProjectionError.invalidSequence
+    }
+    var aggregate = ProviderUsageAggregate()
+    for step in ordered {
+        switch step {
+        case .started:
+            try aggregate.recordStarted()
+        case .settled(_, _, let settlement):
+            try aggregate.recordSettlement(settlement)
+        }
+    }
+    return aggregate
+}
+
+internal extension WorkSnapshot {
+    /// Authenticate the fixed aggregate against every retained action. Call only when `actions`
+    /// is the complete canonical action table; event-local exact-state snapshots are intentionally
+    /// partial and must not use this check.
+    func validateProviderUsageAgainstCompleteActions() throws {
+        try providerUsage.validate()
+        var steps: [CompleteProviderUsageProjectionStep] = []
+        for action in actions.values {
+            guard action.hasValidProviderEvidence else {
+                throw CompleteProviderUsageProjectionError.invalidActionEvidence
+            }
+            guard action.kind == .provider || action.kind == .compactionProvider else { continue }
+            guard let intent = action.intentEvent,
+                  let intentSequence = canonicalSequence(for: intent) else {
+                throw CompleteProviderUsageProjectionError.invalidActionEvidence
+            }
+            if action.state == .proposed {
+                guard action.startedEvent == nil, action.outcomeEvent == nil else {
+                    throw CompleteProviderUsageProjectionError.invalidActionEvidence
+                }
+                continue
+            }
+            guard let started = action.startedEvent,
+                  let startedSequence = canonicalSequence(for: started) else {
+                throw CompleteProviderUsageProjectionError.invalidActionEvidence
+            }
+            if intentSequence >= startedSequence {
+                throw CompleteProviderUsageProjectionError.invalidSequence
+            }
+            steps.append(.started(sequence: startedSequence, actionID: action.action.actionID))
+            if action.state.isTerminal {
+                guard let settlement = action.providerSettlement,
+                      let outcome = action.outcomeEvent,
+                      let outcomeSequence = canonicalSequence(for: outcome),
+                      startedSequence < outcomeSequence else {
+                    throw CompleteProviderUsageProjectionError.invalidActionEvidence
+                }
+                steps.append(.settled(
+                    sequence: outcomeSequence, actionID: action.action.actionID,
+                    settlement: settlement))
+            }
+        }
+        guard try rebuildCompleteProviderUsage(from: steps) == providerUsage else {
+            throw CompleteProviderUsageProjectionError.aggregateMismatch
+        }
+    }
+
+    private func canonicalSequence(for observation: WorkActionObservation) -> Int? {
+        guard observation.sourceEvent.journal == journal,
+              let sequence = observation.sequence,
+              sequence > 0, sequence <= lastSequence,
+              eventSequences[observation.sourceEvent.eventID] == sequence else { return nil }
+        return sequence
+    }
 }
 
 public struct SessionMessageSnapshot: Codable, Hashable, Sendable {

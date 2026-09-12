@@ -1277,13 +1277,15 @@ public actor Agent {
 
     private func finishNativeAction(
         _ permit: EffectPermit?, state: ActionExecutionState,
-        retrySafety: ActionRetrySafety, failureKind: ActionFailureKind? = nil
+        retrySafety: ActionRetrySafety, failureKind: ActionFailureKind? = nil,
+        providerSettlement: ProviderSettlement? = nil
     ) async -> Bool {
         guard let nativeJournal else { return true }
         guard let permit else { return false }
         do {
             let commit = try await nativeJournal.finishAction(
-                permit, state: state, retrySafety: retrySafety, failureKind: failureKind)
+                permit, state: state, retrySafety: retrySafety, failureKind: failureKind,
+                providerSettlement: providerSettlement)
             var attributes: [String: AviaryTraceValue] = AviaryTelemetry
                 .canonicalReferenceAttributes(commit, role: .event)
                 .merging(
@@ -1314,6 +1316,26 @@ public actor Agent {
             latchNativeJournalFailure("the \(permit.kind.rawValue) action outcome", error)
             return false
         }
+    }
+
+    /// Settle a provider crossing once its stream has reached a terminal observation.  Usage is
+    /// added only after the canonical action outcome (when present) accepts the same pinned
+    /// admission; a failed or canceled crossing therefore contributes an explicitly unconfirmed
+    /// report exactly once, without implying that the provider completed successfully.
+    private func finishProviderAction(
+        _ permit: EffectPermit?, state: ActionExecutionState,
+        retrySafety: ActionRetrySafety, failureKind: ActionFailureKind?,
+        admission: ProviderAdmission, report: ProviderUsage.RawReport?,
+        finality: ProviderUsage.ReportFinality
+    ) async -> Bool {
+        let settlement = ProviderSettlement(
+            admission: admission, report: report, finality: finality)
+        let recorded = await finishNativeAction(
+            permit, state: state, retrySafety: retrySafety, failureKind: failureKind,
+            providerSettlement: settlement)
+        guard recorded else { return false }
+        totalUsage += settlement.usage
+        return true
     }
 
     /// Bracket one admitted user instruction with the canonical turn lifecycle. The helper
@@ -1491,6 +1513,7 @@ public actor Agent {
         purpose: String,
         kind: ActionKind,
         intent: String,
+        admission: ProviderAdmission,
         assembly: SystemPromptAssembly? = nil, targetModel: String
     ) async -> EffectPermit? {
         guard nativeJournal != nil else { return nil }
@@ -1503,7 +1526,7 @@ public actor Agent {
         ) {
             let result = await self.prepareModelCrossingBody(
                 for: request, purpose: purpose, kind: kind, intent: intent,
-                assembly: assembly, targetModel: targetModel)
+                admission: admission, assembly: assembly, targetModel: targetModel)
             if let outcome = result.outcome { AviaryTelemetry.outcome(outcome) }
             return result
         }
@@ -1518,6 +1541,7 @@ public actor Agent {
         purpose: String,
         kind: ActionKind,
         intent: String,
+        admission: ProviderAdmission,
         assembly: SystemPromptAssembly? = nil, targetModel: String
     ) async -> (permit: EffectPermit?, outcome: String?) {
         guard let nativeJournal else { return (nil, "unavailable") }
@@ -1687,7 +1711,7 @@ public actor Agent {
         }
         do {
             let permit = try await nativeJournal.prepareModelCrossing(
-                manifest: manifest, kind: kind, intent: intent,
+                manifest: manifest, admission: admission, kind: kind, intent: intent,
                 target: targetModel)
             let actionAttributes = [
                 "aviary.action.id": .string(
@@ -1921,9 +1945,6 @@ public actor Agent {
                 await recordOutcome(.failed, detail: detail)
                 emit(.failed(detail))
                 return .failed(detail)
-            }
-            if let usage = turn.usage {
-                totalUsage += usage
             }
             if let contextTokens = turn.contextTokens { lastInputTokens = contextTokens }
             emit(.turnFinished(
@@ -2229,15 +2250,21 @@ public actor Agent {
                     + String(transcriptText.prefix(60_000))),
             ])
 
+        let providerAdmission = ProviderAdmission(
+            purpose: .compaction, rates: ProviderUsage.RateSnapshot(model: crossingModel))
+
         var summary = ""
         let permit = await prepareModelCrossing(
             for: ask, purpose: "compaction", kind: .compactionProvider,
             intent: "Compact the conversation with the provider",
-            assembly: compactionAssembly, targetModel: crossingModel.qualifiedID)
+            admission: providerAdmission, assembly: compactionAssembly,
+            targetModel: crossingModel.qualifiedID)
         do { try requireNativePermit(permit, for: "compaction provider") }
         catch { return "indeterminate" }
         var compactionProviderSucceeded = false
         var compactionProviderFailed = false
+        var latestReport: ProviderUsage.RawReport?
+        var doneObserved = false
         do {
             try await AviaryTelemetry.withSpan(
                 "aviary.agent.provider", kind: .client,
@@ -2245,11 +2272,11 @@ public actor Agent {
                     var measurements = AviaryProviderTelemetry()
                     defer { measurements.record(model: crossingModel) }
                     do {
-                        var doneObserved = false
                         for try await event in crossingProvider.stream(ask) {
                             try Task.checkCancellation()
                             measurements.observe(event)
                             if case .textDelta(let t) = event { summary += t }
+                            if case .usage(let report) = event { latestReport = report }
                             if case .done = event { doneObserved = true }
                         }
                         try Task.checkCancellation()
@@ -2261,10 +2288,12 @@ public actor Agent {
                             "aviary.agent.exception",
                             attributes: ["error.type": .string(
                                 error is CancellationError ? "cancellation" : "provider")])
-                        let recorded = await finishNativeAction(
+                        let recorded = await finishProviderAction(
                             permit, state: error is CancellationError ? .canceled : .failed,
                             retrySafety: .unknown,
-                            failureKind: error is CancellationError ? .cancellation : .infrastructure)
+                            failureKind: error is CancellationError ? .cancellation : .infrastructure,
+                            admission: providerAdmission, report: latestReport,
+                            finality: doneObserved ? .finalReport : .unconfirmed)
                         guard recorded else {
                             throw NativeJournalFailure(
                                 detail: journalFailureDetail
@@ -2274,9 +2303,11 @@ public actor Agent {
                         throw error
                     }
                     guard !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                        guard await finishNativeAction(
+                        guard await finishProviderAction(
                             permit, state: .failed, retrySafety: .unsafe,
-                            failureKind: .task) else {
+                            failureKind: .task, admission: providerAdmission,
+                            report: latestReport,
+                            finality: doneObserved ? .finalReport : .unconfirmed) else {
                             throw NativeJournalFailure(
                                 detail: journalFailureDetail
                                     ?? "The compaction outcome could not be recorded.")
@@ -2284,8 +2315,10 @@ public actor Agent {
                         AviaryTelemetry.outcome("failed")
                         return
                     }
-                    guard await finishNativeAction(
-                        permit, state: .succeeded, retrySafety: .unsafe) else {
+                    guard await finishProviderAction(
+                        permit, state: .succeeded, retrySafety: .unsafe,
+                        failureKind: nil, admission: providerAdmission,
+                        report: latestReport, finality: .finalReport) else {
                         throw NativeJournalFailure(
                             detail: journalFailureDetail
                                 ?? "The compaction outcome could not be recorded.")
@@ -2423,13 +2456,18 @@ public actor Agent {
             maxTokens: config.maxTokens,
             reasoningEffort: config.reasoningEffort)
 
+        let providerAdmission = ProviderAdmission(
+            purpose: .normal, rates: ProviderUsage.RateSnapshot(model: crossingModel))
+
         let permit = await prepareModelCrossing(
             for: request, purpose: "model", kind: .provider,
-            intent: "Request the next agent response", assembly: requestAssembly,
+            intent: "Request the next agent response", admission: providerAdmission,
+            assembly: requestAssembly,
             targetModel: crossingModel.qualifiedID)
         try requireNativePermit(permit, for: "provider")
         var turn = Turn()
         var latestReport: ProviderUsage.RawReport?
+        var doneObserved = false
         turn.usage = Usage(finality: .unconfirmed,
             accounted: ProviderUsage.account(report: nil, model: crossingModel))
         do {
@@ -2439,7 +2477,6 @@ public actor Agent {
                     var measurements = AviaryProviderTelemetry()
                     defer { measurements.record(model: crossingModel) }
                     do {
-                        var doneObserved = false
                         for try await event in crossingProvider.stream(request) {
                             try Task.checkCancellation()
                             measurements.observe(event)
@@ -2475,9 +2512,11 @@ public actor Agent {
                             "aviary.agent.exception",
                             attributes: ["error.type": .string(
                                 error is CancellationError ? "cancellation" : "provider")])
-                        let recorded = await finishNativeAction(
+                        let recorded = await finishProviderAction(
                             permit, state: .indeterminateEffect,
-                            retrySafety: .unsafe, failureKind: .indeterminateEffect)
+                            retrySafety: .unsafe, failureKind: .indeterminateEffect,
+                            admission: providerAdmission, report: latestReport,
+                            finality: doneObserved ? .finalReport : .unconfirmed)
                         guard recorded else {
                             throw NativeJournalFailure(
                                 detail: journalFailureDetail
@@ -2486,8 +2525,10 @@ public actor Agent {
                         AviaryTelemetry.outcome("indeterminate")
                         throw error
                     }
-                    guard await finishNativeAction(
-                        permit, state: .succeeded, retrySafety: .unsafe) else {
+                    guard await finishProviderAction(
+                        permit, state: .succeeded, retrySafety: .unsafe,
+                        failureKind: nil, admission: providerAdmission,
+                        report: latestReport, finality: .finalReport) else {
                         throw NativeJournalFailure(
                             detail: journalFailureDetail
                                 ?? "The provider outcome could not be recorded.")

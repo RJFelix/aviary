@@ -271,6 +271,7 @@ func test_boundedProjectionRetainsUnsettledRowsBeforeResolvedRows() throws {
             id: "w7", sequence: 7, type: TimelineEventType.actionIntent,
             payload: .object([
                 "kind": .string(ActionKind.provider.rawValue),
+                "provider_admission": fixtureProviderAdmission().timelineValue,
                 "intent": .string("old"), "state": .string(ActionExecutionState.proposed.rawValue)
             ]), run: run, action: oldAction),
         boundedProjectionWorkEvent(
@@ -281,12 +282,15 @@ func test_boundedProjectionRetainsUnsettledRowsBeforeResolvedRows() throws {
             id: "w9", sequence: 9, type: TimelineEventType.actionOutcome,
             payload: .object([
                 "state": .string(ActionExecutionState.succeeded.rawValue),
+                "provider_settlement": ProviderSettlement(
+                    admission: fixtureProviderAdmission(), report: nil, finality: .finalReport).timelineValue,
                 "retry_safety": .string(ActionRetrySafety.safe.rawValue)
             ]), run: run, action: oldAction),
         boundedProjectionWorkEvent(
             id: "w10", sequence: 10, type: TimelineEventType.actionIntent,
             payload: .object([
                 "kind": .string(ActionKind.provider.rawValue),
+                "provider_admission": fixtureProviderAdmission().timelineValue,
                 "intent": .string("active"), "state": .string(ActionExecutionState.proposed.rawValue)
             ]), run: run, action: activeAction),
         boundedProjectionWorkEvent(

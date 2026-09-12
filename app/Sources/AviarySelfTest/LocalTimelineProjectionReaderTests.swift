@@ -401,7 +401,7 @@ func testLocalTimelineProjectionReaderContinuesStatefulActionFromExactRoot() thr
             path: "work-exact-state", directoryHint: .isDirectory),
         namespaceID: grown.snapshot.namespaceID, journal: localReaderWorkJournal,
         sourceGeneration: grown.snapshot.source.sourceGeneration,
-        mapKind: "work-exact-v6")
+        mapKind: "work-exact-v7")
     let state = try PersistentWorkExactState(map: map, root: checkpoint.roots[0].root)
     let outcome = localReaderDetailedEvent(
         sequence: 6, type: TimelineEventType.actionOutcome, previous: "w-5",
@@ -877,7 +877,7 @@ func testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState() thro
     XCTAssertEqual(coldCheckpoint.prefixByteCount, cold.snapshot.source.prefixByteCount)
     XCTAssertEqual(coldCheckpoint.prefixDigest, cold.snapshot.source.prefixDigest)
     XCTAssertEqual(coldCheckpoint.roots.count, 1)
-    XCTAssertEqual(coldCheckpoint.roots[0].mapKind, "work-exact-v6")
+    XCTAssertEqual(coldCheckpoint.roots[0].mapKind, "work-exact-v7")
     XCTAssertEqual(coldCheckpoint.roots[0].namespaceID, cold.snapshot.namespaceID)
 
     let fourth = localReaderWorkEvents(count: 1, start: 4)[0]
@@ -899,7 +899,7 @@ func testLocalTimelineProjectionReaderPublishesAndContinuesExactWorkState() thro
         namespaceID: grown.snapshot.namespaceID,
         journal: localReaderWorkJournal,
         sourceGeneration: grown.snapshot.source.sourceGeneration,
-        mapKind: "work-exact-v6")
+        mapKind: "work-exact-v7")
     try map.validate(root: grownCheckpoint.roots[0].root)
     let state = try PersistentWorkExactState(
         map: map, root: grownCheckpoint.roots[0].root)
@@ -998,12 +998,12 @@ func testLocalTimelineProjectionReaderRebuildsObsoleteWorkState(previousVersion:
     XCTAssertNotEqual(migrated.snapshot.namespaceID, legacyNamespace)
     let migratedCheckpoint = try XCTUnwrap(
         try legacyStore.loadExactStateCheckpoint(proving: migrated.source))
-    XCTAssertEqual(migratedCheckpoint.roots.first?.mapKind, "work-exact-v6")
+    XCTAssertEqual(migratedCheckpoint.roots.first?.mapKind, "work-exact-v7")
     let migratedMap = try PersistentProjectionRadixMap(
         directory: legacyDirectory.appending(
             path: "work-exact-state", directoryHint: .isDirectory),
         namespaceID: migrated.snapshot.namespaceID, journal: localReaderWorkJournal,
-        sourceGeneration: migrated.source.sourceGeneration, mapKind: "work-exact-v6")
+        sourceGeneration: migrated.source.sourceGeneration, mapKind: "work-exact-v7")
     var migratedState = try PersistentWorkExactState(
         map: migratedMap, root: try XCTUnwrap(migratedCheckpoint.roots.first).root)
     let delivered = TimelineEvent(
@@ -1149,5 +1149,8 @@ let casesLocalTimelineProjectionReader: [Case] = [
     }),
     ("phase5 local projection reader: v5 Work exact state rebuilds optional deadline", {
         try testLocalTimelineProjectionReaderRebuildsObsoleteWorkState(previousVersion: 5)
+    }),
+    ("phase3 local projection reader rebuilds pre-settlement Work cache", {
+        try testLocalTimelineProjectionReaderRebuildsObsoleteWorkState(previousVersion: 6)
     }),
 ]

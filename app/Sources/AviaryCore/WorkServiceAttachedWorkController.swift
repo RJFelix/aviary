@@ -3176,13 +3176,16 @@ public actor WorkServiceAttachedWorkController {
         return true
     }
 
-    private static func validCommittedWork(
+    internal static func validCommittedWork(
         _ snapshot: WorkSnapshot,
         cursor: JournalCursor,
         work: WorkRef,
         journal: JournalRef
     ) -> Bool {
-        snapshot.journal == journal
+        guard (try? snapshot.validateProviderUsageAgainstCompleteActions()) != nil else {
+            return false
+        }
+        return snapshot.journal == journal
             && snapshot.work == work
             && snapshot.workHost == WorkHostRef(work.workHostID)
             && snapshot.lastSequence == cursor.sequence

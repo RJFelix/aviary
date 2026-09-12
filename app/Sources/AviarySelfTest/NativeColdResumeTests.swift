@@ -110,15 +110,16 @@ private func makeNativeResumeFixture(
             "properties": .object(["code": .object(["type": .string("string")])]),
             "required": .array([.string("code")]),
         ]))]
-    let request = ChatRequest(model: "provider/native", messages: [
+    let request = ChatRequest(model: "model", messages: [
         .system("instructions"), .user("before the boundary"),
     ], tools: tools)
     let manifest = try nativeResumeManifest(request: request, bundle: bundle, store: store)
     let crossing = try await bundle.prepareModelCrossing(
-        manifest: manifest, action: ActionRef("context-provider-action"),
+        manifest: manifest, admission: fixtureProviderAdmission(kind: crossingKind), action: ActionRef("context-provider-action"),
         kind: crossingKind)
     _ = try await bundle.finishAction(
-        crossing, state: .succeeded, retrySafety: .unsafe)
+        crossing, state: .succeeded, retrySafety: .unsafe,
+        providerSettlement: fixtureProviderSettlement(crossing))
     if crossingKind == .compactionProvider {
         _ = try await bundle.commitCompaction(
             summary: "compacted", tokensBefore: 100, droppedMessages: 2)
@@ -246,7 +247,7 @@ func test_nativeColdResumeReconstructsProducerContextAndReportsCoverage() async 
         result.messages.map(\.plainText),
         ["before the boundary", "after the boundary"])
     XCTAssertEqual(result.tools, fixture.request.tools)
-    XCTAssertEqual(result.modelID, "provider/native")
+    XCTAssertEqual(result.modelID, "model")
     XCTAssertEqual(result.sessionCursor, fixture.sessionCursor)
     XCTAssertEqual(result.workCursor, fixture.workCursor)
     XCTAssertEqual(result.coverage.operation, .coldResume)
@@ -390,6 +391,62 @@ func test_nativeColdResumeRefusesTextOnlyOrDanglingStructuredAssistant() async t
 }
 
 func test_nativeColdResumeRefusesPostBoundaryActionAndCompactionCrossing() async throws {
+    // Cold resume must independently authenticate the provider terminal evidence; reducer-side
+    // validation is not a substitute for exercising this boundary with a replayed read.
+    let validSettlement = try await makeNativeResumeFixture()
+    defer { try? FileManager.default.removeItem(at: validSettlement.home.root) }
+    _ = try resumeNativeFixture(validSettlement)
+
+    let missingSettlement = try await makeNativeResumeFixture()
+    defer { try? FileManager.default.removeItem(at: missingSettlement.home.root) }
+    var missingRecords = missingSettlement.workRead.records
+    let missingIndex = try XCTUnwrap(missingRecords.lastIndex(where: {
+        $0.event.type == TimelineEventType.actionOutcome
+            && $0.event.action?.actionID == "context-provider-action"
+    }))
+    let missingRecord = missingRecords[missingIndex]
+    var missingPayload = try XCTUnwrap(missingRecord.event.payload.objectValue)
+    missingPayload.removeValue(forKey: "provider_settlement")
+    missingRecords[missingIndex] = TimelineJournalRecord(
+        event: cloneNativeResumeEvent(missingRecord.event, payload: .object(missingPayload)),
+        rawLineBytes: missingRecord.rawLineBytes,
+        byteStart: missingRecord.byteStart, byteEnd: missingRecord.byteEnd)
+    assertNativeResumeThrows({ try resumeNativeFixture(
+        missingSettlement,
+        workRead: TimelineJournalReadResult(records: missingRecords)) }) { error in
+        guard case .semanticallyInvalid(_, let reason) = error else {
+            return XCTFail("expected semantic missing-settlement refusal, got \(error)")
+        }
+        XCTAssertTrue(reason.contains("provider action outcome"))
+    }
+
+    let unconfirmedSettlement = try await makeNativeResumeFixture()
+    defer { try? FileManager.default.removeItem(at: unconfirmedSettlement.home.root) }
+    var unconfirmedRecords = unconfirmedSettlement.workRead.records
+    let unconfirmedIndex = try XCTUnwrap(unconfirmedRecords.lastIndex(where: {
+        $0.event.type == TimelineEventType.actionOutcome
+            && $0.event.action?.actionID == "context-provider-action"
+    }))
+    let unconfirmedRecord = unconfirmedRecords[unconfirmedIndex]
+    var unconfirmedPayload = try XCTUnwrap(unconfirmedRecord.event.payload.objectValue)
+    var settlementPayload = try XCTUnwrap(
+        unconfirmedPayload["provider_settlement"]?.objectValue)
+    settlementPayload["finality"] = .string(ProviderUsage.ReportFinality.unconfirmed.rawValue)
+    unconfirmedPayload["provider_settlement"] = .object(settlementPayload)
+    unconfirmedRecords[unconfirmedIndex] = TimelineJournalRecord(
+        event: cloneNativeResumeEvent(unconfirmedRecord.event, payload: .object(unconfirmedPayload)),
+        rawLineBytes: unconfirmedRecord.rawLineBytes,
+        byteStart: unconfirmedRecord.byteStart,
+        byteEnd: unconfirmedRecord.byteEnd)
+    assertNativeResumeThrows({ try resumeNativeFixture(
+        unconfirmedSettlement,
+        workRead: TimelineJournalReadResult(records: unconfirmedRecords)) }) { error in
+        guard case .semanticallyInvalid(_, let reason) = error else {
+            return XCTFail("expected semantic unconfirmed-settlement refusal, got \(error)")
+        }
+        XCTAssertTrue(reason.contains("provider action outcome"))
+    }
+
     let actionGap = try await makeNativeResumeFixture(postContextAction: .python)
     defer { try? FileManager.default.removeItem(at: actionGap.home.root) }
     assertNativeResumeThrows({ try resumeNativeFixture(actionGap) }) { error in

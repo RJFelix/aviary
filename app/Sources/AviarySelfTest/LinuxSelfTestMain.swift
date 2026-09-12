@@ -51,7 +51,9 @@ enum LinuxSelfTestMain {
     static func main() async {
         await Harness.run([
             ("Linux telemetry: SDK, Agent, transport and bounded collector", {
-                try await runLinuxCases(casesProviderUsage + casesProviderUsageWire + casesUsageCompleteness + casesProviderTerminal)
+                try await runLinuxCases(casesProviderUsage + casesProviderUsageWire + casesUsageCompleteness + casesProviderTerminal
+                    + casesProviderSettlement + casesProviderSettlementReducer
+                    + casesProviderSettlementAgent + casesProviderSettlementJournal)
                 try await runLinuxCases(casesAviaryTelemetry + casesAviaryTelemetryAgent
                     + casesAviaryTelemetryTransport + casesAviaryTelemetryHTTPClient
                     + casesAviaryTelemetryDelivery + casesRuntimeHostTelemetry + casesWorkAgentChildTelemetry)

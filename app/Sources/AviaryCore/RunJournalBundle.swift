@@ -38,6 +38,7 @@ public enum RunTurnOutcome: String, Codable, Hashable, Sendable {
 public enum ActionKind: String, Codable, CaseIterable, Hashable, Sendable {
     case provider
     case compactionProvider = "compaction_provider"
+    case providerSetup = "provider_setup"
     case python
     case mcp
     case runtime
@@ -70,15 +71,18 @@ public struct EffectPermit: Codable, Hashable, Sendable {
     public let intent: String
     public let intentCommit: TimelineJournalCommit
     public let startedCommit: TimelineJournalCommit
+    public let providerAdmission: ProviderAdmission?
 
     fileprivate init(action: ActionRef, kind: ActionKind, intent: String,
                      intentCommit: TimelineJournalCommit,
-                     startedCommit: TimelineJournalCommit) {
+                     startedCommit: TimelineJournalCommit,
+                     providerAdmission: ProviderAdmission? = nil) {
         self.action = action
         self.kind = kind
         self.intent = intent
         self.intentCommit = intentCommit
         self.startedCommit = startedCommit
+        self.providerAdmission = providerAdmission
     }
 }
 
@@ -2862,7 +2866,11 @@ public actor RunJournalBundle {
         metadata: [String: JSONValue] = [:]
     ) async throws -> EffectPermit {
         try await withSemanticGate {
-            try await self.beginActionLocked(action: action, kind: kind, intent: intent,
+            guard kind != .provider, kind != .compactionProvider else {
+                throw RunJournalBundleError.invalidOperation(
+                    "provider requests require a context crossing and pinned accounting admission")
+            }
+            return try await self.beginActionLocked(action: action, kind: kind, intent: intent,
                                               target: target, scope: scope, metadata: metadata)
         }
     }
@@ -2873,6 +2881,7 @@ public actor RunJournalBundle {
     /// provider request has settled.
     public func prepareModelCrossing(
         manifest: ContextManifest,
+        admission: ProviderAdmission,
         action: ActionRef = ActionRef(UUID().uuidString.lowercased()),
         kind: ActionKind,
         intent: String = "Request the next model response",
@@ -2885,10 +2894,14 @@ public actor RunJournalBundle {
                 throw RunJournalBundleError.invalidOperation(
                     "a model crossing requires a provider action kind")
             }
+            try admission.validate(kind: kind)
+            try admission.validate(
+                contextModelID: manifest.modelID, targetModel: target)
             let contextCommit = try await self.appendContextManifestLocked(manifest)
             return try await self.beginActionLocked(
                 action: action, kind: kind, intent: intent, target: target, scope: "run",
                 metadata: ["request_id": .string(manifest.requestID)],
+                providerAdmission: admission,
                 causedBy: contextCommit.eventRef,
                 links: [TimelineLink(kind: .derivedFrom, target: contextCommit.eventRef)])
         }
@@ -2901,6 +2914,7 @@ public actor RunJournalBundle {
         target: String?,
         scope: String?,
         metadata: [String: JSONValue],
+        providerAdmission: ProviderAdmission? = nil,
         causedBy: EventRef? = nil,
         links: [TimelineLink] = []
     ) async throws -> EffectPermit {
@@ -2924,6 +2938,7 @@ public actor RunJournalBundle {
         if let target { payload["target"] = .string(target) }
         if let scope { payload["scope"] = .string(scope) }
         if !metadata.isEmpty { payload["metadata"] = .object(metadata) }
+        if let providerAdmission { payload["provider_admission"] = providerAdmission.timelineValue }
         let intentCommit = try await appendWork(TimelineEventDraft(
             hostSequence: nextHostOrder(), causedByEventID: causedBy,
             work: work, workHost: workHost,
@@ -2940,7 +2955,8 @@ public actor RunJournalBundle {
                 "kind": .string(kind.rawValue)
             ])))
         let permit = EffectPermit(action: action, kind: kind, intent: intent,
-                                  intentCommit: intentCommit, startedCommit: startedCommit)
+                                  intentCommit: intentCommit, startedCommit: startedCommit,
+                                  providerAdmission: providerAdmission)
         seenActionIDs.insert(action.actionID)
         activeActionIDs.insert(action.actionID)
         permits[action.actionID] = permit
@@ -2951,11 +2967,13 @@ public actor RunJournalBundle {
         _ permit: EffectPermit,
         state: ActionExecutionState,
         retrySafety: ActionRetrySafety,
-        failureKind: ActionFailureKind? = nil
+        failureKind: ActionFailureKind? = nil,
+        providerSettlement: ProviderSettlement? = nil
     ) async throws -> TimelineJournalCommit {
         try await withSemanticGate(respectCancellation: false) {
             try await self.finishActionLocked(permit, state: state,
-                                               retrySafety: retrySafety, failureKind: failureKind)
+                                               retrySafety: retrySafety, failureKind: failureKind,
+                                               providerSettlement: providerSettlement)
         }
     }
 
@@ -2963,7 +2981,8 @@ public actor RunJournalBundle {
         _ permit: EffectPermit,
         state: ActionExecutionState,
         retrySafety: ActionRetrySafety,
-        failureKind: ActionFailureKind?
+        failureKind: ActionFailureKind?,
+        providerSettlement: ProviderSettlement?
     ) async throws -> TimelineJournalCommit {
         try ensureUsable()
         guard state.isTerminal else {
@@ -2977,12 +2996,21 @@ public actor RunJournalBundle {
             throw RunJournalBundleError.invalidOperation(
                 "failed, canceled, or indeterminate action outcomes require a failure kind")
         }
+        if let admission = permit.providerAdmission {
+            guard let providerSettlement else {
+                throw RunJournalBundleError.invalidOperation("provider outcome requires usage settlement")
+            }
+            try providerSettlement.validate(admission: admission, kind: permit.kind, state: state)
+        } else if providerSettlement != nil || permit.kind == .provider || permit.kind == .compactionProvider {
+            throw RunJournalBundleError.invalidOperation("provider settlement has no matching admission")
+        }
         var outcomePayload: [String: JSONValue] = [
             "state": .string(state.rawValue),
             "retry_safety": .string(retrySafety.rawValue),
             "kind": .string(permit.kind.rawValue)
         ]
         if let failureKind { outcomePayload["failure_kind"] = .string(failureKind.rawValue) }
+        if let providerSettlement { outcomePayload["provider_settlement"] = providerSettlement.timelineValue }
         let commit = try await appendWork(TimelineEventDraft(
             hostSequence: nextHostOrder(), causedByEventID: permit.startedCommit.eventRef,
             parentActivityID: permit.startedCommit.eventRef,

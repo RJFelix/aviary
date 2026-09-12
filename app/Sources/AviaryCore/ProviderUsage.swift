@@ -404,6 +404,15 @@ public enum ProviderUsage {
         makeAccountedCrossing(report: report, snapshot: RateSnapshot(model: model))
     }
 
+    /// Account a report against the exact pinned rate identity captured at admission.  Unlike
+    /// rebuilding a ``ModelSpec``, this preserves the snapshot's invalid-rate classifications
+    /// and every rate bit pattern without consulting the mutable model catalog.
+    public static func account(
+        report: RawReport?, rates: RateSnapshot
+    ) -> AccountedCrossing {
+        makeAccountedCrossing(report: report, snapshot: rates)
+    }
+
     private static func makeAccountedCrossing(
         report: RawReport?, snapshot: RateSnapshot
     ) -> AccountedCrossing {

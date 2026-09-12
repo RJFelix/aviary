@@ -200,7 +200,7 @@ final class InHouseDriver {
         // The same factory `--agent` uses. Two switch statements over the same api enum is
         // what let the GUI send Codex traffic to the completions client and 404.
         let providerPermit = await beginNativeEffect(
-            kind: .provider, intent: "Resolve credentials and construct the chat provider",
+            kind: .providerSetup, intent: "Resolve credentials and construct the chat provider",
             target: model.qualifiedID)
         guard nativeJournal == nil || providerPermit != nil else {
             _ = await commandController.markFailed(commandID: admittedStart.commandID)
@@ -1158,7 +1158,7 @@ final class InHouseDriver {
         guard let agent else { return "This run has not started yet." }
         guard let writer else { return "The session journal is unavailable." }
         let permit = await beginNativeEffect(
-            kind: .provider, intent: "Resolve and construct a replacement chat provider",
+            kind: .providerSetup, intent: "Resolve and construct a replacement chat provider",
             target: spec.qualifiedID)
         guard nativeJournal == nil || permit != nil else {
             return errorBanner ?? "The canonical Work journal refused the model switch."

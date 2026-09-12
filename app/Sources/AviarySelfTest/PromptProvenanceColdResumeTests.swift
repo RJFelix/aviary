@@ -93,7 +93,7 @@ private func makePromptColdResumeFixture(
     let assembly = try SystemPromptAssembly.build(
         cwd: project.path, memory: "retained memory", includeContextFiles: true)
     let request = ChatRequest(
-        model: "provider/prompt-cold", messages: [
+        model: "model", messages: [
             .system(assembly.flattenedText), .user("before prompt provenance boundary"),
         ])
     let hostID = try home.requirePersistedWorkHostID()
@@ -113,8 +113,9 @@ private func makePromptColdResumeFixture(
         journal: bundle.sessionJournal, manifestID: "prompt-cold-manifest",
         includeSources: includeSources)
     let permit = try await bundle.prepareModelCrossing(
-        manifest: manifest, action: ActionRef("prompt-cold-provider-action"), kind: .provider)
-    _ = try await bundle.finishAction(permit, state: .succeeded, retrySafety: .unsafe)
+        manifest: manifest, admission: fixtureProviderAdmission(), action: ActionRef("prompt-cold-provider-action"), kind: .provider)
+    _ = try await bundle.finishAction(permit, state: .succeeded, retrySafety: .unsafe,
+        providerSettlement: fixtureProviderSettlement(permit))
     _ = try await bundle.commitAssistantMessage(.init(
         role: .assistant, content: [.text("after prompt provenance boundary")]))
     _ = try await bundle.finishRun()

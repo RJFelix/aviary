@@ -7,7 +7,7 @@ private let contextManifestWorkHost = WorkHostRef(contextManifestWork.workHostID
 
 private func contextManifestRequest() -> ChatRequest {
     ChatRequest(
-        model: "provider/model",
+        model: "model",
         messages: [
             .system("stable instructions"),
             .init(role: .user, content: [.text("private request body")]),
@@ -215,7 +215,7 @@ func test_contextCrossingRejectsMissingRetainedBodyAndFalseCumulativeClaims() as
         request: contextManifestRequest(), store: ContextBodyStore(home: AgentHome(root: foreignRoot)),
         journal: bundle.sessionJournal)
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: absent, kind: .provider)
+        _ = try await bundle.prepareModelCrossing(manifest: absent, admission: fixtureProviderAdmission(), kind: .provider)
         XCTFail("metadata-only retained body claims must not authorize a provider request")
     } catch { }
     XCTAssertEqual(await bundle.activeRunContextDeliveredBytes, 0)
@@ -225,15 +225,16 @@ func test_contextCrossingRejectsMissingRetainedBodyAndFalseCumulativeClaims() as
         request: contextManifestRequest(), store: store, journal: bundle.sessionJournal,
         manifestID: "false-first", requestID: "false-first", priorDeliveredBytes: 1)
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: falseFirst, kind: .provider)
+        _ = try await bundle.prepareModelCrossing(manifest: falseFirst, admission: fixtureProviderAdmission(), kind: .provider)
         XCTFail("the first cumulative total must equal this crossing")
     } catch { }
 
     let first = try retainedContextManifest(
         request: contextManifestRequest(), store: store, journal: bundle.sessionJournal,
         manifestID: "first", requestID: "first")
-    let firstPermit = try await bundle.prepareModelCrossing(manifest: first, kind: .provider)
-    _ = try await bundle.finishAction(firstPermit, state: .succeeded, retrySafety: .unsafe)
+    let firstPermit = try await bundle.prepareModelCrossing(manifest: first, admission: fixtureProviderAdmission(), kind: .provider)
+    _ = try await bundle.finishAction(firstPermit, state: .succeeded, retrySafety: .unsafe,
+        providerSettlement: fixtureProviderSettlement(firstPermit))
     XCTAssertEqual(await bundle.activeRunContextDeliveredBytes, first.deliveredBytes)
 
     let jumped = try retainedContextManifest(
@@ -241,7 +242,7 @@ func test_contextCrossingRejectsMissingRetainedBodyAndFalseCumulativeClaims() as
         manifestID: "jumped", requestID: "jumped",
         priorDeliveredBytes: first.cumulativeDeliveredBytes + 1)
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: jumped, kind: .provider)
+        _ = try await bundle.prepareModelCrossing(manifest: jumped, admission: fixtureProviderAdmission(), kind: .provider)
         XCTFail("a later cumulative total must advance by exactly this crossing")
     } catch { }
     XCTAssertEqual(await bundle.activeRunContextDeliveredBytes, first.cumulativeDeliveredBytes)
@@ -406,8 +407,9 @@ func test_runJournalBundleRestoresPerRunContextTotalsOnColdReopen() async throws
     let manifest = try retainedContextManifest(
         request: contextManifestRequest(), store: ContextBodyStore(home: home),
         journal: firstBundle.sessionJournal)
-    let permit = try await firstBundle.prepareModelCrossing(manifest: manifest, kind: .provider)
-    _ = try await firstBundle.finishAction(permit, state: .succeeded, retrySafety: .unsafe)
+    let permit = try await firstBundle.prepareModelCrossing(manifest: manifest, admission: fixtureProviderAdmission(), kind: .provider)
+    _ = try await firstBundle.finishAction(permit, state: .succeeded, retrySafety: .unsafe,
+        providerSettlement: fixtureProviderSettlement(permit))
     _ = try await firstBundle.finishRun()
     try await firstBundle.closeChecked()
 
@@ -441,7 +443,7 @@ func test_runJournalBundlePersistsContextManifestWithoutBodyText() async throws 
     let manifest = try retainedContextManifest(
         request: contextManifestRequest(), store: store, journal: bundle.sessionJournal)
     let permit = try await bundle.prepareModelCrossing(
-        manifest: manifest, kind: .provider,
+        manifest: manifest, admission: fixtureProviderAdmission(), kind: .provider,
         intent: "Request the next agent response", target: "provider/model")
     let data = try Data(contentsOf: home.timelineV2SessionJournalURL(session))
     let read = TimelineJournalReader.read(
@@ -473,20 +475,22 @@ func test_runJournalBundlePersistsContextManifestWithoutBodyText() async throws 
         $0.kind == .derivedFrom && $0.target == .event(intent.causedByEventID!)
     })
     XCTAssertEqual(permit.intentCommit.eventRef, EventRef(journal: bundle.workJournal, eventID: intent.eventID))
-    _ = try await bundle.finishAction(permit, state: .succeeded, retrySafety: .unsafe)
+    _ = try await bundle.finishAction(permit, state: .succeeded, retrySafety: .unsafe,
+        providerSettlement: fixtureProviderSettlement(permit))
     let compactionManifest = try retainedContextManifest(
         request: contextManifestRequest(), store: store, journal: bundle.sessionJournal,
         manifestID: "context-run:compaction:1", requestID: "request-1",
         priorDeliveredBytes: manifest.cumulativeDeliveredBytes)
     let compactionPermit = try await bundle.prepareModelCrossing(
-        manifest: compactionManifest, kind: .compactionProvider,
+        manifest: compactionManifest, admission: fixtureProviderAdmission(kind: .compactionProvider), kind: .compactionProvider,
         intent: "Compact the conversation with the provider", target: "provider/model")
     XCTAssertEqual(compactionPermit.kind, .compactionProvider)
     XCTAssertEqual(
         compactionManifest.cumulativeDeliveredBytes,
         manifest.cumulativeDeliveredBytes + compactionManifest.deliveredBytes)
     _ = try await bundle.finishAction(
-        compactionPermit, state: .succeeded, retrySafety: .unsafe)
+        compactionPermit, state: .succeeded, retrySafety: .unsafe,
+        providerSettlement: fixtureProviderSettlement(compactionPermit))
     _ = try await bundle.finishRun()
     try await bundle.closeChecked()
     let finalReport = ReaderCensus.report(
@@ -524,7 +528,7 @@ func test_contextWorkIntentFailureCannotIssueProviderPermit() async throws {
     await bundle.injectWriterFailure(.beforeWrite, in: .work)
     do {
         _ = try await bundle.prepareModelCrossing(
-            manifest: manifest, kind: .provider,
+            manifest: manifest, admission: fixtureProviderAdmission(), kind: .provider,
             intent: "Request the next agent response", target: "provider/model")
         XCTFail("a failed Work action append must not return an effect permit")
     } catch { }

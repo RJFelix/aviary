@@ -336,7 +336,7 @@ enum AgentCLI {
         // The same factory the GUI uses. Two switch statements over the same api enum is how
         // the GUI ended up sending Codex traffic to the completions client and getting a 404.
         let providerPermit = await beginNativeEffect(
-            kind: .provider, intent: "Resolve credentials and construct the chat provider",
+            kind: .providerSetup, intent: "Resolve credentials and construct the chat provider",
             target: model.qualifiedID)
         guard providerPermit != nil else {
             await endAndCleanup(

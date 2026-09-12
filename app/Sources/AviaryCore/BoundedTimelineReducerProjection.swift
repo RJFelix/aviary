@@ -265,6 +265,8 @@ public struct BoundedWorkActionIndexRecord: Codable, Hashable, Sendable {
     public let scope: BoundedReducerProjectionDigest?
     public let metadata: BoundedReducerProjectionDigest?
     public let metadataWasTruncated: Bool
+    public let providerAdmission: ProviderAdmission?
+    public let providerSettlement: ProviderSettlement?
     public let intentEvent: BoundedReducerProjectionEvent?
     public let startedEvent: BoundedReducerProjectionEvent?
     public let outcomeEvent: BoundedReducerProjectionEvent?
@@ -280,6 +282,8 @@ public struct BoundedWorkActionIndexRecord: Codable, Hashable, Sendable {
         scope: BoundedReducerProjectionDigest? = nil,
         metadata: BoundedReducerProjectionDigest? = nil,
         metadataWasTruncated: Bool = false,
+        providerAdmission: ProviderAdmission? = nil,
+        providerSettlement: ProviderSettlement? = nil,
         intentEvent: BoundedReducerProjectionEvent? = nil,
         startedEvent: BoundedReducerProjectionEvent? = nil,
         outcomeEvent: BoundedReducerProjectionEvent? = nil
@@ -294,6 +298,8 @@ public struct BoundedWorkActionIndexRecord: Codable, Hashable, Sendable {
         self.scope = scope
         self.metadata = metadata
         self.metadataWasTruncated = metadataWasTruncated
+        self.providerAdmission = providerAdmission
+        self.providerSettlement = providerSettlement
         self.intentEvent = intentEvent
         self.startedEvent = startedEvent
         self.outcomeEvent = outcomeEvent
@@ -719,7 +725,7 @@ public enum BoundedChildState: String, Codable, Hashable, Sendable {
 }
 
 public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
-    public static let schemaVersion = 6
+    public static let schemaVersion = 7
     public static let mediaType = "application/x-aviary-bounded-work-reducer-head"
 
     public let schemaVersion: Int
@@ -742,6 +748,9 @@ public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
     public let modelEvent: BoundedReducerProjectionEvent?
     public let activeActionIDs: [String]
     public let actions: [BoundedWorkActionIndexRecord]
+    /// Exact fixed Work-lifetime accounting scalar. It remains authoritative when old action
+    /// rows are omitted by bounded index coverage.
+    public let providerUsage: ProviderUsageAggregate
     public let handles: [BoundedWorkHandleIndexRecord]
     /// Complete at the pilot's lifetime bound; this is never a sampled recent-history index.
     public let agentHandles: [BoundedWorkAgentHandleIndexRecord]
@@ -1160,6 +1169,23 @@ public enum BoundedTimelineReducerProjection {
         }
     }
 
+    private static func validProviderEvidence(_ action: BoundedWorkActionIndexRecord) -> Bool {
+        guard action.state != .unknown else { return false }
+        switch action.kind {
+        case .provider, .compactionProvider:
+            guard let admission = action.providerAdmission,
+                  (try? admission.validate(kind: action.kind)) != nil else { return false }
+            if action.state.isTerminal {
+                guard let settlement = action.providerSettlement else { return false }
+                return (try? settlement.validate(
+                    admission: admission, kind: action.kind, state: action.state)) != nil
+            }
+            return action.providerSettlement == nil
+        default:
+            return action.providerAdmission == nil && action.providerSettlement == nil
+        }
+    }
+
     fileprivate static func classifyHandleState(_ state: String) -> BoundedHandleState {
         switch state {
         case "succeeded": return .succeeded
@@ -1412,6 +1438,8 @@ public enum BoundedTimelineReducerProjection {
                 intent: digestText(action.intent), target: digestText(action.target),
                 scope: digestText(action.scope), metadata: digestJSON(action.metadata),
                 metadataWasTruncated: action.metadataWasTruncated,
+                providerAdmission: action.providerAdmission,
+                providerSettlement: action.providerSettlement,
                 intentEvent: trace.actionEvents[id]?.intent ?? projectionEvent(action.intentEvent),
                 startedEvent: trace.actionEvents[id]?.started ?? projectionEvent(action.startedEvent),
                 outcomeEvent: trace.actionEvents[id]?.outcome ?? projectionEvent(action.outcomeEvent))
@@ -1568,6 +1596,7 @@ public enum BoundedTimelineReducerProjection {
             activeActionIDs: Array(snapshot.activeActionIDs.sorted().prefix(limits.maximumActions)).map {
                 bounded($0, maxBytes: limits.maximumIdentifierBytes)
             }, actions: retainedActionRows,
+            providerUsage: snapshot.providerUsage,
             handles: retainedHandleRows, agentHandles: retainedAgentHandleRows,
             liveAgentHandleCount: snapshot.agentHandles.values.filter(\.blocksWorkCompletion).count,
             unreapedAgentHandleCount: snapshot.agentHandles.values.filter { $0.state != .reaped }.count,
@@ -2062,6 +2091,15 @@ public enum BoundedTimelineReducerProjection {
         try validateRows(head.source, head.corruption.compactMap(\.event), limits: limits)
         try validateRows(head.source, head.coverage.diagnostics.compactMap(\.sourceEvent), limits: limits)
         try validateUnique(head.actions.map { $0.action.actionID })
+        guard head.actions.allSatisfy({ validProviderEvidence($0) }) else {
+            throw BoundedTimelineReducerProjectionError.invalidIdentity
+        }
+        do { try head.providerUsage.validate() }
+        catch { throw BoundedTimelineReducerProjectionError.invalidOffsets }
+        guard head.providerUsage.started <= head.lastSequence,
+              head.providerUsage.settled <= head.providerUsage.started else {
+            throw BoundedTimelineReducerProjectionError.invalidOffsets
+        }
         try validateUnique(head.handles.map { $0.handle.handleID })
         try validateUnique(head.agentHandles.map { $0.handle.handleID })
         guard Set(head.handles.map { $0.handle.handleID }).isDisjoint(
@@ -2146,7 +2184,45 @@ public enum BoundedTimelineReducerProjection {
         if head.coverage.isIndexComplete(.actions) {
             let activeIDs = Set(head.actions.filter { actionIsActive($0.state) }
                 .map { $0.action.actionID })
-            guard activeIDs == Set(head.activeActionIDs) else {
+            guard activeIDs == Set(head.activeActionIDs),
+                  head.providerUsage.started - head.providerUsage.settled
+                    <= activeIDs.count else {
+                throw BoundedTimelineReducerProjectionError.invalidOffsets
+            }
+            var providerSteps: [CompleteProviderUsageProjectionStep] = []
+            for action in head.actions
+            where action.kind == .provider || action.kind == .compactionProvider {
+                guard let intentSequence = action.intentEvent?.sequence,
+                      intentSequence > 0 else {
+                    throw BoundedTimelineReducerProjectionError.invalidOffsets
+                }
+                if action.state == .proposed {
+                    guard action.startedEvent == nil, action.outcomeEvent == nil else {
+                        throw BoundedTimelineReducerProjectionError.invalidOffsets
+                    }
+                    continue
+                }
+                guard let startedSequence = action.startedEvent?.sequence,
+                      startedSequence > 0 else {
+                    throw BoundedTimelineReducerProjectionError.invalidOffsets
+                }
+                if intentSequence >= startedSequence {
+                    throw BoundedTimelineReducerProjectionError.invalidOffsets
+                }
+                providerSteps.append(.started(
+                    sequence: startedSequence, actionID: action.action.actionID))
+                if action.state.isTerminal {
+                    guard let settlement = action.providerSettlement,
+                          let outcomeSequence = action.outcomeEvent?.sequence,
+                          startedSequence < outcomeSequence else {
+                        throw BoundedTimelineReducerProjectionError.invalidOffsets
+                    }
+                    providerSteps.append(.settled(
+                        sequence: outcomeSequence, actionID: action.action.actionID,
+                        settlement: settlement))
+                }
+            }
+            guard (try? rebuildCompleteProviderUsage(from: providerSteps)) == head.providerUsage else {
                 throw BoundedTimelineReducerProjectionError.invalidOffsets
             }
         }
@@ -3429,6 +3505,7 @@ private extension BoundedWorkReducerHead {
         modelEvent: BoundedReducerProjectionEvent?,
         activeActionIDs: [String],
         actions: [BoundedWorkActionIndexRecord],
+        providerUsage: ProviderUsageAggregate,
         handles: [BoundedWorkHandleIndexRecord],
         agentHandles: [BoundedWorkAgentHandleIndexRecord],
         liveAgentHandleCount: Int,
@@ -3464,6 +3541,7 @@ private extension BoundedWorkReducerHead {
         self.modelEvent = modelEvent
         self.activeActionIDs = activeActionIDs.sorted()
         self.actions = actions.sorted(by: BoundedTimelineReducerProjection.actionLess)
+        self.providerUsage = providerUsage
         self.handles = handles.sorted(by: BoundedTimelineReducerProjection.handleLess)
         self.agentHandles = agentHandles.sorted {
             if $0.blocksWorkCompletion != $1.blocksWorkCompletion {

@@ -374,6 +374,13 @@ private func testAviaryTelemetryCanonicalCompactionLegacyFailure() async throws 
         actor: TimelineActor(actorID: "context-legacy-failure-work-reader", kind: "self-test"),
         hostRecordedAt: Date(timeIntervalSince1970: 0)).records.map(\.event)
     XCTAssertEqual(await state.value(), 5)
+    let settledWork = WorkReducer.reduce(workEvents)
+    XCTAssertTrue(settledWork.semanticProjectionValid)
+    XCTAssertEqual(settledWork.providerUsage.started, 5)
+    XCTAssertEqual(settledWork.providerUsage.settled, 5)
+    XCTAssertEqual(settledWork.providerUsage.knownTokenFloor, 3_650)
+    XCTAssertEqual(await agent.totalUsage.totalTokens, 3_650,
+                   "compaction usage survives a later transcript projection failure")
     XCTAssertEqual(workEvents.filter {
         $0.type == TimelineEventType.actionIntent
             && $0.payload["kind"]?.stringValue == ActionKind.compactionProvider.rawValue
@@ -480,4 +487,16 @@ private func testAviaryTelemetryCompactionWithoutTerminalDone() async throws {
             && $0.action == compactionAction
             && $0.payload["state"]?.stringValue != ActionExecutionState.succeeded.rawValue
     }, "an unterminated compaction crossing must not be marked succeeded")
+    let reduced = WorkReducer.reduce(workEvents)
+    XCTAssertTrue(reduced.semanticProjectionValid)
+    XCTAssertEqual(reduced.providerUsage.started, 6)
+    XCTAssertEqual(reduced.providerUsage.settled, 6)
+    XCTAssertEqual(reduced.providerUsage.knownTokenFloor, 3_700)
+    XCTAssertEqual(reduced.providerUsage.unresolvedTotal, 1)
+    let settlement = try XCTUnwrap(reduced.actions[compactionAction.actionID]?.providerSettlement)
+    XCTAssertEqual(settlement.admission.purpose, .compaction)
+    XCTAssertEqual(settlement.report?.inputTokens, 50)
+    XCTAssertEqual(settlement.finality, .unconfirmed)
+    XCTAssertEqual(await agent.totalUsage.totalTokens, 3_700,
+                   "one failed compaction plus five ordinary crossings are counted once")
 }

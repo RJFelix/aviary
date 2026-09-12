@@ -243,9 +243,9 @@ func test_workAgentHandleEvidenceSurvivesTerminalReapAndRoundTrips() throws {
                 schemaVersion: 4, bytes: head.encodedMetadata()))
         XCTAssertTrue(false, "the pre-evidence bounded Work schema must be rejected")
     } catch { XCTAssertTrue(true) }
-    XCTAssertEqual(PersistentWorkExactState.schemaVersion, 6)
-    XCTAssertEqual(BoundedWorkReducerHead.schemaVersion, 6)
-    XCTAssertEqual(WorkServiceAttachedWorkCheckpointStore.Record.currentSchemaVersion, 9)
+    XCTAssertEqual(PersistentWorkExactState.schemaVersion, 7)
+    XCTAssertEqual(BoundedWorkReducerHead.schemaVersion, 7)
+    XCTAssertEqual(WorkServiceAttachedWorkCheckpointStore.Record.currentSchemaVersion, 10)
 }
 
 func test_workAgentHandleDeadlineCancellationRetainsNilCommandEvidence() {

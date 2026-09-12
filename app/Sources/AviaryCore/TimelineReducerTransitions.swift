@@ -20,6 +20,7 @@ internal struct BoundedWorkScalarContinuation: Equatable, Sendable {
     var activeRunSessionAttachment: SessionAttachmentRef?
     var modelID: String?
     var activeTurn: TurnRef?
+    var providerUsage: ProviderUsageAggregate
     var lastHostSequence: Int?
     var unknownDomains: Set<TimelineDomain>
     var lastEventID: String?
@@ -39,6 +40,7 @@ internal struct BoundedWorkScalarContinuation: Equatable, Sendable {
         activeRunSessionAttachment = snapshot.activeRunSessionAttachment
         modelID = snapshot.modelID
         activeTurn = snapshot.activeTurn
+        providerUsage = snapshot.providerUsage
         lastHostSequence = snapshot.lastHostSequence
         unknownDomains = snapshot.unknownDomains
         lastEventID = snapshot.lastEventID
@@ -59,6 +61,7 @@ internal struct BoundedWorkScalarContinuation: Equatable, Sendable {
         snapshot.activeRunSessionAttachment = activeRunSessionAttachment
         snapshot.modelID = modelID
         snapshot.activeTurn = activeTurn
+        snapshot.providerUsage = providerUsage
         snapshot.lastHostSequence = lastHostSequence
         snapshot.unknownDomains = unknownDomains
         snapshot.lastEventID = lastEventID
@@ -641,20 +644,36 @@ internal enum WorkReducerTransition {
             guard let action = event.action, !action.actionID.isEmpty,
                   let existing = state.action(for: action.actionID),
                   existing.state == .proposed,
+                  existing.hasValidProviderEvidence,
                   validActionEventPayload(event, state: state),
                   event.payload["kind"] == nil || actionKind(in: event) == existing.kind,
+                  event.payload["provider_admission"] == nil,
+                  event.payload["provider_settlement"] == nil,
                   let actionState = event.payload["state"]?.stringValue.flatMap({ ActionExecutionState(rawValue: $0) }),
                   actionState == .queued || actionState == .running else {
                 quarantine(event, state: &state, reason: "action start requires a prior action intent")
                 return
             }
+            var providerUsage = state.scalar.providerUsage
+            if isProviderAction(existing.kind) {
+                do { try providerUsage.recordStarted() }
+                catch {
+                    quarantine(event, state: &state,
+                               reason: "provider action start exceeds the bounded usage aggregate")
+                    return
+                }
+            }
             state.stageAction(existing.withStarted(event, state: actionState), active: true)
-            updateScalar(&state) { $0.execution = .running }
+            updateScalar(&state) {
+                $0.execution = .running
+                $0.providerUsage = providerUsage
+            }
         case TimelineEventType.actionIntent:
             guard let action = event.action, !action.actionID.isEmpty,
                   state.action(for: action.actionID) == nil,
                   validActionEventPayload(event, state: state),
                   actionKind(in: event) != nil,
+                  event.payload["provider_settlement"] == nil,
                   let intent = event.payload["intent"]?.stringValue,
                   !intent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   event.payload["state"]?.stringValue.flatMap({ ActionExecutionState(rawValue: $0) }) == .proposed else {
@@ -664,6 +683,11 @@ internal enum WorkReducerTransition {
             guard let projected = WorkActionSnapshot(intent: event) else {
                 quarantine(event, state: &state,
                            reason: "action intent is missing a known kind or identity")
+                return
+            }
+            guard projected.hasValidProviderEvidence else {
+                quarantine(event, state: &state,
+                           reason: "action intent has invalid provider admission evidence")
                 return
             }
             state.stageAction(projected, active: nil)
@@ -935,12 +959,22 @@ internal enum WorkReducerTransition {
     ) {
         guard let action = event.action, !action.actionID.isEmpty,
               let existing = state.action(for: action.actionID),
+              existing.hasValidProviderEvidence,
               validActionEventPayload(event, state: state),
               event.payload["kind"] == nil || actionKind(in: event) == existing.kind,
+              event.payload["provider_admission"] == nil,
               let actionState = event.payload["state"]?.stringValue.flatMap({ ActionExecutionState(rawValue: $0) }),
               legalActionTransition(from: existing.state, to: actionState) else {
             quarantine(event, state: &state,
                        reason: "action outcome has no intent or illegal state transition")
+            return
+        }
+        // Provider accounting begins at the dedicated action.started transition. Allowing the
+        // generic outcome family to activate a proposed provider action would bypass that single
+        // start count and make its later terminal settlement impossible to account exactly.
+        if isProviderAction(existing.kind), existing.state == .proposed {
+            quarantine(event, state: &state,
+                       reason: "provider action activation requires action.started")
             return
         }
         let failureKind = event.payload["failure_kind"]?.stringValue
@@ -965,9 +999,50 @@ internal enum WorkReducerTransition {
                        reason: "failed, canceled, or indeterminate action must declare failure kind")
             return
         }
+        let providerSettlement: ProviderSettlement?
+        if let value = event.payload["provider_settlement"] {
+            guard let decoded = try? ProviderSettlement(timelineValue: value) else {
+                quarantine(event, state: &state,
+                           reason: "provider action outcome has malformed settlement evidence")
+                return
+            }
+            providerSettlement = decoded
+        } else {
+            providerSettlement = nil
+        }
+        if isProviderAction(existing.kind), actionState.isTerminal {
+            guard let admission = existing.providerAdmission, let providerSettlement,
+                  (try? providerSettlement.validate(
+                    admission: admission, kind: existing.kind, state: actionState)) != nil else {
+                quarantine(event, state: &state,
+                           reason: "provider action outcome has no matching terminal settlement")
+                return
+            }
+        } else if isProviderAction(existing.kind) {
+            guard providerSettlement == nil else {
+                quarantine(event, state: &state,
+                           reason: "nonterminal provider action cannot carry provider settlement")
+                return
+            }
+        } else if providerSettlement != nil {
+            quarantine(event, state: &state,
+                       reason: "non-provider action outcome cannot carry provider settlement")
+            return
+        }
+        var providerUsage = state.scalar.providerUsage
+        if let providerSettlement {
+            do { try providerUsage.recordSettlement(providerSettlement) }
+            catch {
+                quarantine(event, state: &state,
+                           reason: "provider action settlement violates the Work usage aggregate")
+                return
+            }
+        }
         state.stageAction(existing.withOutcome(
-            event, state: actionState, failureKind: failureKind, retrySafety: retrySafety),
+            event, state: actionState, failureKind: failureKind, retrySafety: retrySafety,
+            providerSettlement: providerSettlement),
             active: !actionState.isTerminal)
+        updateScalar(&state) { $0.providerUsage = providerUsage }
         if actionState.isTerminal {
             if state.activeActionCount == 0, state.scalar.activeTurn == nil {
                 updateScalar(&state) {
@@ -1271,6 +1346,10 @@ internal enum WorkReducerTransition {
 
     private static func actionKind(in event: TimelineEvent) -> ActionKind? {
         event.payload["kind"]?.stringValue.flatMap(ActionKind.init(rawValue:))
+    }
+
+    private static func isProviderAction(_ kind: ActionKind) -> Bool {
+        kind == .provider || kind == .compactionProvider
     }
 
     private static func executionAfterRun(_ payload: JSONValue) -> WorkExecution {

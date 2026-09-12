@@ -57,6 +57,24 @@ lower bounds, never authority for admitting a hard spend-limited crossing.
 
 ## Settlement integration boundaries
 
+Foundation checkpoint: `a89a478`. Native settlement integration is verified as a backend checkpoint;
+child accounting, finite limits, and Work-scoped GUI usage remain subsequent integration work.
+Provider setup has its own action kind; only context-qualified model requests can create provider
+admissions. A protocol-completed response without any usage report remains successful with unknown
+accounting. Neither absent measurements nor malformed observations become zero-cost evidence.
+
+The provider payload uses its own strict schema inside the current timeline envelope. Counts use
+canonical decimal strings and configured rates retain their exact Double bits across JSONValue.
+Disposable Work exact maps, bounded heads, and attached-client checkpoints are versioned anew;
+old derived caches must rebuild rather than interpret missing accounting as a neutral aggregate.
+
+Admissions independently match the manifest's raw request model and, when supplied, the action's
+qualified provider/model target. Model IDs containing slashes are not split into guessed routing
+components. The only accounting start is `action.started`; an outcome cannot bypass it. Complete
+action projections reconstruct the aggregate in canonical event order and compare it with the
+stored total, including at attached-client checkpoint restoration. Partial historical indexes do
+not pretend to perform that complete-table check.
+
 The native Run boundary is the existing `RunJournalBundle.finishAction` commit: provider usage
 belongs on that action's terminal outcome, not on the later assistant or compaction message.
 Reducer acceptance updates a fixed usage aggregate. Persistent Work exact state and bounded Work
@@ -83,6 +101,22 @@ change or remove an optional limit; reconnecting or retrying must never silently
 Postpaid reported-token and configured-price thresholds are not hard billing caps.
 
 ## Verification boundary
+
+Native settlement: final macOS SelfTest passes 1,334 cases / 20,094 assertions in 518.05s,
+after rebuilding Aviary, aviaryd, and SelfTest. Linux Swift 6.3.3 builds aviaryd and SelfTest;
+its selected suite passes 41 grouped cases / 7,023 assertions in 256.20s. Snapshot
+`aviary-linux-settlement-20260912-v1` has a 333-entry source manifest (SHA-256
+`2c088d43857fad7bd2e2ae16296a01a96772e55ad8c4422a620369f12825b423`); only Package.resolved
+differs for the platform dependency graph. These are deterministic-provider tests, not paid calls.
+
+This checkpoint is deliberately not installed over the running `a89a478` GUI/service pair.
+The provider journal contract is incompatible with older provider actions. Before deployment,
+bump the exact Work-service protocol to v5, prove old-version rejection without replacement,
+drain the old service and reconcile its pending mutation intents, then recoverably archive/rotate
+the disposable Aviary-native Work Host inventory. Rebuilding derived caches cannot invent missing
+provider admissions or settlements. Do not weaken catalog completeness to hide old invalid Works;
+they would otherwise prevent reconstruction of healthy new Works. External Claude/Codex stores
+are excluded from this operation. If old Work cannot be proven quiescent, stop for user direction.
 
 The foundation's final macOS run passes 1,317 cases / 19,852 assertions in 517.83s, including
 terminal-protocol and superseded-End race regressions. Signed `just build` passes. The production
