@@ -88,6 +88,7 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
         }
         let pilot = self.pilot
         let configuration = self.configuration
+        let admissionContext = AviaryTelemetry.context
         let task = Task<Agent.SpawnStartResult, Never> {
             do {
                 let admission = try await pilot.coordinator.admit(
@@ -105,7 +106,8 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
                                 maxIterations: nil,
                                 memory: configuration.memory, recordPayloads: configuration.recordPayloads,
                                 makeRuntimeHost: pilot.makeRuntimeHost), prompt: prompt)
-                    })
+                    },
+                    admissionContext: admissionContext)
                 return .workOwned(
                     handleID: admission.handle.handleID, name: label,
                     deadline: admission.deadline, admissionUncertain: false)

@@ -2,6 +2,11 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 @testable import AviaryCore
 
@@ -31,7 +36,6 @@ private final class AviaryTelemetryHTTPCompletion: @unchecked Sendable {
 private final class AviaryTelemetryHTTPURLProtocol: URLProtocol, @unchecked Sendable {
     enum Mode {
         case response(status: Int, body: Data, declaredLength: Int?)
-        case redirect
         case hold
     }
 
@@ -74,18 +78,6 @@ private final class AviaryTelemetryHTTPURLProtocol: URLProtocol, @unchecked Send
         switch Self.begin() {
         case .hold:
             return
-        case .redirect:
-            guard let source = request.url,
-                  let response = HTTPURLResponse(
-                      url: source, statusCode: 302, httpVersion: nil,
-                      headerFields: ["Location": "https://collector.invalid/elsewhere"]),
-                  let destination = URL(string: "https://collector.invalid/elsewhere") else {
-                client?.urlProtocol(self, didFailWithError: URLError(.badURL))
-                return
-            }
-            client?.urlProtocol(
-                self, wasRedirectedTo: URLRequest(url: destination),
-                redirectResponse: response)
         case .response(let status, let body, let declaredLength):
             guard let url = request.url else {
                 client?.urlProtocol(self, didFailWithError: URLError(.badURL))
@@ -108,6 +100,133 @@ private final class AviaryTelemetryHTTPURLProtocol: URLProtocol, @unchecked Send
         Self.stopsStorage += 1
         Self.lock.unlock()
     }
+}
+
+/// A real loopback redirect, because Linux FoundationNetworking does not implement the custom
+/// URLProtocol redirect callback used by the other HTTP fixtures. The target writes a marker only
+/// when contacted, so refusal is proved by the absence of that marker rather than by trusting a
+/// mocked callback.
+private final class AviaryTelemetryLocalRedirectServer: @unchecked Sendable {
+    private let process: Process
+    private let portFileURL: URL
+    private let targetHitURL: URL
+    let port: Int
+
+    private init(process: Process, portFileURL: URL, targetHitURL: URL, port: Int) {
+        self.process = process
+        self.portFileURL = portFileURL
+        self.targetHitURL = targetHitURL
+        self.port = port
+    }
+
+    static func make() async throws -> AviaryTelemetryLocalRedirectServer {
+        let portFileURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-telemetry-port-\(UUID().uuidString).txt")
+        let targetHitURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "aviary-telemetry-target-\(UUID().uuidString).marker")
+        let script = #"""
+import http.server
+import sys
+
+port_path = sys.argv[1]
+marker = sys.argv[2]
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/target":
+            with open(marker, "w", encoding="ascii") as output:
+                output.write("contacted")
+            body = b"unexpected target"
+            self.send_response(200)
+        elif self.path == "/redirect":
+            body = b"redirect"
+            self.send_response(302)
+            self.send_header("Location", "/target")
+        else:
+            body = b"not found"
+            self.send_response(404)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+with open(port_path, "w", encoding="ascii") as output:
+    output.write(str(server.server_address[1]))
+server.serve_forever()
+"""#
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["python3", "-u", "-c", script, portFileURL.path, targetHitURL.path]
+        process.standardInput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.environment = ProcessEnvironment.shared.snapshot
+        try process.run()
+
+        for _ in 0..<200 {
+            if let data = try? Data(contentsOf: portFileURL),
+               let line = String(data: data, encoding: .utf8),
+               let port = Int(line.trimmingCharacters(in: .whitespacesAndNewlines)),
+               (1...65_535).contains(port), process.isRunning
+            {
+                return AviaryTelemetryLocalRedirectServer(
+                    process: process, portFileURL: portFileURL, targetHitURL: targetHitURL,
+                    port: port)
+            }
+            guard process.isRunning else { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        terminateProcess(process)
+        cleanupProcessFiles(portFileURL: portFileURL, targetHitURL: targetHitURL)
+        throw UnwrapFailure(description: "local redirect server did not publish a port")
+    }
+
+    var redirectURL: URL {
+        URL(string: "http://127.0.0.1:\(port)/redirect")!
+    }
+
+    var targetWasContacted: Bool {
+        FileManager.default.fileExists(atPath: targetHitURL.path)
+    }
+
+    var isRunning: Bool { process.isRunning }
+
+    func stop() async {
+        if process.isRunning {
+            process.terminate()
+            let deadline = Date().addingTimeInterval(1)
+            while process.isRunning && Date() < deadline {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            if process.isRunning { terminateProcess(process) }
+        }
+        cleanupProcessFiles(portFileURL: portFileURL, targetHitURL: targetHitURL)
+    }
+
+    func terminateIfRunning() {
+        if process.isRunning { terminateProcess(process) }
+        cleanupProcessFiles(portFileURL: portFileURL, targetHitURL: targetHitURL)
+    }
+
+    deinit { terminateIfRunning() }
+}
+
+private func terminateProcess(_ process: Process) {
+    guard process.isRunning else { return }
+    process.terminate()
+    #if canImport(Darwin)
+    _ = Darwin.kill(process.processIdentifier, SIGKILL)
+    #elseif canImport(Glibc)
+    _ = Glibc.kill(process.processIdentifier, SIGKILL)
+    #endif
+}
+
+private func cleanupProcessFiles(portFileURL: URL, targetHitURL: URL) {
+    try? FileManager.default.removeItem(at: portFileURL)
+    try? FileManager.default.removeItem(at: targetHitURL)
 }
 
 private func aviaryTelemetryHTTPConfiguration() -> URLSessionConfiguration {
@@ -185,18 +304,22 @@ func test_aviaryTelemetryHTTPClientRejectsStatusAndOverflowWithoutDetails() asyn
 }
 
 func test_aviaryTelemetryHTTPClientRefusesRedirects() async throws {
-    AviaryTelemetryHTTPURLProtocol.reset(.redirect)
-    let client = AviaryTelemetryHTTPClient(configuration: aviaryTelemetryHTTPConfiguration())
+    let server = try await AviaryTelemetryLocalRedirectServer.make()
+    defer { server.terminateIfRunning() }
+    let client = AviaryTelemetryHTTPClient()
     defer { client.shutDown() }
     let completion = AviaryTelemetryHTTPCompletion()
     client.send(
-        request: URLRequest(url: URL(string: "http://aviary-telemetry.invalid/redirect")!),
+        request: URLRequest(url: server.redirectURL),
         completion: completion.receive)
     XCTAssertEqual(
         telemetryHTTPError(await awaitTelemetryHTTPResult(completion)),
         .redirectRefused)
     try? await Task.sleep(nanoseconds: 20_000_000)
     XCTAssertEqual(completion.count, 1)
+    XCTAssertTrue(server.isRunning)
+    XCTAssertFalse(server.targetWasContacted)
+    await server.stop()
 }
 
 func test_aviaryTelemetryHTTPClientCapsConcurrencyAndCancelsExactlyOnce() async throws {

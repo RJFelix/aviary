@@ -282,21 +282,34 @@ public actor Agent {
         }
     }
 
+    /// A refusal known to have happened before any native append is a rejection. Everything
+    /// else stays indeterminate: beginAction writes its intent and start as separate records,
+    /// while a model crossing may have appended context before action admission fails.
+    private static func telemetryAdmissionOutcome(_ error: Error) -> String {
+        guard let error = error as? RunJournalBundleError else { return "indeterminate" }
+        switch error {
+        case .invalidOperation, .alreadyFinished, .workTerminal:
+            return "rejected"
+        default:
+            return "indeterminate"
+        }
+    }
+
     private func telemetryProviderAttributes(
-        crossing: String, permit: EffectPermit?
+        crossing: String, permit: EffectPermit?, model: ModelSpec
     ) -> [String: AviaryTraceValue] {
         var attributes: [String: AviaryTraceValue] = [
             "aviary.operation": .string(crossing),
-            "aviary.provider.id_hash": .string(AviaryTelemetry.identity(config.model.providerID)),
-            "aviary.model.id_hash": .string(AviaryTelemetry.identity(config.model.id)),
+            "aviary.provider.id_hash": .string(AviaryTelemetry.identity(model.providerID)),
+            "aviary.model.id_hash": .string(AviaryTelemetry.identity(model.id)),
         ]
         if let permit {
+            attributes.merge(
+                AviaryTelemetry.canonicalReferenceAttributes(
+                    permit.startedCommit, role: .actionStarted),
+                uniquingKeysWith: { _, replacement in replacement })
             attributes["aviary.action.id"] = .string(
                 AviaryTelemetry.identity(permit.action.actionID))
-            attributes["aviary.action.started.id"] = .string(
-                AviaryTelemetry.identity(permit.startedCommit.eventRef.eventID))
-            attributes["aviary.action.started.sequence"] = .int(
-                permit.startedCommit.cursor.sequence)
             attributes["aviary.action.kind"] = .string(Self.telemetryActionKind(permit.kind))
         }
         return attributes
@@ -530,7 +543,8 @@ public actor Agent {
             "aviary.agent.callback",
             attributes: ["aviary.callback.kind": .string(callbackKind)]) {
                 let result = await self.serveCallbackBody(rid: rid, kind: kind, payload: payload)
-                AviaryTelemetry.outcome(result["error"] == nil ? "succeeded" : "failed")
+                AviaryTelemetry.outcome(
+                    result["error"] == nil ? "succeeded" : "failed", fallbackOnly: true)
                 return result
             }
     }
@@ -1223,38 +1237,42 @@ public actor Agent {
         kind: ActionKind, intent: String, target: String? = nil,
         metadata: [String: JSONValue] = [:]
     ) async -> EffectPermit? {
-        await AviaryTelemetry.withSpan(
+        let (permit, admissionOutcome) = await AviaryTelemetry.withSpan(
             "aviary.agent.action.dispatch",
-            attributes: ["aviary.action.kind": .string(Self.telemetryActionKind(kind))]) {
+            attributes: ["aviary.action.kind": .string(Self.telemetryActionKind(kind))])
+            { () -> (EffectPermit?, String?) in
                 guard let nativeJournal else {
                     AviaryTelemetry.outcome("unavailable")
-                    return nil
+                    return (nil, nil)
                 }
                 do {
                     let permit = try await nativeJournal.beginAction(
                         kind: kind, intent: intent, target: target, scope: "run", metadata: metadata)
                     AviaryTelemetry.event(
                         "aviary.agent.action.admitted",
-                        attributes: [
+                        attributes: AviaryTelemetry.canonicalReferenceAttributes(
+                            permit.startedCommit, role: .event).merging([
                             "aviary.action.id": .string(
                                 AviaryTelemetry.identity(permit.action.actionID)),
-                            "aviary.event.id": .string(
-                                AviaryTelemetry.identity(permit.startedCommit.eventRef.eventID)),
-                            "aviary.event.sequence": .int(permit.startedCommit.cursor.sequence),
                             "aviary.action.kind": .string(Self.telemetryActionKind(kind)),
                             "aviary.receipt.state": .string("started"),
-                        ])
+                        ], uniquingKeysWith: { _, replacement in replacement }))
                     AviaryTelemetry.outcome("succeeded")
-                    return permit
+                    return (permit, nil)
                 } catch {
                     AviaryTelemetry.event(
                         "aviary.agent.exception",
                         attributes: ["error.type": .string("action_dispatch")])
-                    AviaryTelemetry.outcome("failed")
+                    let outcome = Self.telemetryAdmissionOutcome(error)
+                    AviaryTelemetry.outcome(outcome)
                     latchNativeJournalFailure("the \(kind.rawValue) action start", error)
-                    return nil
+                    return (nil, outcome)
                 }
             }
+        if let admissionOutcome {
+            AviaryTelemetry.outcome(admissionOutcome)
+        }
+        return permit
     }
 
     private func finishNativeAction(
@@ -1266,29 +1284,33 @@ public actor Agent {
         do {
             let commit = try await nativeJournal.finishAction(
                 permit, state: state, retrySafety: retrySafety, failureKind: failureKind)
-            var attributes: [String: AviaryTraceValue] = [
+            var attributes: [String: AviaryTraceValue] = AviaryTelemetry
+                .canonicalReferenceAttributes(commit, role: .event)
+                .merging(
+                    AviaryTelemetry.canonicalReferenceAttributes(
+                        permit.startedCommit, role: .actionStarted),
+                    uniquingKeysWith: { _, replacement in replacement })
+            attributes.merge([
                 "aviary.action.id": .string(
                     AviaryTelemetry.identity(permit.action.actionID)),
-                "aviary.event.id": .string(
-                    AviaryTelemetry.identity(commit.eventRef.eventID)),
-                "aviary.event.sequence": .int(commit.cursor.sequence),
-                "aviary.action.started.id": .string(
-                    AviaryTelemetry.identity(permit.startedCommit.eventRef.eventID)),
-                "aviary.action.started.sequence": .int(permit.startedCommit.cursor.sequence),
                 "aviary.action.kind": .string(Self.telemetryActionKind(permit.kind)),
                 "aviary.outcome": .string(Self.telemetryActionOutcome(state)),
                 "aviary.receipt.state": .string(state.rawValue),
                 "aviary.retry.safety": .string(retrySafety.rawValue),
-            ]
+            ], uniquingKeysWith: { _, replacement in replacement })
             if let failureKind {
                 attributes["aviary.failure.kind"] = .string(failureKind.rawValue)
             }
             AviaryTelemetry.event("aviary.agent.action.outcome", attributes: attributes)
+            if state == .indeterminateEffect {
+                AviaryTelemetry.outcome("indeterminate")
+            }
             return true
         } catch {
             AviaryTelemetry.event(
                 "aviary.agent.exception",
                 attributes: ["error.type": .string("action_outcome")])
+            AviaryTelemetry.outcome("indeterminate")
             latchNativeJournalFailure("the \(permit.kind.rawValue) action outcome", error)
             return false
         }
@@ -1469,14 +1491,41 @@ public actor Agent {
         purpose: String,
         kind: ActionKind,
         intent: String,
-        assembly: SystemPromptAssembly? = nil
+        assembly: SystemPromptAssembly? = nil, targetModel: String
     ) async -> EffectPermit? {
-        guard let nativeJournal else { return nil }
+        guard nativeJournal != nil else { return nil }
+        let result = await AviaryTelemetry.withSpan(
+            "aviary.agent.context.prepare",
+            attributes: [
+                "aviary.operation": .string(
+                    kind == .compactionProvider ? "compaction" : "normal"),
+            ]
+        ) {
+            let result = await self.prepareModelCrossingBody(
+                for: request, purpose: purpose, kind: kind, intent: intent,
+                assembly: assembly, targetModel: targetModel)
+            if let outcome = result.outcome { AviaryTelemetry.outcome(outcome) }
+            return result
+        }
+        if let outcome = result.outcome {
+            AviaryTelemetry.outcome(outcome)
+        }
+        return result.permit
+    }
+
+    private func prepareModelCrossingBody(
+        for request: ChatRequest,
+        purpose: String,
+        kind: ActionKind,
+        intent: String,
+        assembly: SystemPromptAssembly? = nil, targetModel: String
+    ) async -> (permit: EffectPermit?, outcome: String?) {
+        guard let nativeJournal else { return (nil, "unavailable") }
         guard let contextBodyStore else {
             latchNativeJournalFailure(
                 "the \(purpose) context crossing",
                 NativeJournalFailure(detail: "The retained context body store is unavailable."))
-            return nil
+            return (nil, "unavailable")
         }
         let applicableAssembly = assembly ?? config.systemPromptAssembly
         if let applicableAssembly {
@@ -1485,7 +1534,7 @@ public actor Agent {
                     "validating the \(purpose) prompt sources",
                     NativeJournalFailure(
                         detail: "The prompt source decomposition exceeds 32 sources."))
-                return nil
+                return (nil, "rejected")
             }
             let systemMessages = request.messages.filter { $0.role == .system }
             guard systemMessages.count == 1,
@@ -1496,7 +1545,7 @@ public actor Agent {
                     "validating the \(purpose) system prompt",
                     NativeJournalFailure(
                         detail: "The assembled system prompt must be one text ChatMessage."))
-                return nil
+                return (nil, "rejected")
             }
             let expectedBytes = Data(systemText.utf8)
             let assemblyBytes = Data(applicableAssembly.flattenedText.utf8)
@@ -1519,7 +1568,7 @@ public actor Agent {
                     "validating the \(purpose) system prompt",
                     NativeJournalFailure(
                         detail: "The prompt source rendering does not equal the system message."))
-                return nil
+                return (nil, "rejected")
             }
         }
         let ordinal = modelRequestOrdinal
@@ -1532,7 +1581,7 @@ public actor Agent {
                 priorDeliveredBytes: priorDeliveredBytes)
         } catch {
             latchNativeJournalFailure("encoding the \(purpose) context", error)
-            return nil
+            return (nil, "rejected")
         }
         var bodyReferences: [String: TimelineBodyReference] = [:]
         var promptSources: [ContextManifestSource]?
@@ -1602,40 +1651,72 @@ public actor Agent {
             }
         } catch {
             latchNativeJournalFailure("retaining the \(purpose) context body", error)
-            return nil
+            return (nil, "indeterminate")
         }
+        let bodyManifest: ContextManifest
         do {
-            let bodyManifest = try ContextManifest.build(
+            bodyManifest = try ContextManifest.build(
                 request: request, manifestID: requestID, requestID: requestID,
                 bodyReferences: bodyReferences,
                 priorDeliveredBytes: priorDeliveredBytes)
-            let manifest = ContextManifest(
-                schemaVersion: bodyManifest.schemaVersion, manifestID: bodyManifest.manifestID,
-                requestID: bodyManifest.requestID, modelID: bodyManifest.modelID,
-                measuredBy: bodyManifest.measuredBy, components: bodyManifest.components,
-                omissions: bodyManifest.omissions,
-                cumulativeDeliveredBytes: bodyManifest.cumulativeDeliveredBytes,
-                systemPromptAssemblyID: applicableAssembly?.digest,
-                systemPromptSources: promptSources)
+        } catch {
+            latchNativeJournalFailure("encoding the \(purpose) context", error)
+            return (nil, "rejected")
+        }
+        let manifest = ContextManifest(
+            schemaVersion: bodyManifest.schemaVersion, manifestID: bodyManifest.manifestID,
+            requestID: bodyManifest.requestID, modelID: bodyManifest.modelID,
+            measuredBy: bodyManifest.measuredBy, components: bodyManifest.components,
+            omissions: bodyManifest.omissions,
+            cumulativeDeliveredBytes: bodyManifest.cumulativeDeliveredBytes,
+            systemPromptAssemblyID: applicableAssembly?.digest,
+            systemPromptSources: promptSources)
+        var contextAttributes: [String: AviaryTraceValue] = [
+            "aviary.operation": .string(
+                kind == .compactionProvider ? "compaction" : "normal"),
+            "aviary.request.id": .string(AviaryTelemetry.identity(manifest.requestID)),
+            "aviary.context.manifest.id": .string(AviaryTelemetry.identity(manifest.manifestID)),
+            "aviary.context.components": .int(manifest.components.count),
+            "aviary.context.omissions": .int(manifest.omissions.count),
+        ]
+        if manifest.measuredBytes >= 0 {
+            contextAttributes["aviary.context.measured_bytes"] = .int(manifest.measuredBytes)
+        }
+        if manifest.deliveredBytes >= 0 {
+            contextAttributes["aviary.context.delivered_bytes"] = .int(manifest.deliveredBytes)
+        }
+        do {
             let permit = try await nativeJournal.prepareModelCrossing(
                 manifest: manifest, kind: kind, intent: intent,
-                target: config.model.qualifiedID)
+                target: targetModel)
+            let actionAttributes = [
+                "aviary.action.id": .string(
+                    AviaryTelemetry.identity(permit.action.actionID)),
+                "aviary.action.kind": .string(Self.telemetryActionKind(kind)),
+                "aviary.receipt.state": .string("started"),
+            ] as [String: AviaryTraceValue]
             AviaryTelemetry.event(
                 "aviary.agent.action.admitted",
-                attributes: [
-                    "aviary.action.id": .string(
-                        AviaryTelemetry.identity(permit.action.actionID)),
-                    "aviary.event.id": .string(
-                        AviaryTelemetry.identity(permit.startedCommit.eventRef.eventID)),
-                    "aviary.event.sequence": .int(permit.startedCommit.cursor.sequence),
-                    "aviary.action.kind": .string(Self.telemetryActionKind(kind)),
-                    "aviary.receipt.state": .string("started"),
-                ])
+                attributes: AviaryTelemetry.canonicalReferenceAttributes(
+                    permit.startedCommit, role: .event).merging(
+                        actionAttributes, uniquingKeysWith: { _, replacement in replacement }))
+            AviaryTelemetry.event(
+                "aviary.agent.context.prepared",
+                attributes: contextAttributes.merging(
+                    AviaryTelemetry.canonicalReferenceAttributes(
+                        permit.startedCommit, role: .actionStarted),
+                    uniquingKeysWith: { _, replacement in replacement }).merging(
+                        actionAttributes, uniquingKeysWith: { _, replacement in replacement }))
+            AviaryTelemetry.outcome("succeeded")
             modelRequestOrdinal += 1
-            return permit
+            return (permit, nil)
         } catch {
+            // Context is appended before the Work action starts. Even an invalid-operation
+            // error here may follow a durable context prefix, so do not call it rejected.
+            let outcome = "indeterminate"
+            AviaryTelemetry.outcome(outcome)
             latchNativeJournalFailure("the \(purpose) context crossing", error)
-            return nil
+            return (nil, outcome)
         }
     }
 
@@ -1668,7 +1749,7 @@ public actor Agent {
                 "aviary.agent.prompt_bytes": .int(prompt.utf8.count),
             ]) {
                 let outcome = await self.sendBody(prompt, onInputDelivery: onInputDelivery)
-                AviaryTelemetry.outcome(Self.telemetryOutcome(outcome))
+                AviaryTelemetry.outcome(Self.telemetryOutcome(outcome), fallbackOnly: true)
                 return outcome
             }
     }
@@ -2065,18 +2146,19 @@ public actor Agent {
     /// between them with a summary. Nothing is lost from the *transcript* — the file keeps
     /// every entry and records a `compaction` marker — so the model forgets while the record
     /// does not, and a reader can still see what was dropped.
-    private func compactIfNeeded() async {
-        guard let window = config.model.contextWindow, window > 0 else { return }
+    @discardableResult
+    private func compactIfNeeded() async -> String? {
+        guard let window = config.model.contextWindow, window > 0 else { return nil }
         let threshold = Int(Double(window) * config.compactAtContextShare)
-        guard lastInputTokens > threshold else { return }
+        guard lastInputTokens > threshold else { return nil }
         // Needs enough middle to be worth summarising: system + task + a few recent turns.
-        guard messages.count > 8 else { return }
+        guard messages.count > 8 else { return nil }
 
         let keepRecent = 4
         let head = messages.prefix(2)                       // system, first task
         let middle = messages.dropFirst(2).dropLast(keepRecent)
         let tail = messages.suffix(keepRecent)
-        guard middle.count >= 2 else { return }
+        guard middle.count >= 2 else { return nil }
 
         let transcriptText = middle.map { message -> String in
             var line = "\(message.role.rawValue.uppercased()): \(message.plainText)"
@@ -2089,6 +2171,30 @@ public actor Agent {
             }
             return line
         }.joined(separator: "\n\n")
+
+        let outcome: String? = await AviaryTelemetry.withSpan(
+            "aviary.agent.compaction",
+            attributes: [
+                "aviary.compaction.dropped_messages": .int(middle.count),
+            ]) { () async -> String? in
+                let result = await self.performCompaction(
+                    head: Array(head), middle: Array(middle), tail: Array(tail),
+                    transcriptText: transcriptText)
+                if self.journalFailureDetail != nil {
+                    AviaryTelemetry.outcome("indeterminate")
+                    return "indeterminate"
+                }
+                return result
+            }
+        if journalFailureDetail != nil {
+            AviaryTelemetry.outcome("indeterminate")
+        }
+        return outcome
+    }
+
+    private func performCompaction(
+        head: [ChatMessage], middle: [ChatMessage], tail: [ChatMessage], transcriptText: String
+    ) async -> String? {
 
         let compactionInstructions =
             "You compress an agent's working transcript so it can keep going. "
@@ -2110,11 +2216,13 @@ public actor Agent {
             if nativeJournal != nil {
                 latchNativeJournalFailure("assembling the compaction prompt", error)
             }
-            return
+            return "indeterminate"
         }
 
+        let crossingModel = config.model
+        let crossingProvider = provider
         let ask = ChatRequest(
-            model: config.model.id,
+            model: crossingModel.id,
             messages: [
                 .system(compactionInstructions),
                 .user("Summarise this span of work:\n\n"
@@ -2125,17 +2233,20 @@ public actor Agent {
         let permit = await prepareModelCrossing(
             for: ask, purpose: "compaction", kind: .compactionProvider,
             intent: "Compact the conversation with the provider",
-            assembly: compactionAssembly)
+            assembly: compactionAssembly, targetModel: crossingModel.qualifiedID)
         do { try requireNativePermit(permit, for: "compaction provider") }
-        catch { return }
+        catch { return "indeterminate" }
         var compactionProviderSucceeded = false
         var compactionProviderFailed = false
         do {
             try await AviaryTelemetry.withSpan(
                 "aviary.agent.provider", kind: .client,
-                attributes: telemetryProviderAttributes(crossing: "compaction", permit: permit)) {
+                attributes: telemetryProviderAttributes(crossing: "compaction", permit: permit, model: crossingModel)) {
+                    var measurements = AviaryProviderTelemetry()
+                    defer { measurements.record(model: crossingModel, accounting: crossingProvider.usageAccounting) }
                     do {
-                        for try await event in provider.stream(ask) {
+                        for try await event in crossingProvider.stream(ask) {
+                            measurements.observe(event)
                             if case .textDelta(let t) = event { summary += t }
                         }
                     } catch {
@@ -2183,24 +2294,39 @@ public actor Agent {
                 _ = await appendJournalNote(
                     "Could not compact the conversation: \(error.localizedDescription)")
             }
-            return
+            AviaryTelemetry.outcome(
+                compactionProviderFailed ? "failed" : "indeterminate", fallbackOnly: true)
+            return compactionProviderFailed ? "failed" : "indeterminate"
         }
-        guard compactionProviderSucceeded else { return }
+        guard compactionProviderSucceeded else {
+            AviaryTelemetry.outcome("failed", fallbackOnly: true)
+            return "failed"
+        }
 
         let before = lastInputTokens
         if let nativeJournal {
             do {
-                _ = try await nativeJournal.commitCompaction(
+                let commit = try await nativeJournal.commitCompaction(
                     summary: summary, tokensBefore: before, droppedMessages: middle.count)
+                AviaryTelemetry.event(
+                    "aviary.agent.compaction.committed",
+                    attributes: AviaryTelemetry.canonicalReferenceAttributes(commit).merging([
+                        "aviary.compaction.tokens_before": .int(before),
+                        "aviary.compaction.dropped_messages": .int(middle.count),
+                        "aviary.compaction.summary_bytes": .int(summary.utf8.count),
+                        "aviary.receipt.state": .string("succeeded"),
+                    ], uniquingKeysWith: { _, replacement in replacement }))
             } catch {
+                let outcome = Self.telemetryAdmissionOutcome(error)
+                AviaryTelemetry.outcome(outcome)
                 latchNativeJournalFailure("the context compaction", error)
-                return
+                return outcome
             }
         }
-        messages = Array(head)
+        messages = head
             + [ChatMessage(role: .user, content: [.text(
                 "[Earlier work, compacted]\n\n" + summary)])]
-            + Array(tail)
+            + tail
         compactions += 1
         lastInputTokens = 0
         do {
@@ -2211,9 +2337,12 @@ public actor Agent {
                 + error.localizedDescription
             emit(.compacted(before: before, after: messages.count, summary: summary))
             emit(.failed(journalFailureDetail!))
-            return
+            AviaryTelemetry.outcome("indeterminate")
+            return "indeterminate"
         }
         emit(.compacted(before: before, after: messages.count, summary: summary))
+        AviaryTelemetry.outcome("succeeded")
+        return "succeeded"
     }
 
     // MARK: One turn
@@ -2277,8 +2406,10 @@ public actor Agent {
             // ordinary live context changes and receive their own manifest before dispatch.
             config.expectedResumeTools = nil
         }
+        let crossingModel = config.model
+        let crossingProvider = provider
         let request = ChatRequest(
-            model: config.model.id,
+            model: crossingModel.id,
             messages: messagesForTurn,
             tools: tools,
             maxTokens: config.maxTokens,
@@ -2286,15 +2417,19 @@ public actor Agent {
 
         let permit = await prepareModelCrossing(
             for: request, purpose: "model", kind: .provider,
-            intent: "Request the next agent response", assembly: requestAssembly)
+            intent: "Request the next agent response", assembly: requestAssembly,
+            targetModel: crossingModel.qualifiedID)
         try requireNativePermit(permit, for: "provider")
         var turn = Turn()
         do {
             try await AviaryTelemetry.withSpan(
                 "aviary.agent.provider", kind: .client,
-                attributes: telemetryProviderAttributes(crossing: "normal", permit: permit)) {
+                attributes: telemetryProviderAttributes(crossing: "normal", permit: permit, model: crossingModel)) {
+                    var measurements = AviaryProviderTelemetry()
+                    defer { measurements.record(model: crossingModel, accounting: crossingProvider.usageAccounting) }
                     do {
-                        for try await event in provider.stream(request) {
+                        for try await event in crossingProvider.stream(request) {
+                            measurements.observe(event)
                             switch event {
                             case .textDelta(let t):
                                 turn.text += t
@@ -2309,7 +2444,7 @@ public actor Agent {
                             case .usage(let u):
                                 // Priced here rather than at display time, so the transcript carries dollars
                                 // and every screen that reads it agrees without re-deriving them.
-                                turn.usage = config.model.priced(u)
+                                turn.usage = crossingModel.priced(u)
                             case .done(let reason):
                                 turn.stopReason = reason
                             }
@@ -2361,7 +2496,8 @@ public actor Agent {
                 "aviary.tool.kind": .string(telemetryToolKind(call.name)),
             ]) {
                 let result = await self.executeBody(call)
-                AviaryTelemetry.outcome(result.1 ? "failed" : "succeeded")
+                AviaryTelemetry.outcome(
+                    result.1 ? "failed" : "succeeded", fallbackOnly: true)
                 return result
             }
     }

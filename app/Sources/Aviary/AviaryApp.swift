@@ -148,10 +148,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// flushed cancels termination instead of silently becoming memory loss. This is intentionally
     /// not invoked for last-window close: that event has no user intent to end Work.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let prepareForTermination else { return .terminateNow }
         guard terminationTask == nil else { return .terminateLater }
         terminationTask = Task { @MainActor in
-            let draftsAndWorkAreReady = await prepareForTermination()
+            let draftsAndWorkAreReady = await prepareForTermination?() ?? true
+            if draftsAndWorkAreReady { await AviaryTelemetry.shutdown(maximumDuration: 2) }
             terminationTask = nil
             sender.reply(toApplicationShouldTerminate: draftsAndWorkAreReady)
         }

@@ -125,9 +125,21 @@ public enum ChatError: LocalizedError {
     }
 }
 
+/// Relationship between the adapter's input count and its separately reported cache counts.
+public enum ProviderUsageAccounting: String, Sendable {
+    case cacheInclusive = "cache_inclusive"
+    case cacheExclusive = "cache_exclusive"
+    case unknown
+}
+
 public protocol ChatProvider: Sendable {
     var id: String { get }
+    var usageAccounting: ProviderUsageAccounting { get }
     func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error>
+}
+
+public extension ChatProvider {
+    var usageAccounting: ProviderUsageAccounting { .unknown }
 }
 
 // MARK: - Server-sent events
@@ -215,6 +227,7 @@ extension AsyncSequence where Element == UInt8 {
 /// including the LiteLLM gateway that fronts the rest — so one implementation reaches every
 /// route that is actually in use, and keeps the gateway's metering intact.
 public struct OpenAICompletionsProvider: ChatProvider {
+    public var usageAccounting: ProviderUsageAccounting { .cacheInclusive }
     public let id: String
     public let baseURL: URL
     public let apiKey: String?

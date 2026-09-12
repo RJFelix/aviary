@@ -744,14 +744,56 @@ public struct ObservedRepositoryReviewer: Sendable {
         observedAt: Date = Date(),
         limits: ObservedRepositoryReviewLimits = .default) async -> ObservedRepositoryReview
     {
-        let observer = ObservationState(
-            cwd: cwd.standardizedFileURL,
-            runID: runID,
-            turnID: turnID,
-            observedAt: observedAt,
-            limits: limits,
-            commandRunner: commandRunner)
-        return await observer.run()
+        // Keep this span around the actual bounded Git observation.  Only bounded facts leave
+        // the process: the Run/Turn are correlation hashes, while status and measurements are
+        // emitted as a fixed completion event after the observer has settled.  In particular,
+        // no cwd, path, diff, or retained body is ever an attribute or event value.
+        return await AviaryTelemetry.withSpan(
+            "aviary.repository.review",
+            attributes: [
+                "aviary.run.id": .string(AviaryTelemetry.identity(runID)),
+                "aviary.turn.id": .string(AviaryTelemetry.identity(turnID)),
+            ]) {
+                let observer = ObservationState(
+                    cwd: cwd.standardizedFileURL,
+                    runID: runID,
+                    turnID: turnID,
+                    observedAt: observedAt,
+                    limits: limits,
+                    commandRunner: commandRunner)
+                let review = await observer.run()
+                var attributes: [String: AviaryTraceValue] = [
+                    "aviary.repository.review.status": .string(review.status.rawValue),
+                    "aviary.repository.review.files": .int(review.files.count),
+                    "aviary.repository.review.diffs": .int(review.diffs.count),
+                    "aviary.repository.review.omissions": .int(review.omissions.count),
+                    "aviary.repository.review.diff_bytes": .int(
+                        review.diffs.reduce(0) { partial, diff in
+                            let (value, overflow) = partial.addingReportingOverflow(
+                                max(0, diff.byteCount))
+                            return overflow ? Int.max : value
+                        }),
+                    "aviary.repository.review.bounded": .bool(review.coverage.bounded),
+                ]
+                if AviaryTelemetry.context != nil,
+                   let artifactBytes = try? review.encoded().count {
+                    attributes["aviary.repository.review.artifact_bytes"] = .int(artifactBytes)
+                }
+                AviaryTelemetry.event("aviary.repository.review.completed", attributes: attributes)
+                switch review.status {
+                case .clean, .changes, .bounded:
+                    AviaryTelemetry.outcome("completed")
+                case .notRepository:
+                    AviaryTelemetry.outcome("unavailable")
+                case .unstableConflict:
+                    AviaryTelemetry.outcome("indeterminate")
+                case .timedOut, .failed:
+                    AviaryTelemetry.outcome("failed")
+                case .cancelled:
+                    AviaryTelemetry.outcome("cancelled")
+                }
+                return review
+            }
     }
 
     public static let liveCommandRunner: CommandRunner = { arguments, cwd, timeout in

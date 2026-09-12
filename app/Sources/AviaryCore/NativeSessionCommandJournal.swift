@@ -380,7 +380,33 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
 
     public func markDelivered(_ intent: SessionCommandIntent, at timestamp: Date) async throws {
         try validate(intent)
-        _ = try await nativeJournal.markCommandDelivered(commandID: intent.commandID)
+        _ = try await AviaryTelemetry.withSpan(
+            "aviary.command.canonical_delivery",
+            attributes: [
+                "aviary.command.ledger.id": .string(AviaryTelemetry.identity(intent.commandID)),
+                "aviary.client.id": .string(AviaryTelemetry.identity(intent.actorID)),
+                "aviary.session.id": .string(AviaryTelemetry.identity(identity.sessionID)),
+                "aviary.work.id": .string(AviaryTelemetry.workIdentity(identity.work)),
+                "aviary.run.id": .string(AviaryTelemetry.identity(identity.runID)),
+            ]) {
+                do {
+                    let commit = try await nativeJournal.markCommandDelivered(
+                        commandID: intent.commandID)
+                    AviaryTelemetry.event("aviary.command.canonical_delivery", attributes: [
+                        "aviary.command.ledger.id": .string(
+                            AviaryTelemetry.identity(intent.commandID)),
+                        "aviary.delivery.state": .string("delivered"),
+                    ].merging(AviaryTelemetry.canonicalReferenceAttributes(commit)) { _, exact in exact })
+                    AviaryTelemetry.outcome("succeeded")
+                    return commit
+                } catch {
+                    AviaryTelemetry.event(
+                        "aviary.agent.exception",
+                        attributes: ["error.type": .string("canonical_delivery")])
+                    Self.recordCanonicalDeliveryFailure(error)
+                    throw error
+                }
+            }
         try await legacyProjection.markDelivered(intent, at: timestamp)
     }
 
@@ -388,8 +414,43 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
         _ intent: SessionCommandIntent, reason: String, at timestamp: Date
     ) async throws {
         try validate(intent)
-        _ = try await nativeJournal.markCommandNotDelivered(
-            commandID: intent.commandID, reason: reason)
+        try await AviaryTelemetry.withSpan("aviary.command.canonical_nondelivery", attributes: [
+            "aviary.command.ledger.id": .string(AviaryTelemetry.identity(intent.commandID)),
+            "aviary.client.id": .string(AviaryTelemetry.identity(intent.actorID)),
+            "aviary.session.id": .string(AviaryTelemetry.identity(identity.sessionID)),
+            "aviary.work.id": .string(AviaryTelemetry.workIdentity(identity.work)),
+            "aviary.run.id": .string(AviaryTelemetry.identity(identity.runID)),
+        ]) {
+            do {
+                let commit = try await nativeJournal.markCommandNotDelivered(
+                    commandID: intent.commandID, reason: reason)
+                AviaryTelemetry.event("aviary.command.canonical_nondelivery", attributes: [
+                    "aviary.command.ledger.id": .string(AviaryTelemetry.identity(intent.commandID)),
+                    "aviary.delivery.state": .string("not_delivered"),
+                ].merging(AviaryTelemetry.canonicalReferenceAttributes(commit)) { _, exact in exact })
+                AviaryTelemetry.outcome("succeeded")
+            } catch {
+                AviaryTelemetry.event("aviary.agent.exception", attributes: [
+                    "error.type": .string("canonical_delivery"),
+                ])
+                Self.recordCanonicalDeliveryFailure(error)
+                throw error
+            }
+        }
+    }
+
+    private static func recordCanonicalDeliveryFailure(_ error: Error) {
+        if let error = error as? RunJournalBundleError {
+            switch error {
+            case .invalidOperation, .alreadyFinished, .workTerminal:
+                AviaryTelemetry.outcome("rejected")
+                return
+            default: break
+            }
+        }
+        // An append can fail after writing. No commit event is emitted without confirmation,
+        // and failure alone must not imply that the delivery record does not exist.
+        AviaryTelemetry.outcome("indeterminate")
     }
 
     private func validate(_ intent: SessionCommandIntent) throws {

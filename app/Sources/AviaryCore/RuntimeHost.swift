@@ -18,6 +18,7 @@ private enum UnixSocketFailure: Error {
 private final class UnixSocketConnection: @unchecked Sendable {
     let path: String
     private let handle: FileHandle
+    private let stateLock = NSLock()
     private let writeLock = NSLock()
     private var closed = false
     private var handleClosed = false
@@ -80,7 +81,7 @@ private final class UnixSocketConnection: @unchecked Sendable {
     func write(_ data: Data) throws {
         writeLock.lock()
         defer { writeLock.unlock() }
-        guard !closed else { throw UnixSocketFailure.closed }
+        guard !isClosed() else { throw UnixSocketFailure.closed }
         // FileHandle.write can ignore SO_SNDTIMEO while it retries a short socket write. Use
         // non-blocking send attempts and a bounded poll instead, while leaving the descriptor's
         // read mode untouched for FileHandle's readability handler.
@@ -120,7 +121,7 @@ private final class UnixSocketConnection: @unchecked Sendable {
                 }
             }
         } catch {
-            closed = true
+            _ = claimClosed()
             closeHandleLocked()
             throw error
         }
@@ -130,27 +131,82 @@ private final class UnixSocketConnection: @unchecked Sendable {
         onData: @escaping @Sendable (Data) -> Void,
         onClose: @escaping @Sendable () -> Void
     ) {
-        handle.readabilityHandler = { [weak self] handle in
-            let chunk = handle.availableData
-            guard !chunk.isEmpty else {
-                self?.markClosed()
-                onClose()
-                return
+        handle.readabilityHandler = { [weak self] _ in
+            guard let self else { return }
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            // Yield the callback queue after at most 1 MiB, including under a continuous sender.
+            for _ in 0..<16 {
+                guard let (count, readError) = self.receive(into: &buffer) else { break }
+                if count > 0 {
+                    onData(Data(buffer[0..<count]))
+                    continue
+                }
+                if count == 0 {
+                    if self.markClosed() { onClose() }
+                    break
+                }
+                if readError == EINTR { continue }
+                if readError == EAGAIN || readError == EWOULDBLOCK { break }
+                if self.markClosed() { onClose() }
+                break
             }
-            onData(chunk)
         }
     }
 
-    func close() {
-        writeLock.lock()
-        closed = true
-        closeHandleLocked()
-        writeLock.unlock()
+    private func receive(into buffer: inout [UInt8]) -> (Int, Int32)? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !closed else { return nil }
+        let count = recv(handle.fileDescriptor, &buffer, buffer.count, Int32(MSG_DONTWAIT))
+        return (count, errno)
     }
 
-    private func markClosed() {
-        writeLock.lock()
+    func close() {
+        guard claimClosed() else { return }
+        finishClose()
+    }
+
+    /// The readability callback must not synchronously tear down its own FileHandle source.
+    /// Callers already executing on that callback queue use this deferred form instead.
+    func deferClose() {
+        guard claimClosed() else { return }
+        DispatchQueue.global(qos: .utility).async {
+            self.finishClose()
+        }
+    }
+
+    @discardableResult
+    private func markClosed() -> Bool {
+        // ``markClosed`` runs on Foundation's readability callback queue. FileHandle's
+        // readability-handler mutation and close path synchronously coordinate with that queue;
+        // doing either reentrantly traps on Linux in ``__DISPATCH_WAIT_FOR_QUEUE__``. Claim the
+        // state above, then finish cleanup only after this callback has returned.
+        guard claimClosed() else { return false }
+        DispatchQueue.global(qos: .utility).async {
+            self.finishClose()
+        }
+        return true
+    }
+
+    private func claimClosed() -> Bool {
+        stateLock.lock()
+        guard !closed else {
+            stateLock.unlock()
+            return false
+        }
         closed = true
+        stateLock.unlock()
+        return true
+    }
+
+    private func isClosed() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return closed
+    }
+
+    private func finishClose() {
+        writeLock.lock()
         closeHandleLocked()
         writeLock.unlock()
     }
@@ -160,9 +216,13 @@ private final class UnixSocketConnection: @unchecked Sendable {
     /// the underlying descriptor is not leaked or accidentally closed twice.
     private func closeHandleLocked() {
         guard !handleClosed else { return }
+        // Removing the handler can wait for the read callback. Do that before taking its
+        // short recv lock, then fence the actual descriptor close against any acquired read.
         handle.readabilityHandler = nil
+        stateLock.lock()
         try? handle.close()
         handleClosed = true
+        stateLock.unlock()
     }
 }
 
@@ -670,14 +730,14 @@ public actor RuntimeHost {
                                 // a transport failure; close it so pending requests fail and a
                                 // later reconnect can establish a clean stream.
                                 inputContinuation.finish()
-                                connection.close()
+                                connection.deferClose()
                                 Task { await self?.handleTransportClose(generation: generation) }
                                 return
                             case .terminated:
                                 return
                             @unknown default:
                                 inputContinuation.finish()
-                                connection.close()
+                                connection.deferClose()
                                 Task { await self?.handleTransportClose(generation: generation) }
                                 return
                             }
@@ -687,7 +747,7 @@ public actor RuntimeHost {
                             // this client transport so pending calls fail promptly instead of
                             // retaining an unbounded partial line or waiting for a timeout.
                             inputContinuation.finish()
-                            connection.close()
+                            connection.deferClose()
                             Task { await self?.handleTransportClose(generation: generation) }
                         }
                     },
@@ -885,6 +945,9 @@ public actor RuntimeHost {
                 let kind = v["kind"]?.stringValue ?? ""
                 let payload = v["payload"] ?? .object([:])
                 let session = v["session"]?.stringValue ?? ""
+                let callbackParent = v["traceparent"]?.stringValue.flatMap {
+                    AviaryTraceContext(traceparent: $0)
+                }
                 guard callbackAdmissionOpen else {
                     // Admission is a one-way lifecycle boundary. The host is normally already
                     // stopping here, so do not run an application callback merely to answer an
@@ -908,8 +971,18 @@ public actor RuntimeHost {
                     var failure: Error?
                     do {
                         try await Self.$activeCallbackID.withValue(callbackID) {
-                            try await self.serveCallback(
-                                rid: rid, kind: kind, payload: payload, session: session)
+                            try await AviaryTelemetry.withSpan(
+                                "aviary.runtime.callback",
+                                kind: .server,
+                                attributes: [
+                                    "aviary.runtime.session.id": .string(AviaryTelemetry.identity(session)),
+                                    "aviary.request.id": .string(AviaryTelemetry.identity(rid)),
+                                ],
+                                parent: callbackParent
+                            ) {
+                                try await self.serveCallback(
+                                    rid: rid, kind: kind, payload: payload, session: session)
+                            }
                         }
                     } catch {
                         failure = error
@@ -1009,23 +1082,46 @@ public actor RuntimeHost {
 
     @discardableResult
     private func send(
-        _ op: String, _ fields: [String: JSONValue] = [:], timeout: TimeInterval = 120
+        _ op: String,
+        _ fields: [String: JSONValue] = [:],
+        timeout: TimeInterval = 120,
+        diagnosticFields: [String: JSONValue] = [:]
     ) async throws -> JSONValue? {
         guard isConnected, let socket else { throw HostError.notRunning }
         nextID += 1
         let id = "av-\(nextID)"
-        var obj = fields
-        obj["id"] = .string(id)
-        obj["op"] = .string(op)
+        var baseObject = fields
+        baseObject["id"] = .string(id)
+        baseObject["op"] = .string(op)
+        var tracedObject = baseObject
+        for (key, value) in diagnosticFields where tracedObject[key] == nil {
+            tracedObject[key] = value
+        }
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
-        guard var data = try? encoder.encode(JSONValue.object(obj)) else {
-            throw HostError.malformedReply
+        func encodedFrame(_ object: [String: JSONValue]) throws -> Data {
+            guard var data = try? encoder.encode(JSONValue.object(object)) else {
+                throw HostError.malformedReply
+            }
+            data.append(UInt8(ascii: "\n"))
+            guard data.count <= Self.maxFrameBytes else {
+                throw HostError.frameTooLarge(op: op, bytes: data.count, limit: Self.maxFrameBytes)
+            }
+            return data
         }
-        data.append(UInt8(ascii: "\n"))
-        guard data.count <= Self.maxFrameBytes else {
-            throw HostError.frameTooLarge(op: op, bytes: data.count, limit: Self.maxFrameBytes)
+
+        // Trace context is diagnostic only. If it is the sole reason a request exceeds the
+        // frame bound, preserve the base request and send it once without context. This all
+        // happens before pending registration and the first write, so there is no post-write
+        // retry or ambiguity about how many requests were delivered.
+        let data: Data
+        do {
+            data = try encodedFrame(tracedObject)
+        } catch let error as HostError {
+            guard !diagnosticFields.isEmpty, case .frameTooLarge = error else { throw error }
+            data = try encodedFrame(baseObject)
+            AviaryTelemetry.event("aviary.transport.context_omitted")
         }
 
         // Register the reply stream before the first suspension or write. The previous
@@ -1234,12 +1330,17 @@ public actor RuntimeHost {
                 // Keep the protocol live for the runtime's blocked request, while preserving the
                 // typed handler failure for waitUntilCallbacksQuiescent(). If even this response
                 // cannot be delivered, that transport error is also propagated by the task.
-                _ = try await send("callback.result", [
-                    "rid": .string(rid),
-                    "result": .object([
-                        "error": .string(Self.boundedErrorDescription(error)),
-                    ]),
-                ], timeout: 30)
+                do {
+                    _ = try await send("callback.result", [
+                        "rid": .string(rid),
+                        "result": .object([
+                            "error": .string(Self.boundedErrorDescription(error)),
+                        ]),
+                    ], timeout: 30)
+                } catch {
+                    AviaryTelemetry.outcome("indeterminate")
+                    throw error
+                }
                 throw error
             }
         } else {
@@ -1249,9 +1350,22 @@ public actor RuntimeHost {
                 "error": .string("This client does not serve \(kind) requests."),
             ])
         }
-        _ = try await send("callback.result", [
-            "rid": .string(rid), "result": result,
-        ], timeout: 30)
+        do {
+            let reply = try await send("callback.result", [
+                "rid": .string(rid), "result": result,
+            ], timeout: 30)
+            // This describes the callback exchange, not success of an arbitrary Python effect.
+            let status = reply?["status"]?.stringValue ?? "unknown"
+            AviaryTelemetry.event("aviary.runtime.callback.reply", attributes: [
+                "aviary.runtime.callback.reply_state": .string(status),
+            ])
+            AviaryTelemetry.outcome(status == "accepted" || status == "duplicate"
+                ? "completed" : "indeterminate")
+        } catch {
+            // The handler has returned; loss of its reply must not imply it was never invoked.
+            AviaryTelemetry.outcome("indeterminate")
+            throw error
+        }
     }
 
     private func validateHandshake(_ caps: Capabilities) throws {
@@ -1469,11 +1583,17 @@ public actor RuntimeHost {
     private func executeUntraced(
         _ code: String, in session: String, mode: String, timeout: TimeInterval
     ) async throws -> ExecResult {
+        var diagnosticFields: [String: JSONValue] = [:]
+        if let traceparent = AviaryTelemetry.traceparent {
+            diagnosticFields["traceparent"] = .string(traceparent)
+        }
         guard let data = try await send("exec", [
             "session": .string(session),
             "code": .string(code),
             "mode": .string(mode),
-        ], timeout: timeout) else { throw HostError.malformedReply }
+        ], timeout: timeout, diagnosticFields: diagnosticFields) else {
+            throw HostError.malformedReply
+        }
         return ExecResult(
             stdout: data["stdout"]?.stringValue ?? "",
             stderr: data["stderr"]?.stringValue ?? "",

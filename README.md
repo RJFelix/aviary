@@ -165,6 +165,26 @@ size inline. Where it doesn't — the Codex route encrypts its reasoning — Avi
 
 ## Build and run
 
+### Optional OpenTelemetry tracing
+
+Tracing is off by default and backend-neutral. Enable it for each process at launch with
+`AVIARY_OTEL_ENABLED=1` and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` pointing to an OTLP/HTTP
+protobuf collector (for example, `http://127.0.0.1:4318/v1/traces`). An already-running Work
+Host keeps its original configuration. Remote collectors require HTTPS; use a local collector
+for authenticated forwarding rather than putting credentials in the endpoint URL.
+
+Spans record bounded operational metadata and hashed identities, not prompts, code, thinking,
+tool bodies, or raw errors. They are diagnostic and may be lost; canonical journals remain the
+authority for delivery and recovery. Current coverage, known gaps, and verification are in the
+[observability plan](plans/opentelemetry.md).
+
+Diagnostics shows this app process's queue and export-result counters separately from agent-service
+health. The exporter holds at most 1,024 queued/in-flight spans and drains against one bounded
+deadline on ordinary exit. Collector failures never retry Work or prevent quitting. HTTP success
+is not proof of backend retention, and abrupt termination can still lose traces.
+
+### Building
+
 The GUI requires macOS 15+ and a Swift 6 toolchain (Command Line Tools is enough — no Xcode).
 The headless Work Host and selected Core/self-test surfaces also build on Linux.
 

@@ -12,6 +12,7 @@ import FoundationNetworking
 /// thinking is a first-class block type, and the stream is typed events rather than deltas on
 /// a choice.
 public struct AnthropicMessagesProvider: ChatProvider {
+    public var usageAccounting: ProviderUsageAccounting { .cacheExclusive }
     public let id: String
     public let baseURL: URL
     public let apiKey: String?

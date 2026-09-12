@@ -1,8 +1,35 @@
 # Aviary observability: one journey across GUI, service, and agents
 
-Status: first implementation slice implemented and macOS-verified, 2026-09-11. Backend-neutral OTLP;
+Status: continuation instrumentation implemented, 2026-09-11. Backend-neutral OTLP;
 no collector selected or enabled in the installed app. This is a coverage plan, not a claim
 that every stage below is already instrumented.
+
+Prior continuation baseline verified: saved-chat/initial delivery tracing, provider measurements,
+Python execution/callback propagation, and independent linked child spans pass 49 focused cases /
+742 assertions. Full macOS: 1,246 cases / 19,025 assertions, 537.63 seconds. Fresh Linux Swift 6.3.3:
+40 grouped cases / 6,082 assertions, 243.39 seconds; clean aviaryd and SelfTest builds pass.
+The actual isolated AppModel probe exports seven verified OTLP spans. Verification exposed and
+fixed a real delayed-shell-Future state lifetime bug and Linux RuntimeHost EOF-close race; the
+redirect test now uses a real HTTP server rather than Linux's unsupported URLProtocol redirect
+fixture. These receipts precede the current small corrective pass for sticky uncertainty and
+journal-qualified canonical references.
+
+Current focused macOS receipt: 71 cases / 989 assertions, 14.25 seconds. This adds context and
+compaction, repository observation/publication, read acknowledgements, bounded exporter drain,
+and a stopped-provider propagation regression. The current signed AppModel collector probe passes
+with 13 spans (3 saves, 2 blocked startups, 6 read acknowledgements, 2 commands). Wide/off and
+narrow/enabled diagnostics fixtures were rendered and inspected from the signed app. Full macOS
+verification now passes: 1,268 cases / 19,275 assertions in 516.84 seconds. Fresh Linux and
+cross-device receipts are recorded below. The signed bundle and debug products build; the running
+user app/service has not been replaced or restarted.
+
+The first current broad run completed 1,268 cases with one saved-intent integration failure:
+its immediate post-Start refresh raced the still-settling Hosted turn. The fixture now waits
+for its exact owned actor to be idle, healthy and connected before asserting canonical delivery;
+12 consecutive isolated runs pass (28 assertions each). This is test sequencing, not a relaxation
+of canonical read checks or proof that transient GUI read errors are already well presented.
+The full rerun passes. The separate production review confirmed automatic next-poll recovery;
+the snapshot-coherence improvement remains a follow-up below.
 
 ## Contract
 
@@ -30,8 +57,8 @@ indeterminate outcome must survive a later thrown error.
 | Agent/model | Send, normal provider, compaction provider spans | Measured input/output/cached tokens, costs with pricing provenance, first-token latency and cancellation outcomes |
 | Tools/runtime | Tool and Python execution boundaries | Runtime request/callback propagation across output-pump tasks, dispatch/settlement timing and explicit unknown effects |
 | Canonical actions | Hashed committed action/event correlation | Verify complete admitted-effect-outcome joins under success, rejection, timeout, cancellation, and lost confirmation |
-| Background children | Agent execution inherits current task context where present | Explicit durable parent/child links across queues, detached tasks, restart and terminal Handle outcomes |
-| Recovery/review | Not yet traced | Attach/resume/reconstruct distinction, context assembly/compaction, artifact/repository review and GUI acknowledgement |
+| Background children | Explicit admission spans and independent linked execution roots verified | Preserve origin across queue promotion; truthful queued cancellation/expiry and terminal evidence; restart joins canonical identities, never resurrected spans |
+| Recovery/review | Context/compaction, repository observation/publication and actual GUI read acknowledgements | Distinct explicit Attach, presentation resume, reconstruction and retained-Start recovery; explicit history/review inspection scopes |
 
 Each stage must name its actual outcome: an accepted command is not delivered input, a finished
 HTTP call is not completed Work, and completed Python execution does not prove each external
@@ -63,12 +90,14 @@ messages, filesystem paths, environment values, credentials, and wire logs. Only
 instrumented bounded fields are accepted. Full bodies remain under the existing artifact/context
 inspection contract, not duplicated into telemetry. A future content opt-in needs separate review.
 
-Use a bounded SDK queue and bounded batch size; failed exports do not accumulate an unbounded
-retry list. Bound collector response bytes, concurrent requests, and request lifetime. Report
-export failures locally without recursively exporting their errors. A queue overflow or abrupt
+Use Aviary's bounded processor with the official SDK: at most 1,024 queued plus in-flight spans,
+128 per batch, one export worker, and no failed-batch retry list. Collector response bytes,
+concurrent requests, and request lifetime are bounded. Local saturating counters distinguish
+queue loss, accepted spans, exporter success, unconfirmed exporter results, and abandonment before
+export. A queue overflow or abrupt
 process exit can lose spans; do not market traces as a durable audit log. Successful unparented
 polling reads are suppressed in the first slice; read errors/slow-read summaries and shutdown
-drain coverage remain explicit follow-up work.
+drain coverage are tracked separately below.
 
 ## Verification gates
 
@@ -87,19 +116,19 @@ drain coverage remain explicit follow-up work.
 Do not declare exhaustive coverage on the strength of the first component tests. After each
 slice, update this matrix and distinguish source/build proof from installed-app proof.
 
-Current focused receipt: 19 cases / 156 assertions pass on macOS, including native successful
+Prior first-slice focused receipt: 19 cases / 156 assertions pass on macOS, including native successful
 and indeterminate provider actions joined to the canonical journal, real socket propagation,
 exact frame-boundary fallback, closed attribute vocabularies, and bounded collector behavior.
 No installed-app collector journey or current Linux trace receipt is claimed.
 
-Full receipt: 1,216 cases / 18,438 assertions passed in 527.95 seconds. `just compile`
+Prior checkpoint (84a0620) full receipt: 1,216 cases / 18,438 assertions passed in 527.95 seconds. `just compile`
 (Aviary + aviaryd), the SelfTest build, and staged whitespace checks pass. SwiftPM reports one
 upstream unhandled Markdown resource in the SDK's unused MetricKit target; no Aviary compiler
 warnings or errors. The first broad attempt stalled in a pre-existing scheduler-sensitive held-
 intent test; a bounded fixture wait/cleanup replaced its yield-count assumption before this clean
 full rerun. No installed app or service was replaced or restarted.
 
-## Next bounded implementation batch: saved chat to delivered input
+## Implemented continuation: saved chat to delivered input
 
 - Trace `AppModel.createPendingChat`'s local write separately from `retryPendingChat`'s later
   startup attempt. Correlate with hashed persisted chat/Create/Start IDs; do not invent Work or
@@ -117,6 +146,150 @@ full rerun. No installed app or service was replaced or restarted.
   retire only at its existing strict canonical-delivery predicate, never because a span succeeded.
 
 This batch changes instrumentation, not the command protocol, store schema, or delivery policy.
+
+### Continuation details and measurement boundaries
+
+- Local save and later startup have separate scopes. Reconciliation is a new root correlated
+  through hashed durable command IDs. Runtime delivery callbacks precede—and are separate from—
+  canonical delivery/nondelivery writes. Only a successful append emits the committed EventRef
+  hash and sequence; errors never synthesize a commit or trigger resubmission.
+- GUI/client command IDs and Native's client-qualified ledger command IDs are distinct domains.
+  `aviary.command.id` and `aviary.command.ledger.id` explicitly join them at the Hosted boundary.
+- Provider spans retain the dispatch model/provider across actor suspension and model switches,
+  including their canonical action target, usage-accounting convention, and rate snapshot.
+  A returned provider stream followed by an unrecordable action outcome is indeterminate.
+- Measurements record the latest adapter usage report, not the sum of cumulative updates.
+  Missing usage is `unreported`; malformed negative counts are `invalid`. Reasoning is a subset
+  of output, not added again. Individual field presence is not retained by `Usage`: a zero
+  adapter field is not proof that the provider explicitly reported zero. These are diagnostic
+  observations, not a new billing meter or enforcement authority.
+- `ProviderUsageAccounting` identifies cache-inclusive, cache-exclusive, or unknown input.
+  Estimates require a known relationship and complete valid rates for the used buckets; unknown
+  adapters, inconsistent cache counts, missing rates, and nonfinite arithmetic produce no dollar
+  amount. Configured rates, effective cache fallbacks, and a rate-set digest accompany estimates.
+  `model_spec` means configured pricing—not independently verified published prices or invoices.
+  The existing transcript/UI `ModelSpec.priced` and compaction input-count arithmetic still need
+  a separate accounting audit; this telemetry calculation does not certify those consumers.
+- First output latency measures the first nonempty text/thinking chunk or completed tool call,
+  not an exact first-token timestamp. Request-body/usage events do not count as output. No event
+  is exported for each token. Usage observed before a failure remains visible without claiming a
+  completed provider request.
+
+The cache-inclusive convention follows the official [OpenAI prompt-caching accounting](https://developers.openai.com/api/docs/guides/prompt-caching)
+and the actual adapters. Provider requests and provider usage payloads are unchanged by the
+new declaration; unrecognized adapters default to unknown rather than guessed accounting.
+
+`uv run scripts/verify-chat-telemetry.py <Aviary executable>` runs the actual isolated AppModel
+journey against a disposable loopback OTLP/HTTP protobuf collector. It verifies successful and
+failed saves, independent blocked-startup roots, and metadata-only export. It uses the actual
+production shutdown drain rather than a probe-only export-delay sleep. Current signed
+`build/Aviary.app` executable receipt: PASS, 13 received spans (3 saves, 2 blocked startups,
+6 read acknowledgements, 2 commands). This is the isolated AppModel path, not a live-provider journey or evidence
+that the user's running app/daemon was reconfigured. That separate gate remains above.
+
+Runtime continuation relays optional traceparent per execution and callback, including retained
+Future callables and reconnect replay. A callback exchange has its own explicit server parent;
+missing context never inherits the socket pump. Context is omitted before writing if it alone
+exceeds a frame bound. Callback frame serialization must not call arbitrary Python `__str__`
+an additional time just because tracing is enabled. Public helper signatures and user-replaced
+shared-host bindings remain unchanged. These are effect-preservation requirements, not just
+trace-shape tests. See the [runtime protocol](../docs/runtime-host-protocol.md#diagnostic-tracing).
+
+Work-child execution uses a fresh root with a bounded OTel link to its admitting span, not the
+context of whichever operation later pumps the queue. Its provider/runtime children inherit that
+execution scope. Admission context exists only in coordinator memory; no trace ID or open span is
+persisted into a Work journal. Restart correlation uses canonical identity hashes. Work hashes
+include the owning host with unambiguous length-delimited encoding, consistently across GUI,
+Hosted delivery, and children. Handle hashes are qualified by that Work identity. Queue wait is
+monotonic elapsed time after the queue commitment is known, not a reconstructed wall-clock time.
+
+Schema 2 adds `aviary.event.journal.id` and `aviary.action.started.journal.id`: hashes of the
+complete, length-delimited JournalRef (journal ID, authority, owner kind and owner identity).
+Canonical joins require the journal hash plus event-ID hash; sequences are journal-local too.
+Schema-1 bare event hashes alone were not exact cross-journal identities. Primary and action-start
+references carry their own journal qualification. A mismatched cursor/reference or oversized
+diagnostic identity emits no canonical-reference tuple, never a truncated substitute. These fields
+remain diagnostics, not authorization or a substitute for reading canonical evidence.
+
+Current integration batch (focused verification passed): context preparation/compaction, repository
+observation and canonical artifact publication, and actual read-acknowledgement attempts (not every
+polling refresh and not a claim that a person read or approved changes). Read-ack tracing preserves
+the existing exact idempotent replay policy after descriptor reconciliation. Repository publication
+requires a returned Work-journal commit; a retained body alone or failed/uncertain append emits no
+publication receipt.
+
+The production exporter now has an absolute-deadline drain rather than chaining per-batch SDK flush
+timeouts. Concurrent callers share a deadline that can only shorten and an immutable result. A
+quiesced result means locally accepted spans reached an exporter result, which may be unconfirmed;
+it never proves backend retention. A deadline result records queued abandonment and in-flight
+uncertainty before transport cancellation. Late exporter completion can update live local counters,
+not rewrite that receipt. Transport closure and SDK-provider shutdown each occur once. Recording
+fixtures have a separate tracer and cannot accidentally shut down the production provider instead.
+
+The GUI drains only after its draft/resource quit preparation succeeds; rejected quit leaves tracing
+live. Daemon refusal/timeout likewise keeps tracing live, while actual exits drain after transport
+cleanup. Both headless engine success paths and async failures drain before exit; those CLI paths
+are source-reviewed, not yet separately collector-subprocess verified. Non-instrumented early usage,
+MCP-bridge setup and rendering/inspection modes are not claimed as traced engine journeys. The
+isolated AppModel collector probe now uses the real drain instead of a fixed export-delay sleep.
+Diagnostics exposes app-process counters only, explicitly not daemon or canonical delivery health.
+The stopped production provider cannot originate new trace context: the SDK otherwise supplies a
+valid unsampled no-op context after shutdown, which can suppress later callback traces. Existing
+remote sampling decisions remain intact, and independent recording providers remain usable.
+
+Linux baseline snapshot: `/home/azureuser/aviary-linux-final-20260912-0305`, manifest SHA-256
+`b6d0319107c86d237768974071ef7d433106f2ac61433624ddc7fd29f2b843af` (345 files,
+2026-09-12T03:05:52Z). Only the Mac-only shell regression fixture changed during that copy/build;
+production and Linux-selected sources were frozen. That snapshot's ordinary Mac-to-SSH connection
+proof is not a trace-propagation proof. The current opt-in Mac probe now configures OTel, and
+`scripts/verify-linux-telemetry.py` validates exact Mac-client/Linux-server parentage at a disposable
+protobuf collector through SSH streamlocal/reverse-TCP forwarding. Current execution receipt is pending.
+
+## Next bounded batches
+
+1. Close full macOS/current Linux verification and the cross-device collector proof. Keep snapshot,
+binary, signed-app and running-service identities distinct. No user service or permanent collector
+   configuration has been changed by these checks.
+2. Preserve quiet fast polling, but expose failed/slow unparented reads with duration-correct bounded
+   diagnostics. Direct read acknowledgements are mutations, not polling. Add consumer scopes for
+   history and repository inspection and distinct Attach/resume/reconstruction/retained-Start stages.
+3. Extend the signed isolated journey through a real disposable daemon and deterministic local
+   provider/runtime, including Queue/Steer/Stop and uncertain receipt reconciliation. Component
+   receipts do not substitute for this combined flow. Measure disabled/healthy/unreachable overhead.
+4. In a separate behavioral checkpoint, share provider-aware cache accounting with transcript
+   pricing, compaction pressure and token totals. Current `ModelSpec.priced`, `lastInputTokens`, and
+   Anthropic total-token calculations have different cache assumptions; the OTel observations do not
+   certify or fix them. Include compaction calls and partial/failed provider reports in the subsequent
+   cumulative budget audit before adding optional child token/spend limits.
+
+Current Linux verification uses the frozen 350-file snapshot
+`/home/azureuser/aviary-linux-final-20260912-035914`, manifest SHA-256
+`2771542413a33b602866b226d0e350a863f73a82f6bce0890a1b9d580269f27a`.
+Swift 6.3.3 release aviaryd builds; debug SelfTest plus colocated debug aviaryd passes
+40 grouped cases / 6,302 assertions in 248.31 seconds. The focused telemetry group passes
+881 assertions. A release SelfTest build is not claimed: the current test target uses
+`@testable import`, requiring the debug testing build. The Mac-only saved-chat fixture wait
+and neutral unprobed Diagnostics presentation do not change this Linux-selected source set.
+The current Mac probe and this snapshot's canonical debug daemon exported five spans through
+SSH forwarding to a disposable standard OTLP collector: two CLIENT/SERVER pairs with exact
+parentage, plus the probe root. This proves handshake/list propagation, not a remote provider
+turn. The script's first automatic cleanup check conservatively refused; exact PID/executable/
+AgentHome verification followed by scoped shutdown/removal confirmed no fixture daemon remained.
+The cause was Ubuntu dash's `kill` builtin rejecting `--`, so no signal was sent. The script now
+uses explicit `/bin/kill` after the same exact ownership checks. A second cross-device run passes
+the same five-span checks and automatic cleanup; no verification roots or fixture daemon remain.
+
+The saved-chat test investigation also identified a production snapshot-coherence follow-up:
+JBS currently selects a page from one canonical source, then re-reads for its descriptor.
+A concurrent Run transition can yield a mismatched tuple. The GUI safely retains its old pair,
+disables mutation and recovers on the next stable poll; this is not a permanent recovery latch.
+Constructing descriptor/page facts from one source and adding a deterministic transition test
+will avoid avoidable warnings and baseline replay without weakening reader validation.
+
+Queue/Steer delivery needs a separate causal-context correction before the combined journey:
+capture each admission's context in its deferred callback and parent delivery to that origin,
+with a bounded link to the executing turn. A missing origin must not silently inherit an
+unrelated Send. Keep context in memory only; canonical command identity remains authoritative.
 
 References: [OpenTelemetry trace API](https://opentelemetry.io/docs/specs/otel/trace/api/),
 [OTLP specification](https://opentelemetry.io/docs/specs/otlp/),

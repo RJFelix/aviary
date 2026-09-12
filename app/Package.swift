@@ -9,6 +9,8 @@ let packagePlatforms: [SupportedPlatform]? = nil
 let linuxCoreSources: [String] = [
     "AttachmentQualifiedIdentity.swift",
     "AviaryTelemetry.swift",
+    "AviaryBoundedSpanProcessor.swift",
+    "AviaryProviderTelemetry.swift",
     "AviaryTelemetryHTTPClient.swift",
     "AgentTree.swift",
     "AviaryPlatform.swift",
@@ -111,8 +113,14 @@ let linuxCoreSources: [String] = [
 let linuxSelfTestSources: [String] = [
     "AviaryTelemetryTests.swift",
     "AviaryTelemetryAgentTests.swift",
+    "AviaryTelemetryContextTests.swift",
+    "AviaryTelemetryDrainTests.swift",
+    "AviaryTelemetryRepositoryReviewTests.swift",
     "AviaryTelemetryTransportTests.swift",
     "AviaryTelemetryHTTPClientTests.swift",
+    "AviaryTelemetryDeliveryTests.swift",
+    "RuntimeHostTelemetryTests.swift",
+    "WorkAgentChildTelemetryTests.swift",
     "AttachmentQualifiedIdentityTests.swift",
     "AviaryDigestFormattingTests.swift",
     "AviaryPlatformTests.swift",

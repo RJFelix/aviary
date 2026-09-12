@@ -354,11 +354,13 @@ struct AviaryDaemonMain {
                 // SIGTERM during startup is an ordinary supervisor stop, not a daemon startup
                 // error. Cleanup has completed above, so return successfully without printing a
                 // misleading failure or exiting with status 1.
+                await AviaryTelemetry.shutdown(maximumDuration: 2)
                 return
             case .parentLeaseEnded:
                 startupTask.cancel()
                 await createdCoordinator.forceStop()
                 await startupCompletion.wait(timeout: 2)
+                await AviaryTelemetry.shutdown(maximumDuration: 2)
                 return
             }
             let ready = "aviaryd ready host=\(descriptor.hostInstance.host.workHostID)"
@@ -388,6 +390,7 @@ struct AviaryDaemonMain {
                     throw error
                 }
             }
+            await AviaryTelemetry.shutdown(maximumDuration: 2)
         } catch {
             if let coordinator {
                 // Unexpected startup/shutdown failure must not strand an endpoint.json or socket
@@ -397,6 +400,7 @@ struct AviaryDaemonMain {
             }
             let line = "aviaryd: \(Self.bounded(error.localizedDescription))\n"
             FileHandle.standardError.write(Data(line.utf8))
+            await AviaryTelemetry.shutdown(maximumDuration: 2)
             exit(1)
         }
     }

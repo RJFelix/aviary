@@ -26,6 +26,7 @@ enum VisualFixtureRoute: String {
     case activityOverview = "activity-overview-fixture"
     case activityOverviewNarrow = "activity-overview-narrow-fixture"
     case activityOverviewStale = "activity-overview-stale-fixture"
+    case diagnostics = "diagnostics-fixture"
 
     var isNarrow: Bool {
         self == .serviceChatNarrow || self == .productionDeliveryNarrow
@@ -66,7 +67,23 @@ struct VisualFixtureView: View {
                 .background(Color(nsColor: .windowBackgroundColor))
         case .activityOverview, .activityOverviewNarrow, .activityOverviewStale:
             ActivityOverviewFixture(isCurrent: route != .activityOverviewStale)
+        case .diagnostics:
+            DiagnosticsFixture()
         }
+    }
+}
+
+/// Production diagnostics without bootstrapping, connecting to, or changing a user's service.
+private struct DiagnosticsFixture: View {
+    @State private var model: AppModel = {
+        let model = AppModel()
+        model.home = AgentHome(root: URL(fileURLWithPath: "/tmp/aviary-diagnostics-fixture"))
+        return model
+    }()
+
+    var body: some View {
+        HealthView().environment(model)
+            .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 

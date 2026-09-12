@@ -3145,15 +3145,47 @@ public actor RunJournalBundle {
             if let bodyReference {
                 payload["body_reference"] = encodeTimelineValue(bodyReference)
             }
-            let commit = try await self.appendWork(TimelineEventDraft(
-                hostSequence: self.nextHostOrder(),
-                causedByEventID: provenance,
-                session: self.session, work: self.work, workHost: self.workHost,
-                sessionAttachment: self.sessionAttachment, run: self.activeRun,
-                turn: self.activeTurn, action: action,
-                type: TimelineEventType.artifact,
-                declaredDomains: [.work], links: links,
-                payload: .object(payload)))
+            let commit: TimelineJournalCommit
+            do {
+                commit = try await self.appendWork(TimelineEventDraft(
+                    hostSequence: self.nextHostOrder(),
+                    causedByEventID: provenance,
+                    session: self.session, work: self.work, workHost: self.workHost,
+                    sessionAttachment: self.sessionAttachment, run: self.activeRun,
+                    turn: self.activeTurn, action: action,
+                    type: TimelineEventType.artifact,
+                    declaredDomains: [.work], links: links,
+                    payload: .object(payload)))
+            } catch {
+                // A Work-writer failure is an uncertain publication boundary. Validation and
+                // body-retention failures happen before this block and remain ordinary failures.
+                AviaryTelemetry.outcome("indeterminate")
+                throw error
+            }
+            if mediaType == ObservedRepositoryReviewFormat.mediaType,
+               let run = self.activeRun {
+                var attributes = AviaryTelemetry.canonicalReferenceAttributes(commit)
+                attributes.merge([
+                    "aviary.artifact.id": .string(AviaryTelemetry.identity(artifactID)),
+                    "aviary.work.id": .string(AviaryTelemetry.workIdentity(self.work)),
+                    "aviary.run.id": .string(AviaryTelemetry.identity(run.runID)),
+                ], uniquingKeysWith: { _, replacement in replacement })
+                if let turn = self.activeTurn {
+                    attributes["aviary.turn.id"] = .string(
+                        AviaryTelemetry.identity(turn.turnID))
+                }
+                if let action {
+                    attributes["aviary.action.id"] = .string(
+                        AviaryTelemetry.identity(action.actionID))
+                }
+                if let descriptorByteCount {
+                    attributes["aviary.artifact.bytes"] = .int(descriptorByteCount)
+                }
+                // Publication telemetry is a receipt for the canonical Work append, not for
+                // body retention. An orphaned body has no event and cannot produce this receipt.
+                AviaryTelemetry.event(
+                    "aviary.repository.artifact.published", attributes: attributes)
+            }
             self.seenArtifactIDs.insert(artifactID)
             // The source event does not exist until appendWork commits it. Build the descriptor
             // from that exact commit and the same envelope values/payload metadata, so a receipt

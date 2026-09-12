@@ -10,9 +10,11 @@ enum ChatJourneyProbe {
         Task { @MainActor in
             do {
                 try await run()
+                await AviaryTelemetry.shutdown(maximumDuration: 2)
                 print("chat journey: exact save, blocked launch, relaunch, edit, retry, and save failure PASS")
                 done.set(true)
             } catch {
+                await AviaryTelemetry.shutdown(maximumDuration: 2)
                 FileHandle.standardError.write(Data("chat journey probe FAILED: \(error)\n".utf8))
                 exit(1)
             }

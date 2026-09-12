@@ -44,6 +44,7 @@ enum AgentCLI {
             await run(prompt: prompt, modelRef: model, cwd: cwd, variant: variant,
                       quiet: quiet, record: record, tokenBudget: tokenBudget,
                       minutes: minutes, resume: resume)
+            await AviaryTelemetry.shutdown(maximumDuration: 2)
             done.set(true)
         }
         while !done.get() {
@@ -129,6 +130,7 @@ enum AgentCLI {
                 failure = error.localizedDescription
             }
             await login.stop()
+            await AviaryTelemetry.shutdown(maximumDuration: 2)
             done.set(true)
         }
         while !done.get() {
@@ -146,7 +148,7 @@ enum AgentCLI {
         let home = AgentHome.default
 
         guard let repoRoot = EngineLocator.repoRoot() else {
-            fail("Could not find the Aviary checkout, so there is no runtime host to run.")
+            await fail("Could not find the Aviary checkout, so there is no runtime host to run.")
         }
 
         // Expand before resolving or starting anything. The durable start command must carry
@@ -158,7 +160,7 @@ enum AgentCLI {
                 projectRoot: URL(fileURLWithPath: cwd), enginePackageRoot: nil).prompts)
         let expansion = expander.expand(prompt)
         if let missing = expansion.missing {
-            fail("No prompt template named /\(missing). "
+            await fail("No prompt template named /\(missing). "
                 + "Available: " + expander.templates.map(\.name).sorted()
                     .prefix(12).joined(separator: ", "))
         }
@@ -173,7 +175,7 @@ enum AgentCLI {
         guard let (providerSpec, model) = resolve(modelRef, in: config, auth: auth) else {
             let available = (config.providers + [BuiltInProviders.openAICodex()])
                 .flatMap { p in p.models.map { "\(p.id)/\($0.id)" } }
-            fail("No such model. Configured: \(available.prefix(12).joined(separator: ", "))")
+            await fail("No such model. Configured: \(available.prefix(12).joined(separator: ", "))")
         }
         let identity = RunConfiguration(
             cwd: cwd, provider: providerSpec.id, model: model.id, resume: resume)
@@ -185,7 +187,7 @@ enum AgentCLI {
                     home: home, resuming: $0, cwd: cwd, model: model, identity: identity)
             } ?? SessionWriter(home: home, cwd: cwd, model: model, identity: identity)
         } catch {
-            fail("Could not open the session journal: \(error.localizedDescription)")
+            await fail("Could not open the session journal: \(error.localizedDescription)")
         }
 
         // Every current in-house launch is backed by the canonical Session/Work pair. Aviary's
@@ -199,7 +201,7 @@ enum AgentCLI {
                 modelContextMode: resume == nil ? .launchFresh : .exactColdResume)
         } catch {
             try? await writer.closeChecked()
-            fail("Could not open the canonical Session/Work journal: "
+            await fail("Could not open the canonical Session/Work journal: "
                 + error.localizedDescription)
         }
         let nativeJournal = nativeBridge.nativeJournal
@@ -317,17 +319,17 @@ enum AgentCLI {
             causalCursor: startCursor)
         guard case .accepted(let startCommand) = startReceipt.admission else {
             await endAndCleanup(outcome: .failed, detail: "Start was not durably admitted")
-            fail("The CLI start command could not be durably admitted.")
+            await fail("The CLI start command could not be durably admitted.")
         }
         admittedStartCommandID = startCommand.commandID
         if startReceipt.isAcceptedButUndelivered {
             let detail = startReceipt.delivery.detail ?? "canonical delivery was not confirmed"
             await endAndCleanup(outcome: .indeterminate, detail: detail)
-            fail("The CLI start command was accepted but not delivered: \(detail)")
+            await fail("The CLI start command was accepted but not delivered: \(detail)")
         }
         guard await commandController.awaitDispatch(commandID: startCommand.commandID) != nil else {
             await endAndCleanup(outcome: .failed, detail: "Start lost its dispatch turn")
-            fail("The CLI start command lost its dispatch turn.")
+            await fail("The CLI start command lost its dispatch turn.")
         }
         _ = await commandController.acknowledgeDispatched(commandID: startCommand.commandID)
 
@@ -340,7 +342,7 @@ enum AgentCLI {
             await endAndCleanup(
                 outcome: .indeterminate,
                 detail: "canonical provider action permit was unavailable")
-            fail("The canonical Work journal refused provider construction.")
+            await fail("The canonical Work journal refused provider construction.")
         }
         let routed = await ChatProviderRouting.makeProvider(
             spec: providerSpec, model: model, home: home,
@@ -351,7 +353,7 @@ enum AgentCLI {
                 failureKind: .infrastructure)
             if case .failure(let why) = routed {
                 await endAndCleanup(outcome: .failed, detail: why.localizedDescription)
-                fail(why.localizedDescription)
+                await fail(why.localizedDescription)
             }
             return
         }
@@ -367,14 +369,14 @@ enum AgentCLI {
             await endAndCleanup(
                 outcome: .indeterminate,
                 detail: "provider construction outcome was not recorded")
-            fail("The canonical Work journal could not record provider construction.")
+            await fail("The canonical Work journal could not record provider construction.")
         }
 
         // 2. The runtime host.
         let hostScript = repoRoot.appending(path: "runtime-hosts/\(variant)/host.py")
         guard FileManager.default.fileExists(atPath: hostScript.path) else {
             await endAndCleanup(outcome: .failed, detail: "runtime host script is missing")
-            fail("No runtime host at \(hostScript.path)")
+            await fail("No runtime host at \(hostScript.path)")
         }
         let host = RuntimeHost(executable: "/usr/bin/env", arguments: ["python3", hostScript.path])
         let runtimePermit = await beginNativeEffect(
@@ -383,7 +385,7 @@ enum AgentCLI {
             await endAndCleanup(
                 host: host, outcome: .indeterminate,
                 detail: "canonical runtime action permit was unavailable")
-            fail("The canonical Work journal refused runtime startup.")
+            await fail("The canonical Work journal refused runtime startup.")
         }
         let capabilities: RuntimeHost.Capabilities
         do {
@@ -397,7 +399,7 @@ enum AgentCLI {
             await endAndCleanup(
                 host: host, outcome: .failed,
                 detail: "runtime host failed to start: \(error.localizedDescription)")
-            fail("Could not start the runtime host: \(error.localizedDescription)")
+            await fail("Could not start the runtime host: \(error.localizedDescription)")
         }
         guard await finishNativeEffect(
             runtimePermit, state: .succeeded, retrySafety: .unsafe)
@@ -405,7 +407,7 @@ enum AgentCLI {
             await endAndCleanup(
                 host: host, outcome: .indeterminate,
                 detail: "runtime startup outcome was not recorded")
-            fail("The canonical Work journal could not record runtime startup.")
+            await fail("The canonical Work journal could not record runtime startup.")
         }
         if !quiet {
             note("runtime \(capabilities.summary) · session isolation "
@@ -447,7 +449,7 @@ enum AgentCLI {
             await endAndCleanup(
                 host: host, outcome: .failed,
                 detail: "Could not assemble the system prompt: \(error.localizedDescription)")
-            fail("Could not assemble the system prompt: \(error.localizedDescription)")
+            await fail("Could not assemble the system prompt: \(error.localizedDescription)")
         }
 
         let runner = AgentRunner(
@@ -520,7 +522,7 @@ enum AgentCLI {
                 await endAndCleanup(
                     runner: runner, host: host, outcome: .failed,
                     detail: "Start preparation was not acknowledged")
-                fail("The CLI start command was not acknowledged.")
+                await fail("The CLI start command was not acknowledged.")
             }
             let outcome = await agent.send(prompt) { delivery in
                 switch delivery {
@@ -630,6 +632,12 @@ enum AgentCLI {
 
     static func fail(_ s: String) -> Never {
         FileHandle.standardError.write(Data(("aviary: " + s + "\n").utf8))
+        exit(2)
+    }
+
+    static func fail(_ s: String) async -> Never {
+        FileHandle.standardError.write(Data(("aviary: " + s + "\n").utf8))
+        await AviaryTelemetry.shutdown(maximumDuration: 2)
         exit(2)
     }
 }

@@ -703,7 +703,7 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
             "aviary.command.kind": .string(commandKind),
             "aviary.client.id": .string(AviaryTelemetry.identity(command.client.clientID)),
             "aviary.session.id": .string(AviaryTelemetry.identity(command.session.sessionID)),
-            "aviary.work.id": .string(AviaryTelemetry.identity(identity.work.workID)),
+            "aviary.work.id": .string(AviaryTelemetry.workIdentity(identity.work)),
             "aviary.run.id": .string(AviaryTelemetry.identity(identity.runID)),
         ]) {
             let result = try await self.submitUntraced(command)
@@ -1308,24 +1308,61 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
         _ delivery: SessionCommandDelivery,
         for command: HostedInHouseWorkCommand
     ) async {
+        await AviaryTelemetry.withSpan(
+            "aviary.command.runtime_delivery",
+            attributes: [
+                "aviary.command.id": .string(
+                    AviaryTelemetry.identity(command.commandID)),
+                "aviary.command.ledger.id": .string(
+                    AviaryTelemetry.identity(controllerCommandID(for: command))),
+                "aviary.client.id": .string(
+                    AviaryTelemetry.identity(command.client.clientID)),
+                "aviary.session.id": .string(
+                    AviaryTelemetry.identity(command.session.sessionID)),
+                "aviary.work.id": .string(
+                    AviaryTelemetry.workIdentity(identity.work)),
+                "aviary.run.id": .string(
+                    AviaryTelemetry.identity(identity.runID)),
+            ]) {
+                await self.recordDeliveryBody(delivery, for: command)
+            }
+    }
+
+    private func recordDeliveryBody(
+        _ delivery: SessionCommandDelivery,
+        for command: HostedInHouseWorkCommand
+    ) async {
         let commandID = controllerCommandID(for: command)
         switch delivery {
         case .delivered:
-            _ = await controller.recordDelivered(commandID: commandID)
+            AviaryTelemetry.event("aviary.command.runtime_callback", attributes: [
+                "aviary.delivery.state": .string("delivered"),
+            ])
+            let recorded = await controller.recordDelivered(commandID: commandID)
+            AviaryTelemetry.outcome(recorded ? "succeeded" : "indeterminate")
             await emitDurable(
                 source: "command.delivered", commandID: command.commandID, client: command.client)
         case .notDelivered(let reason):
-            _ = await controller.recordNotDelivered(commandID: commandID, reason: reason)
+            AviaryTelemetry.event("aviary.command.runtime_callback", attributes: [
+                "aviary.delivery.state": .string("not_delivered"),
+            ])
+            let recorded = await controller.recordNotDelivered(commandID: commandID, reason: reason)
+            AviaryTelemetry.outcome(recorded ? "failed" : "indeterminate")
             await emitDurable(
                 source: "command.not_delivered", commandID: command.commandID, client: command.client)
         case .indeterminate(let reason):
             lastFailure = Self.bounded(reason)
+            AviaryTelemetry.outcome("indeterminate")
+            AviaryTelemetry.event("aviary.command.runtime_callback", attributes: [
+                "aviary.delivery.state": .string("indeterminate"),
+            ])
             guard lifecycle != .ended else { return }
             transition(to: .failed, reason: lastFailure)
             await emitDurable(
                 source: "command.delivery_indeterminate", commandID: command.commandID,
                 client: command.client)
         case .notAttempted, .queued:
+            AviaryTelemetry.outcome("accepted")
             break
         }
     }

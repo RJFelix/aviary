@@ -449,46 +449,51 @@ final class ServiceBackedRunBridge {
 
     func start(_ prompt: String, commandID: String? = nil) async throws -> WorkServiceCommandReceipt {
         try requireExactRunOwner()
-        if let commandID {
-            return try await issue { try await self.controller.start(prompt, commandID: commandID) }
+        let effectiveCommandID = commandID ?? UUID().uuidString.lowercased()
+        return try await issue(kind: .start, commandID: effectiveCommandID) {
+            try await self.controller.start(prompt, commandID: effectiveCommandID)
         }
-        return try await issue { try await self.controller.start(prompt) }
     }
 
     func send(_ prompt: String, commandID: String? = nil) async throws -> WorkServiceCommandReceipt {
         try requireExactRunOwner()
-        if let commandID {
-            return try await issue { try await self.controller.send(prompt, commandID: commandID) }
+        let effectiveCommandID = commandID ?? UUID().uuidString.lowercased()
+        return try await issue(kind: .send, commandID: effectiveCommandID) {
+            try await self.controller.send(prompt, commandID: effectiveCommandID)
         }
-        return try await issue { try await self.controller.send(prompt) }
     }
 
     func steer(_ text: String, commandID: String? = nil) async throws -> WorkServiceCommandReceipt {
         try requireExactRunOwner()
-        if let commandID {
-            return try await issue { try await self.controller.steer(text, commandID: commandID) }
+        let effectiveCommandID = commandID ?? UUID().uuidString.lowercased()
+        return try await issue(kind: .steer, commandID: effectiveCommandID) {
+            try await self.controller.steer(text, commandID: effectiveCommandID)
         }
-        return try await issue { try await self.controller.steer(text) }
     }
 
     func queue(_ text: String, commandID: String? = nil) async throws -> WorkServiceCommandReceipt {
         try requireExactRunOwner()
-        if let commandID {
-            return try await issue { try await self.controller.queue(text, commandID: commandID) }
+        let effectiveCommandID = commandID ?? UUID().uuidString.lowercased()
+        return try await issue(kind: .queue, commandID: effectiveCommandID) {
+            try await self.controller.queue(text, commandID: effectiveCommandID)
         }
-        return try await issue { try await self.controller.queue(text) }
     }
 
     func cancel(scope: SessionCancellationScope) async throws -> WorkServiceCommandReceipt {
         try requireExactRunOwner()
-        return try await issue { try await self.controller.cancel(scope: scope) }
+        let commandID = UUID().uuidString.lowercased()
+        return try await issue(kind: .cancel, commandID: commandID) {
+            try await self.controller.cancel(scope: scope, commandID: commandID)
+        }
     }
 
     /// The only service-backed lifecycle termination operation.  Generic GUI disconnect and
     /// process termination never call this method.
     func end(commandID: String) async throws -> WorkServiceCommandReceipt {
         try requireExactRunOwner()
-        return try await issue { try await self.controller.end(commandID: commandID) }
+        return try await issue(kind: .end, commandID: commandID) {
+            try await self.controller.end(commandID: commandID)
+        }
     }
 
     /// A failed response is not itself a rejection. Only a structured rejection, a proven stale
@@ -574,7 +579,12 @@ final class ServiceBackedRunBridge {
     /// id, value, and causal cursor. This is a user repair action, never an automatic polling
     /// behavior.
     func retryPendingCommand() async throws -> WorkServiceCommandReceipt {
-        try await issue { try await self.controller.retryPendingCommand() }
+        // Do not prefetch the pending row: a concurrent refresh may replace it between the read
+        // and the retry. The controller owns the single atomic retained request; its returned
+        // receipt is the first safe place to expose the exact command identity.
+        return try await issue {
+            try await self.controller.retryPendingCommand()
+        }
     }
 
     /// Abandon only a stale command after the user has seen the current canonical projection.
@@ -585,25 +595,54 @@ final class ServiceBackedRunBridge {
     }
 
     private func issue(
+        kind: WorkServiceCommandKind? = nil,
+        commandID: String? = nil,
         _ operation: @escaping () async throws -> WorkServiceCommandReceipt
     ) async throws -> WorkServiceCommandReceipt {
-        try await AviaryTelemetry.withSpan("aviary.ui.command", attributes: [
-            "aviary.work.id": .string(AviaryTelemetry.identity(work.workID)),
-        ]) {
-            try await self.issueUntraced(operation)
+        var attributes: [String: AviaryTraceValue] = [
+            "aviary.work.id": .string(AviaryTelemetry.workIdentity(work)),
+        ]
+        if let commandID {
+            attributes["aviary.command.id"] = .string(AviaryTelemetry.identity(commandID))
+        }
+        if let kind {
+            attributes["aviary.command.kind"] = .string(kind.rawValue)
+        }
+        return try await AviaryTelemetry.withSpan("aviary.ui.command", attributes: attributes) {
+            do {
+                return try await self.issueUntraced(operation, kind: kind)
+            } catch {
+                let certainty: ServiceBackedRunBridgeFailureCertainty
+                if let kind, let commandID {
+                    certainty = await self.failureCertainty(
+                        for: error, commandID: commandID, kind: kind)
+                } else {
+                    certainty = .uncertain
+                }
+                AviaryTelemetry.outcome(certainty == .rejected ? "rejected" : "indeterminate")
+                throw error
+            }
         }
     }
 
     private func issueUntraced(
-        _ operation: @escaping () async throws -> WorkServiceCommandReceipt
+        _ operation: @escaping () async throws -> WorkServiceCommandReceipt,
+        kind: WorkServiceCommandKind?
     ) async throws -> WorkServiceCommandReceipt {
         do {
             let receipt = try await operation()
             AviaryTelemetry.outcome(receipt.state.rawValue)
-            AviaryTelemetry.event("aviary.command.receipt", attributes: [
+            var receiptAttributes: [String: AviaryTraceValue] = [
                 "aviary.receipt.state": .string(receipt.state.rawValue),
-            ])
+                "aviary.command.id": .string(
+                    AviaryTelemetry.identity(receipt.commandID)),
+            ]
+            if let kind {
+                receiptAttributes["aviary.command.kind"] = .string(kind.rawValue)
+            }
+            AviaryTelemetry.event("aviary.command.receipt", attributes: receiptAttributes)
             guard receipt.state == .accepted || receipt.state == .duplicate else {
+                AviaryTelemetry.outcome("rejected")
                 let detail = receipt.diagnostic
                     ?? receipt.rejection?.rawValue
                     ?? "The Work Host rejected the command."

@@ -7,11 +7,14 @@ import AviaryCore
 struct HealthView: View {
     @Environment(AppModel.self) private var model
     @State private var busy = false
+    @State private var telemetryStatus = AviaryTelemetry.configurationStatus
+    @State private var telemetryDiagnostics = AviaryTelemetry.exportDiagnostics
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 serviceCard
+                telemetryCard
                 verdict
                 runtimeCard
                 claudeCodeCard
@@ -24,6 +27,44 @@ struct HealthView: View {
     }
 
     // MARK: Verdict
+
+    private var telemetryCard: some View {
+        Card("Tracing · this app process", symbol: "waveform.path") {
+            VStack(alignment: .leading, spacing: 8) {
+                switch telemetryStatus {
+                case "enabled": Text("OpenTelemetry export is enabled.")
+                case "invalid_endpoint":
+                    Text("Tracing could not start: the configured collector endpoint is invalid.")
+                        .foregroundStyle(Design.warning)
+                case "stopped": Text("This process's trace exporter has shut down.")
+                default: Text("Tracing is off. Configure an OTLP collector at launch to enable it.")
+                }
+                if let stats = telemetryDiagnostics {
+                    Text("Accepted \(stats.acceptedSpans) · queued \(stats.queuedSpans) · exporting \(stats.inFlightSpans)")
+                    Text("Export succeeded \(stats.exportSucceededSpans) · result unconfirmed \(stats.exportResultFailureSpans)")
+                    if stats.droppedQueueFullSpans > 0 || stats.droppedAfterShutdownSpans > 0
+                        || stats.abandonedBeforeAttemptSpans > 0 {
+                        Text("Not exported: queue full \(stats.droppedQueueFullSpans), after shutdown \(stats.droppedAfterShutdownSpans), drain deadline \(stats.abandonedBeforeAttemptSpans).")
+                            .foregroundStyle(Design.warning)
+                    }
+                    if stats.countersSaturated {
+                        Text("Counters reached their limit; totals are lower bounds.")
+                            .foregroundStyle(Design.warning)
+                    }
+                }
+                Text("These are local diagnostic counters, not proof of collector retention or request delivery. The agent service has its own tracing configuration; its status is not shown here.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Refresh trace status") {
+                    telemetryStatus = AviaryTelemetry.configurationStatus
+                    telemetryDiagnostics = AviaryTelemetry.exportDiagnostics
+                }.buttonStyle(.bordered)
+            }.font(.system(size: 12))
+        }
+        .onAppear {
+            telemetryStatus = AviaryTelemetry.configurationStatus
+            telemetryDiagnostics = AviaryTelemetry.exportDiagnostics
+        }
+    }
 
     private var serviceCard: some View {
         Card("Local agent service", symbol: "network") {
@@ -65,7 +106,9 @@ struct HealthView: View {
                         .foregroundStyle(verdictColor)
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(runtimeOK ? "Python interpreter available" : "Python interpreter unavailable")
+                    Text(runtimeOK ? "Python interpreter available"
+                         : runtimeChecked ? "Python interpreter unavailable"
+                         : busy ? "Checking Python interpreter…" : "Python interpreter not checked")
                         .font(.system(size: 15, weight: .semibold))
                     Text(verdictSubtitle)
                         .font(.system(size: 11.5)).foregroundStyle(.secondary)
@@ -85,11 +128,15 @@ struct HealthView: View {
     }
 
     private var runtimeOK: Bool { model.runtimeProbes.contains(where: \.ok) }
+    private var runtimeChecked: Bool { !model.runtimeProbes.isEmpty }
 
-    private var verdictColor: Color { runtimeOK ? Design.success : Design.danger }
+    private var verdictColor: Color {
+        runtimeOK ? Design.success : runtimeChecked ? Design.danger : .secondary
+    }
 
     private var verdictSymbol: String {
-        runtimeOK ? "checkmark.circle.fill" : "exclamationmark.octagon.fill"
+        runtimeOK ? "checkmark.circle.fill"
+            : runtimeChecked ? "exclamationmark.octagon.fill" : "questionmark.circle"
     }
 
     private var verdictSubtitle: String {
@@ -120,10 +167,10 @@ struct HealthView: View {
     private var runtimeCard: some View {
         Card("Aviary's own runtime", symbol: "cube.transparent",
              accessory: AnyView(
-                Text(model.runtimeProbes.contains(where: \.ok) ? "ready" : "unavailable")
+                Text(runtimeOK ? "ready" : runtimeChecked ? "unavailable" : "not checked")
                     .font(.system(size: 9))
-                    .foregroundStyle(model.runtimeProbes.contains(where: \.ok)
-                        ? Design.success : Design.warning)))
+                    .foregroundStyle(runtimeOK ? Design.success
+                        : runtimeChecked ? Design.warning : Color.secondary)))
         {
             VStack(alignment: .leading, spacing: 9) {
                 if model.runtimeProbes.isEmpty {

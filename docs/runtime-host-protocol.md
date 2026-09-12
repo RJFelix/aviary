@@ -75,7 +75,7 @@ Failure is a response, not a dropped connection:
 | `session.list` | — | `{sessions: [id]}` |
 | `session.attach` | `session` | `{session, attached}` — routes callbacks to this client and replays unresolved callbacks |
 | `session.detach` | `session` | `{session, detached}` — leaves the session alive |
-| `exec` | `session`, `code`, `mode?` (`exec`\|`eval`) | `{stdout, stderr, value, exception}` |
+| `exec` | `session`, `code`, `mode?` (`exec`\|`eval`), diagnostic `traceparent?` | `{stdout, stderr, value, exception}` |
 | `inspect` | `session` | `{names: [{name,type,repr,length}], cwd}` |
 | `shutdown` | — | `{stopping:true}`, then the process exits |
 | `callback.result` | `rid`, `result` | `{delivered, status}` — answers or classifies a `callback` event |
@@ -117,6 +117,27 @@ result and returns `{delivered:false,status:"duplicate"}` for a later result, or
 `{delivered:false,status:"stale"}` when no callback remains. This process-local history is not
 durable exactly-once effect state; consumers performing durable effects must deduplicate by the
 stable `rid` themselves.
+
+### Diagnostic tracing
+
+An `exec` request and a `callback` event may carry a top-level W3C `traceparent`.
+Only the lowercase version-00, 55-byte form with nonzero trace/span IDs is accepted; other
+values are ignored. There is no baggage. Trace context is never authentication, an effect
+identity, or delivery evidence. If context alone would exceed the frame limit, the sender
+omits it before the single write. An oversized base request still fails normally.
+
+The bundled hosts capture context per execution and retain it with pending callback messages,
+including reconnect replay. Reference-host Futures and their notification/Handle observers
+capture the originating callback callable, so a later cell cannot relabel their work. A retained
+callback callable in the shared host likewise keeps its origin. Arbitrary user threads that
+later look up a replaced namespace function do not have automatic context inheritance; this
+is not a complete Python-effect audit.
+
+The Swift callback boundary starts a server span from the explicit received context. Missing
+or malformed context starts an independent trace, never inherits the socket-listener task.
+A callback may legitimately descend from an already-ended execution span. Its reply status
+describes the callback exchange, not whether arbitrary external effects succeeded. Replayed
+callbacks remain subject to the existing RID/idempotency contract, regardless of trace IDs.
 
 ## Capabilities, and why they are declared
 

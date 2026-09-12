@@ -61,6 +61,20 @@ MAX_SEND_SECONDS = 1.0
 SEND_CHUNK_BYTES = 512
 
 
+def validated_traceparent(value) -> str | None:
+    """Accept only a W3C v00 traceparent with lowercase, nonzero identifiers."""
+    if not isinstance(value, str) or len(value) != 55 or not value.isascii():
+        return None
+    parts = value.split("-")
+    if len(parts) != 4 or parts[0] != "00":
+        return None
+    if (len(parts[1]) != 32 or len(parts[2]) != 16 or len(parts[3]) != 2
+            or any(c not in "0123456789abcdef" for c in "".join(parts[1:]))
+            or set(parts[1]) == {"0"} or set(parts[2]) == {"0"}):
+        return None
+    return value
+
+
 def install_parent_lifetime_lease(parent_pid: int | None, socket_path: str) -> None:
     """Exit this test-owned host when its launching process goes away.
 
@@ -121,8 +135,22 @@ def bounded_diagnostic(value, limit: int = MAX_DIAGNOSTIC_BYTES) -> str:
     return str(value)[:limit]
 
 
+def encoded_frame(obj: dict) -> bytes:
+    """Encode one wire frame, omitting trace context only when it breaks the frame bound."""
+    if obj.get("event") != "callback" or "traceparent" not in obj:
+        return json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8") + b"\n"
+    base = dict(obj)
+    context = validated_traceparent(base.pop("traceparent", None))
+    base_line = json.dumps(base, ensure_ascii=False, default=str).encode("utf-8") + b"\n"
+    if context is None:
+        return base_line
+    context_bytes = json.dumps(context, ensure_ascii=False).encode("ascii")
+    candidate = base_line[:-2] + b',"traceparent":' + context_bytes + b"}\n"
+    return candidate if len(candidate) <= MAX_FRAME_BYTES else base_line
+
+
 def encoded_frame_size(obj: dict) -> int:
-    return len(json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")) + 1
+    return len(encoded_frame(obj))
 
 # Everything the host puts into the agent's namespace. Listed once, because `inspect` must
 # hide exactly this set: the namespace belongs to the agent, and a host whose own helpers show
@@ -184,7 +212,8 @@ def _remember_callback_outcome_locked(rid: str, status: str) -> None:
         _callback_history.popitem(last=False)
 
 
-def request_from_app(kind: str, payload: dict, session: str = "", timeout: float = 900.0):
+def request_from_app(kind: str, payload: dict, session: str = "", timeout: float = 900.0,
+                     traceparent: str | None = None):
     """Ask Aviary to do something, and block this session's thread until it answers.
 
     Blocking is correct here: the agent wrote `await spawn(...)` and expects a result. Only
@@ -197,6 +226,9 @@ def request_from_app(kind: str, payload: dict, session: str = "", timeout: float
         event = threading.Event()
         message = {"event": "callback", "rid": rid, "kind": kind,
                    "payload": payload, "session": session}
+        context = validated_traceparent(traceparent)
+        if context is not None:
+            message["traceparent"] = context
         _callbacks[rid] = {
             "event": event, "result": _CALLBACK_PENDING, "session": session,
             "message": message,
@@ -298,16 +330,18 @@ __aviary_result = {"stdout": "", "stderr": "", "value": None, "exception": None}
 # calls — the entire reason this is a long-lived interpreter and not a subprocess.
 if "__aviary_ns" not in globals():
     globals()["__aviary_ns"] = {"__name__": "__main__", "__builtins__": builtins}
-    globals()["__aviary_session_state"] = {"cwd": __AVIARY_CWD, "env": {}}
+    globals()["__aviary_session_state"] = {
+        "cwd": __AVIARY_CWD,
+        "env": {},
+        "sh_lock": __import__("threading").Lock(),
+    }
 
 __aviary_ns = globals()["__aviary_ns"]
 __aviary_state = globals()["__aviary_session_state"]
+__aviary_sh_lock = __aviary_state["sh_lock"]
 
 
-__aviary_sh_lock = __import__("threading").Lock()
-
-
-def __aviary_sh(command, timeout=None):
+def __aviary_sh(command, timeout, call_app, state, state_lock, blocking):
     # A Future, like spawn() and search(). A shell command is the commonest long-running thing
     # an agent does — a test suite, a build, a clone — and making it await-or-not is what lets
     # one cell start the slow thing and get on with reading code while it runs.
@@ -315,11 +349,19 @@ def __aviary_sh(command, timeout=None):
     # `.result()` is the old blocking behaviour, spelled by the caller.
     import threading as _th
 
-    future = _AviaryFuture()
+    # A shell Future can outlive this cell. Snapshot launch state synchronously, and retain
+    # every host implementation object the worker needs rather than looking up globals that
+    # the cell cleanup deliberately removes or a later cell replaces.
+    with state_lock:
+        launch_cwd = state["cwd"]
+        launch_env = dict(state["env"])
+    future = _AviaryFuture(call_app)
 
     def __aviary_run_sh():
         try:
-            future.set_result(__aviary_sh_blocking(command, timeout=timeout))
+            future.set_result(blocking(
+                command, timeout=timeout, launch_cwd=launch_cwd, launch_env=launch_env,
+                state=state, state_lock=state_lock))
         except Exception as exc:
             future.set_exception(exc)
 
@@ -327,7 +369,7 @@ def __aviary_sh(command, timeout=None):
     return future
 
 
-def __aviary_sh_blocking(command, timeout=None):
+def __aviary_sh_blocking(command, timeout, launch_cwd, launch_env, state, state_lock):
     # Run a shell command whose working directory and environment persist.
     #
     # The measured reason this exists: 19.7% of cells in the corpus did working-directory
@@ -335,13 +377,13 @@ def __aviary_sh_blocking(command, timeout=None):
     # `cd` and `export` stick for the life of the session.
     import subprocess as _sp, tempfile as _tf, os as _os, shlex as _shlex
     env = dict(_os.environ)
-    env.update(__aviary_state["env"])
+    env.update(launch_env)
     with _tf.NamedTemporaryFile("w+", delete=False, suffix=".aviary-sh") as probe:
         probe_path = probe.name
     # The trailing probe reports the shell's final state, so a `cd` inside the command is
     # observed rather than inferred.
     wrapped = "\n".join([
-        "cd " + _shlex.quote(__aviary_state["cwd"]) + " 2>/dev/null || cd /",
+        "cd " + _shlex.quote(launch_cwd) + " 2>/dev/null || cd /",
         command,
         "__aviary_status=$?",
         '{ printf "%s\\0" "$PWD"; env -0; } > ' + _shlex.quote(probe_path) + " 2>/dev/null",
@@ -356,9 +398,9 @@ def __aviary_sh_blocking(command, timeout=None):
         # Locked because commands can now overlap. Each one still *starts* from the cwd as of
         # its own launch, which is deterministic; it is only the write-back that races, and
         # last-finisher-wins is the honest rule. Await if you care which.
-        with __aviary_sh_lock:
+        with state_lock:
             if parts and parts[0]:
-                __aviary_state["cwd"] = parts[0]
+                state["cwd"] = parts[0]
             base = dict(_os.environ)
             for item in parts[1:]:
                 if "=" not in item:
@@ -367,40 +409,60 @@ def __aviary_sh_blocking(command, timeout=None):
                 # Remember only what the command changed, so the session does not accumulate
                 # the whole inherited environment.
                 if base.get(k) != v and k not in ("_", "PWD", "SHLVL", "OLDPWD"):
-                    __aviary_state["env"][k] = v
+                    state["env"][k] = v
     except Exception:
         pass
     return {"stdout": proc.stdout, "stderr": proc.stderr, "status": proc.returncode}
 
 
-def __aviary_ask_app(kind, **payload):
+def __aviary_make_ask_app(__context, __callback_dir):
     # Objects cannot cross an interpreter boundary, so a callback is marshalled through two
-    # files: this side writes the request and spins on the reply. The spin is cheap because
-    # this interpreter has its own GIL — waiting here does not stall any other session.
+    # files: this side writes the request and spins on the reply. Capture the execution's
+    # validated context in this closure; a Future retained by a later cell must not consult a
+    # mutable global belonging to that newer execution.
     import json as _json, os as _os, tempfile as _tf, time as _time
-    fd, req_path = _tf.mkstemp(prefix="aviary-cb-req-", suffix=".json")
-    _os.close(fd)
-    reply_path = req_path.replace("-req-", "-rep-")
-    with open(req_path, "w") as fh:
-        _json.dump({"kind": kind, "payload": payload, "reply": reply_path}, fh)
-    with open(__AVIARY_CALLBACK_DIR + "/pending", "a") as fh:
-        fh.write(req_path + "\n")
-    deadline = _time.time() + 900
-    while _time.time() < deadline:
-        if _os.path.exists(reply_path):
-            try:
-                with open(reply_path) as fh:
-                    out = _json.load(fh)
-                _os.unlink(reply_path)
-                return out
-            except Exception:
-                _time.sleep(0.02)
-                continue
-        _time.sleep(0.02)
-    return {"error": "Aviary did not answer in time"}
+
+    def __aviary_ask_app(kind, **payload):
+        fd, req_path = _tf.mkstemp(prefix="aviary-cb-req-", suffix=".json")
+        _os.close(fd)
+        reply_path = req_path.replace("-req-", "-rep-")
+        request = {"kind": kind, "payload": payload, "reply": reply_path}
+        if __context is not None:
+            request["traceparent"] = __context
+        with open(req_path, "w") as fh:
+            _json.dump(request, fh)
+        with open(__callback_dir + "/pending", "a") as fh:
+            fh.write(req_path + "\n")
+        deadline = _time.time() + 900
+        while _time.time() < deadline:
+            if _os.path.exists(reply_path):
+                try:
+                    with open(reply_path) as fh:
+                        out = _json.load(fh)
+                    _os.unlink(reply_path)
+                    return out
+                except Exception:
+                    _time.sleep(0.02)
+                    continue
+            _time.sleep(0.02)
+        return {"error": "Aviary did not answer in time"}
+
+    return __aviary_ask_app
 
 
-__aviary_ns["sh"] = __aviary_sh
+__aviary_ask_app = __aviary_make_ask_app(__AVIARY_TRACEPARENT, __AVIARY_CALLBACK_DIR)
+
+def __aviary_make_sh(call_app, implementation, blocking, state, state_lock):
+    def sh(command, timeout=None):
+        return implementation(
+            command, timeout=timeout, call_app=call_app, state=state,
+            state_lock=state_lock, blocking=blocking)
+    return sh
+
+
+__aviary_ns["sh"] = __aviary_make_sh(
+    __aviary_ask_app, __aviary_sh, __aviary_sh_blocking,
+    __aviary_state, __aviary_sh_lock)
 __aviary_ns["cwd"] = lambda: __aviary_state["cwd"]
 __aviary_ns["ask_app"] = __aviary_ask_app
 # Aliased without the double underscore because Python mangles `__name` *inside a class body*
@@ -432,6 +494,10 @@ class _AviaryFuture(__import__("concurrent.futures", fromlist=["Future"]).Future
     #: way to put a megabyte into a transcript forever.
     aviary_notify_limit = 1500
 
+    def __init__(self, call_app=None):
+        super().__init__()
+        self._aviary_call_app = call_app or _aviary_call_app
+
     def notify(self, label=None):
         """Deliver this result into the conversation when it finishes.
 
@@ -445,7 +511,7 @@ class _AviaryFuture(__import__("concurrent.futures", fromlist=["Future"]).Future
         self.aviary_notified = True
         # Announced up front so the run knows not to finish on a promise: an agent that
         # dispatches and stops would otherwise end before its own answer arrived.
-        _aviary_call_app("dispatched")
+        self._aviary_call_app("dispatched")
 
         def __aviary_deliver(done):
             try:
@@ -462,7 +528,7 @@ class _AviaryFuture(__import__("concurrent.futures", fromlist=["Future"]).Future
                     + "\n\n[truncated: %d characters in total. The whole value is still on "
                       "the Future in your namespace — .result() has it.]" % (len(text),))
             name = self.aviary_label or "a background task"
-            _aviary_call_app("notify", text="[%s finished]\n\n%s" % (name, text))
+            self._aviary_call_app("notify", text="[%s finished]\n\n%s" % (name, text))
 
         self.add_done_callback(__aviary_deliver)
         return self
@@ -488,13 +554,13 @@ class _AviaryWorkFuture(_AviaryFuture):
         return False
 
 
-def _aviary_work_result(handle_id):
+def _aviary_work_result(handle_id, call_app):
     import base64 as _b64, hashlib as _hash
     body = bytearray()
     expected_digest = None
     expected_count = None
     while True:
-        page = _aviary_call_app("agent_handle_result", id=handle_id, offset=len(body))
+        page = call_app("agent_handle_result", id=handle_id, offset=len(body))
         if not isinstance(page, dict) or "error" in page:
             raise RuntimeError(page.get("error", "Invalid Handle body response")
                                if isinstance(page, dict) else "Invalid Handle body response")
@@ -521,7 +587,7 @@ def _aviary_work_result(handle_id):
             return body.decode("utf-8")
 
 
-def _aviary_make_work_future(record):
+def _aviary_make_work_future(record, call_app=None):
     import math as _math, threading as _th, time as _time, uuid as _uuid
     handle_id, deadline = record.get("id"), record.get("deadline")
     if (not isinstance(handle_id, str) or not handle_id or len(handle_id.encode()) > 256
@@ -529,7 +595,8 @@ def _aviary_make_work_future(record):
             or (deadline is not None
                 and (type(deadline) not in (float, int) or not _math.isfinite(deadline)))):
         raise RuntimeError("Invalid Work Handle admission response")
-    future = _AviaryWorkFuture()
+    call_app = call_app or _aviary_call_app
+    future = _AviaryWorkFuture(call_app)
     future.aviary_id = handle_id
     future.aviary_name = record.get("name")
     future.aviary_deadline = deadline
@@ -546,10 +613,10 @@ def _aviary_make_work_future(record):
                 with future._aviary_interest_lock:
                     interest = future._aviary_waiters > 0
                 if interest != last_interest:
-                    _aviary_call_app("agent_handle_await", id=handle_id,
-                                     observer_id=future._aviary_observer_id, awaited=interest)
+                    call_app("agent_handle_await", id=handle_id,
+                             observer_id=future._aviary_observer_id, awaited=interest)
                     last_interest = interest
-                row = _aviary_call_app("agent_handle_status", id=handle_id)
+                row = call_app("agent_handle_status", id=handle_id)
                 if not isinstance(row, dict) or "error" in row:
                     raise RuntimeError(row.get("error", "Handle state unavailable")
                                        if isinstance(row, dict) else "Handle state unavailable")
@@ -563,7 +630,7 @@ def _aviary_make_work_future(record):
                 state = row.get("state")
                 if state == "terminal":
                     if row.get("outcome") == "succeeded":
-                        future.set_result(_aviary_work_result(handle_id))
+                        future.set_result(_aviary_work_result(handle_id, call_app))
                         return
                     raise RuntimeError("Handle %s settled as %s; inspect its retained outcome" %
                                        (handle_id, row.get("outcome", "unknown")))
@@ -582,9 +649,10 @@ def _aviary_make_work_future(record):
     return future
 
 
-def __aviary_attach_agent(handle_id, name=None):
+def __aviary_attach_agent(handle_id, name=None, call_app=None):
     """Observe one explicitly named Work Handle, optionally binding it without overwriting."""
     import keyword as _keyword, threading as _th
+    call_app = call_app or __aviary_ask_app
     if (not isinstance(handle_id, str) or not handle_id or len(handle_id.encode()) > 256):
         raise ValueError("attach_agent needs a bounded Handle ID")
     if name is not None and (not isinstance(name, str) or not name.isidentifier()
@@ -599,13 +667,13 @@ def __aviary_attach_agent(handle_id, name=None):
                 raise ValueError("attach_agent will not overwrite existing binding: " + name)
             __aviary_ns[name] = sentinel
     try:
-        record = _aviary_call_app("agent_handle_status", id=handle_id)
+        record = call_app("agent_handle_status", id=handle_id)
         if not isinstance(record, dict) or "error" in record:
             raise RuntimeError(record.get("error", "Handle unavailable")
                                if isinstance(record, dict) else "Handle unavailable")
         if record.get("id") != handle_id or record.get("ownership") != "work":
             raise RuntimeError("Handle attachment identity mismatch")
-        future = _aviary_make_work_future(record)
+        future = _aviary_make_work_future(record, call_app)
         if name is not None:
             with lock:
                 if __aviary_ns.get(name) is not sentinel:
@@ -620,10 +688,16 @@ def __aviary_attach_agent(handle_id, name=None):
         raise
 
 
-__aviary_ns["attach_agent"] = __aviary_attach_agent
+def __aviary_make_attach_agent(call_app):
+    def attach_agent(handle_id, name=None):
+        return __aviary_attach_agent(handle_id, name=name, call_app=call_app)
+    return attach_agent
 
 
-def __aviary_spawn(prompt, name=None, model=None):
+__aviary_ns["attach_agent"] = __aviary_make_attach_agent(__aviary_ask_app)
+
+
+def __aviary_spawn(prompt, name=None, model=None, call_app=None):
     # Returns a real `concurrent.futures.Future`, not a bespoke handle.
     #
     # The agent here is *writing Python*, not calling a sub-agent tool, so whether to wait is
@@ -636,10 +710,11 @@ def __aviary_spawn(prompt, name=None, model=None):
     import threading as _th
     import time as _time
 
-    started = __aviary_ask_app("spawn", prompt=prompt, name=name, model=model)
+    call_app = call_app or __aviary_ask_app
+    started = call_app("spawn", prompt=prompt, name=name, model=model)
     if isinstance(started, dict) and started.get("ownership") == "work" and "id" in started:
-        return _aviary_make_work_future(started)
-    future = _AviaryFuture()
+        return _aviary_make_work_future(started, call_app)
+    future = _AviaryFuture(call_app)
     if not isinstance(started, dict) or "id" not in started:
         future.set_result(started)
         return future
@@ -653,7 +728,7 @@ def __aviary_spawn(prompt, name=None, model=None):
         # finds out by asking. One thread per child, and threads are cheap next to an agent.
         deadline = _time.time() + 3600
         while _time.time() < deadline:
-            rows = __aviary_ask_app("children")
+            rows = call_app("children")
             if isinstance(rows, dict) and "error" in rows:
                 # The host is going away, or sub-agents were never enabled. Resolving with the
                 # error beats a thread that outlives the session waiting for an answer nobody
@@ -682,10 +757,16 @@ def __aviary_spawn(prompt, name=None, model=None):
     return future
 
 
-__aviary_ns["spawn"] = __aviary_spawn
+def __aviary_make_spawn(call_app):
+    def spawn(prompt, name=None, model=None):
+        return __aviary_spawn(prompt, name=name, model=model, call_app=call_app)
+    return spawn
 
 
-def __aviary_async(kind, **payload):
+__aviary_ns["spawn"] = __aviary_make_spawn(__aviary_ask_app)
+
+
+def __aviary_async(callback, /, kind, **payload):
     # The same Future shape spawn() has, for the calls whose cost is latency rather than
     # tokens. Search and page reads are the two places an agent most obviously wants to start
     # several at once and collect them, and giving them the shape it already knows means it
@@ -696,11 +777,12 @@ def __aviary_async(kind, **payload):
     # blocked while it happens.
     import threading as _th
 
-    future = _AviaryFuture()
+    call_app = callback
+    future = _AviaryFuture(callback)
 
     def __aviary_run():
         try:
-            answer = __aviary_ask_app(kind, **payload)
+            answer = call_app(kind, **payload)
         except Exception as exc:  # the callback channel itself failed
             future.set_exception(exc)
             return
@@ -713,28 +795,77 @@ def __aviary_async(kind, **payload):
     return future
 
 
-__aviary_ns["search"] = lambda objective, queries=None, mode="fast", n=10, **rest: (
-    __aviary_async(
-        "search", objective=objective, queries=list(queries or []), mode=mode, n=n, **rest))
-__aviary_ns["read_url"] = lambda urls, objective=None, full=False, **rest: (
-    __aviary_async(
-        "read_url",
-        urls=[urls] if isinstance(urls, str) else list(urls),
-        objective=objective, full=bool(full), **rest))
-__aviary_ns["conversation"] = lambda limit=40: __aviary_ask_app("conversation", limit=limit)
-__aviary_ns["remember"] = lambda text, scope="project", days=None, tags=None: __aviary_ask_app(
-    "remember", text=text, scope=scope, days=days, tags=tags or [])
-__aviary_ns["recall"] = lambda query="": __aviary_ask_app("recall", query=query)
-__aviary_ns["attach_image"] = lambda path, note=None: __aviary_ask_app(
-    "attach_image", path=str(path), note=note)
-__aviary_ns["agents"] = lambda: __aviary_ask_app("agents")
-__aviary_ns["message"] = lambda to, text: __aviary_ask_app(
-    "message", to=str(to), text=str(text))
+__aviary_cell_call_app = __aviary_ask_app
+def __aviary_make_search(call_app):
+    def search(objective, queries=None, mode="fast", n=10, **rest):
+        return __aviary_async(
+            call_app, "search", objective=objective, queries=list(queries or []),
+            mode=mode, n=n, **rest)
+    return search
+
+
+def __aviary_make_read_url(call_app):
+    def read_url(urls, objective=None, full=False, **rest):
+        return __aviary_async(
+            call_app, "read_url", urls=[urls] if isinstance(urls, str) else list(urls),
+            objective=objective, full=bool(full), **rest)
+    return read_url
+
+
+def __aviary_make_conversation(call_app):
+    def conversation(limit=40):
+        return call_app("conversation", limit=limit)
+    return conversation
+
+
+def __aviary_make_remember(call_app):
+    def remember(text, scope="project", days=None, tags=None):
+        return call_app("remember", text=text, scope=scope, days=days, tags=tags or [])
+    return remember
+
+
+def __aviary_make_recall(call_app):
+    def recall(query=""):
+        return call_app("recall", query=query)
+    return recall
+
+
+def __aviary_make_attach_image(call_app):
+    def attach_image(path, note=None):
+        return call_app("attach_image", path=str(path), note=note)
+    return attach_image
+
+
+def __aviary_make_agents(call_app):
+    def agents():
+        return call_app("agents")
+    return agents
+
+
+def __aviary_make_message(call_app):
+    def message(to, text):
+        return call_app("message", to=str(to), text=str(text))
+    return message
+
+
+__aviary_ns["search"] = __aviary_make_search(__aviary_cell_call_app)
+__aviary_ns["read_url"] = __aviary_make_read_url(__aviary_cell_call_app)
+__aviary_ns["conversation"] = __aviary_make_conversation(__aviary_cell_call_app)
+__aviary_ns["remember"] = __aviary_make_remember(__aviary_cell_call_app)
+__aviary_ns["recall"] = __aviary_make_recall(__aviary_cell_call_app)
+__aviary_ns["attach_image"] = __aviary_make_attach_image(__aviary_cell_call_app)
+__aviary_ns["agents"] = __aviary_make_agents(__aviary_cell_call_app)
+__aviary_ns["message"] = __aviary_make_message(__aviary_cell_call_app)
 # Storage is Aviary's: the kernel does not know the session id or where its artifacts live, and
 # a runtime that picked its own directory would put the same document somewhere different on
 # each engine.
-__aviary_ns["artifact"] = lambda text, title=None, format="md": __aviary_ask_app(
-    "artifact", text=text, title=title, format=format)
+def __aviary_make_artifact(call_app):
+    def artifact(text, title=None, format="md"):
+        return call_app("artifact", text=text, title=title, format=format)
+    return artifact
+
+
+__aviary_ns["artifact"] = __aviary_make_artifact(__aviary_cell_call_app)
 
 try:
     sys.stdout, sys.stderr = __aviary_out, __aviary_err
@@ -765,7 +896,8 @@ finally:
         json.dump(__aviary_result, __aviary_fh, default=repr)
     for __aviary_dead in ("__aviary_out", "__aviary_err", "__aviary_result", "__aviary_fh",
                           "__aviary_value", "__aviary_sh", "__aviary_state",
-                          "__AVIARY_CODE", "__AVIARY_MODE", "__AVIARY_OUT", "__AVIARY_CWD"):
+                          "__AVIARY_CODE", "__AVIARY_MODE", "__AVIARY_OUT", "__AVIARY_CWD",
+                          "__AVIARY_TRACEPARENT"):
         globals().pop(__aviary_dead, None)
     globals().pop("__aviary_dead", None)
 '''
@@ -936,8 +1068,9 @@ class Session:
             os.unlink(req_path)
         except Exception:
             return
-        result = request_from_app(req.get("kind") or "", req.get("payload") or {},
-                                  session=self.sid)
+        result = request_from_app(
+            req.get("kind") or "", req.get("payload") or {}, session=self.sid,
+            traceparent=validated_traceparent(req.get("traceparent")))
         try:
             with open(req["reply"], "w") as fh:
                 json.dump(result, fh, default=str)
@@ -970,9 +1103,10 @@ class Session:
             except OSError:
                 pass
 
-    def execute(self, code: str, mode: str) -> dict:
+    def execute(self, code: str, mode: str, traceparent: str | None = None) -> dict:
         return self._run(_EXEC_BODY, __AVIARY_CODE=code, __AVIARY_MODE=mode,
-                         __AVIARY_CWD=self.cwd, __AVIARY_CALLBACK_DIR=self.cb_dir)
+                         __AVIARY_CWD=self.cwd, __AVIARY_CALLBACK_DIR=self.cb_dir,
+                         __AVIARY_TRACEPARENT=traceparent)
 
     def inspect(self) -> dict:
         return self._run(_INSPECT_BODY, __AVIARY_INJECTED=sorted(_AVIARY_INJECTED))
@@ -1020,7 +1154,7 @@ class Client:
         self.client_id = str(uuid.uuid4())
 
     def send_obj(self, obj: dict) -> bool:
-        line = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8") + b"\n"
+        line = encoded_frame(obj)
         callback_oversized = obj.get("event") == "callback" and len(line) > MAX_FRAME_BYTES
         if len(line) > MAX_FRAME_BYTES:
             # Preserve request completion when a result itself is too large. An event-only
@@ -1398,7 +1532,9 @@ class Host:
             try:
                 if op == "exec":
                     code = msg.get("code") or ""
-                    result = session.execute(code, msg.get("mode") or "exec")
+                    result = session.execute(
+                        code, msg.get("mode") or "exec",
+                        traceparent=validated_traceparent(msg.get("traceparent")))
                     # Output goes out as events first so a caller can stream it, then the
                     # response closes the request. Both, deliberately: streaming is what a
                     # UI wants, and a single settled result is what a test wants.

@@ -25,6 +25,7 @@ enum ClaudeCodeCLI {
         let done = Atomic(false)
         Task {
             await run(prompt: prompt, model: model, cwd: cwd, effort: effort, quiet: quiet)
+            await AviaryTelemetry.shutdown(maximumDuration: 2)
             done.set(true)
         }
         while !done.get() {
@@ -48,7 +49,7 @@ enum ClaudeCodeCLI {
             writer = try SessionWriter(
                 home: home, cwd: cwd, model: ClaudeCodeRun.modelSpec(for: model), identity: identity)
         } catch {
-            AgentCLI.fail("Could not open the session journal: \(error.localizedDescription)")
+            await AgentCLI.fail("Could not open the session journal: \(error.localizedDescription)")
         }
         let commandController = SessionCommandController(
             identity: identity, writer: writer)
@@ -56,11 +57,11 @@ enum ClaudeCodeCLI {
             .start(prompt: prompt), actorID: "cli", commandID: "cli-start")
         guard case .accepted(let startCommand) = startAdmission else {
             await finishFailedLaunch(commandController: commandController, writer: writer)
-            AgentCLI.fail("The Claude Code start command could not be durably admitted.")
+            await AgentCLI.fail("The Claude Code start command could not be durably admitted.")
         }
         guard await commandController.awaitDispatch(commandID: startCommand.commandID) != nil else {
             await finishFailedLaunch(commandController: commandController, writer: writer)
-            AgentCLI.fail("The Claude Code start command lost its dispatch turn.")
+            await AgentCLI.fail("The Claude Code start command lost its dispatch turn.")
         }
         _ = await commandController.acknowledgeDispatched(commandID: startCommand.commandID)
         let prepared: ClaudeCodeSession.Prepared
@@ -71,7 +72,7 @@ enum ClaudeCodeCLI {
                 identity: identity, writer: writer)
         } catch {
             await finishFailedLaunch(commandController: commandController, writer: writer)
-            AgentCLI.fail(error.localizedDescription)
+            await AgentCLI.fail(error.localizedDescription)
         }
         let run = prepared.run
         if !quiet {

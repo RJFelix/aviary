@@ -15,6 +15,7 @@ import Foundation
 /// documented path; the WebSocket route is an optimization, and implementing it half-way would
 /// be a novel client signature for no gain.
 public struct CodexResponsesProvider: ChatProvider {
+    public var usageAccounting: ProviderUsageAccounting { .cacheInclusive }
     public let id: String
     public let store: CodexAuth.Store
     public let baseURL: String?

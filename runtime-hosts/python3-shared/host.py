@@ -62,6 +62,20 @@ MAX_SEND_SECONDS = 1.0
 SEND_CHUNK_BYTES = 512
 
 
+def validated_traceparent(value) -> str | None:
+    """Accept only a W3C v00 traceparent with lowercase, nonzero identifiers."""
+    if not isinstance(value, str) or len(value) != 55 or not value.isascii():
+        return None
+    parts = value.split("-")
+    if len(parts) != 4 or parts[0] != "00":
+        return None
+    if (len(parts[1]) != 32 or len(parts[2]) != 16 or len(parts[3]) != 2
+            or any(c not in "0123456789abcdef" for c in "".join(parts[1:]))
+            or set(parts[1]) == {"0"} or set(parts[2]) == {"0"}):
+        return None
+    return value
+
+
 def install_parent_lifetime_lease(parent_pid: int | None, socket_path: str) -> None:
     """Exit this test-owned host when its launching process goes away.
 
@@ -122,8 +136,22 @@ def bounded_diagnostic(value, limit: int = MAX_DIAGNOSTIC_BYTES) -> str:
     return str(value)[:limit]
 
 
+def encoded_frame(obj: dict) -> bytes:
+    """Encode one wire frame, omitting trace context only when it breaks the frame bound."""
+    if obj.get("event") != "callback" or "traceparent" not in obj:
+        return json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8") + b"\n"
+    base = dict(obj)
+    context = validated_traceparent(base.pop("traceparent", None))
+    base_line = json.dumps(base, ensure_ascii=False, default=str).encode("utf-8") + b"\n"
+    if context is None:
+        return base_line
+    context_bytes = json.dumps(context, ensure_ascii=False).encode("ascii")
+    candidate = base_line[:-2] + b',"traceparent":' + context_bytes + b"}\n"
+    return candidate if len(candidate) <= MAX_FRAME_BYTES else base_line
+
+
 def encoded_frame_size(obj: dict) -> int:
-    return len(json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")) + 1
+    return len(encoded_frame(obj))
 
 # Everything the host puts into the agent's namespace. Listed once, because `inspect` must
 # hide exactly this set: the namespace belongs to the agent, and a host whose own helpers show
@@ -171,13 +199,17 @@ def _remember_callback_outcome_locked(rid: str, status: str) -> None:
         _callback_history.popitem(last=False)
 
 
-def request_from_app(kind: str, payload: dict, session: str = "", timeout: float = 900.0):
+def request_from_app(kind: str, payload: dict, session: str = "", timeout: float = 900.0,
+                     traceparent: str | None = None):
     with _callback_lock:
         _callback_seq[0] += 1
         rid = f"cb-{_callback_seq[0]}"
         event = threading.Event()
         message = {"event": "callback", "rid": rid, "kind": kind,
                    "payload": payload, "session": session}
+        context = validated_traceparent(traceparent)
+        if context is not None:
+            message["traceparent"] = context
         _callbacks[rid] = {
             "event": event, "result": _CALLBACK_PENDING, "session": session, "message": message,
         }
@@ -423,22 +455,39 @@ class Session:
         self.state = {"cwd": cwd, "env": {}}
         self.globals["sh"] = self._make_sh()
         self.globals["cwd"] = lambda: self.state["cwd"]
-        # Same namespace surface as the reference host, so agent code is portable between
-        # them. Here the closure can be handed over directly; the sub-interpreter host has to
-        # marshal through a file because objects cannot cross an interpreter boundary.
-        self.globals["ask_app"] = lambda kind, **payload: request_from_app(kind, payload, sid)
-        self.globals["spawn"] = lambda prompt, name=None, model=None: request_from_app(
-            "spawn", {"prompt": prompt, "name": name, "model": model}, sid)
-        self.globals["conversation"] = lambda limit=40: request_from_app(
-            "conversation", {"limit": limit}, sid)
-        self.globals["remember"] = lambda text, scope="project", days=None, tags=None: (
-            request_from_app("remember",
-                             {"text": text, "scope": scope, "days": days, "tags": tags or []},
-                             sid))
-        self.globals["recall"] = lambda query="": request_from_app(
-            "recall", {"query": query}, sid)
+        self._installed_bindings: dict[str, object] = {}
+        self._install_exec_bindings(None)
+
         self.thread = threading.Thread(target=self._loop, name=f"session-{sid}", daemon=True)
         self.thread.start()
+
+    def _install_exec_bindings(self, traceparent: str | None) -> None:
+        # Bind every callback-capable value for this execution to its validated context. A
+        # callable retained by an earlier cell keeps its origin; later executions never rewrite
+        # a worker's callback by consulting mutable Session state. User replacements and
+        # deletions remain theirs: only a binding that is still identical to the previous host
+        # binding may be refreshed.
+        def install(name: str, value: object) -> None:
+            prior = self._installed_bindings.get(name)
+            current = self.globals.get(name)
+            if prior is None or current is prior:
+                self.globals[name] = value
+                self._installed_bindings[name] = value
+
+        ask_app = lambda kind, **payload: request_from_app(
+            kind, payload, session=self.sid, traceparent=traceparent)
+        install("ask_app", ask_app)
+        install("spawn", lambda prompt, name=None, model=None: request_from_app(
+            "spawn", {"prompt": prompt, "name": name, "model": model}, self.sid,
+            traceparent=traceparent))
+        install("conversation", lambda limit=40: request_from_app(
+            "conversation", {"limit": limit}, self.sid, traceparent=traceparent))
+        install("remember", lambda text, scope="project", days=None, tags=None: (
+            request_from_app(
+                "remember", {"text": text, "scope": scope, "days": days,
+                              "tags": tags or []}, self.sid, traceparent=traceparent)))
+        install("recall", lambda query="": request_from_app(
+            "recall", {"query": query}, self.sid, traceparent=traceparent))
 
     def _make_sh(self):
         state = self.state
@@ -497,7 +546,8 @@ class Session:
                 emit({"event": "host_error", "session": self.sid,
                       "detail": bounded_diagnostic(traceback.format_exc())})
 
-    def execute(self, code: str, mode: str) -> dict:
+    def execute(self, code: str, mode: str, traceparent: str | None = None) -> dict:
+        self._install_exec_bindings(traceparent)
         import ast, contextlib, io
         out, err = io.StringIO(), io.StringIO()
         result = {"stdout": "", "stderr": "", "value": None, "exception": None}
@@ -566,7 +616,7 @@ class Client:
         self.client_id = str(uuid.uuid4())
 
     def send_obj(self, obj: dict) -> bool:
-        line = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8") + b"\n"
+        line = encoded_frame(obj)
         callback_oversized = obj.get("event") == "callback" and len(line) > MAX_FRAME_BYTES
         if len(line) > MAX_FRAME_BYTES:
             # Preserve request completion when a result itself is too large. An event-only
@@ -855,7 +905,9 @@ class Host:
             try:
                 if op == "exec":
                     code = msg.get("code") or ""
-                    result = session.execute(code, msg.get("mode") or "exec")
+                    result = session.execute(
+                        code, msg.get("mode") or "exec",
+                        traceparent=validated_traceparent(msg.get("traceparent")))
                     # Output goes out as events first so a caller can stream it, then the
                     # response closes the request. Both, deliberately: streaming is what a
                     # UI wants, and a single settled result is what a test wants.

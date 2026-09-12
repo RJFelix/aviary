@@ -1,4 +1,5 @@
 import Foundation
+import OpenTelemetrySdk
 @testable import AviaryCore
 
 private enum AttachedControllerTestError: Error {
@@ -327,6 +328,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
     var loseReadAcknowledgementBeforeAdmissionRemaining = 0
     var loseReadAcknowledgementBeforeAdmissionTarget: WorkServiceReadTarget?
     var advanceControlAfterWorkAcknowledgement = false
+    var forgeReadAcknowledgementResponse = false
     var corruptPrefixDigests = false
     var snapshotAfterSequences: [Int] = []
     var pageAfterSequences: [Int] = []
@@ -344,6 +346,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
     }
 
     func setMode(_ mode: AttachedControllerServiceMode) { self.mode = mode }
+    func setForgedReadAcknowledgementResponse() { forgeReadAcknowledgementResponse = true }
     func setArtifactDescriptors(_ descriptors: [WorkServiceArtifactDescriptor]) {
         artifactDescriptors = descriptors
     }
@@ -496,6 +499,14 @@ private actor AttachedControllerTestService: WorkServiceClient {
         if loseReadAcknowledgementResponsesRemaining > 0 {
             loseReadAcknowledgementResponsesRemaining -= 1
             throw AttachedControllerTestError.transport
+        }
+        if forgeReadAcknowledgementResponse {
+            return WorkServiceAcknowledgeReadResponse(
+                work: response.work, target: response.target, cursor: response.cursor,
+                commandID: "foreign-command", state: response.state, host: response.host,
+                causalControlCursor: response.causalControlCursor,
+                resultingControlCursor: response.resultingControlCursor,
+                authorization: fixture.authorization, receipt: response.receipt)
         }
         return response
     }
@@ -2527,6 +2538,66 @@ func testWorkServiceAttachedControllerKeepsFrozenAncestorBranchTipAcrossDescenda
     XCTAssertTrue(requestBranchTips.allSatisfy { $0 == originalBranchTip })
 }
 
+func testWorkServiceAttachedControllerReadAcknowledgementTelemetry() async throws {
+    let fixture = try AttachedControllerFixture()
+    let service = AttachedControllerTestService(fixture: fixture)
+    await service.setLoseReadAcknowledgementResponses(2)
+    let controller = try makeAttachedController(fixture: fixture, service: service)
+    let (_, spans) = try await AviaryTelemetry.withRecording {
+        _ = try await controller.refresh()
+        _ = try await controller.refresh()
+        _ = try await controller.refresh()
+    }
+    let attempts = spans.filter { $0.name == "aviary.gui.read_acknowledgement" }
+    let requests = await service.readAckRequests()
+    XCTAssertEqual(attempts.count, requests.count)
+    XCTAssertEqual(attempts.count, 3, "descriptor reconciliation and unchanged polling emit no new attempts")
+    XCTAssertEqual(attempts.map { $0.attributes["aviary.outcome"] },
+        [.string("indeterminate"), .string("rejected"), .string("indeterminate")])
+    XCTAssertEqual(Set(attempts.map { $0.traceId.hexString }).count, 3)
+    for (span, request) in zip(attempts, requests) {
+        XCTAssertEqual(span.attributes["aviary.command.id"], .string(AviaryTelemetry.identity(request.commandID)))
+        XCTAssertEqual(span.attributes["aviary.read.journal.id"],
+            .string(AviaryTelemetry.journalIdentity(request.cursor.journal)))
+        XCTAssertEqual(span.attributes["aviary.read.sequence"], .int(request.cursor.sequence))
+        XCTAssertFalse(String(describing: span).contains(fixture.session.sessionID))
+    }
+    XCTAssertEqual(await service.readAckEffectCount(), 2)
+    XCTAssertEqual((await controller.projection()).attachment.readAcknowledgements.count, 2)
+}
+
+func testWorkServiceAttachedControllerReadAcknowledgementTelemetryCheckpointGate() async throws {
+    let fixture = try AttachedControllerFixture()
+    let service = AttachedControllerTestService(fixture: fixture)
+    let box = AttachedControllerCheckpointBox()
+    box.failSaves = true
+    let controller = try makeAttachedController(fixture: fixture, service: service,
+        checkpointStore: AttachedControllerCheckpointStore(box: box))
+    let (_, withheld) = try await AviaryTelemetry.withRecording { _ = try await controller.refresh() }
+    XCTAssertTrue(withheld.filter { $0.name == "aviary.gui.read_acknowledgement" }.isEmpty)
+    XCTAssertTrue((await service.readAckRequests()).isEmpty)
+    box.failSaves = false
+    let (_, recovered) = try await AviaryTelemetry.withRecording { _ = try await controller.refresh() }
+    let attempts = recovered.filter { $0.name == "aviary.gui.read_acknowledgement" }
+    XCTAssertEqual(attempts.count, 2)
+    XCTAssertTrue(attempts.allSatisfy { $0.attributes["aviary.outcome"] == .string("accepted") })
+    XCTAssertTrue(attempts.allSatisfy { $0.events.count == 1 })
+}
+
+func testWorkServiceAttachedControllerReadAcknowledgementTelemetryForgedReceipt() async throws {
+    let fixture = try AttachedControllerFixture()
+    let service = AttachedControllerTestService(fixture: fixture)
+    await service.setForgedReadAcknowledgementResponse()
+    let controller = try makeAttachedController(fixture: fixture, service: service)
+    let (_, spans) = try await AviaryTelemetry.withRecording { _ = try await controller.refresh() }
+    let attempts = spans.filter { $0.name == "aviary.gui.read_acknowledgement" }
+    XCTAssertEqual(attempts.count, (await service.readAckRequests()).count)
+    XCTAssertTrue(attempts.contains { $0.attributes["aviary.outcome"] == .string("indeterminate") })
+    XCTAssertFalse(attempts.contains { $0.attributes["aviary.outcome"] == .string("accepted") })
+    XCTAssertTrue(attempts.filter { $0.attributes["aviary.outcome"] == .string("indeterminate") }
+        .allSatisfy { $0.events.isEmpty }, "an uncorrelated response is not a diagnostic receipt")
+}
+
 func testWorkServiceAttachedControllerAcknowledgesWorkAndSessionWithExactControlChain() async throws {
     let fixture = try AttachedControllerFixture()
     let service = AttachedControllerTestService(fixture: fixture)
@@ -3259,6 +3330,15 @@ let casesWorkServiceAttachedWorkController: [Case] = [
     }),
     ("phase3 Work controller acknowledges Work and Session with exact control chaining", {
         try await testWorkServiceAttachedControllerAcknowledgesWorkAndSessionWithExactControlChain()
+    }),
+    ("telemetry Work controller read acknowledgements preserve uncertainty without polling spans", {
+        try await testWorkServiceAttachedControllerReadAcknowledgementTelemetry()
+    }),
+    ("telemetry Work controller read acknowledgements require durable local checkpoints", {
+        try await testWorkServiceAttachedControllerReadAcknowledgementTelemetryCheckpointGate()
+    }),
+    ("telemetry Work controller read acknowledgements reject forged receipt evidence", {
+        try await testWorkServiceAttachedControllerReadAcknowledgementTelemetryForgedReceipt()
     }),
     ("phase3 Work controller reconciles lost Work and Session acknowledgements", {
         try await testWorkServiceAttachedControllerReconcilesLostWorkAndSessionAcknowledgements()

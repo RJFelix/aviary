@@ -2843,7 +2843,7 @@ public actor WorkServiceAttachedWorkController {
                 guard persistCheckpointIfPossible(attachmentOverride: attachment) else { return }
             }
             do {
-                let response = try await service.acknowledgeRead(request)
+                let response = try await tracedReadAcknowledgement(request)
                 guard Self.validAcknowledgementResponse(
                     response, request: request, expectedHost: WorkHostRef(work.workHostID)) else {
                     appendReadDiagnostic(
@@ -2890,6 +2890,53 @@ public actor WorkServiceAttachedWorkController {
                 return
             }
         }
+    }
+
+    /// A persisted client read checkpoint, not proof that a person read or approved the content.
+    /// Each actual request is a new diagnostic root; retained command identity joins lost replies.
+    private func tracedReadAcknowledgement(
+        _ request: WorkServiceAcknowledgeReadRequest
+    ) async throws -> WorkServiceAcknowledgeReadResponse {
+        let targetKind: String
+        switch request.target {
+        case .work: targetKind = "work"
+        case .session: targetKind = "session"
+        }
+        return try await AviaryTelemetry.withSpan(
+            "aviary.gui.read_acknowledgement", attributes: [
+                "aviary.work.id": .string(AviaryTelemetry.workIdentity(request.work)),
+                "aviary.client.id": .string(AviaryTelemetry.identity(request.client.clientID)),
+                "aviary.command.id": .string(AviaryTelemetry.identity(request.commandID)),
+                "aviary.read.target": .string(targetKind),
+                "aviary.read.journal.id": .string(AviaryTelemetry.journalIdentity(request.cursor.journal)),
+                "aviary.read.event.id": .string(AviaryTelemetry.identity(request.cursor.eventID ?? "")),
+                "aviary.read.sequence": .int(request.cursor.sequence),
+                "aviary.control.sequence": .int(request.causalControlCursor.sequence),
+            ], root: true) {
+                do {
+                    let response = try await service.acknowledgeRead(request)
+                    guard Self.validAcknowledgementResponse(
+                        response, request: request, expectedHost: WorkHostRef(request.work.workHostID)) else {
+                        AviaryTelemetry.outcome("indeterminate")
+                        return response
+                    }
+                    let state: String
+                    switch response.state {
+                    case .accepted: state = "accepted"
+                    case .duplicate: state = "duplicate"
+                    case .rejected: state = "rejected"
+                    }
+                    AviaryTelemetry.event("aviary.gui.read_acknowledgement.receipt",
+                        attributes: ["aviary.receipt.state": .string(state)])
+                    AviaryTelemetry.outcome(state)
+                    return response
+                } catch {
+                    // A transport error can follow durable admission. Existing reconciliation
+                    // retains the exact request; telemetry never chooses a retry.
+                    AviaryTelemetry.outcome("indeterminate")
+                    throw error
+                }
+            }
     }
 
     private func currentControlCursor() async -> JournalCursor? {

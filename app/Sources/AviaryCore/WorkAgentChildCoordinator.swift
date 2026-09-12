@@ -44,6 +44,11 @@ internal actor WorkAgentChildCoordinator {
         case admissionUncertain(HandleRef)
         case admissionsFrozen
         case invalidRequest(String)
+
+        var isAdmissionUncertain: Bool {
+            if case .admissionUncertain = self { return true }
+            return false
+        }
     }
 
     /// A capability to reopen admission after one coordinator-local shutdown freeze. Tokens are
@@ -122,6 +127,8 @@ internal actor WorkAgentChildCoordinator {
         let handle: HandleRef
         let label: String
         let deadline: Date?
+        var queuedAtUptime: TimeInterval?
+        let admissionContext: AviaryTraceContext?
         let requestBody: TimelineBodyReference
         let reservation: WorkAgentChildAdmissionQueue.Reservation
         var factory: ExecutionFactory?
@@ -254,7 +261,49 @@ internal actor WorkAgentChildCoordinator {
         label: String,
         deadline: Date? = nil,
         makeExecution: @escaping ExecutionFactory,
-        now: Date = Date()
+        now: Date = Date(),
+        admissionContext: AviaryTraceContext? = nil
+    ) async throws -> Admission {
+        let work = binding.workBinding.work
+        let parentContext = admissionContext ?? AviaryTelemetry.context
+        let attributes: [String: AviaryTraceValue] = [
+            "aviary.work.id": .string(telemetryWorkID(work)),
+            "aviary.run.id": .string(AviaryTelemetry.identity(binding.run.runID)),
+        ]
+        return try await AviaryTelemetry.withSpan(
+            "aviary.agent_child.admission",
+            attributes: attributes,
+            parent: parentContext,
+            root: parentContext == nil
+        ) {
+            do {
+                let admission = try await self.admitUntraced(
+                    origin: binding, prompt: prompt, label: label, deadline: deadline,
+                    makeExecution: makeExecution, now: now,
+                    admissionContext: AviaryTelemetry.context)
+                // The queue event was appended and committed before admitUntraced returns.
+                AviaryTelemetry.outcome("accepted")
+                return admission
+            } catch let error as Failure {
+                // A lost journal confirmation is materially different from a rejected request.
+                AviaryTelemetry.outcome(
+                    error.isAdmissionUncertain ? "indeterminate" : "rejected")
+                throw error
+            } catch {
+                AviaryTelemetry.outcome("indeterminate")
+                throw error
+            }
+        }
+    }
+
+    private func admitUntraced(
+        origin binding: WorkRunBinding,
+        prompt: String,
+        label: String,
+        deadline: Date? = nil,
+        makeExecution: @escaping ExecutionFactory,
+        now: Date = Date(),
+        admissionContext: AviaryTraceContext?
     ) async throws -> Admission {
         await acquireLifecycleGate()
         defer { releaseLifecycleGate() }
@@ -306,6 +355,8 @@ internal actor WorkAgentChildCoordinator {
         let key = Key(work: work, handle: handle)
         entries[key] = Entry(
             work: work, origin: origin, handle: handle, label: label, deadline: deadline,
+            queuedAtUptime: nil,
+            admissionContext: admissionContext,
             requestBody: requestBody, reservation: reservation, factory: makeExecution,
             latestLifecycleEvent: nil, phase: .admitting, cancellationCause: nil,
             resource: nil, terminalOutcome: nil, executionSettlement: nil,
@@ -319,6 +370,8 @@ internal actor WorkAgentChildCoordinator {
             try queue.commit(reservation)
             entries[key]?.latestLifecycleEvent = commit.eventRef
             entries[key]?.phase = .queued
+            entries[key]?.queuedAtUptime = ProcessInfo.processInfo.systemUptime
+            recordLifecycleTelemetry("aviary.agent_child.queued", entry: entries[key]!, commit: commit)
         } catch let appendError {
             let canonical: BoundedWorkAgentHandleIndexRecord?
             do { canonical = try await canonicalRecord(route: route, handle: handle) }
@@ -333,6 +386,7 @@ internal actor WorkAgentChildCoordinator {
                 try queue.commit(reservation)
                 entries[key]?.latestLifecycleEvent = record.latestLifecycleEvent
                 entries[key]?.phase = .queued
+                entries[key]?.queuedAtUptime = ProcessInfo.processInfo.systemUptime
             } else if canonical == nil {
                 try? queue.abandonUncommitted(reservation)
                 entries.removeValue(forKey: key)
@@ -462,7 +516,7 @@ internal actor WorkAgentChildCoordinator {
             entries[key] = entry
             if record.state == .cancelRequested {
                 if let settlement = entry.executionSettlement {
-                    await settleExecutionLocked(key: key, route: route, settlement: settlement)
+                    _ = await settleExecutionLocked(key: key, route: route, settlement: settlement)
                     releaseLifecycleGate()
                     return .alreadyRequested
                 }
@@ -631,10 +685,36 @@ internal actor WorkAgentChildCoordinator {
                     entries[key]?.latestLifecycleEvent = started.eventRef
                     entries[key]?.phase = .running
                     entries[key]?.resource = resource
+                    let executionContext = entry.admissionContext
+                    let executionHandleID = telemetryHandleID(work: entry.work, handle: entry.handle)
+                    let executionWorkID = telemetryWorkID(entry.work)
+                    let executionRunID = AviaryTelemetry.identity(entry.origin.run.runID)
+                    let queueWait = max(
+                        0,
+                        ProcessInfo.processInfo.systemUptime
+                            - (entry.queuedAtUptime ?? ProcessInfo.processInfo.systemUptime))
+                    let startedTelemetry = telemetryLifecycleAttributes(
+                        entry: entry, commit: started)
                     let task = Task { [weak self, resource] in
-                        let result = await resource.execute()
-                        let settledAt = Date()
-                        await self?.finish(key: key, result: result, settledAt: settledAt)
+                        await AviaryTelemetry.withSpan(
+                            "aviary.agent_child.execution",
+                            attributes: [
+                                "aviary.handle.id": .string(executionHandleID),
+                                "aviary.work.id": .string(executionWorkID),
+                                "aviary.run.id": .string(executionRunID),
+                                "aviary.queue.wait.seconds": .double(queueWait),
+                            ],
+                            root: true,
+                            links: executionContext.map { [$0] } ?? []
+                        ) {
+                            AviaryTelemetry.event(
+                                "aviary.agent_child.started", attributes: startedTelemetry)
+                            let result = await resource.execute()
+                            let settledAt = Date()
+                            let outcome = await self?.finish(
+                                key: key, result: result, settledAt: settledAt)
+                            AviaryTelemetry.outcome(outcome?.rawValue ?? "indeterminate")
+                        }
                     }
                     entries[key]?.executionTask = task
                 } catch {
@@ -724,21 +804,25 @@ internal actor WorkAgentChildCoordinator {
         }
     }
 
-    private func finish(key: Key, result: AgentChildExecutionResult, settledAt: Date) async {
+    private func finish(
+        key: Key, result: AgentChildExecutionResult, settledAt: Date
+    ) async -> WorkAgentHandleTerminalOutcome? {
         await acquireLifecycleGate()
         guard let entry = entries[key], let route = routes[entry.work] else {
-            releaseLifecycleGate(); return
+            releaseLifecycleGate(); return nil
         }
         let settlement = ExecutionSettlement(result: result, settledAt: settledAt)
         entries[key]?.executionSettlement = settlement
-        await settleExecutionLocked(key: key, route: route, settlement: settlement)
+        let outcome = await settleExecutionLocked(
+            key: key, route: route, settlement: settlement)
         releaseLifecycleGate()
+        return outcome
     }
 
     private func settleExecutionLocked(
         key: Key, route: Route, settlement: ExecutionSettlement
-    ) async {
-        guard let entry = entries[key] else { return }
+    ) async -> WorkAgentHandleTerminalOutcome? {
+        guard let entry = entries[key] else { return nil }
         let result = settlement.result
         entries[key]?.phase = .settling
         entries[key]?.deadlineTask?.cancel()
@@ -776,9 +860,13 @@ internal actor WorkAgentChildCoordinator {
         let finalOutcome: WorkAgentHandleTerminalOutcome =
             outcome == .succeeded && resultBody == nil ? .failed : outcome
         do {
-            try await appendTerminalLocked(
+            let commit = try await appendTerminalLocked(
                 entry: entries[key]!, route: route, outcome: finalOutcome,
                 resultBody: resultBody, cleanup: cleanup)
+            AviaryTelemetry.event(
+                "aviary.agent_child.terminal",
+                attributes: telemetryLifecycleAttributes(
+                    entry: entries[key]!, commit: commit))
             awaitObservers.removeValue(forKey: key)
             if cleanup.state == .indeterminate {
                 entries[key]?.phase = .terminalUnquiesced
@@ -787,13 +875,15 @@ internal actor WorkAgentChildCoordinator {
                 settleTerminalLocked(key: key)
                 await pumpLocked(now: Date())
             }
+            return finalOutcome
         } catch {
             let reconciliation = await reconcileMutationFailureLocked(key: key, route: route)
             switch reconciliation {
-            case .terminal:
-                break
+            case .terminal(let outcome):
+                return outcome
             case .cancellationCommitted, .unchanged, .uncertain:
                 entries[key]?.phase = .ambiguous
+                return .indeterminate
             }
         }
     }
@@ -802,10 +892,33 @@ internal actor WorkAgentChildCoordinator {
         key: Key, route: Route, outcome: WorkAgentHandleTerminalOutcome
     ) async throws {
         guard let entry = entries[key] else { throw Failure.ambiguous }
-        try await appendTerminalLocked(
-            entry: entry, route: route, outcome: outcome, resultBody: nil,
-            cleanup: WorkAgentHandleCleanupProof(state: .notStarted))
-        settleTerminalLocked(key: key)
+        let attributes: [String: AviaryTraceValue] = [
+            "aviary.handle.id": .string(telemetryHandleID(work: entry.work, handle: entry.handle)),
+            "aviary.work.id": .string(telemetryWorkID(entry.work)),
+            "aviary.run.id": .string(AviaryTelemetry.identity(entry.origin.run.runID)),
+        ]
+        try await AviaryTelemetry.withSpan(
+            "aviary.agent_child.settlement",
+            attributes: attributes,
+            root: true,
+            links: entry.admissionContext.map { [$0] } ?? []
+        ) {
+            do {
+                let commit = try await appendTerminalLocked(
+                    entry: entry, route: route, outcome: outcome, resultBody: nil,
+                    cleanup: WorkAgentHandleCleanupProof(state: .notStarted))
+                // Emit only after the terminal append has returned its durable commit.
+                AviaryTelemetry.event(
+                    "aviary.agent_child.terminal",
+                    attributes: telemetryLifecycleAttributes(
+                        entry: entries[key]!, commit: commit))
+                settleTerminalLocked(key: key)
+                AviaryTelemetry.outcome(outcome.rawValue)
+            } catch {
+                AviaryTelemetry.outcome("indeterminate")
+                throw error
+            }
+        }
     }
 
     /// A start rejected after queue promotion is only recoverable when an exact read proves the
@@ -880,7 +993,7 @@ internal actor WorkAgentChildCoordinator {
     private func appendTerminalLocked(
         entry: Entry, route: Route, outcome: WorkAgentHandleTerminalOutcome,
         resultBody: TimelineBodyReference?, cleanup: WorkAgentHandleCleanupProof
-    ) async throws {
+    ) async throws -> TimelineJournalCommit {
         let key = Key(work: entry.work, handle: entry.handle)
         guard let latest = entries[key]?.latestLifecycleEvent else { throw Failure.ambiguous }
         let commit = try await route.journal.append(draft(
@@ -888,6 +1001,7 @@ internal actor WorkAgentChildCoordinator {
             causedBy: latest, payload: WorkAgentHandleTerminalPayload(
                 outcome: outcome, resultBody: resultBody, cleanup: cleanup)))
         entries[key]?.latestLifecycleEvent = commit.eventRef
+        return commit
     }
 
     private func reconcileMutationFailureLocked(
@@ -1001,6 +1115,28 @@ internal actor WorkAgentChildCoordinator {
             sessionAttachment: entry.origin.sessionAttachment, run: entry.origin.run,
             handle: entry.handle, type: type,
             declaredDomains: [.work, .runtime, .externalEffects], payload: payloadJSON)
+    }
+
+    private func telemetryWorkID(_ work: WorkRef) -> String {
+        AviaryTelemetry.workIdentity(work)
+    }
+
+    private func telemetryHandleID(work: WorkRef, handle: HandleRef) -> String {
+        AviaryTelemetry.identity("handle:v1:\(AviaryTelemetry.workIdentity(work)):\(handle.handleID)")
+    }
+
+    private func recordLifecycleTelemetry(
+        _ name: String, entry: Entry, commit: TimelineJournalCommit
+    ) {
+        AviaryTelemetry.event(name, attributes: telemetryLifecycleAttributes(entry: entry, commit: commit))
+    }
+
+    private func telemetryLifecycleAttributes(
+        entry: Entry, commit: TimelineJournalCommit
+    ) -> [String: AviaryTraceValue] {
+        [
+            "aviary.handle.id": .string(telemetryHandleID(work: entry.work, handle: entry.handle)),
+        ].merging(AviaryTelemetry.canonicalReferenceAttributes(commit)) { _, exact in exact }
     }
 
     private func acquireLifecycleGate() async {

@@ -14,6 +14,25 @@ enum CanonicalNotificationPlatform {
     }
 }
 
+private func pendingStartupTelemetryOutcome(for error: Error) -> String {
+    if error is ServiceBackedRunBridgeError { return "rejected" }
+    if error is WorkHostWorkspaceRegistryError || error is LocalWorkServiceBootstrapError {
+        return "unavailable"
+    }
+    if let controllerError = error as? WorkServiceAttachedWorkControllerError {
+        switch controllerError {
+        case .staleCursor, .commandNotAdmissible, .capabilityDenied, .terminalWork,
+             .invalidSeed, .invalidOptions:
+            return "rejected"
+        case .sourceIncomplete, .notConnected, .malformedResponse,
+             .transportFailure, .hostMismatch, .pendingCommandExists, .noPendingCommand,
+             .recoveryRequired:
+            return "indeterminate"
+        }
+    }
+    return "indeterminate"
+}
+
 /// Fixed, non-sensitive reason a service draft could not be restored. The distinction matters:
 /// an unreadable record is known to remain on disk, while failure to construct the store proves
 /// no such thing and must not claim that it does.
@@ -1555,8 +1574,41 @@ final class AppModel {
             let pending = try store.loadPending()
             for retained in pending {
                 let request = retained.request
+                var reconcileAttributes: [String: AviaryTraceValue] = [
+                    "aviary.create.command.id": .string(
+                        AviaryTelemetry.identity(request.commandID)),
+                ]
+                if let initialStart = retained.initialStart {
+                    reconcileAttributes["aviary.start.command.id"] = .string(
+                        AviaryTelemetry.identity(initialStart.commandID))
+                }
+                if let chat = pendingChats.first(where: {
+                    $0.attemptCommandID.uuidString.lowercased() == request.commandID
+                }) {
+                    reconcileAttributes["aviary.chat.id"] = .string(
+                        AviaryTelemetry.identity(chat.id.uuidString.lowercased()))
+                }
                 do {
-                    let response = try await session.createWork(request)
+                    let response = try await AviaryTelemetry.withSpan(
+                        "aviary.gui.pending_create.reconcile",
+                        attributes: reconcileAttributes, root: true
+                    ) {
+                        AviaryTelemetry.event(
+                            "aviary.pending_intent.retained", attributes: reconcileAttributes)
+                        do {
+                            let response = try await session.createWork(request)
+                            AviaryTelemetry.event("aviary.create.receipt_validated", attributes: [
+                                "aviary.receipt.state": .string(response.receipt.state.rawValue),
+                            ])
+                            AviaryTelemetry.outcome(response.receipt.state.rawValue)
+                            return response
+                        } catch {
+                            AviaryTelemetry.outcome(
+                                Self.isProvenStaleCreateFailure(error)
+                                    ? "rejected" : "indeterminate")
+                            throw error
+                        }
+                    }
                     guard response.receipt.state == .accepted
                         || response.receipt.state == .duplicate else {
                         // A structured rejection is definitive non-admission, so clear it rather
@@ -3527,10 +3579,20 @@ final class AppModel {
     ) -> Bool {
         guard acceptsNewWork else { return false }
         do {
-            let chat = try PendingChatStore(home: home).create(
-                prompt: prompt, cwd: cwd, providerID: providerID, modelID: modelID,
-                thinkingLevel: thinkingLevel, title: title ?? String(prompt.prefix(80)),
-                noContextFiles: noContextFiles, recordPayloads: recordPayloads)
+            let chat = try AviaryTelemetry.withSynchronousSpan(
+                "aviary.gui.pending_chat.save", root: true
+            ) {
+                let chat = try PendingChatStore(home: home).create(
+                    prompt: prompt, cwd: cwd, providerID: providerID, modelID: modelID,
+                    thinkingLevel: thinkingLevel, title: title ?? String(prompt.prefix(80)),
+                    noContextFiles: noContextFiles, recordPayloads: recordPayloads)
+                AviaryTelemetry.event("aviary.chat.intent_saved", attributes: [
+                    "aviary.chat.id": .string(
+                        AviaryTelemetry.identity(chat.id.uuidString.lowercased())),
+                ])
+                AviaryTelemetry.outcome("completed")
+                return chat
+            }
             pendingChats.insert(chat, at: 0)
             selectedPendingChatID = chat.id
             pendingChatStoreError = nil
@@ -3669,7 +3731,17 @@ final class AppModel {
                 continue
             }
             do {
-                try PendingChatStore(home: home).delete(id: chat.id, expectedGeneration: chat.generation)
+                try AviaryTelemetry.withSynchronousSpan(
+                    "aviary.gui.pending_chat.retire", root: true
+                ) {
+                    try PendingChatStore(home: home).delete(
+                        id: chat.id, expectedGeneration: chat.generation)
+                    AviaryTelemetry.event("aviary.chat.retired", attributes: [
+                        "aviary.chat.id": .string(
+                            AviaryTelemetry.identity(chat.id.uuidString.lowercased())),
+                    ])
+                    AviaryTelemetry.outcome("completed")
+                }
                 pendingChats.removeAll { $0.id == chat.id }
                 pendingChatDetails.removeValue(forKey: chat.id)
                 if selectedPendingChatID == chat.id {
@@ -3743,6 +3815,23 @@ final class AppModel {
         }
     }
 
+    private func tracePendingChatStartup(
+        _ chat: PendingChat, operation: @escaping () async -> Void
+    ) async {
+        await AviaryTelemetry.withSpan(
+            "aviary.gui.pending_chat.startup",
+            attributes: [
+                "aviary.chat.id": .string(
+                    AviaryTelemetry.identity(chat.id.uuidString.lowercased())),
+                "aviary.create.command.id": .string(
+                    AviaryTelemetry.identity(chat.attemptCommandID.uuidString.lowercased())),
+                "aviary.start.command.id": .string(
+                    AviaryTelemetry.identity(chat.startCommandID)),
+            ],
+            root: true,
+            operation: operation)
+    }
+
     func retryPendingChat(_ id: UUID) {
         guard acceptsNewWork, !pendingChatAttempts.contains(id),
               let original = pendingChats.first(where: { $0.id == id }) else { return }
@@ -3751,26 +3840,40 @@ final class AppModel {
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.pendingChatAttempts.remove(id) }
-            if original.phase == .awaitingAcceptance || original.createdAssociation != nil {
-                if self.localWorkService == nil { await self.bootstrapLocalWorkService() }
-                do {
-                    let (session, handshake) = try await self.reconnectLocalWorkService()
-                    guard let client = self.localWorkServiceClient,
-                          await self.reconcilePendingCreateIntents(session: session, client: client) else { return }
-                    await self.restoreServiceWork(session: session, client: client, handshake: handshake)
-                    self.settlePendingChats()
-                } catch {
-                    self.pendingChatDetails[id] = "Still unable to confirm delivery. Your saved request is kept; no second attempt was sent. " + Self.serviceErrorMessage(error)
+            await self.tracePendingChatStartup(original) {
+                if original.phase == .awaitingAcceptance || original.createdAssociation != nil {
+                    if self.localWorkService == nil { await self.bootstrapLocalWorkService() }
+                    do {
+                        let (session, handshake) = try await self.reconnectLocalWorkService()
+                        guard let client = self.localWorkServiceClient,
+                              await self.reconcilePendingCreateIntents(session: session, client: client) else {
+                            AviaryTelemetry.outcome("unavailable")
+                            return
+                        }
+                        await self.restoreServiceWork(session: session, client: client, handshake: handshake)
+                        self.settlePendingChats()
+                        // Reaching the end of a refresh is not proof of delivery. The strict
+                        // canonical retirement predicate above must have removed this card.
+                        AviaryTelemetry.outcome(
+                            self.pendingChats.contains(where: { $0.id == id })
+                                ? "indeterminate" : "completed", fallbackOnly: true)
+                    } catch {
+                        AviaryTelemetry.outcome("indeterminate")
+                        self.pendingChatDetails[id] = "Still unable to confirm delivery. Your saved request is kept; no second attempt was sent. " + Self.serviceErrorMessage(error)
+                    }
+                    return
                 }
-                return
+                guard self.updatePendingChat(id, phase: .preparing),
+                      let chat = self.pendingChats.first(where: { $0.id == id }) else {
+                    AviaryTelemetry.outcome("unavailable")
+                    return
+                }
+                await self.startServiceInHouseRun(
+                    cwd: chat.cwd, providerID: chat.providerID, modelID: chat.modelID,
+                    prompt: chat.prompt, thinkingLevel: chat.thinkingLevel,
+                    noContextFiles: chat.noContextFiles, recordPayloads: chat.recordPayloads,
+                    title: chat.title, onCreated: nil, pendingChatID: id)
             }
-            guard self.updatePendingChat(id, phase: .preparing),
-                  let chat = self.pendingChats.first(where: { $0.id == id }) else { return }
-            await self.startServiceInHouseRun(
-                cwd: chat.cwd, providerID: chat.providerID, modelID: chat.modelID,
-                prompt: chat.prompt, thinkingLevel: chat.thinkingLevel,
-                noContextFiles: chat.noContextFiles, recordPayloads: chat.recordPayloads,
-                title: chat.title, onCreated: nil, pendingChatID: id)
         }
     }
 
@@ -3780,10 +3883,12 @@ final class AppModel {
         onCreated: (@MainActor (LiveRun) -> Void)?, pendingChatID: UUID? = nil
     ) async {
         guard prompt.utf8.count <= WorkServiceBounds.maxCommandValueCharacters else {
+            AviaryTelemetry.outcome("rejected")
             blockPendingChat(pendingChatID, message: "Your prompt is saved, but this connection accepts at most \(WorkServiceBounds.maxCommandValueCharacters) bytes per message. Shorten the request before retrying.", kind: .invalidRequest)
             return
         }
         guard !noContextFiles else {
+            AviaryTelemetry.outcome("rejected")
             blockPendingChat(pendingChatID, message:
                 "This agent requires project instructions. Choose Edit request and save it to include those instructions before retrying.", kind: .invalidRequest)
             return
@@ -3793,21 +3898,27 @@ final class AppModel {
                 [providerID, modelID].compactMap { $0 }.joined(separator: "/"),
                 in: modelsConfig) ?? AgentCLI.resolve(modelID, in: modelsConfig)
         else {
+            AviaryTelemetry.outcome("unavailable")
             blockPendingChat(pendingChatID, message: "The selected model is not configured. Choose a model in Models, then retry this saved chat.", kind: .providerUnavailable)
             return
         }
         if localWorkService == nil { await bootstrapLocalWorkService() }
         if let pendingChatID,
            !pendingChats.contains(where: { $0.id == pendingChatID && $0.createdAssociation == nil }) {
+            AviaryTelemetry.outcome("completed")
             settlePendingChats()
             return
         }
         guard localWorkService != nil,
               let client = localWorkServiceClient else {
+            AviaryTelemetry.outcome("unavailable")
             blockPendingChat(pendingChatID, message: localWorkServiceError ?? "The local agent service is unavailable. Your request has not been sent.", kind: .hostUnavailable)
             return
         }
-        guard beginServiceLifecycleOperation() else { return }
+        guard beginServiceLifecycleOperation() else {
+            AviaryTelemetry.outcome("unavailable")
+            return
+        }
         defer { finishServiceLifecycleOperation() }
         do {
             // This is the one path-bearing operation in the GUI service flow.  The returned
@@ -3819,12 +3930,14 @@ final class AppModel {
                 isDefault: true)
             let (session, handshake) = try await reconnectLocalWorkService()
             guard !serviceCreateInFlight else {
+                AviaryTelemetry.outcome("unavailable")
                 blockPendingChat(pendingChatID, message: "Another conversation is being prepared. Your request is saved; retry in a moment.")
                 return
             }
             serviceCreateInFlight = true
             defer { serviceCreateInFlight = false }
             guard await reconcilePendingCreateIntents(session: session, client: client) else {
+                AviaryTelemetry.outcome("unavailable")
                 blockPendingChat(pendingChatID, message:
                     localWorkServiceError
                         ?? "A prior Work creation is still awaiting reconciliation.",
@@ -3833,6 +3946,7 @@ final class AppModel {
             }
             if let pendingChatID,
                !pendingChats.contains(where: { $0.id == pendingChatID && $0.createdAssociation == nil }) {
+                AviaryTelemetry.outcome("completed")
                 await restoreServiceWork(session: session, client: client, handshake: handshake)
                 return
             }
@@ -3865,8 +3979,29 @@ final class AppModel {
                 commandID: pendingChatID.flatMap { id in pendingChats.first { $0.id == id }?.startCommandID } ?? "start-v2-" + UUID().uuidString.lowercased(), prompt: prompt)
             localWorkServiceCreatesReconciled = false
             try createIntentStore.retain(createRequest, initialStart: initialStart)
-            if let pendingChatID, !updatePendingChat(pendingChatID, phase: .awaitingAcceptance) { return }
+            var retainedIntentAttributes: [String: AviaryTraceValue] = [
+                "aviary.create.command.id": .string(
+                    AviaryTelemetry.identity(createRequest.commandID)),
+                "aviary.start.command.id": .string(
+                    AviaryTelemetry.identity(initialStart.commandID)),
+            ]
+            if let pendingChatID {
+                retainedIntentAttributes["aviary.chat.id"] = .string(
+                    AviaryTelemetry.identity(pendingChatID.uuidString.lowercased()))
+            }
+            AviaryTelemetry.event(
+                "aviary.pending_intent.retained", attributes: retainedIntentAttributes)
+            if let pendingChatID, !updatePendingChat(pendingChatID, phase: .awaitingAcceptance) {
+                AviaryTelemetry.outcome("unavailable")
+                return
+            }
             let response = try await session.createWork(createRequest)
+            AviaryTelemetry.event("aviary.create.receipt_validated", attributes: [
+                "aviary.receipt.state": .string(response.receipt.state.rawValue),
+            ])
+            AviaryTelemetry.outcome(
+                response.receipt.state == .accepted || response.receipt.state == .duplicate
+                    ? "accepted" : "rejected")
             guard response.receipt.state == .accepted
                 || response.receipt.state == .duplicate else {
                 // Every structured rejection is definitive non-admission. In particular,
@@ -3898,6 +4033,10 @@ final class AppModel {
                 try associatePendingChat(request: createRequest, response: response)
                 try Self.retainStartIntent(
                     initialStart, response: response, home: home, client: client)
+                AviaryTelemetry.event("aviary.start.intent_retained", attributes: [
+                    "aviary.start.command.id": .string(
+                        AviaryTelemetry.identity(initialStart.commandID)),
+                ])
                 try createIntentStore.clear(createRequest)
                 localWorkServiceCreatesReconciled = true
             } catch {
@@ -3960,7 +4099,10 @@ final class AppModel {
             // Create and its Start seed are already durable. If application shutdown closed GUI
             // admission during the host round-trip, leave the idle Work for next-launch catalog
             // reconstruction instead of publishing a row after shutdown's drain.
-            guard acceptsNewWork else { return }
+            guard acceptsNewWork else {
+                AviaryTelemetry.outcome("cancelled")
+                return
+            }
             runs.append(run)
             if pendingChatID == nil {
                 focusedRunID = run.id
@@ -3974,12 +4116,16 @@ final class AppModel {
                     prompt: unresolvedRetainedStart.prompt,
                     commandID: unresolvedRetainedStart.commandID)
             } else if unresolvedRetainedStart != nil {
+                AviaryTelemetry.outcome("indeterminate")
                 run.commandNotice = .warning(
                     bridge.projection.isCanonical
                         ? "The saved first message is awaiting startup reconciliation. Check delivery before retrying."
                         : "The saved first message is waiting for a complete Work and Session read. It has not been resubmitted.")
+            } else {
+                AviaryTelemetry.outcome("completed")
             }
         } catch let error as WorkHostWorkspaceRegistryError {
+            AviaryTelemetry.outcome(pendingStartupTelemetryOutcome(for: error))
             blockPendingChat(pendingChatID,
                 message: error == .workspaceIdentityMismatch
                     ? "The saved project folder identity needs confirmation, which can happen after a restart. Confirm the original folder, then start this saved request when ready. Nothing has been sent."
@@ -3987,6 +4133,7 @@ final class AppModel {
                         + " Choose Edit request to check the project folder. Your request has not been sent.",
                 kind: error == .workspaceIdentityMismatch ? .workspaceConfirmationRequired : .workspaceUnavailable)
         } catch {
+            AviaryTelemetry.outcome(pendingStartupTelemetryOutcome(for: error))
             let message = Self.serviceErrorMessage(error)
             if let pendingChatID,
                pendingChats.contains(where: { $0.id == pendingChatID && $0.phase == .awaitingAcceptance }) {
@@ -5088,6 +5235,7 @@ final class LiveRun: Identifiable {
             ownsOperation = false
         } else {
             guard beginServiceCommandOperation() else {
+                AviaryTelemetry.outcome("unavailable")
                 commandNotice = .warning(
                     serviceCommandBarrier.operationsInFlight > 0
                         ? "Another Work command is already in progress."
@@ -5101,6 +5249,7 @@ final class LiveRun: Identifiable {
         }
         guard let start = ServiceBackedGUIOrchestration.startCommand(
             prompt: prompt, commandID: commandID, retained: initialStart) else {
+            AviaryTelemetry.outcome("rejected")
             if let commandID, draftHandoff?.commandID == commandID {
                 _ = await resolveDraftHandoff(commandID: commandID, accepted: false)
             }
@@ -5115,6 +5264,14 @@ final class LiveRun: Identifiable {
         }
         do {
             let receipt = try await serviceBridge.start(effectivePrompt, commandID: effectiveCommandID)
+            AviaryTelemetry.event("aviary.start.receipt_validated", attributes: [
+                "aviary.receipt.state": .string(receipt.state.rawValue),
+                "aviary.start.command.id": .string(
+                    AviaryTelemetry.identity(receipt.commandID)),
+            ])
+            AviaryTelemetry.outcome(
+                receipt.state == .accepted || receipt.state == .duplicate
+                    ? "accepted" : "rejected")
             var draftMarkerResolved = true
             if let effectiveCommandID,
                draftHandoff?.commandID == effectiveCommandID {
@@ -5154,6 +5311,7 @@ final class LiveRun: Identifiable {
             }
             return .service(receipt)
         } catch {
+            var startFailureOutcome = pendingStartupTelemetryOutcome(for: error)
             if let effectiveCommandID,
                draftHandoff?.commandID == effectiveCommandID,
                await commandWasDefinitivelyRejected(
@@ -5165,6 +5323,7 @@ final class LiveRun: Identifiable {
                 let pending = await serviceBridge.controller.pendingCommand()
                 let definitiveRejection = error is ServiceBackedRunBridgeError
                     || pending?.state == .stale
+                startFailureOutcome = definitiveRejection ? "rejected" : "indeterminate"
                 if definitiveRejection {
                     // A structured rejection or stale cursor proves this exact Start never
                     // crossed the host boundary. Clear the GUI bootstrap obligation; the
@@ -5184,6 +5343,7 @@ final class LiveRun: Identifiable {
                     }
                 }
             }
+            AviaryTelemetry.outcome(startFailureOutcome)
             syncServiceState()
             commandNotice = .warning(serviceBridge.errorBanner ?? "Start was not accepted.")
             return .rejected(serviceBridge.errorBanner ?? "Work service unavailable")

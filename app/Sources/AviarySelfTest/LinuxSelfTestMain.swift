@@ -52,7 +52,10 @@ enum LinuxSelfTestMain {
         await Harness.run([
             ("Linux telemetry: SDK, Agent, transport and bounded collector", {
                 try await runLinuxCases(casesAviaryTelemetry + casesAviaryTelemetryAgent
-                    + casesAviaryTelemetryTransport + casesAviaryTelemetryHTTPClient)
+                    + casesAviaryTelemetryTransport + casesAviaryTelemetryHTTPClient
+                    + casesAviaryTelemetryDelivery + casesRuntimeHostTelemetry + casesWorkAgentChildTelemetry)
+                try await runLinuxCases(casesAviaryTelemetryDrain + casesAviaryTelemetryRepositoryReview
+                    + casesAviaryTelemetryContext)
             }),
             ("Shell: no implicit stdin inherits the controlling terminal", {
                 try await test_shellRunDetachesImplicitStdin()
