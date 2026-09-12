@@ -42,6 +42,51 @@ func testAviaryTelemetryTransportIgnoresMalformedTraceparent() throws {
 private let telemetryTransportHost = WorkHostRef("telemetry-transport-host")
 private let telemetryTransportClient = ClientRef("telemetry-transport-client")
 
+private final class TelemetryContextAuthorizer: WorkServiceAuthorizer, @unchecked Sendable {
+    private let lock = NSLock()
+    private var contexts: [String?] = []
+    func authorization(for client: ClientRef, requested: Set<WorkServiceCapability>)
+        -> WorkServiceAuthorizationOutcome
+    {
+        lock.lock(); contexts.append(AviaryTelemetry.traceparent); lock.unlock()
+        return WorkServiceCapabilityPolicy(grantsByClient: [telemetryTransportClient: [.observe]])
+            .authorization(for: client, requested: requested)
+    }
+    func captured() -> [String?] { lock.lock(); defer { lock.unlock() }; return contexts }
+}
+
+private func testTelemetryUnsampledSocketPropagation() async throws {
+    let path = telemetryTransportSocketPath()
+    let authorizer = TelemetryContextAuthorizer()
+    let service = InMemoryWorkService(host: telemetryTransportHost,
+        instanceID: "unsampled-instance", startIdentity: "unsampled-start", authorizer: authorizer)
+    let server = WorkServiceUnixSocketServer(endpoint: .init(path: path), service: service)
+    try await server.start()
+    let client = WorkServiceUnixSocketClient(endpoint: .init(path: path), client: telemetryTransportClient)
+    do {
+        let wire = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
+        let parent = try XCTUnwrap(AviaryTraceContext(traceparent: wire))
+        let (_, spans) = try await AviaryTelemetry.withRecording {
+            try await AviaryTelemetry.withSpan("aviary.test.unsampled_socket", parent: parent) {
+                _ = try await client.connect(build: "unsampled-test")
+                _ = try await client.listWorks(.init(client: telemetryTransportClient, pageSize: 1))
+                XCTAssertEqual(AviaryTelemetry.traceparent, wire)
+            }
+        }
+        let contexts = authorizer.captured()
+        XCTAssertFalse(contexts.isEmpty)
+        XCTAssertTrue(contexts.allSatisfy { $0 == wire },
+                      "server authorization must see the exact unsampled wire context")
+        XCTAssertTrue(spans.isEmpty)
+    } catch {
+        await client.close(); await server.stop()
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: path).deletingLastPathComponent())
+        throw error
+    }
+    await client.close(); await server.stop()
+    try? FileManager.default.removeItem(at: URL(fileURLWithPath: path).deletingLastPathComponent())
+}
+
 private func telemetryTransportSocketPath() -> String {
     let root = URL(fileURLWithPath: "/tmp")
         .appendingPathComponent("aviary-telemetry-transport-\(UUID().uuidString)", isDirectory: true)
@@ -355,7 +400,86 @@ func testAviaryTelemetryTransportFallsBackBeforeWriteAtExactFrameBoundary() asyn
 }
 
 let casesAviaryTelemetryTransport: [Case] = [
-    ("phase5 telemetry transport: quiet read acknowledgements still have uncertain mutation outcomes", {
+    ("phase5 telemetry transport: unsampled identity survives real socket boundary", {
+        try await testTelemetryUnsampledSocketPropagation()
+    }),
+    ("phase5 telemetry transport: disconnected reads are visible without a socket attempt", {
+        let client = WorkServiceUnixSocketClient(
+            endpoint: WorkServiceTransportEndpoint(path: "/tmp/unused-telemetry.sock"),
+            client: telemetryTransportClient)
+        let (_, spans) = await AviaryTelemetry.withRecording {
+            do {
+                _ = try await client.listWorks(.init(client: telemetryTransportClient))
+                XCTFail("a disconnected read must fail")
+            } catch {
+                XCTAssertEqual(error as? WorkServiceTransportError, .notConnected)
+            }
+        }
+        XCTAssertEqual(spans.count, 1)
+        let span = try XCTUnwrap(spans.first)
+        XCTAssertEqual(span.name, "aviary.work.list_works")
+        XCTAssertEqual(span.kind, .client)
+        XCTAssertNil(span.parentSpanId)
+        XCTAssertEqual(span.attributes["aviary.outcome"], .string("unavailable"))
+        XCTAssertFalse(await client.isConnected)
+    }),
+    ("phase5 telemetry transport: failed and slow quiet reads have accurate single roots", {
+        for timeout in [false, true] {
+            let path = telemetryTransportSocketPath()
+            let base = InMemoryWorkService(
+                host: telemetryTransportHost, instanceID: "quiet-read-instance",
+                startIdentity: "quiet-read-start",
+                authorizer: WorkServiceCapabilityPolicy(grantsByClient: [
+                    telemetryTransportClient: [.observe],
+                ]))
+            let delayed = DelayedWorkService(base: base,
+                delayNanoseconds: timeout ? 300_000_000 : 1_100_000_000)
+            let server = WorkServiceUnixSocketServer(
+                endpoint: WorkServiceTransportEndpoint(path: path), service: delayed)
+            try await server.start()
+            let client = WorkServiceUnixSocketClient(
+                endpoint: WorkServiceTransportEndpoint(path: path), client: telemetryTransportClient,
+                requestTimeout: timeout ? 0.1 : 3)
+            do {
+                _ = try await client.connect()
+                let (_, spans) = await AviaryTelemetry.withRecording {
+                    do {
+                        _ = try await client.listWorks(.init(client: telemetryTransportClient))
+                        XCTAssertFalse(timeout)
+                    } catch {
+                        XCTAssertTrue(timeout)
+                        XCTAssertEqual(error as? WorkServiceTransportError, .timedOut(operation: .listWorks))
+                    }
+                }
+                XCTAssertEqual(spans.count, 1, "the unparented server must not emit a duplicate")
+                let span = try XCTUnwrap(spans.first)
+                XCTAssertEqual(span.kind, .client)
+                XCTAssertNil(span.parentSpanId)
+                XCTAssertEqual(span.attributes["aviary.outcome"], .string(timeout ? "failed" : "completed"))
+                guard case .double(let measured)? = span.attributes["aviary.read.duration.seconds"] else {
+                    throw TelemetryRawTransportError()
+                }
+                XCTAssertTrue(measured >= (timeout ? 0.09 : 1))
+                XCTAssertTrue(abs(span.endTime.timeIntervalSince(span.startTime) - measured) < 0.00001)
+                XCTAssertEqual(span.attributes["aviary.read.slow"], .bool(!timeout))
+                if !timeout {
+                    let (_, fastSpans) = try await AviaryTelemetry.withRecording {
+                        try await client.listWorks(.init(client: telemetryTransportClient))
+                    }
+                    XCTAssertTrue(fastSpans.isEmpty)
+                }
+            } catch {
+                await client.close()
+                await server.stop()
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: path).deletingLastPathComponent())
+                throw error
+            }
+            await client.close()
+            await server.stop()
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: path).deletingLastPathComponent())
+        }
+    }),
+    ("phase5 telemetry transport: read acknowledgements retain uncertain mutation outcomes", {
         XCTAssertEqual(workServiceClientTraceOutcome(for: WorkServiceTransportError.disconnected,
             operation: .acknowledgeRead, didStartWrite: true), "indeterminate")
         XCTAssertEqual(workServiceClientTraceOutcome(for: WorkServiceTransportError.disconnected,
@@ -364,6 +488,70 @@ let casesAviaryTelemetryTransport: [Case] = [
             operation: .command, didStartWrite: false), "unavailable")
         XCTAssertEqual(workServiceClientTraceOutcome(for: WorkServiceTransportError.invalidFrame,
             operation: .command, didStartWrite: true), "indeterminate")
+    }),
+    ("phase5 telemetry transport: prewrite failure and direct read acknowledgement are observable", {
+        let path = telemetryTransportSocketPath()
+        let service = InMemoryWorkService(
+            host: telemetryTransportHost, instanceID: "quiet-bound-instance",
+            startIdentity: "quiet-bound-start", authorizer: WorkServiceCapabilityPolicy(
+                grantsByClient: [telemetryTransportClient: [.observe]]))
+        let server = WorkServiceUnixSocketServer(
+            endpoint: WorkServiceTransportEndpoint(path: path), service: service)
+        try await server.start()
+        let client = WorkServiceUnixSocketClient(
+            endpoint: WorkServiceTransportEndpoint(path: path), client: telemetryTransportClient,
+            maxFrameBytes: 4_096)
+        do {
+            let handshake = try await client.connect()
+            let marker = "private-pagination-body-do-not-export"
+            let (_, spans) = try await AviaryTelemetry.withRecording {
+                do {
+                    _ = try await client.listWorks(.init(client: telemetryTransportClient,
+                        pageToken: String(repeating: marker, count: 256)))
+                    XCTFail("oversized frame must fail before write")
+                } catch {
+                    guard let transport = error as? WorkServiceTransportError,
+                          case .frameTooLarge(let bytes, let limit) = transport else {
+                        throw error
+                    }
+                    XCTAssertTrue(bytes > limit)
+                }
+            }
+            XCTAssertEqual(spans.count, 1)
+            XCTAssertEqual(spans.first?.kind, .client)
+            XCTAssertEqual(spans.first?.attributes["aviary.outcome"], .string("failed"))
+            XCTAssertFalse(String(describing: spans).contains(marker))
+
+            let work = WorkRef(workHostID: telemetryTransportHost.workHostID, workID: "absent-work")
+            let journal = JournalRef.work(work)
+            let (_, acknowledgements) = await AviaryTelemetry.withRecording(waitingFor: { spans in
+                spans.contains { $0.kind == .server && $0.name == "aviary.work.acknowledge_read" }
+            }) {
+                do {
+                    _ = try await client.acknowledgeRead(.init(work: work, journal: journal,
+                        attachment: ClientAttachmentRef("absent-attachment"),
+                        client: telemetryTransportClient, target: .work(journal: journal),
+                        cursor: JournalCursor(journal: journal, sequence: 0),
+                        commandID: "explicit-ack-attempt", causalControlCursor: handshake.controlCursor))
+                    XCTFail("unknown Work cannot accept an acknowledgement")
+                } catch {}
+            }
+            XCTAssertEqual(acknowledgements.count, 2)
+            let caller = try XCTUnwrap(acknowledgements.first { $0.kind == .client })
+            let receiver = try XCTUnwrap(acknowledgements.first { $0.kind == .server })
+            XCTAssertEqual(caller.name, "aviary.work.acknowledge_read")
+            XCTAssertEqual(receiver.traceId, caller.traceId)
+            XCTAssertEqual(receiver.parentSpanId, caller.spanId)
+            XCTAssertNotEqual(caller.attributes["aviary.outcome"], .string("completed"))
+        } catch {
+            await client.close()
+            await server.stop()
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: path).deletingLastPathComponent())
+            throw error
+        }
+        await client.close()
+        await server.stop()
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: path).deletingLastPathComponent())
     }),
     ("phase5 telemetry transport: traceparent envelope round trip", {
         try testAviaryTelemetryTransportEnvelopeCarriesTraceparent()

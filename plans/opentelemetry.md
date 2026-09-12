@@ -29,7 +29,7 @@ for its exact owned actor to be idle, healthy and connected before asserting can
 12 consecutive isolated runs pass (28 assertions each). This is test sequencing, not a relaxation
 of canonical read checks or proof that transient GUI read errors are already well presented.
 The full rerun passes. The separate production review confirmed automatic next-poll recovery;
-the snapshot-coherence improvement remains a follow-up below.
+the subsequent snapshot-coherence correction and its focused proof are described below.
 
 ## Contract
 
@@ -243,16 +243,18 @@ Linux baseline snapshot: `/home/azureuser/aviary-linux-final-20260912-0305`, man
 production and Linux-selected sources were frozen. That snapshot's ordinary Mac-to-SSH connection
 proof is not a trace-propagation proof. The current opt-in Mac probe now configures OTel, and
 `scripts/verify-linux-telemetry.py` validates exact Mac-client/Linux-server parentage at a disposable
-protobuf collector through SSH streamlocal/reverse-TCP forwarding. Current execution receipt is pending.
+protobuf collector through SSH streamlocal/reverse-TCP forwarding. The completed five-span receipt
+and its narrower handshake/list boundary are recorded below.
 
 ## Next bounded batches
 
-1. Close full macOS/current Linux verification and the cross-device collector proof. Keep snapshot,
-binary, signed-app and running-service identities distinct. No user service or permanent collector
-   configuration has been changed by these checks.
-2. Preserve quiet fast polling, but expose failed/slow unparented reads with duration-correct bounded
-   diagnostics. Direct read acknowledgements are mutations, not polling. Add consumer scopes for
-   history and repository inspection and distinct Attach/resume/reconstruction/retained-Start stages.
+1. Revalidate the continuation against the full macOS suite and a fresh Linux snapshot. The preceding
+   checkpoint's macOS/Linux/cross-device proofs are complete, not proofs of later source changes.
+   Keep snapshot, binary, signed-app and running-service identities distinct. No user service or
+   permanent collector configuration has been changed by these checks.
+2. Verify explicit history/repository consumer scopes and distinct Attach/resume/reconstruction/
+   retained-Start stages in the AppModel journey. Quiet read diagnostics, read-ack mutation tracing,
+   and deferred delivery causality have focused receipts below.
 3. Extend the signed isolated journey through a real disposable daemon and deterministic local
    provider/runtime, including Queue/Steer/Stop and uncertain receipt reconciliation. Component
    receipts do not substitute for this combined flow. Measure disabled/healthy/unreachable overhead.
@@ -278,18 +280,104 @@ AgentHome verification followed by scoped shutdown/removal confirmed no fixture 
 The cause was Ubuntu dash's `kill` builtin rejecting `--`, so no signal was sent. The script now
 uses explicit `/bin/kill` after the same exact ownership checks. A second cross-device run passes
 the same five-span checks and automatic cleanup; no verification roots or fixture daemon remain.
+The final script-only synchronization changes the snapshot manifest to
+`212f120b44deb407a6d2454ed3b4b4318c0882d9c3fa1139b96db80ab37e1ba2`;
+the selected Swift source and already-built binaries are unchanged from the build manifest above.
 
-The saved-chat test investigation also identified a production snapshot-coherence follow-up:
-JBS currently selects a page from one canonical source, then re-reads for its descriptor.
-A concurrent Run transition can yield a mismatched tuple. The GUI safely retains its old pair,
-disables mutation and recovers on the next stable poll; this is not a permanent recovery latch.
-Constructing descriptor/page facts from one source and adding a deterministic transition test
-will avoid avoidable warnings and baseline replay without weakening reader validation.
+### Follow-up correctness and quiet-read diagnostics
 
-Queue/Steer delivery needs a separate causal-context correction before the combined journey:
-capture each admission's context in its deferred callback and parent delivery to that origin,
-with a bounded link to the executing turn. A missing origin must not silently inherit an
-unrelated Send. Keep context in memory only; canonical command identity remains authoritative.
+JBS snapshot responses now retain one canonical source and authorized control projection for both
+the page and its descriptor. Independent live-host observations remain conservative when the Run
+has advanced. A deterministic fixture advances and closes a Run after both controller pages have
+been selected, verifies the retained pair, then catches up using nonzero cursors: 1 case / 23
+assertions passes. This avoids a known transient warning without weakening reader validation or
+claiming atomicity across two independently requested pages.
+
+Fast successful unparented polling remains silent. Failed reads and reads taking at least one second
+emit one completed CLIENT diagnostic, with duration measured monotonically and no retroactively
+propagated parent. Explicitly parented operations retain ordinary CLIENT/SERVER spans. Request
+encoding and pre-handshake rejection are now inside that boundary; socket opening and connection
+setup are still covered by their enclosing user operation rather than a separate connection span.
+Read acknowledgement is always treated as a mutation. Real socket fixtures cover slow success,
+timeout, prewrite bounds, exact parentage, and no duplicate server span for an unparented read.
+
+The pinned Swift SDK loses the explicit context when its parent-based sampler declines a span.
+Aviary therefore carries a valid unsampled parent as context only, without constructing a child
+span. Nested async/sync scopes and real outgoing client/server calls preserve the exact `00`
+traceparent and export nothing; an explicitly independent root remains independently sampled.
+
+Queue/Steer delivery now captures each admission's context in its deferred callback, parents
+delivery to that origin, and links the executing turn. Missing origin explicitly creates a new
+root. Context is in memory only; canonical command identity remains authoritative. The real gated
+Hosted fixture joins delivery to exact closed-journal event IDs, journal identities, and journal
+sequences (not the separate host command sequence): 2 cases / 82 assertions pass. The missing-origin
+case tests the pure parent/link policy, not a full missing-origin callback lifecycle.
+
+Current follow-up focused telemetry receipt: 77 cases / 1,059 assertions, 15.16 seconds. This is
+separate from the Hosted and snapshot tests above. Full follow-up macOS passes 1,277 cases / 19,445
+assertions in 532.65 seconds. After that run, the Hosted fixture became self-contained and the JBS
+fixture switched from a Mac-only test store to the durable launch-manifest adapter so both can run
+on Linux; focused reruns pass 2 / 82 and 1 / 23 respectively. New GUI-consumer and fresh Linux
+receipts for the final integrated tree remain pending; the preceding checkpoint's signed/Linux
+receipts are not substituted.
+
+The explicit consumer probe now uses a 769-message canonical fixture with a proven earlier-page
+boundary. The actual bridge preserves the visible history on a failed read and preserves bounded,
+successful, and disconnected/stale repository-review results. A disposable protobuf collector
+observes 20 spans across the complete AppModel probe, including three repository loads and one
+failed earlier-history load; ordinary refresh/jump operations add no consumer spans. AppModel now
+accepts its home at initialization, and headless routes exit before constructing the normal GUI
+model, avoiding an initial read of user configuration in isolated probes.
+
+Fresh Linux verification exposed a real shutdown lock cycle: Foundation's `FileHandle.close()`
+waited for its readability callback while holding the callback's `stateLock`. The close claim now
+fences admitted/future reads before Foundation teardown, with no callback lock held across close.
+Four repeated Linux telemetry runs pass 1,029 assertions each after this fix. Current full macOS
+passes 1,277 cases / 19,447 assertions in 521.01 seconds. The fresh Linux snapshot
+`/home/azureuser/aviary-linux-followup-20260912-0615` has 276 source/fixture files, manifest SHA-256
+`4a716739e4a504f6a3a2ad041b61ecb8ad03739b059ce26d4b1a57a5b0a0d028` (excluding `.build`).
+Its debug SelfTest passes 41 grouped cases / 6,473 assertions in 252.48 seconds; current debug
+aviaryd builds and the Mac-to-SSH-to-Linux collector proof passes five spans with two exact
+CLIENT/SERVER parent pairs. This uses the previously built Mac probe binary and the current Linux
+daemon; it is handshake/list evidence, not a remote provider turn. All fixture processes, tunnels,
+and verification roots were checked absent.
+
+The current signed `just build` passes with Aviary's stable designated signing identity. Its
+actual AppModel-to-normal-daemon journey exports 98 spans to a disposable protobuf collector:
+exactly two deterministic local provider calls, one Python edit, canonical delivered Start,
+explicit repository review load, End, and app/daemon export drain. Start admission joins the
+caller command/Work/Session/Run in one span; the canonical command is separately checked against
+the client-qualified ledger identity. The successful tool's outcome event joins action and Work
+journal; the review-load span joins the selected artifact/Work/Session. Prompt, tool, credential,
+file-name and private-root sentinels are absent from telemetry. The signed blocked-start/relaunch
+and consumer probe separately passes 20 spans. Normal running user services were not replaced.
+
+Fixture corrections were not product recovery changes: the typed startup wait must not accept a
+nested optional `some(nil)`, Python uses `Path(cwd())` for its Session directory rather than the
+shared process directory, and cleanup normalizes `/tmp` versus `/private/tmp` before comparing
+AgentHome identity. Cleanup now fails closed on an unavailable process inventory; three earlier
+test-owned daemons missed by the initial string comparison were independently identified by
+executable/PID/home and stopped. Current signed runs prove automatic cleanup with no remaining
+fixture daemon. Shell startup is isolated with a private empty `ZDOTDIR`; no user credentials or
+transcripts are needed for the fixture. Queue/Steer/Stop and uncertain-delivery journey cases
+remain follow-ups; this successful normal path does not certify them.
+
+Three sequential signed runs per exporter mode all completed the same canonical two-call workload
+and automatic cleanup. The elapsed app journey includes its final export drain; full time also
+includes fixture setup, daemon drain, and server cleanup. Medians (seconds):
+
+| Export configuration | App journey | Through full cleanup |
+| --- | ---: | ---: |
+| Disabled | 3.755 | 5.202 |
+| Healthy loopback collector | 3.690 | 5.366 |
+| Reserved refusing loopback endpoint | 5.825 | 8.211 |
+
+Healthy runs passed all canonical/trace joins (97–98 total spans); disabled runs emitted no spans
+to their live collector. Unreachable runs used a bound, non-listening socket to prevent endpoint
+reuse and proved workload completion/cleanup, not collector delivery or zero span creation. The
+roughly two-second app-exit difference is consistent with the configured bounded export drain.
+This tiny end-to-end sample is not a per-action overhead benchmark or evidence that tracing makes
+the application faster; startup/process timing noise exceeds the healthy/disabled difference.
 
 References: [OpenTelemetry trace API](https://opentelemetry.io/docs/specs/otel/trace/api/),
 [OTLP specification](https://opentelemetry.io/docs/specs/otlp/),

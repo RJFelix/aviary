@@ -495,6 +495,25 @@ public struct HostedInHouseWorkSnapshot: Codable, Hashable, Sendable {
 /// the paired native journals. Retaining this actor after every GUI unsubscribes is safe; neither
 /// a stream cancellation nor a RuntimeHost transport disconnect calls End or closes the Work.
 public actor HostedInHouseWork: WorkServiceTerminalCommitter {
+    internal struct DeferredDeliveryTracePlan: Sendable, Equatable {
+        let parent: AviaryTraceContext?
+        let root: Bool
+        let links: [AviaryTraceContext]
+    }
+
+    /// A Queue or Steer callback may run much later inside a different Send turn. Keep its
+    /// admission as the causal parent and link the turn that actually delivered it. When no
+    /// admission context exists, make the callback an explicit root so it cannot inherit
+    /// an unrelated active Send by accident.
+    internal nonisolated static func deferredDeliveryTracePlan(
+        origin: AviaryTraceContext?, executing: AviaryTraceContext?
+    ) -> DeferredDeliveryTracePlan {
+        DeferredDeliveryTracePlan(
+            parent: origin,
+            root: origin == nil,
+            links: executing.flatMap { $0 == origin ? nil : [$0] } ?? [])
+    }
+
     public nonisolated let identity: SessionWorkIdentity
     public nonisolated let sessionAttachment: SessionAttachmentRef
 
@@ -1159,9 +1178,11 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
         guard (try await admitAndDispatch(command)) != nil else {
             return await receipt(for: command)
         }
+        let deliveryOrigin = AviaryTelemetry.context
         let accepted = await agent.steer(text) { [weak self] delivery in
             guard let self else { return }
-            await self.recordDelivery(delivery, for: command)
+            await self.recordDeferredDelivery(
+                delivery, for: command, origin: deliveryOrigin)
         }
         if !accepted {
             _ = await controller.recordNotDelivered(
@@ -1180,9 +1201,11 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
         guard (try await admitAndDispatch(command)) != nil else {
             return await receipt(for: command)
         }
+        let deliveryOrigin = AviaryTelemetry.context
         let accepted = await agent.queueFollowUp(text) { [weak self] delivery in
             guard let self else { return }
-            await self.recordDelivery(delivery, for: command)
+            await self.recordDeferredDelivery(
+                delivery, for: command, origin: deliveryOrigin)
         }
         if !accepted {
             _ = await controller.recordNotDelivered(
@@ -1308,6 +1331,29 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
         _ delivery: SessionCommandDelivery,
         for command: HostedInHouseWorkCommand
     ) async {
+        await recordDelivery(
+            delivery, for: command, parent: nil, root: false, links: [])
+    }
+
+    private func recordDeferredDelivery(
+        _ delivery: SessionCommandDelivery,
+        for command: HostedInHouseWorkCommand,
+        origin: AviaryTraceContext?
+    ) async {
+        let plan = Self.deferredDeliveryTracePlan(
+            origin: origin, executing: AviaryTelemetry.context)
+        await recordDelivery(
+            delivery, for: command, parent: plan.parent, root: plan.root,
+            links: plan.links)
+    }
+
+    private func recordDelivery(
+        _ delivery: SessionCommandDelivery,
+        for command: HostedInHouseWorkCommand,
+        parent: AviaryTraceContext?,
+        root: Bool,
+        links: [AviaryTraceContext]
+    ) async {
         await AviaryTelemetry.withSpan(
             "aviary.command.runtime_delivery",
             attributes: [
@@ -1323,7 +1369,7 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
                     AviaryTelemetry.workIdentity(identity.work)),
                 "aviary.run.id": .string(
                     AviaryTelemetry.identity(identity.runID)),
-            ]) {
+            ], parent: parent, root: root, links: links) {
                 await self.recordDeliveryBody(delivery, for: command)
             }
     }

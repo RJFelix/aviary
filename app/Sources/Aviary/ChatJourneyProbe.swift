@@ -251,11 +251,9 @@ enum ChatJourneyProbe {
             throw Failure.assertion("could not create an isolated selection preference")
         }
         defer { selectionDefaults.removePersistentDomain(forName: suiteName) }
-        let firstLaunch = AppModel(presentationDefaults: selectionDefaults)
-        firstLaunch.home = home
+        let firstLaunch = AppModel(home: home, presentationDefaults: selectionDefaults)
         firstLaunch.focusRun(ordinary)
-        let reopenedLaunch = AppModel(presentationDefaults: selectionDefaults)
-        reopenedLaunch.home = home
+        let reopenedLaunch = AppModel(home: home, presentationDefaults: selectionDefaults)
         try require(
             reopenedLaunch.preferredServiceAttachmentKey == ordinaryKey
                 && reopenedLaunch.preferredServiceAttachmentKey != guardedKey,
@@ -440,8 +438,7 @@ enum ChatJourneyProbe {
         let chat = try PendingChat(prompt: "Preserve this exact request", cwd: directory.path,
             phase: .blocked, failureKind: .workspaceConfirmationRequired)
         try store.insert(chat)
-        let model = AppModel()
-        model.home = home
+        let model = AppModel(home: home)
         model.restorePendingChats()
         let originalBytes = try Data(contentsOf: home.workHostWorkspaceRegistryFile)
         let token = try model.preparePendingProjectReconfirmation(chatID: chat.id, directory: directory)
@@ -599,8 +596,7 @@ enum ChatJourneyProbe {
         defer { try? FileManager.default.removeItem(at: root) }
         try await runProjectReconfirmationProbe(root: root)
         let home = AgentHome(root: root.appending(path: "home", directoryHint: .isDirectory))
-        let model = AppModel()
-        model.home = home
+        let model = AppModel(home: home)
         let internalFailure = AppModel.serviceErrorMessage(WorkServiceTransportError.remote(
             code: .internalError, detail: "credential-shaped-private-detail"))
         try require(internalFailure.contains("internal error") && !internalFailure.contains("credential-shaped"),
@@ -627,8 +623,7 @@ enum ChatJourneyProbe {
         try require(model.pendingChats.first?.phase == .blocked, "failure not attached to chat")
         try require(model.runs.isEmpty, "failed preflight fabricated a Run")
 
-        let reopened = AppModel()
-        reopened.home = home
+        let reopened = AppModel(home: home)
         reopened.restorePendingChats()
         guard let restored = reopened.pendingChats.first else { throw Failure.assertion("relaunch lost chat") }
         try require(restored.id == saved.id && restored.prompt == exact, "relaunch changed prompt")
@@ -677,13 +672,13 @@ enum ChatJourneyProbe {
 
         let unavailableRoot = root.appending(path: "not-a-directory")
         try Data("test-owned blocker".utf8).write(to: unavailableRoot)
-        let failedSave = AppModel()
-        failedSave.home = AgentHome(root: unavailableRoot)
+        let failedSave = AppModel(home: AgentHome(root: unavailableRoot))
         try require(!failedSave.createPendingChat(cwd: root.path, providerID: nil, modelID: nil,
                                                  prompt: "keep this in the editor"), "save failure claimed success")
         try require(failedSave.pendingChats.isEmpty && failedSave.pendingChatStoreError != nil,
                     "save failure missing visible explanation")
 
         try await runServiceInitialStartProbe(root: root)
+        try await ConsumerTelemetryProbe.run(root: root)
     }
 }

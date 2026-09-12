@@ -7207,5 +7207,6 @@ await Harness.run(
         + casesAviaryTelemetry + casesAviaryTelemetryAgent + casesAviaryTelemetryTransport
         + casesAviaryTelemetryHTTPClient + casesAviaryTelemetryDelivery + casesAviaryTelemetrySavedChat
         + casesAviaryTelemetryDrain + casesAviaryTelemetryRepositoryReview
-        + casesAviaryTelemetryContext
+        + casesAviaryTelemetryContext + casesHostedDeferredDeliveryTelemetry
+        + casesJournalBackedSnapshotCoherence
         + casesRuntimeHostTelemetry + casesRuntimeHostTelemetryProtocol + casesWorkAgentChildTelemetry)

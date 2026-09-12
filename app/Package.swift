@@ -119,6 +119,8 @@ let linuxSelfTestSources: [String] = [
     "AviaryTelemetryTransportTests.swift",
     "AviaryTelemetryHTTPClientTests.swift",
     "AviaryTelemetryDeliveryTests.swift",
+    "HostedDeferredDeliveryTelemetryTests.swift",
+    "JournalBackedSnapshotCoherenceTests.swift",
     "RuntimeHostTelemetryTests.swift",
     "WorkAgentChildTelemetryTests.swift",
     "AttachmentQualifiedIdentityTests.swift",

@@ -200,6 +200,32 @@ final class ServiceBackedRunBridge {
         expectedDescriptor: WorkServiceArtifactDescriptor,
         maxTotalBytes: Int = ObservedRepositoryReviewLimits.default.totalArtifactBytes
     ) async -> Result<ObservedRepositoryReview, RepositoryReviewLoadError> {
+        var attributes = consumerReadAttributes
+        attributes["aviary.read.target"] = .string("work")
+        attributes["aviary.artifact.id"] = .string(
+            AviaryTelemetry.identity(expectedDescriptor.artifactID))
+        let result = await AviaryTelemetry.withSpan(
+            "aviary.gui.repository_review.load", attributes: attributes
+        ) {
+            let result = await loadRepositoryReviewUntraced(
+                expectedDescriptor: expectedDescriptor, maxTotalBytes: maxTotalBytes)
+            switch result {
+            case .success:
+                AviaryTelemetry.outcome("succeeded")
+            case .failure(.bounded):
+                AviaryTelemetry.outcome("unavailable")
+            case .failure(.stale), .failure(.unavailable):
+                AviaryTelemetry.outcome("unavailable")
+            }
+            return result
+        }
+        return result
+    }
+
+    private func loadRepositoryReviewUntraced(
+        expectedDescriptor: WorkServiceArtifactDescriptor,
+        maxTotalBytes: Int
+    ) async -> Result<ObservedRepositoryReview, RepositoryReviewLoadError> {
         let selected = expectedDescriptor
         guard repositoryReviewHistory.sourceComplete,
               repositoryReviewHistory.rows.contains(where: { $0.descriptor == selected }) else {
@@ -427,14 +453,20 @@ final class ServiceBackedRunBridge {
     /// reducer, read acknowledgement, or command cursors.
     @discardableResult
     func loadEarlierHistory() async throws -> WorkServiceConversationHistoryWindow {
-        do {
-            history = try await controller.loadEarlierConversationHistory()
-            historyError = nil
-            return history
-        } catch {
-            history = await controller.conversationHistory()
-            historyError = Self.historyMessage(for: error)
-            throw error
+        try await AviaryTelemetry.withSpan(
+            "aviary.gui.history.load_earlier", attributes: consumerReadAttributes
+        ) {
+            do {
+                history = try await controller.loadEarlierConversationHistory()
+                historyError = nil
+                AviaryTelemetry.outcome("succeeded")
+                return history
+            } catch {
+                history = await controller.conversationHistory()
+                historyError = Self.historyMessage(for: error)
+                AviaryTelemetry.outcome(Self.historyTelemetryOutcome(for: error))
+                throw error
+            }
         }
     }
 
@@ -573,6 +605,33 @@ final class ServiceBackedRunBridge {
             sessionSourceCompleteness: projection.sessionSourceCompleteness,
             workOmissions: projection.workOmissions,
             sessionOmissions: projection.sessionOmissions)
+    }
+
+    private var consumerReadAttributes: [String: AviaryTraceValue] {
+        var attributes: [String: AviaryTraceValue] = [
+            "aviary.work.id": .string(AviaryTelemetry.workIdentity(work)),
+            "aviary.read.target": .string("session"),
+        ]
+        if !sessionID.isEmpty {
+            attributes["aviary.session.id"] = .string(AviaryTelemetry.identity(sessionID))
+        }
+        return attributes
+    }
+
+    private static func historyTelemetryOutcome(for error: Error) -> String {
+        if error is CancellationError { return "cancelled" }
+        guard let error = error as? WorkServiceAttachedWorkControllerError else {
+            return "failed"
+        }
+        switch error {
+        case .invalidOptions:
+            return "unavailable"
+        case .invalidSeed, .hostMismatch, .notConnected, .malformedResponse, .sourceIncomplete,
+             .pendingCommandExists, .noPendingCommand, .commandNotAdmissible,
+             .capabilityDenied, .terminalWork, .recoveryRequired, .staleCursor,
+             .transportFailure:
+            return "unavailable"
+        }
     }
 
     /// Retry the controller's one explicitly retained command, preserving its original command

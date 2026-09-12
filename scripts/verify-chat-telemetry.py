@@ -8,6 +8,7 @@ Usage: uv run scripts/verify-chat-telemetry.py build/Aviary.app/Contents/MacOS/A
 Last verified: 2026-09-11. Does not start the user's Work or select a permanent backend.
 """
 import collections
+import hashlib
 import http.server
 import os
 import pathlib
@@ -91,11 +92,34 @@ def main():
     if not all(attrs(span).get("aviary.outcome") in {"rejected", "unavailable", "indeterminate"}
                for span in startups):
         raise RuntimeError("blocked startup was not truthfully classified")
+    reviews = [span for span in spans if span.name == "aviary.gui.repository_review.load"]
+    histories = [span for span in spans if span.name == "aviary.gui.history.load_earlier"]
+    if collections.Counter(attrs(span).get("aviary.outcome") for span in reviews) != {
+            "unavailable": 2, "succeeded": 1}:
+        raise RuntimeError("repository consumer outcomes did not preserve bounded/success/stale results")
+    if len(histories) != 1 or attrs(histories[0]).get("aviary.outcome") != "unavailable":
+        raise RuntimeError("history failure consumer scope missing or repeated by refresh/jump")
+    session_hash = hashlib.sha256(b"consumer-telemetry-session").hexdigest()
+    artifact_hash = hashlib.sha256(b"consumer-review-artifact").hexdigest()
+    for span in reviews + histories:
+        values = attrs(span)
+        if span.parent_span_id or values.get("aviary.session.id") != session_hash:
+            raise RuntimeError("consumer trace had unrelated parent or Session identity")
+        work_hash = values.get("aviary.work.id", "")
+        if len(work_hash) != 64 or any(c not in "0123456789abcdef" for c in work_hash):
+            raise RuntimeError("consumer Work identity missing or not hashed")
+        expected_target = "work" if span in reviews else "session"
+        if values.get("aviary.read.target") != expected_target:
+            raise RuntimeError("consumer read target was misclassified")
+        if span in reviews and values.get("aviary.artifact.id") != artifact_hash:
+            raise RuntimeError("consumer artifact identity was not exact")
     for span in spans:
         for entry in list(span.attributes) + [attr for event in span.events for attr in event.attributes]:
             value = entry.value.string_value
             if any(secret in value for secret in ["/tmp/", "/var/folders/", "keep this in the editor",
-                                                   "preserve this initial prompt", "Preserve this exact request"]):
+                                                   "preserve this initial prompt", "Preserve this exact request",
+                                                   "consumer-telemetry-work", "consumer-telemetry-session",
+                                                   "consumer-review-artifact"]):
                 raise RuntimeError("private fixture content appeared in exported attributes")
     print(f"OTLP AppModel probe PASS: {len(spans)} spans; {len(saves)} saves; {len(startups)} blocked startups")
     for name, count in sorted(names.items()):

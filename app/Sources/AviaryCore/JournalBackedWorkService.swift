@@ -1219,6 +1219,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
     /// suspend after the first Session read and prove the second authority pass observes a
     /// concurrent relationship transition.
     private var historyAfterInitialReadHook: (@Sendable () async -> Void)?
+    /// Internal deterministic race seam. Production leaves this nil; self-tests use it to
+    /// advance a canonical pair after a snapshot page has been selected but before its descriptor
+    /// is assembled. The descriptor must remain bound to the page's retained source rather than
+    /// silently describing the newer journal tip.
+    private var snapshotAfterPageHook:
+        (@Sendable (WorkServiceSnapshotRequest) async -> Void)?
     /// A durable reservation prevents two processes from minting Runs, while this in-process
     /// task map prevents an actor re-entrant duplicate from observing the winner's pre-assembly
     /// reservation and incorrectly reporting ``sourceIncomplete``.  The key is the complete
@@ -1340,6 +1346,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
         _ hook: (@Sendable () async -> Void)?
     ) {
         historyAfterInitialReadHook = hook
+    }
+
+    func installSnapshotAfterPageHook(
+        _ hook: (@Sendable (WorkServiceSnapshotRequest) async -> Void)?
+    ) {
+        snapshotAfterPageHook = hook
     }
 
     public func handshake(_ request: WorkServiceHandshakeRequest) async throws
@@ -2384,19 +2396,24 @@ public actor JournalBackedWorkService: WorkServiceClient {
         try await ensureLoaded()
         try validateClient(request.client)
         let source = try await requireCanonical(work: request.work, journal: request.journal)
-        let attachment = try await requireAttached(
+        let authorized = try await requireAttachedWithControl(
             work: request.work, journal: request.journal, attachment: request.attachment,
             client: request.client, capability: .observe)
         try await validateReadableTarget(
-            request.target, attachment: attachment, source: source)
-        let records = try await records(for: request.target, source: source)
+            request.target, attachment: authorized.attachment, source: source,
+            control: authorized.control)
+        let records = try await records(
+            for: request.target, source: source, control: authorized.control)
         let page = try await page(
             entry: records, journal: request.target.journal,
             expectedURL: expectedURL(for: request.target, source: source),
             after: request.afterCursor, target: request.target,
             limit: request.limit, maxBytes: request.maxBytes)
+        if let snapshotAfterPageHook { await snapshotAfterPageHook(request) }
         return WorkServiceSnapshot(
-            work: try await descriptor(for: request.work, client: request.client),
+            work: try await descriptor(
+                for: request.work, client: request.client, source: source,
+                control: authorized.control),
             events: page.events, target: request.target,
             servedCursor: page.servedCursor, basePrefixDigest: page.basePrefixDigest,
             prefixDigest: page.prefixDigest, omissions: page.omissions)
@@ -5041,13 +5058,28 @@ public actor JournalBackedWorkService: WorkServiceClient {
         }
     }
 
-    private func descriptor(for work: WorkRef, client: ClientRef) async throws -> WorkServiceWorkDescriptor {
-        let source: CanonicalSource
-        do {
-            source = try await requireCanonical(
-                work: work, journal: JournalRef.work(work))
-        } catch {
-            throw error
+    private func descriptor(for work: WorkRef, client: ClientRef) async throws
+        -> WorkServiceWorkDescriptor {
+        let source = try await requireCanonical(
+            work: work, journal: JournalRef.work(work))
+        return try await descriptor(
+            for: work, client: client, source: source)
+    }
+
+    /// Assemble one descriptor from the exact canonical source retained by its caller. Snapshot
+    /// reads use this overload so `currentRun` and `servedCursor` cannot advance beyond the page
+    /// returned in the same response. Live Hosted state remains an independent observation: when
+    /// it no longer matches this source, execution is conservatively recovery-required rather
+    /// than being projected as actionable under a newer owner.
+    private func descriptor(
+        for work: WorkRef,
+        client: ClientRef,
+        source: CanonicalSource,
+        control suppliedControl: WorkHostControlSnapshot? = nil
+    ) async throws -> WorkServiceWorkDescriptor {
+        guard source.registration.reservation.work == work,
+              source.workJournal == JournalRef.work(work) else {
+            throw WorkServiceProtocolError.journalMismatch
         }
         // This is observation-only repair of a stale negative bootstrap fact. It does not open an
         // actor or append a journal; the descriptor below re-reads the registry after the CAS so
@@ -5166,7 +5198,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
         if execution == .idle && hasUnstartedReservation {
             execution = .recoveryRequired
         }
-        let control = try await controlSnapshot()
+        let control: WorkHostControlSnapshot
+        if let suppliedControl {
+            control = suppliedControl
+        } else {
+            control = try await controlSnapshot()
+        }
         // Every completed Session creation is inserted into the canonical control attachment
         // table by the reducer. Source verification below authenticates those records; it must
         // not synthesize a second always-attached copy that could resurrect a later detach.
@@ -5652,6 +5689,20 @@ public actor JournalBackedWorkService: WorkServiceClient {
         work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
         client: ClientRef, capability: WorkServiceCapability
     ) async throws -> WorkServiceClientAttachment {
+        try await requireAttachedWithControl(
+            work: work, journal: journal, attachment: attachment,
+            client: client, capability: capability).attachment
+    }
+
+    /// Authenticate one attachment and retain the exact control projection used for the decision.
+    /// Snapshot descriptor assembly consumes the same value so a later control read cannot mix a
+    /// newer relationship table with an older journal page. As with the prior implementation, a
+    /// detach after this authorization point is fenced by subsequent service operations; no
+    /// attachment authority is inferred from the canonical Work journal itself.
+    private func requireAttachedWithControl(
+        work: WorkRef, journal: JournalRef, attachment: ClientAttachmentRef,
+        client: ClientRef, capability: WorkServiceCapability
+    ) async throws -> (attachment: WorkServiceClientAttachment, control: WorkHostControlSnapshot) {
         let control = try await controlSnapshot()
         guard let value = control.clientAttachments[attachment.attachmentID],
               value.work == work, value.workJournal == journal,
@@ -5662,7 +5713,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         guard result.authorization.allows(capability) else {
             throw WorkServiceProtocolError.capabilityDenied(capability)
         }
-        return result
+        return (result, control)
     }
 
     /// Convert the authenticated client attachment into the exact canonical Work binding. The
@@ -5745,7 +5796,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
     }
 
     private func records(
-        for target: WorkServiceReadTarget, source: CanonicalSource
+        for target: WorkServiceReadTarget, source: CanonicalSource,
+        control suppliedControl: WorkHostControlSnapshot? = nil
     ) async throws -> JournalReadCacheEntry {
         switch target {
         case .work(let journal):
@@ -5757,7 +5809,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
             if session == source.session && journal == source.sessionJournal {
                 return source.sessionCache
             }
-            let control = try await controlSnapshot()
+            let control: WorkHostControlSnapshot
+            if let suppliedControl {
+                control = suppliedControl
+            } else {
+                control = try await controlSnapshot()
+            }
             guard try await sessionRelationships(for: source, control: control).contains(where: {
                 $0.session == session && $0.sessionJournal == journal
             }) else { throw WorkServiceProtocolError.journalMismatch }
@@ -5769,7 +5826,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
     private func validateReadableTarget(
         _ target: WorkServiceReadTarget,
         attachment: WorkServiceClientAttachment,
-        source: CanonicalSource
+        source: CanonicalSource,
+        control suppliedControl: WorkHostControlSnapshot? = nil
     ) async throws {
         switch target {
         case .work(let journal):
@@ -5782,7 +5840,12 @@ public actor JournalBackedWorkService: WorkServiceClient {
                   attachment.sessionAttachment != nil else {
                 throw WorkServiceProtocolError.journalMismatch
             }
-            let control = try await controlSnapshot()
+            let control: WorkHostControlSnapshot
+            if let suppliedControl {
+                control = suppliedControl
+            } else {
+                control = try await controlSnapshot()
+            }
             guard try await sessionRelationships(for: source, control: control).contains(where: {
                 $0.session == session && $0.sessionJournal == journal
                     && $0.sessionAttachment == attachment.sessionAttachment

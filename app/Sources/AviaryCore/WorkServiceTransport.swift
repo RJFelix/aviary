@@ -132,6 +132,7 @@ private func workServiceTraceAttributes(
 }
 
 private func workServiceTraceOutcome(for error: Error) -> String {
+    if error is CancellationError { return "cancelled" }
     if let protocolError = error as? WorkServiceProtocolError {
         switch protocolError {
         case .capabilityDenied, .workNotFound, .attachmentNotFound, .artifactNotFound:
@@ -164,7 +165,7 @@ private func workServiceIsRoutineRead(
 ) -> Bool {
     switch operation {
     case .listWorks, .describeWork, .snapshot, .eventsAfterCursor, .historyBeforeCursor,
-         .fetchArtifact, .fetchBody, .acknowledgeRead:
+         .fetchArtifact, .fetchBody:
         return true
     default:
         return false
@@ -4114,46 +4115,56 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
     private func performHandshake(
         _ request: WorkServiceHandshakeRequest
     ) async throws -> WorkServiceHandshakeResponse {
-        let payload = try WorkServiceTransportCodec.encodePayload(request)
-        let envelope = WorkServiceTransportRequestEnvelope(
-            id: nextID(), operation: .handshake, client: client, payload: payload)
-        let response: WorkServiceHandshakeResponse = try await callEnvelope(envelope)
-        return response
+        try await call(.handshake, request, requiresHandshake: false)
     }
 
     private func call<Req: Encodable, Resp: Decodable>(
-        _ operation: WorkServiceTransportOperation, _ request: Req
+        _ operation: WorkServiceTransportOperation, _ request: Req,
+        requiresHandshake: Bool = true
     ) async throws -> Resp {
-        guard handshakeResponse != nil else { throw WorkServiceTransportError.notConnected }
-        let payload = try WorkServiceTransportCodec.encodePayload(request)
-        let envelope = WorkServiceTransportRequestEnvelope(
-            id: nextID(), operation: operation, client: client, payload: payload)
-        return try await callEnvelope(envelope)
+        let requestID = nextID()
+        return try await callOperation(operation, requestID: requestID) {
+            guard !requiresHandshake || self.handshakeResponse != nil else {
+                throw WorkServiceTransportError.notConnected
+            }
+            let payload = try WorkServiceTransportCodec.encodePayload(request)
+            return WorkServiceTransportRequestEnvelope(
+                id: requestID, operation: operation, client: self.client, payload: payload)
+        }
     }
 
-    private func callEnvelope<Resp: Decodable>(
-        _ envelope: WorkServiceTransportRequestEnvelope
+    private func callOperation<Resp: Decodable>(
+        _ operation: WorkServiceTransportOperation, requestID: String,
+        makeEnvelope: () throws -> WorkServiceTransportRequestEnvelope
     ) async throws -> Resp {
-        if workServiceIsRoutineRead(envelope.operation), workServiceActiveTraceContext() == nil {
-            // Unparented reads are routine polling. Keep them out of the trace stream until a
-            // caller explicitly places the read inside a user-operation span.
-            let untracedEnvelope = WorkServiceTransportRequestEnvelope(
-                id: envelope.id, operation: envelope.operation, client: envelope.client,
-                traceparent: nil, payload: envelope.payload)
-            return try await callEnvelopeBody(untracedEnvelope)
+        if workServiceIsRoutineRead(operation), workServiceActiveTraceContext() == nil {
+            let started = DispatchTime.now().uptimeNanoseconds
+            do {
+                let envelope = try makeEnvelope()
+                let untracedEnvelope = WorkServiceTransportRequestEnvelope(
+                    id: envelope.id, operation: envelope.operation, client: envelope.client,
+                    traceparent: nil, payload: envelope.payload)
+                let response: Resp = try await callEnvelopeBody(untracedEnvelope)
+                recordQuietRead(operation, requestID: requestID, started: started, error: nil)
+                return response
+            } catch {
+                recordQuietRead(operation, requestID: requestID, started: started, error: error)
+                throw error
+            }
         }
         return try await AviaryTelemetry.withSpan(
-            "aviary.work.\(envelope.operation.rawValue)", kind: .client,
+            "aviary.work.\(operation.rawValue)", kind: .client,
             attributes: workServiceTraceAttributes(
-                operation: envelope.operation, requestID: envelope.id)
+                operation: operation, requestID: requestID)
         ) {
-            // The envelope is rebuilt inside the span so its parent is the active CLIENT span,
-            // even when the caller supplied stale or unrelated observability metadata.
-            let tracedEnvelope = WorkServiceTransportRequestEnvelope(
-                id: envelope.id, operation: envelope.operation, client: envelope.client,
-                traceparent: AviaryTelemetry.traceparent, payload: envelope.payload)
             let writeTracker = WorkServiceTransportWriteTracker()
             do {
+                // Admission and encoding failures belong to this same operation, even when
+                // there was no envelope or socket write. IDs never imply delivery.
+                let envelope = try makeEnvelope()
+                let tracedEnvelope = WorkServiceTransportRequestEnvelope(
+                    id: envelope.id, operation: envelope.operation, client: envelope.client,
+                    traceparent: AviaryTelemetry.traceparent, payload: envelope.payload)
                 let response: Resp
                 do {
                     response = try await callEnvelopeBody(
@@ -4179,11 +4190,27 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
                 return response
             } catch {
                 AviaryTelemetry.outcome(workServiceClientTraceOutcome(
-                    for: error, operation: envelope.operation,
+                    for: error, operation: operation,
                     didStartWrite: writeTracker.didStartWrite))
                 throw error
             }
         }
+    }
+
+    private func recordQuietRead(
+        _ operation: WorkServiceTransportOperation, requestID: String,
+        started: UInt64, error: Error?
+    ) {
+        let finished = DispatchTime.now().uptimeNanoseconds
+        let seconds = Double(finished >= started ? finished - started : 0) / 1_000_000_000
+        let slow = seconds >= 1
+        guard error != nil || slow else { return }
+        var attributes = workServiceTraceAttributes(operation: operation, requestID: requestID)
+        attributes["aviary.read.duration.seconds"] = .double(seconds)
+        attributes["aviary.read.slow"] = .bool(slow)
+        AviaryTelemetry.completedSpan("aviary.work.\(operation.rawValue)", kind: .client,
+            attributes: attributes, elapsedSeconds: seconds,
+            outcome: error.map(workServiceTraceOutcome(for:)) ?? "completed")
     }
 
     private func callEnvelopeBody<Resp: Decodable>(

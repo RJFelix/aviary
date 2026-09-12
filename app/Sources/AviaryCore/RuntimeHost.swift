@@ -216,13 +216,14 @@ private final class UnixSocketConnection: @unchecked Sendable {
     /// the underlying descriptor is not leaked or accidentally closed twice.
     private func closeHandleLocked() {
         guard !handleClosed else { return }
-        // Removing the handler can wait for the read callback. Do that before taking its
-        // short recv lock, then fence the actual descriptor close against any acquired read.
+        // Every caller has already claimed `closed` under `stateLock`. That claim waits for an
+        // admitted recv to finish and prevents the readability callback from starting another,
+        // so the descriptor cannot be reused beneath a read after the lock is released here.
+        // Foundation may synchronously wait for that callback from both the handler setter and
+        // `close()` on Linux; do not hold the callback's state lock across either operation.
         handle.readabilityHandler = nil
-        stateLock.lock()
         try? handle.close()
         handleClosed = true
-        stateLock.unlock()
     }
 }
 

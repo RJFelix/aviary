@@ -1572,7 +1572,7 @@ private final class RawWorkServiceTransportClient: @unchecked Sendable {
     func close() { _ = AviaryPOSIX.close(descriptor) }
 }
 
-private final class DelayedWorkService: WorkServiceClient, @unchecked Sendable {
+final class DelayedWorkService: WorkServiceClient, @unchecked Sendable {
     let base: InMemoryWorkService
     let delayNanoseconds: UInt64
     private let delayState = DispatchQueue(label: "aviary.transport.delayed-service.state")

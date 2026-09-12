@@ -163,7 +163,7 @@ final class AppModel {
     var pendingChatDetails: [UUID: String] = [:]
     // MARK: Configuration
 
-    var home: AgentHome = .default {
+    var home: AgentHome {
         didSet {
             preferredServiceAttachmentKey = Self.loadPreferredServiceAttachment(
                 home: home, defaults: presentationDefaults)
@@ -181,7 +181,7 @@ final class AppModel {
         }
     }
 
-    var settings: HarnessSettings = .load(home: .default)
+    var settings: HarnessSettings
     var loginShellEnvironmentLoaded = false
 
     // MARK: Catalog
@@ -278,15 +278,15 @@ final class AppModel {
 
     // MARK: Models & library
 
-    var modelsConfig: ModelsConfig = .load(home: .default)
-    var auth: AuthInfo = .load(home: .default)
+    var modelsConfig: ModelsConfig
+    var auth: AuthInfo
     /// Runtime model catalog from the engine — includes built-in providers that never
     /// appear in models.json.
     var runtimeModels: [ModelSpec] = []
     var runtimeModelsError: String?
     /// The reachable model catalogue, assembled locally rather than asked of the engine.
     var modelCatalog = ModelCatalog()
-    let modelPreferencesStore = ModelPreferencesStore()
+    let modelPreferencesStore: ModelPreferencesStore
     var modelPreferences = ModelPreferences()
     /// What a picker offers: reachable, enabled, in your order.
     var pickerModels: [ModelSpec] { modelCatalog.enabled }
@@ -423,10 +423,17 @@ final class AppModel {
     var reloadInProgress = false
     var acceptsNewWork = true
 
-    init(presentationDefaults: UserDefaults = .standard) {
+    init(home: AgentHome = .default, presentationDefaults: UserDefaults = .standard,
+         modelPreferencesStore: ModelPreferencesStore = ModelPreferencesStore()) {
+        self.home = home
+        self.settings = .load(home: home)
+        let auth = AuthInfo.load(home: home)
+        self.auth = auth
+        self.modelsConfig = .load(home: home, auth: auth)
+        self.modelPreferencesStore = modelPreferencesStore
         self.presentationDefaults = presentationDefaults
         self.preferredServiceAttachmentKey = Self.loadPreferredServiceAttachment(
-            home: .default, defaults: presentationDefaults)
+            home: home, defaults: presentationDefaults)
     }
 
     @discardableResult
@@ -927,9 +934,11 @@ final class AppModel {
                 : false
             let reconciliationWarning = localWorkServiceObservationError
             // A blocked creation must not hide unrelated attachments or implicitly replay Start.
-            await restoreServiceWork(
-                session: session, client: client, handshake: freshHandshake,
-                resumeInitialStart: createsReconciled && sessionsReconciled)
+            _ = await traceServiceReconstruction(client: client) {
+                await self.restoreServiceWork(
+                    session: session, client: client, handshake: freshHandshake,
+                    resumeInitialStart: createsReconciled && sessionsReconciled)
+            }
             if !sessionsReconciled, localWorkServiceObservationError == nil {
                 localWorkServiceObservationError = reconciliationWarning
             }
@@ -963,9 +972,11 @@ final class AppModel {
                 ? await reconcilePendingCreateSessionIntents(session: session, client: client) != .blocked
                 : false
             let reconciliationWarning = localWorkServiceObservationError
-            await restoreServiceWork(
-                session: session, client: client, handshake: handshake,
-                resumeInitialStart: createsReconciled && sessionsReconciled)
+            _ = await traceServiceReconstruction(client: client) {
+                await self.restoreServiceWork(
+                    session: session, client: client, handshake: handshake,
+                    resumeInitialStart: createsReconciled && sessionsReconciled)
+            }
             if !sessionsReconciled, localWorkServiceObservationError == nil {
                 localWorkServiceObservationError = reconciliationWarning
             }
@@ -977,11 +988,12 @@ final class AppModel {
     /// Read the host catalog and recreate every attachment belonging to this durable client.
     /// This never issues another Attach. Initial Start recovery is a separate, explicit mode;
     /// blocked creation reconciliation permits only observation of existing attachments.
+    @discardableResult
     private func restoreServiceWork(
         session: WorkServiceClientSession, client: ClientRef,
         handshake suppliedHandshake: WorkServiceHandshakeResponse? = nil,
         resumeInitialStart: Bool = true
-    ) async {
+    ) async -> Bool {
         defer { settlePendingChats() }
         let handshake: WorkServiceHandshakeResponse?
         if let suppliedHandshake {
@@ -992,7 +1004,7 @@ final class AppModel {
         guard let handshake else {
             localServiceCatalogWorks = []
             localWorkServiceError = "The Work Host did not provide a handshake for reconstruction."
-            return
+            return false
         }
         let catalog = await WorkServiceCatalog().refresh([
             WorkServiceCatalogHost(host: handshake.host, session: session)
@@ -1009,7 +1021,7 @@ final class AppModel {
               host.sourceCompleteness == .complete || rowLocalQuarantineOnly else {
             localServiceCatalogWorks = []
             localWorkServiceError = "The Work Host catalog is incomplete; attached Work was withheld until a complete read."
-            return
+            return false
         }
         // A malformed/duplicate descriptor is quarantined as a row by WorkServiceCatalog. It
         // must not poison unrelated healthy Works from the same complete page, but any page or
@@ -1050,9 +1062,14 @@ final class AppModel {
                 || canCreateSession
         }
         var restorationCandidates: [(WorkServiceWorkDescriptor, WorkServiceClientAttachment)] = []
+        var restorationHadIncompleteEvidence = !host.quarantined.isEmpty
         for descriptor in catalog.works where descriptor.recordedDisposition == .reusable {
             for attachment in descriptor.attachments where attachment.client == client {
                 restorationCandidates.append((descriptor, attachment))
+                if !descriptor.omissions.isEmpty
+                    || ServiceAttachmentKey(work: descriptor.work, attachment: attachment) == nil {
+                    restorationHadIncompleteEvidence = true
+                }
             }
         }
         if let preferredServiceAttachmentKey {
@@ -1083,10 +1100,11 @@ final class AppModel {
             // Attach action below, but relaunch should not flood Live with completed history.
             guard let key = ServiceAttachmentKey(work: descriptor.work, attachment: attachment),
                   !hiddenServiceAttachmentKeys.contains(key) else { continue }
-            await adoptServiceAttachment(
+            let adoptionError = await adoptServiceAttachment(
                 descriptor: descriptor, attachment: attachment,
                 session: session, client: client, focus: false,
                 resumeInitialStart: resumeInitialStart)
+            if adoptionError != nil { restorationHadIncompleteEvidence = true }
         }
         // A Start seed may outlive both its GUI and its Run. Terminal Work is not auto-opened
         // into Live, but its exact command evidence can still settle the local marker so a later
@@ -1101,11 +1119,85 @@ final class AppModel {
                     session: session, client: client)
             }
         }
+        let representedAfterRestore = Set(workRuns.compactMap(\.serviceAttachmentKey))
+        let allExpectedKeysReconstructed = restoringKeys.allSatisfy {
+            representedAfterRestore.contains($0)
+        }
+        return !restorationHadIncompleteEvidence && allExpectedKeysReconstructed
     }
 
     private func connectionIsUsable(_ state: WorkServiceClientSessionState) -> Bool {
         if case .connected = state { return true }
         return false
+    }
+
+    private func traceServiceReconstruction(
+        client: ClientRef, operation: @escaping () async -> Bool
+    ) async -> Bool {
+        await AviaryTelemetry.withSpan(
+            "aviary.gui.service.reconstruct",
+            attributes: [
+                "aviary.client.id": .string(AviaryTelemetry.identity(client.clientID)),
+            ],
+            root: true
+        ) {
+            let reconstructed = await operation()
+            AviaryTelemetry.outcome(reconstructed ? "completed" : "unavailable")
+            return reconstructed
+        }
+    }
+
+    private func tracePresentationResume(
+        sessionID: String, operation: @escaping () async -> Bool
+    ) async {
+        await AviaryTelemetry.withSpan(
+            "aviary.gui.presentation.resume",
+            attributes: [
+                "aviary.session.id": .string(AviaryTelemetry.identity(sessionID)),
+            ],
+            root: true
+        ) {
+            let resumed = await operation()
+            AviaryTelemetry.outcome(resumed ? "completed" : "unavailable")
+        }
+    }
+
+    private func traceServiceAttach(
+        work: WorkRef, target: WorkSessionKey, client: ClientRef,
+        operation: @escaping () async -> String
+    ) async {
+        await AviaryTelemetry.withSpan(
+            "aviary.gui.attach",
+            attributes: [
+                "aviary.work.id": .string(AviaryTelemetry.workIdentity(work)),
+                "aviary.session.id": .string(AviaryTelemetry.identity(target.session.sessionID)),
+                "aviary.client.id": .string(AviaryTelemetry.identity(client.clientID)),
+            ],
+            root: true
+        ) {
+            AviaryTelemetry.outcome(await operation())
+        }
+    }
+
+    private func traceRetainedStartRecovery(
+        _ chat: PendingChat, operation: @escaping () async -> String
+    ) async -> String {
+        await AviaryTelemetry.withSpan(
+            "aviary.gui.retained_start.recover",
+            attributes: [
+                "aviary.chat.id": .string(
+                    AviaryTelemetry.identity(chat.id.uuidString.lowercased())),
+                "aviary.create.command.id": .string(
+                    AviaryTelemetry.identity(chat.attemptCommandID.uuidString.lowercased())),
+                "aviary.start.command.id": .string(
+                    AviaryTelemetry.identity(chat.startCommandID)),
+            ],
+            root: true
+        ) {
+            let outcome = await operation()
+            AviaryTelemetry.outcome(outcome)
+            return outcome
+        }
     }
 
     private func reconcileTerminalStartIntent(
@@ -2064,9 +2156,11 @@ final class AppModel {
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.serviceAttachesInFlight.remove(target) }
-            await self.attachServiceWorkNow(
-                descriptor, targetSessionAttachment: targetSessionAttachment, client: client,
-                destination: destination)
+            await self.traceServiceAttach(work: descriptor.work, target: target, client: client) {
+                await self.attachServiceWorkNow(
+                    descriptor, targetSessionAttachment: targetSessionAttachment, client: client,
+                    destination: destination)
+            }
         }
     }
 
@@ -2075,8 +2169,10 @@ final class AppModel {
         targetSessionAttachment: SessionAttachmentRef,
         client: ClientRef,
         destination: Section
-    ) async {
-        guard localWorkService != nil, beginServiceLifecycleOperation() else { return }
+    ) async -> String {
+        guard localWorkService != nil, beginServiceLifecycleOperation() else {
+            return "unavailable"
+        }
         defer { finishServiceLifecycleOperation() }
         do {
             // Attach is a mutation too: fence the shared socket and fresh cursor to one exact
@@ -2105,7 +2201,7 @@ final class AppModel {
                   }) else {
                 localWorkServiceError =
                     "The Work Host catalog changed or is incomplete; Attach was withheld."
-                return
+                return "unavailable"
             }
             // Resolve the target only from the host's semantic relationship projection; never
             // choose the first Session on a Work because ordering is not identity.
@@ -2115,16 +2211,16 @@ final class AppModel {
                 targetSessionAttachment: targetSessionAttachment) else {
                 localWorkServiceError =
                     "This Work does not expose one exact Session relationship for Attach."
-                return
+                return "unavailable"
             }
             let target = inspectDecision.target.workSession
             let targetKey = inspectDecision.target
             if let existing = inspectDecision.existingAttachment {
-                await adoptServiceAttachment(
+                let adoptionError = await adoptServiceAttachment(
                     descriptor: descriptor, attachment: existing,
                     session: session, client: client, focus: inspectDecision.shouldFocus,
                     destination: destination)
-                return
+                return adoptionError == nil ? "completed" : "unavailable"
             }
             let requestedCapabilities: Set<WorkServiceCapability> = [
                 .observe, .control, .start, .send, .steer, .queue, .cancel, .end,
@@ -2179,7 +2275,7 @@ final class AppModel {
                     // again.
                     pendingServiceAttaches.removeValue(forKey: targetKey)
                     await refreshAfterStaleAttach(session)
-                    return
+                    return "rejected"
                 }
                 // Transport uncertainty retains the exact request. A subsequent catalog read
                 // can prove it committed; no fresh Attach is synthesized here.
@@ -2190,15 +2286,15 @@ final class AppModel {
                 pendingServiceAttaches.removeValue(forKey: targetKey)
                 if response.rejection == .staleCursor {
                     await refreshAfterStaleAttach(session)
-                    return
+                    return "rejected"
                 }
                 localWorkServiceError =
                     "The Work Host rejected Attach: "
                         + (response.diagnostic ?? "no attachment was admitted.")
-                return
+                return "rejected"
             }
             pendingServiceAttaches.removeValue(forKey: targetKey)
-            await adoptServiceAttachment(
+            let adoptionError = await adoptServiceAttachment(
                 descriptor: response.work, attachment: attachment,
                 session: session, client: client, focus: inspectDecision.shouldFocus,
                 destination: destination)
@@ -2207,8 +2303,10 @@ final class AppModel {
                 // attachable/inspectable after this client attaches one exact target.
                 localServiceCatalogWorks[index] = response.work
             }
+            return adoptionError == nil ? "completed" : "unavailable"
         } catch {
             localWorkServiceError = Self.serviceErrorMessage(error)
+            return pendingStartupTelemetryOutcome(for: error)
         }
     }
 
@@ -3519,28 +3617,47 @@ final class AppModel {
             return
         }
         if let resume {
-            if focusExistingWork(forSession: resume) {
-                if let run = workRuns.first(where: {
+            // Focus an already-open conversation immediately. Catalog-backed resume is a
+            // separate asynchronous stage only when this local lookup cannot find it.
+            let focusedExisting = AviaryTelemetry.withSynchronousSpan(
+                "aviary.gui.presentation.focus",
+                attributes: [
+                    "aviary.session.id": .string(AviaryTelemetry.identity(resume)),
+                ], root: true
+            ) {
+                let focused = focusExistingWork(forSession: resume)
+                AviaryTelemetry.outcome(focused ? "completed" : "unavailable")
+                return focused
+            }
+            let resumedRun = focusedExisting
+                ? workRuns.first(where: {
                     $0.config.identity?.sessionID == resume || $0.sessionID == resume
-                }) {
-                    onCreated?(run)
+                })
+                : nil
+            if focusedExisting {
+                if let resumedRun {
+                    onCreated?(resumedRun)
                 }
                 return
             }
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                await self.refreshServiceWork()
-                if self.focusExistingWork(forSession: resume) {
-                    if let run = self.workRuns.first(where: {
-                        $0.config.identity?.sessionID == resume || $0.sessionID == resume
-                    }) {
-                        onCreated?(run)
+                await self.tracePresentationResume(sessionID: resume) {
+                    await self.refreshServiceWork()
+                    guard self.focusExistingWork(forSession: resume) else {
+                        self.show(
+                            "This session has no attached Work in the current host catalog; a new "
+                                + "in-house run was not created.", isError: true)
+                        return false
                     }
+                    guard let run = self.workRuns.first(where: {
+                        $0.config.identity?.sessionID == resume || $0.sessionID == resume
+                    }) else {
+                        return false
+                    }
+                    onCreated?(run)
                     self.show("Reattached the durable Work for this conversation.")
-                } else {
-                    self.show(
-                        "This session has no attached Work in the current host catalog; a new "
-                            + "in-house run was not created.", isError: true)
+                    return true
                 }
             }
             return
@@ -3842,25 +3959,29 @@ final class AppModel {
             defer { self.pendingChatAttempts.remove(id) }
             await self.tracePendingChatStartup(original) {
                 if original.phase == .awaitingAcceptance || original.createdAssociation != nil {
-                    if self.localWorkService == nil { await self.bootstrapLocalWorkService() }
-                    do {
-                        let (session, handshake) = try await self.reconnectLocalWorkService()
-                        guard let client = self.localWorkServiceClient,
-                              await self.reconcilePendingCreateIntents(session: session, client: client) else {
-                            AviaryTelemetry.outcome("unavailable")
-                            return
+                    let recoveryOutcome = await self.traceRetainedStartRecovery(original) {
+                        if self.localWorkService == nil { await self.bootstrapLocalWorkService() }
+                        do {
+                            let (session, handshake) = try await self.reconnectLocalWorkService()
+                            guard let client = self.localWorkServiceClient,
+                                  await self.reconcilePendingCreateIntents(session: session, client: client) else {
+                                return "unavailable"
+                            }
+                            let reconstructed = await self.restoreServiceWork(
+                                session: session, client: client, handshake: handshake)
+                            self.settlePendingChats()
+                            // Reaching the end of a refresh is not proof of delivery. The strict
+                            // canonical retirement predicate above must have removed this card.
+                            if self.pendingChats.contains(where: { $0.id == id }) {
+                                return "indeterminate"
+                            }
+                            return reconstructed ? "completed" : "unavailable"
+                        } catch {
+                            self.pendingChatDetails[id] = "Still unable to confirm delivery. Your saved request is kept; no second attempt was sent. " + Self.serviceErrorMessage(error)
+                            return "indeterminate"
                         }
-                        await self.restoreServiceWork(session: session, client: client, handshake: handshake)
-                        self.settlePendingChats()
-                        // Reaching the end of a refresh is not proof of delivery. The strict
-                        // canonical retirement predicate above must have removed this card.
-                        AviaryTelemetry.outcome(
-                            self.pendingChats.contains(where: { $0.id == id })
-                                ? "indeterminate" : "completed", fallbackOnly: true)
-                    } catch {
-                        AviaryTelemetry.outcome("indeterminate")
-                        self.pendingChatDetails[id] = "Still unable to confirm delivery. Your saved request is kept; no second attempt was sent. " + Self.serviceErrorMessage(error)
                     }
+                    AviaryTelemetry.outcome(recoveryOutcome)
                     return
                 }
                 guard self.updatePendingChat(id, phase: .preparing),

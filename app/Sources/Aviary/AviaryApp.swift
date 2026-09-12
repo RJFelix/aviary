@@ -5,7 +5,7 @@ import SwiftUI
 
 @main
 struct AviaryApp: App {
-    @State private var model = AppModel()
+    @State private var model: AppModel
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     /// When this process started, for the preview loop's own timing line.
@@ -15,11 +15,13 @@ struct AviaryApp: App {
         _ = Self.launchedAt
         AviaryTelemetry.configure(serviceName: "aviary", environment: ProcessInfo.processInfo.environment)
         // Headless modes short-circuit before any scene is created, and exit.
+        LiveChatTelemetryProbe.runIfRequested()
         ChatJourneyProbe.runIfRequested()
         WireInspect.runIfRequested()
         Snapshot.runIfRequested()
         AgentCLI.runIfRequested()
         ClaudeCodeCLI.runIfRequested()
+        _model = State(initialValue: AppModel())
     }
 
     /// `Aviary --preview <section>` — one screen, opened fast, for a layout pass.

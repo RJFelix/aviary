@@ -26,6 +26,66 @@ private final class TelemetryCaptureHTTP: HTTPClient, @unchecked Sendable {
 private struct TelemetryFixtureError: Error {}
 
 let casesAviaryTelemetry: [Case] = [
+    ("telemetry: unsampled context survives asynchronous and synchronous scopes", {
+        let wire = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
+        let parent = try XCTUnwrap(AviaryTraceContext(traceparent: wire))
+        let (_, spans) = await AviaryTelemetry.withRecording {
+            await AviaryTelemetry.withSpan("aviary.test.unsampled", parent: parent) {
+                XCTAssertEqual(AviaryTelemetry.traceparent, wire)
+                AviaryTelemetry.event("aviary.test.no_export")
+                AviaryTelemetry.outcome("failed")
+                AviaryTelemetry.withSynchronousSpan("aviary.test.unsampled_sync") {
+                    XCTAssertEqual(AviaryTelemetry.traceparent, wire)
+                    AviaryTelemetry.event("aviary.test.no_export")
+                }
+                await AviaryTelemetry.withSpan("aviary.test.unsampled_async", kind: .client) {
+                    XCTAssertEqual(AviaryTelemetry.traceparent, wire)
+                }
+                XCTAssertEqual(AviaryTelemetry.traceparent, wire)
+            }
+            XCTAssertNil(AviaryTelemetry.traceparent)
+        }
+        XCTAssertTrue(spans.isEmpty)
+        let (_, rooted) = await AviaryTelemetry.withRecording {
+            await AviaryTelemetry.withSpan("aviary.test.unsampled_outer", parent: parent) {
+                await AviaryTelemetry.withSpan("aviary.test.independent", root: true) {
+                    XCTAssertNotEqual(AviaryTelemetry.traceparent, wire)
+                }
+                XCTAssertEqual(AviaryTelemetry.traceparent, wire)
+            }
+        }
+        XCTAssertEqual(rooted.count, 1)
+        XCTAssertNil(rooted.first?.parentSpanId)
+    }),
+    ("telemetry: completed quiet diagnostics preserve duration without lending context", {
+        let end = Date(timeIntervalSince1970: 1_800_000_000)
+        let (_, spans) = await AviaryTelemetry.withRecording {
+            await AviaryTelemetry.withSpan("aviary.test.outer") {
+                let parent = AviaryTelemetry.traceparent
+                AviaryTelemetry.completedSpan("aviary.test.quiet", kind: .client,
+                    attributes: ["raw.error": .string("secret-error")],
+                    elapsedSeconds: 1.75, outcome: "unavailable", finishedAt: end)
+                XCTAssertEqual(AviaryTelemetry.traceparent, parent)
+                AviaryTelemetry.completedSpan("aviary.test.invalid", kind: .client,
+                    attributes: [:], elapsedSeconds: .nan, outcome: "failed")
+                AviaryTelemetry.completedSpan("aviary.test.before_epoch", kind: .client,
+                    attributes: [:], elapsedSeconds: 5, outcome: "failed",
+                    finishedAt: Date(timeIntervalSince1970: 1))
+                AviaryTelemetry.completedSpan("aviary.test.unrepresentable", kind: .client,
+                    attributes: [:], elapsedSeconds: 1, outcome: "failed",
+                    finishedAt: Date(timeIntervalSince1970: Double.greatestFiniteMagnitude))
+            }
+        }
+        XCTAssertEqual(spans.count, 2)
+        let quiet = try XCTUnwrap(spans.first { $0.name == "aviary.test.quiet" })
+        let outer = try XCTUnwrap(spans.first { $0.name == "aviary.test.outer" })
+        XCTAssertNil(quiet.parentSpanId)
+        XCTAssertNotEqual(quiet.traceId, outer.traceId)
+        XCTAssertEqual(quiet.startTime, end.addingTimeInterval(-1.75))
+        XCTAssertEqual(quiet.endTime, end)
+        XCTAssertEqual(quiet.status, .error(description: "unavailable"))
+        XCTAssertNil(quiet.attributes["raw.error"])
+    }),
     ("telemetry: production shutdown is shared and cannot stop a recording scope", {
         AviaryTelemetry.configure(serviceName: "aviary", environment: [
             "AVIARY_OTEL_ENABLED": "1",

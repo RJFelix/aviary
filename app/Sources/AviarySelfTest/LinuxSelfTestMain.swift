@@ -55,7 +55,10 @@ enum LinuxSelfTestMain {
                     + casesAviaryTelemetryTransport + casesAviaryTelemetryHTTPClient
                     + casesAviaryTelemetryDelivery + casesRuntimeHostTelemetry + casesWorkAgentChildTelemetry)
                 try await runLinuxCases(casesAviaryTelemetryDrain + casesAviaryTelemetryRepositoryReview
-                    + casesAviaryTelemetryContext)
+                    + casesAviaryTelemetryContext + casesHostedDeferredDeliveryTelemetry)
+            }),
+            ("Linux journal-backed snapshot coherence", {
+                try await runLinuxCases(casesJournalBackedSnapshotCoherence)
             }),
             ("Shell: no implicit stdin inherits the controlling terminal", {
                 try await test_shellRunDetachesImplicitStdin()

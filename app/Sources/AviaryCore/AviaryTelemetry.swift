@@ -32,17 +32,19 @@ public struct AviaryTraceContext: Sendable, Equatable {
 }
 
 private final class AviaryActiveSpan: @unchecked Sendable {
-    let span: any Span
+    let span: (any Span)?
+    let context: SpanContext
     private let lock = NSLock()
     private var recordedOutcome: String?
-    init(_ span: any Span) { self.span = span }
+    init(_ span: any Span) { self.span = span; context = span.context }
+    init(propagating context: SpanContext) { span = nil; self.context = context }
     func outcome(_ value: String, fallbackOnly: Bool = false) {
         lock.lock(); defer { lock.unlock() }
         if fallbackOnly, let recordedOutcome, recordedOutcome != "unknown" { return }
         recordedOutcome = value
-        span.setAttribute(key: "aviary.outcome", value: .string(value))
+        span?.setAttribute(key: "aviary.outcome", value: .string(value))
         if ["failed", "rejected", "indeterminate", "unavailable"].contains(value) {
-            span.status = .error(description: value)
+            span?.status = .error(description: value)
         }
     }
 }
@@ -65,8 +67,8 @@ public enum AviaryTelemetry {
     }
     /// Capture causality for an in-memory deferred operation; never persist this as Work state.
     internal static var context: AviaryTraceContext? {
-        guard let span = active?.span, span.context.isValid else { return nil }
-        return AviaryTraceContext(span.context)
+        guard let context = active?.context, context.isValid else { return nil }
+        return AviaryTraceContext(context)
     }
     public static var configurationStatus: String {
         lock.lock(); defer { lock.unlock() }; return configuration
@@ -214,8 +216,8 @@ public enum AviaryTelemetry {
     ) async rethrows -> T {
         guard let span = startSpan(name, kind: kind, attributes: attributes, parent: parent, root: root, links: links)
         else { return try await operation() }
-        defer { span.end() }
-        return try await $active.withValue(AviaryActiveSpan(span)) {
+        defer { span.span?.end() }
+        return try await $active.withValue(span) {
             do { return try await operation() }
             catch {
                 active?.outcome(error is CancellationError ? "cancelled" : "failed", fallbackOnly: true)
@@ -232,8 +234,8 @@ public enum AviaryTelemetry {
     ) rethrows -> T {
         guard let span = startSpan(name, kind: kind, attributes: attributes, parent: parent, root: root, links: links)
         else { return try operation() }
-        defer { span.end() }
-        return try $active.withValue(AviaryActiveSpan(span)) {
+        defer { span.span?.end() }
+        return try $active.withValue(span) {
             do { return try operation() }
             catch {
                 active?.outcome(error is CancellationError ? "cancelled" : "failed", fallbackOnly: true)
@@ -246,8 +248,9 @@ public enum AviaryTelemetry {
     /// Durable command hashes join attempts; an old span is never reconstructed from storage.
     private static func startSpan(
         _ name: String, kind: AviaryTraceKind, attributes: [String: AviaryTraceValue],
-        parent: AviaryTraceContext?, root: Bool, links: [AviaryTraceContext]
-    ) -> (any Span)? {
+        parent: AviaryTraceContext?, root: Bool, links: [AviaryTraceContext],
+        startedAt: Date? = nil
+    ) -> AviaryActiveSpan? {
         guard let tracer = currentTracer() else { return nil }
         let builder = tracer.spanBuilder(spanName: safeName(name))
         switch kind {
@@ -260,9 +263,16 @@ public enum AviaryTelemetry {
         let inherited: SpanContext?
         switch kind {
         case .server: inherited = nil
-        case .internal, .client: inherited = active?.span.context
+        case .internal, .client: inherited = active?.context
         }
-        if !root, let context = parent?.sdk ?? inherited { builder.setParent(context) }
+        if !root, let context = parent?.sdk ?? inherited {
+            // The pinned SDK drops the explicit parent when its sampler declines a span.
+            // Preserve the exact propagation context without recording a fictitious child.
+            if context.isValid, !context.traceFlags.sampled {
+                return AviaryActiveSpan(propagating: context)
+            }
+            builder.setParent(context)
+        }
         else { builder.setNoParent() }
         // Bound both traversal and exported links; a caller cannot turn this into a history scan.
         var linked = Set<String>()
@@ -271,17 +281,42 @@ public enum AviaryTelemetry {
             if linked.insert(identity).inserted { builder.addLink(spanContext: link.sdk) }
         }
         for (key, value) in safeAttributes(attributes) { builder.setAttribute(key: key, value: value) }
-        return builder.startSpan()
+        if let startedAt { builder.setStartTime(time: startedAt) }
+        return AviaryActiveSpan(builder.startSpan())
+    }
+
+    /// A diagnostic for an already-completed quiet operation. Duration comes from a monotonic
+    /// clock; reconstructing the wall-clock start from the finish avoids clock-jump distortion.
+    /// No context was propagated during the operation, so this is explicitly a new root.
+    internal static func completedSpan(
+        _ name: String, kind: AviaryTraceKind,
+        attributes: [String: AviaryTraceValue], elapsedSeconds: Double,
+        outcome: String, finishedAt: Date = Date()
+    ) {
+        guard elapsedSeconds.isFinite, elapsedSeconds >= 0,
+              finishedAt.timeIntervalSince1970.isFinite else { return }
+        let start = finishedAt.addingTimeInterval(-elapsedSeconds)
+        // OTLP timestamps are unsigned nanoseconds. Invalid diagnostic clocks must not reach
+        // an SDK/exporter integer conversion which could trap instead of recording nothing.
+        guard start.timeIntervalSince1970.isFinite, start.timeIntervalSince1970 >= 0,
+              finishedAt.timeIntervalSince1970 <= Double(UInt64.max / 1_000_000_000),
+              let span = startSpan(name, kind: kind, attributes: attributes,
+                parent: nil, root: true, links: [], startedAt: start) else { return }
+        // Deliberately do not install this completed span as the task's active context.
+        span.outcome(normalizedOutcome(outcome))
+        span.span?.end(time: finishedAt)
     }
 
     public static func event(_ name: String, attributes: [String: AviaryTraceValue] = [:]) {
-        active?.span.addEvent(name: safeName(name), attributes: safeAttributes(attributes))
+        active?.span?.addEvent(name: safeName(name), attributes: safeAttributes(attributes))
     }
     public static func outcome(_ value: String, fallbackOnly: Bool = false) {
+        active?.outcome(normalizedOutcome(value), fallbackOnly: fallbackOnly)
+    }
+    private static func normalizedOutcome(_ value: String) -> String {
         let known: Set<String> = ["completed", "succeeded", "failed", "cancelled", "canceled",
             "rejected", "indeterminate", "accepted", "duplicate", "unavailable", "expired"]
-        let value = known.contains(value) ? value : "unknown"
-        active?.outcome(value, fallbackOnly: fallbackOnly)
+        return known.contains(value) ? value : "unknown"
     }
     private static func currentTracer() -> (any Tracer)? {
         lock.lock(); defer { lock.unlock() }
@@ -363,11 +398,12 @@ public enum AviaryTelemetry {
             case .int(let value): if integers.contains(key), value >= 0 { result[key] = .int(value) }
             case .bool(let value):
                 if ["aviary.exception.present", "aviary.provider.done_observed", "aviary.pricing.cache_fallback",
-                    "aviary.repository.review.bounded"].contains(key) {
+                    "aviary.repository.review.bounded", "aviary.read.slow"].contains(key) {
                     result[key] = .bool(value)
                 }
             case .double(let value):
                 if ["aviary.timeout.seconds", "aviary.queue.wait.seconds", "aviary.provider.first_output.seconds", "aviary.pricing.estimated_usd",
+                    "aviary.read.duration.seconds",
                     "aviary.pricing.input_per_million_usd", "aviary.pricing.output_per_million_usd",
                     "aviary.pricing.cache_read_per_million_usd", "aviary.pricing.cache_write_per_million_usd"].contains(key),
                    value.isFinite, value >= 0 { result[key] = .double(value) }
