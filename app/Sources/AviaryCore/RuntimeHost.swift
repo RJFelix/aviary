@@ -1451,6 +1451,24 @@ public actor RuntimeHost {
     public func execute(
         _ code: String, in session: String, mode: String = "exec", timeout: TimeInterval = 600
     ) async throws -> ExecResult {
+        try await AviaryTelemetry.withSpan("aviary.runtime.execute", attributes: [
+            "aviary.runtime.session.id": .string(AviaryTelemetry.identity(session)),
+            "aviary.input.bytes": .int(code.utf8.count),
+            "aviary.timeout.seconds": .double(timeout),
+        ]) {
+            let result = try await self.executeUntraced(code, in: session, mode: mode, timeout: timeout)
+            AviaryTelemetry.outcome(result.exception == nil ? "completed" : "failed")
+            AviaryTelemetry.event("aviary.runtime.result", attributes: [
+                "aviary.output.bytes": .int(result.stdout.utf8.count + result.stderr.utf8.count),
+                "aviary.exception.present": .bool(result.exception != nil),
+            ])
+            return result
+        }
+    }
+
+    private func executeUntraced(
+        _ code: String, in session: String, mode: String, timeout: TimeInterval
+    ) async throws -> ExecResult {
         guard let data = try await send("exec", [
             "session": .string(session),
             "code": .string(code),

@@ -587,8 +587,22 @@ final class ServiceBackedRunBridge {
     private func issue(
         _ operation: @escaping () async throws -> WorkServiceCommandReceipt
     ) async throws -> WorkServiceCommandReceipt {
+        try await AviaryTelemetry.withSpan("aviary.ui.command", attributes: [
+            "aviary.work.id": .string(AviaryTelemetry.identity(work.workID)),
+        ]) {
+            try await self.issueUntraced(operation)
+        }
+    }
+
+    private func issueUntraced(
+        _ operation: @escaping () async throws -> WorkServiceCommandReceipt
+    ) async throws -> WorkServiceCommandReceipt {
         do {
             let receipt = try await operation()
+            AviaryTelemetry.outcome(receipt.state.rawValue)
+            AviaryTelemetry.event("aviary.command.receipt", attributes: [
+                "aviary.receipt.state": .string(receipt.state.rawValue),
+            ])
             guard receipt.state == .accepted || receipt.state == .duplicate else {
                 let detail = receipt.diagnostic
                     ?? receipt.rejection?.rawValue

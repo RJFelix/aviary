@@ -400,14 +400,21 @@ func test_sessionCommandControllerEndBypassesHeldCommitAndStaysEnded() async thr
         await controller.admitAndCommit(.send(prompt: "held"), actorID: "gui", commandID: "held")
     }
     var sawCommitting = false
-    for _ in 0..<100 {
+    for _ in 0..<500 {
         if await controller.state == .committing {
             sawCommitting = true
             break
         }
-        await Task.yield()
+        try await Task.sleep(nanoseconds: 10_000_000)
     }
     XCTAssertTrue(sawCommitting, "send must be held after admission and before its writer append")
+    guard sawCommitting else {
+        // Do not let a scheduling failure put End itself behind the still-installed write gate.
+        await gate.release()
+        _ = await heldSend.value
+        try? await writer.closeChecked()
+        return
+    }
 
     // End must not await the held SessionWriter actor call. It receives a degraded, local-only
     // teardown permit and can release the runtime even though the prior intent is unresolved.

@@ -286,6 +286,7 @@ struct AviaryDaemonMain {
     }
 
     static func main() async {
+        AviaryTelemetry.configure(serviceName: "aviaryd", environment: ProcessInfo.processInfo.environment)
         var coordinator: WorkHostDaemonCoordinator?
         do {
             let options = try Options.parse(CommandLine.arguments)

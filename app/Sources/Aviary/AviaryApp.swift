@@ -13,6 +13,7 @@ struct AviaryApp: App {
 
     init() {
         _ = Self.launchedAt
+        AviaryTelemetry.configure(serviceName: "aviary", environment: ProcessInfo.processInfo.environment)
         // Headless modes short-circuit before any scene is created, and exit.
         ChatJourneyProbe.runIfRequested()
         WireInspect.runIfRequested()

@@ -689,6 +689,43 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
     public func submit(
         _ command: HostedInHouseWorkCommand
     ) async throws -> HostedInHouseWorkReceipt {
+        let commandKind: String
+        switch command.command {
+        case .start: commandKind = "start"
+        case .send: commandKind = "send"
+        case .steer: commandKind = "steer"
+        case .queueFollowUp: commandKind = "queue"
+        case .cancel: commandKind = "cancel"
+        case .endRun: commandKind = "end"
+        }
+        return try await AviaryTelemetry.withSpan("aviary.work.admission", attributes: [
+            "aviary.command.id": .string(AviaryTelemetry.identity(command.commandID)),
+            "aviary.command.kind": .string(commandKind),
+            "aviary.client.id": .string(AviaryTelemetry.identity(command.client.clientID)),
+            "aviary.session.id": .string(AviaryTelemetry.identity(command.session.sessionID)),
+            "aviary.work.id": .string(AviaryTelemetry.identity(identity.work.workID)),
+            "aviary.run.id": .string(AviaryTelemetry.identity(identity.runID)),
+        ]) {
+            let result = try await self.submitUntraced(command)
+            AviaryTelemetry.outcome(result.wasAdmitted ? "accepted" : "rejected")
+            let delivery: String
+            switch result.receipt.delivery {
+            case .notAttempted: delivery = "not_attempted"
+            case .queued: delivery = "queued"
+            case .delivered: delivery = "delivered"
+            case .notDelivered: delivery = "not_delivered"
+            case .indeterminate: delivery = "indeterminate"
+            }
+            AviaryTelemetry.event("aviary.command.admission_receipt", attributes: [
+                "aviary.delivery.state": .string(delivery),
+            ])
+            return result
+        }
+    }
+
+    private func submitUntraced(
+        _ command: HostedInHouseWorkCommand
+    ) async throws -> HostedInHouseWorkReceipt {
         try command.validate(
             identity: identity,
             workJournal: bridge.nativeJournal.workJournal,
@@ -1383,13 +1420,23 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
         command: HostedInHouseWorkCommand,
         agent: Agent
     ) {
+        let traceContext = AviaryTelemetry.traceparent.flatMap(AviaryTraceContext.init(traceparent:))
         let task = Task { [weak self] in
-            let outcome = await agent.send(prompt) { [weak self] delivery in
+            await AviaryTelemetry.withSpan("aviary.work.turn", attributes: [
+                "aviary.command.id": .string(AviaryTelemetry.identity(command.commandID)),
+            ], parent: traceContext) {
+                let outcome = await agent.send(prompt) { [weak self] delivery in
+                    guard let self else { return }
+                    await self.recordDelivery(delivery, for: command)
+                }
+                switch outcome {
+                case .completed: AviaryTelemetry.outcome("completed")
+                case .cancelled: AviaryTelemetry.outcome("cancelled")
+                case .failed: AviaryTelemetry.outcome("failed")
+                }
                 guard let self else { return }
-                await self.recordDelivery(delivery, for: command)
+                await self.finishAgentSend(outcome, command: command)
             }
-            guard let self else { return }
-            await self.finishAgentSend(outcome, command: command)
         }
         activeSendTask = task
     }

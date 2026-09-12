@@ -105,14 +105,109 @@ public struct WorkServiceTransportRequestEnvelope: Codable, Hashable, Sendable {
     /// A connection's client identity is repeated on each request.  This is not authentication;
     /// it is an identity-consistency fence that prevents one socket from changing principals.
     public let client: ClientRef?
+    /// W3C trace context is observability metadata only. A peer ignores malformed values rather
+    /// than turning an otherwise valid Work request into a protocol failure.
+    public let traceparent: String?
     public let payload: JSONValue?
 
     public init(id: String, operation: WorkServiceTransportOperation,
-                client: ClientRef? = nil, payload: JSONValue? = nil) {
+                client: ClientRef? = nil, traceparent: String? = nil,
+                payload: JSONValue? = nil) {
         self.id = id
         self.operation = operation
         self.client = client
+        self.traceparent = traceparent
         self.payload = payload
+    }
+}
+
+private func workServiceTraceAttributes(
+    operation: WorkServiceTransportOperation, requestID: String
+) -> [String: AviaryTraceValue] {
+    [
+        "rpc.system": .string("aviary.work"),
+        "rpc.method": .string(operation.rawValue),
+        "aviary.request.id": .string(AviaryTelemetry.identity(requestID)),
+    ]
+}
+
+private func workServiceTraceOutcome(for error: Error) -> String {
+    if let protocolError = error as? WorkServiceProtocolError {
+        switch protocolError {
+        case .capabilityDenied, .workNotFound, .attachmentNotFound, .artifactNotFound:
+            return "rejected"
+        case .hostUnavailable, .sourceIncomplete:
+            return "unavailable"
+        default:
+            return "failed"
+        }
+    }
+    guard let transport = error as? WorkServiceTransportError else { return "failed" }
+    switch transport {
+    case .remote(let code, _):
+        switch code {
+        case .duplicateRequestID: return "duplicate"
+        case .handshakeRejected, .identityMismatch, .capabilityDenied:
+            return "rejected"
+        case .serviceUnavailable, .transportClosed, .connectionExhausted:
+            return "unavailable"
+        default: return "failed"
+        }
+    case .canceled: return "cancelled"
+    case .endpointUnavailable, .disconnected, .notConnected: return "unavailable"
+    default: return "failed"
+    }
+}
+
+private func workServiceIsRoutineRead(
+    _ operation: WorkServiceTransportOperation
+) -> Bool {
+    switch operation {
+    case .listWorks, .describeWork, .snapshot, .eventsAfterCursor, .historyBeforeCursor,
+         .fetchArtifact, .fetchBody, .acknowledgeRead:
+        return true
+    default:
+        return false
+    }
+}
+
+private func workServiceActiveTraceContext() -> AviaryTraceContext? {
+    guard let traceparent = AviaryTelemetry.traceparent else { return nil }
+    return AviaryTraceContext(traceparent: traceparent)
+}
+
+private final class WorkServiceTransportWriteTracker: @unchecked Sendable {
+    var didStartWrite = false
+}
+
+internal func workServiceClientTraceOutcome(
+    for error: Error,
+    operation: WorkServiceTransportOperation,
+    didStartWrite: Bool
+) -> String {
+    let mutatesDurableState: Bool
+    switch operation {
+    case .handshake, .listWorks, .describeWork, .snapshot, .eventsAfterCursor,
+         .historyBeforeCursor, .fetchArtifact, .fetchBody:
+        mutatesDurableState = false
+    case .createWork, .createSession, .completeWork, .attach, .detach,
+         .updateCapabilities, .acknowledgeRead, .command, .cancelAgentHandle:
+        mutatesDurableState = true
+    }
+    guard didStartWrite, mutatesDurableState else {
+        return workServiceTraceOutcome(for: error)
+    }
+    guard let transportError = error as? WorkServiceTransportError else {
+        return "indeterminate"
+    }
+    switch transportError {
+    case .remote:
+        // A peer response is authoritative for the bounded classification it carries.
+        return workServiceTraceOutcome(for: error)
+    default:
+        // A mutation frame may have reached the peer even when no receipt returned. Do not
+        // imply delivery or execution; callers must reconcile the canonical receipt.
+        return "indeterminate"
     }
 }
 
@@ -3390,14 +3485,47 @@ public actor WorkServiceUnixSocketServer {
         generation: UInt64,
         token: WorkServiceTransportConnectionCancellation
     ) async {
+        let parent = envelope.traceparent.flatMap { AviaryTraceContext(traceparent: $0) }
+        if workServiceIsRoutineRead(envelope.operation), parent == nil {
+            // GUI polling is intentionally quiet when it is not part of a user operation. This
+            // also avoids accidentally attaching an unparented server request to inherited task
+            // context; processBody disables outcome writes in this path as well.
+            await processBody(
+                envelope, connectionID: connectionID, generation: generation, token: token,
+                recordTelemetryOutcome: false)
+            return
+        }
+        await AviaryTelemetry.withSpan(
+            "aviary.work.\(envelope.operation.rawValue)", kind: .server,
+            attributes: workServiceTraceAttributes(
+                operation: envelope.operation, requestID: envelope.id), parent: parent
+        ) {
+            await processBody(
+                envelope, connectionID: connectionID, generation: generation, token: token,
+                recordTelemetryOutcome: true)
+        }
+    }
+
+    private func processBody(
+        _ envelope: WorkServiceTransportRequestEnvelope, connectionID: UUID,
+        generation: UInt64,
+        token: WorkServiceTransportConnectionCancellation,
+        recordTelemetryOutcome: Bool
+    ) async {
         defer {
             if isCurrent(connectionID: connectionID, generation: generation) {
                 pendingRequestCounts[connectionID] = max(
                     0, pendingRequestCounts[connectionID, default: 1] - 1)
             }
         }
-        guard isCurrent(connectionID: connectionID, generation: generation),
-              !token.isCanceled else { return }
+        guard isCurrent(connectionID: connectionID, generation: generation) else {
+            if recordTelemetryOutcome { AviaryTelemetry.outcome("unavailable") }
+            return
+        }
+        guard !token.isCanceled else {
+            if recordTelemetryOutcome { AviaryTelemetry.outcome("cancelled") }
+            return
+        }
         do {
             if envelope.operation != .handshake,
                let expectedHostInstance = hostInstances[connectionID],
@@ -3422,11 +3550,15 @@ public actor WorkServiceUnixSocketServer {
             }
             guard isCurrent(connectionID: connectionID, generation: generation),
                   !token.isCanceled else { return }
+            if recordTelemetryOutcome { AviaryTelemetry.outcome("completed") }
             enqueue(response, connectionID: connectionID, generation: generation)
         } catch {
             guard isCurrent(connectionID: connectionID, generation: generation),
                   !token.isCanceled else { return }
             let (code, detail) = WorkServiceTransportText.error(for: error)
+            if recordTelemetryOutcome {
+                AviaryTelemetry.outcome(workServiceTraceOutcome(for: error))
+            }
             enqueue(
                 WorkServiceTransportResponseEnvelope(
                     id: envelope.id, ok: false,
@@ -4002,6 +4134,62 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
     private func callEnvelope<Resp: Decodable>(
         _ envelope: WorkServiceTransportRequestEnvelope
     ) async throws -> Resp {
+        if workServiceIsRoutineRead(envelope.operation), workServiceActiveTraceContext() == nil {
+            // Unparented reads are routine polling. Keep them out of the trace stream until a
+            // caller explicitly places the read inside a user-operation span.
+            let untracedEnvelope = WorkServiceTransportRequestEnvelope(
+                id: envelope.id, operation: envelope.operation, client: envelope.client,
+                traceparent: nil, payload: envelope.payload)
+            return try await callEnvelopeBody(untracedEnvelope)
+        }
+        return try await AviaryTelemetry.withSpan(
+            "aviary.work.\(envelope.operation.rawValue)", kind: .client,
+            attributes: workServiceTraceAttributes(
+                operation: envelope.operation, requestID: envelope.id)
+        ) {
+            // The envelope is rebuilt inside the span so its parent is the active CLIENT span,
+            // even when the caller supplied stale or unrelated observability metadata.
+            let tracedEnvelope = WorkServiceTransportRequestEnvelope(
+                id: envelope.id, operation: envelope.operation, client: envelope.client,
+                traceparent: AviaryTelemetry.traceparent, payload: envelope.payload)
+            let writeTracker = WorkServiceTransportWriteTracker()
+            do {
+                let response: Resp
+                do {
+                    response = try await callEnvelopeBody(
+                        tracedEnvelope, writeTracker: writeTracker)
+                } catch let transportError as WorkServiceTransportError {
+                    guard !writeTracker.didStartWrite, tracedEnvelope.traceparent != nil,
+                          case .frameTooLarge = transportError else { throw transportError }
+                    // Trace metadata is optional observability context. If it alone crosses a
+                    // configured frame bound, retry the same request ID before any write with
+                    // metadata omitted; this is one logical send, never a post-write retry.
+                    let untracedEnvelope = WorkServiceTransportRequestEnvelope(
+                        id: envelope.id, operation: envelope.operation, client: envelope.client,
+                        traceparent: nil, payload: envelope.payload)
+                    guard (try? WorkServiceTransportCodec.encodeFrame(
+                        untracedEnvelope, maxBytes: maxFrameBytes)) != nil else {
+                        throw transportError
+                    }
+                    AviaryTelemetry.event("aviary.transport.context_omitted")
+                    response = try await callEnvelopeBody(
+                        untracedEnvelope, writeTracker: writeTracker)
+                }
+                AviaryTelemetry.outcome("completed")
+                return response
+            } catch {
+                AviaryTelemetry.outcome(workServiceClientTraceOutcome(
+                    for: error, operation: envelope.operation,
+                    didStartWrite: writeTracker.didStartWrite))
+                throw error
+            }
+        }
+    }
+
+    private func callEnvelopeBody<Resp: Decodable>(
+        _ envelope: WorkServiceTransportRequestEnvelope,
+        writeTracker: WorkServiceTransportWriteTracker? = nil
+    ) async throws -> Resp {
         guard connected, let socket else { throw WorkServiceTransportError.notConnected }
         let frame = try WorkServiceTransportCodec.encodeFrame(
             envelope, maxBytes: maxFrameBytes)
@@ -4021,6 +4209,7 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
             throw WorkServiceTransportError.canceled
         }
         do {
+            writeTracker?.didStartWrite = true
             try socket.write(frame)
         } catch {
             failRequest(

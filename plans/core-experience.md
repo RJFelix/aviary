@@ -4,6 +4,11 @@ Status: implementation in progress; Phase 0/1 foundations and the Phase 3A–3C 
 Date: 2026-09-06
 Scope: human-agent sessions, chat, action understanding/control, local/remote Work ownership, recovery, review, and multi-agent attention
 
+Priority update, 2026-09-11: end-to-end OpenTelemetry observability is now near the top of
+the implementation queue, ahead of optional child token/spend limits. See
+[the tracing coverage and rollout plan](opentelemetry.md). Ryan selected backend-neutral OTLP.
+Operational traces supplement canonical records; they never authorize actions or prove delivery.
+
 Product steering, 2026-09-07: Ryan's first real signed-app journey exposed a startup failure,
 lost pre-launch prompt, overlapping navigation, and machinery-first vocabulary. Further
 checkpoint/restore expansion is paused for the [chat-first experience reset](chat-first-experience.md).

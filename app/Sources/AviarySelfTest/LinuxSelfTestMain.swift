@@ -50,6 +50,10 @@ private func test_linuxISO8601DateParsing() {
 enum LinuxSelfTestMain {
     static func main() async {
         await Harness.run([
+            ("Linux telemetry: SDK, Agent, transport and bounded collector", {
+                try await runLinuxCases(casesAviaryTelemetry + casesAviaryTelemetryAgent
+                    + casesAviaryTelemetryTransport + casesAviaryTelemetryHTTPClient)
+            }),
             ("Shell: no implicit stdin inherits the controlling terminal", {
                 try await test_shellRunDetachesImplicitStdin()
             }),

@@ -8,6 +8,8 @@ import PackageDescription
 let packagePlatforms: [SupportedPlatform]? = nil
 let linuxCoreSources: [String] = [
     "AttachmentQualifiedIdentity.swift",
+    "AviaryTelemetry.swift",
+    "AviaryTelemetryHTTPClient.swift",
     "AgentTree.swift",
     "AviaryPlatform.swift",
     "AviaryFormatting.swift",
@@ -107,6 +109,10 @@ let linuxCoreSources: [String] = [
     "WireLog.swift",
 ]
 let linuxSelfTestSources: [String] = [
+    "AviaryTelemetryTests.swift",
+    "AviaryTelemetryAgentTests.swift",
+    "AviaryTelemetryTransportTests.swift",
+    "AviaryTelemetryHTTPClientTests.swift",
     "AttachmentQualifiedIdentityTests.swift",
     "AviaryDigestFormattingTests.swift",
     "AviaryPlatformTests.swift",
@@ -189,9 +195,18 @@ let package = Package(
         .executable(name: "AviarySelfTest", targets: ["AviarySelfTest"]),
         .library(name: "AviaryCore", targets: ["AviaryCore"]),
     ] + guiProducts + macTransportProbeProducts,
+    dependencies: [
+        .package(url: "https://github.com/open-telemetry/opentelemetry-swift.git", exact: "2.5.1"),
+        .package(url: "https://github.com/open-telemetry/opentelemetry-swift-core.git", exact: "2.5.1"),
+    ],
     targets: [
         .target(
             name: "AviaryCore",
+            dependencies: [
+                .product(name: "OpenTelemetryApi", package: "opentelemetry-swift-core"),
+                .product(name: "OpenTelemetrySdk", package: "opentelemetry-swift-core"),
+                .product(name: "OpenTelemetryProtocolExporterHTTP", package: "opentelemetry-swift"),
+            ],
             sources: linuxCoreSources,
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

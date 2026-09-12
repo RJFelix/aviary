@@ -3,6 +3,11 @@
 Status: assessment and first implementation slice, 2026-09-07. This interrupts further
 checkpoint/restore work in `core-experience.md`; the durable architecture remains underneath.
 
+Current priority (2026-09-11): [end-to-end OpenTelemetry](opentelemetry.md), following saved
+user intent through command delivery, model/runtime activity, and completion. This comes before
+the next optional background-agent token/spend limit slice. Keep the default lifetime unlimited
+until explicit stop or agent completion; tracing must not change execution policy.
+
 ## Assessment
 
 The implementation is substantially stronger than the experience it presents. Tests proved many

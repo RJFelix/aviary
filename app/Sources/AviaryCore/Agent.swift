@@ -235,6 +235,73 @@ public actor Agent {
     /// durable antecedent. Keep the failure local and fail closed at every effect boundary.
     private var journalFailureDetail: String?
 
+    // Keep agent telemetry deliberately boring: these values are the bounded vocabulary that
+    // can safely become attributes. In particular, never put a provider's error text, a tool
+    // name supplied by an MCP server, or a prompt/cell body in telemetry.
+    private static func telemetryOutcome(_ outcome: SendOutcome) -> String {
+        switch outcome {
+        case .completed: return "completed"
+        case .cancelled: return "cancelled"
+        case .failed: return "failed"
+        }
+    }
+
+    private static func telemetryCallbackKind(_ kind: String) -> String {
+        switch kind {
+        case "spawn": return "spawn"
+        case "agent_handle_status", "agent_handle_result", "agent_handle_await":
+            return "agent_handle"
+        case "children", "agents": return "list"
+        case "message": return "peer_message"
+        case "notify", "dispatched": return "self_delivery"
+        case "search", "read_url": return "web"
+        case "remember", "recall": return "memory"
+        default: return "other"
+        }
+    }
+
+    private func telemetryToolKind(_ name: String) -> String {
+        if name == "python" { return "python" }
+#if !os(Linux)
+        if mcpTools[name] != nil { return "mcp" }
+#endif
+        return "other"
+    }
+
+    private static func telemetryActionKind(_ kind: ActionKind) -> String {
+        kind.rawValue
+    }
+
+    private static func telemetryActionOutcome(_ state: ActionExecutionState) -> String {
+        switch state {
+        case .succeeded: return "succeeded"
+        case .canceled: return "cancelled"
+        case .failed: return "failed"
+        case .indeterminateEffect: return "indeterminate"
+        default: return "unknown"
+        }
+    }
+
+    private func telemetryProviderAttributes(
+        crossing: String, permit: EffectPermit?
+    ) -> [String: AviaryTraceValue] {
+        var attributes: [String: AviaryTraceValue] = [
+            "aviary.operation": .string(crossing),
+            "aviary.provider.id_hash": .string(AviaryTelemetry.identity(config.model.providerID)),
+            "aviary.model.id_hash": .string(AviaryTelemetry.identity(config.model.id)),
+        ]
+        if let permit {
+            attributes["aviary.action.id"] = .string(
+                AviaryTelemetry.identity(permit.action.actionID))
+            attributes["aviary.action.started.id"] = .string(
+                AviaryTelemetry.identity(permit.startedCommit.eventRef.eventID))
+            attributes["aviary.action.started.sequence"] = .int(
+                permit.startedCommit.cursor.sequence)
+            attributes["aviary.action.kind"] = .string(Self.telemetryActionKind(permit.kind))
+        }
+        return attributes
+    }
+
     public init(
         provider: ChatProvider, host: RuntimeHost, writer: SessionWriter,
         hostSession: String, config: Configuration,
@@ -458,6 +525,17 @@ public actor Agent {
     /// `rid` is stable across at-least-once transport replay. Durable callback effects can use it
     /// as their idempotency key; this method does not claim exactly-once semantics by itself.
     public func serveCallback(rid: String, kind: String, payload: JSONValue) async -> JSONValue {
+        let callbackKind = Self.telemetryCallbackKind(kind)
+        return await AviaryTelemetry.withSpan(
+            "aviary.agent.callback",
+            attributes: ["aviary.callback.kind": .string(callbackKind)]) {
+                let result = await self.serveCallbackBody(rid: rid, kind: kind, payload: payload)
+                AviaryTelemetry.outcome(result["error"] == nil ? "succeeded" : "failed")
+                return result
+            }
+    }
+
+    private func serveCallbackBody(rid: String, kind: String, payload: JSONValue) async -> JSONValue {
         if kind == "spawn" {
             // Replayed transport callbacks must reach the already-admitted Handle even after
             // the parent journal fails. The memo covers action admission and its outcome too.
@@ -1145,14 +1223,38 @@ public actor Agent {
         kind: ActionKind, intent: String, target: String? = nil,
         metadata: [String: JSONValue] = [:]
     ) async -> EffectPermit? {
-        guard let nativeJournal else { return nil }
-        do {
-            return try await nativeJournal.beginAction(
-                kind: kind, intent: intent, target: target, scope: "run", metadata: metadata)
-        } catch {
-            latchNativeJournalFailure("the \(kind.rawValue) action start", error)
-            return nil
-        }
+        await AviaryTelemetry.withSpan(
+            "aviary.agent.action.dispatch",
+            attributes: ["aviary.action.kind": .string(Self.telemetryActionKind(kind))]) {
+                guard let nativeJournal else {
+                    AviaryTelemetry.outcome("unavailable")
+                    return nil
+                }
+                do {
+                    let permit = try await nativeJournal.beginAction(
+                        kind: kind, intent: intent, target: target, scope: "run", metadata: metadata)
+                    AviaryTelemetry.event(
+                        "aviary.agent.action.admitted",
+                        attributes: [
+                            "aviary.action.id": .string(
+                                AviaryTelemetry.identity(permit.action.actionID)),
+                            "aviary.event.id": .string(
+                                AviaryTelemetry.identity(permit.startedCommit.eventRef.eventID)),
+                            "aviary.event.sequence": .int(permit.startedCommit.cursor.sequence),
+                            "aviary.action.kind": .string(Self.telemetryActionKind(kind)),
+                            "aviary.receipt.state": .string("started"),
+                        ])
+                    AviaryTelemetry.outcome("succeeded")
+                    return permit
+                } catch {
+                    AviaryTelemetry.event(
+                        "aviary.agent.exception",
+                        attributes: ["error.type": .string("action_dispatch")])
+                    AviaryTelemetry.outcome("failed")
+                    latchNativeJournalFailure("the \(kind.rawValue) action start", error)
+                    return nil
+                }
+            }
     }
 
     private func finishNativeAction(
@@ -1162,10 +1264,31 @@ public actor Agent {
         guard let nativeJournal else { return true }
         guard let permit else { return false }
         do {
-            _ = try await nativeJournal.finishAction(
+            let commit = try await nativeJournal.finishAction(
                 permit, state: state, retrySafety: retrySafety, failureKind: failureKind)
+            var attributes: [String: AviaryTraceValue] = [
+                "aviary.action.id": .string(
+                    AviaryTelemetry.identity(permit.action.actionID)),
+                "aviary.event.id": .string(
+                    AviaryTelemetry.identity(commit.eventRef.eventID)),
+                "aviary.event.sequence": .int(commit.cursor.sequence),
+                "aviary.action.started.id": .string(
+                    AviaryTelemetry.identity(permit.startedCommit.eventRef.eventID)),
+                "aviary.action.started.sequence": .int(permit.startedCommit.cursor.sequence),
+                "aviary.action.kind": .string(Self.telemetryActionKind(permit.kind)),
+                "aviary.outcome": .string(Self.telemetryActionOutcome(state)),
+                "aviary.receipt.state": .string(state.rawValue),
+                "aviary.retry.safety": .string(retrySafety.rawValue),
+            ]
+            if let failureKind {
+                attributes["aviary.failure.kind"] = .string(failureKind.rawValue)
+            }
+            AviaryTelemetry.event("aviary.agent.action.outcome", attributes: attributes)
             return true
         } catch {
+            AviaryTelemetry.event(
+                "aviary.agent.exception",
+                attributes: ["error.type": .string("action_outcome")])
             latchNativeJournalFailure("the \(permit.kind.rawValue) action outcome", error)
             return false
         }
@@ -1497,6 +1620,17 @@ public actor Agent {
             let permit = try await nativeJournal.prepareModelCrossing(
                 manifest: manifest, kind: kind, intent: intent,
                 target: config.model.qualifiedID)
+            AviaryTelemetry.event(
+                "aviary.agent.action.admitted",
+                attributes: [
+                    "aviary.action.id": .string(
+                        AviaryTelemetry.identity(permit.action.actionID)),
+                    "aviary.event.id": .string(
+                        AviaryTelemetry.identity(permit.startedCommit.eventRef.eventID)),
+                    "aviary.event.sequence": .int(permit.startedCommit.cursor.sequence),
+                    "aviary.action.kind": .string(Self.telemetryActionKind(kind)),
+                    "aviary.receipt.state": .string("started"),
+                ])
             modelRequestOrdinal += 1
             return permit
         } catch {
@@ -1522,6 +1656,24 @@ public actor Agent {
     /// Send a prompt and run until the model stops calling tools.
     @discardableResult
     public func send(
+        _ prompt: String,
+        onInputDelivery: InputDeliveryObserver? = nil
+    ) async -> SendOutcome {
+        await AviaryTelemetry.withSpan(
+            "aviary.agent.send",
+            attributes: [
+                "aviary.agent.session.id": .string(AviaryTelemetry.identity(writer.sessionID)),
+                "aviary.provider.id_hash": .string(AviaryTelemetry.identity(config.model.providerID)),
+                "aviary.model.id_hash": .string(AviaryTelemetry.identity(config.model.id)),
+                "aviary.agent.prompt_bytes": .int(prompt.utf8.count),
+            ]) {
+                let outcome = await self.sendBody(prompt, onInputDelivery: onInputDelivery)
+                AviaryTelemetry.outcome(Self.telemetryOutcome(outcome))
+                return outcome
+            }
+    }
+
+    private func sendBody(
         _ prompt: String,
         onInputDelivery: InputDeliveryObserver? = nil
     ) async -> SendOutcome {
@@ -1976,32 +2128,64 @@ public actor Agent {
             assembly: compactionAssembly)
         do { try requireNativePermit(permit, for: "compaction provider") }
         catch { return }
+        var compactionProviderSucceeded = false
+        var compactionProviderFailed = false
         do {
-            for try await event in provider.stream(ask) {
-                if case .textDelta(let t) = event { summary += t }
-            }
+            try await AviaryTelemetry.withSpan(
+                "aviary.agent.provider", kind: .client,
+                attributes: telemetryProviderAttributes(crossing: "compaction", permit: permit)) {
+                    do {
+                        for try await event in provider.stream(ask) {
+                            if case .textDelta(let t) = event { summary += t }
+                        }
+                    } catch {
+                        AviaryTelemetry.event(
+                            "aviary.agent.exception",
+                            attributes: ["error.type": .string(
+                                error is CancellationError ? "cancellation" : "provider")])
+                        let recorded = await finishNativeAction(
+                            permit, state: error is CancellationError ? .canceled : .failed,
+                            retrySafety: .unknown,
+                            failureKind: error is CancellationError ? .cancellation : .infrastructure)
+                        guard recorded else {
+                            throw NativeJournalFailure(
+                                detail: journalFailureDetail
+                                    ?? "The compaction outcome could not be recorded.")
+                        }
+                        compactionProviderFailed = true
+                        throw error
+                    }
+                    guard !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        guard await finishNativeAction(
+                            permit, state: .failed, retrySafety: .unsafe,
+                            failureKind: .task) else {
+                            throw NativeJournalFailure(
+                                detail: journalFailureDetail
+                                    ?? "The compaction outcome could not be recorded.")
+                        }
+                        AviaryTelemetry.outcome("failed")
+                        return
+                    }
+                    guard await finishNativeAction(
+                        permit, state: .succeeded, retrySafety: .unsafe) else {
+                        throw NativeJournalFailure(
+                            detail: journalFailureDetail
+                                ?? "The compaction outcome could not be recorded.")
+                    }
+                    compactionProviderSucceeded = true
+                    AviaryTelemetry.outcome("succeeded")
+                }
         } catch {
-            guard await finishNativeAction(
-                permit, state: error is CancellationError ? .canceled : .failed,
-                retrySafety: .unknown,
-                failureKind: error is CancellationError ? .cancellation : .infrastructure) else {
-                return
-            }
             // A failed compaction must not end the run: the next model call may still fit,
             // and if it does not, the provider's own error is a clearer thing to show than a
             // summariser's.
-            _ = await appendJournalNote(
-                "Could not compact the conversation: \(error.localizedDescription)")
+            if compactionProviderFailed {
+                _ = await appendJournalNote(
+                    "Could not compact the conversation: \(error.localizedDescription)")
+            }
             return
         }
-        guard !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            _ = await finishNativeAction(
-                permit, state: .failed, retrySafety: .unsafe, failureKind: .task)
-            return
-        }
-        guard await finishNativeAction(permit, state: .succeeded, retrySafety: .unsafe) else {
-            return
-        }
+        guard compactionProviderSucceeded else { return }
 
         let before = lastInputTokens
         if let nativeJournal {
@@ -2105,44 +2289,57 @@ public actor Agent {
             intent: "Request the next agent response", assembly: requestAssembly)
         try requireNativePermit(permit, for: "provider")
         var turn = Turn()
-        var streamFailure: Error?
         do {
-            for try await event in provider.stream(request) {
-                switch event {
-                case .textDelta(let t):
-                    turn.text += t
-                    emit(.textDelta(t))
-                case .thinkingDelta(let t):
-                    turn.thinking += t
-                    emit(.thinkingDelta(t))
-                case .toolCall(let id, let name, let arguments):
-                    turn.toolCalls.append((id: id, name: name, arguments: arguments))
-                case .requestBody(let payload):
-                    record(payload)
-                case .usage(let u):
-                    // Priced here rather than at display time, so the transcript carries dollars
-                    // and every screen that reads it agrees without re-deriving them.
-                    turn.usage = config.model.priced(u)
-                case .done(let reason):
-                    turn.stopReason = reason
+            try await AviaryTelemetry.withSpan(
+                "aviary.agent.provider", kind: .client,
+                attributes: telemetryProviderAttributes(crossing: "normal", permit: permit)) {
+                    do {
+                        for try await event in provider.stream(request) {
+                            switch event {
+                            case .textDelta(let t):
+                                turn.text += t
+                                emit(.textDelta(t))
+                            case .thinkingDelta(let t):
+                                turn.thinking += t
+                                emit(.thinkingDelta(t))
+                            case .toolCall(let id, let name, let arguments):
+                                turn.toolCalls.append((id: id, name: name, arguments: arguments))
+                            case .requestBody(let payload):
+                                record(payload)
+                            case .usage(let u):
+                                // Priced here rather than at display time, so the transcript carries dollars
+                                // and every screen that reads it agrees without re-deriving them.
+                                turn.usage = config.model.priced(u)
+                            case .done(let reason):
+                                turn.stopReason = reason
+                            }
+                        }
+                    } catch {
+                        AviaryTelemetry.event(
+                            "aviary.agent.exception",
+                            attributes: ["error.type": .string(
+                                error is CancellationError ? "cancellation" : "provider")])
+                        let recorded = await finishNativeAction(
+                            permit, state: .indeterminateEffect,
+                            retrySafety: .unsafe, failureKind: .indeterminateEffect)
+                        guard recorded else {
+                            throw NativeJournalFailure(
+                                detail: journalFailureDetail
+                                    ?? "The provider outcome could not be recorded.")
+                        }
+                        AviaryTelemetry.outcome("indeterminate")
+                        throw error
+                    }
+                    guard await finishNativeAction(
+                        permit, state: .succeeded, retrySafety: .unsafe) else {
+                        throw NativeJournalFailure(
+                            detail: journalFailureDetail
+                                ?? "The provider outcome could not be recorded.")
+                    }
+                    AviaryTelemetry.outcome("succeeded")
                 }
-            }
         } catch {
-            streamFailure = error
-        }
-        if let streamFailure {
-            let recorded = await finishNativeAction(
-                permit, state: .indeterminateEffect,
-                retrySafety: .unsafe, failureKind: .indeterminateEffect)
-            guard recorded else {
-                throw NativeJournalFailure(
-                    detail: journalFailureDetail ?? "The provider outcome could not be recorded.")
-            }
-            throw streamFailure
-        }
-        guard await finishNativeAction(permit, state: .succeeded, retrySafety: .unsafe) else {
-            throw NativeJournalFailure(
-                detail: journalFailureDetail ?? "The provider outcome could not be recorded.")
+            throw error
         }
         return turn
     }
@@ -2156,6 +2353,20 @@ public actor Agent {
     }
 
     private func execute(
+        _ call: (id: String, name: String, arguments: JSONValue)
+    ) async -> (String, Bool) {
+        await AviaryTelemetry.withSpan(
+            "aviary.agent.tool",
+            attributes: [
+                "aviary.tool.kind": .string(telemetryToolKind(call.name)),
+            ]) {
+                let result = await self.executeBody(call)
+                AviaryTelemetry.outcome(result.1 ? "failed" : "succeeded")
+                return result
+            }
+    }
+
+    private func executeBody(
         _ call: (id: String, name: String, arguments: JSONValue)
     ) async -> (String, Bool) {
         guard await requireJournal("tool \(call.name)") else {
@@ -2203,6 +2414,9 @@ public actor Agent {
                     }
                     return (text, result.isError)
                 } catch {
+                    AviaryTelemetry.event(
+                        "aviary.agent.exception",
+                        attributes: ["error.type": .string("mcp")])
                     let recorded = await finishNativeAction(
                         permit, state: .indeterminateEffect, retrySafety: .unsafe,
                         failureKind: .indeterminateEffect)
@@ -2243,6 +2457,9 @@ public actor Agent {
                     "session": .string(hostSession),
                 ]))
             } catch {
+                AviaryTelemetry.event(
+                    "aviary.agent.exception",
+                    attributes: ["error.type": .string("hook")])
                 let recorded = await finishNativeAction(
                     permit, state: .indeterminateEffect, retrySafety: .unsafe,
                     failureKind: .indeterminateEffect)
@@ -2295,6 +2512,9 @@ public actor Agent {
             }
             return (Self.render(result), result.failed)
         } catch {
+            AviaryTelemetry.event(
+                "aviary.agent.exception",
+                attributes: ["error.type": .string("runtime")])
             let recorded = await finishNativeAction(
                 permit, state: .indeterminateEffect, retrySafety: .unsafe,
                 failureKind: .indeterminateEffect)

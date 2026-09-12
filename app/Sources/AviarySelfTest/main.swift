@@ -7203,4 +7203,6 @@ await Harness.run(
         + casesWorkAgentHandleCancelService
         + casesWorkAgentHandleCatalog + casesWorkAgentHandleActivity
         + casesCommandDeliveryOutcome + casesRuntimeHostParentLifetime
-        + casesRuntimeHostAdoption)
+        + casesRuntimeHostAdoption
+        + casesAviaryTelemetry + casesAviaryTelemetryAgent + casesAviaryTelemetryTransport
+        + casesAviaryTelemetryHTTPClient)
