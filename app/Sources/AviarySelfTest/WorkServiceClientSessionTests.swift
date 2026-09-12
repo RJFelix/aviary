@@ -42,6 +42,8 @@ private actor ClientSessionConnectionFactoryCounter {
         count += 1
         return count
     }
+
+    func observedCount() -> Int { count }
 }
 
 private actor ClientSessionObservedConnection: WorkServiceClientConnection {
@@ -49,6 +51,8 @@ private actor ClientSessionObservedConnection: WorkServiceClientConnection {
     let createResponseGate: ClientSessionGate?
     let listError: WorkServiceTransportError?
     let childCancelResponseError: WorkServiceTransportError?
+    let handshakeResponse: WorkServiceHandshakeResponse?
+    let handshakeError: WorkServiceTransportError?
     private(set) var closeCount = 0
     private(set) var childCancelCallCount = 0
 
@@ -56,12 +60,16 @@ private actor ClientSessionObservedConnection: WorkServiceClientConnection {
         base: WorkServiceUnixSocketClient,
         createResponseGate: ClientSessionGate? = nil,
         listError: WorkServiceTransportError? = nil,
-        childCancelResponseError: WorkServiceTransportError? = nil
+        childCancelResponseError: WorkServiceTransportError? = nil,
+        handshakeResponse: WorkServiceHandshakeResponse? = nil,
+        handshakeError: WorkServiceTransportError? = nil
     ) {
         self.base = base
         self.createResponseGate = createResponseGate
         self.listError = listError
         self.childCancelResponseError = childCancelResponseError
+        self.handshakeResponse = handshakeResponse
+        self.handshakeError = handshakeError
     }
 
     func close() async {
@@ -72,7 +80,9 @@ private actor ClientSessionObservedConnection: WorkServiceClientConnection {
     func handshake(
         _ request: WorkServiceHandshakeRequest
     ) async throws -> WorkServiceHandshakeResponse {
-        try await base.handshake(request)
+        if let handshakeError { throw handshakeError }
+        if let handshakeResponse { return handshakeResponse }
+        return try await base.handshake(request)
     }
 
     func listWorks(_ request: WorkServiceListRequest) async throws -> WorkServiceWorkPage {
@@ -178,6 +188,77 @@ private func clientSessionService(
         host: host, instanceID: "client-session-instance", startIdentity: "client-session-start",
         authorizer: WorkServiceCapabilityPolicy(
             grantsByClient: [client: Set(WorkServiceCapability.allCases)]))
+}
+
+func testWorkServiceClientSessionRejectsV4DiscoveryAndBackingHandshake() async throws {
+    let host = WorkHostRef("client-session-v4-host")
+    let client = ClientRef("client-session-v4-gui")
+    let endpoint = clientSessionEndpoint()
+    let instance = WorkHostInstanceRef(
+        host: host, instanceID: "client-session-v4-instance",
+        startIdentity: "client-session-v4-start")
+
+    let factoryCalls = ClientSessionConnectionFactoryCounter()
+    let discoveredV4 = try WorkServiceClientSession(
+        locator: FixedWorkServiceHostLocator(location: WorkServiceHostLocation(
+            host: host, expectedInstance: instance, protocolVersion: 4,
+            transport: .unixSocket(endpoint))),
+        client: client,
+        connectionFactory: { _, _ in
+            _ = await factoryCalls.next()
+            throw WorkServiceTransportError.endpointUnavailable
+        })
+    do {
+        _ = try await discoveredV4.connect()
+        XCTFail("a structurally valid v4 discovery record must not connect")
+    } catch WorkServiceClientSessionError.incompatibleProtocol {
+        XCTAssertEqual(await discoveredV4.state, .incompatible(host))
+    }
+    XCTAssertEqual(await factoryCalls.observedCount(), 0)
+
+    let v4Rejection = WorkServiceHandshakeResponse(
+        accepted: false, negotiatedVersion: nil, supportedRange: 4 ... 4,
+        host: host, hostInstance: instance,
+        controlJournal: .workHost(host),
+        controlCursor: JournalCursor(journal: .workHost(host), sequence: 0),
+        capabilities: [], diagnostic: "unsupported Work service protocol version")
+    let rejectedConnection = ClientSessionObservedConnection(
+        base: WorkServiceUnixSocketClient(
+            endpoint: endpoint, client: client, expectedHost: host),
+        handshakeResponse: v4Rejection)
+    let currentDiscovery = try WorkServiceClientSession(
+        locator: FixedWorkServiceHostLocator(location: WorkServiceHostLocation(
+            host: host, expectedInstance: instance,
+            protocolVersion: WorkServiceProtocol.currentVersion,
+            transport: .unixSocket(endpoint))),
+        client: client,
+        connectionFactory: { _, _ in rejectedConnection })
+    do {
+        _ = try await currentDiscovery.connect()
+        XCTFail("a current discovery hint cannot upgrade a v4 backing handshake")
+    } catch WorkServiceClientSessionError.incompatibleProtocol {
+        XCTAssertEqual(await currentDiscovery.state, .incompatible(host))
+    }
+    XCTAssertTrue(await rejectedConnection.closeCount > 0)
+
+    let remoteRejection = ClientSessionObservedConnection(
+        base: WorkServiceUnixSocketClient(
+            endpoint: endpoint, client: client, expectedHost: host),
+        handshakeError: .remote(code: .unsupportedVersion, detail: nil))
+    let remoteSession = try WorkServiceClientSession(
+        locator: FixedWorkServiceHostLocator(location: WorkServiceHostLocation(
+            host: host, expectedInstance: instance,
+            protocolVersion: WorkServiceProtocol.currentVersion,
+            transport: .unixSocket(endpoint))),
+        client: client,
+        connectionFactory: { _, _ in remoteRejection })
+    do {
+        _ = try await remoteSession.connect()
+        XCTFail("a v4 transport rejection must map to the typed protocol fence")
+    } catch WorkServiceClientSessionError.incompatibleProtocol {
+        XCTAssertEqual(await remoteSession.state, .incompatible(host))
+    }
+    XCTAssertTrue(await remoteRejection.closeCount > 0)
 }
 
 func testWorkServiceClientSessionCoalescesConnectAndDisconnectsOnlyClient() async throws {
@@ -544,6 +625,9 @@ func testWorkServiceClientSessionDoesNotReplayChildCancellation() async throws {
 }
 
 let casesWorkServiceClientSession: [Case] = [
+    ("phase5 Work service client fences v4 discovery and backing handshakes", {
+        try await testWorkServiceClientSessionRejectsV4DiscoveryAndBackingHandshake()
+    }),
     ("phase5 child cancellation client: explicit retry only after lost response", {
         try await testWorkServiceClientSessionDoesNotReplayChildCancellation()
     }),

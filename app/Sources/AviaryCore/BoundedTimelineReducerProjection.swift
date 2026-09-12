@@ -341,6 +341,7 @@ public struct BoundedWorkAgentHandleIndexRecord: Codable, Hashable, Sendable {
     public let startedEvent: EventRef?
     public let latestLifecycleEvent: EventRef
     public let reapedEvent: EventRef?
+    public let providerAccounting: WorkAgentProviderAccounting
 
     public var cancellationCause: WorkAgentHandleCancellationCause? {
         cancellationEvidence?.cause
@@ -363,6 +364,7 @@ public struct BoundedWorkAgentHandleIndexRecord: Codable, Hashable, Sendable {
         queuedEvent = snapshot.queuedEvent; startedEvent = snapshot.startedEvent
         latestLifecycleEvent = snapshot.latestLifecycleEvent
         reapedEvent = snapshot.reapedEvent
+        providerAccounting = snapshot.providerAccounting
     }
 
 }
@@ -382,6 +384,7 @@ internal enum WorkAgentHandlePreflight {
             TimelineEventType.agentHandleQueued, TimelineEventType.agentHandleStarted,
             TimelineEventType.agentHandleCancelRequested, TimelineEventType.agentHandleTerminal,
             TimelineEventType.agentHandleReaped,
+            TimelineEventType.agentHandleProviderStarted, TimelineEventType.agentHandleProviderSettled,
         ]
         guard types.contains(event.type), snapshot.causalOrderValid,
               snapshot.structuralIntegrityValid, snapshot.semanticProjectionValid,
@@ -395,7 +398,8 @@ internal enum WorkAgentHandlePreflight {
         guard after.semanticProjectionValid, after.structuralIntegrityValid,
               let handleID = event.handle?.handleID,
               let result = after.agentHandles[handleID],
-              result.latestLifecycleEvent.eventID == event.eventID else { throw Error.rejected }
+              result.latestLifecycleEvent.eventID == event.eventID
+                || result.providerAccounting.latestEvent?.eventID == event.eventID else { throw Error.rejected }
         return result
     }
 }
@@ -725,7 +729,7 @@ public enum BoundedChildState: String, Codable, Hashable, Sendable {
 }
 
 public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
-    public static let schemaVersion = 7
+    public static let schemaVersion = 8
     public static let mediaType = "application/x-aviary-bounded-work-reducer-head"
 
     public let schemaVersion: Int
@@ -2632,6 +2636,16 @@ public enum BoundedTimelineReducerProjection {
         source: BoundedReducerProjectionSource,
         limits: BoundedTimelineReducerProjectionLimits
     ) throws {
+        try handle.providerAccounting.validate(
+            origin: handle.origin, handle: handle.handle, execution: handle.startedEvent,
+            journal: source.journal, lastSequence: source.cursor.sequence)
+        try handle.providerAccounting.validateLifecycleOrder(
+            executionSequence: nil,
+            cancellationSequence: handle.cancellationEvidence?.event.sequence,
+            terminalSequence: handle.terminalEvidence?.event.sequence)
+        for evidence in handle.providerAccounting.evidence {
+            try validateAgentHandleEventEvidence(evidence, source: source, limits: limits)
+        }
         if let cancellation = handle.cancellationEvidence {
             try validateAgentHandleEventEvidence(
                 cancellation.event, source: source, limits: limits)

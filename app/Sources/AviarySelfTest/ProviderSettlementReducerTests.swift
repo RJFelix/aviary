@@ -277,7 +277,7 @@ func test_providerSettlementReducerExactStateParityAndDuplicateRejection() throw
     let map = try PersistentProjectionRadixMap(
         directory: directory.appending(path: "map", directoryHint: .isDirectory),
         namespaceID: "provider-settlement-exact", journal: settlementReducerJournal,
-        sourceGeneration: String(repeating: "c", count: 64), mapKind: "work-exact-v7")
+        sourceGeneration: String(repeating: "c", count: 64), mapKind: "work-exact-v8")
 
     let action = ActionRef("exact-provider-action")
     let admission = settlementReducerAdmission()

@@ -3206,7 +3206,7 @@ func test_workServiceTransportAgentHandleCancellationIsExplicit() async throws {
     let fixture = try await transportFixture(path: transportSocketPath())
     do {
         let handshake = try await fixture.clientA.connect(build: "child-cancel-test")
-        XCTAssertEqual(handshake.negotiatedVersion, 4)
+        XCTAssertEqual(handshake.negotiatedVersion, WorkServiceProtocol.currentVersion)
         let created = try await fixture.clientA.createWork(.init(
             client: transportClientA, commandID: "child-control-create",
             causalControlCursor: handshake.controlCursor,

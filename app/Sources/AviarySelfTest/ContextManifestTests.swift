@@ -215,7 +215,9 @@ func test_contextCrossingRejectsMissingRetainedBodyAndFalseCumulativeClaims() as
         request: contextManifestRequest(), store: ContextBodyStore(home: AgentHome(root: foreignRoot)),
         journal: bundle.sessionJournal)
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: absent, admission: fixtureProviderAdmission(), kind: .provider)
+        _ = try await bundle.prepareModelCrossing(
+            manifest: absent, admission: fixtureProviderAdmission(), kind: .provider,
+            target: "provider/model")
         XCTFail("metadata-only retained body claims must not authorize a provider request")
     } catch { }
     XCTAssertEqual(await bundle.activeRunContextDeliveredBytes, 0)
@@ -225,14 +227,18 @@ func test_contextCrossingRejectsMissingRetainedBodyAndFalseCumulativeClaims() as
         request: contextManifestRequest(), store: store, journal: bundle.sessionJournal,
         manifestID: "false-first", requestID: "false-first", priorDeliveredBytes: 1)
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: falseFirst, admission: fixtureProviderAdmission(), kind: .provider)
+        _ = try await bundle.prepareModelCrossing(
+            manifest: falseFirst, admission: fixtureProviderAdmission(), kind: .provider,
+            target: "provider/model")
         XCTFail("the first cumulative total must equal this crossing")
     } catch { }
 
     let first = try retainedContextManifest(
         request: contextManifestRequest(), store: store, journal: bundle.sessionJournal,
         manifestID: "first", requestID: "first")
-    let firstPermit = try await bundle.prepareModelCrossing(manifest: first, admission: fixtureProviderAdmission(), kind: .provider)
+    let firstPermit = try await bundle.prepareModelCrossing(
+        manifest: first, admission: fixtureProviderAdmission(), kind: .provider,
+        target: "provider/model")
     _ = try await bundle.finishAction(firstPermit, state: .succeeded, retrySafety: .unsafe,
         providerSettlement: fixtureProviderSettlement(firstPermit))
     XCTAssertEqual(await bundle.activeRunContextDeliveredBytes, first.deliveredBytes)
@@ -242,7 +248,9 @@ func test_contextCrossingRejectsMissingRetainedBodyAndFalseCumulativeClaims() as
         manifestID: "jumped", requestID: "jumped",
         priorDeliveredBytes: first.cumulativeDeliveredBytes + 1)
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: jumped, admission: fixtureProviderAdmission(), kind: .provider)
+        _ = try await bundle.prepareModelCrossing(
+            manifest: jumped, admission: fixtureProviderAdmission(), kind: .provider,
+            target: "provider/model")
         XCTFail("a later cumulative total must advance by exactly this crossing")
     } catch { }
     XCTAssertEqual(await bundle.activeRunContextDeliveredBytes, first.cumulativeDeliveredBytes)
@@ -407,7 +415,9 @@ func test_runJournalBundleRestoresPerRunContextTotalsOnColdReopen() async throws
     let manifest = try retainedContextManifest(
         request: contextManifestRequest(), store: ContextBodyStore(home: home),
         journal: firstBundle.sessionJournal)
-    let permit = try await firstBundle.prepareModelCrossing(manifest: manifest, admission: fixtureProviderAdmission(), kind: .provider)
+    let permit = try await firstBundle.prepareModelCrossing(
+        manifest: manifest, admission: fixtureProviderAdmission(), kind: .provider,
+        target: "provider/model")
     _ = try await firstBundle.finishAction(permit, state: .succeeded, retrySafety: .unsafe,
         providerSettlement: fixtureProviderSettlement(permit))
     _ = try await firstBundle.finishRun()

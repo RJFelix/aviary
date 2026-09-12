@@ -726,100 +726,17 @@ internal enum WorkReducerTransition {
             }
             state.stageHandle(WorkHandleSnapshot(handle: handle, state: handleState))
         case TimelineEventType.agentHandleQueued:
-            guard !isTerminalLifecycle(state),
-                  let handle = event.handle,
-                  validIdentity(handle.handleID),
-                  state.handle(for: handle.handleID) == nil,
-                  state.agentHandle(for: handle.handleID) == nil,
-                  state.retainedAgentHandleCount < WorkAgentHandleSnapshot.maximumRetainedPerWork,
-                  validAgentHandleDomains(event),
-                  let payload: WorkAgentHandleQueuedPayload = decodeExactTimelineValue(event.payload),
-                  validAgentHandleOrigin(payload.origin, event: event, state: state),
-                  validAgentHandleLabel(payload.label),
-                  payload.deadline.map({
-                      $0.timeIntervalSince1970.isFinite && $0 > event.hostRecordedAt
-                  }) ?? true,
-                  validAgentHandleBody(payload.requestBody, journal: event.journal),
-                  event.command == nil, event.client == nil,
-                  event.causedByEventID == nil else {
-                quarantine(event, state: &state,
-                           reason: "agent Handle queue admission is malformed, over limit, or not owned by the active Run")
-                return
-            }
-            let source = EventRef(journal: event.journal, eventID: event.eventID)
-            state.stageAgentHandle(WorkAgentHandleSnapshot(
-                handle: handle, origin: payload.origin, label: payload.label,
-                deadline: payload.deadline, requestBody: payload.requestBody,
-                queuedEvent: source))
+            applyAgentHandleQueued(event, state: &state)
         case TimelineEventType.agentHandleStarted:
-            guard let existing = validAgentHandleTransition(event, state: state),
-                  existing.state == .queued,
-                  existing.deadline.map({
-                      $0.timeIntervalSince1970.isFinite && event.hostRecordedAt < $0
-                  }) ?? true,
-                  event.payload == .object([:]),
-                  event.command == nil, event.client == nil else {
-                quarantine(event, state: &state,
-                           reason: "agent Handle start requires the exact queued origin and causal event")
-                return
-            }
-            var updated = existing
-            updated.state = .running
-            let source = EventRef(journal: event.journal, eventID: event.eventID)
-            updated.startedEvent = source
-            updated.latestLifecycleEvent = source
-            state.stageAgentHandle(updated)
+            applyAgentHandleStarted(event, state: &state)
+        case TimelineEventType.agentHandleProviderStarted, TimelineEventType.agentHandleProviderSettled:
+            applyAgentHandleProviderEvent(event, state: &state)
         case TimelineEventType.agentHandleCancelRequested:
-            guard let existing = validAgentHandleTransition(event, state: state),
-                  existing.state == .queued || existing.state == .running,
-                  let payload: WorkAgentHandleCancelRequestedPayload = decodeExactTimelineValue(event.payload),
-                  validAgentHandleCancellationEnvelope(
-                      event, cause: payload.cause, prior: existing, state: state) else {
-                quarantine(event, state: &state,
-                           reason: "agent Handle cancellation is malformed, stale, or already terminal")
-                return
-            }
-            var updated = existing
-            updated.state = .cancelRequested
-            updated.cancellationEvidence = WorkAgentHandleCancellationEvidence(
-                cause: payload.cause, event: WorkAgentHandleEventEvidence(event),
-                command: event.command)
-            updated.latestLifecycleEvent = updated.cancellationEvidence!.event.event
-            state.stageAgentHandle(updated)
+            applyAgentHandleCancellation(event, state: &state)
         case TimelineEventType.agentHandleTerminal:
-            guard let existing = validAgentHandleTransition(event, state: state),
-                  existing.state.isLive,
-                  event.command == nil, event.client == nil,
-                  let payload: WorkAgentHandleTerminalPayload = decodeExactTimelineValue(event.payload),
-                  validAgentHandleTerminal(payload, prior: existing, event: event, state: state) else {
-                quarantine(event, state: &state,
-                           reason: "agent Handle terminal outcome is malformed, conflicting, or lacks exact cleanup evidence")
-                return
-            }
-            var updated = existing
-            updated.state = .terminal
-            updated.terminalEvidence = WorkAgentHandleTerminalEvidence(
-                outcome: payload.outcome, resultBody: payload.resultBody,
-                cleanup: payload.cleanup, event: WorkAgentHandleEventEvidence(event))
-            updated.latestLifecycleEvent = updated.terminalEvidence!.event.event
-            state.stageAgentHandle(updated)
+            applyAgentHandleTerminal(event, state: &state)
         case TimelineEventType.agentHandleReaped:
-            guard let existing = validAgentHandleTransition(event, state: state),
-                  existing.state == .terminal,
-                  existing.cleanup?.state != .indeterminate,
-                  event.command == nil, event.client == nil,
-                  let payload: WorkAgentHandleReapedPayload = decodeExactTimelineValue(event.payload) else {
-                quarantine(event, state: &state,
-                           reason: "agent Handle reap requires one exact terminal outcome")
-                return
-            }
-            let source = EventRef(journal: event.journal, eventID: event.eventID)
-            var updated = existing
-            updated.state = .reaped
-            updated.reapReason = payload.reason
-            updated.latestLifecycleEvent = source
-            updated.reapedEvent = source
-            state.stageAgentHandle(updated)
+            applyAgentHandleReaped(event, state: &state)
         case TimelineEventType.recoveryCoverage:
             guard let coverage = decodeRecoveryCoverage(event.payload),
                   let session = event.session, !session.sessionID.isEmpty,
@@ -952,6 +869,162 @@ internal enum WorkReducerTransition {
         _ event: TimelineEvent, state: inout State, reason: String, structural: Bool = false
     ) {
         state.stageQuarantine(event, reason: reason, structural: structural)
+    }
+
+    private static func applyAgentHandleQueued<State: WorkTransitionState>(
+        _ event: TimelineEvent, state: inout State
+    ) {
+        guard !isTerminalLifecycle(state),
+              let handle = event.handle,
+              validIdentity(handle.handleID),
+              state.handle(for: handle.handleID) == nil,
+              state.agentHandle(for: handle.handleID) == nil,
+              state.retainedAgentHandleCount < WorkAgentHandleSnapshot.maximumRetainedPerWork,
+              validAgentHandleDomains(event),
+              let payload: WorkAgentHandleQueuedPayload = decodeExactTimelineValue(event.payload),
+              validAgentHandleOrigin(payload.origin, event: event, state: state),
+              validAgentHandleLabel(payload.label),
+              payload.deadline.map({
+                  $0.timeIntervalSince1970.isFinite && $0 > event.hostRecordedAt
+              }) ?? true,
+              validAgentHandleBody(payload.requestBody, journal: event.journal),
+              event.command == nil, event.client == nil,
+              event.causedByEventID == nil else {
+            quarantine(event, state: &state,
+                       reason: "agent Handle queue admission is malformed, over limit, or not owned by the active Run")
+            return
+        }
+        let source = EventRef(journal: event.journal, eventID: event.eventID)
+        state.stageAgentHandle(WorkAgentHandleSnapshot(
+            handle: handle, origin: payload.origin, label: payload.label,
+            deadline: payload.deadline, requestBody: payload.requestBody,
+            queuedEvent: source))
+    }
+
+    private static func applyAgentHandleStarted<State: WorkTransitionState>(
+        _ event: TimelineEvent, state: inout State
+    ) {
+        guard let existing = validAgentHandleTransition(event, state: state),
+              existing.state == .queued,
+              existing.deadline.map({
+                  $0.timeIntervalSince1970.isFinite && event.hostRecordedAt < $0
+              }) ?? true,
+              event.payload == .object([:]),
+              event.command == nil, event.client == nil else {
+            quarantine(event, state: &state,
+                       reason: "agent Handle start requires the exact queued origin and causal event")
+            return
+        }
+        var updated = existing
+        updated.state = .running
+        let source = EventRef(journal: event.journal, eventID: event.eventID)
+        updated.startedEvent = source
+        updated.latestLifecycleEvent = source
+        state.stageAgentHandle(updated)
+    }
+
+    private static func applyAgentHandleProviderEvent<State: WorkTransitionState>(
+        _ event: TimelineEvent, state: inout State
+    ) {
+        guard let handle = event.handle,
+              let existing = state.agentHandle(for: handle.handleID),
+              validStoredAgentHandleEvidence(existing, state: state),
+              let execution = existing.startedEvent,
+              validAgentHandleDomains(event), event.command == nil, event.client == nil,
+              event.action == nil, event.turn == nil,
+              event.work == existing.origin.work, event.workHost == existing.origin.workHost,
+              event.session == existing.origin.session,
+              event.sessionAttachment == existing.origin.sessionAttachment,
+              event.run == existing.origin.run,
+              existing.state == .running || existing.state == .cancelRequested else {
+            quarantine(event, state: &state,
+                       reason: "Child provider crossing has no exact live execution owner")
+            return
+        }
+        var updated = existing
+        do {
+            if event.type == TimelineEventType.agentHandleProviderStarted {
+                guard existing.state == .running,
+                      existing.deadline.map({ event.hostRecordedAt < $0 }) ?? true else {
+                    throw WorkAgentProviderAccounting.Failure.invalidTransition
+                }
+                try updated.providerAccounting.applyStart(event, execution: execution)
+            } else {
+                try updated.providerAccounting.applySettlement(event)
+            }
+            state.stageAgentHandle(updated)
+        } catch {
+            quarantine(event, state: &state,
+                       reason: "Child provider accounting transition is conflicting or malformed")
+        }
+    }
+
+    private static func applyAgentHandleCancellation<State: WorkTransitionState>(
+        _ event: TimelineEvent, state: inout State
+    ) {
+        guard let existing = validAgentHandleTransition(event, state: state),
+              existing.state == .queued || existing.state == .running,
+              let payload: WorkAgentHandleCancelRequestedPayload = decodeExactTimelineValue(
+                event.payload),
+              validAgentHandleCancellationEnvelope(
+                  event, cause: payload.cause, prior: existing, state: state) else {
+            quarantine(event, state: &state,
+                       reason: "agent Handle cancellation is malformed, stale, or already terminal")
+            return
+        }
+        var updated = existing
+        updated.state = .cancelRequested
+        updated.cancellationEvidence = WorkAgentHandleCancellationEvidence(
+            cause: payload.cause, event: WorkAgentHandleEventEvidence(event),
+            command: event.command)
+        updated.latestLifecycleEvent = updated.cancellationEvidence!.event.event
+        state.stageAgentHandle(updated)
+    }
+
+    private static func applyAgentHandleTerminal<State: WorkTransitionState>(
+        _ event: TimelineEvent, state: inout State
+    ) {
+        guard let existing = validAgentHandleTransition(event, state: state),
+              existing.state.isLive,
+              event.command == nil, event.client == nil,
+              let payload: WorkAgentHandleTerminalPayload = decodeExactTimelineValue(
+                event.payload),
+              existing.providerAccounting.pending == nil || payload.outcome != .succeeded,
+              validAgentHandleTerminal(
+                payload, prior: existing, event: event, state: state) else {
+            quarantine(event, state: &state,
+                       reason: "agent Handle terminal outcome is malformed, conflicting, or lacks exact cleanup evidence")
+            return
+        }
+        var updated = existing
+        updated.state = .terminal
+        updated.terminalEvidence = WorkAgentHandleTerminalEvidence(
+            outcome: payload.outcome, resultBody: payload.resultBody,
+            cleanup: payload.cleanup, event: WorkAgentHandleEventEvidence(event))
+        updated.latestLifecycleEvent = updated.terminalEvidence!.event.event
+        state.stageAgentHandle(updated)
+    }
+
+    private static func applyAgentHandleReaped<State: WorkTransitionState>(
+        _ event: TimelineEvent, state: inout State
+    ) {
+        guard let existing = validAgentHandleTransition(event, state: state),
+              existing.state == .terminal,
+              existing.cleanup?.state != .indeterminate,
+              event.command == nil, event.client == nil,
+              let payload: WorkAgentHandleReapedPayload = decodeExactTimelineValue(
+                event.payload) else {
+            quarantine(event, state: &state,
+                       reason: "agent Handle reap requires one exact terminal outcome")
+            return
+        }
+        let source = EventRef(journal: event.journal, eventID: event.eventID)
+        var updated = existing
+        updated.state = .reaped
+        updated.reapReason = payload.reason
+        updated.latestLifecycleEvent = source
+        updated.reapedEvent = source
+        state.stageAgentHandle(updated)
     }
 
     private static func applyActionOutcome<State: WorkTransitionState>(
@@ -1440,6 +1513,15 @@ internal enum WorkReducerTransition {
         _ handle: WorkAgentHandleSnapshot, state: State
     ) -> Bool {
         guard let journal = state.scalar.journal else { return false }
+        guard (try? handle.providerAccounting.validate(
+            origin: handle.origin, handle: handle.handle, execution: handle.startedEvent,
+            journal: journal, lastSequence: state.scalar.lastSequence)) != nil else { return false }
+        guard (try? handle.providerAccounting.validateLifecycleOrder(
+            executionSequence: handle.startedEvent.flatMap {
+                state.eventSequence(for: $0.eventID)
+            },
+            cancellationSequence: handle.cancellationEvidence?.event.sequence,
+            terminalSequence: handle.terminalEvidence?.event.sequence)) != nil else { return false }
         guard handle.deadline.map({ $0.timeIntervalSince1970.isFinite }) ?? true else {
             return false
         }
@@ -1473,6 +1555,7 @@ internal enum WorkReducerTransition {
             }
             return true
         }
+        guard handle.providerAccounting.evidence.allSatisfy(validEvent) else { return false }
         if let cancellation = handle.cancellationEvidence {
             guard validEvent(cancellation.event),
                   cancellation.event.causedByEventID

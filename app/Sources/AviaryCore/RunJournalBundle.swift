@@ -357,6 +357,10 @@ public enum RunJournalBundleError: LocalizedError, Equatable, Sendable {
     case alreadyFinished(String)
     case workTerminal(WorkLifecycle)
     case invalidOperation(String)
+    /// The bundle's semantic gate observed a cleanly closed bundle before an agent Handle
+    /// append touched the Work writer. Only this result is safe for the Work-owned route to
+    /// retry through its post-Run writer.
+    case closedBeforeAgentAppend
     case writer(TimelineJournalWriter.WriterError)
     case initializationFailed(RunJournalBundlePrefix, reason: String)
     case closeFailed(RunJournalBundlePrefix, reason: String)
@@ -377,6 +381,8 @@ public enum RunJournalBundleError: LocalizedError, Equatable, Sendable {
         case .workTerminal(let lifecycle):
             return "Work is terminal and cannot be mutated: \(lifecycle.rawValue)"
         case .invalidOperation(let reason): return "Invalid Run journal operation: \(reason)"
+        case .closedBeforeAgentAppend:
+            return "Run journal bundle closed before the agent Handle append began."
         case .writer(let error): return error.localizedDescription
         case .initializationFailed(_, let reason): return "Run journal bundle initialization failed: \(reason)"
         case .closeFailed(_, let reason): return "Run journal bundle close was partial: \(reason)"
@@ -2885,7 +2891,7 @@ public actor RunJournalBundle {
         action: ActionRef = ActionRef(UUID().uuidString.lowercased()),
         kind: ActionKind,
         intent: String = "Request the next model response",
-        target: String? = nil
+        target: String
     ) async throws -> EffectPermit {
         try await withSemanticGate {
             try self.ensureUsable()
@@ -2895,8 +2901,7 @@ public actor RunJournalBundle {
                     "a model crossing requires a provider action kind")
             }
             try admission.validate(kind: kind)
-            try admission.validate(
-                contextModelID: manifest.modelID, targetModel: target)
+            try admission.validate(contextModelID: manifest.modelID, targetModel: target)
             let contextCommit = try await self.appendContextManifestLocked(manifest)
             return try await self.beginActionLocked(
                 action: action, kind: kind, intent: intent, target: target, scope: "run",
@@ -4170,8 +4175,20 @@ public actor RunJournalBundle {
     @discardableResult
     public func appendAgentHandle(_ draft: TimelineEventDraft) async throws -> TimelineJournalCommit {
         try await withSemanticGate(respectCancellation: false) {
+            if self.isClosed {
+                switch self.healthState {
+                case .closed:
+                    throw RunJournalBundleError.closedBeforeAgentAppend
+                case .failed(let reason):
+                    // A close failure may retain an earlier ambiguous durable prefix. It is not
+                    // a clean pre-write handoff merely because both close paths were attempted.
+                    throw RunJournalBundleError.unavailable(reason)
+                case .healthy:
+                    throw RunJournalBundleError.unavailable("bundle is closed")
+                }
+            }
             if self.workLifecycle == .completed && draft.type == TimelineEventType.agentHandleReaped {
-                guard !self.isClosed, self.healthState == .healthy else {
+                guard self.healthState == .healthy else {
                     throw RunJournalBundleError.unavailable("Work writer is unavailable")
                 }
             } else {

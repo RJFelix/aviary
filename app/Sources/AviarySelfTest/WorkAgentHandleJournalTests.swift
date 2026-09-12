@@ -16,6 +16,34 @@ private func handleJournalDraft(
         declaredDomains: [.work, .runtime, .externalEffects], payload: payload)
 }
 
+private actor HandleJournalBundleSelectionGate {
+    private var armed = false
+    private var selected = false
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func arm() { armed = true }
+
+    func pauseIfArmed() async {
+        guard armed else { return }
+        armed = false
+        selected = true
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilSelected() async -> Bool {
+        for _ in 0..<500 {
+            if selected { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return false
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
 func testWorkAgentHandleJournalOutlivesClosedRunWriter() async throws {
     let home = scratchHome()
     let work = WorkRef(workHostID: try home.requirePersistedWorkHostID(), workID: "child-journal-work")
@@ -130,11 +158,109 @@ func testWorkAgentHandleJournalReconcilesAfterAmbiguousClose() async throws {
                    "reconciliation must read the durable fact, not retry the terminal write")
 }
 
+func testWorkAgentHandleJournalRetriesOnlyPrewriteCloseAcrossEnd() async throws {
+    let home = scratchHome()
+    let work = WorkRef(
+        workHostID: try home.requirePersistedWorkHostID(), workID: "provider-handoff-work")
+    let identity = SessionWorkIdentity(
+        sessionID: "provider-handoff-session", work: work, runID: "provider-handoff-run")
+    let gate = HandleJournalBundleSelectionGate()
+    let route = try WorkAgentHandleJournal(
+        home: home, work: work,
+        actor: TimelineActor(actorID: "provider-handoff-owner", kind: "work-host"),
+        beforeBundleAgentAppend: { await gate.pauseIfArmed() })
+    let bundle = try await route.openRun {
+        try await RunJournalBundle.openForExecution(
+            home: home, identity: identity, actorID: "provider-handoff-parent",
+            makeAttachmentID: { "provider-handoff-attachment" })
+    }
+    let origin = WorkAgentHandleOrigin(
+        work: work, workHost: WorkHostRef(work.workHostID),
+        session: SessionRef(identity.sessionID), sessionAttachment: bundle.sessionAttachment,
+        run: RunRef(identity.runID))
+    let handle = HandleRef("provider-handoff-child")
+    let body = try ContextBodyStore(home: home).retain(
+        Data("provider handoff request".utf8), authority: bundle.workJournal)
+    let queued = try await route.append(handleJournalDraft(
+        TimelineEventType.agentHandleQueued, origin: origin, handle: handle,
+        payload: handleJournalPayload(WorkAgentHandleQueuedPayload(
+            origin: origin, label: "Provider handoff", requestBody: body))))
+    let started = try await route.append(handleJournalDraft(
+        TimelineEventType.agentHandleStarted, origin: origin, handle: handle,
+        cause: queued.eventRef))
+    let admission = ProviderAdmission(
+        purpose: .normal,
+        rates: ProviderUsage.RateSnapshot(model: ModelSpec(rpc: .object([
+            "id": .string("provider-handoff-model"),
+            "provider": .string("fixture"),
+        ]))))
+
+    await gate.arm()
+    let providerStartTask = Task {
+        try await route.append(handleJournalDraft(
+            TimelineEventType.agentHandleProviderStarted, origin: origin, handle: handle,
+            cause: started.eventRef, payload: .object([
+                "ordinal": .string("1"), "admission": admission.timelineValue,
+            ])))
+    }
+    defer { Task { await gate.release() } }
+    guard await gate.waitUntilSelected() else {
+        await gate.release()
+        providerStartTask.cancel()
+        _ = try? await providerStartTask.value
+        throw NSError(
+            domain: "WorkAgentHandleJournalTests", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "timed out selecting the parent bundle"])
+    }
+
+    _ = try await bundle.finishRun(outcome: .completed)
+    try await bundle.closeChecked()
+    await gate.release()
+    let providerStarted = try await providerStartTask.value
+
+    let settlement = ProviderSettlement(
+        admission: admission, report: nil, finality: .unconfirmed)
+    _ = try await route.append(handleJournalDraft(
+        TimelineEventType.agentHandleProviderSettled, origin: origin, handle: handle,
+        cause: providerStarted.eventRef, payload: .object([
+            "ordinal": .string("1"), "settlement": settlement.timelineValue,
+            "state": .string(ActionExecutionState.failed.rawValue),
+        ])))
+    _ = try await route.append(handleJournalDraft(
+        TimelineEventType.agentHandleTerminal, origin: origin, handle: handle,
+        cause: started.eventRef,
+        payload: handleJournalPayload(WorkAgentHandleTerminalPayload(
+            outcome: .failed, cleanup: .init(state: .quiesced)))))
+
+    let events = TimelineJournalReader.read(
+        try Data(contentsOf: home.timelineV2WorkJournalURL(work)),
+        journal: bundle.workJournal,
+        actor: TimelineActor(actorID: "provider-handoff-reader", kind: "self-test"),
+        hostRecordedAt: Date(timeIntervalSince1970: 0)).records.map(\.event)
+    let providerStarts = events.filter {
+        $0.type == TimelineEventType.agentHandleProviderStarted && $0.handle == handle
+    }
+    XCTAssertEqual(providerStarts.count, 1, "the pre-write close handoff must append exactly once")
+    XCTAssertEqual(providerStarts.first?.eventID, providerStarted.eventRef.eventID)
+    XCTAssertTrue(
+        (try XCTUnwrap(events.first { $0.type == TimelineEventType.runFinished }?.sequence))
+            < providerStarted.cursor.sequence)
+    let head = try await route.read()
+    let record = try head.agentHandle(for: handle.handleID)
+    XCTAssertEqual(record.state, .terminal)
+    XCTAssertEqual(record.providerAccounting.usage.started, 1)
+    XCTAssertEqual(record.providerAccounting.usage.settled, 1)
+    XCTAssertNil(record.providerAccounting.pending)
+}
+
 let casesWorkAgentHandleJournal: [Case] = [
     ("phase5 agent journal: post-End writer handoff and retained cold outcome", {
         try await testWorkAgentHandleJournalOutlivesClosedRunWriter()
     }),
     ("phase5 agent journal: failed closed writer remains canonically readable", {
         try await testWorkAgentHandleJournalReconcilesAfterAmbiguousClose()
+    }),
+    ("phase5 agent journal: provider admission retries only a pre-write End close", {
+        try await testWorkAgentHandleJournalRetriesOnlyPrewriteCloseAcrossEnd()
     }),
 ]

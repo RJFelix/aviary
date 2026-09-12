@@ -2,6 +2,21 @@ import Foundation
 
 @testable import AviaryCore
 
+/// Engine-isolation tests deliberately replace the durable host boundary with an explicit fake.
+private actor ChildExecutionTestAccounting: ChildProviderAccounting {
+    private var admission: ProviderAdmission?
+    func begin(_ value: ProviderAdmission, requestModel: String, targetModel: String) throws {
+        guard admission == nil else { throw WorkAgentProviderAccounting.Failure.invalidTransition }
+        try value.validate(contextModelID: requestModel, targetModel: targetModel)
+        admission = value
+    }
+    func finish(_ settlement: ProviderSettlement, state: ActionExecutionState) throws {
+        guard let admission else { throw WorkAgentProviderAccounting.Failure.invalidTransition }
+        try settlement.validate(admission: admission, kind: admission.expectedActionKind, state: state)
+        self.admission = nil
+    }
+}
+
 private actor ChildExecutionGate {
     private var continuation: AsyncThrowingStream<ChatEvent, Error>.Continuation?
 
@@ -106,6 +121,7 @@ private func childExecutionConfiguration(
         provider: provider,
         systemPrompt: "You are a focused child agent.",
         maxIterations: maxIterations,
+        makeProviderAccounting: { ChildExecutionTestAccounting() },
         makeRuntimeHost: makeHost)
 }
 
@@ -308,6 +324,7 @@ func test_agentChildExecutionRejectsExpiredAndInvalidConfigurationBeforeHostStar
         provider: ImmediateChildProvider(),
         systemPrompt: "test",
         maxIterations: 0,
+        makeProviderAccounting: { ChildExecutionTestAccounting() },
         makeRuntimeHost: makeHost), prompt: "invalid")
     let invalidResult = await invalidIterations.execute()
     XCTAssertEqual(invalidResult.state, .failed)

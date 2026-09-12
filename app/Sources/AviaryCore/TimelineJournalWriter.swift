@@ -387,6 +387,18 @@ public actor TimelineJournalWriter {
     private var healthState: WriterHealth = .healthy
     private var isClosed = false
 
+    // A writer owns the advisory lock for its entire lifetime, so it can retain the exact Work
+    // reducer continuation that was seeded from that same file. This is deliberately an exact
+    // continuation, not a bounded cache: WorkReducer retains the canonical identity maps needed
+    // for append-time admission and duplicate/evidence validation. It only removes repeated
+    // journal replay from the writer-owned append path.
+    private var workContinuation: InMemoryWorkTransitionState?
+    private var workContinuationFingerprint: StableReadFingerprint?
+    private var workContinuationAgentHandleCoverage = false
+    private var workContinuationSeedCount = 0
+    private var workContinuationApplyCount = 0
+    private var workContinuationInvalidationCount = 0
+
     /// Create a new, empty journal without ever overwriting an existing path.
     public init(
         freshAt fileURL: URL,
@@ -648,12 +660,29 @@ public actor TimelineJournalWriter {
         maximumResidentRecords: Int = 1_000_000
     ) throws -> TimelineJournalCanonicalRead {
         try ensureReadable()
-        return try Self.readCanonicalProjectionLocked(
+        let read = try Self.readCanonicalProjectionLocked(
             at: fileURL, journal: journal, actor: hostActor,
             expectedWork: expectedWork, expectedWorkHost: expectedWorkHost,
             expectedSession: expectedSession, limits: limits,
             maximumResidentRecords: maximumResidentRecords)
+        if let snapshot = read.workSnapshot {
+            let agentHandleCoverage: Bool
+            if case .work(let head) = read.projection {
+                agentHandleCoverage = head.coverage.isControlling
+                    && head.coverage.isIndexComplete(.agentHandles)
+            } else {
+                agentHandleCoverage = false
+            }
+            try seedWorkContinuation(from: snapshot, agentHandleCoverage: agentHandleCoverage)
+        }
+        return read
     }
+
+    /// Counts are intentionally internal diagnostics for the writer continuation tests. They
+    /// measure replay seeds and incremental reducer applications; they are not service receipts.
+    var canonicalContinuationSeedCount: Int { workContinuationSeedCount }
+    var canonicalContinuationApplyCount: Int { workContinuationApplyCount }
+    var canonicalContinuationInvalidationCount: Int { workContinuationInvalidationCount }
 
     private func ensureReadable() throws {
         guard !isClosed, healthState == .healthy else {
@@ -662,6 +691,147 @@ public actor TimelineJournalWriter {
                 throw WriterError.unavailable(reason)
             }
             throw WriterError.unavailable("Timeline journal writer is unavailable")
+        }
+    }
+
+    private func currentWorkFingerprint() throws -> StableReadFingerprint {
+        guard case .work = journal.owner else {
+            throw WriterError.invalidJournal(reason: "a non-Work writer has no Work continuation")
+        }
+        do {
+            return try Self.stableReadFingerprint(
+                descriptor: handle.fileDescriptor, fileURL: fileURL)
+        } catch {
+            invalidateWorkContinuation()
+            healthState = .failed(reason: error.localizedDescription)
+            throw error
+        }
+    }
+
+    private func rejectContinuationSourceChange(
+        _ fingerprint: StableReadFingerprint
+    ) throws {
+        guard let cached = workContinuationFingerprint else { return }
+        guard cached == fingerprint else {
+            invalidateWorkContinuation()
+            let error = WriterError.dataPathReplaced(path: fileURL.path)
+            healthState = .failed(reason: error.localizedDescription)
+            throw error
+        }
+        guard let state = workContinuation else {
+            invalidateWorkContinuation()
+            let error = WriterError.unavailable("Work continuation state is missing")
+            healthState = .failed(reason: error.localizedDescription)
+            throw error
+        }
+        let snapshot = state.snapshot
+        let expectedSequence = nextSequence == 0 ? 0 : nextSequence - 1
+        guard snapshot.journal == journal,
+              snapshot.lastEventID == previousEventID,
+              snapshot.lastSequence == expectedSequence else {
+            invalidateWorkContinuation()
+            let error = WriterError.unavailable(
+                "Work continuation cursor no longer matches the writer chain")
+            healthState = .failed(reason: error.localizedDescription)
+            throw error
+        }
+    }
+
+    private func invalidateWorkContinuation() {
+        guard workContinuation != nil || workContinuationFingerprint != nil else { return }
+        workContinuation = nil
+        workContinuationFingerprint = nil
+        workContinuationAgentHandleCoverage = false
+        workContinuationInvalidationCount += 1
+    }
+
+    /// Seed the continuation from a canonical read only when its source differs. The caller is
+    /// already inside this writer actor and therefore still holds the same owner lease.
+    private func seedWorkContinuation(
+        from snapshot: WorkSnapshot, agentHandleCoverage: Bool = true
+    ) throws {
+        guard case .work = journal.owner else { return }
+        let fingerprint: StableReadFingerprint
+        do {
+            fingerprint = try currentWorkFingerprint()
+        } catch {
+            invalidateWorkContinuation()
+            throw error
+        }
+        try rejectContinuationSourceChange(fingerprint)
+        if workContinuation != nil, workContinuationFingerprint == fingerprint { return }
+        guard snapshot.journal == journal, snapshot.lastSequence == nextSequence - 1,
+              snapshot.lastEventID == previousEventID, snapshot.seenEventIDs == eventIDs else {
+            let error = WriterError.unavailable("Work continuation seed does not match the opened writer")
+            healthState = .failed(reason: error.localizedDescription)
+            throw error
+        }
+        workContinuation = InMemoryWorkTransitionState(snapshot: snapshot)
+        workContinuationFingerprint = fingerprint
+        workContinuationAgentHandleCoverage = agentHandleCoverage
+        workContinuationSeedCount += 1
+    }
+
+    /// Ensure an exact continuation exists before a mutation. Fresh journals have no canonical
+    /// event to scan, so their empty Work state is the only valid seed. Existing journals seed
+    /// once through the same locked reader used by the public canonical-read API.
+    private func ensureWorkContinuationForMutation() throws {
+        guard case .work(let work) = journal.owner else { return }
+        let fingerprint: StableReadFingerprint
+        do {
+            fingerprint = try currentWorkFingerprint()
+        } catch {
+            invalidateWorkContinuation()
+            throw error
+        }
+        try rejectContinuationSourceChange(fingerprint)
+        if workContinuation != nil, workContinuationFingerprint == fingerprint { return }
+        if workContinuation != nil || workContinuationFingerprint != nil {
+            invalidateWorkContinuation()
+        }
+        if nextSequence == 1, previousEventID == nil {
+            guard fingerprint.size == 0 else {
+                let error = WriterError.unavailable("Fresh Work journal changed before its first append")
+                healthState = .failed(reason: error.localizedDescription)
+                throw error
+            }
+            workContinuation = InMemoryWorkTransitionState()
+            workContinuationFingerprint = fingerprint
+            workContinuationAgentHandleCoverage = true
+            workContinuationSeedCount += 1
+            return
+        }
+        let read = try Self.readCanonicalProjectionLocked(
+            at: fileURL, journal: journal, actor: hostActor,
+            expectedWork: work, expectedWorkHost: WorkHostRef(work.workHostID),
+            expectedSession: nil, limits: .default, maximumResidentRecords: 0)
+        guard case .work(let head) = read.projection, let exact = read.workSnapshot else {
+            throw WriterError.invalidDraft(reason: "Work continuation seed is incomplete")
+        }
+        try seedWorkContinuation(
+            from: exact,
+            agentHandleCoverage: head.coverage.isControlling
+                && head.coverage.isIndexComplete(.agentHandles))
+    }
+
+    /// Apply only after the complete record and fsync have succeeded. Any failure while
+    /// refreshing the source identity invalidates the continuation; the durable bytes remain
+    /// authoritative and must be reconciled by a later canonical read.
+    private func applyCommittedWorkEvent(_ event: TimelineEvent) throws {
+        guard case .work = journal.owner else { return }
+        guard workContinuation != nil else {
+            throw WriterError.unavailable("Work continuation is unavailable after commit")
+        }
+        WorkReducerTransition.apply(event, to: &workContinuation!)
+        if !workContinuation!.snapshot.unknownDomains.isEmpty {
+            workContinuationAgentHandleCoverage = false
+        }
+        workContinuationApplyCount += 1
+        do {
+            workContinuationFingerprint = try currentWorkFingerprint()
+        } catch {
+            invalidateWorkContinuation()
+            throw error
         }
     }
 
@@ -931,14 +1101,12 @@ public actor TimelineJournalWriter {
     /// The Work coordinator retains request/result bodies before calling this metadata seam.
     public func appendAgentHandle(_ draft: TimelineEventDraft) throws -> TimelineJournalCommit {
         try ensureAppendable()
-        guard case .work(let work) = journal.owner else {
+        guard case .work = journal.owner else {
             throw WriterError.invalidDraft(reason: "agent Handles require a Work journal")
         }
-        let canonical = try readCanonicalProjection(
-            expectedWork: work, expectedWorkHost: WorkHostRef(work.workHostID),
-            maximumResidentRecords: 0)
-        guard case .work(let head) = canonical.projection, head.coverage.isControlling,
-              let snapshot = canonical.workSnapshot else {
+        try ensureWorkContinuationForMutation()
+        guard workContinuationAgentHandleCoverage,
+              let snapshot = workContinuation.map({ $0.snapshot }) else {
             throw WriterError.invalidDraft(reason: "agent Handle state is incomplete")
         }
         var reservedEventIDs = eventIDs
@@ -972,6 +1140,7 @@ public actor TimelineJournalWriter {
         guard !eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               reservedEventIDs.insert(eventID).inserted else {
             let error = WriterError.eventIDCollision(eventID)
+            invalidateWorkContinuation()
             healthState = .failed(reason: error.localizedDescription)
             throw error
         }
@@ -1024,12 +1193,15 @@ public actor TimelineJournalWriter {
     }
 
     private func commit(_ prepared: PreparedAppend) throws -> TimelineJournalCommit {
+        try ensureWorkContinuationForMutation()
         do {
             try writeAndSynchronize(prepared.bytes)
         } catch let error as WriterError {
+            invalidateWorkContinuation()
             healthState = .failed(reason: error.localizedDescription)
             throw error
         } catch {
+            invalidateWorkContinuation()
             let wrapped = WriterError.unavailable(error.localizedDescription)
             healthState = .failed(reason: wrapped.localizedDescription)
             throw wrapped
@@ -1039,6 +1211,18 @@ public actor TimelineJournalWriter {
         eventIDs.insert(prepared.event.eventID)
         previousEventID = prepared.event.eventID
         nextSequence += 1
+        do {
+            try applyCommittedWorkEvent(prepared.event)
+        } catch let error as WriterError {
+            invalidateWorkContinuation()
+            healthState = .failed(reason: error.localizedDescription)
+            throw error
+        } catch {
+            invalidateWorkContinuation()
+            let wrapped = WriterError.unavailable(error.localizedDescription)
+            healthState = .failed(reason: wrapped.localizedDescription)
+            throw wrapped
+        }
         let eventRef = EventRef(journal: journal, eventID: prepared.event.eventID)
         return TimelineJournalCommit(
             eventRef: eventRef,
@@ -1113,6 +1297,9 @@ public actor TimelineJournalWriter {
         } catch {
             if failure == nil { failure = .closeFailed(error.localizedDescription) }
         }
+        // A closed writer no longer owns the canonical lease. Drop its continuation even when
+        // the close reports an error; callers must reopen and reseed from the durable prefix.
+        invalidateWorkContinuation()
         isClosed = true
 
         if let failure {

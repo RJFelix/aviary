@@ -210,6 +210,41 @@ func test_workHostDaemonEndpointDecoderCannotPromotePersistedLiveness() throws {
     try decoded.validate(expectedHost: fixture.host)
 }
 
+func test_workHostDaemonEndpointDistinguishesUnsupportedProtocolFromMalformedDescriptor() throws {
+    let fixture = try daemonEndpointFixture("protocol-fence")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let instance = WorkHostInstanceRef(
+        host: fixture.host, instanceID: "instance-protocol-fence",
+        startIdentity: "start-protocol-fence")
+    let descriptor = WorkHostDaemonDescriptor(
+        hostInstance: instance,
+        endpoint: try fixture.layout.endpoint(for: instance),
+        processID: 404,
+        publishedAt: Date(timeIntervalSince1970: 789))
+    let publisher = try WorkHostDaemonEndpointPublisher(
+        layout: fixture.layout, descriptor: descriptor)
+    try publisher.publish()
+
+    var object = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: JSONEncoder().encode(descriptor)) as? [String: Any])
+    object["workServiceProtocolVersion"] = 4
+    try JSONSerialization.data(withJSONObject: object).write(to: fixture.layout.descriptorURL)
+    let unsupported = try XCTUnwrap(
+        WorkHostDaemonEndpointPublisher.discover(layout: fixture.layout))
+    XCTAssertEqual(unsupported.workServiceProtocolVersion, 4)
+    XCTAssertEqual(unsupported.hostInstance, instance)
+    try unsupported.validate(expectedHost: fixture.host)
+
+    object["workServiceProtocolVersion"] = 0
+    try JSONSerialization.data(withJSONObject: object).write(to: fixture.layout.descriptorURL)
+    do {
+        _ = try WorkHostDaemonEndpointPublisher.discover(layout: fixture.layout)
+        XCTFail("a nonpositive protocol version is a malformed descriptor, not a negotiable peer")
+    } catch WorkHostDaemonEndpointError.invalidDescriptor {
+        XCTAssertTrue(true)
+    }
+}
+
 func test_workHostDaemonRuntimeSurvivesClientDisconnectAndAcceptsAnotherClient() async throws {
     let fixture = try daemonEndpointFixture("runtime")
     defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -310,6 +345,9 @@ let casesWorkHostDaemonEndpoint: [Case] = [
     }),
     ("phase3 Work Host endpoint: persisted liveness assertion is ignored", {
         try test_workHostDaemonEndpointDecoderCannotPromotePersistedLiveness()
+    }),
+    ("phase5 Work Host endpoint: unsupported protocol remains structurally discoverable", {
+        try test_workHostDaemonEndpointDistinguishesUnsupportedProtocolFromMalformedDescriptor()
     }),
     ("phase3 Work Host endpoint: shared socket roots are never chmod repaired", {
         try test_workHostDaemonEndpointRefusesRatherThanChmodsSharedSocketRoot()

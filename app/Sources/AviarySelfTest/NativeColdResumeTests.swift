@@ -116,7 +116,7 @@ private func makeNativeResumeFixture(
     let manifest = try nativeResumeManifest(request: request, bundle: bundle, store: store)
     let crossing = try await bundle.prepareModelCrossing(
         manifest: manifest, admission: fixtureProviderAdmission(kind: crossingKind), action: ActionRef("context-provider-action"),
-        kind: crossingKind)
+        kind: crossingKind, target: "provider/model")
     _ = try await bundle.finishAction(
         crossing, state: .succeeded, retrySafety: .unsafe,
         providerSettlement: fixtureProviderSettlement(crossing))

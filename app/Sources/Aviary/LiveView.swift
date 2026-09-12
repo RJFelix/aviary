@@ -1853,6 +1853,9 @@ struct RunInspector: View {
 
                 if run.isServiceBacked {
                     ServiceWorkCard(run: run)
+                    if let usage = run.serviceWorkUsage {
+                        ServiceWorkUsageCard(usage: usage)
+                    }
                 }
 
                 if let context = run.recordedModelContext {
@@ -2226,6 +2229,118 @@ private struct ServiceWorkCard: View {
         case .incompatible: return "incompatible"
         case .disconnected: return "disconnected"
         }
+    }
+}
+
+/// Work accounting is separate from transcript ``Usage``. It is shown only after the service has authenticated a complete
+/// Work/Session pair; otherwise the absence of a number is safer than attributing shared Work
+/// spend to this one Session.
+private struct ServiceWorkUsageCard: View {
+    let usage: CanonicalWorkUsage
+
+    var body: some View {
+        Card("Shared model usage", symbol: "chart.bar.xaxis") {
+            VStack(alignment: .leading, spacing: 7) {
+                if !usage.hasCrossingEvidence {
+                    Text("No model requests recorded for this work yet.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                } else {
+                    HStack(spacing: 10) {
+                        StatTile(
+                            label: "tokens",
+                            value: tokenValue(usage.knownTokenFloor, usage.totalTokenCertainty))
+                        StatTile(label: "estimated cost", value: costValue)
+                    }
+                    DetailRow(
+                        label: "Input floor",
+                        value: tokenValue(usage.inputTokens, usage.breakdownCertainty),
+                        mono: true)
+                    DetailRow(
+                        label: "Output floor",
+                        value: tokenValue(usage.outputTokens, usage.breakdownCertainty),
+                        mono: true)
+                    if usage.cacheReadTokens > 0 || usage.cacheWriteTokens > 0 {
+                        DetailRow(label: "Cache read floor", value: tokenValue(
+                            usage.cacheReadTokens, usage.breakdownCertainty), mono: true)
+                        DetailRow(label: "Cache write floor", value: tokenValue(
+                            usage.cacheWriteTokens, usage.breakdownCertainty), mono: true)
+                    }
+                    DetailRow(
+                        label: "Requests",
+                        value: "\(usage.settledCrossings)/\(usage.startedCrossings) outcomes recorded",
+                        mono: true)
+                    if usage.outstandingCrossings > 0 {
+                        DetailRow(
+                            label: "Awaiting outcomes",
+                            value: "\(usage.outstandingCrossings)",
+                            tint: Design.warning)
+                    }
+                }
+
+                if usage.hasUnresolvedAccounting {
+                    Divider().opacity(0.5)
+                    Label(
+                        accountingCaveat,
+                        systemImage: usage.tokenOverflow || usage.costOverflow
+                            ? "exclamationmark.triangle" : "questionmark.circle")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Design.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Text(
+                    "Across chats attached to this work. Child agents are not included. "
+                        + "Cost uses configured rates, not invoices."
+                )
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var costValue: String {
+        switch usage.costCertainty {
+        case .exact:
+            return usage.knownCostFloor == 0 ? "$0.00" : Fmt.cost(usage.knownCostFloor)
+        case .lowerBound:
+            return usage.knownCostFloor > 0
+                ? "≥" + Fmt.cost(usage.knownCostFloor) : "unknown"
+        case .unknown:
+            return usage.knownCostFloor > 0
+                ? "≥" + Fmt.cost(usage.knownCostFloor) : "unknown"
+        }
+    }
+
+    private func tokenValue(
+        _ value: Int, _ certainty: CanonicalWorkUsage.Certainty
+    ) -> String {
+        switch certainty {
+        case .exact: return Fmt.tokens(value)
+        case .lowerBound:
+            return value > 0 ? "≥" + Fmt.tokens(value) : "unknown"
+        case .unknown:
+            return value > 0 ? "≥" + Fmt.tokens(value) : "unknown"
+        }
+    }
+
+    private var accountingCaveat: String {
+        var parts: [String] = []
+        if usage.unresolvedTotal > 0 {
+            parts.append("total usage is unresolved for \(usage.unresolvedTotal) crossing(s)")
+        }
+        if usage.unresolvedBreakdown > 0 {
+            parts.append(
+                "the token breakdown is unresolved for \(usage.unresolvedBreakdown) crossing(s)")
+        }
+        if usage.unresolvedCost > 0 {
+            parts.append("cost is unresolved for \(usage.unresolvedCost) crossing(s)")
+        }
+        if usage.tokenOverflow { parts.append("token arithmetic overflowed") }
+        if usage.costOverflow { parts.append("cost arithmetic overflowed") }
+        return parts.joined(separator: "; ").capitalized
+            + ". Values are known floors or unknown, not billing totals."
     }
 }
 

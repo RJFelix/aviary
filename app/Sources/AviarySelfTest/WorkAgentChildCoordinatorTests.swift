@@ -158,6 +158,7 @@ private func coordinatorFixture(
 }
 
 private func coordinatorExecutionFactory(
+    coordinator: WorkAgentChildCoordinator,
     fixture: CoordinatorFixture,
     gate: CoordinatorExecutionGate,
     makeHost: @escaping @Sendable () -> RuntimeHost,
@@ -170,6 +171,9 @@ private func coordinatorExecutionFactory(
                 home: fixture.home, cwd: "/tmp", model: fakeModel(),
                 provider: CoordinatorGatedProvider(gate: gate),
                 systemPrompt: "You are a focused coordinator child.", maxIterations: 3,
+                makeProviderAccounting: {
+                    try await coordinator.providerAccounting(work: fixture.binding.workBinding.work, handle: handle)
+                },
                 makeRuntimeHost: makeHost),
             prompt: "perform the coordinator integration test")
         resourceBox?.set(resource)
@@ -361,7 +365,7 @@ func testWorkAgentChildCoordinatorCompletesAfterParentEndAndReadsCold() async th
         origin: fixture.binding, prompt: "private post-End request",
         label: "Post-End child", deadline: Date().addingTimeInterval(30),
         makeExecution: coordinatorExecutionFactory(
-            fixture: fixture, gate: gate, makeHost: makeHost))
+            coordinator: coordinator, fixture: fixture, gate: gate, makeHost: makeHost))
     _ = try await coordinatorWaitForRecord(
         coordinator, work: fixture.binding.workBinding.work, handle: admission.handle,
         matching: { $0.state == .running })
@@ -475,7 +479,7 @@ func testWorkAgentChildCoordinatorExpiresAcrossStartedCommitBoundary() async thr
 }
 
 func testWorkAgentChildCoordinatorExpiresQueuedAndRunningChildren() async throws {
-    guard let makeHost = coordinatorHostFactory() else { return }
+    let makeHost = try XCTUnwrap(coordinatorHostFactory())
     let home = scratchHome()
     let limits = try WorkAgentChildAdmissionQueue.Limits(
         executing: 1, queued: 8, queuedPerWork: 8)
@@ -489,7 +493,7 @@ func testWorkAgentChildCoordinatorExpiresQueuedAndRunningChildren() async throws
         origin: runningFixture.binding, prompt: "occupy the only slot",
         label: "Running blocker", deadline: Date().addingTimeInterval(20),
         makeExecution: coordinatorExecutionFactory(
-            fixture: runningFixture, gate: runningGate, makeHost: makeHost))
+            coordinator: coordinator, fixture: runningFixture, gate: runningGate, makeHost: makeHost))
     try await coordinatorWaitForGate(runningGate)
     _ = try await coordinatorWaitForRecord(
         coordinator, work: runningFixture.binding.workBinding.work, handle: blocker.handle,
@@ -526,9 +530,9 @@ func testWorkAgentChildCoordinatorExpiresQueuedAndRunningChildren() async throws
     let resourceBox = CoordinatorLockedBox<AgentChildExecutionResource>()
     let expiring = try await runningExpiryCoordinator.admit(
         origin: runningExpiryFixture.binding, prompt: "expire while running",
-        label: "Running expiry", deadline: Date().addingTimeInterval(0.45),
+        label: "Running expiry", deadline: Date().addingTimeInterval(5),
         makeExecution: coordinatorExecutionFactory(
-            fixture: runningExpiryFixture, gate: expiryGate, makeHost: makeHost,
+            coordinator: runningExpiryCoordinator, fixture: runningExpiryFixture, gate: expiryGate, makeHost: makeHost,
             resourceBox: resourceBox))
     try await coordinatorWaitForGate(expiryGate)
     let resource = try XCTUnwrap(resourceBox.get())
@@ -559,7 +563,7 @@ func testWorkAgentChildCoordinatorCancellationUsesExactLatestCauseAcrossClients(
         origin: fixture.binding, prompt: "cancel from an attached client",
         label: "Cancellation child", deadline: Date().addingTimeInterval(20),
         makeExecution: coordinatorExecutionFactory(
-            fixture: fixture, gate: gate, makeHost: makeHost, resourceBox: resourceBox))
+            coordinator: coordinator, fixture: fixture, gate: gate, makeHost: makeHost, resourceBox: resourceBox))
     let running = try await coordinatorWaitForRecord(
         coordinator, work: fixture.binding.workBinding.work, handle: admission.handle,
         matching: { $0.state == .running })
@@ -649,7 +653,7 @@ func testWorkAgentChildCoordinatorAppliesCanonicallyProvenAmbiguousCancellation(
         origin: fixture.binding, prompt: "cancel after ambiguous durability",
         label: "Ambiguous cancellation", deadline: Date().addingTimeInterval(20),
         makeExecution: coordinatorExecutionFactory(
-            fixture: fixture, gate: gate, makeHost: makeHost, resourceBox: resourceBox))
+            coordinator: coordinator, fixture: fixture, gate: gate, makeHost: makeHost, resourceBox: resourceBox))
     _ = try await coordinatorWaitForRecord(
         coordinator, work: fixture.binding.workBinding.work, handle: admission.handle,
         matching: { $0.state == .running })
@@ -667,7 +671,9 @@ func testWorkAgentChildCoordinatorAppliesCanonicallyProvenAmbiguousCancellation(
     XCTAssertFalse(await resource.cancellationIntentRecorded)
     await gate.release(answer: "late success must not override canonical cancellation")
     let lateResult = await resource.execute()
-    XCTAssertEqual(lateResult.state, .succeeded)
+    XCTAssertEqual(lateResult.state, .failed,
+                   "the failed live writer cannot confirm the mandatory provider settlement")
+    XCTAssertTrue(lateResult.cleanup.isComplete)
     try await Task.sleep(nanoseconds: 100_000_000)
     try? await fixture.bundle.closeChecked()
 

@@ -268,6 +268,9 @@ private func createCanonicalServiceWork(
 }
 
 func test_workServiceHandshakeIsVersionedAndHostIdentityIsOpaque() async throws {
+    XCTAssertEqual(WorkServiceProtocol.currentVersion, 5)
+    XCTAssertEqual(WorkServiceProtocol.minimumSupportedVersion, 5)
+    XCTAssertEqual(WorkServiceProtocol.maximumSupportedVersion, 5)
     let (service, _) = try await serviceFixture()
     let response = try await service.handshake(.init(
         protocolVersion: WorkServiceProtocol.currentVersion, client: ClientRef("gui-a"), build: "test"))
@@ -286,10 +289,10 @@ func test_workServiceHandshakeIsVersionedAndHostIdentityIsOpaque() async throws 
         XCTAssertEqual(version, 999)
     }
     do {
-        _ = try await service.handshake(.init(protocolVersion: 2, client: ClientRef("gui-a")))
-        XCTFail("protocol v2 must not survive the history-paging cutover")
+        _ = try await service.handshake(.init(protocolVersion: 4, client: ClientRef("gui-a")))
+        XCTFail("protocol v4 must not survive the provider-settlement cutover")
     } catch WorkServiceProtocolError.unsupportedVersion(let version) {
-        XCTAssertEqual(version, 2)
+        XCTAssertEqual(version, 4)
     }
 
     // The advertised surface describes what this particular host instance can execute. A

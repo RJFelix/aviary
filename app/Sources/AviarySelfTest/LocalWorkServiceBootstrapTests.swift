@@ -227,6 +227,30 @@ func testLocalWorkServiceBootstrapAcceptsExistingDaemonWithoutLaunching() async 
     XCTAssertEqual(await session.state, .disconnected)
 }
 
+func testLocalWorkServiceBootstrapRefusesV4DiscoveryWithoutLaunchingReplacement() async throws {
+    let host = WorkHostRef("bootstrap-v4-host")
+    let client = ClientRef("bootstrap-v4-client")
+    let instance = WorkHostInstanceRef(
+        host: host, instanceID: "bootstrap-v4-instance", startIdentity: "bootstrap-v4-start")
+    let endpoint = WorkServiceTransportEndpoint(path: "/tmp/aviary-v4-published.sock")
+    let launches = BootstrapLaunchCounter()
+    let bootstrap = try LocalWorkServiceBootstrap(
+        locator: BootstrapFixedLocator(location: WorkServiceHostLocation(
+            host: host, expectedInstance: instance, protocolVersion: 4,
+            transport: .unixSocket(endpoint))),
+        client: client,
+        launcher: { await launches.invoked() })
+
+    do {
+        _ = try await bootstrap.connect()
+        XCTFail("a known v4 publication must be refused without launching over it")
+    } catch LocalWorkServiceBootstrapError.connectionFailed(.incompatibleProtocol) {
+        XCTAssertEqual(await bootstrap.session.state, .incompatible(host))
+    }
+    XCTAssertEqual(await launches.count, 0)
+    await bootstrap.disconnect()
+}
+
 func testLocalWorkServiceBootstrapCoalescesLaunchAndAcceptsRacingDaemon() async throws {
     let host = WorkHostRef("bootstrap-race-host")
     let client = ClientRef("bootstrap-race-client")
@@ -589,6 +613,9 @@ let casesLocalWorkServiceBootstrap: [Case] = [
     }),
     ("phase3 local Work service bootstrap accepts an existing daemon without launching", {
         try await testLocalWorkServiceBootstrapAcceptsExistingDaemonWithoutLaunching()
+    }),
+    ("phase5 local Work service bootstrap refuses v4 without replacement", {
+        try await testLocalWorkServiceBootstrapRefusesV4DiscoveryWithoutLaunchingReplacement()
     }),
     ("phase3 local Work service bootstrap coalesces a racing daemon launch", {
         try await testLocalWorkServiceBootstrapCoalescesLaunchAndAcceptsRacingDaemon()

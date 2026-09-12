@@ -98,9 +98,12 @@ public struct WorkHostDaemonDescriptor: Codable, Hashable, Sendable {
         try values.encode(false, forKey: .isLivenessProof)
     }
 
+    /// Validate the bounded discovery record, not whether this client implements its protocol.
+    /// Keeping those checks separate lets a client surface a structurally valid older daemon as
+    /// incompatible without treating its publication as absent and launching over it.
     public func validate(expectedHost: WorkHostRef? = nil) throws {
         guard schemaVersion == Self.currentSchemaVersion,
-              workServiceProtocolVersion == WorkServiceProtocol.currentVersion,
+              workServiceProtocolVersion > 0,
               processID > 0,
               !isLivenessProof else {
             throw WorkHostDaemonEndpointError.invalidDescriptor

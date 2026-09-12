@@ -839,10 +839,10 @@ public struct LocalTimelineProjectionReader: Sendable {
         let replayBytes: Int
     }
 
-    private static let exactWorkMapKind = "work-exact-v7"
+    private static let exactWorkMapKind = "work-exact-v8"
     private static let legacyWorkMapKinds: Set<String> = [
         "work-exact-v1", "work-exact-v2", "work-exact-v3", "work-exact-v4", "work-exact-v5",
-        "work-exact-v6",
+        "work-exact-v6", "work-exact-v7",
     ]
     private static let exactSessionMapKind = "session-exact-v1"
 
@@ -869,8 +869,8 @@ public struct LocalTimelineProjectionReader: Sendable {
     private func defaultWorkExactNamespaceID(
         source: DisposableTimelineProjectionStore.SourceFingerprint
     ) -> String {
-        "work-exact-v7." + AviarySHA256.hash(data: Data(
-            "aviary-work-exact-namespace-v7\u{0}\(journal.stableKey)\u{0}"
+        "work-exact-v8." + AviarySHA256.hash(data: Data(
+            "aviary-work-exact-namespace-v8\u{0}\(journal.stableKey)\u{0}"
                 .appending(source.sourceGeneration)
                 .appending("\u{0}\(source.sourceByteCount)\u{0}")
                 .appending(source.fingerprint)

@@ -105,6 +105,10 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
                                 reasoningEffort: configuration.reasoningEffort,
                                 maxIterations: nil,
                                 memory: configuration.memory, recordPayloads: configuration.recordPayloads,
+                                makeProviderAccounting: {
+                                    try await pilot.coordinator.providerAccounting(
+                                        work: configuration.workRunBinding.workBinding.work, handle: handle)
+                                },
                                 makeRuntimeHost: pilot.makeRuntimeHost), prompt: prompt)
                     },
                     admissionContext: admissionContext)

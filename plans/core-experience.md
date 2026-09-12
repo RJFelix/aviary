@@ -11,7 +11,9 @@ Operational traces supplement canonical records; they never authorize actions or
 
 Current follow-on: [provider accounting and optional execution limits](provider-usage-accounting.md).
 Normalize missing/partial usage and cache pricing before enforcing token or spend policies;
-background agents remain unlimited unless the user supplies a limit.
+the intended default is unlimited background execution unless the user supplies a limit. The
+Work-owned pilot implements that default; normal daemon activation remains a separate integration
+step, and its parent-owned fallback must not be described as unlimited or independent.
 
 Product steering, 2026-09-07: Ryan's first real signed-app journey exposed a startup failure,
 lost pre-launch prompt, overlapping navigation, and machinery-first vocabulary. Further

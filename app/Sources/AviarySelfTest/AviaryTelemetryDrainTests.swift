@@ -119,14 +119,19 @@ let casesAviaryTelemetryDrain: [Case] = [
         XCTAssertEqual(exporter.snapshot().aborts, 1)
     }),
     ("telemetry drain: exporter failure quiesces without retry or retention claim", {
-        let exporter = TelemetryDrainExporter(result: .failure)
+        let exporter = TelemetryDrainExporter(result: .failure, blocked: true)
         let processor = AviaryBoundedSpanProcessor(
             spanExporter: exporter, maximumResidentSpans: 10,
             maximumExportBatchSize: 3, scheduleDelay: 60, exportTimeout: 1,
             abortExporter: { exporter.abort() })
         let provider = telemetryDrainProvider(processor: processor)
         defer { provider.shutdown() }
-        telemetryDrainEmit(5, provider: provider, prefix: "failed")
+        telemetryDrainEmit(3, provider: provider, prefix: "failed-first")
+        XCTAssertTrue(await telemetryDrainEventually {
+            exporter.snapshot().batches.count == 1
+        })
+        telemetryDrainEmit(2, provider: provider, prefix: "failed-second")
+        exporter.release()
 
         let receipt = await processor.shutdown(
             deadline: ContinuousClock.now.advanced(by: .seconds(1)))

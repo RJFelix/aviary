@@ -48,6 +48,7 @@ public actor AgentRunner {
         /// The exact native Session/Work producer opened by the launch boundary. The runner
         /// borrows it for the root Agent; the driver or CLI retains teardown ownership.
         public var nativeJournal: RunJournalBundle?
+        public var childProviderAccounting: (any ChildProviderAccounting)?
         /// Immutable history captured by the native launch boundary before Start admission.
         /// Supplying a native journal for a cold resume without this seed is an error; the
         /// runner must never reread a later tip containing the new prompt or fall back to legacy.
@@ -79,6 +80,7 @@ public actor AgentRunner {
             reasoningEffort: String? = nil,
             writer: SessionWriter? = nil,
             nativeJournal: RunJournalBundle? = nil,
+            childProviderAccounting: (any ChildProviderAccounting)? = nil,
             nativeResumeSeed: NativeColdResumeResult? = nil,
             repositoryReviewer: ObservedRepositoryReviewer? = nil
         ) {
@@ -102,6 +104,7 @@ public actor AgentRunner {
             self.identity = identity
             self.writer = writer
             self.nativeJournal = nativeJournal
+            self.childProviderAccounting = childProviderAccounting
             self.nativeResumeSeed = nativeResumeSeed
             self.repositoryReviewer = repositoryReviewer
         }
@@ -410,6 +413,7 @@ public actor AgentRunner {
                 expectedResumeTools: expectedResumeTools,
                 repositoryReviewer: settings.repositoryReviewer),
             nativeJournal: settings.nativeJournal,
+            childProviderAccounting: settings.childProviderAccounting,
             contextBodyStore: ContextBodyStore(home: settings.home))
 
         let obs = observer

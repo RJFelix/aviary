@@ -51,6 +51,21 @@ let casesProviderSettlementJournal: [Case] = [
         } catch {
             XCTFail("unexpected model identity error: \(error)")
         }
+        let foreignProviderAdmission = ProviderAdmission(
+            purpose: .normal,
+            rates: ProviderUsage.RateSnapshot(model: ModelSpec(rpc: .object([
+                "id": .string("model"), "provider": .string("foreign-provider")
+            ]))))
+        do {
+            _ = try await bundle.prepareModelCrossing(
+                manifest: manifest, admission: foreignProviderAdmission, kind: .provider,
+                target: "provider/model")
+            XCTFail("a rate snapshot for another provider must not authorize this crossing")
+        } catch let error as ProviderSettlementError {
+            XCTAssertEqual(error, .modelIdentityMismatch)
+        } catch {
+            XCTFail("unexpected provider identity error: \(error)")
+        }
         XCTAssertEqual(await bundle.latestWorkCursor, beforeMismatch)
         let preflightSessionData = try Data(
             contentsOf: home.timelineV2SessionJournalURL(bundle.session))
@@ -82,7 +97,9 @@ let casesProviderSettlementJournal: [Case] = [
         try longAdmission.validate(
             contextModelID: longModel, targetModel: "\(longProvider)/\(longModel)")
 
-        let permit = try await bundle.prepareModelCrossing(manifest: manifest, admission: admission, kind: .provider)
+        let permit = try await bundle.prepareModelCrossing(
+            manifest: manifest, admission: admission, kind: .provider,
+            target: "provider/model")
         let before = await bundle.latestWorkCursor
         let settlement = ProviderSettlement(admission: admission,
             report: .init(inputTokens: 17, outputTokens: 3, inputAccounting: .cacheInclusive),
@@ -123,7 +140,7 @@ let casesProviderSettlementJournal: [Case] = [
         let bundle = try await settlementBundle(home)
         let manifest = try await fixtureProviderManifest(home: home, bundle: bundle)
         let permit = try await bundle.prepareModelCrossing(manifest: manifest,
-            admission: fixtureProviderAdmission(), kind: .provider)
+            admission: fixtureProviderAdmission(), kind: .provider, target: "provider/model")
         await bundle.injectWriterFailure(.afterWriteBeforeSync, in: .work)
         do {
             _ = try await bundle.finishAction(permit, state: .succeeded, retrySafety: .unsafe,
@@ -134,7 +151,8 @@ let casesProviderSettlementJournal: [Case] = [
         if case .healthy = failed.health { XCTFail("ambiguous outcome must latch journal") }
         do {
             _ = try await bundle.prepareModelCrossing(manifest: manifest,
-                admission: fixtureProviderAdmission(), kind: .provider)
+                admission: fixtureProviderAdmission(), kind: .provider,
+                target: "provider/model")
             XCTFail("latched writer cannot dispatch another model")
         } catch { }
         try? await bundle.closeChecked()

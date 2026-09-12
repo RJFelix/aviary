@@ -19,6 +19,7 @@ public struct AgentChildExecutionConfiguration: Sendable {
     public let maxIterations: Int?
     public let memory: MemoryStore?
     public let recordPayloads: Bool
+    public let makeProviderAccounting: @Sendable () async throws -> any ChildProviderAccounting
     public let makeRuntimeHost: @Sendable () -> RuntimeHost
 
     public init(
@@ -35,6 +36,7 @@ public struct AgentChildExecutionConfiguration: Sendable {
         maxIterations: Int? = nil,
         memory: MemoryStore? = nil,
         recordPayloads: Bool = false,
+        makeProviderAccounting: @escaping @Sendable () async throws -> any ChildProviderAccounting,
         makeRuntimeHost: @escaping @Sendable () -> RuntimeHost
     ) {
         self.origin = origin
@@ -50,6 +52,7 @@ public struct AgentChildExecutionConfiguration: Sendable {
         self.maxIterations = maxIterations
         self.memory = memory
         self.recordPayloads = recordPayloads
+        self.makeProviderAccounting = makeProviderAccounting
         self.makeRuntimeHost = makeRuntimeHost
     }
 }
@@ -242,6 +245,7 @@ public actor AgentChildExecutionResource {
         do {
             try validateConfiguration()
             try checkCancellationOrDeadline()
+            let providerAccounting = try await configuration.makeProviderAccounting()
 
             let childHome = try makeChildHome()
             let identity = SessionWorkIdentity.allocate(
@@ -287,7 +291,7 @@ public actor AgentChildExecutionResource {
                     identity: identity,
                     reasoningEffort: configuration.reasoningEffort,
                     writer: childWriter,
-                    nativeJournal: nil))
+                    nativeJournal: nil, childProviderAccounting: providerAccounting))
             runner = childRunner
             runtimeSession = identity.workID
             runtimeSessionCreated = true

@@ -53,7 +53,9 @@ enum LinuxSelfTestMain {
             ("Linux telemetry: SDK, Agent, transport and bounded collector", {
                 try await runLinuxCases(casesProviderUsage + casesProviderUsageWire + casesUsageCompleteness + casesProviderTerminal
                     + casesProviderSettlement + casesProviderSettlementReducer
-                    + casesProviderSettlementAgent + casesProviderSettlementJournal)
+                    + casesProviderSettlementAgent + casesProviderSettlementJournal
+                    + casesCanonicalWorkUsage + casesWorkAgentProviderAccounting
+                    + casesTimelineJournalWriterContinuation + casesWorkAgentProviderExecution)
                 try await runLinuxCases(casesAviaryTelemetry + casesAviaryTelemetryAgent
                     + casesAviaryTelemetryTransport + casesAviaryTelemetryHTTPClient
                     + casesAviaryTelemetryDelivery + casesRuntimeHostTelemetry + casesWorkAgentChildTelemetry)

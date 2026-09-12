@@ -597,6 +597,8 @@ public enum TimelineEventType {
     public static let agentHandleCancelRequested = "agent_handle.cancel_requested"
     public static let agentHandleTerminal = "agent_handle.terminal"
     public static let agentHandleReaped = "agent_handle.reaped"
+    public static let agentHandleProviderStarted = "agent_handle.provider_started"
+    public static let agentHandleProviderSettled = "agent_handle.provider_settled"
     public static let recoveryCoverage = "recovery.coverage"
     public static let contextSourcesObserved = "context.sources_observed"
     public static let contextAssembled = "context.assembled"
@@ -1150,6 +1152,7 @@ public struct TimelineEvent: Codable, Hashable, Sendable {
         TimelineEventType.handleOutcome, TimelineEventType.agentHandleQueued,
         TimelineEventType.agentHandleStarted, TimelineEventType.agentHandleCancelRequested,
         TimelineEventType.agentHandleTerminal, TimelineEventType.agentHandleReaped,
+        TimelineEventType.agentHandleProviderStarted, TimelineEventType.agentHandleProviderSettled,
         TimelineEventType.recoveryCoverage,
         TimelineEventType.contextSourcesObserved,
         TimelineEventType.contextAssembled, TimelineEventType.sessionAttention,
@@ -2115,6 +2118,7 @@ public struct WorkAgentHandleSnapshot: Codable, Hashable, Sendable {
     public var startedEvent: EventRef?
     public var latestLifecycleEvent: EventRef
     public var reapedEvent: EventRef?
+    public var providerAccounting = WorkAgentProviderAccounting()
 
     public var cancellationCause: WorkAgentHandleCancellationCause? {
         cancellationEvidence?.cause
@@ -2302,6 +2306,27 @@ internal extension WorkSnapshot {
     /// partial and must not use this check.
     func validateProviderUsageAgainstCompleteActions() throws {
         try providerUsage.validate()
+        if let journal {
+            for handle in agentHandles.values {
+                try handle.providerAccounting.validate(
+                    origin: handle.origin, handle: handle.handle, execution: handle.startedEvent,
+                    journal: journal, lastSequence: lastSequence)
+                try handle.providerAccounting.validateLifecycleOrder(
+                    executionSequence: handle.startedEvent.flatMap {
+                        eventSequences[$0.eventID]
+                    },
+                    cancellationSequence: handle.cancellationEvidence?.event.sequence,
+                    terminalSequence: handle.terminalEvidence?.event.sequence)
+                for proof in handle.providerAccounting.evidence {
+                    guard eventSequences[proof.event.eventID] == proof.sequence,
+                          proof.previousEventID.flatMap({ eventSequences[$0] }) == proof.sequence - 1,
+                          proof.causedByEventID.flatMap({ eventSequences[$0.eventID] }).map({ $0 < proof.sequence }) == true
+                    else { throw CompleteProviderUsageProjectionError.invalidActionEvidence }
+                }
+            }
+        } else if !agentHandles.isEmpty {
+            throw CompleteProviderUsageProjectionError.invalidActionEvidence
+        }
         var steps: [CompleteProviderUsageProjectionStep] = []
         for action in actions.values {
             guard action.hasValidProviderEvidence else {

@@ -160,6 +160,8 @@ public actor Agent {
     /// The canonical Session/Work producer for native runs. The legacy writer remains an
     /// explicit presentation adapter until every reader consumes Timeline v2 directly.
     private let nativeJournal: RunJournalBundle?
+    private let childProviderAccounting: (any ChildProviderAccounting)?
+    private var childProviderAdmitted = false
     private var config: Configuration
     private let hostSession: String
     private var messages: [ChatMessage] = []
@@ -319,12 +321,14 @@ public actor Agent {
         provider: ChatProvider, host: RuntimeHost, writer: SessionWriter,
         hostSession: String, config: Configuration,
         nativeJournal: RunJournalBundle? = nil,
+        childProviderAccounting: (any ChildProviderAccounting)? = nil,
         contextBodyStore: ContextBodyStore? = nil
     ) {
         self.provider = provider
         self.host = host
         self.writer = writer
         self.nativeJournal = nativeJournal
+        self.childProviderAccounting = childProviderAccounting
         self.contextBodyStore = contextBodyStore
         self.hostSession = hostSession
         self.config = config
@@ -1330,6 +1334,16 @@ public actor Agent {
     ) async -> Bool {
         let settlement = ProviderSettlement(
             admission: admission, report: report, finality: finality)
+        if let childProviderAccounting {
+            guard nativeJournal == nil, childProviderAdmitted else { return false }
+            do {
+                try await childProviderAccounting.finish(settlement, state: state)
+                childProviderAdmitted = false
+            } catch {
+                latchNativeJournalFailure("the child provider settlement", error)
+                return false
+            }
+        }
         let recorded = await finishNativeAction(
             permit, state: state, retrySafety: retrySafety, failureKind: failureKind,
             providerSettlement: settlement)
@@ -1506,6 +1520,13 @@ public actor Agent {
         }
     }
 
+    private func requireModelPermit(_ permit: EffectPermit?, for effect: String) throws {
+        try requireNativePermit(permit, for: effect)
+        guard childProviderAccounting == nil || (childProviderAdmitted && journalFailureDetail == nil) else {
+            throw NativeJournalFailure(detail: journalFailureDetail ?? "Child provider admission was refused.")
+        }
+    }
+
     /// Retain what the next provider request will receive, then durably append its Session
     /// manifest and causally linked Work action before returning an effect permit.
     private func prepareModelCrossing(
@@ -1516,6 +1537,20 @@ public actor Agent {
         admission: ProviderAdmission,
         assembly: SystemPromptAssembly? = nil, targetModel: String
     ) async -> EffectPermit? {
+        if let childProviderAccounting {
+            guard nativeJournal == nil, journalFailureDetail == nil, !childProviderAdmitted else {
+                journalFailureDetail = "Provider accounting ownership is conflicting or unavailable."
+                return nil
+            }
+            do {
+                try await childProviderAccounting.begin(
+                    admission, requestModel: request.model, targetModel: targetModel)
+                childProviderAdmitted = true
+            } catch {
+                latchNativeJournalFailure("the child provider admission", error)
+            }
+            return nil
+        }
         guard nativeJournal != nil else { return nil }
         let result = await AviaryTelemetry.withSpan(
             "aviary.agent.context.prepare",
@@ -2259,7 +2294,7 @@ public actor Agent {
             intent: "Compact the conversation with the provider",
             admission: providerAdmission, assembly: compactionAssembly,
             targetModel: crossingModel.qualifiedID)
-        do { try requireNativePermit(permit, for: "compaction provider") }
+        do { try requireModelPermit(permit, for: "compaction provider") }
         catch { return "indeterminate" }
         var compactionProviderSucceeded = false
         var compactionProviderFailed = false
@@ -2464,7 +2499,7 @@ public actor Agent {
             intent: "Request the next agent response", admission: providerAdmission,
             assembly: requestAssembly,
             targetModel: crossingModel.qualifiedID)
-        try requireNativePermit(permit, for: "provider")
+        try requireModelPermit(permit, for: "provider")
         var turn = Turn()
         var latestReport: ProviderUsage.RawReport?
         var doneObserved = false

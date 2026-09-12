@@ -105,16 +105,37 @@ public actor WorkServiceClientSession: WorkServiceClient {
             do {
                 let handshake = try await connection.handshake(
                     WorkServiceHandshakeRequest(client: client, build: build))
-                guard handshake.accepted,
-                      handshake.negotiatedVersion == location.protocolVersion,
-                      handshake.host == location.host,
+                guard handshake.host == location.host,
                       handshake.hostInstance == location.expectedInstance else {
                     await connection.close()
                     throw WorkServiceClientSessionError.hostInstanceMismatch
                 }
+                guard handshake.supportedRange.contains(WorkServiceProtocol.currentVersion) else {
+                    await connection.close()
+                    throw WorkServiceClientSessionError.incompatibleProtocol
+                }
+                guard handshake.accepted else {
+                    await connection.close()
+                    throw WorkServiceClientSessionError.hostInstanceMismatch
+                }
+                guard let negotiatedVersion = handshake.negotiatedVersion,
+                      negotiatedVersion == location.protocolVersion,
+                      (WorkServiceProtocol.minimumSupportedVersion
+                        ... WorkServiceProtocol.maximumSupportedVersion)
+                        .contains(negotiatedVersion),
+                      handshake.supportedRange.contains(negotiatedVersion) else {
+                    await connection.close()
+                    throw WorkServiceClientSessionError.incompatibleProtocol
+                }
                 return Established(
                     generation: attemptGeneration, location: location,
                     connection: connection, handshake: handshake)
+            } catch let error as WorkServiceTransportError {
+                await connection.close()
+                if case .remote(code: .unsupportedVersion, detail: _) = error {
+                    throw WorkServiceClientSessionError.incompatibleProtocol
+                }
+                throw error
             } catch {
                 await connection.close()
                 throw error

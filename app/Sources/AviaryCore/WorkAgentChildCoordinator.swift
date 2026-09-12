@@ -140,6 +140,7 @@ internal actor WorkAgentChildCoordinator {
         var executionSettlement: ExecutionSettlement?
         var executionTask: Task<Void, Never>?
         var deadlineTask: Task<Void, Never>?
+        var providerLedger: WorkAgentChildProviderLedger?
     }
 
     private let limits: WorkAgentChildAdmissionQueue.Limits
@@ -413,6 +414,20 @@ internal actor WorkAgentChildCoordinator {
         return ReadResult(
             record: record, request: bodyAvailability(record.requestBody, store: route.bodyStore),
             result: record.resultBody.map { bodyAvailability($0, store: route.bodyStore) } ?? .absent)
+    }
+
+    func providerAccounting(work: WorkRef, handle: HandleRef) async throws -> any ChildProviderAccounting {
+        await acquireLifecycleGate()
+        defer { releaseLifecycleGate() }
+        let key = Key(work: work, handle: handle)
+        guard let entry = entries[key], entry.phase == .running,
+              let route = routes[work] else { throw Failure.ambiguous }
+        if let ledger = entry.providerLedger { return ledger }
+        guard let record = try await canonicalRecord(route: route, handle: handle),
+              record.origin == entry.origin else { throw Failure.ambiguous }
+        let ledger = try WorkAgentChildProviderLedger(journal: route.journal, record: record)
+        entries[key]?.providerLedger = ledger
+        return ledger
     }
 
     /// Metadata-only canonical polling. This does not load request or result body bytes.

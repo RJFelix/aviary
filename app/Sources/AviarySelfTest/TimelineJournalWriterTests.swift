@@ -467,8 +467,14 @@ func test_timelineJournalWriterOwnerLockSurvivesJournalPathReplacement() async t
         path: "writer-work-moved", directoryHint: .isDirectory)
     try FileManager.default.moveItem(at: ownerDirectory, to: movedDirectory)
     try FileManager.default.createDirectory(at: ownerDirectory, withIntermediateDirectories: true)
+    let replacementURL = ownerDirectory.appending(path: "journal.jsonl")
     try Data(contentsOf: movedDirectory.appending(path: "journal.jsonl"))
-        .write(to: ownerDirectory.appending(path: "journal.jsonl"))
+        .write(to: replacementURL)
+    // Data.write uses the process umask and may create a world-readable replacement. Canonical
+    // source fingerprints intentionally reject that; model the private journal permissions that
+    // TimelineJournalWriter.createFresh establishes before exercising the owner-lock proof.
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: 0o600)], ofItemAtPath: replacementURL.path)
 
     do {
         _ = try TimelineJournalWriter(

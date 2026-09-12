@@ -113,7 +113,8 @@ private func makePromptColdResumeFixture(
         journal: bundle.sessionJournal, manifestID: "prompt-cold-manifest",
         includeSources: includeSources)
     let permit = try await bundle.prepareModelCrossing(
-        manifest: manifest, admission: fixtureProviderAdmission(), action: ActionRef("prompt-cold-provider-action"), kind: .provider)
+        manifest: manifest, admission: fixtureProviderAdmission(), action: ActionRef("prompt-cold-provider-action"),
+        kind: .provider, target: "provider/model")
     _ = try await bundle.finishAction(permit, state: .succeeded, retrySafety: .unsafe,
         providerSettlement: fixtureProviderSettlement(permit))
     _ = try await bundle.commitAssistantMessage(.init(

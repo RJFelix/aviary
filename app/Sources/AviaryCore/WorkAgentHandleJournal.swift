@@ -10,15 +10,20 @@ internal actor WorkAgentHandleJournal {
     let work: WorkRef
     private let home: AgentHome
     private let actor: TimelineActor
+    private let beforeBundleAgentAppend: (@Sendable () async -> Void)?
     private var bundle: RunJournalBundle?
     private var gateHeld = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    init(home: AgentHome, work: WorkRef, actor: TimelineActor) throws {
+    init(
+        home: AgentHome, work: WorkRef, actor: TimelineActor,
+        beforeBundleAgentAppend: (@Sendable () async -> Void)? = nil
+    ) throws {
         guard try home.requirePersistedWorkHostID() == work.workHostID else { throw Failure.wrongWork }
         self.home = home
         self.work = work
         self.actor = actor
+        self.beforeBundleAgentAppend = beforeBundleAgentAppend
     }
 
     /// The closure only opens a bundle; it must not call this route recursively or start agent
@@ -66,13 +71,29 @@ internal actor WorkAgentHandleJournal {
         if let bundle {
             switch await bundle.status.health {
             case .healthy:
-                return try await bundle.appendAgentHandle(draft)
+                await beforeBundleAgentAppend?()
+                do {
+                    return try await bundle.appendAgentHandle(draft)
+                } catch RunJournalBundleError.closedBeforeAgentAppend {
+                    guard await bundle.writersClosed,
+                          await bundle.status.health == .closed else {
+                        throw RunJournalBundleError.closedBeforeAgentAppend
+                    }
+                    self.bundle = nil
+                    return try await appendColdLocked(draft)
+                }
             case .closed:
                 self.bundle = nil
             case .failed:
                 throw Failure.unavailable
             }
         }
+        return try await appendColdLocked(draft)
+    }
+
+    private func appendColdLocked(
+        _ draft: TimelineEventDraft
+    ) async throws -> TimelineJournalCommit {
         let writer = try coldWriter()
         do {
             let result = try await writer.appendAgentHandle(draft)
@@ -95,13 +116,25 @@ internal actor WorkAgentHandleJournal {
         if let bundle {
             switch await bundle.status.health {
             case .healthy:
-                return try await bundle.agentHandleHead()
+                do {
+                    return try await bundle.agentHandleHead()
+                } catch {
+                    // A canonical read is safe to repeat. If close won after this route chose
+                    // the bundle, wait for the bundle's exact closed state before reopening.
+                    guard await bundle.writersClosed else { throw error }
+                    self.bundle = nil
+                    return try await readColdLocked()
+                }
             case .closed:
                 self.bundle = nil
             case .failed:
                 throw Failure.unavailable
             }
         }
+        return try await readColdLocked()
+    }
+
+    private func readColdLocked() async throws -> BoundedWorkReducerHead {
         let writer = try coldWriter()
         do {
             let read = try await writer.readCanonicalProjection(

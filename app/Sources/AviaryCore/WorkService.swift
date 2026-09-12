@@ -6,12 +6,12 @@ import Foundation
 /// in-memory reference service; a Unix-domain socket and a remote transport can encode these
 /// values without changing their meaning.
 public enum WorkServiceProtocol {
-    // Version 3 adds authenticated reverse conversation-history pages. There is deliberately no
-    // v2 compatibility path: an older daemon must fail the handshake instead of accepting a GUI
-    // whose history operation it cannot decode.
-    public static let currentVersion = 4
-    public static let minimumSupportedVersion = 4
-    public static let maximumSupportedVersion = 4
+    // Version 5 requires canonical provider admission and terminal settlement evidence. There is
+    // deliberately no v4 compatibility path: an older daemon must fail discovery/handshake
+    // negotiation instead of accepting a GUI whose provider records it cannot produce.
+    public static let currentVersion = 5
+    public static let minimumSupportedVersion = 5
+    public static let maximumSupportedVersion = 5
 }
 
 /// A bounded surface is intentional: protocol values must be safe to render even when a remote

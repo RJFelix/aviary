@@ -149,7 +149,9 @@ func test_promptSourceManifestCrossingIsCausalBoundedAndSecretSafe() async throw
         assembly: assembly, request: request, store: store, journal: bundle.sessionJournal)
     let componentDeliveredBytes = manifest.deliveredBytes
 
-    let permit = try await bundle.prepareModelCrossing(manifest: manifest, admission: fixtureProviderAdmission(), kind: .provider)
+    let permit = try await bundle.prepareModelCrossing(
+        manifest: manifest, admission: fixtureProviderAdmission(), kind: .provider,
+        target: "provider/model")
     let data = try Data(contentsOf: home.timelineV2SessionJournalURL(session))
     let read = TimelineJournalReader.read(
         data, journal: bundle.sessionJournal,
@@ -210,7 +212,9 @@ func test_promptSourceManifestReducerRejectsForgedOrMismatchedObservation() asyn
     let manifest = try promptSourceManifestFixture(
         assembly: assembly, request: request, store: ContextBodyStore(home: home),
         journal: bundle.sessionJournal)
-    let permit = try await bundle.prepareModelCrossing(manifest: manifest, admission: fixtureProviderAdmission(), kind: .provider)
+    let permit = try await bundle.prepareModelCrossing(
+        manifest: manifest, admission: fixtureProviderAdmission(), kind: .provider,
+        target: "provider/model")
     let read = TimelineJournalReader.read(
         try Data(contentsOf: home.timelineV2SessionJournalURL(session)),
         journal: bundle.sessionJournal,
@@ -318,7 +322,9 @@ func test_promptSourceManifestRejectsSwappedAssemblyAndEmptySourcesBeforeAppend(
     let before = try promptSourceEvents(
         home: home, session: session, journal: bundle.sessionJournal)
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: swapped, admission: fixtureProviderAdmission(), kind: .provider)
+        _ = try await bundle.prepareModelCrossing(
+            manifest: swapped, admission: fixtureProviderAdmission(), kind: .provider,
+            target: "provider/model")
         XCTFail("an assembly from request B must not authorize request A")
     } catch { }
     let afterSwap = try promptSourceEvents(
@@ -335,7 +341,9 @@ func test_promptSourceManifestRejectsSwappedAssemblyAndEmptySourcesBeforeAppend(
         cumulativeDeliveredBytes: manifestA.cumulativeDeliveredBytes,
         systemPromptAssemblyID: assemblyA.digest, systemPromptSources: [])
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: emptySources, admission: fixtureProviderAdmission(), kind: .provider)
+        _ = try await bundle.prepareModelCrossing(
+            manifest: emptySources, admission: fixtureProviderAdmission(), kind: .provider,
+            target: "provider/model")
         XCTFail("a source-aware manifest must not have an empty source list")
     } catch { }
     let afterEmpty = try promptSourceEvents(
@@ -387,7 +395,9 @@ func test_promptSourceManifestRejectsContradictorySourceMetadataAndMedia() async
                                                       $0.inclusionID == source.inclusionID
                                                   }!)
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: badDigestManifest, admission: fixtureProviderAdmission(), kind: .provider)
+        _ = try await bundle.prepareModelCrossing(
+            manifest: badDigestManifest, admission: fixtureProviderAdmission(), kind: .provider,
+            target: "provider/model")
         XCTFail("present source full and delivered digests must agree")
     } catch { }
 
@@ -412,7 +422,9 @@ func test_promptSourceManifestRejectsContradictorySourceMetadataAndMedia() async
                                                           $0.inclusionID == source.inclusionID
                                                       }!)
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: badReferenceManifest, admission: fixtureProviderAdmission(), kind: .provider)
+        _ = try await bundle.prepareModelCrossing(
+            manifest: badReferenceManifest, admission: fixtureProviderAdmission(), kind: .provider,
+            target: "provider/model")
         XCTFail("present source full and delivered references must agree and be local")
     } catch { }
 
@@ -435,7 +447,9 @@ func test_promptSourceManifestRejectsContradictorySourceMetadataAndMedia() async
                                                      $0.inclusionID == source.inclusionID
                                                  }!)
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: badMediaManifest, admission: fixtureProviderAdmission(), kind: .provider)
+        _ = try await bundle.prepareModelCrossing(
+            manifest: badMediaManifest, admission: fixtureProviderAdmission(), kind: .provider,
+            target: "provider/model")
         XCTFail("prompt source body media types must be exact and secret-free")
     } catch { }
     XCTAssertFalse(try promptSourceEvents(home: home, session: session, journal: bundle.sessionJournal)
@@ -495,7 +509,9 @@ func test_promptSourceManifestRejectsTruncatedBodyThatIsNotAFullPrefix() async t
         renderedBodyReference: wrongRenderedReference)
     let malformedManifest = promptSourceManifest(manifest, replacing: malformed, at: sourceIndex)
     do {
-        _ = try await bundle.prepareModelCrossing(manifest: malformedManifest, admission: fixtureProviderAdmission(), kind: .provider)
+        _ = try await bundle.prepareModelCrossing(
+            manifest: malformedManifest, admission: fixtureProviderAdmission(), kind: .provider,
+            target: "provider/model")
         XCTFail("a truncated delivered body must be a prefix of its full retained body")
     } catch { }
     let events = try promptSourceEvents(home: home, session: session, journal: bundle.sessionJournal)

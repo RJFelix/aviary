@@ -95,12 +95,71 @@ putting child calls into the existing generic active-action set: that set curren
 Work completion can still require all Work-owned child resources to settle. Keep parent-direct
 and child-attributed aggregates separate so a combined UI never counts the same crossing twice.
 
+### Child accounting checkpoint and next integration
+
+The child adapter now records independent `agent_handle.provider_started` and
+`agent_handle.provider_settled` events through a Work-owned journal route. A serial Handle ledger
+pins the provider/model/rates at dispatch, retains one pending crossing, and folds each terminal
+report once. This is trusted-producer-pinned configuration, not independent verification of a
+provider's prices. Provider usage remains separate from the parent-direct Work aggregate.
+
+Ending the originating Run does not end its child or prevent later settlement. A clean-close race
+may retry only the typed proof that the bundle closed before any append began. Writer uncertainty
+never authorizes a retry. Cleanup and billing are independent: a quiescent failed/canceled child
+may terminalize and be reaped with unresolved accounting preserved; success cannot conceal a
+pending crossing. A failed live writer cannot certify a later Handle terminal event merely because
+the runtime has stopped. Lifecycle ordering is checked in exact, full, and bounded projections.
+
+The writer keeps an exact live continuation across synchronized Work commits and invalidates it on
+source changes or uncertain writes. This is not an O(1) lifetime-read claim: preflight still clones
+and inspects canonical state, explicit reads replay, and post-End cold child reads/appends reopen
+the journal. Retaining an independent cold writer indefinitely would obstruct the service's
+canonical readers; shared writer/read ownership is a separate performance increment.
+
+The GUI presents parent-direct usage once per Work, shared across its attached chats, with explicit
+unknowns, lower bounds, outstanding outcomes, and configured-rate cost estimates. Child agents are
+explicitly excluded from that card. This is not yet an all-Work usage inventory or child total.
+
+Remaining integration, in order:
+
+1. Persist an immutable optional child execution policy at Handle admission. Token and USD fields
+   are cooperative thresholds over that child's canonical aggregate, not the parent Work's total.
+   Omitted fields mean unlimited. Gate normal and compaction dispatch through the existing ledger;
+   finite dimensions reject unknown exposure/overflow instead of waiving the policy. Preserve a
+   typed stop reason and proven cleanup without calling a reached threshold a provider failure.
+2. Carry optional `timeout`, `token_limit`, and `cost_limit_usd` through Python `spawn`, strict
+   callback decoding, exact callback deduplication, and the Work child delegate. Derive an absolute
+   host deadline once per accepted request. A route that cannot honor a requested policy must
+   refuse it rather than silently falling back to parent-owned execution.
+3. Enable the same coordinator in the normal durable daemon resolver and its Hosted configurations,
+   installed before service use and retained for the process generation. Shutdown must freeze that
+   exact coordinator and refuse while children remain. The durable control-journal writer already
+   holds the same-home Work Host lease for its lifetime; endpoint publication is not that lease.
+   A second daemon currently blocks on that lock, so startup must retain a truthful bounded failure
+   path. Do not add a second competing ownership mechanism or reconstruct lost child processes from
+   journal history.
+4. Prove the real daemon/Python path with unlimited default, parent End, second-client observation,
+   explicit stop, token/cost/time limits, compaction, unknown reports, and daemon shutdown/restart.
+   Show child policies and outcomes in the canonical activity UI; aggregate Work inventory by exact
+   Work identity without summing the same Work once per Session.
+5. Deploy only after the v5 drain/reconciliation and recoverable inventory rotation described below.
+
 Finite token/spend policies will refuse further dispatch when prior exposure cannot be bounded,
 and surface an explicit attention state. Unlimited execution remains the default. A caller may
 change or remove an optional limit; reconnecting or retrying must never silently waive it.
 Postpaid reported-token and configured-price thresholds are not hard billing caps.
 
 ## Verification boundary
+
+Child accounting: Linux Swift 6.3.3 snapshot `aviary-linux-child-accounting-20260912-v1`
+builds SelfTest and aviaryd; 41 grouped cases / 7,243 assertions pass in 272.44s. Its 334-entry
+source manifest SHA-256 is `0346008404fa5548022ef813bf9ea5753016995128c39e00916183e331117ce7`.
+The macOS 1,355-case run exposed a replacement-file permission fixture, a wrong-coordinator
+deadline fixture, and an uncontrolled telemetry batching expectation. Their focused corrections
+pass (writer 1/4, deadline 1/8, drain 5/63); a fresh complete macOS run is required before this
+checkpoint is called broadly verified. These corrections change tests, not production semantics.
+The child accounting, exact-state, and provider-dispatch focused proofs pass; no paid calls were
+made. The shared-usage card is not yet visually verified or installed.
 
 Native settlement: final macOS SelfTest passes 1,334 cases / 20,094 assertions in 518.05s,
 after rebuilding Aviary, aviaryd, and SelfTest. Linux Swift 6.3.3 builds aviaryd and SelfTest;
