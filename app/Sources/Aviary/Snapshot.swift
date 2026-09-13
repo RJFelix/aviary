@@ -39,6 +39,15 @@ enum Snapshot {
         // AppKit has to be alive for CoreAnimation-backed rendering, but the run loop must
         // not start — so initialise the shared application and never call run().
         NSApplication.shared.setActivationPolicy(.accessory)
+        if let appearance = stringValue(of: "--appearance", in: args) {
+            switch appearance {
+            case "light": NSApplication.shared.appearance = NSAppearance(named: .aqua)
+            case "dark": NSApplication.shared.appearance = NSAppearance(named: .darkAqua)
+            default:
+                FileHandle.standardError.write(Data("appearance must be light or dark\n".utf8))
+                exit(2)
+            }
+        }
 
         try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
@@ -86,6 +95,7 @@ enum Snapshot {
             stage.present(
                 VisualFixtureView(route: route)
                     .frame(width: CGFloat(width), height: CGFloat(height))
+                    .environment(\.controlActiveState, .key)
                     .environment(\.staticRendering, true))
             for _ in 0..<4 {
                 try? await Task.sleep(nanoseconds: 300_000_000)

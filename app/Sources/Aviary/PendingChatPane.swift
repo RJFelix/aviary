@@ -2,6 +2,75 @@ import AppKit
 import AviaryCore
 import SwiftUI
 
+/// Visual cues describe saved intent, not an inferred command receipt.
+struct PendingChatVisualState {
+    let symbol: String
+    let tint: Color
+    let deliveryLabel: String
+    let statusOverride: String?
+
+    init(phase: PendingChatPhase, isPreparing: Bool, conversationCreated: Bool) {
+        statusOverride = conversationCreated && !isPreparing
+            ? "Conversation created · delivery unconfirmed" : nil
+        if isPreparing {
+            symbol = "arrow.triangle.2.circlepath"
+            tint = Design.accent
+            deliveryLabel = conversationCreated || phase == .awaitingAcceptance
+                ? "Checking delivery" : "Preparing startup"
+        } else if conversationCreated || phase == .awaitingAcceptance {
+            symbol = "questionmark.circle.fill"
+            tint = Design.warning
+            deliveryLabel = "Delivery unconfirmed"
+        } else if phase == .preparing {
+            symbol = "pause.circle.fill"
+            tint = Design.warning
+            deliveryLabel = "Startup interrupted"
+        } else if phase == .blocked {
+            symbol = "exclamationmark.circle.fill"
+            tint = Design.warning
+            deliveryLabel = "Not sent"
+        } else {
+            symbol = "tray.fill"
+            tint = Design.accent
+            deliveryLabel = "Ready to send"
+        }
+    }
+}
+
+/// The two locations matter: saving a request and delivering it are separate facts.
+struct SavedRequestProgress: View {
+    let state: PendingChatVisualState
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 14) {
+                location("This Mac", detail: "Request saved", symbol: "checkmark.circle.fill", tint: Design.success)
+                Image(systemName: "arrow.right").foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                location("Agent", detail: state.deliveryLabel, symbol: state.symbol, tint: state.tint)
+            }
+            VStack(alignment: .leading, spacing: 12) {
+                location("This Mac", detail: "Request saved", symbol: "checkmark.circle.fill", tint: Design.success)
+                location("Agent", detail: state.deliveryLabel, symbol: state.symbol, tint: state.tint)
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func location(_ title: String, detail: String, symbol: String, tint: Color) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol).font(.system(size: 19, weight: .medium))
+                .foregroundStyle(tint).frame(width: 38, height: 38)
+                .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 11))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                Text(detail).font(.system(size: 13, weight: .semibold)).fixedSize()
+            }
+        }
+    }
+}
+
 /// A saved local conversation while agent startup is blocked. This deliberately does not
 /// fabricate a canonical transcript row, accepted command, or running agent.
 struct PendingChatPane: View {
@@ -22,13 +91,18 @@ struct PendingChatPane: View {
             && !model.pendingChatIsPreparing(chat)
     }
 
+    private var visualState: PendingChatVisualState {
+        .init(phase: chat.phase, isPreparing: model.pendingChatIsPreparing(chat),
+              conversationCreated: chat.createdAssociation != nil)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(chat.title ?? (chat.prompt.isEmpty ? "New chat" : String(chat.prompt.prefix(80))))
                         .font(.system(size: 16, weight: .semibold)).lineLimit(1)
-                    Text(URL(fileURLWithPath: chat.cwd).lastPathComponent + " · Saved on this Mac")
+                    Label(URL(fileURLWithPath: chat.cwd).lastPathComponent, systemImage: "folder")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -40,24 +114,31 @@ struct PendingChatPane: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
-                    VStack(alignment: .leading, spacing: 8) {
+                    SavedRequestProgress(state: visualState)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    VStack(alignment: .leading, spacing: 10) {
                         Label("You", systemImage: "person.circle")
-                            .font(.subheadline.weight(.semibold))
+                            .font(.subheadline.weight(.semibold)).foregroundStyle(Design.user)
                         Text(chat.prompt.isEmpty ? "An empty conversation, ready for your first message." : chat.prompt)
                             .font(.system(size: 14)).textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                    }.padding(18)
-                        .background(RoundedRectangle(cornerRadius: 12).fill(Design.accentSoft.opacity(0.5)))
+                    }.padding(20)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(Design.user.opacity(0.06)))
+                        .overlay(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 2).fill(Design.user.opacity(0.6))
+                                .frame(width: 3).padding(.vertical, 16)
+                        }
 
                     VStack(alignment: .leading, spacing: 12) {
                         HStack(spacing: 9) {
                             if model.pendingChatIsPreparing(chat) {
                                 ProgressView().controlSize(.small)
                             } else {
-                                Image(systemName: chat.phase == .saved ? "tray" : "exclamationmark.circle")
-                                    .foregroundStyle(chat.phase == .saved ? Design.accent : Design.danger)
+                                Image(systemName: visualState.symbol)
+                                    .foregroundStyle(visualState.tint)
                             }
-                            Text(model.pendingChatStatus(chat)).font(.headline)
+                            Text(visualState.statusOverride ?? model.pendingChatStatus(chat)).font(.headline)
                         }
                         Text(model.pendingChatIsPreparing(chat)
                              ? "Your request is saved. Connecting to the agent on this Mac…"
@@ -72,7 +153,9 @@ struct PendingChatPane: View {
                         }
                     }.padding(18)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(RoundedRectangle(cornerRadius: 12).fill(Color.secondary.opacity(0.06)))
+                        .background(RoundedRectangle(cornerRadius: 12).fill(visualState.tint.opacity(0.05)))
+                        .overlay(RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(visualState.tint.opacity(0.25), lineWidth: 1))
 
                     if editing {
                         VStack(alignment: .leading, spacing: 12) {
@@ -103,7 +186,7 @@ struct PendingChatPane: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         }.padding(18)
                     }
-                }.padding(24).frame(maxWidth: 860)
+                }.padding(24).frame(maxWidth: 800)
                     .frame(maxWidth: .infinity)
             }
         }

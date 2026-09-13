@@ -13,22 +13,32 @@ enum Design {
 
     /// Signature accent. Teal reads as neither "success green" nor "link blue", which
     /// leaves both free to mean something.
-    static let accent = Color(red: 0.11, green: 0.63, blue: 0.62)
-    static let accentSoft = Color(red: 0.11, green: 0.63, blue: 0.62).opacity(0.14)
+    static let accent = adaptive(light: (0.00, 0.42, 0.41), dark: (0.19, 0.70, 0.69))
+    static let accentSoft = accent.opacity(0.14)
 
     /// Role colours. Each has a full-strength version for glyphs and rules, and a wash for
     /// backgrounds.
-    static let user = Color(red: 0.29, green: 0.47, blue: 0.92)
-    static let assistant = Color(red: 0.55, green: 0.40, blue: 0.92)
-    static let tool = Color(red: 0.13, green: 0.60, blue: 0.45)
-    static let bash = Color(red: 0.58, green: 0.52, blue: 0.32)
-    static let agentMessage = Color(red: 0.86, green: 0.47, blue: 0.20)
+    static let user = adaptive(light: (0.17, 0.34, 0.76), dark: (0.47, 0.65, 1.00))
+    static let assistant = adaptive(light: (0.47, 0.30, 0.79), dark: (0.73, 0.60, 1.00))
+    static let tool = adaptive(light: (0.06, 0.40, 0.27), dark: (0.25, 0.72, 0.53))
+    static let bash = adaptive(light: (0.45, 0.38, 0.17), dark: (0.76, 0.69, 0.43))
+    static let agentMessage = adaptive(light: (0.62, 0.29, 0.08), dark: (0.95, 0.60, 0.30))
     static let system = Color.secondary
 
-    static let danger = Color(red: 0.85, green: 0.26, blue: 0.24)
-    static let warning = Color(red: 0.90, green: 0.62, blue: 0.13)
-    static let success = Color(red: 0.16, green: 0.65, blue: 0.35)
-    static let thinking = Color(red: 0.48, green: 0.44, blue: 0.60)
+    static let danger = adaptive(light: (0.72, 0.16, 0.14), dark: (0.99, 0.50, 0.46))
+    static let warning = adaptive(light: (0.54, 0.32, 0.00), dark: (0.90, 0.62, 0.13))
+    static let success = adaptive(light: (0.08, 0.43, 0.21), dark: (0.23, 0.72, 0.42))
+    static let thinking = adaptive(light: (0.40, 0.36, 0.54), dark: (0.69, 0.63, 0.82))
+
+    /// Semantic text and glyphs need a darker ink on light surfaces, not the same neon hue.
+    private static func adaptive(
+        light: (Double, Double, Double), dark: (Double, Double, Double)
+    ) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let rgb = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+            return NSColor(srgbRed: rgb.0, green: rgb.1, blue: rgb.2, alpha: 1)
+        })
+    }
 
     /// The surface code sits on. Derived from `textBackgroundColor` rather than fixed, so it
     /// tracks the system appearance instead of needing a light and a dark constant.

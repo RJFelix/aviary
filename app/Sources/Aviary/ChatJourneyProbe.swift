@@ -30,6 +30,141 @@ enum ChatJourneyProbe {
         guard condition() else { throw Failure.assertion(reason) }
     }
 
+    @MainActor private static func runLauncherSelectionProbe() throws {
+        let models = [
+            ModelSpec(rpc: .object([
+                "id": .string("direct-model"), "provider": .string("litellm")
+            ])),
+            ModelSpec(rpc: .object([
+                "id": .string("direct-model-2"), "provider": .string("litellm")
+            ])),
+            ModelSpec(rpc: .object([
+                "id": .string("other-model"), "provider": .string("other-direct")
+            ])),
+            ModelSpec(rpc: .object([
+                "id": .string("sonnet"), "provider": .string("claude-code")
+            ])),
+            ModelSpec(rpc: .object([
+                "id": .string("opus"), "provider": .string("claude-code")
+            ])),
+        ]
+        try require(
+            LauncherSelection.provider(
+                claudeCode: true, preferred: "litellm", fallback: nil,
+                providers: ["litellm", "claude-code"]) == "claude-code",
+            "Claude Code selection retained an incompatible provider")
+        try require(
+            LauncherSelection.provider(
+                claudeCode: false, preferred: "claude-code", fallback: "litellm",
+                providers: ["claude-code", "litellm"]) == "litellm",
+            "in-house selection retained the Claude Code provider")
+        try require(
+            LauncherSelection.model(preferred: "sonnet", fallback: "direct-model", models: models)
+                == "sonnet",
+            "compatible remembered model was not preferred")
+        try require(
+            LauncherSelection.model(preferred: "missing", fallback: "direct-model", models: models)
+                == "direct-model",
+            "model selection did not use its compatible fallback")
+
+        var selection = LauncherSelection.seeded(
+            route: .direct,
+            defaultProviderID: "litellm",
+            defaultModelID: "direct-model",
+            claudeCodeModelID: "sonnet",
+            models: models)
+        selection = selection.selectingModel("direct-model-2", models: models)
+        let directModelTemporarilyMissing = models.filter { $0.id != "direct-model-2" }
+        selection = selection.reconciling(
+            defaultProviderID: "litellm",
+            defaultModelID: "direct-model",
+            fallbackClaudeCodeModelID: "sonnet",
+            models: directModelTemporarilyMissing)
+        try require(selection.modelID == "direct-model",
+                    "catalogue refresh did not expose a compatible direct fallback")
+        selection = selection.reconciling(
+            defaultProviderID: "litellm",
+            defaultModelID: "direct-model",
+            fallbackClaudeCodeModelID: "sonnet",
+            models: models)
+        try require(selection.modelID == "direct-model-2",
+                    "catalogue refresh forgot the user's current direct model")
+
+        selection = selection.selectingProvider(
+            "claude-code",
+            defaultProviderID: "litellm",
+            defaultModelID: "direct-model",
+            fallbackClaudeCodeModelID: "sonnet",
+            models: models)
+        try require(
+            selection.route == .claudeCode && selection.providerID == "claude-code"
+                && selection.modelID == "sonnet",
+            "explicit provider selection did not choose the Claude Code route")
+        selection = selection.selectingModel("opus", models: models)
+        selection = selection.selectingProvider(
+            "litellm",
+            defaultProviderID: "litellm",
+            defaultModelID: "direct-model",
+            fallbackClaudeCodeModelID: "sonnet",
+            models: models)
+        try require(
+            selection.route == .direct && selection.providerID == "litellm"
+                && selection.modelID == "direct-model-2",
+            "Claude Code round trip forgot the user's direct model selection")
+        selection = selection.selectingProvider(
+            "claude-code",
+            defaultProviderID: "litellm",
+            defaultModelID: "direct-model",
+            fallbackClaudeCodeModelID: "sonnet",
+            models: models)
+        try require(selection.modelID == "opus",
+                    "direct route round trip forgot the user's Claude Code model selection")
+
+        let directModels = models.filter { $0.providerID != "claude-code" }
+        selection = selection.selectingProvider(
+            "litellm",
+            defaultProviderID: "litellm",
+            defaultModelID: "direct-model",
+            fallbackClaudeCodeModelID: "sonnet",
+            models: models)
+        selection = selection.selectingRoute(
+            .claudeCode,
+            defaultProviderID: "litellm",
+            defaultModelID: "direct-model",
+            fallbackClaudeCodeModelID: "sonnet",
+            models: directModels)
+        try require(
+            selection.route == .claudeCode && selection.providerID.isEmpty
+                && selection.modelID.isEmpty,
+            "entering an unavailable Claude Code route changed the requested engine")
+        selection = selection.reconciling(
+            defaultProviderID: "litellm",
+            defaultModelID: "direct-model",
+            fallbackClaudeCodeModelID: "sonnet",
+            models: models)
+        try require(selection.route == .claudeCode && selection.modelID == "opus",
+                    "catalogue recovery did not restore the remembered Claude Code model")
+        let repeatedClaudeSelection = selection.selectingRoute(
+            .claudeCode,
+            defaultProviderID: "litellm",
+            defaultModelID: "direct-model",
+            fallbackClaudeCodeModelID: "sonnet",
+            models: models)
+        try require(repeatedClaudeSelection == selection,
+                    "repeating an engine selection changed coherent launcher state")
+
+        selection = selection.selectingProvider(
+            "other-direct",
+            defaultProviderID: "litellm",
+            defaultModelID: "direct-model",
+            fallbackClaudeCodeModelID: "sonnet",
+            models: models)
+        try require(
+            selection.route == .direct && selection.providerID == "other-direct"
+                && selection.modelID == "other-model",
+            "explicit direct-provider selection did not produce a coherent route and model")
+    }
+
     @MainActor private static func waitForAttempt(_ model: AppModel, id: UUID) async throws {
         for _ in 0..<100 {
             guard let chat = model.pendingChats.first(where: { $0.id == id }) else {
@@ -464,6 +599,26 @@ enum ChatJourneyProbe {
     }
 
     @MainActor private static func run() async throws {
+        try runLauncherSelectionProbe()
+        for phase in PendingChatPhase.allCases {
+            let associated = PendingChatVisualState(
+                phase: phase, isPreparing: false, conversationCreated: true)
+            try require(associated.deliveryLabel == "Delivery unconfirmed",
+                        "conversation creation must not visually claim request delivery")
+            try require(associated.statusOverride == "Conversation created · delivery unconfirmed",
+                        "the status headline must not claim an opening operation is active")
+            let checking = PendingChatVisualState(
+                phase: phase, isPreparing: true, conversationCreated: false)
+            try require(checking.deliveryLabel == (phase == .awaitingAcceptance
+                ? "Checking delivery" : "Preparing startup"),
+                "fresh startup and delivery reconciliation need distinct labels")
+        }
+        try require(PendingChatVisualState(phase: .awaitingAcceptance,
+            isPreparing: false, conversationCreated: false).symbol == "questionmark.circle.fill",
+            "uncertain delivery needs a distinct non-color cue")
+        try require(PendingChatVisualState(phase: .preparing,
+            isPreparing: false, conversationCreated: false).deliveryLabel == "Startup interrupted",
+            "an interrupted startup must not be shown as live")
         // This is the actual rail presentation gate, not a hand-built visual fixture. A
         // selected exact attachment may preserve a title, never repair canonical ambiguity.
         let attached = CanonicalWorkspaceRailPresentation.attachedFallback(

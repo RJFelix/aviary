@@ -11,6 +11,7 @@ struct CockpitView: View {
     /// rather than opening a modal over it. See `NewSessionPane`.
     @State private var composingNewSession = false
     @State private var showsConnections = false
+    @State private var showsCompactChatList = false
     @State private var selectedCanonicalEntryID: String?
     /// Selecting a Session does not select one of its Works. This exact key is set only by the
     /// relationship card in the Session pane, so several attached Works never collapse by order.
@@ -18,12 +19,34 @@ struct CockpitView: View {
 
     var body: some View {
         GeometryReader { geo in
-            HStack(spacing: 0) {
-                runRail
-                    .frame(width: min(280, max(190, geo.size.width * 0.27)))
-                Divider()
-                detail
-                    .frame(maxWidth: .infinity)
+            Group {
+                if geo.size.width < 900 {
+                    VStack(spacing: 0) {
+                        HStack {
+                            Button {
+                                showsCompactChatList.toggle()
+                            } label: {
+                                Label(showsCompactChatList ? "Back to chat" : "Chats",
+                                      systemImage: showsCompactChatList ? "chevron.right" : "sidebar.left")
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("chat-list-toggle")
+                            .accessibilityHint(showsCompactChatList
+                                ? "Shows the selected conversation" : "Shows the conversation list")
+                            .padding(12)
+                            Spacer()
+                        }
+                        Divider()
+                        if showsCompactChatList { runRail } else { detail }
+                    }
+                } else {
+                    HStack(spacing: 0) {
+                        runRail
+                            .frame(width: min(280, max(220, geo.size.width * 0.27)))
+                        Divider()
+                        detail.frame(maxWidth: .infinity)
+                    }
+                }
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
@@ -155,22 +178,39 @@ struct CockpitView: View {
                         .textSelection(.enabled).padding(8)
                 }
                 ForEach(model.pendingChats) { chat in
+                    let state = PendingChatVisualState(
+                        phase: chat.phase, isPreparing: model.pendingChatIsPreparing(chat),
+                        conversationCreated: chat.createdAssociation != nil)
                     Button {
                         model.selectedPendingChatID = chat.id
+                        showsCompactChatList = false
                         composingNewSession = false
                         selectedCanonicalEntryID = nil
                         selectedCanonicalWorkTarget = nil
                     } label: {
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(chat.prompt.isEmpty ? "New chat" : String(chat.prompt.prefix(90)))
-                                .font(.system(size: 12, weight: .medium)).lineLimit(2)
-                            Label(model.pendingChatStatus(chat), systemImage: "bubble.left.and.exclamationmark.bubble.right")
-                                .font(.caption).foregroundStyle(.secondary)
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: state.symbol)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(state.tint)
+                                .frame(width: 28, height: 28)
+                                .background(state.tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                                .accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text(chat.prompt.isEmpty ? "New chat" : String(chat.prompt.prefix(90)))
+                                    .font(.system(size: 13, weight: .medium)).lineLimit(2)
+                                    .multilineTextAlignment(.leading)
+                                Text(state.statusOverride ?? model.pendingChatStatus(chat))
+                                    .font(.system(size: 11, weight: .medium)).foregroundStyle(state.tint)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading).padding(12)
                         .background(RoundedRectangle(cornerRadius: 9).fill(
                             model.selectedPendingChatID == chat.id && !composingNewSession
                                 ? Design.accentSoft : Color.secondary.opacity(0.05)))
+                        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(
+                            model.selectedPendingChatID == chat.id && !composingNewSession
+                                ? Design.accent.opacity(0.6) : .clear, lineWidth: 1))
                     }
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(
@@ -193,6 +233,7 @@ struct CockpitView: View {
                 }
                 ForEach(unrepresentedRuns) { run in
                     RunRailCard(run: run, selected: isShowing(run)) {
+                        showsCompactChatList = false
                         model.focusRun(run)
                         model.selectedPendingChatID = nil
                         selectedCanonicalEntryID = nil
@@ -346,6 +387,7 @@ struct CockpitView: View {
             isRestoringHere: isRestoring,
             selected: !composingNewSession && selectedCanonicalEntry?.id == entry.id
         ) {
+            showsCompactChatList = false
             selectedCanonicalEntryID = entry.id
             if attachedRuns.count == 1, let run = attachedRuns.first {
                 model.focusRun(run)
@@ -357,6 +399,7 @@ struct CockpitView: View {
     }
 
     private func beginNewChat() {
+        showsCompactChatList = false
         composingNewSession = true
         model.selectedPendingChatID = nil
         selectedCanonicalEntryID = nil
@@ -366,9 +409,9 @@ struct CockpitView: View {
 
     private func railHeading(_ title: String) -> some View {
         Text(title)
-            .font(.system(size: 9, weight: .semibold))
+            .font(.system(size: 10, weight: .semibold))
             .tracking(0.5)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.secondary)
             .padding(.horizontal, 4)
             .padding(.top, 5)
     }
@@ -521,12 +564,15 @@ private struct CanonicalWorkspaceRailCard: View {
     var body: some View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 7) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                HStack(alignment: .top, spacing: 10) {
                     Image(systemName: entry.state.symbol)
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(entry.state.tint)
+                        .frame(width: 28, height: 28)
+                        .background(entry.state.tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                        .accessibilityHidden(true)
                     Text(displayTitle)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
                     Spacer(minLength: 0)
@@ -534,6 +580,9 @@ private struct CanonicalWorkspaceRailCard: View {
                 HStack(spacing: 5) {
                     Text(entry.state.label)
                         .foregroundStyle(entry.state.tint)
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(entry.state.tint.opacity(0.09), in: Capsule())
+                    Spacer(minLength: 0)
                     if isAttachedHere {
                         Text("open here")
                             .foregroundStyle(Design.accent)
@@ -541,26 +590,26 @@ private struct CanonicalWorkspaceRailCard: View {
                         Text("Restoring chat…")
                             .foregroundStyle(Design.accent)
                     }
-                    if let attachedCatchUpPresentation {
-                        Text("Attached agent · \(ChatInteractionPresentation.stateLabel(attachedCatchUpPresentation.commandState))")
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                    }
-                    if let model = entry.modelID, !model.isEmpty {
-                        Text(model).lineLimit(1).truncationMode(.middle)
-                    }
                 }
-                .font(.system(size: 9.5, weight: .medium))
+                .font(.system(size: 11, weight: .medium))
+                if let attachedCatchUpPresentation {
+                    Text("Attached agent · \(ChatInteractionPresentation.stateLabel(attachedCatchUpPresentation.commandState))")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let model = entry.modelID, !model.isEmpty {
+                    Text(model).font(.system(size: 11)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
                 if entry.workEvidence.count > 1 || entry.omittedWorkEvidenceCount > 0 {
                     Text(
                         "\(entry.workEvidence.count) recorded agent workspaces"
                             + (entry.omittedWorkEvidenceCount > 0
                                 ? " · \(entry.omittedWorkEvidenceCount) more not shown" : ""))
-                        .font(.system(size: 9.5)).foregroundStyle(.secondary)
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
-            .padding(10)
+            .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)

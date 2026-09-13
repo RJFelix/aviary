@@ -130,6 +130,7 @@ struct RootView: View {
                 model.openCapturePanel()
             } label: {
                 Label("Improve Aviary", systemImage: "hammer.fill")
+                    .labelStyle(.titleAndIcon)
             }
             .help("Suggest an improvement to Aviary (⇧⌘I)")
 

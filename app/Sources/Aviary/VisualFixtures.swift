@@ -30,6 +30,12 @@ enum VisualFixtureRoute: String {
     case usageAccounting = "usage-accounting-fixture"
     case usageInventory = "usage-inventory-fixture"
     case usageInventoryNarrow = "usage-inventory-narrow-fixture"
+    case chatWelcome = "chat-welcome-fixture"
+    case chatRecovery = "chat-recovery-fixture"
+    case chatUncertain = "chat-uncertain-fixture"
+    case chatCreated = "chat-created-fixture"
+    case requestLocations = "request-locations-fixture"
+    case activityStrip = "activity-strip-fixture"
 
     var isNarrow: Bool {
         self == .serviceChatNarrow || self == .productionDeliveryNarrow
@@ -77,7 +83,83 @@ struct VisualFixtureView: View {
             UsageAccountingFixture()
         case .usageInventory, .usageInventoryNarrow:
             UsageInventoryFixtureView(narrow: route == .usageInventoryNarrow)
+        case .chatWelcome, .chatRecovery, .chatUncertain, .chatCreated:
+            ChatVisualLearningFixture(route: route)
+        case .requestLocations:
+            VStack(alignment: .leading, spacing: 28) {
+                Text("Saved request states · design fixture").font(.headline)
+                ForEach(PendingChatPhase.allCases, id: \.self) { phase in
+                    SavedRequestProgress(state: .init(
+                        phase: phase, isPreparing: false, conversationCreated: false))
+                }
+                SavedRequestProgress(state: .init(
+                    phase: .preparing, isPreparing: true, conversationCreated: false))
+                SavedRequestProgress(state: .init(
+                    phase: .saved, isPreparing: true, conversationCreated: false))
+                SavedRequestProgress(state: .init(
+                    phase: .awaitingAcceptance, isPreparing: false, conversationCreated: true))
+            }.padding(28).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background(Color(nsColor: .windowBackgroundColor))
+        case .activityStrip:
+            VStack(alignment: .leading, spacing: 20) {
+                Text("Activity strip · production component fixture").font(.headline).padding(.horizontal, 16)
+                WorkActivityStrip(action: WorkActionPresentation(FixtureData.activeAction),
+                    concurrentActions: [WorkActionPresentation(FixtureData.activeAction)], onInspect: { _ in })
+                WorkActivityStrip(action: WorkActionPresentation(FixtureData.activeAction),
+                    concurrentActions: FixtureData.actions.map(WorkActionPresentation.init), onInspect: { _ in })
+                WorkActivityStrip(action: WorkActionPresentation(FixtureData.activeAction),
+                    concurrentActions: [WorkActionPresentation(FixtureData.activeAction)],
+                    sourceIsCurrent: false, onInspect: { _ in })
+            }.padding(.vertical, 20).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background(Color(nsColor: .windowBackgroundColor))
         }
+    }
+}
+
+/// Real chat views with only disposable, local presentation data. No bootstrap or delivery.
+@MainActor
+private struct ChatVisualLearningFixture: View {
+    let route: VisualFixtureRoute
+    @State private var model: AppModel
+
+    init(route: VisualFixtureRoute) {
+        self.route = route
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aviary-chat-design-" + UUID().uuidString)
+        let suite = "aviary.chat-design." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let model = AppModel(home: AgentHome(root: root), presentationDefaults: defaults,
+                             modelPreferencesStore: ModelPreferencesStore(directory: root))
+        defer { try? FileManager.default.removeItem(at: root) }
+        model.modelCatalog.enabled = [ModelSpec(rpc: .object([
+            "id": .string("design-model"), "name": .string("Coding agent"),
+            "provider": .string("Fixture provider"), "contextWindow": .number(128_000)]))]
+        model.localWorkServiceError = route == .chatWelcome ? nil : "The agent service is unavailable."
+        model.newChatRequested = route == .chatWelcome
+        if route != .chatWelcome {
+            let chat = try! PendingChat(
+                id: UUID(uuidString: "27C7620E-5160-4946-8A34-E8AD10A64D17")!,
+                createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+                prompt: "Help me understand how this project fits together, then suggest the smallest useful improvement.",
+                cwd: "/Projects/Aviary", providerID: "Fixture provider", modelID: "design-model",
+                phase: route == .chatUncertain || route == .chatCreated ? .awaitingAcceptance : .blocked,
+                failureKind: .hostUnavailable,
+                createdAssociation: route == .chatCreated ? ServiceAttachmentKey(
+                    client: ClientRef("fixture-client"),
+                    clientAttachment: ClientAttachmentRef("fixture-client-attachment"),
+                    work: FixtureData.work, session: FixtureData.session,
+                    sessionJournal: FixtureData.sessionJournal,
+                    sessionAttachment: FixtureData.attachment) : nil)
+            model.pendingChats = [chat]
+            model.selectedPendingChatID = chat.id
+        }
+        _model = State(initialValue: model)
+    }
+
+    var body: some View {
+        CockpitView().environment(model)
+            .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 

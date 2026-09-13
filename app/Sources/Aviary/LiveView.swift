@@ -1313,202 +1313,191 @@ struct LauncherFormBody: View {
     @State private var cwd = ""
     @State private var projectChosen = false
     @State private var prompt = ""
-    @State private var provider: String = ""
-    @State private var modelID: String = ""
+    @State private var selection = LauncherSelection.seeded(
+        route: .direct, defaultProviderID: nil, defaultModelID: nil,
+        claudeCodeModelID: "", models: [])
+    @State private var selectionWasSeeded = false
     @State private var thinking = "high"
-    /// Which direct engine to return to when leaving `claude-code` behind.
-    @State private var lastDirectEngine: AppModel.Engine = .inHouse
     @State private var noContextFiles = false
     @State private var recordPayloads = false
+    @State private var configurationExpanded = false
     @State private var advancedExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    Card("What should Aviary do?", symbol: "text.bubble") {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ZStack(alignment: .topLeading) {
-                                if prompt.isEmpty {
-                                    Text("Describe the coding task, question, or change…")
-                                        .font(.system(size: 12.5))
-                                        .foregroundStyle(.tertiary)
-                                        .padding(.horizontal, 11)
-                                        .padding(.vertical, 10)
-                                        .allowsHitTesting(false)
-                                }
-                                TextEditor(text: $prompt)
-                                    .font(.system(size: 12.5))
-                                    .frame(minHeight: 120)
-                                    .scrollContentBackground(.hidden)
-                                    .padding(6)
-                                    .accessibilityLabel("New chat request")
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("What would you like to work on?")
+                            .font(.system(size: 24, weight: .semibold, design: .rounded))
+                        Text(launcherSubtitle)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Card(symbol: "text.bubble") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("New chat request")
+                                .font(.system(size: 13, weight: .semibold))
+                            VStack(alignment: .trailing, spacing: 10) {
+                                requestEditor
+                                startButton
                             }
-                            .background(
-                                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                    .fill(Color(nsColor: .textBackgroundColor))
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                    .strokeBorder(.separator, lineWidth: 1))
-                            Text(model.engineChoice == .inHouse
-                                 ? "Your request is saved locally before Aviary tries to reach an agent."
-                                 : "Claude Code runs in this app's process. Keep Aviary open while it works.")
-                                .font(.system(size: 10)).foregroundStyle(.tertiary)
                         }
                     }
 
-                    Card("Project", symbol: "folder") {
-                        VStack(alignment: .leading, spacing: 7) {
-                            HStack(spacing: 7) {
-                                TextField("", text: Binding(get: { cwd }, set: {
-                                    cwd = $0; projectChosen = true
-                                }))
-                                    .textFieldStyle(.roundedBorder)
-                                    .font(Design.mono(11))
-                                Button("Choose…") { chooseDirectory() }
-                                    .controlSize(.small)
+                    Card("For this chat", symbol: "slider.horizontal.3") {
+                        ViewThatFits(in: .horizontal) {
+                            HStack(alignment: .top, spacing: 16) {
+                                workspaceSummary
+                                Divider().frame(height: 58)
+                                agentSummary
                             }
-                            if !model.recentCwds.isEmpty {
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 5) {
-                                        ForEach(model.recentCwds, id: \.self) { path in
-                                            Button {
-                                                cwd = path
-                                                projectChosen = true
-                                            } label: {
-                                                Chip(
-                                                    text: URL(fileURLWithPath: path)
-                                                        .lastPathComponent,
-                                                    symbol: "clock",
-                                                    tint: cwd == path ? Design.accent : .secondary,
-                                                    filled: cwd == path)
+                            VStack(alignment: .leading, spacing: 14) {
+                                workspaceSummary
+                                Divider()
+                                agentSummary
+                            }
+                        }
+                    }
+
+                    DisclosureGroup(
+                        "Project, engine, and model settings",
+                        isExpanded: $configurationExpanded
+                    ) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text("Project folder")
+                                    .font(.system(size: 13, weight: .semibold))
+                                HStack(spacing: 8) {
+                                    TextField("Project path", text: Binding(get: { cwd }, set: {
+                                        cwd = $0; projectChosen = true
+                                    }))
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(Design.mono(11))
+                                    Button("Choose…") { chooseDirectory() }
+                                        .controlSize(.small)
+                                }
+                                if !model.recentCwds.isEmpty {
+                                    ScrollView(.horizontal, showsIndicators: false) {
+                                        HStack(spacing: 5) {
+                                            ForEach(model.recentCwds, id: \.self) { path in
+                                                Button {
+                                                    cwd = path
+                                                    projectChosen = true
+                                                } label: {
+                                                    Chip(
+                                                        text: URL(fileURLWithPath: path)
+                                                            .lastPathComponent,
+                                                        symbol: "clock",
+                                                        tint: cwd == path ? Design.accent : .secondary,
+                                                        filled: cwd == path)
+                                                }
+                                                .buttonStyle(.plain)
+                                                .help(path)
                                             }
-                                            .buttonStyle(.plain)
-                                            .help(path)
                                         }
                                     }
                                 }
+                                Text("Aviary reads project instructions starting from this folder.")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.tertiary)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
-                            Text("Aviary reads project instructions starting from this folder.")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
 
-                    Card("How to run it", symbol: "bolt") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Picker(
-                                "",
-                                selection: Binding(
-                                get: { model.engineChoice },
-                                    set: { model.engineChoice = $0 })
-                            ) {
-                                ForEach(AppModel.Engine.allCases) { Text($0.label).tag($0) }
-                            }
-                            .pickerStyle(.segmented).labelsHidden()
-                            .onChange(of: model.engineChoice) { _, now in
-                                if now != .claudeCode {
-                                    lastDirectEngine = now
-                                    noContextFiles = false
-                                }
-                                if now == .claudeCode { recordPayloads = false }
-                                // The engines offer disjoint catalogues, so a selection made
-                                // under one is meaningless under the other. Re-seeded rather
-                                // than left alone, because a picker showing a provider absent
-                                // from its own list renders blank.
-                                if !providers.contains(provider) {
-                                    provider = providers.first ?? ""
-                                }
-                                if !modelsForProvider.contains(where: { $0.id == modelID }) {
-                                    modelID = modelsForProvider.first?.id ?? ""
-                                }
-                            }
-                            Text(model.engineChoice == .inHouse
-                                ? "Aviary runs the agent and keeps the conversation available when this window closes."
-                                : "Claude Code runs the agent using its own account and conversation history.")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                                .fixedSize(horizontal: false, vertical: true)
+                            Divider()
 
-                            if model.engineChoice == .claudeCode {
-                                Divider().opacity(0.5)
-                                if let auth = model.claudeCodeAuth {
-                                    HStack(spacing: 6) {
-                                        Circle()
-                                            .fill(
-                                                auth.isSubscription
-                                                    ? Design.success : Design.warning
-                                            )
-                                            .frame(width: 6, height: 6)
-                                        Text(
-                                            auth.isSubscription
-                                            ? "\(auth.summary) — draws on the plan"
-                                                : "\(auth.summary) — bills metered API credit"
-                                        )
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("How to run it")
+                                    .font(.system(size: 13, weight: .semibold))
+                                Picker(
+                                    "Engine",
+                                    selection: engineBinding
+                                ) {
+                                    ForEach(AppModel.Engine.allCases) { engine in
+                                        Text(engine == .inHouse ? "Aviary" : engine.label)
+                                            .tag(engine)
                                     }
-                                } else {
+                                }
+                                .pickerStyle(.segmented)
+                                Text(selectedEngine == .inHouse
+                                    ? "Aviary runs the agent and keeps the conversation available when this window closes."
+                                    : "Claude Code runs the agent using its own account and conversation history.")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.tertiary)
+                                    .fixedSize(horizontal: false, vertical: true)
+
+                                if selectedEngine == .claudeCode {
+                                    if let auth = model.claudeCodeAuth {
+                                        HStack(spacing: 6) {
+                                            Circle()
+                                                .fill(auth.isSubscription ? Design.success : Design.warning)
+                                                .frame(width: 6, height: 6)
+                                            Text(
+                                                auth.isSubscription
+                                                ? "\(auth.summary) — draws on the plan"
+                                                    : "\(auth.summary) — bills metered API credit"
+                                            )
+                                                .font(.system(size: 11))
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    } else {
+                                        Text(
+                                            "No `claude` binary found, or it is not signed in. "
+                                                + "Install Claude Code and run `claude /login`."
+                                        )
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(Design.warning)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                            }
+
+                            Divider()
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Agent")
+                                    .font(.system(size: 13, weight: .semibold))
+                                if model.pickerModels.isEmpty {
                                     Text(
-                                        "No `claude` binary found, or it is not signed in. "
-                                            + "Install Claude Code and run `claude /login`."
+                                        model.runtimeModelsError
+                                            ?? "Asking the engine which models it can reach…"
                                     )
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(Design.warning)
-                                        .fixedSize(horizontal: false, vertical: true)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(
+                                            model.runtimeModelsError == nil
+                                                ? .secondary : Design.danger)
+                                } else {
+                                    Picker("Provider", selection: providerBinding) {
+                                        ForEach(providers, id: \.self) { Text($0).tag($0) }
+                                    }
+                                    Picker("Model", selection: modelBinding) {
+                                        ForEach(modelsForProvider) { m in
+                                            Text(m.displayName).tag(m.id)
+                                        }
+                                    }
+                                    if let selected = modelsForProvider.first(where: {
+                                        $0.id == modelID
+                                    }) {
+                                        ModelFactsRow(model: selected, requestedThinking: thinking)
+                                    }
                                 }
                             }
                         }
+                        .padding(.top, 10)
                         .controlSize(.small)
                     }
+                    .font(.system(size: 12, weight: .medium))
+                    .padding(13)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color(nsColor: .controlBackgroundColor)))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(.separator.opacity(0.6), lineWidth: 1))
 
-                    Card("Agent", symbol: "cpu") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            if model.pickerModels.isEmpty {
-                                Text(
-                                    model.runtimeModelsError
-                                        ?? "Asking the engine which models it can reach…"
-                                )
-                                    .font(.system(size: 11))
-                                .foregroundStyle(
-                                    model.runtimeModelsError == nil
-                                        ? .secondary : Design.danger)
-                            } else {
-                                Picker("Provider", selection: $provider) {
-                                    ForEach(providers, id: \.self) { Text($0).tag($0) }
-                                }
-                                .onChange(of: provider) { _, now in
-                                    // Picking the provider sets the engine, because for this
-                                    // one they are the same fact: Claude Code *is* the thing
-                                    // that answers, so choosing it as a provider is choosing
-                                    // it as the engine. Making you say it twice — once here
-                                    // and once in the segment above — is what sent somebody
-                                    // hunting through the provider list for a route that was
-                                    // gated behind a control they had not touched.
-                                    if now == "claude-code" {
-                                        model.engineChoice = .claudeCode
-                                    } else if model.engineChoice == .claudeCode {
-                                        model.engineChoice = lastDirectEngine
-                                    }
-                                    modelID = modelsForProvider.first?.id ?? ""
-                                }
-                                Picker("Model", selection: $modelID) {
-                                    ForEach(modelsForProvider) { m in
-                                        Text(m.displayName).tag(m.id)
-                                    }
-                                }
-                                if let selected = modelsForProvider.first(where: {
-                                    $0.id == modelID
-                                }) {
-                                    ModelFactsRow(model: selected, requestedThinking: thinking)
-                                }
-                            }
-                        }
-                    }
-
-                    if model.engineChoice == .inHouse {
+                    if selectedEngine == .inHouse {
                         agentServiceStatus
                     }
 
@@ -1520,109 +1509,287 @@ struct LauncherFormBody: View {
                                     id: \.self
                                 ) { Text($0).tag($0) }
                             }
-                            Text(model.engineChoice == .inHouse
+                            Text(selectedEngine == .inHouse
                                  ? "Your chat is saved locally before delivery is attempted."
                                  : "Claude Code uses a local conversation journal; its running process belongs to this app.")
-                                .font(.system(size: 10))
+                                .font(.system(size: 11))
                                 .foregroundStyle(.tertiary)
-                            if model.engineChoice == .claudeCode {
+                            if selectedEngine == .claudeCode {
                                 Toggle("Skip AGENTS.md / CLAUDE.md discovery", isOn: $noContextFiles)
                             }
                             Divider().opacity(0.5)
                             Toggle("Record what's sent to the model", isOn: $recordPayloads)
-                                .disabled(model.engineChoice == .claudeCode)
+                                .disabled(selectedEngine == .claudeCode)
                             Text(Self.recordPayloadsExplanation)
-                                .font(.system(size: 10))
+                                .font(.system(size: 11))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
-                            if model.engineChoice == .claudeCode {
+                            if selectedEngine == .claudeCode {
                                 Text(
                                     "Unavailable for a Claude Code-driven run: Claude Code owns "
                                         + "the provider request and does not expose its full payload."
                                 )
-                                .font(.system(size: 10))
+                                .font(.system(size: 11))
                                 .foregroundStyle(.tertiary)
                             }
                         }
-                        .padding(.top, 8)
+                        .padding(.top, 10)
                         .controlSize(.small)
                     }
-                    .font(.system(size: 11.5, weight: .medium))
-                    .padding(12)
+                    .font(.system(size: 12, weight: .medium))
+                    .padding(13)
                     .background(
-                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(Color(nsColor: .controlBackgroundColor)))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .strokeBorder(.separator.opacity(0.6), lineWidth: 1))
                 }
-                .padding(14)
+                .frame(maxWidth: 760, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 24)
             }
-
-            Divider()
-
-            HStack {
-                Spacer()
-                Button {
-                    if model.engineChoice == .claudeCode {
-                        let created = model.startClaudeCodeRun(
-                            cwd: cwd.isEmpty ? model.defaultCwd : cwd,
-                            // From the Model card, like every other engine. `claudeCodeModel`
-                            // is still where the choice is remembered between runs, which is
-                            // why it is written here rather than read.
-                            model: modelID.isEmpty ? model.claudeCodeModel : modelID,
-                            // "off" is the picker's no-reasoning value; Claude Code has no such
-                            // level, so it is expressed by omitting the flag entirely.
-                            effort: thinking == "off" ? nil : thinking,
-                            prompt: prompt, noContextFiles: noContextFiles)
-                        if created { onStart() }
-                        return
-                    }
-                    let saved = model.createPendingChat(
-                        cwd: cwd.isEmpty ? model.defaultCwd : cwd,
-                        providerID: provider.isEmpty ? nil : provider,
-                        modelID: modelID.isEmpty ? nil : modelID,
-                        prompt: prompt,
-                        thinkingLevel: thinking == "off" ? nil : thinking,
-                        noContextFiles: noContextFiles,
-                        recordPayloads: recordPayloads)
-                    if saved { onStart() }
-                } label: {
-                    Label(startActionLabel, systemImage: "arrow.up.circle.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-                .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-            }
-            .padding(14)
         }
         .onChange(of: model.defaultCwd) { _, value in
             if !projectChosen { cwd = value }
         }
         .onAppear {
             if cwd.isEmpty { cwd = model.defaultCwd }
-            if model.engineChoice != .claudeCode { lastDirectEngine = model.engineChoice }
-            // Seeded from the remembered engine, so reopening the sheet after a driven run
-            // does not show `litellm` above an engine segment that says Claude Code. The
-            // defaults in settings describe a provider route and cannot express this one.
-            if model.engineChoice == .claudeCode {
-                provider = "claude-code"
-                if !modelsForProvider.contains(where: { $0.id == modelID }) {
-                    modelID = model.claudeCodeModel
-                }
+            if selectionWasSeeded {
+                selection = selection.selectingRoute(
+                    route(for: model.engineChoice),
+                    defaultProviderID: model.settings.defaultProvider,
+                    defaultModelID: model.settings.defaultModel,
+                    fallbackClaudeCodeModelID: model.claudeCodeModel,
+                    models: offeredModels)
             } else {
-                if provider.isEmpty || provider == "claude-code" {
-                    provider = model.settings.defaultProvider ?? providers.first ?? ""
-                }
-                if modelID.isEmpty
-                    || !modelsForProvider.contains(where: { $0.id == modelID })
-                {
-                    modelID = model.settings.defaultModel ?? modelsForProvider.first?.id ?? ""
-                }
+                selection = LauncherSelection.seeded(
+                    route: route(for: model.engineChoice),
+                    defaultProviderID: model.settings.defaultProvider,
+                    defaultModelID: model.settings.defaultModel,
+                    claudeCodeModelID: model.claudeCodeModel,
+                    models: offeredModels)
+                selectionWasSeeded = true
             }
             thinking = model.settings.defaultThinkingLevel ?? "high"
         }
+        .onChange(of: model.pickerModels) { _, _ in
+            if selectionWasSeeded { reconcileSelection() }
+        }
+    }
+
+    private var launcherSubtitle: String {
+        selectedEngine == .inHouse
+            ? "Write a request and choose the workspace and agent below. Your chat is saved before delivery."
+            : "Write a request and choose the workspace and agent below. Claude Code runs in this app and keeps its own conversation history."
+    }
+
+    private var engineBinding: Binding<AppModel.Engine> {
+        Binding(get: { selectedEngine }, set: { selectEngine($0) })
+    }
+
+    private var providerBinding: Binding<String> {
+        Binding(get: { selection.providerID }, set: { selectProvider($0) })
+    }
+
+    private var modelBinding: Binding<String> {
+        Binding(get: { selection.modelID }, set: {
+            selection = selection.selectingModel($0, models: offeredModels)
+        })
+    }
+
+    private var provider: String { selection.providerID }
+    private var modelID: String { selection.modelID }
+    private var selectedEngine: AppModel.Engine { engine(for: selection.route) }
+
+    private func selectEngine(_ engine: AppModel.Engine) {
+        selection = selection.selectingRoute(
+            route(for: engine),
+            defaultProviderID: model.settings.defaultProvider,
+            defaultModelID: model.settings.defaultModel,
+            fallbackClaudeCodeModelID: model.claudeCodeModel,
+            models: offeredModels)
+        if model.engineChoice != engine { model.engineChoice = engine }
+        if engine == .claudeCode {
+            recordPayloads = false
+        } else {
+            noContextFiles = false
+        }
+    }
+
+    private func selectProvider(_ providerID: String) {
+        selection = selection.selectingProvider(
+            providerID,
+            defaultProviderID: model.settings.defaultProvider,
+            defaultModelID: model.settings.defaultModel,
+            fallbackClaudeCodeModelID: model.claudeCodeModel,
+            models: offeredModels)
+        let selectedEngine = engine(for: selection.route)
+        if model.engineChoice != selectedEngine { model.engineChoice = selectedEngine }
+        if selection.route == .claudeCode {
+            recordPayloads = false
+        } else {
+            noContextFiles = false
+        }
+    }
+
+    private func reconcileSelection() {
+        selection = selection.reconciling(
+            defaultProviderID: model.settings.defaultProvider,
+            defaultModelID: model.settings.defaultModel,
+            fallbackClaudeCodeModelID: model.claudeCodeModel,
+            models: offeredModels)
+    }
+
+    private func route(for engine: AppModel.Engine) -> LauncherSelection.Route {
+        engine == .claudeCode ? .claudeCode : .direct
+    }
+
+    private func engine(for route: LauncherSelection.Route) -> AppModel.Engine {
+        route == .claudeCode ? .claudeCode : .inHouse
+    }
+
+    private var requestEditor: some View {
+        ZStack(alignment: .topLeading) {
+            if prompt.isEmpty {
+                Text("Describe the coding task, question, or change…")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .allowsHitTesting(false)
+            }
+            TextEditor(text: $prompt)
+                .font(.system(size: 14))
+                .frame(minHeight: 156)
+                .scrollContentBackground(.hidden)
+                .padding(7)
+                .accessibilityLabel("New chat request")
+        }
+        .frame(minWidth: 0, maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(nsColor: .textBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(.separator, lineWidth: 1))
+    }
+
+    private var startButton: some View {
+        Button {
+            if selectedEngine == .claudeCode {
+                let created = model.startClaudeCodeRun(
+                    cwd: cwd.isEmpty ? model.defaultCwd : cwd,
+                    // `claudeCodeModel` remains the remembered fallback for driven runs.
+                    model: modelID.isEmpty ? model.claudeCodeModel : modelID,
+                    // Claude Code has no explicit "off" effort flag.
+                    effort: thinking == "off" ? nil : thinking,
+                    prompt: prompt, noContextFiles: noContextFiles)
+                if created { onStart() }
+                return
+            }
+            let saved = model.createPendingChat(
+                cwd: cwd.isEmpty ? model.defaultCwd : cwd,
+                providerID: provider.isEmpty ? nil : provider,
+                modelID: modelID.isEmpty ? nil : modelID,
+                prompt: prompt,
+                thinkingLevel: thinking == "off" ? nil : thinking,
+                noContextFiles: noContextFiles,
+                recordPayloads: recordPayloads)
+            if saved { onStart() }
+        } label: {
+            Label(startActionLabel, systemImage: "arrow.up.circle.fill")
+        }
+        .buttonStyle(.borderedProminent)
+        .keyboardShortcut(.defaultAction)
+        .accessibilityLabel("Start chat")
+        .accessibilityAddTraits(.isButton)
+        .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    private var workspaceSummary: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Workspace", systemImage: "folder")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text(workspaceName)
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .fixedSize(horizontal: false, vertical: true)
+            Text(activeCwd)
+                .font(Design.mono(10.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(activeCwd)
+            Button("Change project…") { chooseDirectory() }
+                .buttonStyle(.link)
+                .font(.system(size: 11, weight: .medium))
+                .padding(.leading, -2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var agentSummary: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Agent", systemImage: "cpu")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text(selectedModelSummary)
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .fixedSize(horizontal: false, vertical: true)
+                .help(selectedModelSummary)
+            Text(selectedEngine == .inHouse ? "Aviary" : "Claude Code")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text(provider.isEmpty ? "No provider selected" : provider)
+                .font(Design.mono(10.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(provider)
+            Text(engineLifetimeSummary)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let runtimeModelsError = model.runtimeModelsError {
+                Text(runtimeModelsError)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Design.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(runtimeModelsError)
+            } else if model.pickerModels.isEmpty {
+                Text("Model choices are still loading…")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            }
+            Button("Configure agent…") { configurationExpanded = true }
+                .buttonStyle(.link)
+                .font(.system(size: 11, weight: .medium))
+                .padding(.leading, -2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var activeCwd: String {
+        cwd.isEmpty ? model.defaultCwd : cwd
+    }
+
+    private var workspaceName: String {
+        let name = URL(fileURLWithPath: activeCwd).lastPathComponent
+        return name.isEmpty ? activeCwd : name
+    }
+
+    private var selectedModelSummary: String {
+        if let selected = modelsForProvider.first(where: { $0.id == modelID }) {
+            return selected.displayName
+        }
+        return modelID.isEmpty ? "Choose a model" : modelID
+    }
+
+    private var engineLifetimeSummary: String {
+        selectedEngine == .inHouse
+            ? "Aviary keeps this chat available if the window closes."
+            : "Keep Aviary open while Claude Code runs in this app."
     }
 
     @ViewBuilder
@@ -1675,12 +1842,19 @@ struct LauncherFormBody: View {
         + "tool schemas, messages — so the run can show where its input tokens went. Writes "
         + "them to a file in Aviary's support directory, which is why it is off by default."
 
-    /// In catalogue order, de-duplicated by first appearance, so the picker agrees with the
-    /// switcher and both follow your ordering.
-    private var providers: [String] {
+    /// In catalogue order, de-duplicated by first appearance.
+    private var allProviders: [String] {
         var seen = Set<String>()
         return offeredModels.compactMap {
             seen.insert($0.providerID).inserted ? $0.providerID : nil
+        }
+    }
+
+    private var providers: [String] {
+        allProviders.filter {
+            selectedEngine == .claudeCode
+                ? $0 == LauncherSelection.claudeCodeProviderID
+                : $0 != LauncherSelection.claudeCodeProviderID
         }
     }
 
@@ -1688,17 +1862,7 @@ struct LauncherFormBody: View {
         offeredModels.filter { $0.providerID == provider }
     }
 
-    /// Every reachable route, `claude-code` included, whichever engine is selected.
-    ///
-    /// It is deliberately *not* filtered by engine. Filtering was the first attempt and it was
-    /// wrong in a way that only shows up in use: `claude-code` was absent from the provider
-    /// list until you had already found the Engine segment and switched it, so somebody looking
-    /// for "Claude Code plus a Claude model" in the obvious place found four providers and
-    /// concluded the feature was missing.
-    ///
-    /// Picking it instead *sets* the engine — see the provider picker's `onChange`. The two
-    /// controls stay in step in both directions, and the engine segment remains because
-    /// Harness versus In-house is a real choice that no model selection expresses.
+    /// Every reachable route, including the built-in Claude Code route.
     private var offeredModels: [ModelSpec] { model.pickerModels }
 
     private func chooseDirectory() {
