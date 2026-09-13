@@ -4727,9 +4727,9 @@ final class LiveRun: Identifiable {
     private(set) var serviceBridge: ServiceBackedRunBridge? = nil
     var isServiceBacked: Bool { serviceBridge != nil }
     /// Durable provider accounting for the Work lifetime, kept separate from ``usage`` which is
-    /// the legacy/in-process transcript total.  This value is shared by every Session attached
-    /// to the Work and is available only after a complete canonical Work/Session read.
-    private(set) var serviceWorkUsage: CanonicalWorkUsage? = nil
+    /// the legacy/in-process transcript total. This inventory is shared by every Session
+    /// attached to the Work and is available only after a complete canonical Work/Session read.
+    private(set) var serviceWorkUsageInventory: CanonicalWorkUsageInventory? = nil
     /// Timer polling keeps active work and any unresolved command/input handoff on the prompt
     /// cadence. This is process-local scheduling only; canonical admission still belongs to the
     /// controller and Work Host.
@@ -4956,7 +4956,7 @@ final class LiveRun: Identifiable {
             model: bridge.projection.descriptor.configuration.modelID,
             thinkingLevel: bridge.thinkingLevel)
         self.serviceBridge = bridge
-        self.serviceWorkUsage = bridge.canonicalWorkUsage
+        self.serviceWorkUsageInventory = bridge.canonicalWorkUsageInventory
         self.serviceAttachmentKey = bridge.serviceAttachmentKey
         self.serviceReviewDescriptor = bridge.latestRepositoryReviewDescriptor
         self.serviceReviewHistory = bridge.repositoryReviewHistory
@@ -5502,7 +5502,7 @@ final class LiveRun: Identifiable {
         publish(serviceBridge.historyError, to: \.serviceHistoryError)
         publish(serviceBridge.recordedModelContext, to: \.recordedModelContext)
         publish(serviceBridge.canonicalWorkingState, to: \.canonicalWorkingState)
-        publish(serviceBridge.canonicalWorkUsage, to: \.serviceWorkUsage)
+        publish(serviceBridge.canonicalWorkUsageInventory, to: \.serviceWorkUsageInventory)
         publish(serviceBridge.latestRepositoryReviewDescriptor, to: \.serviceReviewDescriptor)
         publish(serviceBridge.repositoryReviewHistory, to: \.serviceReviewHistory)
         // This is canonical Session evidence (input.accepted/message history), not a Start

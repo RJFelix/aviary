@@ -1,6 +1,15 @@
 import Foundation
 @testable import AviaryCore
 
+private func agentHandleJournalLifecycleTestHome() throws -> AgentHome {
+    let root = FileManager.default.temporaryDirectory.appending(
+        path: "ahjl-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(
+        at: root, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: NSNumber(value: Int16(0o700))])
+    return AgentHome(root: root)
+}
+
 private struct AgentHandleJournalLifecycleFixture {
     let home: AgentHome
     let work: WorkRef
@@ -38,7 +47,7 @@ private func agentHandleLifecycleDraft(
 private func makeAgentHandleJournalLifecycleFixture(
     suffix: String
 ) async throws -> AgentHandleJournalLifecycleFixture {
-    let home = scratchHome()
+    let home = try agentHandleJournalLifecycleTestHome()
     let work = WorkRef(
         workHostID: try home.requirePersistedWorkHostID(),
         workID: "agent-handle-lifecycle-work-\(suffix)")
@@ -134,8 +143,8 @@ private func agentHandleLifecycleCommand(
 }
 
 func testWorkAgentHandleJournalRejectsSameIdentityFromWrongHome() async throws {
-    let routeHome = scratchHome()
-    let foreignHome = scratchHome()
+    let routeHome = try agentHandleJournalLifecycleTestHome()
+    let foreignHome = try agentHandleJournalLifecycleTestHome()
     defer {
         try? FileManager.default.removeItem(at: routeHome.root)
         try? FileManager.default.removeItem(at: foreignHome.root)

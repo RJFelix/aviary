@@ -1,7 +1,9 @@
 # Provider usage and optional execution limits
 
-Status: implementation in progress, 2026-09-12. No token/spend limit is claimed complete.
-Background agents remain unlimited by default, until stopped or finished.
+Status: implementation verified, 2026-09-12. Optional child policies, normal-daemon activation,
+shared usage inventory, and policy presentation pass the cross-platform checks below;
+installation is blocked on retirement of the old user service. Background agents remain
+unlimited by default, until stopped or finished.
 
 ## Accounting contract
 
@@ -57,8 +59,9 @@ lower bounds, never authority for admitting a hard spend-limited crossing.
 
 ## Settlement integration boundaries
 
-Foundation checkpoint: `a89a478`. Native settlement integration is verified as a backend checkpoint;
-child accounting, finite limits, and Work-scoped GUI usage remain subsequent integration work.
+Foundation checkpoint: `a89a478`; native settlement checkpoint: `c3d3be9`; child accounting and
+parent-direct shared Work usage checkpoint: `656c0d1`. Optional child policies and combined
+parent/child Work inventory are subsequent integration work.
 Provider setup has its own action kind; only context-qualified model requests can create provider
 admissions. A protocol-completed response without any usage report remains successful with unknown
 accounting. Neither absent measurements nor malformed observations become zero-cost evidence.
@@ -116,11 +119,20 @@ and inspects canonical state, explicit reads replay, and post-End cold child rea
 the journal. Retaining an independent cold writer indefinitely would obstruct the service's
 canonical readers; shared writer/read ownership is a separate performance increment.
 
-The GUI presents parent-direct usage once per Work, shared across its attached chats, with explicit
-unknowns, lower bounds, outstanding outcomes, and configured-rate cost estimates. Child agents are
-explicitly excluded from that card. This is not yet an all-Work usage inventory or child total.
+The normal-daemon stress journey exposed another pre-append boundary: a cold child writer can
+lose the advisory lock to an ordinary canonical reader after the parent Run closes. A typed
+`competingWriter` error during construction proves that this attempt has not appended anything;
+bounded acquisition retry is safe there. This does not authorize retrying an append or close
+failure, retaining the cold writer forever, or treating an unsettled crossing as zero usage.
+This correction needs both deliberate lock-contention coverage and repeated real-daemon runs.
 
-Remaining integration, in order:
+The GUI now presents main-agent, background-agent, and combined usage once per Work, shared across
+attached chats. The trusted controller produces this inventory from canonical aggregates, without
+summing a Work again for each Session. Unknowns, lower bounds, outstanding outcomes, and configured
+rates remain explicit. Missing child facts withhold the combined total, not a valid main-agent
+subtotal. Fixture rendering checks layout; it does not certify the installed application.
+
+Implemented integration:
 
 1. Persist an immutable optional child execution policy at Handle admission. Token and USD fields
    are cooperative thresholds over that child's canonical aggregate, not the parent Work's total.
@@ -138,26 +150,54 @@ Remaining integration, in order:
    A second daemon currently blocks on that lock, so startup must retain a truthful bounded failure
    path. Do not add a second competing ownership mechanism or reconstruct lost child processes from
    journal history.
-4. Prove the real daemon/Python path with unlimited default, parent End, second-client observation,
-   explicit stop, token/cost/time limits, compaction, unknown reports, and daemon shutdown/restart.
-   Show child policies and outcomes in the canonical activity UI; aggregate Work inventory by exact
-   Work identity without summing the same Work once per Session.
-5. Deploy only after the v5 drain/reconciliation and recoverable inventory rotation described below.
+4. The real normal-daemon/Python journey covers parent End, second-client observation, explicit
+   stop and shutdown refusal while a child remains. Provider/resource and callback fixtures cover
+   token/cost/time policies, compaction and unknown reports; these are separate proof layers, not
+   a claim that every policy permutation ran through the complete GUI. Policy and usage views are
+   wired to canonical projections. Standalone fallback children also default to unlimited, with
+   a real Python fixture exceeding twenty provider turns and retaining an explicit ceiling option.
+
+Remaining: deploy only after the v5 drain/reconciliation and recoverable inventory rotation
+described below. Real installed-app
+policy/usage journeys remain a deployment acceptance step.
 
 Finite token/spend policies will refuse further dispatch when prior exposure cannot be bounded,
-and surface an explicit attention state. Unlimited execution remains the default. A caller may
-change or remove an optional limit; reconnecting or retrying must never silently waive it.
+and surface an explicit attention state. Unlimited execution remains the default. Policy is
+immutable for an admitted child; a different policy requires a new explicit child admission.
+Reconnecting or retrying must never silently waive a limit.
 Postpaid reported-token and configured-price thresholds are not hard billing caps.
 
 ## Verification boundary
+
+Current integrated macOS run: 1,401 cases / 20,840 assertions pass in 558.56s. The final
+portable lock regression adds 1 case / 6 assertions; journal contention/lifecycle coverage
+passes 13 cases / 137 assertions after rebuilding SelfTest, aviaryd and Aviary. The standalone
+Python child fixture runs 22 provider crossings by default and exactly 20 with an explicit limit.
+Main/child/combined usage fixtures were rendered and inspected at wide and 520-point widths.
+These are debug/fixture receipts, not an installed-user-service upgrade.
+
+The first Linux run exposed a real portability bug: exclusive-lock construction ignored
+`O_NONBLOCK`. It blocked rather than producing the typed pre-append contention result, so an
+upper-layer retry budget could not apply. The Linux wrapper now maps that flag to `LOCK_NB`
+and preserves errno across descriptor cleanup; no-flag callers remain blocking. A held-lock
+regression has an independent watchdog so the old bug fails instead of hanging the suite.
+The corrected Linux Swift 6.3.3 run passes 41 grouped cases / 7,774 assertions in 324.82s,
+including real normal-daemon child execution and parent-End survival. SelfTest and aviaryd build.
+Snapshot `aviary-linux-child-limits-20260912-v1` has a 354-entry source manifest SHA-256
+`565d4d3faea5875c6ad811d5c0b46bae612f9e028ae0609b59c935d9e5e8a91e`.
+All entries matched before building; only Package.resolved changed for the Linux dependency graph.
+The final UI-copy-only rebuild and narrow render pass separately on macOS. No paid provider calls
+or external transcript edits were used.
 
 Child accounting: Linux Swift 6.3.3 snapshot `aviary-linux-child-accounting-20260912-v1`
 builds SelfTest and aviaryd; 41 grouped cases / 7,243 assertions pass in 272.44s. Its 334-entry
 source manifest SHA-256 is `0346008404fa5548022ef813bf9ea5753016995128c39e00916183e331117ce7`.
 The macOS 1,355-case run exposed a replacement-file permission fixture, a wrong-coordinator
 deadline fixture, and an uncontrolled telemetry batching expectation. Their focused corrections
-pass (writer 1/4, deadline 1/8, drain 5/63); a fresh complete macOS run is required before this
-checkpoint is called broadly verified. These corrections change tests, not production semantics.
+pass (writer 1/4, deadline 1/8, drain 5/63), followed by a complete green run of checkpoint
+`656c0d1`: 1,355 cases / 20,342 assertions in 526.72s. These corrections change tests, not
+production semantics. Later production activation/optional-limit edits are not certified by
+that checkpoint's binaries or receipts.
 The child accounting, exact-state, and provider-dispatch focused proofs pass; no paid calls were
 made. The shared-usage card is not yet visually verified or installed.
 
@@ -168,7 +208,9 @@ its selected suite passes 41 grouped cases / 7,023 assertions in 256.20s. Snapsh
 `2c088d43857fad7bd2e2ae16296a01a96772e55ad8c4422a620369f12825b423`); only Package.resolved
 differs for the platform dependency graph. These are deterministic-provider tests, not paid calls.
 
-This checkpoint is deliberately not installed over the running `a89a478` GUI/service pair.
+This checkpoint is deliberately not installed over the existing user service. The bundle files
+on disk identify `a89a478`, but a read-only handshake found that the older in-memory daemon speaks
+protocol v3; replacing files did not replace that process.
 The provider journal contract is incompatible with older provider actions. Before deployment,
 bump the exact Work-service protocol to v5, prove old-version rejection without replacement,
 drain the old service and reconcile its pending mutation intents, then recoverably archive/rotate
@@ -176,6 +218,11 @@ the disposable Aviary-native Work Host inventory. Rebuilding derived caches cann
 provider admissions or settlements. Do not weaken catalog completeness to hide old invalid Works;
 they would otherwise prevent reconstruction of healthy new Works. External Claude/Codex stores
 are excluded from this operation. If old Work cannot be proven quiescent, stop for user direction.
+The current read-only inventory found six old Works, two reporting recovery-required, plus two
+retained pending chats without reconciled creation receipts. A permitted graceful SIGTERM did
+not stop PID 28101; stdout/stderr are `/dev/null`, so this is not a captured refusal-reason proof.
+Do not escalate, replace the bundle, or replay those prompts without an explicit retirement
+decision. Retain pending chats and drafts byte-for-byte independently of inventory rotation.
 
 The foundation's final macOS run passes 1,317 cases / 19,852 assertions in 517.83s, including
 terminal-protocol and superseded-End race regressions. Signed `just build` passes. The production

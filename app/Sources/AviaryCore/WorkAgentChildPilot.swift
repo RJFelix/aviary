@@ -1,6 +1,7 @@
 import Foundation
 
-/// Host-private opt-in. No persisted or remote configuration can enable this pilot yet.
+/// Host-private composition. The durable resolver supplies the owning coordinator and a fresh
+/// runtime factory; persisted or remote configuration cannot inject either capability.
 internal struct WorkAgentChildPilot: Sendable {
     let coordinator: WorkAgentChildCoordinator
     let deadline: Date?
@@ -24,11 +25,26 @@ internal struct WorkAgentChildPilot: Sendable {
 /// authorization layer and never enumerate children belonging to other attached Sessions.
 internal protocol WorkAgentSpawnDelegate: Agent.SpawnDelegate {
     func startWorkChild(
-        callbackID: String, prompt: String, name: String?, model: String?, depth: Int
+        callbackID: String, prompt: String, name: String?, model: String?, depth: Int,
+        policy: WorkAgentSpawnPolicy
     ) async -> Agent.SpawnStartResult
     func handleStatus(id: String) async -> JSONValue
     func handleResult(id: String, offset: Int) async -> JSONValue
     func handleAwaitInterest(id: String, observerID: String, awaited: Bool) async -> JSONValue
+}
+
+extension WorkAgentSpawnDelegate {
+    /// Omitting a policy is a one-way unlimited convenience for in-process callers. The
+    /// protocol witness is policy-aware, so finite limits cannot silently downgrade to an
+    /// unlimited child.
+    func startWorkChild(
+        callbackID: String, prompt: String, name: String?, model: String?, depth: Int
+    ) async -> Agent.SpawnStartResult {
+        await startWorkChild(
+            callbackID: callbackID, prompt: prompt, name: name, model: model, depth: depth,
+            policy: .unlimited)
+    }
+
 }
 
 internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
@@ -37,6 +53,7 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
         let name: String?
         let model: String?
         let depth: Int
+        let policy: WorkAgentSpawnPolicy
     }
     private struct Attempt {
         let request: Request
@@ -65,7 +82,8 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
     /// At-least-once callbacks in this live Run share one admission task. An uncertain admission
     /// is retained as the same Handle, not retried. This is not cross-host execution recovery.
     func startWorkChild(
-        callbackID: String, prompt: String, name: String?, model: String?, depth: Int
+        callbackID: String, prompt: String, name: String?, model: String?, depth: Int,
+        policy: WorkAgentSpawnPolicy
     ) async -> Agent.SpawnStartResult {
         let label = name ?? "child"
         guard !callbackID.isEmpty, callbackID.utf8.count <= 512,
@@ -76,7 +94,8 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
                 || model == configuration.model.qualifiedID else {
             return .refused(name: label, reason: "Invalid Work child request or unsupported model/depth.")
         }
-        let request = Request(prompt: prompt, name: name, model: model, depth: depth)
+        let request = Request(
+            prompt: prompt, name: name, model: model, depth: depth, policy: policy)
         if let prior = attempts[callbackID] {
             guard prior.request == request else {
                 return .refused(name: label, reason: "The callback identity already names another request.")
@@ -90,10 +109,20 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
         let configuration = self.configuration
         let admissionContext = AviaryTelemetry.context
         let task = Task<Agent.SpawnStartResult, Never> {
+            let deadline: Date?
+            do {
+                deadline = try policy.absoluteDeadline(
+                    now: Date(), pilotDeadline: pilot.deadline)
+            } catch {
+                return .refused(
+                    name: label,
+                    reason: "The child deadline could not be represented as a future host deadline.")
+            }
             do {
                 let admission = try await pilot.coordinator.admit(
                     origin: configuration.workRunBinding, prompt: prompt, label: label,
-                    deadline: pilot.deadline,
+                    deadline: deadline,
+                    executionLimits: policy.executionLimits,
                     makeExecution: { handle, deadline in
                         AgentChildExecutionResource(
                             configuration: AgentChildExecutionConfiguration(
@@ -118,7 +147,7 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
             } catch WorkAgentChildCoordinator.Failure.admissionUncertain(let handle) {
                 return .workOwned(
                     handleID: handle.handleID, name: label,
-                    deadline: pilot.deadline, admissionUncertain: true)
+                    deadline: deadline, admissionUncertain: true)
             } catch {
                 return .refused(name: label, reason: "Work child admission was refused; no request was replayed.")
             }
@@ -151,11 +180,15 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
                 "id": .string(id), "name": .string(row.label), "ownership": .string("work"),
                 "state": .string(row.state.rawValue),
                 "deadline": row.deadline.map { .number($0.timeIntervalSince1970) } ?? .null,
+                "execution_limits": row.executionLimits.timelineValue,
                 "result_recorded": .bool(row.resultBody != nil),
                 "source_event_id": .string(row.latestLifecycleEvent.eventID),
             ]
             if let outcome = row.terminalOutcome { payload["outcome"] = .string(outcome.rawValue) }
             if let cleanup = row.cleanup { payload["cleanup"] = .string(cleanup.state.rawValue) }
+            if let refusal = row.terminalEvidence?.limitRefusal {
+                payload["limit_reason"] = .string(refusal.decision.rawValue)
+            }
             return .object(payload)
         } catch { return failure("The Handle is unknown or canonical Work state is unavailable. No work was restarted.") }
     }

@@ -150,6 +150,8 @@ internal actor WorkAgentChildProviderLedger: ChildProviderAccounting {
     private var latest: EventRef
     private var unavailable = false
     private var mutating = false
+    private let executionLimits: WorkAgentExecutionLimits
+    private var limitRefusal: WorkAgentExecutionLimitRefusal?
 
     init(journal: WorkAgentHandleJournal, record: BoundedWorkAgentHandleIndexRecord) throws {
         guard record.state == .running, let execution = record.startedEvent,
@@ -163,12 +165,24 @@ internal actor WorkAgentChildProviderLedger: ChildProviderAccounting {
         usage = record.providerAccounting.usage
         pending = record.providerAccounting.pending
         latest = record.providerAccounting.latestEvent ?? execution
+        executionLimits = record.executionLimits
     }
 
     func begin(_ admission: ProviderAdmission, requestModel: String, targetModel: String) async throws {
         guard !unavailable, !mutating, pending == nil,
               usage.started < Int.max else { throw WorkAgentProviderAccounting.Failure.unavailable }
         try admission.validate(contextModelID: requestModel, targetModel: targetModel)
+        if let limitRefusal { throw limitRefusal }
+        let decision = try executionLimits.admissionDecision(for: usage, providerAdmission: admission)
+        guard decision == .allow else {
+            let refusal = try WorkAgentExecutionLimitRefusal(decision: decision, admission: admission)
+            limitRefusal = refusal
+            AviaryTelemetry.event("aviary.agent_child.provider.limit_refused", attributes: [
+                "aviary.outcome": .string("limited"),
+                "aviary.agent_child.limit.reason": .string(decision.rawValue),
+            ])
+            throw refusal
+        }
         var nextUsage = usage
         try nextUsage.recordStarted()
         try await commit(type: TimelineEventType.agentHandleProviderStarted,

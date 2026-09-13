@@ -1885,6 +1885,7 @@ public enum WorkAgentHandleTerminalOutcome: String, Codable, Hashable, Sendable 
     case failed
     case canceled
     case expired
+    case limited
     /// The prior host observed execution but cannot prove either its result or clean cancellation.
     case indeterminate
 }
@@ -1929,19 +1930,23 @@ public struct WorkAgentHandleQueuedPayload: Codable, Hashable, Sendable {
     /// Optional deadline policy. Nil means the child is not eligible for deadline expiry.
     public let deadline: Date?
     public let requestBody: TimelineBodyReference
+    public let executionLimits: WorkAgentExecutionLimits
 
     public init(
         origin: WorkAgentHandleOrigin, label: String, deadline: Date? = nil,
-        requestBody: TimelineBodyReference
+        requestBody: TimelineBodyReference,
+        executionLimits: WorkAgentExecutionLimits = .unlimited
     ) {
         self.origin = origin
         self.label = label
         self.deadline = deadline
         self.requestBody = requestBody
+        self.executionLimits = executionLimits
     }
 
     private enum CodingKeys: String, CodingKey {
         case origin, label, deadline, requestBody = "request_body"
+        case executionLimits = "execution_limits"
     }
 
     public init(from decoder: Decoder) throws {
@@ -1958,6 +1963,8 @@ public struct WorkAgentHandleQueuedPayload: Codable, Hashable, Sendable {
         self.deadline = try container.decodeIfPresent(Date.self, forKey: .deadline)
         self.requestBody = try container.decode(
             TimelineBodyReference.self, forKey: .requestBody)
+        self.executionLimits = try container.decodeIfPresent(
+            WorkAgentExecutionLimits.self, forKey: .executionLimits) ?? .unlimited
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1968,6 +1975,9 @@ public struct WorkAgentHandleQueuedPayload: Codable, Hashable, Sendable {
         // schema and never confuse omission with an older payload shape.
         try container.encode(deadline, forKey: .deadline)
         try container.encode(requestBody, forKey: .requestBody)
+        if executionLimits != .unlimited {
+            try container.encode(executionLimits, forKey: .executionLimits)
+        }
     }
 }
 
@@ -2054,19 +2064,30 @@ public struct WorkAgentHandleTerminalPayload: Codable, Hashable, Sendable {
     public let outcome: WorkAgentHandleTerminalOutcome
     public let resultBody: TimelineBodyReference?
     public let cleanup: WorkAgentHandleCleanupProof
+    public let limitRefusal: WorkAgentExecutionLimitRefusal?
+    /// The instant the owned execution resource returned its terminal settlement. This is
+    /// retained only for `.limited`, whose refusal may be recorded after an absolute deadline
+    /// while waiting for the Work journal gate.
+    public let executionSettledAt: Date?
 
     public init(
         outcome: WorkAgentHandleTerminalOutcome,
         resultBody: TimelineBodyReference? = nil,
-        cleanup: WorkAgentHandleCleanupProof
+        cleanup: WorkAgentHandleCleanupProof,
+        limitRefusal: WorkAgentExecutionLimitRefusal? = nil,
+        executionSettledAt: Date? = nil
     ) {
         self.outcome = outcome
         self.resultBody = resultBody
         self.cleanup = cleanup
+        self.limitRefusal = limitRefusal
+        self.executionSettledAt = executionSettledAt
     }
 
     private enum CodingKeys: String, CodingKey {
         case outcome, resultBody = "result_body", cleanup
+        case limitRefusal = "limit_refusal"
+        case executionSettledAt = "execution_settled_at"
     }
 }
 
@@ -2075,17 +2096,23 @@ public struct WorkAgentHandleTerminalEvidence: Codable, Hashable, Sendable {
     public let resultBody: TimelineBodyReference?
     public let cleanup: WorkAgentHandleCleanupProof
     public let event: WorkAgentHandleEventEvidence
+    public let limitRefusal: WorkAgentExecutionLimitRefusal?
+    public let executionSettledAt: Date?
 
     public init(
         outcome: WorkAgentHandleTerminalOutcome,
         resultBody: TimelineBodyReference? = nil,
         cleanup: WorkAgentHandleCleanupProof,
-        event: WorkAgentHandleEventEvidence
+        event: WorkAgentHandleEventEvidence,
+        limitRefusal: WorkAgentExecutionLimitRefusal? = nil,
+        executionSettledAt: Date? = nil
     ) {
         self.outcome = outcome
         self.resultBody = resultBody
         self.cleanup = cleanup
         self.event = event
+        self.limitRefusal = limitRefusal
+        self.executionSettledAt = executionSettledAt
     }
 }
 
@@ -2110,12 +2137,14 @@ public struct WorkAgentHandleSnapshot: Codable, Hashable, Sendable {
     /// Optional deadline policy. Nil means the child is not eligible for deadline expiry.
     public let deadline: Date?
     public let requestBody: TimelineBodyReference
+    public let executionLimits: WorkAgentExecutionLimits
     public var state: WorkAgentHandleState
     public var cancellationEvidence: WorkAgentHandleCancellationEvidence?
     public var terminalEvidence: WorkAgentHandleTerminalEvidence?
     public var reapReason: WorkAgentHandleReapReason?
     public let queuedEvent: EventRef
     public var startedEvent: EventRef?
+    public var executionStartedAt: Date?
     public var latestLifecycleEvent: EventRef
     public var reapedEvent: EventRef?
     public var providerAccounting = WorkAgentProviderAccounting()
@@ -2138,17 +2167,51 @@ public struct WorkAgentHandleSnapshot: Codable, Hashable, Sendable {
 
     public init(
         handle: HandleRef, origin: WorkAgentHandleOrigin, label: String, deadline: Date? = nil,
-        requestBody: TimelineBodyReference, queuedEvent: EventRef
+        requestBody: TimelineBodyReference, queuedEvent: EventRef,
+        executionLimits: WorkAgentExecutionLimits = .unlimited
     ) {
         self.handle = handle
         self.origin = origin
         self.label = label
         self.deadline = deadline
         self.requestBody = requestBody
+        self.executionLimits = executionLimits
         self.state = .queued
         self.queuedEvent = queuedEvent
         self.startedEvent = nil
+        self.executionStartedAt = nil
         self.latestLifecycleEvent = queuedEvent
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case handle, origin, label, deadline, requestBody, state
+        case cancellationEvidence, terminalEvidence, reapReason, queuedEvent, startedEvent
+        case executionStartedAt, latestLifecycleEvent, reapedEvent, providerAccounting, executionLimits
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        handle = try container.decode(HandleRef.self, forKey: .handle)
+        origin = try container.decode(WorkAgentHandleOrigin.self, forKey: .origin)
+        label = try container.decode(String.self, forKey: .label)
+        deadline = try container.decodeIfPresent(Date.self, forKey: .deadline)
+        requestBody = try container.decode(TimelineBodyReference.self, forKey: .requestBody)
+        executionLimits = try container.decode(
+            WorkAgentExecutionLimits.self, forKey: .executionLimits)
+        state = try container.decode(WorkAgentHandleState.self, forKey: .state)
+        cancellationEvidence = try container.decodeIfPresent(
+            WorkAgentHandleCancellationEvidence.self, forKey: .cancellationEvidence)
+        terminalEvidence = try container.decodeIfPresent(
+            WorkAgentHandleTerminalEvidence.self, forKey: .terminalEvidence)
+        reapReason = try container.decodeIfPresent(
+            WorkAgentHandleReapReason.self, forKey: .reapReason)
+        queuedEvent = try container.decode(EventRef.self, forKey: .queuedEvent)
+        startedEvent = try container.decodeIfPresent(EventRef.self, forKey: .startedEvent)
+        executionStartedAt = try container.decodeIfPresent(Date.self, forKey: .executionStartedAt)
+        latestLifecycleEvent = try container.decode(EventRef.self, forKey: .latestLifecycleEvent)
+        reapedEvent = try container.decodeIfPresent(EventRef.self, forKey: .reapedEvent)
+        providerAccounting = try container.decode(
+            WorkAgentProviderAccounting.self, forKey: .providerAccounting)
     }
 }
 
@@ -2308,6 +2371,13 @@ internal extension WorkSnapshot {
         try providerUsage.validate()
         if let journal {
             for handle in agentHandles.values {
+                guard (try? handle.executionLimits.validate()) != nil,
+                      (handle.startedEvent == nil) == (handle.executionStartedAt == nil),
+                      handle.executionStartedAt.map({
+                          $0.timeIntervalSince1970.isFinite
+                      }) ?? true else {
+                    throw CompleteProviderUsageProjectionError.invalidActionEvidence
+                }
                 try handle.providerAccounting.validate(
                     origin: handle.origin, handle: handle.handle, execution: handle.startedEvent,
                     journal: journal, lastSequence: lastSequence)
@@ -2322,6 +2392,26 @@ internal extension WorkSnapshot {
                           proof.previousEventID.flatMap({ eventSequences[$0] }) == proof.sequence - 1,
                           proof.causedByEventID.flatMap({ eventSequences[$0.eventID] }).map({ $0 < proof.sequence }) == true
                     else { throw CompleteProviderUsageProjectionError.invalidActionEvidence }
+                }
+                if let terminal = handle.terminalEvidence {
+                    if terminal.outcome == .limited {
+                        guard terminal.cleanup.state == .quiesced,
+                              handle.providerAccounting.pending == nil,
+                              let refusal = terminal.limitRefusal,
+                              let startedAt = handle.executionStartedAt,
+                              let settledAt = terminal.executionSettledAt,
+                              settledAt.timeIntervalSince1970.isFinite,
+                              settledAt >= startedAt,
+                              settledAt <= terminal.event.hostRecordedAt,
+                              (try? refusal.validate(
+                                  limits: handle.executionLimits,
+                                  usage: handle.providerAccounting.usage)) != nil,
+                              handle.deadline.map({ settledAt < $0 }) ?? true
+                        else { throw CompleteProviderUsageProjectionError.invalidActionEvidence }
+                    } else if terminal.limitRefusal != nil
+                                || terminal.executionSettledAt != nil {
+                        throw CompleteProviderUsageProjectionError.invalidActionEvidence
+                    }
                 }
             }
         } else if !agentHandles.isEmpty {

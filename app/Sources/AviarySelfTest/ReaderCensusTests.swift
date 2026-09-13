@@ -88,7 +88,9 @@ func test_readerCensusRecordedAgentsSurviveParentEnd() throws {
         XCTAssertFalse(metadata.contains("private-agent-label-secret"))
         XCTAssertFalse(metadata.contains("request_body"))
         XCTAssertFalse(metadata.contains("result_body"))
-        XCTAssertFalse(metadata.contains("deadline"))
+        XCTAssertTrue(report.agentHandles.allSatisfy {
+            $0.deadline == Date(timeIntervalSinceReferenceDate: 1_000)
+        }, "admitted deadlines are safe policy metadata; request and result bodies stay private")
     }
     // An unknown runtime event is preserved as an unknown, never interpreted as zero agents.
     let lastLine = try XCTUnwrap(workData.split(separator: 0x0A).last)

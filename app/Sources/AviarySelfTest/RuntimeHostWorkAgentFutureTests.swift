@@ -20,6 +20,17 @@ private final class WorkFutureSpawnCounter: @unchecked Sendable {
     func next() -> Int { lock.withLock { value += 1; return value } }
 }
 
+private final class WorkFutureSpawnPolicyCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedPayload: JSONValue?
+
+    func record(_ payload: JSONValue) {
+        lock.withLock { storedPayload = payload }
+    }
+
+    var payload: JSONValue? { lock.withLock { storedPayload } }
+}
+
 private actor WorkFutureInterestGate {
     private var observed = false
     private var released = false
@@ -60,10 +71,11 @@ private func workFuturePythonRoot() -> URL? {
 }
 
 private func withWorkFutureHost<Value: Sendable>(
-    root: URL,
+    root: URL, variant: String = "python3",
     body: @Sendable (RuntimeHost, String) async throws -> Value
 ) async throws -> Value {
-    guard let host = RuntimeHost.bundledPython(repoRoot: root, parentLifetimeLease: true)
+    guard let host = RuntimeHost.bundledPython(
+        repoRoot: root, variant: variant, parentLifetimeLease: true)
     else { throw RuntimeHost.HostError.invalidEndpoint("bundled Python host is unavailable") }
     do {
         _ = try await host.start()
@@ -394,6 +406,150 @@ func test_runtimeHostWorkFutureWithoutDeadlineUsesCanonicalCompletion() async th
     }
 }
 
+func test_runtimeHostWorkFutureForwardsBoundedSpawnPolicy() async throws {
+    let root = try XCTUnwrap(workFuturePythonRoot())
+    for variant in ["python3", "python3-shared"] {
+        try await withWorkFutureHost(root: root, variant: variant) { host, session in
+            let capture = WorkFutureSpawnPolicyCapture()
+            let spawnCounter = WorkFutureSpawnCounter()
+            let statusCounter = WorkFutureSpawnCounter()
+            let body = Data("shared-work-future-result".utf8)
+            let digest = "sha256:" + AviarySHA256.hash(data: body).description
+            let deadline = Date().addingTimeInterval(60).timeIntervalSince1970
+            await host.onCallback { _, _, kind, payload in
+                switch kind {
+                case "spawn":
+                    capture.record(payload)
+                    let id: String
+                    switch spawnCounter.next() {
+                    case 1: id = "bounded-policy-child"
+                    case 2: id = "limited-policy-child"
+                    default: id = "unknown-limited-policy-child"
+                    }
+                    return workFutureRecord(
+                        id: id, deadline: deadline,
+                        state: "admitted", outcome: nil)
+                case "agent_handle_await":
+                    return .object(["accepted": .bool(true)])
+                case "agent_handle_status":
+                    let id = payload["id"]?.stringValue ?? "unknown"
+                    let statusIndex = statusCounter.next()
+                    if id == "bounded-policy-child" {
+                        let state = statusIndex < 2 ? "running" : "terminal"
+                        return workFutureRecord(
+                            id: id, deadline: deadline,
+                            state: state, outcome: state == "terminal" ? "succeeded" : nil)
+                    }
+                    if id == "limited-policy-child" {
+                        return .object([
+                            "id": .string(id), "name": .string("future-child"),
+                            "ownership": .string("work"), "state": .string("terminal"),
+                            "deadline": .number(deadline), "outcome": .string("limited"),
+                            "limit_reason": .string("tokenThresholdReached"),
+                        ])
+                    }
+                    if id == "unknown-limited-policy-child" {
+                        return .object([
+                            "id": .string(id), "name": .string("future-child"),
+                            "ownership": .string("work"), "state": .string("terminal"),
+                            "deadline": .number(deadline), "outcome": .string("limited"),
+                            "limit_reason": .string("private-provider-detail"),
+                        ])
+                    }
+                    return workFutureRecord(
+                        id: id, deadline: deadline, state: "terminal", outcome: "failed")
+                case "agent_handle_result":
+                    let offset = payload["offset"]?.intValue ?? 0
+                    return .object([
+                        "id": .string("bounded-policy-child"),
+                        "offset": .number(Double(offset)),
+                        "next_offset": .number(Double(body.count)),
+                        "byte_count": .number(Double(body.count)),
+                        "body_digest": .string(digest),
+                        "data_base64": .string(body.base64EncodedString()),
+                        "eof": .bool(true),
+                    ])
+                default:
+                    return .object(["error": .string("unexpected callback")])
+                }
+            }
+
+            let valid = try await host.execute(
+                "child = spawn('bounded', name='bounded', timeout=2.5, "
+                    + "token_limit=9223372036854775807, cost_limit_usd=0.25)\n"
+                    + "(child.aviary_id, child.aviary_ownership, child.cancel(), "
+                    + "child.result(timeout=5))",
+                in: session, timeout: 10)
+            XCTAssertNil(valid.exception)
+            XCTAssertEqual(
+                valid.value,
+                "('bounded-policy-child', 'work', False, 'shared-work-future-result')")
+
+            let payload = try XCTUnwrap(capture.payload)
+            XCTAssertEqual(payload["prompt"]?.stringValue, "bounded")
+            XCTAssertEqual(payload["name"]?.stringValue, "bounded")
+            XCTAssertEqual(payload["timeout"]?.doubleValue, 2.5)
+            XCTAssertEqual(payload["token_limit"]?.stringValue, "9223372036854775807")
+            XCTAssertEqual(payload["cost_limit_usd"]?.doubleValue, 0.25)
+
+            let failed = try await host.execute("""
+            child = spawn('failed')
+            try:
+                child.result(timeout=5)
+                failure = 'unexpected success'
+            except RuntimeError as error:
+                failure = str(error)
+            (child.aviary_id, failure)
+            """, in: session, timeout: 10)
+            XCTAssertNil(failed.exception)
+            XCTAssertEqual(
+                failed.value,
+                "('limited-policy-child', 'Work Handle was limited (token threshold reached)')")
+
+            let unknownLimited = try await host.execute("""
+            child = spawn('unknown-limited')
+            try:
+                child.result(timeout=5)
+                failure = 'unexpected success'
+            except RuntimeError as error:
+                failure = str(error)
+            (child.aviary_id, failure)
+            """, in: session, timeout: 10)
+            XCTAssertNil(unknownLimited.exception)
+            XCTAssertEqual(
+                unknownLimited.value,
+                "('unknown-limited-policy-child', 'Work Handle was limited (execution limit reached)')")
+
+            let rejected = try await host.execute("""
+        rejected = []
+        for value in [True, 0, -1, float('inf'), 10 ** 1000]:
+            try:
+                spawn('bad-timeout', timeout=value)
+                rejected.append(False)
+            except (TypeError, ValueError):
+                rejected.append(True)
+        for value in [True, 0, -1, 9223372036854775808, '1']:
+            try:
+                spawn('bad-token', token_limit=value)
+                rejected.append(False)
+            except (TypeError, ValueError):
+                rejected.append(True)
+        for value in [True, 0, -1, float('inf'), 10 ** 1000]:
+            try:
+                spawn('bad-cost', cost_limit_usd=value)
+                rejected.append(False)
+            except (TypeError, ValueError):
+                rejected.append(True)
+        rejected
+        """, in: session, timeout: 5)
+            XCTAssertNil(rejected.exception)
+            XCTAssertEqual(
+                rejected.value,
+                "[True, True, True, True, True, True, True, True, True, True, True, True, True, True, True]")
+        }
+    }
+}
+
 func test_runtimeHostWorkFutureAttachAgentIsHiddenFromNamespaceInspection() async throws {
     guard let root = workFuturePythonRoot() else { return }
     try await withWorkFutureHost(root: root) { host, session in
@@ -417,6 +573,9 @@ func test_runtimeHostWorkFutureAttachAgentIsHiddenFromNamespaceInspection() asyn
 }
 
 let casesRuntimeHostWorkAgentFuture: [Case] = [
+    ("runtimeHost work Future forwards bounded spawn policy", {
+        try await test_runtimeHostWorkFutureForwardsBoundedSpawnPolicy()
+    }),
     ("runtimeHost work Future with no deadline waits for canonical completion", {
         try await test_runtimeHostWorkFutureWithoutDeadlineUsesCanonicalCompletion()
     }),

@@ -31,6 +31,7 @@ internal actor WorkAgentChildCoordinator {
     typealias ExecutionFactory = @Sendable (HandleRef, Date?) -> any WorkAgentChildExecution
     typealias BeforeAdmissionCommit = @Sendable () async -> Void
     typealias BeforeStartCommit = @Sendable () async -> Void
+    typealias BeforeTerminalCommit = @Sendable (WorkAgentHandleTerminalOutcome) async -> Void
 
     static let maximumPromptBytes = 64 * 1_024
     static let maximumRegisteredWorks = 256
@@ -127,6 +128,7 @@ internal actor WorkAgentChildCoordinator {
         let handle: HandleRef
         let label: String
         let deadline: Date?
+        let executionLimits: WorkAgentExecutionLimits
         var queuedAtUptime: TimeInterval?
         let admissionContext: AviaryTraceContext?
         let requestBody: TimelineBodyReference
@@ -147,6 +149,7 @@ internal actor WorkAgentChildCoordinator {
     private nonisolated let admissionSeal: WorkAgentAdmissionSeal
     private let beforeAdmissionCommit: BeforeAdmissionCommit?
     private let beforeStartCommit: BeforeStartCommit?
+    private let beforeTerminalCommit: BeforeTerminalCommit?
     private var queue: WorkAgentChildAdmissionQueue
     private var routes: [WorkRef: Route] = [:]
     private var entries: [Key: Entry] = [:]
@@ -158,13 +161,15 @@ internal actor WorkAgentChildCoordinator {
     init(
         limits: WorkAgentChildAdmissionQueue.Limits? = nil,
         beforeAdmissionCommit: BeforeAdmissionCommit? = nil,
-        beforeStartCommit: BeforeStartCommit? = nil
+        beforeStartCommit: BeforeStartCommit? = nil,
+        beforeTerminalCommit: BeforeTerminalCommit? = nil
     ) throws {
         let chosen = try limits ?? WorkAgentChildAdmissionQueue.Limits()
         self.limits = chosen
         self.admissionSeal = WorkAgentAdmissionSeal()
         self.beforeAdmissionCommit = beforeAdmissionCommit
         self.beforeStartCommit = beforeStartCommit
+        self.beforeTerminalCommit = beforeTerminalCommit
         queue = WorkAgentChildAdmissionQueue(limits: chosen)
     }
 
@@ -261,16 +266,26 @@ internal actor WorkAgentChildCoordinator {
         prompt: String,
         label: String,
         deadline: Date? = nil,
+        executionLimits: WorkAgentExecutionLimits = .unlimited,
         makeExecution: @escaping ExecutionFactory,
         now: Date = Date(),
         admissionContext: AviaryTraceContext? = nil
     ) async throws -> Admission {
         let work = binding.workBinding.work
         let parentContext = admissionContext ?? AviaryTelemetry.context
-        let attributes: [String: AviaryTraceValue] = [
+        var attributes: [String: AviaryTraceValue] = [
             "aviary.work.id": .string(telemetryWorkID(work)),
             "aviary.run.id": .string(AviaryTelemetry.identity(binding.run.runID)),
+            "aviary.agent_child.limit.time_enabled": .bool(deadline != nil),
+            "aviary.agent_child.limit.tokens_enabled": .bool(executionLimits.maximumTokens != nil),
+            "aviary.agent_child.limit.cost_enabled": .bool(executionLimits.maximumEstimatedCostUSD != nil),
         ]
+        if let tokens = executionLimits.maximumTokens {
+            attributes["aviary.agent_child.limit.tokens"] = .int(tokens)
+        }
+        if let cost = executionLimits.maximumEstimatedCostUSD {
+            attributes["aviary.agent_child.limit.estimated_usd"] = .double(cost)
+        }
         return try await AviaryTelemetry.withSpan(
             "aviary.agent_child.admission",
             attributes: attributes,
@@ -280,6 +295,7 @@ internal actor WorkAgentChildCoordinator {
             do {
                 let admission = try await self.admitUntraced(
                     origin: binding, prompt: prompt, label: label, deadline: deadline,
+                    executionLimits: executionLimits,
                     makeExecution: makeExecution, now: now,
                     admissionContext: AviaryTelemetry.context)
                 // The queue event was appended and committed before admitUntraced returns.
@@ -302,6 +318,7 @@ internal actor WorkAgentChildCoordinator {
         prompt: String,
         label: String,
         deadline: Date? = nil,
+        executionLimits: WorkAgentExecutionLimits = .unlimited,
         makeExecution: @escaping ExecutionFactory,
         now: Date = Date(),
         admissionContext: AviaryTraceContext?
@@ -326,6 +343,9 @@ internal actor WorkAgentChildCoordinator {
               label == label.trimmingCharacters(in: .whitespacesAndNewlines),
               label.utf8.count <= WorkAgentHandleSnapshot.maximumLabelBytes else {
             throw Failure.invalidRequest("label must be non-empty, trimmed, and at most 256 bytes")
+        }
+        guard (try? executionLimits.validate()) != nil else {
+            throw Failure.invalidRequest("execution limits are invalid")
         }
         let promptBytes = Data(prompt.utf8)
         guard !promptBytes.isEmpty else { throw Failure.invalidRequest("prompt is empty") }
@@ -356,6 +376,7 @@ internal actor WorkAgentChildCoordinator {
         let key = Key(work: work, handle: handle)
         entries[key] = Entry(
             work: work, origin: origin, handle: handle, label: label, deadline: deadline,
+            executionLimits: executionLimits,
             queuedAtUptime: nil,
             admissionContext: admissionContext,
             requestBody: requestBody, reservation: reservation, factory: makeExecution,
@@ -367,7 +388,8 @@ internal actor WorkAgentChildCoordinator {
             let commit = try await route.journal.append(draft(
                 type: TimelineEventType.agentHandleQueued, entry: entries[key]!,
                 payload: WorkAgentHandleQueuedPayload(
-                    origin: origin, label: label, deadline: deadline, requestBody: requestBody)))
+                    origin: origin, label: label, deadline: deadline, requestBody: requestBody,
+                    executionLimits: executionLimits)))
             try queue.commit(reservation)
             entries[key]?.latestLifecycleEvent = commit.eventRef
             entries[key]?.phase = .queued
@@ -383,7 +405,8 @@ internal actor WorkAgentChildCoordinator {
                 throw Failure.admissionUncertain(handle)
             }
             if let record = canonical, record.origin == origin,
-               record.requestBody == requestBody, record.state == .queued {
+               record.requestBody == requestBody, record.state == .queued,
+               record.executionLimits == executionLimits {
                 try queue.commit(reservation)
                 entries[key]?.latestLifecycleEvent = record.latestLifecycleEvent
                 entries[key]?.phase = .queued
@@ -860,10 +883,13 @@ internal actor WorkAgentChildCoordinator {
             case .failed: outcome = .failed
             case .canceled: outcome = .canceled
             case .expired: outcome = .expired
+            case .limited: outcome = .limited
             }
         }
         var resultBody: TimelineBodyReference?
-        let resultText = outcome == .succeeded ? result.answer : (result.detail ?? result.answer)
+        let resultText = outcome == .succeeded || outcome == .limited
+            ? (outcome == .succeeded ? result.answer : nil)
+            : (result.detail ?? result.answer)
         if let resultText {
             let bytes = Data(resultText.utf8)
             if bytes.count <= WorkAgentHandleSnapshot.maximumBodyBytes {
@@ -873,11 +899,15 @@ internal actor WorkAgentChildCoordinator {
             }
         }
         let finalOutcome: WorkAgentHandleTerminalOutcome =
-            outcome == .succeeded && resultBody == nil ? .failed : outcome
+            outcome == .succeeded && resultBody == nil ? .failed
+            : (outcome == .limited && result.limitRefusal == nil ? .failed : outcome)
+        let limitRefusal = finalOutcome == .limited ? result.limitRefusal : nil
+        let executionSettledAt = finalOutcome == .limited ? settlement.settledAt : nil
         do {
             let commit = try await appendTerminalLocked(
                 entry: entries[key]!, route: route, outcome: finalOutcome,
-                resultBody: resultBody, cleanup: cleanup)
+                resultBody: resultBody, cleanup: cleanup, limitRefusal: limitRefusal,
+                executionSettledAt: executionSettledAt)
             AviaryTelemetry.event(
                 "aviary.agent_child.terminal",
                 attributes: telemetryLifecycleAttributes(
@@ -960,7 +990,8 @@ internal actor WorkAgentChildCoordinator {
         guard
               record.state == .queued, record.origin == entry.origin,
               record.requestBody == entry.requestBody, record.label == entry.label,
-              record.deadline == entry.deadline else { return false }
+              record.deadline == entry.deadline,
+              record.executionLimits == entry.executionLimits else { return false }
         entries[key]?.latestLifecycleEvent = record.latestLifecycleEvent
         entries[key]?.cancellationCause = .deadline
         do {
@@ -1007,14 +1038,19 @@ internal actor WorkAgentChildCoordinator {
 
     private func appendTerminalLocked(
         entry: Entry, route: Route, outcome: WorkAgentHandleTerminalOutcome,
-        resultBody: TimelineBodyReference?, cleanup: WorkAgentHandleCleanupProof
+        resultBody: TimelineBodyReference?, cleanup: WorkAgentHandleCleanupProof,
+        limitRefusal: WorkAgentExecutionLimitRefusal? = nil,
+        executionSettledAt: Date? = nil
     ) async throws -> TimelineJournalCommit {
         let key = Key(work: entry.work, handle: entry.handle)
         guard let latest = entries[key]?.latestLifecycleEvent else { throw Failure.ambiguous }
+        await beforeTerminalCommit?(outcome)
         let commit = try await route.journal.append(draft(
             type: TimelineEventType.agentHandleTerminal, entry: entry,
             causedBy: latest, payload: WorkAgentHandleTerminalPayload(
-                outcome: outcome, resultBody: resultBody, cleanup: cleanup)))
+                outcome: outcome, resultBody: resultBody, cleanup: cleanup,
+                limitRefusal: limitRefusal,
+                executionSettledAt: executionSettledAt)))
         entries[key]?.latestLifecycleEvent = commit.eventRef
         return commit
     }

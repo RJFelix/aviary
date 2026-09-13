@@ -10,7 +10,7 @@ import Foundation
 /// event payload is never copied into this map; child state is classified and recovery caveats are
 /// represented by count/digest metadata.
 public struct PersistentWorkExactState: Sendable {
-    public static let schemaVersion = 8
+    public static let schemaVersion = 9
     public static let maximumIdentityBytes = 1_024
     /// One mutation may need to authenticate every active attachment in the affected Session.
     /// WorkService bounds those relationships to 64, leaving room for the event's other typed
@@ -30,7 +30,7 @@ public struct PersistentWorkExactState: Sendable {
             case .missingScalar: return "Persistent Work exact state has no scalar continuation."
             case .invalidRecord: return "Persistent Work exact state contains an invalid typed record."
             case .duplicateEvent(let id): return "Persistent Work event was already observed: \(id)."
-            case .unsupportedEvent(let type): return "Persistent Work event family is not exact in v8: \(type)."
+            case .unsupportedEvent(let type): return "Persistent Work event family is not exact in v9: \(type)."
             case .tooManyPrefetchedSlots: return "Persistent Work exact-state prefetch exceeds its bound."
             case .map(let error): return error.localizedDescription
             }
@@ -57,7 +57,7 @@ public struct PersistentWorkExactState: Sendable {
         }
     }
 
-    private static let scalarKey = "work-exact-v8/scalar"
+    private static let scalarKey = "work-exact-v9/scalar"
     private let map: PersistentProjectionRadixMap
     private var root: PersistentProjectionRadixMap.Root?
     private var lastSnapshot: WorkSnapshot
@@ -193,7 +193,7 @@ public struct PersistentWorkExactState: Sendable {
 
     private static func slotKey(kind: String, identity: String) -> String {
         let material = "work-exact-slot-v1\0\(kind.count):\(kind)\0\(identity.utf8.count):\(identity)"
-        return "work-exact-v8/\(kind)/" + AviarySHA256.hash(data: Data(material.utf8)).description
+        return "work-exact-v9/\(kind)/" + AviarySHA256.hash(data: Data(material.utf8)).description
     }
 
     private static func validateIncomingIdentities(_ event: TimelineEvent) throws {
@@ -224,7 +224,10 @@ public struct PersistentWorkExactState: Sendable {
     }
 
     private static func validStoredAgentHandle(_ handle: WorkAgentHandleSnapshot) -> Bool {
-        guard handle.deadline.map({ $0.timeIntervalSince1970.isFinite }) ?? true else {
+        guard (try? handle.executionLimits.validate()) != nil,
+              (handle.startedEvent == nil) == (handle.executionStartedAt == nil),
+              handle.executionStartedAt.map({ $0.timeIntervalSince1970.isFinite }) ?? true,
+              handle.deadline.map({ $0.timeIntervalSince1970.isFinite }) ?? true else {
             return false
         }
         guard (try? handle.providerAccounting.validateLifecycleOrder(
@@ -244,6 +247,36 @@ public struct PersistentWorkExactState: Sendable {
         if let terminal = handle.terminalEvidence, terminal.outcome == .expired,
            !validDeadlineEvidence(handle.deadline, recordedAt: terminal.event.hostRecordedAt) {
             return false
+        }
+        if let terminal = handle.terminalEvidence {
+            if terminal.outcome == .limited {
+                guard terminal.cleanup.state == .quiesced,
+                      handle.providerAccounting.pending == nil,
+                      let refusal = terminal.limitRefusal,
+                      let startedAt = handle.executionStartedAt,
+                      let settledAt = terminal.executionSettledAt,
+                      settledAt.timeIntervalSince1970.isFinite,
+                      settledAt >= startedAt,
+                      settledAt <= terminal.event.hostRecordedAt,
+                      (try? refusal.validate(
+                          limits: handle.executionLimits,
+                          usage: handle.providerAccounting.usage)) != nil,
+                      handle.deadline.map({ settledAt < $0 }) ?? true else {
+                    return false
+                }
+            } else if terminal.limitRefusal != nil || terminal.executionSettledAt != nil {
+                return false
+            }
+            if handle.startedEvent == nil {
+                guard terminal.cleanup.state == .notStarted,
+                      [.failed, .canceled, .expired].contains(terminal.outcome) else {
+                    return false
+                }
+            } else if terminal.outcome == .indeterminate {
+                guard terminal.cleanup.state == .indeterminate else { return false }
+            } else if terminal.cleanup.state != .quiesced {
+                return false
+            }
         }
         if let cancellation = handle.cancellationEvidence,
            let terminal = handle.terminalEvidence,

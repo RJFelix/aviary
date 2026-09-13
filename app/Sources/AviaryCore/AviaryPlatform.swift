@@ -859,8 +859,14 @@ public enum AviaryPOSIX {
         #elseif canImport(Glibc)
         let descriptor = Glibc.open(path, flags, mode)
         guard descriptor >= 0 else { return descriptor }
-        guard aviaryLinuxFlock(descriptor, Int32(LOCK_EX)) == 0 else {
+        let operation = Int32(LOCK_EX)
+            | ((flags & O_NONBLOCK) == 0 ? 0 : Int32(LOCK_NB))
+        guard aviaryLinuxFlock(descriptor, operation) == 0 else {
+            // close(2) is allowed to replace errno. The caller classifies EAGAIN/EWOULDBLOCK as
+            // owner contention, so preserve the flock failure across descriptor cleanup.
+            let lockError = errno
             _ = Glibc.close(descriptor)
+            errno = lockError
             return -1
         }
         return descriptor

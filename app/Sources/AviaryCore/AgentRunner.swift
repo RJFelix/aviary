@@ -21,17 +21,18 @@ public actor AgentRunner {
         public var reasoningEffort: String?
         public var maxDepth: Int
         public var maxIterations: Int?
-        /// Children get a tighter ceiling than their parent. A delegated task is meant to be
-        /// narrower, and an unbounded child is how a fan-out becomes a runaway.
-        public var childMaxIterations: Int
+        /// Optional explicit ceiling for process-local fallback children. Nil lets a background
+        /// child run until it finishes or is stopped; fan-out remains bounded independently by
+        /// depth, admission, and owner shutdown.
+        public var childMaxIterations: Int?
         /// Where `remember` writes. Nil disables memory for the run, which is a legitimate
         /// configuration rather than a degraded one.
         public var memory: MemoryStore?
         /// Record request payloads for the root run. Off unless asked: it writes the whole
         /// system prompt and conversation to disk.
         public var recordPayloads = false
-        /// A budget and finishing condition for the root run. Children get their own iteration
-        /// ceiling instead — a shared token budget would let one child starve its siblings.
+        /// A budget and finishing condition for the root run. Children do not share this budget;
+        /// an optional child iteration ceiling is configured independently.
         public var goal: Goal?
         /// Hook files to load. Empty means the feature costs nothing.
         public var hookPaths: [String] = []
@@ -70,7 +71,7 @@ public actor AgentRunner {
         public init(
             home: AgentHome, cwd: String, model: ModelSpec, systemPrompt: String,
             systemPromptAssembly: SystemPromptAssembly? = nil,
-            maxDepth: Int = 3, maxIterations: Int? = 40, childMaxIterations: Int = 20,
+            maxDepth: Int = 3, maxIterations: Int? = 40, childMaxIterations: Int? = nil,
             memory: MemoryStore? = nil, recordPayloads: Bool = false, goal: Goal? = nil,
             hookPaths: [String] = [], resume: String? = nil,
             peerDelegate: Agent.PeerDelegate? = nil,

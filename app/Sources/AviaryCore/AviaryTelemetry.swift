@@ -350,9 +350,11 @@ public enum AviaryTelemetry {
             "aviary.runtime.callback.reply_state": ["accepted", "duplicate", "stale", "invalid", "unknown"],
             "aviary.pricing.source": ["model_spec"],
             "aviary.pricing.state": ["estimated", "unavailable", "partial"],
+            "aviary.agent_child.limit.reason": ["tokenThresholdReached", "costThresholdReached",
+                "tokenAccountingUnknown", "costAccountingUnknown"],
             "aviary.command.kind": ["create", "start", "send", "steer", "queue", "cancel", "end"],
             "aviary.outcome": ["unknown", "completed", "succeeded", "failed", "cancelled", "canceled",
-                "rejected", "indeterminate", "accepted", "duplicate", "unavailable", "expired"],
+                "rejected", "indeterminate", "accepted", "duplicate", "unavailable", "expired", "limited"],
             "aviary.action.kind": Set(ActionKind.allCases.map(\.rawValue)),
             "aviary.tool.kind": ["python", "mcp", "other"],
             "aviary.callback.kind": ["spawn", "agent_handle", "list", "peer_message", "self_delivery", "web", "memory", "other"],
@@ -379,6 +381,8 @@ public enum AviaryTelemetry {
             "aviary.action.started.id", "aviary.action.started.journal.id",
             "aviary.provider.id_hash", "aviary.model.id_hash"]
         let integers: Set<String> = ["aviary.event.sequence", "aviary.agent.prompt_bytes",
+            "aviary.journal.open_attempts",
+            "aviary.agent_child.limit.tokens",
             "aviary.usage.updates", "aviary.usage.input_tokens", "aviary.usage.output_tokens",
             "aviary.usage.cache_read_tokens", "aviary.usage.cache_write_tokens",
             "aviary.usage.total_tokens", "aviary.usage.reasoning_tokens",
@@ -406,11 +410,15 @@ public enum AviaryTelemetry {
             case .int(let value): if integers.contains(key), value >= 0 { result[key] = .int(value) }
             case .bool(let value):
                 if ["aviary.exception.present", "aviary.provider.done_observed", "aviary.pricing.complete",
+                    "aviary.agent_child.limit.time_enabled", "aviary.agent_child.limit.tokens_enabled",
+                    "aviary.agent_child.limit.cost_enabled",
                     "aviary.repository.review.bounded", "aviary.read.slow"].contains(key) {
                     result[key] = .bool(value)
                 }
             case .double(let value):
                 if ["aviary.timeout.seconds", "aviary.queue.wait.seconds", "aviary.provider.first_output.seconds", "aviary.pricing.estimated_usd",
+                    "aviary.journal.acquisition.seconds",
+                    "aviary.agent_child.limit.estimated_usd",
                     "aviary.pricing.known_lower_bound_usd",
                     "aviary.read.duration.seconds",
                     "aviary.pricing.input_per_million_usd", "aviary.pricing.output_per_million_usd",

@@ -4,6 +4,13 @@ Status: continuation instrumentation implemented, 2026-09-11. Backend-neutral OT
 no collector selected or enabled in the installed app. This is a coverage plan, not a claim
 that every stage below is already instrumented.
 
+2026-09-12 child-policy integration: the background-agent policy fields and one-per-contention
+journal-acquisition event are now covered by the combined macOS/Linux checkpoint. macOS full
+suite: 1,401 cases / 20,840 assertions; final journal tests: 13 / 137 plus the new portable lock
+test: 1 / 6. Linux Swift 6.3.3 full selected suite: 41 grouped cases / 7,774 assertions. The Linux
+run caught and verified a nonblocking-lock portability fix. These receipts do not install a
+collector, upgrade the user's old daemon, or turn tracing into canonical delivery evidence.
+
 Prior continuation baseline verified: saved-chat/initial delivery tracing, provider measurements,
 Python execution/callback propagation, and independent linked child spans pass 49 focused cases /
 742 assertions. Full macOS: 1,246 cases / 19,025 assertions, 537.63 seconds. Fresh Linux Swift 6.3.3:
@@ -382,3 +389,19 @@ the application faster; startup/process timing noise exceeds the healthy/disable
 References: [OpenTelemetry trace API](https://opentelemetry.io/docs/specs/otel/trace/api/),
 [OTLP specification](https://opentelemetry.io/docs/specs/otlp/),
 [Swift SDK releases](https://github.com/open-telemetry/opentelemetry-swift/releases).
+
+## Background policy instrumentation (current source)
+
+Cold child-journal contention emits one `aviary.agent_child.journal_acquisition` event on the
+existing span when acquisition succeeds or exhausts its bounded retry policy. It includes the
+host-qualified Work hash, attempt count, acquisition duration, and fixed outcome—not paths or
+error bodies. Uncontended opens emit no extra event; individual retries do not flood the trace.
+
+Child admission records whether time/token/estimated-cost limits were selected and the numeric
+token/cost thresholds. An undispatched provider request refused by policy emits
+`aviary.agent_child.provider.limit_refused` with outcome `limited` and a fixed reason from the
+four threshold/unknown-accounting classifications. Raw errors, prompts and model configuration
+are not accepted as reason attributes. The independent execution span and canonical terminal
+reference remain the lifecycle evidence; telemetry neither enforces policy nor proves delivery.
+This source addition is being verified with the normal-daemon activation slice; the older signed
+journey receipts above do not certify it.

@@ -51,7 +51,8 @@ private actor WorkSpawnReplayDelegate: WorkAgentSpawnDelegate {
     }
 
     func startWorkChild(
-        callbackID: String, prompt: String, name: String?, model: String?, depth: Int
+        callbackID: String, prompt: String, name: String?, model: String?, depth: Int,
+        policy: WorkAgentSpawnPolicy
     ) async -> Agent.SpawnStartResult {
         admissionCountStorage += 1
         if !admitted {

@@ -107,7 +107,7 @@ public enum ChatAgentHandleActivityStatus: String, Codable, Hashable, Sendable {
     case reaped
 }
 
-/// A privacy-safe activity row for one Work-owned agent Handle. Labels, deadlines, command
+/// A privacy-safe activity row for one Work-owned agent Handle. Labels, command
 /// envelopes, and request/result body references stay in the canonical Work journal and never
 /// cross into this presentation value.
 public struct ChatAgentHandleActivityRow: Codable, Hashable, Sendable, Identifiable {
@@ -115,17 +115,62 @@ public struct ChatAgentHandleActivityRow: Codable, Hashable, Sendable, Identifia
     public let status: ChatAgentHandleActivityStatus
     public let terminalOutcome: WorkAgentHandleTerminalOutcome?
     public let cleanupState: WorkAgentHandleCleanupState?
+    public let executionLimits: WorkAgentExecutionLimits
+    public let deadline: Date?
+    public let limitDecision: WorkAgentExecutionLimitDecision?
 
     public init(
         id: String,
         status: ChatAgentHandleActivityStatus,
         terminalOutcome: WorkAgentHandleTerminalOutcome?,
-        cleanupState: WorkAgentHandleCleanupState?
+        cleanupState: WorkAgentHandleCleanupState?,
+        executionLimits: WorkAgentExecutionLimits = .unlimited, deadline: Date? = nil,
+        limitDecision: WorkAgentExecutionLimitDecision? = nil
     ) {
         self.id = id
         self.status = status
         self.terminalOutcome = terminalOutcome
         self.cleanupState = cleanupState
+        self.executionLimits = executionLimits
+        self.deadline = deadline
+        self.limitDecision = limitDecision
+    }
+
+    public var statusTitle: String {
+        if status == .terminalCleanupIndeterminate { return "Cleanup not confirmed" }
+        if let limitDecision {
+            switch limitDecision {
+            case .tokenThresholdReached: return "Stopped at token limit"
+            case .costThresholdReached: return "Stopped at estimated-cost limit"
+            case .tokenAccountingUnknown: return "Stopped: token usage incomplete"
+            case .costAccountingUnknown: return "Stopped: usage or pricing incomplete"
+            case .allow: return "Limit status unavailable"
+            }
+        }
+        switch status {
+        case .queued: return "Queued"
+        case .running: return "Last recorded running"
+        case .cancellationRequested: return "Stop requested"
+        case .terminalCleanupIndeterminate: return "Cleanup not confirmed"
+        case .reaped: return "Resources released"
+        case .settled:
+            switch terminalOutcome {
+            case .succeeded: return "Finished"
+            case .failed: return "Failed"
+            case .canceled: return "Stopped"
+            case .expired: return "Time limit reached"
+            case .limited: return "Limit reached"
+            case .indeterminate, nil: return "Outcome unavailable"
+            }
+        }
+    }
+
+    public var policySummary: String {
+        let tokens = executionLimits.maximumTokens.map { "Token threshold: \($0)" } ?? "No token limit"
+        let cost = executionLimits.maximumEstimatedCostUSD.map {
+            "Estimated-cost threshold: $" + String(format: "%.6g", $0)
+        } ?? "No spend limit"
+        return tokens + " · " + cost + (deadline == nil ? " · No time limit" : " · Time limit set")
     }
 }
 
@@ -254,7 +299,9 @@ public struct ChatAgentHandleActivityPresentation: Codable, Hashable, Sendable {
         }
         let row = ChatAgentHandleActivityRow(
             id: id, status: status,
-            terminalOutcome: fact.terminalOutcome, cleanupState: fact.cleanupState)
+            terminalOutcome: fact.terminalOutcome, cleanupState: fact.cleanupState,
+            executionLimits: fact.executionLimits, deadline: fact.deadline,
+            limitDecision: fact.limitDecision)
         return Classified(
             id: id, status: status,
             blocksWorkCompletion: fact.blocksWorkCompletion

@@ -1,10 +1,111 @@
-#if os(Linux)
 import Foundation
+@testable import AviaryCore
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+#if os(Linux)
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+#endif
 
-@testable import AviaryCore
+private final class ExclusiveLockTestLease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var descriptor: Int32
+
+    init(_ descriptor: Int32) {
+        self.descriptor = descriptor
+    }
+
+    var isHeld: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return descriptor >= 0
+    }
+
+    @discardableResult
+    func release() -> Int32? {
+        lock.lock()
+        guard descriptor >= 0 else {
+            lock.unlock()
+            return nil
+        }
+        let releasedDescriptor = descriptor
+        descriptor = -1
+        lock.unlock()
+        return AviaryPOSIX.close(releasedDescriptor)
+    }
+}
+
+func testAviaryPOSIXExclusiveLockHonorsNonblockingFlag() throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+        path: "apl-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(
+        at: root, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: NSNumber(value: Int16(0o700))])
+    defer { try? FileManager.default.removeItem(at: root) }
+    let lockURL = root.appending(path: "owner.lock", directoryHint: .notDirectory)
+    let blockingFlags = O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC
+    let owner = lockURL.path.withCString {
+        AviaryPOSIX.openExclusiveLock($0, flags: blockingFlags, mode: mode_t(0o600))
+    }
+    guard owner >= 0 else {
+        throw NSError(
+            domain: "AviaryPlatformTests", code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "could not acquire the fixture owner lock"])
+    }
+    let ownerLease = ExclusiveLockTestLease(owner)
+    defer { _ = ownerLease.release() }
+
+    // If the implementation accidentally performs a blocking flock, release the fixture owner so
+    // the test fails instead of wedging the entire suite. The lease swaps out the descriptor before
+    // close, preventing this delayed work from ever closing a subsequently reused descriptor.
+    let watchdog = DispatchWorkItem { _ = ownerLease.release() }
+    DispatchQueue.global(qos: .utility).asyncAfter(
+        deadline: .now() + .seconds(3), execute: watchdog)
+    defer { watchdog.cancel() }
+
+    errno = 0
+    let contender = lockURL.path.withCString {
+        AviaryPOSIX.openExclusiveLock(
+            $0, flags: blockingFlags | O_NONBLOCK, mode: mode_t(0o600))
+    }
+    let contentionError = errno
+    let ownerWasHeldWhenContenderReturned = ownerLease.isHeld
+    XCTAssertEqual(contender, -1)
+    XCTAssertTrue(
+        ownerWasHeldWhenContenderReturned,
+        "the nonblocking contender did not return before the owner-release watchdog")
+    XCTAssertTrue(
+        contentionError == EAGAIN || contentionError == EWOULDBLOCK,
+        "the nonblocking contender must retain the typed owner-contention errno")
+    if contender >= 0 { _ = AviaryPOSIX.close(contender) }
+
+    watchdog.cancel()
+    if let closeResult = ownerLease.release() {
+        XCTAssertEqual(closeResult, 0)
+    } else {
+        XCTFail("the owner-release watchdog fired before the nonblocking operation returned")
+    }
+    let replacement = lockURL.path.withCString {
+        AviaryPOSIX.openExclusiveLock(
+            $0, flags: blockingFlags | O_NONBLOCK, mode: mode_t(0o600))
+    }
+    XCTAssertTrue(replacement >= 0, "the released lock must be immediately acquirable")
+    if replacement >= 0 { XCTAssertEqual(AviaryPOSIX.close(replacement), 0) }
+}
+
+let casesAviaryPlatformLocks: [Case] = [
+    ("platform: exclusive lock honors nonblocking contention", {
+        try testAviaryPOSIXExclusiveLockHonorsNonblockingFlag()
+    }),
+]
+
+#if os(Linux)
 
 /// FoundationNetworking marks URLProtocol as non-Sendable on Swift 6.3. The fixtures serialize
 /// their mutable state with locks, so capture the protocol object through this explicit test-only

@@ -89,6 +89,9 @@ public enum LocalTimelineCatalog {
         public let terminalOutcome: WorkAgentHandleTerminalOutcome?
         public let cleanupState: WorkAgentHandleCleanupState?
         public let latestLifecycleEvent: EventRef
+        public let executionLimits: WorkAgentExecutionLimits
+        public let deadline: Date?
+        public let limitDecision: WorkAgentExecutionLimitDecision?
         private let projectionValidity: Bool
 
         public var id: String { handleID }
@@ -106,14 +109,19 @@ public enum LocalTimelineCatalog {
             terminalOutcome = value.terminalOutcome
             cleanupState = value.cleanup?.state
             latestLifecycleEvent = value.latestLifecycleEvent
+            executionLimits = value.executionLimits
+            deadline = value.deadline
+            limitDecision = value.terminalEvidence?.limitRefusal?.decision
             projectionValidity = Self.isStructurallyValid(
                 handleID: handleID, origin: origin, state: state,
                 terminalOutcome: terminalOutcome, cleanupState: cleanupState,
                 latestLifecycleEvent: latestLifecycleEvent)
+                && Self.validPolicy(executionLimits, deadline, limitDecision, terminalOutcome)
         }
 
         private enum CodingKeys: String, CodingKey {
             case handleID, origin, state, terminalOutcome, cleanupState, latestLifecycleEvent
+            case executionLimits, deadline, limitDecision
         }
 
         public init(from decoder: Decoder) throws {
@@ -127,10 +135,15 @@ public enum LocalTimelineCatalog {
                 let decodedCleanup = try container.decodeIfPresent(
                     WorkAgentHandleCleanupState.self, forKey: .cleanupState)
                 let decodedEvent = try container.decode(EventRef.self, forKey: .latestLifecycleEvent)
+                let decodedLimits = try container.decode(WorkAgentExecutionLimits.self, forKey: .executionLimits)
+                let decodedDeadline = try container.decodeIfPresent(Date.self, forKey: .deadline)
+                let decodedDecision = try container.decodeIfPresent(
+                    WorkAgentExecutionLimitDecision.self, forKey: .limitDecision)
                 guard Self.isStructurallyValid(
                     handleID: decodedHandleID, origin: decodedOrigin, state: decodedState,
                     terminalOutcome: decodedOutcome, cleanupState: decodedCleanup,
-                    latestLifecycleEvent: decodedEvent) else {
+                    latestLifecycleEvent: decodedEvent),
+                      Self.validPolicy(decodedLimits, decodedDeadline, decodedDecision, decodedOutcome) else {
                     throw Self.invalidProjectionError(codingPath: container.codingPath)
                 }
                 handleID = decodedHandleID
@@ -139,6 +152,9 @@ public enum LocalTimelineCatalog {
                 terminalOutcome = decodedOutcome
                 cleanupState = decodedCleanup
                 latestLifecycleEvent = decodedEvent
+                executionLimits = decodedLimits
+                deadline = decodedDeadline
+                limitDecision = decodedDecision
                 projectionValidity = true
             } catch {
                 throw Self.invalidProjectionError(codingPath: decoder.codingPath)
@@ -158,6 +174,26 @@ public enum LocalTimelineCatalog {
             try container.encodeIfPresent(terminalOutcome, forKey: .terminalOutcome)
             try container.encodeIfPresent(cleanupState, forKey: .cleanupState)
             try container.encode(latestLifecycleEvent, forKey: .latestLifecycleEvent)
+            try container.encode(executionLimits, forKey: .executionLimits)
+            try container.encodeIfPresent(deadline, forKey: .deadline)
+            try container.encodeIfPresent(limitDecision, forKey: .limitDecision)
+        }
+
+        private static func validPolicy(
+            _ limits: WorkAgentExecutionLimits, _ deadline: Date?,
+            _ decision: WorkAgentExecutionLimitDecision?, _ outcome: WorkAgentHandleTerminalOutcome?
+        ) -> Bool {
+            guard (try? limits.validate()) != nil,
+                  deadline.map({ $0.timeIntervalSince1970.isFinite }) ?? true else { return false }
+            if outcome == .limited {
+                guard let decision, decision != .allow else { return false }
+                switch decision {
+                case .tokenThresholdReached, .tokenAccountingUnknown: return limits.maximumTokens != nil
+                case .costThresholdReached, .costAccountingUnknown: return limits.maximumEstimatedCostUSD != nil
+                case .allow: return false
+                }
+            }
+            return decision == nil
         }
 
         private static func isStructurallyValid(
@@ -199,7 +235,7 @@ public enum LocalTimelineCatalog {
                 case .notStarted:
                     return [.failed, .canceled, .expired].contains(terminalOutcome)
                 case .quiesced:
-                    return [.succeeded, .failed, .canceled, .expired].contains(terminalOutcome)
+                    return [.succeeded, .failed, .canceled, .expired, .limited].contains(terminalOutcome)
                 case .indeterminate:
                     return false
                 }
@@ -209,7 +245,7 @@ public enum LocalTimelineCatalog {
                 case .notStarted:
                     return [.failed, .canceled, .expired].contains(terminalOutcome)
                 case .quiesced:
-                    return [.succeeded, .failed, .canceled, .expired].contains(terminalOutcome)
+                    return [.succeeded, .failed, .canceled, .expired, .limited].contains(terminalOutcome)
                 case .indeterminate:
                     return false
                 }
@@ -227,6 +263,8 @@ public enum LocalTimelineCatalog {
                 && lhs.state == rhs.state && lhs.terminalOutcome == rhs.terminalOutcome
                 && lhs.cleanupState == rhs.cleanupState
                 && lhs.latestLifecycleEvent == rhs.latestLifecycleEvent
+                && lhs.executionLimits == rhs.executionLimits && lhs.deadline == rhs.deadline
+                && lhs.limitDecision == rhs.limitDecision
         }
 
         public func hash(into hasher: inout Hasher) {
@@ -235,6 +273,9 @@ public enum LocalTimelineCatalog {
             hasher.combine(state)
             hasher.combine(terminalOutcome)
             hasher.combine(cleanupState)
+            hasher.combine(executionLimits)
+            hasher.combine(deadline)
+            hasher.combine(limitDecision)
             hasher.combine(latestLifecycleEvent)
         }
 

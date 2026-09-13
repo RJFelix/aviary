@@ -117,13 +117,13 @@ final class ServiceBackedRunBridge {
     }
 
     var activities: [WorkActionSnapshot] { projection.activities }
-    /// Durable provider accounting for this Work's lifetime.  This is intentionally separate
+    /// Durable provider accounting for this Work's lifetime. This is intentionally separate
     /// from the legacy per-transcript ``Usage`` value: several Sessions may observe one Work,
-    /// and this total must never be added once per attachment.  Do not expose a partial
-    /// aggregate as if it were canonical; the Work/Session pair must be fully recovered first.
-    var canonicalWorkUsage: CanonicalWorkUsage? {
-        guard projection.isCanonical else { return nil }
-        return CanonicalWorkUsage(aggregate: projection.workSnapshot.providerUsage)
+    /// and this total must never be added once per attachment. The controller exposes the
+    /// inventory only after authenticating the complete Work/Session projection, including
+    /// child facts; the GUI must not rebuild or sum provider usage itself.
+    var canonicalWorkUsageInventory: CanonicalWorkUsageInventory? {
+        projection.usageInventory
     }
 
     /// The last provider-bound context accepted by the canonical Session reducer. This is a

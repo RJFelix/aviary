@@ -219,7 +219,7 @@ public enum Builtins {
                 requirement: .memory, mechanism: .callback, isAvailable: ctx.hasMemory),
             Entry(
                 name: "spawn",
-                signature: "spawn(prompt, name=None, model=None)",
+                signature: "spawn(prompt, name=None, model=None, timeout=None, token_limit=None, cost_limit_usd=None)",
                 summary: "Start a sub-agent. Returns a Future you may choose to await.",
                 bullet: "spawn(prompt, name=None) – start a sub-agent and get back a "
                     + "`concurrent.futures.Future` immediately. It does not block: call "
@@ -235,7 +235,13 @@ public enum Builtins {
                     + "The Futures live in your namespace, so one started in an earlier cell "
                     + "is still there in this one. Wait inside a single cell rather than across "
                     + "turns — waiting in a cell costs seconds, waiting across turns costs a "
-                    + "model call each time.",
+                    + "model call each time. Work-owned children run until finished or explicitly stopped "
+                    + "by default. Optional positive `timeout` (seconds), `token_limit` (integer), and "
+                    + "`cost_limit_usd` apply only to that child. Token and estimated-cost thresholds "
+                    + "are checked before each model request, including compaction; one postpaid request "
+                    + "can exceed a threshold. Incomplete usage/pricing stops a finitely limited child. "
+                    + "Unsupported execution routes refuse requested limits. Future.cancel() does not "
+                    + "stop Work-owned execution; use the app's explicit background-agent stop control.",
                 requirement: .spawn, mechanism: .callback, isAvailable: ctx.canSpawn),
             Entry(
                 name: "attach_image",

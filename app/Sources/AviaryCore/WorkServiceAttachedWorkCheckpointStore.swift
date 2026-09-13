@@ -104,7 +104,7 @@ public struct WorkServiceAttachedWorkCheckpointStore: Sendable, Hashable,
 
     public struct Record: Codable, Hashable, Sendable {
         // Provider admission, settlement, and Work-lifetime accounting require canonical replay.
-        public static let currentSchemaVersion = 11
+        public static let currentSchemaVersion = 12
 
         public let schemaVersion: Int
         public let client: ClientRef

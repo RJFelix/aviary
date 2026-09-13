@@ -60,6 +60,13 @@ MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_DIAGNOSTIC_BYTES = 500
 MAX_SEND_SECONDS = 1.0
 SEND_CHUNK_BYTES = 512
+_RUNTIME_MODULE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+try:
+    sys.path.remove(_RUNTIME_MODULE_DIR)
+except ValueError:
+    pass
+sys.path.insert(0, _RUNTIME_MODULE_DIR)
+from work_agent_future import make_work_future as _make_work_future
 
 
 def validated_traceparent(value) -> str | None:
@@ -433,6 +440,44 @@ for __k in ("__aviary_names", "__k", "__v", "__r", "__n", "__fh", "__aviary_stat
 # ---------------------------------------------------------------------------
 
 
+def _validated_spawn_policy_kwargs(timeout=None, token_limit=None, cost_limit_usd=None):
+    # bool is an int subclass but is not a valid execution bound. Token limits become decimal
+    # strings before crossing into Swift, where JSONValue numbers are represented as Doubles.
+    import math
+
+    if timeout is not None:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise TypeError("timeout must be a finite positive number")
+        try:
+            timeout_number = float(timeout)
+        except (OverflowError, ValueError):
+            raise ValueError("timeout must be a finite positive number") from None
+        if not math.isfinite(timeout_number) or timeout <= 0:
+            raise ValueError("timeout must be a finite positive number")
+    if token_limit is not None:
+        if isinstance(token_limit, bool) or not isinstance(token_limit, int):
+            raise TypeError("token_limit must be a positive integer")
+        if token_limit <= 0 or token_limit > ((1 << 63) - 1):
+            raise ValueError("token_limit must be a positive integer")
+    if cost_limit_usd is not None:
+        if isinstance(cost_limit_usd, bool) or not isinstance(cost_limit_usd, (int, float)):
+            raise TypeError("cost_limit_usd must be a finite positive number")
+        try:
+            cost_number = float(cost_limit_usd)
+        except (OverflowError, ValueError):
+            raise ValueError("cost_limit_usd must be a finite positive number") from None
+        if not math.isfinite(cost_number) or cost_limit_usd <= 0:
+            raise ValueError("cost_limit_usd must be a finite positive number")
+    result = {}
+    if timeout is not None:
+        result["timeout"] = timeout_number
+    if token_limit is not None:
+        result["token_limit"] = str(token_limit)
+    if cost_limit_usd is not None:
+        result["cost_limit_usd"] = cost_number
+    return result
+
+
 class Session:
     """A namespace dict in the main interpreter, and a thread that serialises work on it.
 
@@ -477,9 +522,21 @@ class Session:
         ask_app = lambda kind, **payload: request_from_app(
             kind, payload, session=self.sid, traceparent=traceparent)
         install("ask_app", ask_app)
-        install("spawn", lambda prompt, name=None, model=None: request_from_app(
-            "spawn", {"prompt": prompt, "name": name, "model": model}, self.sid,
-            traceparent=traceparent))
+        def spawn(
+            prompt, name=None, model=None, timeout=None, token_limit=None, cost_limit_usd=None
+        ):
+            request = {"prompt": prompt, "name": name, "model": model}
+            request.update(_validated_spawn_policy_kwargs(
+                timeout=timeout, token_limit=token_limit, cost_limit_usd=cost_limit_usd))
+            def call_app(kind, **payload):
+                return request_from_app(
+                    kind, payload, self.sid, traceparent=traceparent)
+            started = call_app("spawn", **request)
+            if (isinstance(started, dict) and started.get("ownership") == "work"
+                    and "id" in started):
+                return _make_work_future(started, call_app)
+            return started
+        install("spawn", spawn)
         install("conversation", lambda limit=40: request_from_app(
             "conversation", {"limit": limit}, self.sid, traceparent=traceparent))
         install("remember", lambda text, scope="project", days=None, tags=None: (

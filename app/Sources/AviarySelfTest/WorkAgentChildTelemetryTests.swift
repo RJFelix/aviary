@@ -162,6 +162,8 @@ func test_phase5WorkAgentChildTelemetryLinksAdmissionToIndependentExecution() as
         let b = try await AviaryTelemetry.withSpan("aviary.test.child.admission_b", root: true) {
             try await coordinator.admit(
                 origin: fixture.binding, prompt: "second", label: "second",
+                executionLimits: try WorkAgentExecutionLimits(
+                    maximumTokens: 100, maximumEstimatedCostUSD: 0.25),
                 makeExecution: factory, admissionContext: AviaryTelemetry.context)
         }
         _ = try await workAgentTelemetryWaitForState(
@@ -189,6 +191,9 @@ func test_phase5WorkAgentChildTelemetryLinksAdmissionToIndependentExecution() as
     XCTAssertEqual(admissions.count, 2)
     let admissionB = try XCTUnwrap(admissions.last)
     XCTAssertEqual(admissionB.attributes["aviary.outcome"], .string("accepted"))
+    XCTAssertEqual(admissionB.attributes["aviary.agent_child.limit.tokens"], .int(100))
+    XCTAssertEqual(admissionB.attributes["aviary.agent_child.limit.estimated_usd"], .double(0.25))
+    XCTAssertEqual(admissionB.attributes["aviary.agent_child.limit.time_enabled"], .bool(false))
     let executionB = try XCTUnwrap(spans.first { span in
         span.name == "aviary.agent_child.execution"
             && span.links.contains { $0.context.spanId == admissionB.spanId }
@@ -498,6 +503,26 @@ func test_phase5WorkAgentChildTelemetryUncertainAdmissionRetainsHandleWithoutExe
 }
 
 let casesWorkAgentChildTelemetry: [Case] = [
+    ("phase5 child telemetry: limit reasons are bounded and retained", {
+        let (_, spans) = await AviaryTelemetry.withRecording {
+            await AviaryTelemetry.withSpan("aviary.test.child.limited", root: true) {
+                for reason in ["tokenThresholdReached", "costThresholdReached",
+                               "tokenAccountingUnknown", "costAccountingUnknown", "private-raw-reason"] {
+                    AviaryTelemetry.event("aviary.agent_child.provider.limit_refused", attributes: [
+                        "aviary.outcome": .string("limited"),
+                        "aviary.agent_child.limit.reason": .string(reason),
+                    ])
+                }
+            }
+        }
+        let events = try XCTUnwrap(spans.first).events
+        XCTAssertEqual(events.count, 5)
+        for event in events.prefix(4) {
+            XCTAssertEqual(event.attributes["aviary.outcome"], .string("limited"))
+            XCTAssertNotNil(event.attributes["aviary.agent_child.limit.reason"])
+        }
+        XCTAssertNil(events.last?.attributes["aviary.agent_child.limit.reason"])
+    }),
     ("phase5 child telemetry: rejected admission has no effect", {
         try await test_phase5WorkAgentChildTelemetryRejectedAdmissionHasNoEffect()
     }),

@@ -28,6 +28,8 @@ enum VisualFixtureRoute: String {
     case activityOverviewStale = "activity-overview-stale-fixture"
     case diagnostics = "diagnostics-fixture"
     case usageAccounting = "usage-accounting-fixture"
+    case usageInventory = "usage-inventory-fixture"
+    case usageInventoryNarrow = "usage-inventory-narrow-fixture"
 
     var isNarrow: Bool {
         self == .serviceChatNarrow || self == .productionDeliveryNarrow
@@ -35,6 +37,7 @@ enum VisualFixtureRoute: String {
             || self == .conversationHistoryNarrow
             || self == .repositoryReviewNarrow
             || self == .activityOverviewNarrow
+            || self == .usageInventoryNarrow
     }
 }
 
@@ -72,7 +75,100 @@ struct VisualFixtureView: View {
             DiagnosticsFixture()
         case .usageAccounting:
             UsageAccountingFixture()
+        case .usageInventory, .usageInventoryNarrow:
+            UsageInventoryFixtureView(narrow: route == .usageInventoryNarrow)
         }
+    }
+}
+
+/// Presentation-only Work usage scenes. These are deliberately not built through Core's
+/// authenticated inventory initializer; they make the complete and incomplete child-fact
+/// states easy to inspect without touching a Work Host or a user's stored transcripts.
+struct ServiceWorkUsageInventoryFixture {
+    let direct: CanonicalWorkUsage?
+    let directAvailability: CanonicalWorkUsageInventory.DirectAvailability
+    let childrenTotal: CanonicalWorkUsage?
+    let childCount: Int
+    let omittedChildCount: Int
+    let invalidChildCount: Int
+    let combined: CanonicalWorkUsage?
+    let combinedAvailability: CanonicalWorkUsageInventory.CombinedAvailability
+
+    static let wide = ServiceWorkUsageInventoryFixture(
+        direct: usage(
+            started: 11, settled: 10,
+            unresolved: .init(total: 1, breakdown: 1, cost: 1),
+            input: 36_000, output: 12_000, cacheRead: 4_000, total: 52_000, cost: 0.87),
+        directAvailability: .complete,
+        childrenTotal: usage(
+            started: 4, settled: 3,
+            unresolved: .init(total: 1, breakdown: 1, cost: 1),
+            input: 14_000, output: 5_000, cacheRead: 1_000, total: 20_000, cost: 0.31),
+        childCount: 2,
+        omittedChildCount: 0,
+        invalidChildCount: 0,
+        combined: usage(
+            started: 15, settled: 13,
+            unresolved: .init(total: 2, breakdown: 2, cost: 2),
+            input: 50_000, output: 17_000, cacheRead: 5_000, total: 72_000, cost: 1.18),
+        combinedAvailability: .complete)
+
+    static let narrow = ServiceWorkUsageInventoryFixture(
+        direct: usage(
+            started: 5, settled: 4,
+            unresolved: .init(total: 1, breakdown: 1, cost: 1),
+            input: 8_000, output: 2_000, cacheRead: 1_000, total: 11_000, cost: 0.19),
+        directAvailability: .complete,
+        childrenTotal: nil,
+        childCount: 1,
+        omittedChildCount: 2,
+        invalidChildCount: 0,
+        combined: nil,
+        combinedAvailability: .childFactsOmitted)
+
+    private static func usage(
+        started: Int,
+        settled: Int,
+        unresolved: ProviderUsageAggregate.UnresolvedCounts,
+        input: Int,
+        output: Int,
+        cacheRead: Int,
+        total: Int,
+        cost: Double
+    ) -> CanonicalWorkUsage {
+        CanonicalWorkUsage(aggregate: ProviderUsageAggregate(
+            started: started,
+            settled: settled,
+            unresolved: unresolved,
+            knownFloors: .init(
+                inputTokens: input, outputTokens: output,
+                cacheReadTokens: cacheRead, totalTokens: total, cost: cost)))
+    }
+}
+
+private struct UsageInventoryFixtureView: View {
+    let narrow: Bool
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(narrow ? "Work-wide usage · incomplete child facts" : "Work-wide usage · complete inventory")
+                    .font(.system(size: 13, weight: .semibold))
+                Text(narrow
+                    ? "Fixture: the Main agent subtotal stays visible while missing Background agent facts withhold a combined total."
+                    : "Fixture: a canonical Work total is split into Main agent and Background agents subtotals before the combined view.")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                ServiceWorkUsageInventoryCard(
+                    fixture: narrow
+                        ? ServiceWorkUsageInventoryFixture.narrow
+                        : ServiceWorkUsageInventoryFixture.wide)
+            }
+            .padding(16)
+        }
+        .frame(minWidth: narrow ? 0 : 560, maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 

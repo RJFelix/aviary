@@ -95,9 +95,24 @@ Protocol 3 carries a second direction. The runtime emits
 ```
 
 and the agent code that asked is unblocked with that result. This is what makes the runtime
-more than a calculator: `spawn(prompt)` runs a whole sub-agent and returns its answer,
+more than a calculator: `spawn(prompt)` starts a sub-agent and returns a Future,
 `conversation(limit)` hands back the transcript the code is part of, and `ask_app(kind, …)` is
 the general form.
+
+For Work-owned children, both bundled Python hosts share the same Future adapter:
+`spawn(prompt, name=None, model=None, timeout=None, token_limit=None, cost_limit_usd=None)`.
+Omitted limits mean run until finished or explicitly stopped. `timeout` is a positive number of
+seconds, `token_limit` a positive integer, and `cost_limit_usd` a positive configured-price estimate.
+The callback encodes token limits as canonical decimal strings to preserve integer precision.
+The Work Host fixes the deadline once on admission; reconnect/retry never renews it. Token/cost
+thresholds gate each child provider request, including compaction. They are not invoice caps:
+the last postpaid request can exceed the threshold, and unknown usage/pricing blocks further
+requests when that dimension is limited. Routes that cannot honor limits refuse them.
+
+The Future observes the durable Handle; `.result()` waits for its retained answer and `.notify()`
+requests a bounded notification. `.cancel()` does not terminate Work-owned execution. Parent Run
+End and client EOF likewise do not stop the child; explicit Work control owns that decision.
+Terminal limit reasons remain distinct from provider failures in canonical state and activity UI.
 
 Two rules. **The session id travels with the request** — one host serves many sessions and a
 client has no other way to know which agent asked; leaving it out cost a debugging session.

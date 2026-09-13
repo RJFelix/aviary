@@ -69,6 +69,38 @@ private actor WorkAgentProviderAccountingConstructionGate {
     }
 }
 
+/// Holds the terminal append after the execution result and its settlement timestamp have been
+/// captured. The coordinator's lifecycle gate stays held, so the deadline path cannot replace
+/// the already-settled limited result while this test advances wall time past the deadline.
+private actor WorkAgentLimitedTerminalCommitGate {
+    private var entered = false
+    private var released = false
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func hold() async {
+        entered = true
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilEntered() async -> Bool {
+        let timeout = ContinuousClock.now.advanced(by: .seconds(10))
+        while !entered && ContinuousClock.now < timeout {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return entered
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+}
+
 /// A bounded, local provider that exposes the exact stream lifecycle needed by the proof. It
 /// reads the Work journal from `stream` itself, so `sawDurableAdmissionBeforeStream` proves the
 /// ledger append happened before the provider was even invoked.
@@ -214,7 +246,8 @@ private func workAgentProviderExecutionRuntimeFactory() -> (@Sendable () -> Runt
 }
 
 private func makeWorkAgentProviderExecutionFixture(
-    suffix: String, mode: WorkAgentProviderExecutionMode
+    suffix: String, mode: WorkAgentProviderExecutionMode, model suppliedModel: ModelSpec? = nil,
+    beforeTerminalCommit: WorkAgentChildCoordinator.BeforeTerminalCommit? = nil
 ) async throws -> (WorkAgentProviderExecutionFixture, WorkAgentProviderExecutionProbe) {
     let home = AgentHome(root: URL(fileURLWithPath: NSTemporaryDirectory())
         .appending(path: "aviary-child-provider-\(UUID().uuidString.lowercased())"))
@@ -228,8 +261,9 @@ private func makeWorkAgentProviderExecutionFixture(
         workHost: host, sessionAttachment: SessionAttachmentRef("child-provider-attachment-\(suffix)"))
     let runBinding = WorkRunBinding(
         workBinding: binding, run: RunRef("child-provider-run-\(suffix)"))
-    let model = workAgentProviderExecutionModel()
-    let coordinator = try WorkAgentChildCoordinator()
+    let model = suppliedModel ?? workAgentProviderExecutionModel()
+    let coordinator = try WorkAgentChildCoordinator(
+        beforeTerminalCommit: beforeTerminalCommit)
     try await coordinator.register(
         work: work, home: home,
         actor: TimelineActor(actorID: "child-provider-register-\(suffix)", kind: "work-host"))
@@ -251,10 +285,11 @@ private func makeWorkAgentProviderExecutionFixture(
 
 private func workAgentProviderExecutionFactory(
     fixture: WorkAgentProviderExecutionFixture,
-    probe: WorkAgentProviderExecutionProbe,
+    probe: any ChatProvider,
     runtimeFactory: @escaping @Sendable () -> RuntimeHost,
     resourceBox: WorkAgentProviderExecutionResourceBox,
-    constructionGate: WorkAgentProviderAccountingConstructionGate? = nil
+    constructionGate: WorkAgentProviderAccountingConstructionGate? = nil,
+    maximumIterations: Int? = 2
 ) -> WorkAgentChildCoordinator.ExecutionFactory {
     { handle, deadline in
         let resource = AgentChildExecutionResource(
@@ -263,7 +298,7 @@ private func workAgentProviderExecutionFactory(
                 home: fixture.home, cwd: fixture.home.root.path, model: fixture.model,
                 provider: probe,
                 systemPrompt: "You are a deterministic child used by a self-test.",
-                maxIterations: 2,
+                maxIterations: maximumIterations,
                 makeProviderAccounting: {
                     let accounting = try await fixture.coordinator.providerAccounting(
                         work: fixture.binding.workBinding.work, handle: handle)
@@ -304,6 +339,132 @@ private func waitForWorkAgentProviderProbe(
     throw NSError(
         domain: "WorkAgentProviderExecutionTests", code: 2,
         userInfo: [NSLocalizedDescriptionKey: "timed out waiting for child provider stream"])
+}
+
+/// Emits four large, tool-calling turns so the child enters compaction, then holds the
+/// compaction crossing until the test has delivered cancellation.  The held crossing is released
+/// with a cancellation error, which lets the real Agent settle its already-admitted provider
+/// accounting before the resource returns.
+private final class WorkAgentCompactionCancellationProbe: ChatProvider, @unchecked Sendable {
+    let id = "fake"
+    private let lock = NSLock()
+    private var callCount = 0
+    private var compactionStarted = false
+    private var compactionReleased = false
+    private var compactionWaiter: CheckedContinuation<Void, Never>?
+
+    var calls: Int {
+        lock.lock(); defer { lock.unlock() }
+        return callCount
+    }
+
+    var sawCompaction: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return compactionStarted
+    }
+
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+        let compaction = request.messages.contains {
+            $0.plainText.contains("Summarise this span of work:")
+        }
+        lock.lock()
+        callCount += 1
+        if compaction { compactionStarted = true }
+        let call = callCount
+        lock.unlock()
+
+        if compaction {
+            return AsyncThrowingStream { continuation in
+                Task {
+                    await self.waitForCompactionRelease()
+                    continuation.finish(throwing: CancellationError())
+                }
+            }
+        }
+        return AsyncThrowingStream { continuation in
+            continuation.yield(.usage(.init(
+                inputTokens: 99_000, outputTokens: 1,
+                cacheReadTokens: 0, cacheWriteTokens: 0,
+                reportedTotalTokens: 99_001, inputAccounting: .cacheExclusive)))
+            if call <= 4 {
+                continuation.yield(.toolCall(
+                    id: "compaction-cancel-tool-\(call)", name: "unknown_tool",
+                    arguments: .object([:])))
+            } else {
+                continuation.yield(.textDelta("unexpected post-cancellation response"))
+            }
+            continuation.yield(.done(stopReason: call <= 4 ? "tool_calls" : "stop"))
+            continuation.finish()
+        }
+    }
+
+    func releaseCompaction() {
+        lock.lock()
+        compactionReleased = true
+        let waiter = compactionWaiter
+        compactionWaiter = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    private func waitForCompactionRelease() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if compactionReleased {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                compactionWaiter = continuation
+                lock.unlock()
+            }
+        }
+    }
+}
+
+private func testWorkAgentProviderCancellationBeforeNextDispatch() async throws {
+    let runtimeFactory = try XCTUnwrap(workAgentProviderExecutionRuntimeFactory())
+    let (fixture, _) = try await makeWorkAgentProviderExecutionFixture(
+        suffix: "cancel-before-next-dispatch", mode: .succeeds,
+        model: workAgentProviderExecutionModel())
+    defer { try? FileManager.default.removeItem(at: fixture.home.root) }
+    let probe = WorkAgentCompactionCancellationProbe()
+    let resourceBox = WorkAgentProviderExecutionResourceBox()
+    let admission = try await fixture.coordinator.admit(
+        origin: fixture.binding, prompt: "cancel during compaction", label: "compaction cancellation",
+        deadline: nil,
+        makeExecution: workAgentProviderExecutionFactory(
+            fixture: fixture, probe: probe, runtimeFactory: runtimeFactory,
+            resourceBox: resourceBox, maximumIterations: nil))
+    _ = try await waitForWorkAgentProviderRecord(
+        fixture, handle: admission.handle, matching: { $0.state == .running })
+    for _ in 0..<600 {
+        if probe.sawCompaction { break }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTAssertTrue(probe.sawCompaction, "the provider must reach the blocked compaction crossing")
+    let resource = try XCTUnwrap(resourceBox.get())
+    let cancellation = Task { await resource.cancel() }
+    for _ in 0..<600 {
+        if await resource.cancellationIntentRecorded { break }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTAssertTrue(await resource.cancellationIntentRecorded)
+    probe.releaseCompaction()
+    _ = await cancellation.value
+
+    let terminal = try await waitForWorkAgentProviderRecord(
+        fixture, handle: admission.handle, matching: { $0.state == .terminal })
+    XCTAssertEqual(terminal.terminalOutcome, .canceled)
+    XCTAssertTrue(terminal.cleanup?.state == .quiesced)
+    XCTAssertEqual(probe.calls, 5, "cancellation must not dispatch a normal crossing after compaction")
+    let events = try workAgentProviderEvents(fixture)
+    XCTAssertEqual(events.filter {
+        $0.type == TimelineEventType.agentHandleProviderStarted && $0.handle == admission.handle
+    }.count, 5)
+    XCTAssertEqual(events.filter {
+        $0.type == TimelineEventType.agentHandleProviderSettled && $0.handle == admission.handle
+    }.count, 5)
+    XCTAssertNil(terminal.providerAccounting.pending)
 }
 
 private func workAgentProviderEvents(
@@ -618,7 +779,193 @@ private func testWorkAgentProviderAdmissionAfterWriteRetainsPendingUnknownUsage(
     XCTAssertEqual(probe.calls, 0, "an uncertain admission must not be replayed")
 }
 
+private final class ChildLimitExecutionProvider: ChatProvider, @unchecked Sendable {
+    let id = "fake"
+    private let lock = NSLock()
+    private var count = 0
+    let toolTurns: Int
+    let inputTokens: Int
+    let reportsUsage: Bool
+
+    init(toolTurns: Int, inputTokens: Int = 4, reportsUsage: Bool = true) {
+        self.toolTurns = toolTurns
+        self.inputTokens = inputTokens
+        self.reportsUsage = reportsUsage
+    }
+
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return count }
+
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+        lock.lock()
+        count += 1
+        let call = count
+        lock.unlock()
+        return AsyncThrowingStream { continuation in
+            if reportsUsage {
+                continuation.yield(.usage(.init(
+                    inputTokens: inputTokens, outputTokens: 1,
+                    cacheReadTokens: 0, cacheWriteTokens: 0,
+                    reportedTotalTokens: inputTokens + 1, inputAccounting: .cacheExclusive)))
+            }
+            if call <= toolTurns {
+                continuation.yield(.toolCall(
+                    id: "limit-tool-\(call)", name: "python",
+                    arguments: .object(["code": .string("limit_probe = \(call)")])))
+                continuation.yield(.done(stopReason: "tool_calls"))
+            } else {
+                continuation.yield(.textDelta("finished under the selected policy"))
+                continuation.yield(.done(stopReason: "stop"))
+            }
+            continuation.finish()
+        }
+    }
+}
+
+private func runChildLimitExecution(
+    limits: WorkAgentExecutionLimits, provider: ChildLimitExecutionProvider,
+    expectedCalls: Int, decision: WorkAgentExecutionLimitDecision? = nil,
+    purpose: ProviderAdmission.Purpose = .normal, completeRates: Bool = true
+) async throws {
+    let runtimeFactory = try XCTUnwrap(workAgentProviderExecutionRuntimeFactory())
+    var model = workAgentProviderExecutionModel()
+    if completeRates { model.costCacheRead = 0; model.costCacheWrite = 0 }
+    let (fixture, _) = try await makeWorkAgentProviderExecutionFixture(
+        suffix: "limits", mode: .succeeds, model: model)
+    defer { try? FileManager.default.removeItem(at: fixture.home.root) }
+    let box = WorkAgentProviderExecutionResourceBox()
+    let admission = try await fixture.coordinator.admit(
+        origin: fixture.binding, prompt: "test the selected child policy", label: "limited child",
+        executionLimits: limits,
+        makeExecution: workAgentProviderExecutionFactory(
+            fixture: fixture, probe: provider, runtimeFactory: runtimeFactory,
+            resourceBox: box, maximumIterations: nil))
+    let record = try await waitForWorkAgentProviderRecord(
+        fixture, handle: admission.handle, matching: { $0.state == .terminal })
+    XCTAssertEqual(provider.calls, expectedCalls)
+    XCTAssertEqual(record.executionLimits, limits)
+    XCTAssertEqual(record.terminalOutcome, decision == nil ? .succeeded : .limited)
+    XCTAssertEqual(record.cleanup?.state, .quiesced)
+    XCTAssertEqual(record.providerAccounting.usage.started, expectedCalls)
+    XCTAssertEqual(record.providerAccounting.usage.settled, expectedCalls)
+    XCTAssertNil(record.providerAccounting.pending)
+    let resource = try XCTUnwrap(box.get())
+    let result = await resource.execute()
+    XCTAssertEqual(result.state, decision == nil ? .succeeded : .limited)
+    XCTAssertEqual(result.limitRefusal?.decision, decision)
+    if let refusal = result.limitRefusal {
+        XCTAssertEqual(refusal.admission.purpose, purpose)
+        try refusal.validate(limits: limits, usage: record.providerAccounting.usage)
+    }
+    let events = try workAgentProviderEvents(fixture)
+    XCTAssertEqual(events.filter { $0.type == TimelineEventType.agentHandleProviderStarted }.count,
+                   expectedCalls, "a refused request must never appear as a billed admission")
+    _ = try await fixture.bundle.finishRun(outcome: .completed)
+    try await fixture.bundle.closeChecked()
+    let cold = try await fixture.coordinator.inspect(
+        work: fixture.binding.workBinding.work, handle: admission.handle)
+    XCTAssertEqual(cold.providerAccounting, record.providerAccounting)
+    XCTAssertEqual(cold.executionLimits, limits)
+    XCTAssertEqual(cold.terminalOutcome, record.terminalOutcome)
+    XCTAssertEqual(await resource.execute(), result)
+    XCTAssertEqual(provider.calls, expectedCalls, "inspection/replay must not waive a limit")
+}
+
+private func testWorkAgentLimitedSettlementSurvivesDelayedTerminalAppend() async throws {
+    let runtimeFactory = try XCTUnwrap(workAgentProviderExecutionRuntimeFactory())
+    let terminalGate = WorkAgentLimitedTerminalCommitGate()
+    var model = workAgentProviderExecutionModel()
+    model.costCacheRead = 0
+    model.costCacheWrite = 0
+    let (fixture, _) = try await makeWorkAgentProviderExecutionFixture(
+        suffix: "limited-delayed-terminal", mode: .succeeds, model: model,
+        beforeTerminalCommit: { outcome in
+            if outcome == .limited { await terminalGate.hold() }
+        })
+    defer {
+        Task { await terminalGate.release() }
+        try? FileManager.default.removeItem(at: fixture.home.root)
+    }
+    let provider = ChildLimitExecutionProvider(toolTurns: 1)
+    let resourceBox = WorkAgentProviderExecutionResourceBox()
+    let deadline = Date().addingTimeInterval(5)
+    let admission = try await fixture.coordinator.admit(
+        origin: fixture.binding, prompt: "settle before the deadline and append afterward",
+        label: "Delayed limited terminal", deadline: deadline,
+        executionLimits: try WorkAgentExecutionLimits(maximumTokens: 5),
+        makeExecution: workAgentProviderExecutionFactory(
+            fixture: fixture, probe: provider, runtimeFactory: runtimeFactory,
+            resourceBox: resourceBox, maximumIterations: nil))
+
+    guard await terminalGate.waitUntilEntered() else {
+        await terminalGate.release()
+        throw NSError(
+            domain: "WorkAgentProviderExecutionTests", code: 5,
+            userInfo: [NSLocalizedDescriptionKey:
+                "limited execution did not reach the terminal commit boundary"])
+    }
+    XCTAssertTrue(Date() < deadline, "the resource must settle before its absolute deadline")
+    let remaining = min(max(deadline.timeIntervalSinceNow + 0.05, 0), 6)
+    try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+    XCTAssertTrue(Date() >= deadline)
+    await terminalGate.release()
+
+    let record = try await waitForWorkAgentProviderRecord(
+        fixture, handle: admission.handle, matching: { $0.state == .terminal })
+    XCTAssertEqual(record.terminalOutcome, .limited)
+    XCTAssertEqual(record.cleanup?.state, .quiesced)
+    XCTAssertEqual(record.terminalEvidence?.limitRefusal?.decision, .tokenThresholdReached)
+    let startedAt = try XCTUnwrap(record.executionStartedAt)
+    let settledAt = try XCTUnwrap(record.terminalEvidence?.executionSettledAt)
+    let recordedAt = try XCTUnwrap(record.terminalEvidence?.event.hostRecordedAt)
+    XCTAssertTrue(settledAt >= startedAt)
+    XCTAssertTrue(settledAt < deadline)
+    XCTAssertTrue(settledAt <= recordedAt)
+    XCTAssertTrue(recordedAt >= deadline,
+                  "the canonical append must actually occur after the deadline")
+    XCTAssertEqual(provider.calls, 1)
+
+    _ = try await fixture.bundle.finishRun(outcome: .completed)
+    try await fixture.bundle.closeChecked()
+}
+
 let casesWorkAgentProviderExecution: [Case] = [
+    ("phase5 child provider: unlimited default runs beyond twenty model calls", {
+        try await runChildLimitExecution(
+            limits: .unlimited, provider: ChildLimitExecutionProvider(toolTurns: 21), expectedCalls: 22)
+    }),
+    ("phase5 child provider: token threshold stops before another dispatch", {
+        try await runChildLimitExecution(
+            limits: WorkAgentExecutionLimits(maximumTokens: 5),
+            provider: ChildLimitExecutionProvider(toolTurns: 1), expectedCalls: 1,
+            decision: .tokenThresholdReached)
+    }),
+    ("phase5 child provider: estimated cost threshold stops before another dispatch", {
+        try await runChildLimitExecution(
+            limits: WorkAgentExecutionLimits(maximumEstimatedCostUSD: 0.000005),
+            provider: ChildLimitExecutionProvider(toolTurns: 1), expectedCalls: 1,
+            decision: .costThresholdReached)
+    }),
+    ("phase5 child provider: unknown pricing refuses the first limited request", {
+        try await runChildLimitExecution(
+            limits: WorkAgentExecutionLimits(maximumEstimatedCostUSD: 1),
+            provider: ChildLimitExecutionProvider(toolTurns: 1), expectedCalls: 0,
+            decision: .costAccountingUnknown, completeRates: false)
+    }),
+    ("phase5 child provider: missing usage does not waive a token threshold", {
+        try await runChildLimitExecution(
+            limits: WorkAgentExecutionLimits(maximumTokens: 100),
+            provider: ChildLimitExecutionProvider(toolTurns: 1, reportsUsage: false), expectedCalls: 1,
+            decision: .tokenAccountingUnknown)
+    }),
+    ("phase5 child provider: compaction uses the same limit admission gate", {
+        try await runChildLimitExecution(
+            limits: WorkAgentExecutionLimits(maximumTokens: 396_004),
+            provider: ChildLimitExecutionProvider(toolTurns: 5, inputTokens: 99_000), expectedCalls: 4,
+            decision: .tokenThresholdReached, purpose: .compaction)
+    }),
+    ("phase5 child provider: pre-deadline limit settlement survives delayed terminal append", {
+        try await testWorkAgentLimitedSettlementSurvivesDelayedTerminalAppend()
+    }),
     ("phase5 child provider: durable admission before stream and settlement after parent End", {
         try await testWorkAgentProviderExecutionPersistsBeforeStreamAndAfterParentEnd()
     }),
@@ -629,6 +976,9 @@ let casesWorkAgentProviderExecution: [Case] = [
     ("phase5 child provider: canceled crossing retains latest report once", {
         try await runWorkAgentProviderTerminalScenario(
             suffix: "cancellation", mode: .cancels, expectedOutcome: .canceled)
+    }),
+    ("phase5 child provider: cancellation during compaction prevents the next dispatch", {
+        try await testWorkAgentProviderCancellationBeforeNextDispatch()
     }),
     ("phase5 child provider: after-write settlement is durable and not replayed", {
         try await testWorkAgentProviderAfterWriteSettlementIsNotReplayed()

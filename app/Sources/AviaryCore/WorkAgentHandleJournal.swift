@@ -7,23 +7,58 @@ import Foundation
 internal actor WorkAgentHandleJournal {
     enum Failure: Error, Equatable { case wrongWork, writerStillOpen, unavailable, capacity }
 
+    struct ColdWriterRetryPolicy: Sendable {
+        static let production = ColdWriterRetryPolicy(
+            maximumWaitNanoseconds: 5_000_000_000,
+            maximumOpenAttempts: 256,
+            initialDelayNanoseconds: 10_000_000,
+            maximumDelayNanoseconds: 100_000_000)
+
+        let maximumWaitNanoseconds: UInt64
+        let maximumOpenAttempts: Int
+        let initialDelayNanoseconds: UInt64
+        let maximumDelayNanoseconds: UInt64
+
+        init(
+            maximumWaitNanoseconds: UInt64,
+            maximumOpenAttempts: Int,
+            initialDelayNanoseconds: UInt64,
+            maximumDelayNanoseconds: UInt64
+        ) {
+            self.maximumWaitNanoseconds = maximumWaitNanoseconds
+            self.maximumOpenAttempts = max(1, maximumOpenAttempts)
+            self.initialDelayNanoseconds = max(1, initialDelayNanoseconds)
+            self.maximumDelayNanoseconds = max(
+                self.initialDelayNanoseconds, maximumDelayNanoseconds)
+        }
+    }
+
     let work: WorkRef
     private let home: AgentHome
     private let actor: TimelineActor
     private let beforeBundleAgentAppend: (@Sendable () async -> Void)?
+    private let coldWriterRetryPolicy: ColdWriterRetryPolicy
+    private let coldWriterFailurePlan: TimelineJournalWriter.FailurePlan
+    private let didEncounterColdWriterContention: (@Sendable (Int) async -> Void)?
     private var bundle: RunJournalBundle?
     private var gateHeld = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         home: AgentHome, work: WorkRef, actor: TimelineActor,
-        beforeBundleAgentAppend: (@Sendable () async -> Void)? = nil
+        beforeBundleAgentAppend: (@Sendable () async -> Void)? = nil,
+        coldWriterRetryPolicy: ColdWriterRetryPolicy = .production,
+        coldWriterFailurePlan: TimelineJournalWriter.FailurePlan = .none,
+        didEncounterColdWriterContention: (@Sendable (Int) async -> Void)? = nil
     ) throws {
         guard try home.requirePersistedWorkHostID() == work.workHostID else { throw Failure.wrongWork }
         self.home = home
         self.work = work
         self.actor = actor
         self.beforeBundleAgentAppend = beforeBundleAgentAppend
+        self.coldWriterRetryPolicy = coldWriterRetryPolicy
+        self.coldWriterFailurePlan = coldWriterFailurePlan
+        self.didEncounterColdWriterContention = didEncounterColdWriterContention
     }
 
     /// The closure only opens a bundle; it must not call this route recursively or start agent
@@ -94,7 +129,7 @@ internal actor WorkAgentHandleJournal {
     private func appendColdLocked(
         _ draft: TimelineEventDraft
     ) async throws -> TimelineJournalCommit {
-        let writer = try coldWriter()
+        let writer = try await openColdWriterLocked()
         do {
             let result = try await writer.appendAgentHandle(draft)
             try await writer.closeChecked()
@@ -135,7 +170,7 @@ internal actor WorkAgentHandleJournal {
     }
 
     private func readColdLocked() async throws -> BoundedWorkReducerHead {
-        let writer = try coldWriter()
+        let writer = try await openColdWriterLocked()
         do {
             let read = try await writer.readCanonicalProjection(
                 expectedWork: work, expectedWorkHost: WorkHostRef(work.workHostID),
@@ -154,7 +189,63 @@ internal actor WorkAgentHandleJournal {
         try TimelineJournalWriter(
             reopeningStreaming: home.timelineV2WorkJournalURL(work),
             journal: JournalRef.work(work, journalID: "work"), actor: actor, home: home,
-            allowTruncatedTail: false)
+            allowTruncatedTail: false, failurePlan: coldWriterFailurePlan)
+    }
+
+    /// A cold constructor has not admitted a mutation, so the single typed owner-lock conflict is
+    /// safe to retry. Once a writer opens, append and close errors remain uncertain and are never
+    /// retried here. Cancellation does not abandon already-running child settlement; each delay is
+    /// performed by an awaited cancellation-independent task. The monotonic budget bounds retries;
+    /// successful construction still pays the separately documented journal replay cost.
+    private func openColdWriterLocked() async throws -> TimelineJournalWriter {
+        let started = DispatchTime.now().uptimeNanoseconds
+        var delay = coldWriterRetryPolicy.initialDelayNanoseconds
+        var attempt = 0
+        var contended = false
+        var acquired = false
+        defer {
+            if contended {
+                let ended = DispatchTime.now().uptimeNanoseconds
+                AviaryTelemetry.event("aviary.agent_child.journal_acquisition", attributes: [
+                    "aviary.work.id": .string(AviaryTelemetry.workIdentity(work)),
+                    "aviary.outcome": .string(acquired ? "accepted" : "unavailable"),
+                    "aviary.journal.open_attempts": .int(attempt),
+                    "aviary.journal.acquisition.seconds": .double(
+                        Double(ended >= started ? ended - started : 0) / 1_000_000_000),
+                ])
+            }
+        }
+        while true {
+            attempt += 1
+            do {
+                let writer = try coldWriter()
+                acquired = true
+                return writer
+            } catch let error as TimelineJournalWriter.WriterError {
+                guard case .competingWriter = error else { throw error }
+                contended = true
+                await didEncounterColdWriterContention?(attempt)
+
+                let now = DispatchTime.now().uptimeNanoseconds
+                let elapsed = now >= started ? now - started : 0
+                guard attempt < coldWriterRetryPolicy.maximumOpenAttempts,
+                      elapsed < coldWriterRetryPolicy.maximumWaitNanoseconds else {
+                    throw error
+                }
+                let remaining = coldWriterRetryPolicy.maximumWaitNanoseconds - elapsed
+                await Self.sleepIgnoringCancellation(nanoseconds: min(delay, remaining))
+                delay = min(
+                    coldWriterRetryPolicy.maximumDelayNanoseconds,
+                    delay > UInt64.max / 2 ? UInt64.max : delay * 2)
+            }
+        }
+    }
+
+    private nonisolated static func sleepIgnoringCancellation(nanoseconds: UInt64) async {
+        guard nanoseconds > 0 else { return }
+        await Task.detached {
+            try? await Task.sleep(nanoseconds: nanoseconds)
+        }.value
     }
 
     private func acquire() async throws {

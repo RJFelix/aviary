@@ -1,6 +1,15 @@
 import Foundation
 @testable import AviaryCore
 
+private func handleJournalTestHome() throws -> AgentHome {
+    let root = FileManager.default.temporaryDirectory.appending(
+        path: "ahj-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(
+        at: root, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: NSNumber(value: Int16(0o700))])
+    return AgentHome(root: root)
+}
+
 private func handleJournalPayload<T: Encodable>(_ value: T) throws -> JSONValue {
     try XCTUnwrap(JSONValue.parse(try JSONEncoder().encode(value)))
 }
@@ -44,8 +53,146 @@ private actor HandleJournalBundleSelectionGate {
     }
 }
 
+private actor HandleJournalColdContentionProbe {
+    private var attempts = 0
+
+    func observed(_ attempt: Int) { attempts = max(attempts, attempt) }
+
+    func wait(for expected: Int) async -> Bool {
+        for _ in 0..<500 {
+            if attempts >= expected { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return false
+    }
+
+    func count() -> Int { attempts }
+}
+
+private struct HandleJournalColdSettlementFixture {
+    let home: AgentHome
+    let work: WorkRef
+    let route: WorkAgentHandleJournal
+    let bundle: RunJournalBundle
+    let origin: WorkAgentHandleOrigin
+    let handle: HandleRef
+    let started: TimelineJournalCommit
+    let providerStarted: TimelineJournalCommit
+    let admission: ProviderAdmission
+}
+
+private func makeHandleJournalColdSettlementFixture(
+    suffix: String,
+    retryPolicy: WorkAgentHandleJournal.ColdWriterRetryPolicy = .production,
+    failurePlan: TimelineJournalWriter.FailurePlan = .none,
+    contentionProbe: HandleJournalColdContentionProbe? = nil
+) async throws -> HandleJournalColdSettlementFixture {
+    let home = try handleJournalTestHome()
+    let work = WorkRef(
+        workHostID: try home.requirePersistedWorkHostID(),
+        workID: "cold-settlement-work-\(suffix)")
+    let identity = SessionWorkIdentity(
+        sessionID: "cold-settlement-session-\(suffix)",
+        work: work,
+        runID: "cold-settlement-run-\(suffix)")
+    let route = try WorkAgentHandleJournal(
+        home: home,
+        work: work,
+        actor: TimelineActor(actorID: "cold-settlement-owner-\(suffix)", kind: "work-host"),
+        coldWriterRetryPolicy: retryPolicy,
+        coldWriterFailurePlan: failurePlan,
+        didEncounterColdWriterContention: { attempt in
+            await contentionProbe?.observed(attempt)
+        })
+    let bundle = try await route.openRun {
+        try await RunJournalBundle.openForExecution(
+            home: home,
+            identity: identity,
+            actorID: "cold-settlement-parent-\(suffix)",
+            makeAttachmentID: { "cold-settlement-attachment-\(suffix)" })
+    }
+    let origin = WorkAgentHandleOrigin(
+        work: work,
+        workHost: WorkHostRef(work.workHostID),
+        session: SessionRef(identity.sessionID),
+        sessionAttachment: bundle.sessionAttachment,
+        run: RunRef(identity.runID))
+    let handle = HandleRef("cold-settlement-child-\(suffix)")
+    let request = try ContextBodyStore(home: home).retain(
+        Data("cold settlement request".utf8), authority: bundle.workJournal)
+    let queued = try await route.append(handleJournalDraft(
+        TimelineEventType.agentHandleQueued,
+        origin: origin,
+        handle: handle,
+        payload: handleJournalPayload(WorkAgentHandleQueuedPayload(
+            origin: origin,
+            label: "Cold settlement child",
+            requestBody: request))))
+    let started = try await route.append(handleJournalDraft(
+        TimelineEventType.agentHandleStarted,
+        origin: origin,
+        handle: handle,
+        cause: queued.eventRef))
+    let admission = ProviderAdmission(
+        purpose: .normal,
+        rates: ProviderUsage.RateSnapshot(model: ModelSpec(rpc: .object([
+            "id": .string("cold-settlement-model"),
+            "provider": .string("fixture"),
+        ]))))
+    let providerStarted = try await route.append(handleJournalDraft(
+        TimelineEventType.agentHandleProviderStarted,
+        origin: origin,
+        handle: handle,
+        cause: started.eventRef,
+        payload: .object([
+            "ordinal": .string("1"),
+            "admission": admission.timelineValue,
+        ])))
+    _ = try await bundle.finishRun(outcome: .completed)
+    try await bundle.closeChecked()
+    return HandleJournalColdSettlementFixture(
+        home: home,
+        work: work,
+        route: route,
+        bundle: bundle,
+        origin: origin,
+        handle: handle,
+        started: started,
+        providerStarted: providerStarted,
+        admission: admission)
+}
+
+private func handleJournalProviderSettlementDraft(
+    _ fixture: HandleJournalColdSettlementFixture
+) -> TimelineEventDraft {
+    let settlement = ProviderSettlement(
+        admission: fixture.admission,
+        report: nil,
+        finality: .unconfirmed)
+    return handleJournalDraft(
+        TimelineEventType.agentHandleProviderSettled,
+        origin: fixture.origin,
+        handle: fixture.handle,
+        cause: fixture.providerStarted.eventRef,
+        payload: .object([
+            "ordinal": .string("1"),
+            "settlement": settlement.timelineValue,
+            "state": .string(ActionExecutionState.failed.rawValue),
+        ]))
+}
+
+private func handleJournalEvents(
+    _ fixture: HandleJournalColdSettlementFixture
+) throws -> [TimelineEvent] {
+    TimelineJournalReader.read(
+        try Data(contentsOf: fixture.home.timelineV2WorkJournalURL(fixture.work)),
+        journal: fixture.bundle.workJournal,
+        actor: TimelineActor(actorID: "cold-settlement-reader", kind: "self-test"),
+        hostRecordedAt: Date(timeIntervalSince1970: 0)).records.map(\.event)
+}
+
 func testWorkAgentHandleJournalOutlivesClosedRunWriter() async throws {
-    let home = scratchHome()
+    let home = try handleJournalTestHome()
     let work = WorkRef(workHostID: try home.requirePersistedWorkHostID(), workID: "child-journal-work")
     let identity = SessionWorkIdentity(sessionID: "child-journal-session", work: work, runID: "origin-run")
     let route = try WorkAgentHandleJournal(
@@ -117,7 +264,7 @@ func testWorkAgentHandleJournalOutlivesClosedRunWriter() async throws {
 }
 
 func testWorkAgentHandleJournalReconcilesAfterAmbiguousClose() async throws {
-    let home = scratchHome()
+    let home = try handleJournalTestHome()
     let work = WorkRef(workHostID: try home.requirePersistedWorkHostID(), workID: "ambiguous-child-work")
     let identity = SessionWorkIdentity(sessionID: "ambiguous-child-session", work: work, runID: "origin")
     let route = try WorkAgentHandleJournal(
@@ -159,7 +306,7 @@ func testWorkAgentHandleJournalReconcilesAfterAmbiguousClose() async throws {
 }
 
 func testWorkAgentHandleJournalRetriesOnlyPrewriteCloseAcrossEnd() async throws {
-    let home = scratchHome()
+    let home = try handleJournalTestHome()
     let work = WorkRef(
         workHostID: try home.requirePersistedWorkHostID(), workID: "provider-handoff-work")
     let identity = SessionWorkIdentity(
@@ -253,7 +400,174 @@ func testWorkAgentHandleJournalRetriesOnlyPrewriteCloseAcrossEnd() async throws 
     XCTAssertNil(record.providerAccounting.pending)
 }
 
+func testWorkAgentHandleJournalRetriesColdOwnerContentionForCanceledSettlement() async throws {
+    let probe = HandleJournalColdContentionProbe()
+    let fixture = try await makeHandleJournalColdSettlementFixture(
+        suffix: "released-owner",
+        retryPolicy: .init(
+            maximumWaitNanoseconds: 1_000_000_000,
+            maximumOpenAttempts: 64,
+            initialDelayNanoseconds: 10_000_000,
+            maximumDelayNanoseconds: 25_000_000),
+        contentionProbe: probe)
+    defer { try? FileManager.default.removeItem(at: fixture.home.root) }
+    let competingOwner = try TimelineJournalWriter(
+        reopeningStreaming: fixture.home.timelineV2WorkJournalURL(fixture.work),
+        journal: fixture.bundle.workJournal,
+        actor: TimelineActor(actorID: "temporary-cold-owner", kind: "self-test"),
+        home: fixture.home,
+        allowTruncatedTail: false)
+    let before = try Data(contentsOf: fixture.home.timelineV2WorkJournalURL(fixture.work))
+    let append = Task {
+        try await fixture.route.append(handleJournalProviderSettlementDraft(fixture))
+    }
+    guard await probe.wait(for: 1) else {
+        append.cancel()
+        try? await competingOwner.closeChecked()
+        _ = try? await append.value
+        throw NSError(
+            domain: "WorkAgentHandleJournalTests", code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "timed out observing cold writer contention"])
+    }
+    XCTAssertEqual(
+        try Data(contentsOf: fixture.home.timelineV2WorkJournalURL(fixture.work)), before,
+        "constructor contention must occur before any settlement append")
+
+    // Child settlement remains a durability obligation even if its execution task was canceled.
+    append.cancel()
+    try await competingOwner.closeChecked()
+    let committed = try await append.value
+    let events = try handleJournalEvents(fixture)
+    let settlements = events.filter {
+        $0.type == TimelineEventType.agentHandleProviderSettled && $0.handle == fixture.handle
+    }
+    XCTAssertEqual(settlements.count, 1)
+    XCTAssertEqual(settlements.first?.eventID, committed.eventRef.eventID)
+    let head = try await fixture.route.read()
+    let record = try head.agentHandle(for: fixture.handle.handleID)
+    XCTAssertEqual(record.providerAccounting.usage.started, 1)
+    XCTAssertEqual(record.providerAccounting.usage.settled, 1)
+    XCTAssertNil(record.providerAccounting.pending)
+}
+
+func testWorkAgentHandleJournalBoundsSustainedColdOwnerContention() async throws {
+    let probe = HandleJournalColdContentionProbe()
+    let fixture = try await makeHandleJournalColdSettlementFixture(
+        suffix: "bounded-owner",
+        retryPolicy: .init(
+            maximumWaitNanoseconds: 5_000_000_000,
+            maximumOpenAttempts: 3,
+            initialDelayNanoseconds: 1_000_000,
+            maximumDelayNanoseconds: 1_000_000),
+        contentionProbe: probe)
+    defer { try? FileManager.default.removeItem(at: fixture.home.root) }
+    let competingOwner = try TimelineJournalWriter(
+        reopeningStreaming: fixture.home.timelineV2WorkJournalURL(fixture.work),
+        journal: fixture.bundle.workJournal,
+        actor: TimelineActor(actorID: "sustained-cold-owner", kind: "self-test"),
+        home: fixture.home,
+        allowTruncatedTail: false)
+    let before = try Data(contentsOf: fixture.home.timelineV2WorkJournalURL(fixture.work))
+    do {
+        _ = try await fixture.route.append(handleJournalProviderSettlementDraft(fixture))
+        XCTAssertTrue(false, "sustained owner contention must remain bounded")
+    } catch let error as TimelineJournalWriter.WriterError {
+        guard case .competingWriter = error else {
+            XCTAssertTrue(false, "wrong sustained-contention error: \(error)")
+            return
+        }
+    }
+    XCTAssertEqual(await probe.count(), 3)
+    XCTAssertEqual(
+        try Data(contentsOf: fixture.home.timelineV2WorkJournalURL(fixture.work)), before,
+        "exhausting cold-open retries must not mutate the journal")
+
+    try await competingOwner.closeChecked()
+    _ = try await fixture.route.append(handleJournalProviderSettlementDraft(fixture))
+    XCTAssertEqual(
+        try handleJournalEvents(fixture).filter {
+            $0.type == TimelineEventType.agentHandleProviderSettled && $0.handle == fixture.handle
+        }.count,
+        1,
+        "an explicit retry after proven pre-write contention must append once")
+}
+
+func testWorkAgentHandleJournalNeverRetriesAmbiguousColdAppend() async throws {
+    let probe = HandleJournalColdContentionProbe()
+    let fixture = try await makeHandleJournalColdSettlementFixture(
+        suffix: "ambiguous-append",
+        failurePlan: .init(point: .afterWriteBeforeSync),
+        contentionProbe: probe)
+    defer { try? FileManager.default.removeItem(at: fixture.home.root) }
+    do {
+        _ = try await fixture.route.append(handleJournalProviderSettlementDraft(fixture))
+        XCTAssertTrue(false, "lost settlement confirmation must remain uncertain")
+    } catch let error as TimelineJournalWriter.WriterError {
+        XCTAssertEqual(error, .injected(.afterWriteBeforeSync))
+    }
+    XCTAssertEqual(await probe.count(), 0, "an admitted append failure is not open contention")
+    XCTAssertEqual(
+        try handleJournalEvents(fixture).filter {
+            $0.type == TimelineEventType.agentHandleProviderSettled && $0.handle == fixture.handle
+        }.count,
+        1,
+        "the uncertain cold append must never be repeated")
+    let head = try await fixture.route.read()
+    let record = try head.agentHandle(for: fixture.handle.handleID)
+    XCTAssertEqual(record.providerAccounting.usage.started, 1)
+    XCTAssertEqual(record.providerAccounting.usage.settled, 1)
+    XCTAssertNil(record.providerAccounting.pending)
+}
+
+func testWorkAgentHandleJournalContentionTelemetryIsBounded() async throws {
+    let (_, acquiredSpans) = try await AviaryTelemetry.withRecording {
+        try await AviaryTelemetry.withSpan("aviary.test.journal_contention", root: true) {
+            try await testWorkAgentHandleJournalRetriesColdOwnerContentionForCanceledSettlement()
+        }
+    }
+    let acquired = acquiredSpans.flatMap(\.events).filter {
+        $0.name == "aviary.agent_child.journal_acquisition"
+    }
+    XCTAssertEqual(acquired.count, 1, "poll retries must produce only one acquisition event")
+    let event = try XCTUnwrap(acquired.first)
+    XCTAssertEqual(event.attributes["aviary.outcome"], .string("accepted"))
+    XCTAssertEqual(Set(event.attributes.keys), Set([
+        "aviary.work.id", "aviary.outcome", "aviary.journal.open_attempts",
+        "aviary.journal.acquisition.seconds",
+    ]), "paths and error bodies are not acquisition metadata")
+    if case .int(let attempts) = event.attributes["aviary.journal.open_attempts"] {
+        XCTAssertTrue(attempts >= 2)
+    } else { XCTAssertTrue(false, "missing attempt count") }
+    if case .double(let elapsed) = event.attributes["aviary.journal.acquisition.seconds"] {
+        XCTAssertTrue(elapsed >= 0)
+    } else { XCTAssertTrue(false, "missing elapsed time") }
+
+    let (_, exhaustedSpans) = try await AviaryTelemetry.withRecording {
+        try await AviaryTelemetry.withSpan("aviary.test.journal_exhausted", root: true) {
+            try await testWorkAgentHandleJournalBoundsSustainedColdOwnerContention()
+        }
+    }
+    let exhausted = exhaustedSpans.flatMap(\.events).filter {
+        $0.name == "aviary.agent_child.journal_acquisition"
+    }
+    XCTAssertEqual(exhausted.count, 1, "a later uncontended explicit retry emits no wait event")
+    XCTAssertEqual(exhausted.first?.attributes["aviary.outcome"], .string("unavailable"))
+    XCTAssertEqual(exhausted.first?.attributes["aviary.journal.open_attempts"], .int(3))
+
+    let (_, uncontendedSpans) = try await AviaryTelemetry.withRecording {
+        try await AviaryTelemetry.withSpan("aviary.test.journal_uncontended", root: true) {
+            try await testWorkAgentHandleJournalNeverRetriesAmbiguousColdAppend()
+        }
+    }
+    XCTAssertFalse(uncontendedSpans.flatMap(\.events).contains {
+        $0.name == "aviary.agent_child.journal_acquisition"
+    }, "an uncontended but uncertain append is not acquisition contention")
+}
+
 let casesWorkAgentHandleJournal: [Case] = [
+    ("phase5 agent journal: contention telemetry is one bounded event", {
+        try await testWorkAgentHandleJournalContentionTelemetryIsBounded()
+    }),
     ("phase5 agent journal: post-End writer handoff and retained cold outcome", {
         try await testWorkAgentHandleJournalOutlivesClosedRunWriter()
     }),
@@ -262,5 +576,14 @@ let casesWorkAgentHandleJournal: [Case] = [
     }),
     ("phase5 agent journal: provider admission retries only a pre-write End close", {
         try await testWorkAgentHandleJournalRetriesOnlyPrewriteCloseAcrossEnd()
+    }),
+    ("phase5 agent journal: canceled settlement waits for a cold owner lease", {
+        try await testWorkAgentHandleJournalRetriesColdOwnerContentionForCanceledSettlement()
+    }),
+    ("phase5 agent journal: sustained cold owner contention is bounded", {
+        try await testWorkAgentHandleJournalBoundsSustainedColdOwnerContention()
+    }),
+    ("phase5 agent journal: ambiguous cold append is never retried", {
+        try await testWorkAgentHandleJournalNeverRetriesAmbiguousColdAppend()
     }),
 ]

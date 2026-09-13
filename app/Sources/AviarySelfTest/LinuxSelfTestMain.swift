@@ -55,7 +55,13 @@ enum LinuxSelfTestMain {
                     + casesProviderSettlement + casesProviderSettlementReducer
                     + casesProviderSettlementAgent + casesProviderSettlementJournal
                     + casesCanonicalWorkUsage + casesWorkAgentProviderAccounting
-                    + casesTimelineJournalWriterContinuation + casesWorkAgentProviderExecution)
+                    + casesTimelineJournalWriterContinuation + casesWorkAgentProviderExecution
+                    + casesWorkAgentHandleJournal + casesWorkAgentHandleJournalLifecycle
+                    + casesCanonicalWorkUsageInventory + casesFallbackChildIterationDefaults
+                    + casesAviaryPlatformLocks
+                    + casesWorkAgentExecutionLimits + casesWorkAgentSpawnPolicy
+                    + casesWorkAgentExecutionPolicyCanonical + casesWorkAgentChildProductionComposition
+                    + casesWorkAgentChildDaemonJourney)
                 try await runLinuxCases(casesAviaryTelemetry + casesAviaryTelemetryAgent
                     + casesAviaryTelemetryTransport + casesAviaryTelemetryHTTPClient
                     + casesAviaryTelemetryDelivery + casesRuntimeHostTelemetry + casesWorkAgentChildTelemetry)

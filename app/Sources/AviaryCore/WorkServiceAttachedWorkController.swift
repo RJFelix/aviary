@@ -134,6 +134,10 @@ public struct WorkServiceAttachedWorkProjection: Sendable, Hashable {
     public let requiresRefresh: Bool
     public let isCanonical: Bool
     public let needsRecovery: Bool
+    /// Work-qualified provider accounting is populated only by the controller after it has
+    /// authenticated the exact canonical cursors and source tuple. Public projection
+    /// construction cannot inject this value.
+    public private(set) var usageInventory: CanonicalWorkUsageInventory?
 
     public init(
         descriptor: WorkServiceWorkDescriptor,
@@ -246,6 +250,15 @@ public struct WorkServiceAttachedWorkProjection: Sendable, Hashable {
             || workSourceCompleteness != .complete
             || sessionSourceCompleteness != .complete
             || !healthySnapshots
+        self.usageInventory = nil
+    }
+
+    internal func withTrustedUsageInventory(
+        _ inventory: CanonicalWorkUsageInventory
+    ) -> WorkServiceAttachedWorkProjection {
+        var copy = self
+        copy.usageInventory = inventory
+        return copy
     }
 
     private static let maxMessages = 512
@@ -890,7 +903,7 @@ public actor WorkServiceAttachedWorkController {
     /// Return the current immutable projection. Reads are actor-isolated and safe to hand to a
     /// SwiftUI task without exposing mutable reducer state.
     public func projection() -> WorkServiceAttachedWorkProjection {
-        WorkServiceAttachedWorkProjection(
+        let projection = WorkServiceAttachedWorkProjection(
             descriptor: descriptorStorage, attachment: attachmentStorage,
             capabilities: attachmentActionableStorage
                 ? attachmentStorage.authorization.granted : [],
@@ -908,6 +921,11 @@ public actor WorkServiceAttachedWorkController {
             pendingCommand: pendingStorage?.projection,
             commandInFlight: commandInFlightStorage, lastReceipt: lastReceiptStorage,
             requiresRefresh: requiresRefreshStorage)
+        guard projection.isCanonical,
+              let inventory = try? CanonicalWorkUsageInventory(projection: projection) else {
+            return projection
+        }
+        return projection.withTrustedUsageInventory(inventory)
     }
 
     /// Fetch the newest descriptor in the current bounded projection whose media type exactly

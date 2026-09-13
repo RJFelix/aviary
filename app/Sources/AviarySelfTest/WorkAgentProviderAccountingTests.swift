@@ -103,7 +103,7 @@ func test_childProviderAccountingSurvivesEndAndColdReopen() throws {
         attributes: [.posixPermissions: 0o700])
     let map = try PersistentProjectionRadixMap(directory: directory.appending(path: "map"),
         namespaceID: "child-provider-exact", journal: f.journal,
-        sourceGeneration: String(repeating: "b", count: 64), mapKind: "work-exact-v8")
+        sourceGeneration: String(repeating: "b", count: 64), mapKind: "work-exact-v9")
     var root: PersistentProjectionRadixMap.Root?
     for event in events {
         var exact = try PersistentWorkExactState(map: map, root: root)

@@ -249,6 +249,15 @@ public struct WorkHostDaemonServiceResolver: Sendable {
         [String: String]
     ) async throws -> WorkHostDaemonServiceComposition
 
+    /// Host-private construction of one fresh runtime for a Work-owned child. The resolver is
+    /// given the already-retained manifest so a local host can pin the same allowlisted runtime
+    /// variant used by the parent without exposing the private coordinator or pilot in this
+    /// public composition API.
+    public typealias AgentChildRuntimeHostFactory = @Sendable () -> RuntimeHost
+    public typealias AgentChildRuntimeHostResolver = @Sendable (
+        WorkLaunchManifest
+    ) async throws -> AgentChildRuntimeHostFactory
+
     private let openClosure: Open
 
     public init(_ open: @escaping Open) {
@@ -264,6 +273,30 @@ public struct WorkHostDaemonServiceResolver: Sendable {
         try await openClosure(home, host, instance, environment)
     }
 
+    /// Bind executable Hosted material to the exact process-local child owner. Kept internal so
+    /// tests can exercise the composition invariant without exposing the pilot or coordinator in
+    /// the daemon's public configuration surface.
+    internal static func agentChildHostedResolver(
+        hostedResolver: @escaping
+            DurableJournalBackedWorkLaunchManifestStore.HostedConfigurationResolver,
+        runtimeHostResolver: @escaping AgentChildRuntimeHostResolver,
+        coordinator: WorkAgentChildCoordinator
+    ) -> DurableJournalBackedWorkLaunchManifestStore.HostedConfigurationResolver {
+        { manifest, binding, policy in
+            guard var configuration = try await hostedResolver(
+                manifest, binding, policy) else { return nil }
+            let makeRuntimeHost = try await runtimeHostResolver(manifest)
+            configuration.agentChildPilot = WorkAgentChildPilot(
+                coordinator: coordinator,
+                // This first production slice has no implicit child lifetime limit. A nonnil
+                // Date here would also be process-construction-relative, not an
+                // admission-relative duration.
+                deadline: nil,
+                makeRuntimeHost: makeRuntimeHost)
+            return configuration
+        }
+    }
+
     /// A durable service resolver for the Work Host's journal-backed composition.
     ///
     /// `draftResolver` and `hostedResolver` are intentionally required inputs rather than
@@ -275,6 +308,7 @@ public struct WorkHostDaemonServiceResolver: Sendable {
         draftResolver: @escaping DurableJournalBackedWorkLaunchManifestStore.DraftResolver,
         hostedResolver: DurableJournalBackedWorkLaunchManifestStore.HostedConfigurationResolver?
             = nil,
+        agentChildRuntimeHostResolver: AgentChildRuntimeHostResolver? = nil,
         promptAssemblyResolver:
             DurableJournalBackedWorkLaunchManifestStore.PromptAssemblyResolver? = nil,
         reconstructabilityProbe: DurableJournalBackedWorkLaunchManifestStore.ReconstructabilityProbe?
@@ -283,11 +317,27 @@ public struct WorkHostDaemonServiceResolver: Sendable {
         actor: TimelineActor = TimelineActor(actorID: "aviaryd", kind: "work-host")
     ) -> WorkHostDaemonServiceResolver {
         WorkHostDaemonServiceResolver { home, host, instance, _ in
+            guard agentChildRuntimeHostResolver == nil || hostedResolver != nil else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let childCoordinator = try agentChildRuntimeHostResolver.map { _ in
+                try WorkAgentChildCoordinator()
+            }
+            let resolvedHostedResolver:
+                DurableJournalBackedWorkLaunchManifestStore.HostedConfigurationResolver?
+            if let hostedResolver, let agentChildRuntimeHostResolver, let childCoordinator {
+                resolvedHostedResolver = agentChildHostedResolver(
+                    hostedResolver: hostedResolver,
+                    runtimeHostResolver: agentChildRuntimeHostResolver,
+                    coordinator: childCoordinator)
+            } else {
+                resolvedHostedResolver = hostedResolver
+            }
             let manifestStore = DurableJournalBackedWorkLaunchManifestStore(
                 store: WorkLaunchManifestStore(home: home),
                 bodyAuthority: .workHost(host),
                 draftResolver: draftResolver,
-                hostedResolver: hostedResolver,
+                hostedResolver: resolvedHostedResolver,
                 promptAssemblyResolver: promptAssemblyResolver,
                 reconstructabilityProbe: reconstructabilityProbe)
             let service = try JournalBackedWorkService(
@@ -299,6 +349,9 @@ public struct WorkHostDaemonServiceResolver: Sendable {
                 authorizer: authorizer,
                 manifestStore: manifestStore,
                 workspaceCatalogProvider: workspaceCatalogProvider)
+            if let childCoordinator {
+                try await service.installAgentHandleCanceller(childCoordinator)
+            }
             return WorkHostDaemonServiceComposition(
                 service: service,
                 scanRecovery: { try await service.scanRecovery() },

@@ -1002,6 +1002,10 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
         }
         let operationalFactsProjectable = disposition != .ambiguous && disposition != .corrupt
             && !invalidAgentHandleFacts
+        let agentFactsProjectable = operationalFactsProjectable
+            && row?.unknownDomains.contains(where: {
+                [.work, .runtime, .externalEffects].contains($0)
+            }) != true
         let sessionOmissions = max(0, sessionFacts.count - limitedSessions.count)
             + omittedSessionIdentityCount + (row?.omittedSessionAttachmentCount ?? 0)
         let limitedClientCount = limitedClients.count
@@ -1052,9 +1056,9 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
             omittedActionCount: omittedActions + (operationalFactsProjectable ? 0 : actions.count),
             handles: operationalFactsProjectable ? handles : [],
             omittedHandleCount: omittedHandles + (operationalFactsProjectable ? 0 : handles.count),
-            agentHandles: operationalFactsProjectable ? retainedAgentHandles : [],
+            agentHandles: agentFactsProjectable ? retainedAgentHandles : [],
             omittedAgentHandleCount: omittedAgentHandles
-                + (operationalFactsProjectable ? 0 : retainedAgentHandles.count),
+                + (agentFactsProjectable ? 0 : retainedAgentHandles.count),
             commands: operationalFactsProjectable ? commands : [],
             omittedCommandCount: omittedCommands + (operationalFactsProjectable ? 0 : commands.count),
             outstandingActionIDs: operationalFactsProjectable ? outstandingActions : [],
@@ -1063,10 +1067,10 @@ public struct CanonicalWorkRecoveryProjection: Codable, Hashable, Sendable {
             outstandingHandleIDs: operationalFactsProjectable ? outstandingHandles : [],
             omittedOutstandingHandleCount: omittedOutstandingHandles
                 + (operationalFactsProjectable ? 0 : outstandingHandles.count),
-            completionBlockingAgentHandleIDs: operationalFactsProjectable
+            completionBlockingAgentHandleIDs: agentFactsProjectable
                 ? completionBlockingAgentHandleIDs : [],
             omittedCompletionBlockingAgentHandleCount: omittedCompletionBlockingAgentHandleCount
-                + (operationalFactsProjectable ? 0 : completionBlockingAgentHandleIDs.count),
+                + (agentFactsProjectable ? 0 : completionBlockingAgentHandleIDs.count),
             outstandingCommandIDs: operationalFactsProjectable ? outstandingCommands : [],
             omittedOutstandingCommandCount: omittedOutstandingCommands
                 + (operationalFactsProjectable ? 0 : outstandingCommands.count),

@@ -59,6 +59,9 @@ MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_DIAGNOSTIC_BYTES = 500
 MAX_SEND_SECONDS = 1.0
 SEND_CHUNK_BYTES = 512
+# The shared Work-Future adapter lives beside both host variants. Resolve it from this script's
+# executable origin so a launched host never imports an ambient cwd/PYTHONPATH module.
+_RUNTIME_MODULE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
 def validated_traceparent(value) -> str | None:
@@ -321,6 +324,12 @@ def _prelude(**names) -> str:
 
 _EXEC_BODY = r'''
 import builtins, io, json, sys, traceback
+try:
+    sys.path.remove(__AVIARY_RUNTIME_MODULE_DIR)
+except ValueError:
+    pass
+sys.path.insert(0, __AVIARY_RUNTIME_MODULE_DIR)
+from work_agent_future import make_work_future as __aviary_make_shared_work_future
 
 __aviary_out = io.StringIO()
 __aviary_err = io.StringIO()
@@ -534,119 +543,8 @@ class _AviaryFuture(__import__("concurrent.futures", fromlist=["Future"]).Future
         return self
 
 
-class _AviaryWorkFuture(_AviaryFuture):
-    """A local observer of a Work-owned Handle, not ownership of its execution."""
-
-    def result(self, timeout=None):
-        # Interest is a scheduling hint sent by the existing observer thread. A callback
-        # must not extend Future.result(timeout) or make an already-local result need a host.
-        with self._aviary_interest_lock:
-            self._aviary_waiters += 1
-        try:
-            return super().result(timeout=timeout)
-        finally:
-            with self._aviary_interest_lock:
-                self._aviary_waiters -= 1
-
-    def cancel(self):
-        # Future.cancel() must not imply a durable Work cancellation. The separately
-        # authorized service command owns that boundary, including uncertain outcomes.
-        return False
-
-
-def _aviary_work_result(handle_id, call_app):
-    import base64 as _b64, hashlib as _hash
-    body = bytearray()
-    expected_digest = None
-    expected_count = None
-    while True:
-        page = call_app("agent_handle_result", id=handle_id, offset=len(body))
-        if not isinstance(page, dict) or "error" in page:
-            raise RuntimeError(page.get("error", "Invalid Handle body response")
-                               if isinstance(page, dict) else "Invalid Handle body response")
-        count = page.get("byte_count")
-        digest = page.get("body_digest")
-        if (type(count) is not int or not 0 <= count <= 8 * 1024 * 1024
-                or not isinstance(digest, str) or page.get("id") != handle_id
-                or page.get("offset") != len(body)):
-            raise RuntimeError("Invalid Handle body identity or bound")
-        if expected_digest is None:
-            expected_digest, expected_count = digest, count
-        if digest != expected_digest or count != expected_count:
-            raise RuntimeError("Handle body changed while reading")
-        chunk = _b64.b64decode(page.get("data_base64", ""), validate=True)
-        end = len(body) + len(chunk)
-        if (len(chunk) > 256 * 1024 or end > count or page.get("next_offset") != end
-                or type(page.get("eof")) is not bool or page["eof"] != (end == count)
-                or (not chunk and end != count)):
-            raise RuntimeError("Invalid Handle body progress")
-        body.extend(chunk)
-        if page["eof"]:
-            if _hash.sha256(body).hexdigest() != digest.removeprefix("sha256:"):
-                raise RuntimeError("Handle body digest mismatch")
-            return body.decode("utf-8")
-
-
 def _aviary_make_work_future(record, call_app=None):
-    import math as _math, threading as _th, time as _time, uuid as _uuid
-    handle_id, deadline = record.get("id"), record.get("deadline")
-    if (not isinstance(handle_id, str) or not handle_id or len(handle_id.encode()) > 256
-            or "deadline" not in record
-            or (deadline is not None
-                and (type(deadline) not in (float, int) or not _math.isfinite(deadline)))):
-        raise RuntimeError("Invalid Work Handle admission response")
-    call_app = call_app or _aviary_call_app
-    future = _AviaryWorkFuture(call_app)
-    future.aviary_id = handle_id
-    future.aviary_name = record.get("name")
-    future.aviary_deadline = deadline
-    future.aviary_ownership = "work"
-    future._aviary_observer_id = _uuid.uuid4().hex
-    future._aviary_interest_lock = _th.Lock()
-    future._aviary_waiters = 0
-    future.set_running_or_notify_cancel()
-
-    def watch():
-        try:
-            last_interest = False
-            while True:
-                with future._aviary_interest_lock:
-                    interest = future._aviary_waiters > 0
-                if interest != last_interest:
-                    call_app("agent_handle_await", id=handle_id,
-                             observer_id=future._aviary_observer_id, awaited=interest)
-                    last_interest = interest
-                row = call_app("agent_handle_status", id=handle_id)
-                if not isinstance(row, dict) or "error" in row:
-                    raise RuntimeError(row.get("error", "Handle state unavailable")
-                                       if isinstance(row, dict) else "Handle state unavailable")
-                if (row.get("id") != handle_id or row.get("ownership") != "work"
-                        or "deadline" not in row
-                        or (row["deadline"] is not None
-                            and (type(row["deadline"]) not in (float, int)
-                                 or not _math.isfinite(row["deadline"])))
-                        or row.get("deadline") != deadline):
-                    raise RuntimeError("Handle observation identity changed")
-                state = row.get("state")
-                if state == "terminal":
-                    if row.get("outcome") == "succeeded":
-                        future.set_result(_aviary_work_result(handle_id, call_app))
-                        return
-                    raise RuntimeError("Handle %s settled as %s; inspect its retained outcome" %
-                                       (handle_id, row.get("outcome", "unknown")))
-                if state == "reaped":
-                    raise RuntimeError("Handle %s was reaped; its tombstone remains recorded" % handle_id)
-                if state not in ("queued", "running", "cancel_requested"):
-                    raise RuntimeError("Handle state is unavailable or unknown")
-                # Scope expiry governs execution at the coordinator, not this observer.
-                # Persistence can lag an on-time completion. Only canonical terminal evidence
-                # settles the Future; result(timeout) bounds the caller's own wait.
-                _time.sleep(0.5)
-        except Exception as exc:
-            future.set_exception(exc)
-
-    _th.Thread(target=watch).start()
-    return future
+    return __aviary_make_shared_work_future(record, call_app or __aviary_call_app)
 
 
 def __aviary_attach_agent(handle_id, name=None, call_app=None):
@@ -697,7 +595,47 @@ def __aviary_make_attach_agent(call_app):
 __aviary_ns["attach_agent"] = __aviary_make_attach_agent(__aviary_ask_app)
 
 
-def __aviary_spawn(prompt, name=None, model=None, call_app=None):
+def __aviary_validate_spawn_policy(timeout=None, token_limit=None, cost_limit_usd=None):
+    # Keep policy validation at the Python boundary as well as in Aviary. In particular, bool
+    # is an int subclass in Python but is not a meaningful timeout/token/cost value. Tokens are
+    # strings on the wire because the Swift JSONValue number representation is a Double.
+    import math as _math
+
+    if timeout is not None:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise TypeError("timeout must be a finite positive number")
+        try:
+            timeout_number = float(timeout)
+        except (OverflowError, ValueError):
+            raise ValueError("timeout must be a finite positive number") from None
+        if not _math.isfinite(timeout_number) or timeout <= 0:
+            raise ValueError("timeout must be a finite positive number")
+    if token_limit is not None:
+        if isinstance(token_limit, bool) or not isinstance(token_limit, int):
+            raise TypeError("token_limit must be a positive integer")
+        if token_limit <= 0 or token_limit > ((1 << 63) - 1):
+            raise ValueError("token_limit must be a positive integer")
+    if cost_limit_usd is not None:
+        if isinstance(cost_limit_usd, bool) or not isinstance(cost_limit_usd, (int, float)):
+            raise TypeError("cost_limit_usd must be a finite positive number")
+        try:
+            cost_number = float(cost_limit_usd)
+        except (OverflowError, ValueError):
+            raise ValueError("cost_limit_usd must be a finite positive number") from None
+        if not _math.isfinite(cost_number) or cost_limit_usd <= 0:
+            raise ValueError("cost_limit_usd must be a finite positive number")
+    policy = {}
+    if timeout is not None:
+        policy["timeout"] = timeout_number
+    if token_limit is not None:
+        policy["token_limit"] = str(token_limit)
+    if cost_limit_usd is not None:
+        policy["cost_limit_usd"] = cost_number
+    return policy
+
+
+def __aviary_spawn(prompt, name=None, model=None, timeout=None, token_limit=None,
+                   cost_limit_usd=None, call_app=None):
     # Returns a real `concurrent.futures.Future`, not a bespoke handle.
     #
     # The agent here is *writing Python*, not calling a sub-agent tool, so whether to wait is
@@ -711,7 +649,11 @@ def __aviary_spawn(prompt, name=None, model=None, call_app=None):
     import time as _time
 
     call_app = call_app or __aviary_ask_app
-    started = call_app("spawn", prompt=prompt, name=name, model=model)
+    policy = __aviary_validate_spawn_policy(
+        timeout=timeout, token_limit=token_limit, cost_limit_usd=cost_limit_usd)
+    request = {"prompt": prompt, "name": name, "model": model}
+    request.update(policy)
+    started = call_app("spawn", **request)
     if isinstance(started, dict) and started.get("ownership") == "work" and "id" in started:
         return _aviary_make_work_future(started, call_app)
     future = _AviaryFuture(call_app)
@@ -758,8 +700,11 @@ def __aviary_spawn(prompt, name=None, model=None, call_app=None):
 
 
 def __aviary_make_spawn(call_app):
-    def spawn(prompt, name=None, model=None):
-        return __aviary_spawn(prompt, name=name, model=model, call_app=call_app)
+    def spawn(prompt, name=None, model=None, timeout=None, token_limit=None,
+              cost_limit_usd=None):
+        return __aviary_spawn(
+            prompt, name=name, model=model, timeout=timeout, token_limit=token_limit,
+            cost_limit_usd=cost_limit_usd, call_app=call_app)
     return spawn
 
 
@@ -897,7 +842,7 @@ finally:
     for __aviary_dead in ("__aviary_out", "__aviary_err", "__aviary_result", "__aviary_fh",
                           "__aviary_value", "__aviary_sh", "__aviary_state",
                           "__AVIARY_CODE", "__AVIARY_MODE", "__AVIARY_OUT", "__AVIARY_CWD",
-                          "__AVIARY_TRACEPARENT"):
+                          "__AVIARY_TRACEPARENT", "__AVIARY_RUNTIME_MODULE_DIR"):
         globals().pop(__aviary_dead, None)
     globals().pop("__aviary_dead", None)
 '''
@@ -1093,7 +1038,9 @@ class Session:
         fd, path = tempfile.mkstemp(prefix="aviary-runtime-", suffix=".json")
         os.close(fd)
         try:
-            source = _prelude(__AVIARY_OUT=path, **inputs) + body
+            source = _prelude(
+                __AVIARY_OUT=path, __AVIARY_RUNTIME_MODULE_DIR=_RUNTIME_MODULE_DIR,
+                **inputs) + body
             subinterpreters.run_string(self.interp, source)
             with open(path) as fh:
                 return json.load(fh)

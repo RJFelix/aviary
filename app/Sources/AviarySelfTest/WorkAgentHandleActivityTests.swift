@@ -223,6 +223,28 @@ func testWorkAgentHandleActivityIsBoundedAndOmitsPrivateFields() throws {
 }
 
 let casesWorkAgentHandleActivity: [Case] = [
+    ("phase5 recorded Work-owned agent activity: policy and stop reason stay explicit", {
+        let unlimited = ChatAgentHandleActivityRow(
+            id: "opaque-child", status: .running, terminalOutcome: nil, cleanupState: nil)
+        XCTAssertTrue(unlimited.policySummary.contains("No token limit"))
+        XCTAssertTrue(unlimited.policySummary.contains("No spend limit"))
+        XCTAssertTrue(unlimited.policySummary.contains("No time limit"))
+        let limited = ChatAgentHandleActivityRow(
+            id: "opaque-limited-child", status: .settled, terminalOutcome: .limited,
+            cleanupState: .quiesced,
+            executionLimits: try WorkAgentExecutionLimits(maximumTokens: 100,
+                                                         maximumEstimatedCostUSD: 0.25),
+            deadline: Date(timeIntervalSince1970: 1000), limitDecision: .tokenAccountingUnknown)
+        XCTAssertEqual(limited.statusTitle, "Stopped: token usage incomplete")
+        XCTAssertTrue(limited.policySummary.contains("100"))
+        XCTAssertTrue(limited.policySummary.contains("$0.25"))
+        XCTAssertTrue(limited.policySummary.contains("Time limit set"))
+        XCTAssertEqual(try JSONDecoder().decode(ChatAgentHandleActivityRow.self,
+                                               from: JSONEncoder().encode(limited)), limited)
+        let encoded = String(decoding: try JSONEncoder().encode(limited), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("admission"))
+        XCTAssertFalse(encoded.contains("providerAccounting"))
+    }),
     ("phase5 recorded Work-owned agent activity: canonical lifecycle presentation", {
         try testWorkAgentHandleActivityProjectionAndPresentation()
     }),

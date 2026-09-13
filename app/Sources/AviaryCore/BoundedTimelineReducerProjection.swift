@@ -333,12 +333,14 @@ public struct BoundedWorkAgentHandleIndexRecord: Codable, Hashable, Sendable {
     public let label: String
     public let deadline: Date?
     public let requestBody: TimelineBodyReference
+    public let executionLimits: WorkAgentExecutionLimits
     public let state: WorkAgentHandleState
     public let cancellationEvidence: WorkAgentHandleCancellationEvidence?
     public let terminalEvidence: WorkAgentHandleTerminalEvidence?
     public let reapReason: WorkAgentHandleReapReason?
     public let queuedEvent: EventRef
     public let startedEvent: EventRef?
+    public let executionStartedAt: Date?
     public let latestLifecycleEvent: EventRef
     public let reapedEvent: EventRef?
     public let providerAccounting: WorkAgentProviderAccounting
@@ -358,10 +360,12 @@ public struct BoundedWorkAgentHandleIndexRecord: Codable, Hashable, Sendable {
 
     public init(_ snapshot: WorkAgentHandleSnapshot) {
         handle = snapshot.handle; origin = snapshot.origin; label = snapshot.label
-        deadline = snapshot.deadline; requestBody = snapshot.requestBody; state = snapshot.state
+        deadline = snapshot.deadline; requestBody = snapshot.requestBody
+        executionLimits = snapshot.executionLimits; state = snapshot.state
         cancellationEvidence = snapshot.cancellationEvidence
         terminalEvidence = snapshot.terminalEvidence; reapReason = snapshot.reapReason
         queuedEvent = snapshot.queuedEvent; startedEvent = snapshot.startedEvent
+        executionStartedAt = snapshot.executionStartedAt
         latestLifecycleEvent = snapshot.latestLifecycleEvent
         reapedEvent = snapshot.reapedEvent
         providerAccounting = snapshot.providerAccounting
@@ -729,7 +733,7 @@ public enum BoundedChildState: String, Codable, Hashable, Sendable {
 }
 
 public struct BoundedWorkReducerHead: Codable, Hashable, Sendable {
-    public static let schemaVersion = 8
+    public static let schemaVersion = 9
     public static let mediaType = "application/x-aviary-bounded-work-reducer-head"
 
     public let schemaVersion: Int
@@ -2636,6 +2640,11 @@ public enum BoundedTimelineReducerProjection {
         source: BoundedReducerProjectionSource,
         limits: BoundedTimelineReducerProjectionLimits
     ) throws {
+        guard (try? handle.executionLimits.validate()) != nil,
+              (handle.startedEvent == nil) == (handle.executionStartedAt == nil),
+              handle.executionStartedAt.map({ $0.timeIntervalSince1970.isFinite }) ?? true else {
+            throw BoundedTimelineReducerProjectionError.invalidIdentity
+        }
         try handle.providerAccounting.validate(
             origin: handle.origin, handle: handle.handle, execution: handle.startedEvent,
             journal: source.journal, lastSequence: source.cursor.sequence)
@@ -2722,6 +2731,24 @@ public enum BoundedTimelineReducerProjection {
                     throw BoundedTimelineReducerProjectionError.invalidIdentity
                 }
             } else if terminal.cleanup.state != .quiesced {
+                throw BoundedTimelineReducerProjectionError.invalidIdentity
+            }
+            if terminal.outcome == .limited {
+                guard terminal.cleanup.state == .quiesced,
+                      handle.providerAccounting.pending == nil,
+                      let refusal = terminal.limitRefusal,
+                      let startedAt = handle.executionStartedAt,
+                      let settledAt = terminal.executionSettledAt,
+                      settledAt.timeIntervalSince1970.isFinite,
+                      settledAt >= startedAt,
+                      settledAt <= terminal.event.hostRecordedAt,
+                      (try? refusal.validate(
+                          limits: handle.executionLimits,
+                          usage: handle.providerAccounting.usage)) != nil,
+                      handle.deadline.map({ settledAt < $0 }) ?? true else {
+                    throw BoundedTimelineReducerProjectionError.invalidIdentity
+                }
+            } else if terminal.limitRefusal != nil || terminal.executionSettledAt != nil {
                 throw BoundedTimelineReducerProjectionError.invalidIdentity
             }
             if handle.cancellationEvidence != nil,

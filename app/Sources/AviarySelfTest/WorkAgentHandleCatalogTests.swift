@@ -79,7 +79,7 @@ func test_workAgentHandleCatalogFactIsPrivateAndCompletionAware() throws {
     let encoded = String(decoding: try JSONEncoder().encode(fact), as: UTF8.self)
     XCTAssertFalse(encoded.contains("private-queued-child"))
     XCTAssertFalse(encoded.contains("request_body"))
-    XCTAssertFalse(encoded.contains("deadline"))
+    XCTAssertEqual(fact.deadline, Date(timeIntervalSince1970: 100))
     let decoded = try JSONDecoder().decode(
         LocalTimelineCatalog.AgentHandleFact.self, from: Data(encoded.utf8))
     XCTAssertEqual(decoded, fact)
@@ -373,6 +373,21 @@ func test_workAgentHandleCatalogRecoveryRejectsOversizedNestedOrigin() throws {
 }
 
 let casesWorkAgentHandleCatalog: [Case] = [
+    ("phase5 catalog: decoded unknown-domain rows cannot expose child facts", {
+        let original = catalogHandleRow([catalogHandleSnapshot(id: "running", state: .running)])
+        for domain in [TimelineDomain.work, .runtime, .externalEffects] {
+            var object = try XCTUnwrap(JSONValue.parse(try JSONEncoder().encode(original))?.objectValue)
+            object["unknownDomains"] = .array([.string(domain.rawValue)])
+            let row = try JSONDecoder().decode(LocalTimelineCatalog.WorkRow.self,
+                from: JSONEncoder().encode(JSONValue.object(object)))
+            let recovered = try XCTUnwrap(CanonicalWorkRecoveryProjection(works: [row]).rows.first)
+            XCTAssertEqual(recovered.disposition, .uncertain)
+            XCTAssertTrue(recovered.agentHandles.isEmpty)
+            XCTAssertTrue(recovered.completionBlockingAgentHandleIDs.isEmpty)
+            XCTAssertEqual(recovered.omittedAgentHandleCount, 1)
+            XCTAssertEqual(recovered.omittedCompletionBlockingAgentHandleCount, 1)
+        }
+    }),
     ("phase5 catalog: Agent Handle facts are private and completion-aware", {
         try test_workAgentHandleCatalogFactIsPrivateAndCompletionAware()
     }),

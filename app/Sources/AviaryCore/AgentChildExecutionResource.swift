@@ -62,6 +62,7 @@ public enum AgentChildExecutionState: String, Sendable, Equatable {
     case failed
     case canceled
     case expired
+    case limited
 }
 
 /// Coverage of resources owned by this executor: its Python session/process, admitted
@@ -95,6 +96,7 @@ public struct AgentChildExecutionResult: Sendable, Equatable {
     public let transcriptURL: URL?
     public let runtimeIdentity: RuntimeHost.HostIdentity?
     public let cleanup: AgentChildExecutionCleanup
+    public let limitRefusal: WorkAgentExecutionLimitRefusal?
 
     public init(
         childID: String,
@@ -103,7 +105,8 @@ public struct AgentChildExecutionResult: Sendable, Equatable {
         detail: String? = nil,
         transcriptURL: URL? = nil,
         runtimeIdentity: RuntimeHost.HostIdentity? = nil,
-        cleanup: AgentChildExecutionCleanup
+        cleanup: AgentChildExecutionCleanup,
+        limitRefusal: WorkAgentExecutionLimitRefusal? = nil
     ) {
         self.childID = childID
         self.state = state
@@ -112,6 +115,7 @@ public struct AgentChildExecutionResult: Sendable, Equatable {
         self.transcriptURL = transcriptURL
         self.runtimeIdentity = runtimeIdentity
         self.cleanup = cleanup
+        self.limitRefusal = limitRefusal
     }
 }
 
@@ -241,6 +245,7 @@ public actor AgentChildExecutionResource {
         var detail: String?
         var transcriptURL: URL?
         var runtimeIdentity: RuntimeHost.HostIdentity?
+        var limitRefusal: WorkAgentExecutionLimitRefusal?
 
         do {
             try validateConfiguration()
@@ -311,6 +316,10 @@ public actor AgentChildExecutionResource {
                 if cancellationRequested || outcome == .cancelled {
                     state = .canceled
                     detail = "The child was canceled at an agent-loop boundary."
+                } else if let refusal = await prepared.agent.childExecutionLimitRefusal {
+                    state = .limited
+                    limitRefusal = refusal
+                    detail = refusal.localizedDescription
                 } else {
                     switch outcome {
                     case .completed:
@@ -342,8 +351,9 @@ public actor AgentChildExecutionResource {
         }
 
         let cleanup = await finishCleanup()
-        if cancellationRequested, state == .succeeded {
+        if cancellationRequested, state == .succeeded || state == .limited {
             state = .canceled
+            limitRefusal = nil
             detail = "The child was canceled during cleanup."
         }
         if !cleanup.isComplete, state == .succeeded {
@@ -357,7 +367,7 @@ public actor AgentChildExecutionResource {
             detail: detail,
             transcriptURL: transcriptURL,
             runtimeIdentity: runtimeIdentity,
-            cleanup: cleanup)
+            cleanup: cleanup, limitRefusal: limitRefusal)
         terminalResult = result
         return result
     }

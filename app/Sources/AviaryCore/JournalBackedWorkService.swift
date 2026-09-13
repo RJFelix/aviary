@@ -1115,8 +1115,8 @@ public actor JournalBackedWorkService: WorkServiceClient {
     /// crossing it changes storage strategy, never source availability.
     private let canonicalResidentRecordLimit: Int
     /// Installed only by the host-private pilot composition before this service is first used.
-    /// The production resolver leaves it nil, so a live canonical child is unavailable rather
-    /// than reconstructed from journal metadata or assigned to a new process owner.
+    /// A fresh production process installs a new owner; live canonical children from an earlier
+    /// process remain unavailable rather than being reconstructed or assigned to that new owner.
     private var agentHandleCanceller: (any WorkServiceAgentHandleCancelling)?
     private var loaded = false
     private var manifests: [WorkRef: JournalBackedWorkLaunchManifest] = [:]
@@ -1311,6 +1311,20 @@ public actor JournalBackedWorkService: WorkServiceClient {
                 "agent Handle canceller must be installed once before service use")
         }
         agentHandleCanceller = canceller
+    }
+
+    /// Hosted execution and child control must be owned by the same process-local coordinator.
+    /// This is deliberately bidirectional: installing an owner makes a missing pilot invalid,
+    /// while a pilot cannot appear on a service which did not install its owner.
+    internal func attestsAgentChildOwnership(
+        _ configuration: HostedInHouseWorkConfiguration
+    ) -> Bool {
+        if let agentHandleCanceller {
+            guard let owner = agentHandleCanceller as? WorkAgentChildCoordinator,
+                  let pilot = configuration.agentChildPilot else { return false }
+            return owner === pilot.coordinator
+        }
+        return configuration.agentChildPilot == nil
     }
 
     /// Shutdown must consult the same private owner that receives child control commands.
@@ -4348,10 +4362,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
         binding: WorkRunBinding,
         policy: WorkLaunchExecutionPolicy
     ) -> Bool {
-        if let pilot = configuration.agentChildPilot {
-            guard let owner = agentHandleCanceller as? WorkAgentChildCoordinator,
-                  owner === pilot.coordinator else { return false }
-        }
+        guard attestsAgentChildOwnership(configuration) else { return false }
         guard configuration.home == home,
               configuration.workRunBinding == binding,
               configuration.projectionMode == policy.projection,
@@ -4380,8 +4391,7 @@ public actor JournalBackedWorkService: WorkServiceClient {
               draft.peerScheduler == WorkLaunchPeerSchedulerConfiguration(),
               configuration.maxIterations == (draft.budgetPolicy.maximumTurns ?? 40),
               configuration.maxDepth == (draft.budgetPolicy.maximumDepth ?? 3),
-              configuration.childMaxIterations ==
-                  (draft.budgetPolicy.childMaximumTurns ?? 20),
+              configuration.childMaxIterations == draft.budgetPolicy.childMaximumTurns,
               configuration.hookPaths.isEmpty else {
             return false
         }

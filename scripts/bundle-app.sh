@@ -41,7 +41,7 @@ cp "$DAEMON_PATH" "$APP_DIR/Contents/Helpers/$DAEMON_NAME"
 
 # The helper is a real Work Host process, not a thin launcher back into the checkout. Ship the
 # Python runtime hosts it owns so Work can continue when the GUI is closed and when the app bundle
-# is moved away from the source tree. Copy the two audited entry points explicitly: build caches or
+# is moved away from the source tree. Copy the audited entry points and shared adapter explicitly: build caches or
 # other local runtime directory contents must never become accidental bundle resources.
 mkdir -p "$APP_DIR/Contents/Resources/runtime-hosts/python3"
 mkdir -p "$APP_DIR/Contents/Resources/runtime-hosts/python3-shared"
@@ -49,6 +49,8 @@ install -m 0644 "$ROOT/runtime-hosts/python3/host.py" \
     "$APP_DIR/Contents/Resources/runtime-hosts/python3/host.py"
 install -m 0644 "$ROOT/runtime-hosts/python3-shared/host.py" \
     "$APP_DIR/Contents/Resources/runtime-hosts/python3-shared/host.py"
+install -m 0644 "$ROOT/runtime-hosts/work_agent_future.py" \
+    "$APP_DIR/Contents/Resources/runtime-hosts/work_agent_future.py"
 
 BUILD_STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 BUILD_COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"

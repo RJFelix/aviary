@@ -7192,7 +7192,12 @@ await Harness.run(
         + casesProviderSettlement + casesProviderSettlementReducer
         + casesProviderSettlementAgent + casesProviderSettlementJournal
         + casesCanonicalWorkUsage + casesWorkAgentProviderAccounting + casesTimelineJournalWriterContinuation
+        + casesCanonicalWorkUsageInventory + casesFallbackChildIterationDefaults
+        + casesAviaryPlatformLocks
         + casesWorkAgentProviderExecution
+        + casesWorkAgentExecutionLimits + casesWorkAgentSpawnPolicy
+        + casesWorkAgentExecutionPolicyCanonical + casesWorkAgentChildProductionComposition
+        + casesWorkAgentChildDaemonJourney
         + casesAviaryTelemetryHTTPClient + casesAviaryTelemetryDelivery + casesAviaryTelemetrySavedChat
         + casesAviaryTelemetryDrain + casesAviaryTelemetryRepositoryReview
         + casesAviaryTelemetryContext + casesHostedDeferredDeliveryTelemetry

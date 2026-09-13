@@ -162,6 +162,7 @@ public actor Agent {
     private let nativeJournal: RunJournalBundle?
     private let childProviderAccounting: (any ChildProviderAccounting)?
     private var childProviderAdmitted = false
+    internal private(set) var childExecutionLimitRefusal: WorkAgentExecutionLimitRefusal?
     private var config: Configuration
     private let hostSession: String
     private var messages: [ChatMessage] = []
@@ -574,7 +575,7 @@ public actor Agent {
                 guard !rid.isEmpty, rid.utf8.count <= 512,
                       workSpawnCallbackAttempts.count < WorkAgentHandleSnapshot.maximumRetainedPerWork,
                       let object = payload.objectValue,
-                      Set(object.keys).isSubset(of: ["prompt", "name", "model"]),
+                      Set(object.keys).isSubset(of: ["prompt", "name", "model", "timeout", "token_limit", "cost_limit_usd"]),
                       let prompt = object["prompt"]?.stringValue,
                       prompt.utf8.count <= WorkAgentChildCoordinator.maximumPromptBytes,
                       boundedOptionalText(object["name"], bytes: 256),
@@ -831,6 +832,13 @@ public actor Agent {
             {
                 return .object(["error": .string(rejection)])
             }
+            let childPolicy: WorkAgentSpawnPolicy
+            do { childPolicy = try WorkAgentSpawnPolicy(callbackPayload: payload) }
+            catch { return .object(["error": .string("Invalid child time, token, or estimated-cost limit.")]) }
+            guard childPolicy == .unlimited || delegate is any WorkAgentSpawnDelegate else {
+                return .object(["error": .string(
+                    "This child execution route cannot enforce requested limits. No child was started.")])
+            }
             let name = payload["name"]?.stringValue
             // Always non-blocking. Waiting is `.result()` on the Future the prelude hands
             // back, which is Python's business rather than this callback's.
@@ -843,7 +851,8 @@ public actor Agent {
             if let workDelegate = delegate as? any WorkAgentSpawnDelegate {
                 started = await workDelegate.startWorkChild(
                     callbackID: rid, prompt: prompt, name: name,
-                    model: payload["model"]?.stringValue, depth: config.depth + 1)
+                    model: payload["model"]?.stringValue, depth: config.depth + 1,
+                    policy: childPolicy)
             } else {
                 started = await delegate.startBackground(
                     prompt: prompt, name: name,
@@ -1522,6 +1531,7 @@ public actor Agent {
 
     private func requireModelPermit(_ permit: EffectPermit?, for effect: String) throws {
         try requireNativePermit(permit, for: effect)
+        if let childExecutionLimitRefusal { throw childExecutionLimitRefusal }
         guard childProviderAccounting == nil || (childProviderAdmitted && journalFailureDetail == nil) else {
             throw NativeJournalFailure(detail: journalFailureDetail ?? "Child provider admission was refused.")
         }
@@ -1538,6 +1548,7 @@ public actor Agent {
         assembly: SystemPromptAssembly? = nil, targetModel: String
     ) async -> EffectPermit? {
         if let childProviderAccounting {
+            guard childExecutionLimitRefusal == nil else { return nil }
             guard nativeJournal == nil, journalFailureDetail == nil, !childProviderAdmitted else {
                 journalFailureDetail = "Provider accounting ownership is conflicting or unavailable."
                 return nil
@@ -1546,6 +1557,8 @@ public actor Agent {
                 try await childProviderAccounting.begin(
                     admission, requestModel: request.model, targetModel: targetModel)
                 childProviderAdmitted = true
+            } catch let refusal as WorkAgentExecutionLimitRefusal {
+                childExecutionLimitRefusal = refusal
             } catch {
                 latchNativeJournalFailure("the child provider admission", error)
             }
@@ -1932,6 +1945,12 @@ public actor Agent {
             guard await requireJournal("model call") else {
                 return .failed(journalFailureDetail!)
             }
+            if cancelled || Task.isCancelled {
+                _ = await appendJournalNote("Stopped at your request.")
+                await recordOutcome(.cancelled, detail: "Stopped at your request.")
+                emit(.finished(reason: "cancelled"))
+                return .cancelled
+            }
 
             let turn: Turn
             do {
@@ -2307,6 +2326,8 @@ public actor Agent {
                     var measurements = AviaryProviderTelemetry()
                     defer { measurements.record(model: crossingModel) }
                     do {
+                        try Task.checkCancellation()
+                        guard !self.cancelled else { throw CancellationError() }
                         for try await event in crossingProvider.stream(ask) {
                             try Task.checkCancellation()
                             measurements.observe(event)
@@ -2512,6 +2533,8 @@ public actor Agent {
                     var measurements = AviaryProviderTelemetry()
                     defer { measurements.record(model: crossingModel) }
                     do {
+                        try Task.checkCancellation()
+                        guard !self.cancelled else { throw CancellationError() }
                         for try await event in crossingProvider.stream(request) {
                             try Task.checkCancellation()
                             measurements.observe(event)

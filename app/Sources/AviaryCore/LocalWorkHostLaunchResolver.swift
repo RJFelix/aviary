@@ -331,7 +331,7 @@ public struct LocalWorkHostLaunchResolver: Sendable {
             reasoningEffort: manifest.reasoningPolicy.level,
             maxDepth: manifest.budgetPolicy.maximumDepth ?? 3,
             maxIterations: manifest.budgetPolicy.maximumTurns ?? 40,
-            childMaxIterations: manifest.budgetPolicy.childMaximumTurns ?? 20,
+            childMaxIterations: manifest.budgetPolicy.childMaximumTurns,
             recordPayloads: manifest.recordingPolicy.recordPayloads,
             projectionMode: policy.projection,
             modelContextMode: policy.modelContext)
@@ -343,6 +343,29 @@ public struct LocalWorkHostLaunchResolver: Sendable {
         DurableJournalBackedWorkLaunchManifestStore.HostedConfigurationResolver {
         { [self] manifest, binding, policy in
             try await self.hostedConfiguration(for: manifest, binding: binding, policy: policy)
+        }
+    }
+
+    /// Resolve the same bounded runtime variant as the parent launch into a fresh, child-owned
+    /// launcher. Validation happens before admission reaches Hosted construction; the returned
+    /// closure performs no filesystem lookup and a later missing executable/script is reported
+    /// by RuntimeHost.start rather than falling back to the parent's runtime.
+    public var agentChildRuntimeHostResolver:
+        WorkHostDaemonServiceResolver.AgentChildRuntimeHostResolver {
+        { [self] manifest in
+            let variant = try validateRuntime(
+                variant: manifest.runtime.runtimeVariant,
+                repository: configuration.runtimeRepositoryRoot)
+            let script = configuration.runtimeRepositoryRoot
+                .appending(path: "runtime-hosts/\(variant)/host.py")
+                .standardizedFileURL
+            let executable = configuration.runtimeExecutable
+            return {
+                RuntimeHost(
+                    executable: executable,
+                    arguments: ["python3", script.path],
+                    parentLifetimeLease: true)
+            }
         }
     }
 

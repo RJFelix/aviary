@@ -46,7 +46,7 @@ public enum InHouseWorkFactory {
         public let reasoningEffort: String?
         public let maxDepth: Int
         public let maxIterations: Int
-        public let childMaxIterations: Int
+        public let childMaxIterations: Int?
         public let memory: MemoryStore?
         public let recordPayloads: Bool
         public let goal: Goal?
@@ -78,7 +78,7 @@ public enum InHouseWorkFactory {
             reasoningEffort: String? = nil,
             maxDepth: Int = 3,
             maxIterations: Int = 40,
-            childMaxIterations: Int = 20,
+            childMaxIterations: Int? = nil,
             memory: MemoryStore? = nil,
             recordPayloads: Bool = false,
             goal: Goal? = nil,

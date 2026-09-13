@@ -1556,6 +1556,12 @@ func testWorkServiceAttachedControllerConsumesReferenceServiceCreateResponse() a
         response.work.work)
     XCTAssertEqual(projection.workCursor, response.workCursor)
     XCTAssertEqual(projection.sessionCursor, response.sessionCursor)
+    let inventory = try XCTUnwrap(projection.usageInventory)
+    XCTAssertEqual(inventory.work, response.work.work)
+    XCTAssertEqual(inventory.combinedAvailability, .complete)
+    XCTAssertEqual(inventory.direct?.startedCrossings, 0)
+    XCTAssertEqual(inventory.childrenTotal?.startedCrossings, 0)
+    XCTAssertEqual(inventory.combined?.startedCrossings, 0)
 }
 
 func testWorkServiceAttachedControllerAcceptsExactStandaloneEventByteBoundary() async throws {

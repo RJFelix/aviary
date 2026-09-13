@@ -1853,8 +1853,8 @@ struct RunInspector: View {
 
                 if run.isServiceBacked {
                     ServiceWorkCard(run: run)
-                    if let usage = run.serviceWorkUsage {
-                        ServiceWorkUsageCard(usage: usage)
+                    if let usageInventory = run.serviceWorkUsageInventory {
+                        ServiceWorkUsageInventoryCard(inventory: usageInventory)
                     }
                 }
 
@@ -2232,54 +2232,187 @@ private struct ServiceWorkCard: View {
     }
 }
 
-/// Work accounting is separate from transcript ``Usage``. It is shown only after the service has authenticated a complete
-/// Work/Session pair; otherwise the absence of a number is safer than attributing shared Work
-/// spend to this one Session.
-private struct ServiceWorkUsageCard: View {
-    let usage: CanonicalWorkUsage
+/// Work accounting is separate from transcript ``Usage``. This card renders the authenticated
+/// Work-wide inventory as distinct Main agent and Background agents subtotals. A combined total
+/// is shown only when the child inventory is complete; a direct subtotal is never relabeled as a
+/// combined total when child facts are omitted or unavailable.
+struct ServiceWorkUsageInventoryCard: View {
+    private let direct: CanonicalWorkUsage?
+    private let directAvailability: CanonicalWorkUsageInventory.DirectAvailability
+    private let childrenTotal: CanonicalWorkUsage?
+    private let childCount: Int
+    private let omittedChildCount: Int
+    private let invalidChildCount: Int
+    private let combined: CanonicalWorkUsage?
+    private let combinedAvailability: CanonicalWorkUsageInventory.CombinedAvailability
+
+    init(inventory: CanonicalWorkUsageInventory) {
+        direct = inventory.direct
+        directAvailability = inventory.directAvailability
+        childrenTotal = inventory.childrenTotal
+        childCount = inventory.children.count
+        omittedChildCount = inventory.omittedChildCount
+        invalidChildCount = inventory.invalidChildCount
+        combined = inventory.combined
+        combinedAvailability = inventory.combinedAvailability
+    }
+
+    /// Presentation-only fixture seam. It intentionally accepts already-projected display
+    /// values and does not construct or bypass Core's authenticated inventory initializer.
+    init(fixture: ServiceWorkUsageInventoryFixture) {
+        direct = fixture.direct
+        directAvailability = fixture.directAvailability
+        childrenTotal = fixture.childrenTotal
+        childCount = fixture.childCount
+        omittedChildCount = fixture.omittedChildCount
+        invalidChildCount = fixture.invalidChildCount
+        combined = fixture.combined
+        combinedAvailability = fixture.combinedAvailability
+    }
 
     var body: some View {
         Card("Shared model usage", symbol: "chart.bar.xaxis") {
-            VStack(alignment: .leading, spacing: 7) {
-                if !usage.hasCrossingEvidence {
-                    Text("No model requests recorded for this work yet.")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 9) {
+                Text("One shared total across attached chats and background agents")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.secondary)
+
+                if let combined, combinedAvailability == .complete {
+                    WorkUsageSubtotal(title: "Combined", usage: combined, emphasis: true)
                 } else {
-                    HStack(spacing: 10) {
-                        StatTile(
-                            label: "tokens",
-                            value: tokenValue(usage.knownTokenFloor, usage.totalTokenCertainty))
-                        StatTile(label: "estimated cost", value: costValue)
-                    }
-                    DetailRow(
-                        label: "Input floor",
-                        value: tokenValue(usage.inputTokens, usage.breakdownCertainty),
-                        mono: true)
-                    DetailRow(
-                        label: "Output floor",
-                        value: tokenValue(usage.outputTokens, usage.breakdownCertainty),
-                        mono: true)
-                    if usage.cacheReadTokens > 0 || usage.cacheWriteTokens > 0 {
-                        DetailRow(label: "Cache read floor", value: tokenValue(
-                            usage.cacheReadTokens, usage.breakdownCertainty), mono: true)
-                        DetailRow(label: "Cache write floor", value: tokenValue(
-                            usage.cacheWriteTokens, usage.breakdownCertainty), mono: true)
-                    }
-                    DetailRow(
-                        label: "Requests",
-                        value: "\(usage.settledCrossings)/\(usage.startedCrossings) outcomes recorded",
-                        mono: true)
-                    if usage.outstandingCrossings > 0 {
-                        DetailRow(
-                            label: "Awaiting outcomes",
-                            value: "\(usage.outstandingCrossings)",
-                            tint: Design.warning)
+                    Label(combinedUnavailableCopy, systemImage: "questionmark.circle")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Design.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Divider().opacity(0.5)
+
+                if directAvailability == .complete, let direct {
+                    WorkUsageSubtotal(title: "Main agent", usage: direct)
+                } else {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("MAIN AGENT")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .tracking(0.5)
+                            .foregroundStyle(.secondary)
+                        Text("Usage is unavailable until the Work projection is complete.")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(Design.warning)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 
+                Divider().opacity(0.5)
+
+                if let childrenTotal {
+                    WorkUsageSubtotal(title: "Background agents", usage: childrenTotal)
+                } else {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("BACKGROUND AGENTS")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .tracking(0.5)
+                            .foregroundStyle(.secondary)
+                        Text(backgroundUnavailableCopy)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(Design.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                Text("Cost is a configured-rate estimate, not an invoice or billing total.")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var combinedUnavailableCopy: String {
+        switch combinedAvailability {
+        case .complete:
+            return "Combined usage is unavailable."
+        case .childFactsUnavailable:
+            return "Combined usage is unavailable while some background-agent results are unknown."
+        case .childFactsOmitted:
+            return "Combined usage is unavailable because some background-agent usage records are missing."
+        case .childFactsInvalid:
+            return "Combined usage is unavailable because some background-agent records need repair."
+        case .arithmeticOverflow:
+            return "Combined usage could not be calculated because the total is too large."
+        }
+    }
+
+    private var backgroundUnavailableCopy: String {
+        var parts: [String] = []
+        if childCount > 0 { parts.append("\(childCount) known") }
+        if omittedChildCount > 0 { parts.append("\(omittedChildCount) omitted") }
+        if invalidChildCount > 0 { parts.append("\(invalidChildCount) invalid") }
+        let detail = parts.isEmpty ? nil : parts.joined(separator: ", ")
+        let status = detail.map {
+            "Background-agent usage is unavailable (\($0))."
+        } ?? "Background-agent usage is unavailable."
+        let directCopy = directAvailability == .complete && direct != nil
+            ? "The Main agent subtotal is still available on its own."
+            : "Main-agent usage is also unavailable."
+        return "\(status) \(directCopy)"
+    }
+}
+
+private struct WorkUsageSubtotal: View {
+    let title: String
+    let usage: CanonicalWorkUsage
+    var emphasis = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title.uppercased())
+                .font(.system(size: 9.5, weight: .semibold))
+                .tracking(0.5)
+                .foregroundStyle(.secondary)
+            if !usage.hasCrossingEvidence {
+                Text("No model requests recorded yet.")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 10) {
+                    StatTile(
+                        label: "tokens",
+                        value: tokenValue(usage.knownTokenFloor, usage.totalTokenCertainty),
+                        emphasis: emphasis)
+                    StatTile(label: "estimated cost", value: costValue)
+                }
+                DisclosureGroup("Token breakdown") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        DetailRow(
+                            label: "Input floor",
+                            value: tokenValue(usage.inputTokens, usage.breakdownCertainty),
+                            mono: true)
+                        DetailRow(
+                            label: "Output floor",
+                            value: tokenValue(usage.outputTokens, usage.breakdownCertainty),
+                            mono: true)
+                        if usage.cacheReadTokens > 0 || usage.cacheWriteTokens > 0 {
+                            DetailRow(label: "Cache read floor", value: tokenValue(
+                                usage.cacheReadTokens, usage.breakdownCertainty), mono: true)
+                            DetailRow(label: "Cache write floor", value: tokenValue(
+                                usage.cacheWriteTokens, usage.breakdownCertainty), mono: true)
+                        }
+                    }
+                }
+                .font(.system(size: 10))
+                DetailRow(
+                    label: "Requests",
+                    value: requestSummary,
+                    mono: true)
+                if usage.outstandingCrossings > 0 {
+                    DetailRow(
+                        label: "Awaiting outcomes",
+                        value: "\(usage.outstandingCrossings) "
+                            + (usage.outstandingCrossings == 1 ? "request" : "requests"),
+                        tint: Design.warning)
+                }
                 if usage.hasUnresolvedAccounting {
-                    Divider().opacity(0.5)
                     Label(
                         accountingCaveat,
                         systemImage: usage.tokenOverflow || usage.costOverflow
@@ -2288,14 +2421,6 @@ private struct ServiceWorkUsageCard: View {
                         .foregroundStyle(Design.warning)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-
-                Text(
-                    "Across chats attached to this work. Child agents are not included. "
-                        + "Cost uses configured rates, not invoices."
-                )
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -2304,10 +2429,7 @@ private struct ServiceWorkUsageCard: View {
         switch usage.costCertainty {
         case .exact:
             return usage.knownCostFloor == 0 ? "$0.00" : Fmt.cost(usage.knownCostFloor)
-        case .lowerBound:
-            return usage.knownCostFloor > 0
-                ? "≥" + Fmt.cost(usage.knownCostFloor) : "unknown"
-        case .unknown:
+        case .lowerBound, .unknown:
             return usage.knownCostFloor > 0
                 ? "≥" + Fmt.cost(usage.knownCostFloor) : "unknown"
         }
@@ -2318,29 +2440,40 @@ private struct ServiceWorkUsageCard: View {
     ) -> String {
         switch certainty {
         case .exact: return Fmt.tokens(value)
-        case .lowerBound:
-            return value > 0 ? "≥" + Fmt.tokens(value) : "unknown"
-        case .unknown:
+        case .lowerBound, .unknown:
             return value > 0 ? "≥" + Fmt.tokens(value) : "unknown"
         }
+    }
+
+    private var requestSummary: String {
+        let noun = usage.startedCrossings == 1 ? "request" : "requests"
+        let verb = usage.startedCrossings == 1 ? "has" : "have"
+        return "\(usage.settledCrossings) of \(usage.startedCrossings) \(noun) \(verb) recorded outcomes"
     }
 
     private var accountingCaveat: String {
         var parts: [String] = []
         if usage.unresolvedTotal > 0 {
-            parts.append("total usage is unresolved for \(usage.unresolvedTotal) crossing(s)")
+            parts.append("total usage is unresolved for \(usage.unresolvedTotal) "
+                + (usage.unresolvedTotal == 1 ? "request" : "requests"))
         }
         if usage.unresolvedBreakdown > 0 {
             parts.append(
-                "the token breakdown is unresolved for \(usage.unresolvedBreakdown) crossing(s)")
+                "the token breakdown is unresolved for \(usage.unresolvedBreakdown) "
+                    + (usage.unresolvedBreakdown == 1 ? "request" : "requests"))
         }
         if usage.unresolvedCost > 0 {
-            parts.append("cost is unresolved for \(usage.unresolvedCost) crossing(s)")
+            parts.append("cost is unresolved for \(usage.unresolvedCost) "
+                + (usage.unresolvedCost == 1 ? "request" : "requests"))
         }
-        if usage.tokenOverflow { parts.append("token arithmetic overflowed") }
-        if usage.costOverflow { parts.append("cost arithmetic overflowed") }
-        return parts.joined(separator: "; ").capitalized
-            + ". Values are known floors or unknown, not billing totals."
+        if usage.tokenOverflow { parts.append("the token total is too large to calculate") }
+        if usage.costOverflow { parts.append("the cost total is too large to calculate") }
+        let text = parts.joined(separator: "; ")
+        let sentence = text.isEmpty
+            ? "Accounting details are unavailable"
+            : String(text.prefix(1)).uppercased() + String(text.dropFirst())
+        return sentence
+            + ". Values are known lower bounds or unknown, not billing totals."
     }
 }
 

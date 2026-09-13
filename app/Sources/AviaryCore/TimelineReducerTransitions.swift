@@ -898,7 +898,7 @@ internal enum WorkReducerTransition {
         state.stageAgentHandle(WorkAgentHandleSnapshot(
             handle: handle, origin: payload.origin, label: payload.label,
             deadline: payload.deadline, requestBody: payload.requestBody,
-            queuedEvent: source))
+            queuedEvent: source, executionLimits: payload.executionLimits))
     }
 
     private static func applyAgentHandleStarted<State: WorkTransitionState>(
@@ -919,6 +919,7 @@ internal enum WorkReducerTransition {
         updated.state = .running
         let source = EventRef(journal: event.journal, eventID: event.eventID)
         updated.startedEvent = source
+        updated.executionStartedAt = event.hostRecordedAt
         updated.latestLifecycleEvent = source
         state.stageAgentHandle(updated)
     }
@@ -946,6 +947,14 @@ internal enum WorkReducerTransition {
             if event.type == TimelineEventType.agentHandleProviderStarted {
                 guard existing.state == .running,
                       existing.deadline.map({ event.hostRecordedAt < $0 }) ?? true else {
+                    throw WorkAgentProviderAccounting.Failure.invalidTransition
+                }
+                guard case .object(let payload) = event.payload,
+                      let admissionValue = payload["admission"],
+                      let admission = try? ProviderAdmission(timelineValue: admissionValue),
+                      try existing.executionLimits.admissionDecision(
+                          for: existing.providerAccounting.usage,
+                          providerAdmission: admission) == .allow else {
                     throw WorkAgentProviderAccounting.Failure.invalidTransition
                 }
                 try updated.providerAccounting.applyStart(event, execution: execution)
@@ -1000,7 +1009,9 @@ internal enum WorkReducerTransition {
         updated.state = .terminal
         updated.terminalEvidence = WorkAgentHandleTerminalEvidence(
             outcome: payload.outcome, resultBody: payload.resultBody,
-            cleanup: payload.cleanup, event: WorkAgentHandleEventEvidence(event))
+            cleanup: payload.cleanup, event: WorkAgentHandleEventEvidence(event),
+            limitRefusal: payload.limitRefusal,
+            executionSettledAt: payload.executionSettledAt)
         updated.latestLifecycleEvent = updated.terminalEvidence!.event.event
         state.stageAgentHandle(updated)
     }
@@ -1522,7 +1533,10 @@ internal enum WorkReducerTransition {
             },
             cancellationSequence: handle.cancellationEvidence?.event.sequence,
             terminalSequence: handle.terminalEvidence?.event.sequence)) != nil else { return false }
-        guard handle.deadline.map({ $0.timeIntervalSince1970.isFinite }) ?? true else {
+        guard (try? handle.executionLimits.validate()) != nil,
+              (handle.startedEvent == nil) == (handle.executionStartedAt == nil),
+              handle.executionStartedAt.map({ $0.timeIntervalSince1970.isFinite }) ?? true,
+              handle.deadline.map({ $0.timeIntervalSince1970.isFinite }) ?? true else {
             return false
         }
         func validEvent(_ proof: WorkAgentHandleEventEvidence) -> Bool {
@@ -1603,6 +1617,23 @@ internal enum WorkReducerTransition {
             } else if terminal.outcome == .indeterminate {
                 guard terminal.cleanup.state == .indeterminate else { return false }
             } else if terminal.cleanup.state != .quiesced { return false }
+            if terminal.outcome == .limited {
+                guard terminal.cleanup.state == .quiesced,
+                      handle.providerAccounting.pending == nil,
+                      let refusal = terminal.limitRefusal,
+                      let startedAt = handle.executionStartedAt,
+                      let settledAt = terminal.executionSettledAt,
+                      settledAt.timeIntervalSince1970.isFinite,
+                      settledAt >= startedAt,
+                      settledAt <= terminal.event.hostRecordedAt,
+                      (try? refusal.validate(
+                          limits: handle.executionLimits,
+                          usage: handle.providerAccounting.usage)) != nil,
+                      handle.deadline.map({ settledAt < $0 }) ?? true
+                else { return false }
+            } else if terminal.limitRefusal != nil || terminal.executionSettledAt != nil {
+                return false
+            }
             if handle.cancellationEvidence != nil,
                !cancellationAllowsTerminalOutcome(
                    handle.cancellationCause, outcome: terminal.outcome) { return false }
@@ -1679,6 +1710,26 @@ internal enum WorkReducerTransition {
                   event.hostRecordedAt >= deadline else {
                 return false
             }
+        }
+        if payload.outcome == .limited {
+            guard prior.providerAccounting.pending == nil,
+                  payload.cleanup.state == .quiesced,
+                  let refusal = payload.limitRefusal,
+                  let startedAt = prior.executionStartedAt,
+                  let settledAt = payload.executionSettledAt,
+                  settledAt.timeIntervalSince1970.isFinite,
+                  settledAt >= startedAt,
+                  settledAt <= event.hostRecordedAt,
+                  (try? refusal.validate(
+                      limits: prior.executionLimits,
+                      usage: prior.providerAccounting.usage)) != nil else {
+                return false
+            }
+            guard prior.deadline.map({ settledAt < $0 }) ?? true else {
+                return false
+            }
+        } else if payload.limitRefusal != nil || payload.executionSettledAt != nil {
+            return false
         }
         if let evidence = payload.cleanup.evidence {
             guard evidence.journal == event.journal,

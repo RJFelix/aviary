@@ -448,6 +448,8 @@ struct AviaryDaemonMain {
                     authorizer: authorizer,
                     draftResolver: launchResolver.draftResolver,
                     hostedResolver: launchResolver.hostedConfigurationResolver,
+                    agentChildRuntimeHostResolver:
+                        launchResolver.agentChildRuntimeHostResolver,
                     promptAssemblyResolver: launchResolver.promptAssemblyResolver,
                     reconstructabilityProbe: launchResolver.reconstructabilityProbe,
                     workspaceCatalogProvider: { try workspaceRegistry.catalog() })

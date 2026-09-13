@@ -133,6 +133,21 @@ struct ChatActivityContent: View {
                     Label("Recorded background agents", systemImage: "person.2.wave.2")
                         .font(.system(size: 12, weight: .semibold))
                     Text(agentHandles.summary).font(.system(size: 12))
+                    ForEach(Array(agentHandles.rows.enumerated()), id: \.element.id) { index, row in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Background agent \(index + 1) · \(row.statusTitle)")
+                                .font(.system(size: 11, weight: .medium))
+                            Text(row.policySummary).font(.caption).foregroundStyle(.secondary)
+                            if let deadline = row.deadline {
+                                Text("Deadline: \(deadline.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    if !agentHandles.rows.isEmpty {
+                        Text("Token and cost thresholds stop the next model request; an in-flight request may exceed them.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Text(agentHandles.disclosure).font(.caption).foregroundStyle(.secondary)
                 }
                 .fixedSize(horizontal: false, vertical: true)
