@@ -1,8 +1,8 @@
 # Provider usage and optional execution limits
 
 Status: implementation verified, 2026-09-12. Optional child policies, normal-daemon activation,
-shared usage inventory, and policy presentation pass the cross-platform checks below;
-installation is blocked on retirement of the old user service. Background agents remain
+shared usage inventory, and policy presentation pass the cross-platform checks below. The old
+service has been retired with explicit permission; signed-bundle journeys pass. Background agents remain
 unlimited by default, until stopped or finished.
 
 ## Accounting contract
@@ -157,9 +157,8 @@ Implemented integration:
    wired to canonical projections. Standalone fallback children also default to unlimited, with
    a real Python fixture exceeding twenty provider turns and retaining an explicit ceiling option.
 
-Remaining: deploy only after the v5 drain/reconciliation and recoverable inventory rotation
-described below. Real installed-app
-policy/usage journeys remain a deployment acceptance step.
+The retirement and signed-bundle deployment acceptance receipts are recorded below. Retained
+pending chats still require explicit user action; retirement is not proof of their delivery.
 
 Finite token/spend policies will refuse further dispatch when prior exposure cannot be bounded,
 and surface an explicit attention state. Unlimited execution remains the default. Policy is
@@ -218,11 +217,27 @@ the disposable Aviary-native Work Host inventory. Rebuilding derived caches cann
 provider admissions or settlements. Do not weaken catalog completeness to hide old invalid Works;
 they would otherwise prevent reconstruction of healthy new Works. External Claude/Codex stores
 are excluded from this operation. If old Work cannot be proven quiescent, stop for user direction.
-The current read-only inventory found six old Works, two reporting recovery-required, plus two
-retained pending chats without reconciled creation receipts. A permitted graceful SIGTERM did
-not stop PID 28101; stdout/stderr are `/dev/null`, so this is not a captured refusal-reason proof.
-Do not escalate, replace the bundle, or replay those prompts without an explicit retirement
-decision. Retain pending chats and drafts byte-for-byte independently of inventory rotation.
+The pre-deployment read-only inventory found six old Works, two reporting recovery-required,
+plus two retained pending chats without reconciled creation receipts. Graceful SIGTERM did not
+stop PID 28101. Ryan then explicitly authorized force-stop and retirement. The old service and
+an orphaned development Python host were stopped; their old native journals, launch material,
+presentation transcripts and retry records were moved together into the private recovery archive
+`~/.aviary/development-recovery-backups/retired-v3-20260912-q1VUxR`. The old app bundle is there too.
+No completion was inferred for recovery-required Work and no request was replayed.
+
+Pending chat cards, drafts, context bodies, client/host identities, configuration, credentials and
+workspace registry remain in place. A 141-entry SHA-256 manifest checks their preserved bytes.
+External Claude Code/Codex stores remain untouched. Do not restore old retry records separately
+from their deduplication history or run the old helper against the new inventory.
+
+Signed release `just build` and strict deep signature validation pass. The test-only
+`AVIARY_CHILD_JOURNEY_DAEMON` override points the real child journey at the installed
+`Contents/Helpers/aviaryd`, proving its own bundled Python resources: 1 case / 29 assertions,
+4.72s. The installed AppModel/normal-service/Python/repository-review OTLP journey passes with
+94 spans and two local fixture provider calls; save/blocked-launch/relaunch/edit/retry probes
+also pass. These use disposable homes and fake loopback providers, never paid calls or saved
+user requests. Final normal-home handshake/list and preservation receipts belong in the archive
+and the superrepo measurement ledger.
 
 The foundation's final macOS run passes 1,317 cases / 19,852 assertions in 517.83s, including
 terminal-protocol and superseded-End race regressions. Signed `just build` passes. The production

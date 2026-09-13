@@ -113,7 +113,17 @@ private func workAgentChildJourneySnapshot(
 
 func testNormalAviarydWorkOwnedChildSurvivesParentEndAndRefusesShutdown() async throws {
     let testExecutable = URL(fileURLWithPath: CommandLine.arguments[0])
-    let daemonExecutable = testExecutable.deletingLastPathComponent().appending(path: "aviaryd")
+    // An explicit installed helper exercises its own bundled runtime resources; the default
+    // remains the SwiftPM sibling used by ordinary cross-platform self-tests.
+    let daemonExecutable: URL
+    if let installed = ProcessInfo.processInfo.environment["AVIARY_CHILD_JOURNEY_DAEMON"] {
+        guard installed.hasPrefix("/") else {
+            throw WorkAgentChildDaemonJourneyFailure.missingProduct
+        }
+        daemonExecutable = URL(fileURLWithPath: installed)
+    } else {
+        daemonExecutable = testExecutable.deletingLastPathComponent().appending(path: "aviaryd")
+    }
     guard FileManager.default.isExecutableFile(atPath: daemonExecutable.path) else {
         throw WorkAgentChildDaemonJourneyFailure.missingProduct
     }
