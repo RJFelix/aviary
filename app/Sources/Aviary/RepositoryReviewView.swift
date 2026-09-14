@@ -149,8 +149,9 @@ struct RepositoryReviewView: View {
 
     private var historyPicker: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Saved reviews").font(.system(size: 11.5, weight: .semibold))
+            HStack(alignment: .firstTextBaseline) {
+                Label("Saved observations", systemImage: "clock.arrow.circlepath")
+                    .font(.system(size: 11.5, weight: .semibold))
                 Spacer()
                 Text("\(reviewRows.count) recorded")
                     .font(Design.numeric(10)).foregroundStyle(.secondary)
@@ -174,6 +175,8 @@ struct RepositoryReviewView: View {
                 }
             }
             .labelsHidden()
+            .pickerStyle(.menu)
+            .controlSize(.small)
             .accessibilityLabel("Saved review selection")
             Text("Ordered by publication. Each review records the working tree at that time, not the difference from the preceding review.")
                 .font(.caption).foregroundStyle(.secondary)
@@ -214,11 +217,16 @@ struct RepositoryReviewView: View {
 
     private var boundaryNotice: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label(
-                "Working-tree changes, not just the agent's edits",
-                systemImage: "eye")
-                .font(.system(size: 11.5, weight: .semibold))
-                .foregroundStyle(Design.accent)
+            HStack(spacing: 7) {
+                Label(
+                    "Working-tree changes, not just the agent's edits",
+                    systemImage: "eye")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(Design.accent)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 6)
+                Chip(text: "read only", symbol: "lock.fill", tint: Design.accent)
+            }
             Text("This saved review can include your edits and other work. Reading it does not change any files.")
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
@@ -336,11 +344,81 @@ struct RepositoryReviewView: View {
         _ review: ObservedRepositoryReview,
         projection: RepositoryReviewDiffProjection?
     ) -> some View {
-        statusCard(review)
-        filesCard(review)
+        reviewSummaryCard(review)
         diffsCard(review, projection: projection)
+        filesCard(review)
+        statusCard(review)
         omissionsCard(review)
         feedbackCard
+    }
+
+    private func reviewSummaryCard(_ review: ObservedRepositoryReview) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: "doc.text.magnifyingglass")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(statusTint(review.status))
+                    .frame(width: 26, height: 26)
+                    .background(statusTint(review.status).opacity(0.13), in: Circle())
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(review.status == .changes ? "Changes ready to inspect" : statusLabel(review.status).capitalized)
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("A bounded, saved observation of the working tree")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Chip(text: statusLabel(review.status), tint: statusTint(review.status), filled: true)
+            }
+            HStack(spacing: 8) {
+                reviewMetric("FILES", "\(review.files.count)", symbol: "doc")
+                reviewMetric("PATCHES", "\(review.diffs.count)", symbol: "arrow.left.arrow.right")
+            }
+            if review.coverage.bounded || !review.omissions.isEmpty {
+                Label("Partial observation · see coverage limits below", systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundStyle(Design.warning)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            statusTint(review.status).opacity(0.06),
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(statusTint(review.status).opacity(0.22), lineWidth: 1))
+    }
+
+    private func reviewMetric(_ label: String, _ value: String, symbol: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: symbol)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(Design.accent)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(value)
+                    .font(Design.numeric(13, weight: .semibold))
+                Text(label)
+                    .font(.system(size: 8.5, weight: .semibold))
+                    .tracking(0.35)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            Color.primary.opacity(0.035),
+            in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+    }
+
+    private func diffSymbol(_ kind: String) -> String {
+        kind == "staged" ? "square.and.arrow.down" : "pencil"
+    }
+
+    private func diffTint(_ kind: String) -> Color {
+        kind == "staged" ? Design.accent : Design.assistant
     }
 
     private func statusCard(_ review: ObservedRepositoryReview) -> some View {
@@ -374,20 +452,29 @@ struct RepositoryReviewView: View {
                     .font(.system(size: 10.5))
                     .foregroundStyle(.tertiary)
             } else {
-                VStack(alignment: .leading, spacing: 5) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Repository-relative paths · status pair is index / working tree")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     ForEach(review.files, id: \.path) { file in
                         VStack(alignment: .leading, spacing: 2) {
                             HStack(alignment: .firstTextBaseline, spacing: 7) {
+                                Image(systemName: fileSymbol(file))
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(fileTint(file))
                                 Text(sanitized(file.path))
                                     .font(Design.mono(10))
                                     .lineLimit(2)
+                                    .truncationMode(.middle)
+                                    .layoutPriority(1)
                                     .textSelection(.enabled)
-                                Spacer(minLength: 4)
-                                Text(statusPair(file))
-                                    .font(Design.mono(9.5, weight: .semibold))
-                                    .foregroundStyle(Design.accent)
                             }
                             HStack(spacing: 5) {
+                                Chip(
+                                    text: statusPair(file),
+                                    symbol: "square.split.2x2",
+                                    tint: fileTint(file))
                                 Text(file.kind)
                                 if let originalPath = file.originalPath {
                                     Text("from \(sanitized(originalPath))")
@@ -400,11 +487,31 @@ struct RepositoryReviewView: View {
                             .font(.system(size: 9.5))
                             .foregroundStyle(.secondary)
                         }
-                        if file.path != review.files.last?.path { Divider().opacity(0.35) }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.primary.opacity(0.028))
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                     }
                 }
             }
         }
+    }
+
+    private func fileSymbol(_ file: ObservedRepositoryFile) -> String {
+        if file.isBinary { return "doc.zipper" }
+        if file.isSubmodule { return "shippingbox" }
+        if file.isUntracked { return "plus.circle" }
+        if file.isIgnored { return "eye.slash" }
+        return "doc.text"
+    }
+
+    private func fileTint(_ file: ObservedRepositoryFile) -> Color {
+        if file.isBinary || file.isSubmodule || file.isUntracked {
+            return Design.warning
+        }
+        if file.isIgnored { return .secondary }
+        return Design.accent
     }
 
     @ViewBuilder
@@ -413,6 +520,12 @@ struct RepositoryReviewView: View {
         projection: RepositoryReviewDiffProjection?
     ) -> some View {
         Card("Unified diffs", symbol: "arrow.left.arrow.right") {
+            Label(
+                "Comment beside a file or hunk to keep feedback attached to this exact observation.",
+                systemImage: "text.badge.plus")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             if let projection,
                !projection.sections.isEmpty || !projection.rawFallbacks.isEmpty
                     || !projection.omissions.isEmpty {
@@ -441,9 +554,12 @@ struct RepositoryReviewView: View {
             ForEach(Array(projection.rawFallbacks.enumerated()), id: \.offset) { _, fallback in
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 7) {
-                        Text(fallback.diffKind.capitalized)
-                            .font(.system(size: 10.5, weight: .semibold))
+                        Chip(
+                            text: fallback.diffKind.capitalized,
+                            symbol: diffSymbol(fallback.diffKind),
+                            tint: diffTint(fallback.diffKind))
                         Chip(text: "raw fallback", tint: Design.warning)
+                        Spacer(minLength: 4)
                     }
                     Text(fallback.reason)
                         .font(.caption)
@@ -479,11 +595,23 @@ struct RepositoryReviewView: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .firstTextBaseline, spacing: 7) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(section.path.map(sanitized) ?? "Path unavailable")
-                        .font(Design.mono(10.5, weight: .semibold))
-                        .textSelection(.enabled)
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: section.kind == .binary ? "doc.zipper" : "doc.text")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(section.kind == .binary || section.kind == .submodule
+                                ? Design.warning : Design.accent)
+                        Text(section.path.map(sanitized) ?? "Path unavailable")
+                            .font(Design.mono(10.5, weight: .semibold))
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                            .layoutPriority(1)
+                            .textSelection(.enabled)
+                    }
                     HStack(spacing: 5) {
-                        Text(section.diffKind.capitalized)
+                        Chip(
+                            text: section.diffKind.capitalized,
+                            symbol: diffSymbol(section.diffKind),
+                            tint: diffTint(section.diffKind))
                         Text(section.kind.rawValue)
                         if let originalPath = section.originalPath {
                             Text("from \(sanitized(originalPath))")
@@ -494,10 +622,15 @@ struct RepositoryReviewView: View {
                 }
                 Spacer(minLength: 6)
                 if let anchor = section.fileAnchor(identity: identity) {
-                    Button("Comment on file") { requestAnchor(anchor) }
+                    Button {
+                        requestAnchor(anchor)
+                    } label: {
+                        Label("Comment", systemImage: "text.badge.plus")
+                    }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .accessibilityLabel("Comment on file \(sanitized(anchor.path))")
+                        .help("Attach feedback to this file")
                 }
             }
 
@@ -530,21 +663,21 @@ struct RepositoryReviewView: View {
                                 .textSelection(.enabled)
                             Spacer(minLength: 6)
                             if anchors.indices.contains(index) {
-                                Button("Comment on hunk") { requestAnchor(anchors[index]) }
+                                Button {
+                                    requestAnchor(anchors[index])
+                                } label: {
+                                    Label("Comment", systemImage: "text.badge.plus")
+                                }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
                                     .accessibilityLabel(
                                         "Comment on hunk \(sanitized(hunk.header)) in "
                                             + "\(sanitized(section.path ?? "file"))")
+                                    .help("Attach feedback to this hunk")
                             }
                         }
                         if !hunk.context.isEmpty {
-                            CodeBlock(
-                                text: hunk.context,
-                                language: "diff",
-                                maxLines: 10,
-                                tint: Design.accent)
-                                .frame(maxHeight: 220)
+                            ReviewHunkCodeBlock(hunk: hunk)
                         }
                         if hunk.contextTruncated {
                             Text("Displayed hunk context was bounded.")
@@ -566,8 +699,10 @@ struct RepositoryReviewView: View {
             ForEach(Array(review.diffs.enumerated()), id: \.offset) { _, diff in
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 7) {
-                        Text(diff.kind.capitalized)
-                            .font(.system(size: 10.5, weight: .semibold))
+                        Chip(
+                            text: diff.kind.capitalized,
+                            symbol: diffSymbol(diff.kind),
+                            tint: diffTint(diff.kind))
                         Text("\(diff.byteCount) bytes")
                             .font(Design.numeric(9.5))
                             .foregroundStyle(.tertiary)
@@ -650,7 +785,13 @@ struct RepositoryReviewView: View {
     private var feedbackCard: some View {
         Card("Request a revision", symbol: "text.bubble") {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Add bounded feedback to the existing composer. Nothing is sent from this sheet.")
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Text("Draft feedback")
+                        .font(.system(size: 11.5, weight: .semibold))
+                    Spacer(minLength: 6)
+                    Chip(text: "not sent", symbol: "paperplane", tint: .secondary)
+                }
+                Text("Add bounded feedback to the existing composer. Review delivery there before sending.")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

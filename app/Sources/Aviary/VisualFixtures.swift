@@ -41,6 +41,10 @@ enum VisualFixtureRoute: String {
     case composerConfirming = "composer-confirming-fixture"
     case composerHandoff = "composer-handoff-fixture"
     case staleChatActivity = "stale-chat-activity-fixture"
+    case chatNotices = "chat-notices-fixture"
+    case chatNoticeSuccess = "chat-notice-success-fixture"
+    case chatStatusDetails = "chat-status-details-fixture"
+    case reviewHunkExpanded = "review-hunk-expanded-fixture"
 
     var isNarrow: Bool {
         self == .serviceChatNarrow || self == .productionDeliveryNarrow
@@ -63,10 +67,29 @@ struct VisualFixtureView: View {
             FixtureServiceConversationView(narrow: route.isNarrow)
         case .productionDelivery, .productionDeliveryNarrow:
             ProductionRunPaneFixture(narrow: route.isNarrow)
-        case .composerGuidanceOnly, .composerDraftOnly, .composerConfirming, .composerHandoff:
+        case .composerGuidanceOnly, .composerDraftOnly, .composerConfirming, .composerHandoff,
+             .chatNotices, .chatNoticeSuccess:
             ProductionRunPaneFixture(narrow: true, scenario: route)
         case .staleChatActivity:
             StaleChatActivityFixture()
+        case .chatStatusDetails:
+            ChatStatusPanel(presentation: ChatStatusPresentation(items: [
+                .init(source: .command, tone: .uncertain, title: "Command outcome uncertain",
+                    message: "The service did not confirm this command. Check its recorded outcome before retrying; it may already have taken effect."),
+                .init(source: .chatError, tone: .danger, title: "Chat needs attention",
+                    message: "The latest activity refresh was unavailable. Previously recorded messages remain visible."),
+                .init(source: .inputDeliveryLimits, tone: .warning, title: "Input delivery view incomplete",
+                    message: "3 delivery rows omitted. Do not infer delivery or retry safety from this bounded view."),
+                .init(source: .projectionLimits, tone: .information, title: "Some recorded activity is outside this view",
+                    message: "24 resolved actions omitted from this bounded view. Full canonical records remain addressable through the Work Host.")
+            ])).details
+        case .reviewHunkExpanded:
+            ReviewHunkCodeBlock(hunk: RepositoryReviewDiffHunk(
+                header: "@@ -1,12 +1,12 @@", oldStart: 1, oldCount: 12, newStart: 1, newCount: 12,
+                context: (1...24).map { ($0.isMultiple(of: 2) ? "+new" : "-old") + " value \($0)" }.joined(separator: "\n"),
+                contextTruncated: false), initiallyExpanded: true)
+                .padding(20).frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(nsColor: .windowBackgroundColor))
         case .productionInspectorNarrow:
             ProductionInspectorFixture()
         case .conversationHistory, .conversationHistoryNarrow:
@@ -1057,7 +1080,18 @@ private struct ProductionRunPaneFixture: View {
             commandInFlight: scenario == .composerConfirming,
             draftHandoff: scenario == .composerHandoff
                 ? try? ServiceBackedDraftHandoff(text: draft, kind: .queue,
-                    commandID: "fixture-handoff") : nil)
+                    commandID: "fixture-handoff") : nil,
+            commandNotice: scenario == .chatNotices
+                ? .uncertain("The service did not confirm this command. Check its recorded outcome before retrying; it may already have taken effect.",
+                    serviceAcknowledgement: .init(work: WorkRef(workHostID: "fixture-host", workID: "fixture-work"),
+                        commandID: "fixture-command", kind: .send, client: ClientRef("fixture-client"),
+                        attachment: ClientAttachmentRef("fixture-client-attachment"),
+                        sessionAttachment: SessionAttachmentRef("fixture-session-attachment"), evidence: .canonicalCommand))
+                : scenario == .chatNoticeSuccess ? .success("The agent service acknowledged the command. This is not proof the task completed.") : nil,
+            errorBanner: scenario == .chatNotices ? "The latest activity refresh was unavailable. Previously recorded messages remain visible." : nil,
+            projectionOmissions: scenario == .chatNotices ? [.init(category: "activities", count: 24)] : [],
+            inputDeliveryOmissions: scenario == .chatNotices ? [.init(category: "canonical_input_delivery.rows", count: 3)] : [],
+            controlResult: scenario == .chatNoticeSuccess ? .stopRequestDelivered : nil)
         model.runs = [run]
         model.focusedRunID = run.id
         model.showInspector = !narrow

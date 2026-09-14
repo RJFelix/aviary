@@ -91,7 +91,7 @@ attempt, including model/folder/authorization failures. It does not infer execut
 from connectivity or automatically retry. The executable probe checks historical wording under
 connected/disconnected diagnostics and preserves the original saved identity.
 
-## Next bounded slice: active-chat status hierarchy
+## Active-chat status hierarchy scope
 
 The production RunPane can stack project/read failures, command receipt notices, stop receipt,
 projection bounds, input-delivery bounds, current action and child/background summaries above
@@ -137,5 +137,47 @@ Verification:
   under build/ui-composer-final. These do not certify a live user's busy session, keyboard or
   screen-reader interactions; the handoff fixture does not have a real service attachment.
 
-The broader overlapping-notice hierarchy, transcript rhythm and change-review flow remain.
+The following pass addresses the overlapping-notice hierarchy, transcript rhythm and change-review flow.
 No daemon restart, command retry or saved-request submission is part of deploying this GUI slice.
+
+## Status, transcript and review readability — September 14
+
+Implemented one compact chat-status panel instead of stacked command/error/omission banners.
+Uncertain commands and actionable failures lead; current acknowledgements lead prior Stop
+receipts and secondary display bounds. Details retains every independent source's full text.
+An exact project diagnosis replaces its generic recovery error, and project checks/confirmation
+and delivery review remain directly accessible. This is presentation only: no notices are
+dismissed, no receipt is reconciled and no command is retried by opening the panel.
+
+Transcript rows now use restrained role surfaces and spacing, keeping each user message distinct
+and only tightening assistant continuations when model/provider match (agent messages require
+matching sender). IDs, history anchoring, live-follow behavior, raw inspection, usage, delivery
+evidence and error markers remain. The current activity tail and earlier-history controls have
+clearer visual affordances.
+
+Review puts the actual diffs ahead of secondary file/HEAD metadata. A visible partial-observation
+label and the original detailed exclusions remain; staged/unstaged and file/hunk Comment buttons
+have distinct visual cues. Bounded parsed hunk lines show additions/removals with color and their
+original prefixes, preserving exact copy content, unknown markers and Unicode separators.
+Expanded hunks scroll rather than hiding lines. Raw fallbacks remain raw, and feedback still
+prepares a draft only; no new file mutation or Send action was introduced.
+
+Verification: debug Aviary, AviarySelfTest and aviaryd builds pass; interaction 8 cases/84
+assertions, command notice 10/49, control result 6/26, draft persistence 12/193, diff projection
+5/50 and repository observation 12/121 pass. The executable saved-chat/consumer-read probe passes,
+including actual AppModel notice mapping, project specialization and nonmutation. Read-only Sol
+review found no remaining lifecycle/identity blockers. Fixtures under build/ui-readability cover
+overlapping notices, full details, light/dark transcript and review, expanded hunks, stale review
+and a full composer. The stale-review fixture has a 560-point minimum; its acceptance render is
+640 points, not the deliberately undersized 380-point clipping diagnostic.
+
+The release bundle and strict deep signature check pass. Its saved-chat/consumer-read probe passes;
+the signed disposable normal-service journey passes Create/Start/Python/review/End/drain with
+102 exported spans, two fixture provider calls and 6.366 seconds through cleanup. This is not
+live-user Queue/Steer/Stop, remote-backend, or accessibility interaction coverage.
+
+The next useful checkpoint is a real user's short coding session: notice whether the current
+activity and message destination are obvious, load earlier history, review a file/hunk and place
+feedback in the composer. Isolated fixtures/probes cannot certify that this feels natural during
+real work, nor replace keyboard and screen-reader acceptance. Further broad UI redesign should
+be informed by that feedback rather than adding more surfaces without observed need.

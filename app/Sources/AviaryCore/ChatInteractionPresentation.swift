@@ -217,3 +217,56 @@ public enum ChatInteractionPresentation {
     public static let stopExplanation =
         "Stops before the next step. A model response or action already in progress may finish first."
 }
+
+/// Orders existing facts for one chat status surface. This never dismisses a notice or
+/// reconciles a command: every supplied source remains available in the detail projection.
+public struct ChatStatusPresentation: Equatable, Sendable {
+    public enum Source: String, Hashable, Sendable { case project, chatError, command, stopReceipt, projectionLimits, inputDeliveryLimits }
+    public enum Tone: Equatable, Sendable { case uncertain, danger, warning, information, success }
+    public struct Item: Equatable, Sendable {
+        public let source: Source
+        public let tone: Tone
+        public let title: String
+        public let message: String
+        public init(source: Source, tone: Tone, title: String, message: String) {
+            self.source = source; self.tone = tone; self.title = title; self.message = message
+        }
+        public var needsAttention: Bool { tone == .uncertain || tone == .danger || tone == .warning }
+        public var symbol: String {
+            switch tone {
+            case .uncertain: "questionmark.circle.fill"
+            case .danger: "exclamationmark.octagon.fill"
+            case .warning: "exclamationmark.triangle.fill"
+            case .information: "info.circle"
+            case .success: "checkmark.circle"
+            }
+        }
+        fileprivate var rank: Int {
+            // Bounded display coverage is supporting evidence, not a new outcome or a
+            // delivery failure. Input-delivery limits retain their warning priority.
+            if source == .projectionLimits { return 5 }
+            switch tone {
+            case .uncertain: return 0
+            case .danger: return 1
+            case .warning: return 2
+            case .success: return 3
+            case .information: return 4
+            }
+        }
+    }
+    public let items: [Item]
+    public var primary: Item? { items.first }
+    public var attentionCount: Int { items.filter(\.needsAttention).count }
+
+    public init(items: [Item]) {
+        // Stable source ordering for equal severity; never deduplicate by prose because two
+        // different evidence sources can legitimately carry the same description.
+        let sourceOrder: [Source] = [.project, .chatError, .command, .inputDeliveryLimits, .projectionLimits, .stopReceipt]
+        self.items = items.enumerated().sorted { lhs, rhs in
+            if lhs.element.rank != rhs.element.rank { return lhs.element.rank < rhs.element.rank }
+            let left = sourceOrder.firstIndex(of: lhs.element.source) ?? sourceOrder.count
+            let right = sourceOrder.firstIndex(of: rhs.element.source) ?? sourceOrder.count
+            return left == right ? lhs.offset < rhs.offset : left < right
+        }.map(\.element)
+    }
+}

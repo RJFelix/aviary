@@ -1,6 +1,51 @@
 import AviaryCore
 
 let casesChatInteractionPresentation: [Case] = [
+    ("chat interaction: status hierarchy preserves every source and prioritizes uncertainty", {
+        typealias Item = ChatStatusPresentation.Item
+        let entries: [Item] = [
+            .init(source: .stopReceipt, tone: .information, title: "Stop delivered", message: "Exact stop receipt"),
+            .init(source: .projectionLimits, tone: .information, title: "Limits", message: "Partial history"),
+            .init(source: .command, tone: .uncertain, title: "Unknown delivery", message: "Do not resend"),
+            .init(source: .chatError, tone: .danger, title: "Error", message: "Exact error"),
+            .init(source: .project, tone: .warning, title: "Project", message: "Confirm folder"),
+            .init(source: .inputDeliveryLimits, tone: .warning, title: "Input limits", message: "Partial history")
+        ]
+        let result = ChatStatusPresentation(items: entries)
+        XCTAssertEqual(result.primary?.source, .command)
+        XCTAssertEqual(result.primary?.symbol, "questionmark.circle.fill")
+        XCTAssertEqual(result.attentionCount, 4)
+        XCTAssertEqual(result.items.count, 6)
+        XCTAssertEqual(result.items.map(\.source), [.command, .chatError, .project, .inputDeliveryLimits, .stopReceipt, .projectionLimits])
+        for entry in entries { XCTAssertTrue(result.items.contains(entry)) }
+        XCTAssertEqual(ChatStatusPresentation(items: Array(entries.reversed())).items, result.items)
+        XCTAssertEqual(entries[0].message, "Exact stop receipt")
+    }),
+    ("chat interaction: receipt success cannot hide warning or missing evidence", {
+        let result = ChatStatusPresentation(items: [
+            .init(source: .command, tone: .success, title: "Acknowledged", message: "Receipt only"),
+            .init(source: .projectionLimits, tone: .information, title: "Partial", message: "Unknowns remain"),
+            .init(source: .inputDeliveryLimits, tone: .warning, title: "Delivery incomplete", message: "Do not infer retry safety")
+        ])
+        XCTAssertEqual(result.primary?.source, .inputDeliveryLimits)
+        XCTAssertEqual(result.items.last?.source, .projectionLimits)
+        XCTAssertEqual(result.attentionCount, 1)
+        let empty = ChatStatusPresentation(items: [])
+        XCTAssertNil(empty.primary)
+        XCTAssertEqual(empty.attentionCount, 0)
+        let receipt = ChatStatusPresentation(items: result.items.filter { $0.source != .inputDeliveryLimits })
+        XCTAssertEqual(receipt.primary?.tone, .success)
+        XCTAssertEqual(receipt.attentionCount, 0)
+        let stopped = ChatStatusPresentation(items: [
+            .init(source: .projectionLimits, tone: .information, title: "Partial", message: "Unknowns remain"),
+            .init(source: .stopReceipt, tone: .information, title: "Stop request delivered", message: "Receipt only")
+        ])
+        XCTAssertEqual(stopped.primary?.source, .stopReceipt)
+        let subsequent = ChatStatusPresentation(items: stopped.items + [
+            .init(source: .command, tone: .success, title: "Acknowledged", message: "Later receipt")
+        ])
+        XCTAssertEqual(subsequent.primary?.source, .command)
+    }),
     ("chat interaction: delivery choice preserves capabilities and explains timing", {
         XCTAssertEqual(ChatBusyDelivery.available(supportsGuidance: false, supportsFollowUp: false), [])
         XCTAssertEqual(ChatBusyDelivery.available(supportsGuidance: true, supportsFollowUp: false), [.guideCurrentWork])

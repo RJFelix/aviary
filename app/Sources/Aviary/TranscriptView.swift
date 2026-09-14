@@ -64,13 +64,16 @@ struct TranscriptView: View {
                                 .id("__earlier_history__")
                                 .onAppear { requestEarlierHistoryIfNeeded() }
                         }
-                        ForEach(visible) { item in
-                            VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(visible.enumerated()), id: \.element.id) { index, item in
+                            let continuesPrevious = index > 0
+                                && TranscriptRow.continuesGroup(from: visible[index - 1], to: item)
+                            VStack(alignment: .leading, spacing: continuesPrevious ? 4 : 7) {
                                 TranscriptRow(
                                     item: item,
                                     searchQuery: searchQuery,
                                     hideThinking: hideThinking,
                                     isLast: item.id == visible.last?.id && isStreaming && indicatesCurrentActivity,
+                                    continuesGroup: continuesPrevious,
                                     onSelect: onSelect)
                                 if let descriptor = reviewDescriptorsByMessageID[item.id],
                                    let onReviewMessage {
@@ -91,7 +94,9 @@ struct TranscriptView: View {
                                                 + item.timestamp.formatted(
                                                     date: .abbreviated, time: .standard))
                                 }
-                            }.id(item.id)
+                            }
+                            .padding(.top, continuesPrevious ? 0 : 5)
+                            .id(item.id)
                         }
                         if isStreaming && indicatesCurrentActivity {
                             StreamingIndicator()
@@ -236,7 +241,14 @@ struct TranscriptView: View {
             Spacer(minLength: 0)
         }
         .font(.system(size: 10.5, weight: .medium))
-        .padding(.vertical, 4)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Design.accent.opacity(0.045))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Design.accent.opacity(0.14), lineWidth: 1)))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(earlierHistoryAccessibilityLabel)
     }
@@ -300,6 +312,7 @@ struct TranscriptRow: View {
     var searchQuery: String
     var hideThinking: Bool
     var isLast: Bool
+    var continuesGroup: Bool = false
     var onSelect: ((TranscriptItem) -> Void)?
 
     @State private var showRaw = false
@@ -311,19 +324,56 @@ struct TranscriptRow: View {
     }
 
     var body: some View {
+        Group {
+            switch item.kind {
+            case .user: userRow
+            case .assistant: assistantRow
+            case .tool: toolRow
+            case .bash: bashRow
+            case .agentMessage: agentMessageRow
+            case .custom:
+                // An artifact is a custom entry, but showing it as one would print the document's
+                // location as grey machinery text — the least useful thing on screen about a file
+                // somebody is meant to open.
+                if let artifact = item.artifact { artifactRow(artifact) } else { customRow }
+            case .compaction, .branchSummary: summaryRow
+            case .stateChange, .note: inlineRow
+            }
+        }
+        .padding(.horizontal, usesRoleSurface ? 9 : 0)
+        .padding(.vertical, continuesGroup ? 5 : 9)
+        .background {
+            if usesRoleSurface {
+                RoundedRectangle(cornerRadius: Design.cardRadius, style: .continuous)
+                    .fill(item.kind.color.opacity(continuesGroup ? 0.025 : 0.055))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Design.cardRadius, style: .continuous)
+                            .strokeBorder(
+                                item.kind.color.opacity(continuesGroup ? 0.06 : 0.13),
+                                lineWidth: 1)
+                    }
+            }
+        }
+    }
+
+    private var usesRoleSurface: Bool {
         switch item.kind {
-        case .user: userRow
-        case .assistant: assistantRow
-        case .tool: toolRow
-        case .bash: bashRow
-        case .agentMessage: agentMessageRow
-        case .custom:
-            // An artifact is a custom entry, but showing it as one would print the document's
-            // location as grey machinery text — the least useful thing on screen about a file
-            // somebody is meant to open.
-            if let artifact = item.artifact { artifactRow(artifact) } else { customRow }
-        case .compaction, .branchSummary: summaryRow
-        case .stateChange, .note: inlineRow
+        case .user, .assistant, .tool, .bash: return true
+        case .agentMessage, .custom, .compaction, .branchSummary, .stateChange, .note:
+            return false
+        }
+    }
+
+    static func continuesGroup(from previous: TranscriptItem, to current: TranscriptItem) -> Bool {
+        switch (previous.kind, current.kind) {
+        case (.assistant, .assistant):
+            return previous.model == current.model && previous.provider == current.provider
+        case (.agentMessage, .agentMessage):
+            return previous.senderName == current.senderName
+        case (.tool, .tool), (.bash, .bash):
+            return true
+        default:
+            return false
         }
     }
 
@@ -359,6 +409,7 @@ struct TranscriptRow: View {
             .opacity(item.raw == nil ? 0 : 1)
             .disabled(item.raw == nil)
         }
+        .padding(.bottom, continuesGroup ? 0 : 2)
     }
 
     private var rawPane: some View {
@@ -900,6 +951,12 @@ struct StreamingIndicator: View {
                 .foregroundStyle(.secondary)
         }
         .padding(.leading, 12)
+        .padding(.trailing, 10)
+        .padding(.vertical, 6)
+        .background(
+            Capsule()
+                .fill(Design.assistant.opacity(0.06))
+                .overlay(Capsule().strokeBorder(Design.assistant.opacity(0.14), lineWidth: 1)))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Agent is working")
         .accessibilityValue("Streaming response")

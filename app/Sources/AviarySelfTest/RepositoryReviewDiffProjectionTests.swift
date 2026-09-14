@@ -349,6 +349,16 @@ func testRepositoryReviewFeedbackAnchorRejectsCapacityBeforeTruncatingIdentity()
 }
 
 let casesRepositoryReviewDiffProjection: [Case] = [
+    ("repository review diff projection: visual lines preserve exact text and unknown markers", {
+        let context = " unchanged\n-old\n+new\n\\ No newline at end of file\n@unknown\n+unicode\u{2028}separator\n"
+        let hunk = RepositoryReviewDiffHunk(header: "@@ -1,2 +1,2 @@", oldStart: 1, oldCount: 2,
+            newStart: 1, newCount: 2, context: context, contextTruncated: true)
+        let lines = RepositoryReviewDiffDisplayLine.lines(in: hunk)
+        XCTAssertEqual(lines.map(\.kind), [.context, .removal, .addition, .marker, .marker, .addition, .marker])
+        XCTAssertEqual(lines.map(\.text).joined(separator: "\n"), context)
+        XCTAssertTrue(hunk.contextTruncated)
+        XCTAssertEqual(hunk.anchorContext, context)
+    }),
     ("repository review diff projection: bounded quoted hunks", {
         try await testRepositoryReviewDiffProjectionParsesBoundedHunksAndQuotedPaths()
     }),

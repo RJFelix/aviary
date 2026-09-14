@@ -1507,6 +1507,55 @@ final class AppModel {
         return matches[0]
     }
 
+    func chatStatus(for run: LiveRun, projectCheckError: String? = nil) -> ChatStatusPresentation {
+        Self.chatStatus(for: run, projectIssue: projectIssue(for: run), projectCheckError: projectCheckError)
+    }
+
+    /// Takes an already authenticated project diagnosis; it does not perform a second join.
+    static func chatStatus(for run: LiveRun, projectIssue: WorkHostWorkspaceDescriptor?,
+                           projectCheckError: String? = nil) -> ChatStatusPresentation {
+        var items: [ChatStatusPresentation.Item] = []
+        if let issue = projectIssue {
+            let identityChanged = issue.unavailabilityReason == .identityNeedsConfirmation
+            var message = identityChanged
+                ? "The agent service is connected, but the saved folder identity no longer matches. Your conversation is saved; confirm the original folder before continuing."
+                : "The agent service is connected, but it cannot open this chat’s project folder. Restore access to the original folder, then check again. Your conversation is saved."
+            if let projectCheckError { message += "\n\nLast project check: " + projectCheckError }
+            items.append(.init(source: .project, tone: .warning,
+                title: identityChanged ? "Confirm this chat’s project folder" : "Project folder unavailable",
+                message: message))
+        } else if let banner = run.errorBanner {
+            items.append(.init(source: .chatError, tone: .danger,
+                title: "Chat needs attention", message: banner))
+        }
+        if let notice = run.commandNotice {
+            let tone: ChatStatusPresentation.Tone = switch notice.level {
+            case .success: .success
+            case .uncertain: .uncertain
+            case .warning: .warning
+            }
+            let title = switch notice.level {
+            case .success: "Command acknowledged"
+            case .uncertain: "Command outcome uncertain"
+            case .warning: "Command needs attention"
+            }
+            items.append(.init(source: .command, tone: tone, title: title, message: notice.message))
+        }
+        if run.serviceControlResult == .stopRequestDelivered {
+            items.append(.init(source: .stopReceipt, tone: .information,
+                title: "Stop request delivered", message: "Ready for your next message."))
+        }
+        if let omissions = run.serviceProjectionOmissionSummary {
+            items.append(.init(source: .projectionLimits, tone: .information,
+                title: "Some recorded activity is outside this view", message: omissions))
+        }
+        if let omissions = run.serviceInputDeliveryOmissionSummary {
+            items.append(.init(source: .inputDeliveryLimits, tone: .warning,
+                title: "Input delivery view incomplete", message: omissions))
+        }
+        return ChatStatusPresentation(items: items)
+    }
+
     func prepareProjectReconfirmation(
         for run: LiveRun, directory: URL
     ) throws -> WorkHostWorkspaceReconfirmation {
@@ -5746,7 +5795,12 @@ final class LiveRun: Identifiable {
         commandCapabilities: SessionCommandCapabilities? = nil,
         commandState: SessionCommandState = .running,
         commandInFlight: Bool = false,
-        draftHandoff: ServiceBackedDraftHandoff? = nil
+        draftHandoff: ServiceBackedDraftHandoff? = nil,
+        commandNotice: RunCommandNotice? = nil,
+        errorBanner: String? = nil,
+        projectionOmissions: [WorkServiceOmission] = [],
+        inputDeliveryOmissions: [WorkServiceOmission] = [],
+        controlResult: ServiceBackedControlResult? = nil
     ) -> LiveRun {
         let run = LiveRun(
             engine: EngineLocation(
@@ -5764,6 +5818,11 @@ final class LiveRun: Identifiable {
         run.isEnding = commandState == .ending
         run.serviceCommandInFlight = commandInFlight
         run.draftHandoff = draftHandoff
+        run.commandNotice = commandNotice
+        run.errorBanner = errorBanner
+        run.serviceProjectionOmissions = projectionOmissions
+        run.serviceInputDeliveryOmissions = inputDeliveryOmissions
+        run.serviceControlResult = controlResult
         run.modelLabel = "claude-sonnet-4-5"
         run.contextTokens = 31_240
         run.contextWindow = 200_000

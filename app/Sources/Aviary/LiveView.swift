@@ -293,67 +293,22 @@ struct RunPane: View {
                         .background(Design.accentSoft.opacity(0.4))
                     Divider()
                 }
-                if let issue = model.projectIssue(for: run) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        NoticeBanner(level: .warning,
-                            title: issue.unavailabilityReason == .identityNeedsConfirmation
-                                ? "Confirm this chat’s project folder" : "Project folder unavailable",
-                            message: issue.unavailabilityReason == .identityNeedsConfirmation
-                                ? "The agent service is connected, but the saved folder identity no longer matches. This can happen after a restart. Your conversation is safe; confirm the original folder before continuing."
-                                : "The agent service is connected, but it cannot open this chat’s project folder. Restore access to the original folder, then check again. Your conversation is saved.")
-                        HStack {
-                            Button("Confirm project folder…") { showProjectReconfirmation = true }
-                            Button("Check again") {
-                                Task {
-                                    do {
-                                        try await model.refreshProjectAvailability()
-                                        projectCheckError = nil
-                                    } catch { projectCheckError = AppModel.serviceErrorMessage(error) }
-                                }
-                            }
-                        }.buttonStyle(.bordered).controlSize(.small)
-                        if let projectCheckError {
-                            Text(projectCheckError).font(.caption).foregroundStyle(Design.warning)
+                ChatStatusPanel(
+                    presentation: model.chatStatus(for: run, projectCheckError: projectCheckError),
+                    onConfirmProject: model.projectIssue(for: run) == nil ? nil : {
+                        showProjectReconfirmation = true
+                    },
+                    onCheckProject: model.projectIssue(for: run) == nil ? nil : {
+                        Task {
+                            do {
+                                try await model.refreshProjectAvailability()
+                                projectCheckError = nil
+                            } catch { projectCheckError = AppModel.serviceErrorMessage(error) }
                         }
-                    }.padding(Design.gutter)
-                } else if let banner = run.errorBanner {
-                    NoticeBanner(level: .danger, title: "Chat needs attention", message: banner)
-                        .padding(Design.gutter)
-                }
-                if let notice = run.commandNotice {
-                    let noticeTitle = switch notice.level {
-                    case .success: "Command acknowledged"
-                    case .uncertain: "Command outcome uncertain"
-                    case .warning: "Needs attention"
-                    }
-                    NoticeBanner(
-                        level: notice.level == .success ? .success : .warning,
-                        title: noticeTitle,
-                        message: notice.message
-                    )
-                        .padding(Design.gutter)
-                }
-                if run.serviceControlResult == .stopRequestDelivered {
-                    NoticeBanner(
-                        level: .info,
-                        title: "Stop request delivered",
-                        message: "Ready for your next message.")
-                        .padding(Design.gutter)
-                }
-                if let omissions = run.serviceProjectionOmissionSummary {
-                    NoticeBanner(
-                        level: .info,
-                        title: "Bounded canonical view",
-                        message: omissions)
-                        .padding(Design.gutter)
-                }
-                if let omissions = run.serviceInputDeliveryOmissionSummary {
-                    NoticeBanner(
-                        level: .warning,
-                        title: "Input delivery view incomplete",
-                        message: omissions)
-                        .padding(Design.gutter)
-                }
+                    },
+                    onReviewDelivery: run.serviceInputDeliveryOmissionSummary == nil ? nil : {
+                        showInputDeliveryReview = true
+                    })
                 if let action = run.currentServiceActions.first {
                     WorkActivityStrip(
                         action: action,

@@ -234,6 +234,26 @@ public struct RepositoryReviewDiffHunk: Codable, Hashable, Sendable {
     }
 }
 
+/// Visual classification of already parsed, bounded hunk context. The prefix remains part
+/// of the exact text; unknown markers remain neutral rather than being guessed as edits.
+public struct RepositoryReviewDiffDisplayLine: Equatable, Sendable {
+    public enum Kind: Equatable, Sendable { case addition, removal, context, marker }
+    public let text: String
+    public let kind: Kind
+    public static func lines(in hunk: RepositoryReviewDiffHunk) -> [Self] {
+        hunk.context.components(separatedBy: "\n").map { text in
+            let kind: Kind
+            switch text.first {
+            case "+": kind = .addition
+            case "-": kind = .removal
+            case " ": kind = .context
+            default: kind = .marker
+            }
+            return Self(text: text, kind: kind)
+        }
+    }
+}
+
 public struct RepositoryReviewDiffSection: Codable, Hashable, Sendable {
     public let diffKind: String
     public let path: String?

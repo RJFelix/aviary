@@ -598,6 +598,45 @@ enum ChatJourneyProbe {
                     "confirming a project implicitly started a service or submitted input")
     }
 
+    @MainActor private static func runChatStatusProbe(root: URL) throws {
+        let model = AppModel(home: AgentHome(root: root.appending(path: "chat-status-home")))
+        let notice = RunCommandNotice.uncertain(
+            "Exact command outcome unknown. Do not send another copy.",
+            serviceAcknowledgement: .init(work: WorkRef(workHostID: "status-host", workID: "status-work"),
+                commandID: "status-command", kind: .send, client: ClientRef("status-client"),
+                attachment: ClientAttachmentRef("status-client-attachment"),
+                sessionAttachment: SessionAttachmentRef("status-session-attachment"), evidence: .canonicalCommand))
+        let run = LiveRun.productionRunPaneVisualFixture(
+            items: [], pendingInputs: [], deliveryAttention: [], actions: [], draft: "Keep this draft",
+            commandNotice: notice, errorBanner: "The most recent read failed",
+            projectionOmissions: [.init(category: "activities", count: 9)],
+            inputDeliveryOmissions: [.init(category: "canonical_input_delivery.rows", count: 2)],
+            controlResult: .stopRequestDelivered)
+        let status = model.chatStatus(for: run)
+        try require(status.primary?.source == .command && status.primary?.tone == .uncertain,
+                    "chat status obscured an uncertain command")
+        try require(status.items.count == 5 && status.attentionCount == 3,
+                    "chat status lost a distinct evidence source")
+        try require(status.items.first(where: { $0.source == .inputDeliveryLimits })?.message.contains("Do not infer delivery or retry safety") == true,
+                    "chat status lost bounded delivery caveat")
+        try require(status.items.first(where: { $0.source == .chatError })?.message == run.errorBanner,
+                    "chat status rewrote the read failure")
+        try require(run.commandNotice == notice && run.draft == "Keep this draft" && run.items.isEmpty,
+                    "status projection mutated command or draft state")
+        run.commandNotice = .success("Receipt only")
+        let acknowledged = model.chatStatus(for: run)
+        try require(acknowledged.primary?.source == .chatError && acknowledged.items.first(where: { $0.source == .command })?.tone == .success,
+                    "success receipt hid an actionable failure")
+        let project = try WorkHostWorkspaceDescriptor(workspaceID: WorkHostWorkspaceID("workspace-00000000-0000-0000-0000-000000000001"),
+            availability: .unavailable, unavailabilityReason: .identityNeedsConfirmation)
+        let specialized = AppModel.chatStatus(for: run, projectIssue: project, projectCheckError: "Still unavailable")
+        try require(specialized.primary?.source == .project
+                    && !specialized.items.contains(where: { $0.source == .chatError }),
+                    "project diagnosis duplicated its generic recovery error")
+        try require(specialized.primary?.message.contains("Last project check: Still unavailable") == true,
+                    "project status lost failed check detail")
+    }
+
     @MainActor private static func run() async throws {
         try runLauncherSelectionProbe()
         for phase in PendingChatPhase.allCases {
@@ -749,6 +788,7 @@ enum ChatJourneyProbe {
             .appending(path: "aviary-chat-journey-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        try runChatStatusProbe(root: root)
         try await runProjectReconfirmationProbe(root: root)
         let home = AgentHome(root: root.appending(path: "home", directoryHint: .isDirectory))
         let model = AppModel(home: home)
