@@ -99,8 +99,7 @@ the transcript. Give these one coherent visual hierarchy: what needs the user's 
 current activity, then secondary evidence. Do not collapse unknown delivery into success, hide
 actionable recovery, or let informational notices consume the conversation's working area.
 
-After that, refine the busy composer around guidance versus a queued follow-up, then transcript
-and change-review readability. Preserve the existing editor identity, draft save/handoff guards,
+Then continue transcript and change-review readability. Preserve the existing editor identity, draft save/handoff guards,
 explicit send, selected history window, canonical evidence and stop/end distinction. Verification
 must exercise the actual RunPane with overlapping failures and incomplete evidence, not only the
 normal happy-path fixture. No execution-model changes are needed for this presentation work.
@@ -108,3 +107,35 @@ normal happy-path fixture. No execution-model changes are needed for this presen
 Most elapsed verification time was optimized Swift compilation. Disjoint UI ownership followed
 by an explicit source freeze avoided shared-file build races; production-component fixtures
 found the remaining contrast and narrow-layout defects without mutating live chats.
+
+## Busy composer and activity freshness — September 14
+
+The busy composer now shows Follow-up message and Guide current work as visible, icon-led
+choices with timing cues. They adapt from adjacent cards to stacked cards in narrow panes;
+one available route is a static card and no route is explicitly Draft only. Choices use the
+existing capability policy and submission path. Guidance remains a one-message override;
+changing a choice never sends or rewrites the draft.
+
+Sending restrictions now have a single policy with ordered, specific explanations adjacent to
+the editor: unresolved handoff, unconfirmed receipt, ending/stopping/starting, failed or denied
+input, and unavailable routes. An empty draft is informational rather than a warning. The
+duplicate receipt-confirmation banner above the transcript is removed; detailed draft recovery
+controls remain intact. Service-backed noncurrent status reads Last recorded and has no live
+pulse or typing tail. Visual freshness is separate from incremental transcript following.
+
+Verification:
+
+- Chat interaction policy: 6 cases / 62 assertions; draft persistence and handoff: 12 / 193;
+  service control receipts: 6 / 26. Debug and release builds pass, as does strict deep signing.
+- Signed saved-chat/consumer-read probe passes. The signed disposable normal-service OTLP journey
+  passes Create/Start/Python/review/End/drain with 99 spans and two fixture provider calls
+  (6.873 seconds through cleanup). Queue/Steer/Stop and remote execution are not covered by that
+  journey; this slice does not change their command implementation.
+- Actual RunPane fixtures cover two, one and zero routes, receipt confirmation and unresolved
+  handoff, in light/dark at 1200/640/380 points. A separate stale-activity fixture uses the
+  production status policy, activity strip and transcript at 520 points. Images were inspected
+  under build/ui-composer-final. These do not certify a live user's busy session, keyboard or
+  screen-reader interactions; the handoff fixture does not have a real service attachment.
+
+The broader overlapping-notice hierarchy, transcript rhythm and change-review flow remain.
+No daemon restart, command retry or saved-request submission is part of deploying this GUI slice.

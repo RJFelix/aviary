@@ -36,6 +36,11 @@ enum VisualFixtureRoute: String {
     case chatCreated = "chat-created-fixture"
     case requestLocations = "request-locations-fixture"
     case activityStrip = "activity-strip-fixture"
+    case composerGuidanceOnly = "composer-guidance-only-fixture"
+    case composerDraftOnly = "composer-draft-only-fixture"
+    case composerConfirming = "composer-confirming-fixture"
+    case composerHandoff = "composer-handoff-fixture"
+    case staleChatActivity = "stale-chat-activity-fixture"
 
     var isNarrow: Bool {
         self == .serviceChatNarrow || self == .productionDeliveryNarrow
@@ -58,6 +63,10 @@ struct VisualFixtureView: View {
             FixtureServiceConversationView(narrow: route.isNarrow)
         case .productionDelivery, .productionDeliveryNarrow:
             ProductionRunPaneFixture(narrow: route.isNarrow)
+        case .composerGuidanceOnly, .composerDraftOnly, .composerConfirming, .composerHandoff:
+            ProductionRunPaneFixture(narrow: true, scenario: route)
+        case .staleChatActivity:
+            StaleChatActivityFixture()
         case .productionInspectorNarrow:
             ProductionInspectorFixture()
         case .conversationHistory, .conversationHistoryNarrow:
@@ -1021,9 +1030,18 @@ private struct ProductionRunPaneFixture: View {
     private let model: AppModel
     private let run: LiveRun
 
-    init(narrow: Bool) {
+    init(narrow: Bool, scenario: VisualFixtureRoute? = nil) {
         self.narrow = narrow
         let model = AppModel()
+        let draft = "Check the current runtime namespace, then queue a separate summary for review."
+        let capabilities: SessionCommandCapabilities?
+        switch scenario {
+        case .composerGuidanceOnly:
+            capabilities = SessionCommandCapabilities(supportsSteering: true)
+        case .composerDraftOnly:
+            capabilities = SessionCommandCapabilities()
+        default: capabilities = nil
+        }
         let run = LiveRun.productionRunPaneVisualFixture(
             items: narrow
                 ? FixtureData.productionTranscriptNarrow : FixtureData.productionTranscript,
@@ -1032,7 +1050,14 @@ private struct ProductionRunPaneFixture: View {
             actions: FixtureData.actions.map(WorkActionPresentation.init),
             recordedModelContext: FixtureData.inspectorProjections.context,
             canonicalWorkingState: FixtureData.inspectorProjections.working,
-            draft: "Check the current runtime namespace, then queue a separate summary for review.")
+            draft: draft,
+            commandCapabilities: capabilities,
+            commandState: scenario == .composerConfirming ? .committing
+                : scenario == .composerHandoff ? .canceling : .running,
+            commandInFlight: scenario == .composerConfirming,
+            draftHandoff: scenario == .composerHandoff
+                ? try? ServiceBackedDraftHandoff(text: draft, kind: .queue,
+                    commandID: "fixture-handoff") : nil)
         model.runs = [run]
         model.focusedRunID = run.id
         model.showInspector = !narrow
@@ -1046,6 +1071,30 @@ private struct ProductionRunPaneFixture: View {
             .environment(model)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+/// Exercises the production activity strip and transcript with an explicitly stale activity
+/// projection. No attachment is created; the header policy is supplied the same facts as RunPane.
+private struct StaleChatActivityFixture: View {
+    private let status = ChatRunHeaderStatusPresentation.resolve(
+        commandState: .running, isStreaming: true, hasExited: false,
+        isServiceBacked: true, serviceSourceIsCurrent: false)
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Label(status.label, systemImage: status.symbol)
+                .font(.headline).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(16)
+            Divider()
+            if let action = FixtureData.actions.first.map(WorkActionPresentation.init) {
+                WorkActivityStrip(action: action, concurrentActions: [action],
+                    sourceIsCurrent: false, onInspect: { _ in })
+            }
+            TranscriptView(items: FixtureData.productionTranscript,
+                isStreaming: true, indicatesCurrentActivity: false)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 

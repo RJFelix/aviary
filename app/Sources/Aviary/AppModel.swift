@@ -5742,7 +5742,11 @@ final class LiveRun: Identifiable {
         actions: [WorkActionPresentation],
         recordedModelContext: RecordedModelContextProjection? = nil,
         canonicalWorkingState: CanonicalWorkingStateProjection? = nil,
-        draft: String
+        draft: String,
+        commandCapabilities: SessionCommandCapabilities? = nil,
+        commandState: SessionCommandState = .running,
+        commandInFlight: Bool = false,
+        draftHandoff: ServiceBackedDraftHandoff? = nil
     ) -> LiveRun {
         let run = LiveRun(
             engine: EngineLocation(
@@ -5754,8 +5758,12 @@ final class LiveRun: Identifiable {
                 thinkingLevel: "high"))
         run.title = "Canonical input delivery"
         run.items = items
-        run.commandState = .running
-        run.isStreaming = true
+        run.commandState = commandState
+        run.isStreaming = commandState == .running || commandState == .canceling
+        run.hasExited = commandState == .ended
+        run.isEnding = commandState == .ending
+        run.serviceCommandInFlight = commandInFlight
+        run.draftHandoff = draftHandoff
         run.modelLabel = "claude-sonnet-4-5"
         run.contextTokens = 31_240
         run.contextWindow = 200_000
@@ -5771,7 +5779,7 @@ final class LiveRun: Identifiable {
         run.serviceActivitySourceIsCurrent = true
         run.recordedModelContext = recordedModelContext
         run.canonicalWorkingState = canonicalWorkingState
-        run.visualFixtureCommandCapabilities = SessionCommandCapabilities(
+        run.visualFixtureCommandCapabilities = commandCapabilities ?? SessionCommandCapabilities(
             supportsSteering: true, supportsQueuedFollowUps: true,
             cancellationScopes: [.agentLoop])
         run.visualFixtureElapsedLabel = "time unknown"

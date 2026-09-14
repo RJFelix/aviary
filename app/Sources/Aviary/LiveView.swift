@@ -319,10 +319,6 @@ struct RunPane: View {
                 } else if let banner = run.errorBanner {
                     NoticeBanner(level: .danger, title: "Chat needs attention", message: banner)
                         .padding(Design.gutter)
-                } else if run.serviceCommandInFlight {
-                    NoticeBanner(level: .info, title: "Awaiting confirmation",
-                        message: "Waiting for the agent service to confirm receipt. Aviary will not send another copy.")
-                        .padding(Design.gutter)
                 }
                 if let notice = run.commandNotice {
                     let noticeTitle = switch notice.level {
@@ -433,6 +429,7 @@ struct RunPane: View {
                     items: run.items,
                     hideThinking: model.hideThinking,
                     isStreaming: run.isStreaming,
+                    indicatesCurrentActivity: !run.isServiceBacked || run.serviceActivitySourceIsCurrent,
                     autoScroll: true,
                     hasEarlierHistory: run.serviceHistoryHasEarlier,
                     hasNewerHistory: run.serviceHistoryHasNewer,
@@ -517,23 +514,30 @@ struct RunPane: View {
         }
     }
 
+    private var headerStatus: ChatRunHeaderStatusPresentation {
+        ChatRunHeaderStatusPresentation.resolve(
+            commandState: run.commandState, isStreaming: run.isStreaming,
+            hasExited: run.hasExited, isServiceBacked: run.isServiceBacked,
+            serviceSourceIsCurrent: run.serviceActivitySourceIsCurrent)
+    }
+
     private var runHeader: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 8) {
-                if run.isStreaming {
+                if headerStatus.showsPulse {
                     PulseDot()
-                } else if run.hasExited {
-                    Image(systemName: "stop.circle.fill")
-                        .font(.system(size: 11)).foregroundStyle(.tertiary)
                 } else {
-                    Circle().fill(Design.accent.opacity(0.7)).frame(width: 7, height: 7)
+                    Image(systemName: headerStatus.symbol)
+                        .font(.system(size: headerStatus.isNeutral || run.hasExited ? 11 : 7))
+                        .foregroundStyle(headerStatus.isNeutral || run.hasExited
+                            ? Color.secondary : Design.accent)
                 }
                 Text(run.title)
                     .font(.system(size: 13.5, weight: .semibold))
                     .lineLimit(1)
                 Chip(
-                    text: ChatInteractionPresentation.stateLabel(run.commandState),
-                    tint: run.presentationState == "failed"
+                    text: headerStatus.label,
+                    tint: headerStatus.isNeutral ? .secondary : run.presentationState == "failed"
                         ? Design.danger
                         : run.presentationState == "working" ? Design.success : .secondary)
                 if run.isCompacting { Chip(text: "compacting", tint: Design.warning) }
@@ -756,10 +760,23 @@ struct RunPane: View {
     private var composer: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
+                if run.isStreaming {
+                    ChatDeliveryChoiceView(
+                        choices: availableComposerDeliveries,
+                        selection: $composerDelivery)
+                }
+                if run.isStreaming || composerStatus.kind == .blocked {
+                    Label(composerStatus.text, systemImage: composerStatus.symbol)
+                        .font(.system(size: 11))
+                        .foregroundStyle(composerStatus.kind == .blocked
+                            ? Design.warning : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("chat-composer-status")
+                }
                 ZStack(alignment: .topLeading) {
                     if run.draft.isEmpty {
                         Text(composerPlaceholder)
-                            .font(.system(size: 12.5))
+                            .font(.system(size: 13))
                             .foregroundStyle(.tertiary)
                             .padding(.horizontal, 5)
                             .padding(.vertical, 6)
@@ -768,7 +785,7 @@ struct RunPane: View {
                     TextEditor(text: Binding(
                         get: { run.draft },
                         set: { run.setDraft($0) }))
-                        .font(.system(size: 12.5))
+                        .font(.system(size: 13))
                         .scrollContentBackground(.hidden)
                         .frame(minHeight: 42, maxHeight: 105)
                         .padding(.horizontal, 1)
@@ -803,29 +820,6 @@ struct RunPane: View {
 
                     Spacer(minLength: 0)
 
-                    if run.isStreaming {
-                        HStack(spacing: 4) {
-                            Picker(
-                                "Delivery mode",
-                                selection: Binding(
-                                    get: { effectiveComposerDelivery ?? .followUp },
-                                    set: { composerDelivery = $0 })
-                            ) {
-                                ForEach(availableComposerDeliveries) { choice in
-                                    Text(choice.label).tag(choice)
-                                }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.menu)
-                            .controlSize(.small)
-                            .disabled(availableComposerDeliveries.count < 2)
-                            .accessibilityLabel("Delivery mode")
-                            .accessibilityValue(
-                                effectiveComposerDelivery?.explanation
-                                    ?? "No delivery mode available")
-                        }
-                    }
-
                     Button {
                         submitComposer()
                     } label: {
@@ -839,25 +833,13 @@ struct RunPane: View {
                     .disabled(!composerCanSubmit)
                     .keyboardShortcut(.return, modifiers: .command)
                     .accessibilityLabel(composerActionLabel)
-                    .accessibilityValue(
-                        run.draft.trimmingCharacters(in: .whitespaces).isEmpty
-                            ? "Unavailable: message is empty"
-                            : composerCanSubmit ? "Ready" : "Unavailable")
-                    .accessibilityHint(composerActionDetail + ". Sends with Command-Return.")
-                    .help("\(composerActionDetail) (⌘↵)")
+                    .accessibilityValue(composerCanSubmit ? "Ready" : composerStatus.text)
+                    .accessibilityHint(composerStatus.text + ". Sends with Command-Return.")
+                    .help("\(composerStatus.text) (⌘↵)")
                 }
             }
             .padding(.horizontal, Design.gutter)
             .padding(.vertical, 9)
-
-            if run.isStreaming {
-                Text(run.commandState == .canceling
-                    ? ChatInteractionPresentation.stopExplanation : composerActionDetail)
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, Design.gutter).padding(.bottom, 9)
-            }
 
             if let notice = run.draftPersistenceNotice {
                 Divider()
@@ -925,7 +907,7 @@ struct RunPane: View {
 
     private var composerActionLabel: String {
         guard run.isStreaming else { return "Send" }
-        return effectiveComposerDelivery?.buttonLabel ?? "Working"
+        return effectiveComposerDelivery?.buttonLabel ?? "Send unavailable"
     }
 
     private var composerActionSymbol: String {
@@ -937,10 +919,18 @@ struct RunPane: View {
         }
     }
 
-    private var composerActionDetail: String {
-        guard run.isStreaming else { return "Send a message to the agent" }
-        return effectiveComposerDelivery?.explanation
-            ?? "The agent cannot receive another message right now. Your draft stays here."
+    private var composerStatus: ChatComposerStatusPresentation {
+        ChatComposerStatusPresentation.resolve(
+            hasUnresolvedDraftHandoff: run.draftHandoff != nil,
+            // Storage details and their recovery controls remain together below the editor.
+            persistenceNotice: nil,
+            commandInFlight: run.serviceCommandInFlight,
+            commandState: run.commandState, hasExited: run.hasExited,
+            isEnding: run.isEnding,
+            acceptsInput: run.acceptsInput, isStreaming: run.isStreaming,
+            availableDeliveries: availableComposerDeliveries,
+            effectiveDelivery: effectiveComposerDelivery,
+            draftIsEmpty: run.draft.trimmingCharacters(in: .whitespaces).isEmpty)
     }
 
     private var composerPlaceholder: String {
@@ -958,7 +948,7 @@ struct RunPane: View {
     }
 
     private var composerAccessibilityHint: String {
-        composerActionDetail
+        composerStatus.text
     }
 
     private var composerCanSubmit: Bool {

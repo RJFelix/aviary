@@ -22,6 +22,8 @@ struct TranscriptView: View {
     var searchQuery: String = ""
     var hideThinking: Bool = false
     var isStreaming: Bool = false
+    /// Activity freshness affects animation, not following newly received transcript text.
+    var indicatesCurrentActivity: Bool = true
     var autoScroll: Bool = true
     var hasEarlierHistory: Bool = false
     var hasNewerHistory: Bool = false
@@ -68,7 +70,7 @@ struct TranscriptView: View {
                                     item: item,
                                     searchQuery: searchQuery,
                                     hideThinking: hideThinking,
-                                    isLast: item.id == visible.last?.id && isStreaming,
+                                    isLast: item.id == visible.last?.id && isStreaming && indicatesCurrentActivity,
                                     onSelect: onSelect)
                                 if let descriptor = reviewDescriptorsByMessageID[item.id],
                                    let onReviewMessage {
@@ -91,7 +93,7 @@ struct TranscriptView: View {
                                 }
                             }.id(item.id)
                         }
-                        if isStreaming {
+                        if isStreaming && indicatesCurrentActivity {
                             StreamingIndicator()
                                 .id("__streaming_tail__")
                         }
