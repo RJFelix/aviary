@@ -1226,6 +1226,38 @@ struct RunOptionsMenu: View {
 
 // MARK: - Launcher
 
+/// Only the header toggles expansion; controls inside the expanded form keep their own input.
+private struct LauncherSettingsDisclosureStyle: DisclosureGroupStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                configuration.isExpanded.toggle()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: configuration.isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 12)
+                    configuration.label
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(13)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(configuration.isExpanded ? "Expanded" : "Collapsed")
+            .accessibilityHint("Expands or collapses these settings")
+            if configuration.isExpanded {
+                configuration.content
+                    .padding(.horizontal, 13)
+                    .padding(.bottom, 13)
+            }
+        }
+    }
+}
+
 struct LauncherSheet: View {
     @Environment(\.dismiss) private var dismiss
 
@@ -1434,7 +1466,7 @@ struct LauncherFormBody: View {
                         .controlSize(.small)
                     }
                     .font(.system(size: 12, weight: .medium))
-                    .padding(13)
+                    .disclosureGroupStyle(LauncherSettingsDisclosureStyle())
                     .background(
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(Color(nsColor: .controlBackgroundColor)))
@@ -1482,7 +1514,7 @@ struct LauncherFormBody: View {
                         .controlSize(.small)
                     }
                     .font(.system(size: 12, weight: .medium))
-                    .padding(13)
+                    .disclosureGroupStyle(LauncherSettingsDisclosureStyle())
                     .background(
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(Color(nsColor: .controlBackgroundColor)))
