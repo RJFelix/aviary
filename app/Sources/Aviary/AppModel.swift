@@ -3753,14 +3753,15 @@ final class AppModel {
             return "Startup was interrupted. Your request is saved. Retry checks any retained delivery attempt before proceeding."
         }
         switch chat.failureKind {
-        case .providerUnavailable: return "The selected model is not available. Choose a configured model, then retry."
-        case .workspaceUnavailable: return "The project folder is unavailable. Check the folder, then retry."
+        case .providerUnavailable: return "The selected model was unavailable during the previous startup attempt. Check the model selection, then retry startup. Your request is saved."
+        case .workspaceUnavailable: return "The project folder was unavailable during the previous startup attempt. Check the folder, then retry startup. Your request is saved."
+        case .authorizationRequired: return "The previous startup attempt needed authorization. Check connection details, then retry startup. Your request is saved."
         case .workspaceConfirmationRequired:
             return "The saved project folder identity needs confirmation, which can happen after a restart. Confirm the original folder, then start this saved request when ready. Nothing has been sent."
         case .staleCreate:
             return "Startup needs a fresh attempt. Your request was not accepted, and the saved text is unchanged. Retry startup when ready."
         case .invalidRequest: return "The request needs an adjustment before it can be sent. Your original text is saved."
-        default: return "The local agent service is not ready. Your request is saved on this Mac and has not been sent. Retry connection to continue."
+        default: return "The previous startup attempt could not complete. Your request is saved on this Mac and has not been sent. Retry startup to check readiness and continue."
         }
     }
 

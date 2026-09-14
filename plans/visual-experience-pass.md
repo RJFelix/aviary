@@ -1,6 +1,6 @@
 # Visual understanding pass
 
-2026-09-12 · first implementation slice complete; live-window acceptance pending unlock
+2026-09-14 · first slice inspected live; historical startup-message correction in verification
 
 Ryan's direction: intuitive and simple, not austere; learn through visual structure, with text
 reinforcing meaning. This pass changes presentation, not Work ownership or delivery semantics.
@@ -79,10 +79,31 @@ Verification performed:
 - All 141 protected file hashes from the prior service-cutover receipt still match. The existing
   GUI and agent service remain running; no saved prompt was replayed.
 
-The Mac locked before final live-window inspection. Do not describe the running GUI as updated:
-after unlock, inspect for unsaved text, gracefully reopen the GUI only, and check the real chat
-list, configuration controls, compact navigation, and Improve Aviary toolbar. Keep the daemon
-running. The screenshot matrix and executable probes do not replace that acceptance check.
+The Mac locked before the initial live-window check. On September 14 the new GUI was already
+running; the actual chat list, expandable configuration, model picker, connection details and
+Improve Aviary entry point were checked without sending, editing or discarding a request. Both
+saved cards remained visible and all 141 protected hashes matched. Compact navigation and active
+conversation layout still have fixture rather than interactive live acceptance in this pass.
+
+That live check found a stale diagnostic: a saved failed-start card described the service as
+currently unavailable despite a connected service. The correction describes the previous startup
+attempt, including model/folder/authorization failures. It does not infer execution readiness
+from connectivity or automatically retry. The executable probe checks historical wording under
+connected/disconnected diagnostics and preserves the original saved identity.
+
+## Next bounded slice: active-chat status hierarchy
+
+The production RunPane can stack project/read failures, command receipt notices, stop receipt,
+projection bounds, input-delivery bounds, current action and child/background summaries above
+the transcript. Give these one coherent visual hierarchy: what needs the user's attention,
+current activity, then secondary evidence. Do not collapse unknown delivery into success, hide
+actionable recovery, or let informational notices consume the conversation's working area.
+
+After that, refine the busy composer around guidance versus a queued follow-up, then transcript
+and change-review readability. Preserve the existing editor identity, draft save/handoff guards,
+explicit send, selected history window, canonical evidence and stop/end distinction. Verification
+must exercise the actual RunPane with overlapping failures and incomplete evidence, not only the
+normal happy-path fixture. No execution-model changes are needed for this presentation work.
 
 Most elapsed verification time was optimized Swift compilation. Disjoint UI ownership followed
 by an explicit source freeze avoided shared-file build races; production-component fixtures

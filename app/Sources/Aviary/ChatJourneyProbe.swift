@@ -767,6 +767,25 @@ enum ChatJourneyProbe {
         model.localWorkServiceError = nil
         model.localWorkServiceCreateError = nil
         try require(model.localWorkServiceError == nil, "resolved Create kept stale failure")
+        // A saved failure describes that attempt, not the host's current health. Reopening
+        // the card or refreshing Diagnostics must neither rewrite it nor retry the request.
+        for failure in [PendingChatFailureKind.hostUnavailable, .providerUnavailable,
+                        .workspaceUnavailable, .authorizationRequired, .unknown] {
+            let historical = try PendingChat(prompt: "Retain this request", cwd: root.path,
+                phase: .blocked, failureKind: failure)
+            let before = historical
+            let connectedExplanation = model.pendingChatExplanation(historical)
+            try require(connectedExplanation.contains("previous startup attempt"),
+                        "saved failure presented an old readiness result as current health")
+            try require(!connectedExplanation.contains("service is not ready"),
+                        "saved startup card contradicted a healthy connection")
+            model.localWorkServiceError = "Connection interrupted"
+            try require(model.pendingChatExplanation(historical) == connectedExplanation,
+                        "connection status changed the recorded startup explanation")
+            model.localWorkServiceError = nil
+            try require(historical == before && !model.pendingChatIsPreparing(historical),
+                        "reading historical failure mutated or retried the saved request")
+        }
         // Larger than the service limit but inside the local save limit. No provider/bootstrap
         // call is reachable; this is a deterministic pre-admission failure.
         let exact = String(repeating: "A🙂\n", count: 2_000)
