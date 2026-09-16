@@ -232,6 +232,10 @@ struct RunPane: View {
     private struct SelectedAction: Identifiable, Hashable {
         let id: String
     }
+    private struct ForwardedMessage: Identifiable {
+        let id = UUID()
+        let text: String
+    }
 
     /// One sheet value captures both sides of the review association at the tap boundary.
     /// Keeping this as one item avoids an `isPresented` closure observing a newer descriptor
@@ -243,15 +247,16 @@ struct RunPane: View {
     }
 
     @Environment(AppModel.self) private var model
+    @Environment(\.usesChatWindowTitle) private var usesChatWindowTitle
     var run: LiveRun
     /// Cockpit owns its two-column layout, so it reuses the chat/composer without a third
     /// technical column. Live keeps the detailed inspector.
     var showsInspector = true
 
-    @State private var showMarkdownPreview = false
     @State private var showLaunchDetails = false
     @State private var selectedItem: TranscriptItem?
     @State private var selectedAction: SelectedAction?
+    @State private var forwardedMessage: ForwardedMessage?
     @State private var confirmEndRun = false
     @State private var showInputDeliveryReview = false
     @State private var showCockpitInspector = false
@@ -272,13 +277,14 @@ struct RunPane: View {
                     $0.createdAssociation != nil && $0.createdAssociation == run.serviceAttachmentKey
                 })?.prompt ?? run.savedInitialPrompt, !prompt.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
-                        Label("Saved first message · delivery not yet confirmed", systemImage: "tray")
+                        Label("You · saved on this Mac", systemImage: "person.fill")
                             .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                         ScrollView {
                             Text(prompt).font(.system(size: 13)).textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }.frame(maxHeight: 160)
-                        if let pending = run.serviceProjection?.pendingCommand, pending.kind == .start {
+                        if let pending = run.serviceProjection?.pendingCommand, pending.kind == .start,
+                           !run.serviceCommandAttemptActive, pending.state != .awaitingCanonicalEvidence {
                             HStack(spacing: 8) {
                                 Button("Check delivery") { Task { await run.refreshService() } }
                                 Button("Retry saved startup") { Task { _ = await run.retryServiceCommand() } }
@@ -287,6 +293,10 @@ struct RunPane: View {
                                         || !run.serviceRetryAvailable)
                             }.buttonStyle(.bordered).controlSize(.small)
                             Text("Retry uses the original saved request, not a new copy.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else if run.serviceCommandAttemptActive || run.commandState == .preparing
+                            || run.commandState == .committing {
+                            Label("Starting…", systemImage: "hourglass")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
@@ -402,6 +412,7 @@ struct RunPane: View {
                         selectedRepositoryReview = SelectedRepositoryReview(
                             run: run, descriptor: descriptor)
                     },
+                    onForwardMessage: { forwardedMessage = ForwardedMessage(text: $0) },
                     onSelect: { selectedItem = $0 })
                 Divider()
                 composer
@@ -442,6 +453,10 @@ struct RunPane: View {
                 WorkActionUnavailableSheet(actionID: selection.id)
             }
         }
+        .sheet(item: $forwardedMessage) { message in
+            AgentMessageForwardingView(text: message.text,
+                sourceProject: run.config.cwd, sourceRunID: run.id)
+        }
         .sheet(isPresented: $showInputDeliveryReview) {
             InputDeliveryReviewSheet(
                 pending: run.servicePendingInputs,
@@ -449,7 +464,16 @@ struct RunPane: View {
                 omissionSummary: run.serviceInputDeliveryOmissionSummary)
         }
         .sheet(isPresented: $showCockpitInspector) {
-            RunInspector(run: run, selectedItem: $selectedItem)
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Chat details").font(.headline)
+                    Spacer()
+                    Button("Done") { showCockpitInspector = false }
+                        .keyboardShortcut(.cancelAction)
+                }.padding()
+                Divider()
+                RunInspector(run: run, selectedItem: $selectedItem)
+            }
                 .frame(minWidth: 360, idealWidth: 420, minHeight: 520, idealHeight: 720)
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Run context and working state")
@@ -478,6 +502,7 @@ struct RunPane: View {
 
     private var runHeader: some View {
         VStack(alignment: .leading, spacing: 7) {
+            if !usesChatWindowTitle {
             HStack(spacing: 8) {
                 if headerStatus.showsPulse {
                     PulseDot()
@@ -503,7 +528,7 @@ struct RunPane: View {
                 }
                 Spacer()
             }
-
+            }
             runMetadata
 
             HStack(spacing: 8) {
@@ -513,7 +538,7 @@ struct RunPane: View {
                         sourceIsCurrent: run.serviceActivitySourceIsCurrent).hasRecords)
                     || (run.isServiceBacked && run.canonicalWorkingState?.agentHandleFactsAvailable != true) {
                     Button { showActivityHistory = true } label: {
-                        Label("Activity", systemImage: "list.bullet.rectangle")
+                        Label("Agent activity", systemImage: "list.bullet.rectangle")
                     }
                     .buttonStyle(.bordered).controlSize(.small)
                     .help("See current and recently recorded agent actions")
@@ -545,13 +570,13 @@ struct RunPane: View {
                     Button {
                         showCockpitInspector = true
                     } label: {
-                        Image(systemName: "sidebar.right")
+                        Label("Details", systemImage: "info.circle")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .keyboardShortcut("i", modifiers: [.command, .option])
-                    .help("Inspect recorded model context and canonical working state")
-                    .accessibilityLabel("Context and working state")
+                    .help("View chat settings, model context, and runtime details")
+                    .accessibilityLabel("Chat details")
                     .accessibilityHint(
                         "Opens recorded provider context and current durable Work and Session evidence")
                 }
@@ -586,6 +611,8 @@ struct RunPane: View {
         .padding(.horizontal, Design.gutter)
         .padding(.vertical, 9)
         .background(.background.secondary)
+        .preference(key: ChatWindowTitleKey.self, value: run.title)
+        .preference(key: ChatWindowSubtitleKey.self, value: headerStatus.label)
     }
 
     private func presentLatestRepositoryReview() {
@@ -597,13 +624,16 @@ struct RunPane: View {
     private var runMetadata: some View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 5) {
-                Chip(text: run.projectName, symbol: "folder", tint: Design.accent)
+                Label(run.projectName, systemImage: "folder")
+                    .font(.caption).foregroundStyle(.secondary)
                     .help(run.config.cwd)
                 if let m = run.modelLabel, !m.isEmpty {
-                    Chip(text: m, symbol: "cpu", tint: Design.assistant)
+                    Label(m, systemImage: "cpu")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 if let level = run.thinkingLevel {
-                    Chip(text: level, symbol: "brain", tint: Design.thinking)
+                    Label(level, systemImage: "brain")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 if !run.usage.isEmpty {
                     Chip(
@@ -636,10 +666,12 @@ struct RunPane: View {
             .fixedSize(horizontal: true, vertical: false)
 
             HStack(spacing: 5) {
-                Chip(text: run.projectName, symbol: "folder", tint: Design.accent)
+                Label(run.projectName, systemImage: "folder")
+                    .font(.caption).foregroundStyle(.secondary)
                     .help(run.config.cwd)
                 if let m = run.modelLabel, !m.isEmpty {
-                    Chip(text: m, symbol: "cpu", tint: Design.assistant)
+                    Label(m, systemImage: "cpu")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 if run.hasCanonicalStartTime && run.elapsedLabel != "time unknown" {
                     Chip(text: run.elapsedLabel, symbol: "clock", tint: .secondary)
@@ -692,7 +724,7 @@ struct RunPane: View {
                 Button {
                     Task { _ = await run.cancel(.agentLoop) }
                 } label: {
-                    Label(run.commandState == .canceling ? "Stopping…" : "Stop after step",
+                    Label(run.commandState == .canceling ? "Stopping…" : "Stop",
                           systemImage: "stop.circle")
                 }
                 .buttonStyle(.bordered).controlSize(.small)
@@ -728,51 +760,19 @@ struct RunPane: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("chat-composer-status")
                 }
-                ZStack(alignment: .topLeading) {
-                    if run.draft.isEmpty {
-                        Text(composerPlaceholder)
-                            .font(.system(size: 13))
-                            .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 6)
-                            .allowsHitTesting(false)
-                    }
-                    TextEditor(text: Binding(
+                VStack(spacing: 0) {
+                    ChatMessageEditor(text: Binding(
                         get: { run.draft },
-                        set: { run.setDraft($0) }))
-                        .font(.system(size: 13))
-                        .scrollContentBackground(.hidden)
-                        .frame(minHeight: 42, maxHeight: 105)
-                        .padding(.horizontal, 1)
-                        // No focus state is mutated by streaming or delivery callbacks. This
-                        // remains the same editor identity while the parent observes the run.
-                        .accessibilityLabel(composerAccessibilityLabel)
-                        .accessibilityHint(composerAccessibilityHint)
-                }
-                .padding(6)
-                .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color(nsColor: .textBackgroundColor))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(.separator, lineWidth: 1))
-
+                        set: { run.setDraft($0) }),
+                        placeholder: composerPlaceholder,
+                        canSubmit: composerCanSubmit,
+                        onSubmit: submitComposer,
+                        accessibilityLabel: composerAccessibilityLabel)
+                        .id(run.id)
+                        .frame(minHeight: 64, maxHeight: 115)
                 HStack(spacing: 8) {
-                    Button {
-                        showMarkdownPreview.toggle()
-                    } label: {
-                        Image(systemName: showMarkdownPreview ? "eye.slash" : "eye")
-                            .font(.system(size: 10))
-                            .frame(width: 26, height: 20)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(run.draft.isEmpty)
-                    .accessibilityLabel(
-                        showMarkdownPreview ? "Hide Markdown preview" : "Show Markdown preview")
-                    .accessibilityValue(showMarkdownPreview ? "Visible" : "Hidden")
-                    .help(showMarkdownPreview ? "Hide Markdown preview" : "Show Markdown preview")
-
+                    Text("⇧ Return for a new line")
+                        .font(.caption2).foregroundStyle(.tertiary)
                     Spacer(minLength: 0)
 
                     Button {
@@ -789,9 +789,14 @@ struct RunPane: View {
                     .keyboardShortcut(.return, modifiers: .command)
                     .accessibilityLabel(composerActionLabel)
                     .accessibilityValue(composerCanSubmit ? "Ready" : composerStatus.text)
-                    .accessibilityHint(composerStatus.text + ". Sends with Command-Return.")
-                    .help("\(composerStatus.text) (⌘↵)")
+                    .accessibilityHint(composerStatus.text + ". Return sends; Shift-Return adds a new line.")
+                    .help("\(composerStatus.text) (↵)")
+                }.padding(.horizontal, 8).padding(.bottom, 8)
                 }
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color(nsColor: .textBackgroundColor)))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(.separator, lineWidth: 1))
             }
             .padding(.horizontal, Design.gutter)
             .padding(.vertical, 9)
@@ -828,21 +833,6 @@ struct RunPane: View {
                 .padding(.vertical, 6)
             }
 
-            if showMarkdownPreview, !run.draft.isEmpty {
-                Divider()
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("MARKDOWN PREVIEW")
-                        .font(Design.sectionTitle).foregroundStyle(.secondary)
-                    ScrollView {
-                        MarkdownText(text: run.draft)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .frame(maxHeight: 130)
-                }
-                .padding(.horizontal, Design.gutter)
-                .padding(.vertical, 9)
-                .background(.background.secondary)
-            }
         }
         .background(.bar)
     }
@@ -876,10 +866,9 @@ struct RunPane: View {
 
     private var composerStatus: ChatComposerStatusPresentation {
         ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: run.draftHandoff != nil,
+            submissionState: run.composerSubmissionState,
             // Storage details and their recovery controls remain together below the editor.
             persistenceNotice: nil,
-            commandInFlight: run.serviceCommandInFlight,
             commandState: run.commandState, hasExited: run.hasExited,
             isEnding: run.isEnding,
             acceptsInput: run.acceptsInput, isStreaming: run.isStreaming,
@@ -1264,7 +1253,7 @@ struct LauncherSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Label("New chat", systemImage: "plus.bubble")
+                Label("What next?", systemImage: "plus.bubble")
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
                 Button("Cancel") { dismiss() }
@@ -1297,59 +1286,26 @@ struct LauncherFormBody: View {
     @State private var thinking = "high"
     @State private var noContextFiles = false
     @State private var recordPayloads = false
-    @State private var configurationExpanded = false
     @State private var advancedExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("What would you like to work on?")
-                            .font(.system(size: 24, weight: .semibold, design: .rounded))
-                        Text(launcherSubtitle)
-                            .font(.system(size: 13))
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("What next?")
+                        .font(.system(size: 20, weight: .semibold, design: .rounded))
 
-                    Card(symbol: "text.bubble") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("New chat request")
-                                .font(.system(size: 13, weight: .semibold))
-                            VStack(alignment: .trailing, spacing: 10) {
-                                requestEditor
-                                startButton
-                            }
-                        }
-                    }
+                    requestEditor
 
-                    Card("For this chat", symbol: "slider.horizontal.3") {
-                        ViewThatFits(in: .horizontal) {
-                            HStack(alignment: .top, spacing: 16) {
-                                workspaceSummary
-                                Divider().frame(height: 58)
-                                agentSummary
-                            }
-                            VStack(alignment: .leading, spacing: 14) {
-                                workspaceSummary
-                                Divider()
-                                agentSummary
-                            }
-                        }
-                    }
-
-                    DisclosureGroup(
-                        "Project, engine, and model settings",
-                        isExpanded: $configurationExpanded
-                    ) {
+                    Card(symbol: "slider.horizontal.3") {
                         VStack(alignment: .leading, spacing: 12) {
                             VStack(alignment: .leading, spacing: 7) {
-                                Text("Project folder")
+                                Text("Workspace")
                                     .font(.system(size: 13, weight: .semibold))
                                 HStack(spacing: 8) {
                                     TextField("Project path", text: Binding(get: { cwd }, set: {
-                                        cwd = $0; projectChosen = true
+                                        cwd = $0
+                                        projectChosen = true
                                     }))
                                         .textFieldStyle(.roundedBorder)
                                         .font(Design.mono(11))
@@ -1377,102 +1333,40 @@ struct LauncherFormBody: View {
                                         }
                                     }
                                 }
-                                Text("Aviary reads project instructions starting from this folder.")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.tertiary)
-                                    .fixedSize(horizontal: false, vertical: true)
                             }
 
                             Divider()
 
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("How to run it")
-                                    .font(.system(size: 13, weight: .semibold))
-                                Picker(
-                                    "Engine",
-                                    selection: engineBinding
-                                ) {
-                                    ForEach(AppModel.Engine.allCases) { engine in
-                                        Text(engine == .inHouse ? "Aviary" : engine.label)
-                                            .tag(engine)
+                            if model.pickerModels.isEmpty {
+                                Text(
+                                    model.runtimeModelsError
+                                        ?? "Asking the engine which models it can reach…"
+                                )
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(
+                                        model.runtimeModelsError == nil
+                                            ? .secondary : Design.danger)
+                            } else {
+                                ViewThatFits(in: .horizontal) {
+                                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                                        providerPicker
+                                        modelPicker
+                                        thinkingPicker
+                                    }
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        providerPicker
+                                        modelPicker
+                                        thinkingPicker
                                     }
                                 }
-                                .pickerStyle(.segmented)
-                                Text(selectedEngine == .inHouse
-                                    ? "Aviary runs the agent and keeps the conversation available when this window closes."
-                                    : "Claude Code runs the agent using its own account and conversation history.")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.tertiary)
-                                    .fixedSize(horizontal: false, vertical: true)
-
-                                if selectedEngine == .claudeCode {
-                                    if let auth = model.claudeCodeAuth {
-                                        HStack(spacing: 6) {
-                                            Circle()
-                                                .fill(auth.isSubscription ? Design.success : Design.warning)
-                                                .frame(width: 6, height: 6)
-                                            Text(
-                                                auth.isSubscription
-                                                ? "\(auth.summary) — draws on the plan"
-                                                    : "\(auth.summary) — bills metered API credit"
-                                            )
-                                                .font(.system(size: 11))
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    } else {
-                                        Text(
-                                            "No `claude` binary found, or it is not signed in. "
-                                                + "Install Claude Code and run `claude /login`."
-                                        )
-                                            .font(.system(size: 11))
-                                            .foregroundStyle(Design.warning)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                    }
-                                }
-                            }
-
-                            Divider()
-
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Agent")
-                                    .font(.system(size: 13, weight: .semibold))
-                                if model.pickerModels.isEmpty {
-                                    Text(
-                                        model.runtimeModelsError
-                                            ?? "Asking the engine which models it can reach…"
-                                    )
-                                        .font(.system(size: 12))
-                                        .foregroundStyle(
-                                            model.runtimeModelsError == nil
-                                                ? .secondary : Design.danger)
-                                } else {
-                                    Picker("Provider", selection: providerBinding) {
-                                        ForEach(providers, id: \.self) { Text($0).tag($0) }
-                                    }
-                                    Picker("Model", selection: modelBinding) {
-                                        ForEach(modelsForProvider) { m in
-                                            Text(m.displayName).tag(m.id)
-                                        }
-                                    }
-                                    if let selected = modelsForProvider.first(where: {
-                                        $0.id == modelID
-                                    }) {
-                                        ModelFactsRow(model: selected, requestedThinking: thinking)
-                                    }
+                                if let selected = modelsForProvider.first(where: {
+                                    $0.id == modelID
+                                }) {
+                                    ModelFactsRow(model: selected, requestedThinking: thinking)
                                 }
                             }
                         }
-                        .padding(.top, 10)
-                        .controlSize(.small)
                     }
-                    .font(.system(size: 12, weight: .medium))
-                    .disclosureGroupStyle(LauncherSettingsDisclosureStyle())
-                    .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(Color(nsColor: .controlBackgroundColor)))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .strokeBorder(.separator.opacity(0.6), lineWidth: 1))
 
                     if selectedEngine == .inHouse {
                         agentServiceStatus
@@ -1480,34 +1374,53 @@ struct LauncherFormBody: View {
 
                     DisclosureGroup("Advanced settings", isExpanded: $advancedExpanded) {
                         VStack(alignment: .leading, spacing: 8) {
-                            Picker("Thinking", selection: $thinking) {
-                                ForEach(
-                                    ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-                                    id: \.self
-                                ) { Text($0).tag($0) }
+                            Picker("Engine", selection: engineBinding) {
+                                ForEach(AppModel.Engine.allCases) { engine in
+                                    Text(engine == .inHouse ? "Aviary" : engine.label)
+                                        .tag(engine)
+                                }
                             }
-                            Text(selectedEngine == .inHouse
-                                 ? "Your chat is saved locally before delivery is attempted."
-                                 : "Claude Code uses a local conversation journal; its running process belongs to this app.")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.tertiary)
+                            .pickerStyle(.segmented)
                             if selectedEngine == .claudeCode {
-                                Toggle("Skip AGENTS.md / CLAUDE.md discovery", isOn: $noContextFiles)
+                                if let auth = model.claudeCodeAuth {
+                                    HStack(spacing: 6) {
+                                        Circle()
+                                            .fill(auth.isSubscription ? Design.success : Design.warning)
+                                            .frame(width: 6, height: 6)
+                                        Text(
+                                            auth.isSubscription
+                                                ? "\(auth.summary) — draws on the plan"
+                                                : "\(auth.summary) — bills metered API credit"
+                                        )
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                } else {
+                                    Text(
+                                        "No `claude` binary found, or it is not signed in. "
+                                            + "Install Claude Code and run `claude /login`."
+                                    )
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(Design.warning)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
                             }
                             Divider().opacity(0.5)
-                            Toggle("Record what's sent to the model", isOn: $recordPayloads)
+                            Toggle("Skip AGENTS.md / CLAUDE.md discovery", isOn: $noContextFiles)
+                                .disabled(selectedEngine != .claudeCode)
+                            Divider().opacity(0.5)
+                            Toggle("Keep full session logs locally", isOn: $recordPayloads)
                                 .disabled(selectedEngine == .claudeCode)
-                            Text(Self.recordPayloadsExplanation)
-                                .font(.system(size: 11))
-                                .foregroundStyle(.tertiary)
-                                .fixedSize(horizontal: false, vertical: true)
-                            if selectedEngine == .claudeCode {
-                                Text(
-                                    "Unavailable for a Claude Code-driven run: Claude Code owns "
-                                        + "the provider request and does not expose its full payload."
-                                )
-                                .font(.system(size: 11))
-                                .foregroundStyle(.tertiary)
+                                .help("Records full model requests, which may contain sensitive content.")
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Log destination")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                Text(WireLog.directory.path)
+                                    .font(Design.mono(10))
+                                    .foregroundStyle(.tertiary)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                         }
                         .padding(.top, 10)
@@ -1556,12 +1469,6 @@ struct LauncherFormBody: View {
         }
     }
 
-    private var launcherSubtitle: String {
-        selectedEngine == .inHouse
-            ? "Write a request and choose the workspace and agent below. Your chat is saved before delivery."
-            : "Write a request and choose the workspace and agent below. Claude Code runs in this app and keeps its own conversation history."
-    }
-
     private var engineBinding: Binding<AppModel.Engine> {
         Binding(get: { selectedEngine }, set: { selectEngine($0) })
     }
@@ -1579,6 +1486,29 @@ struct LauncherFormBody: View {
     private var provider: String { selection.providerID }
     private var modelID: String { selection.modelID }
     private var selectedEngine: AppModel.Engine { engine(for: selection.route) }
+
+    private var providerPicker: some View {
+        Picker("Provider", selection: providerBinding) {
+            ForEach(providers, id: \.self) { Text($0).tag($0) }
+        }
+    }
+
+    private var modelPicker: some View {
+        Picker("Model", selection: modelBinding) {
+            ForEach(modelsForProvider) { m in
+                Text(m.displayName).tag(m.id)
+            }
+        }
+    }
+
+    private var thinkingPicker: some View {
+        Picker("Thinking", selection: $thinking) {
+            ForEach(
+                ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+                id: \.self
+            ) { Text($0).tag($0) }
+        }
+    }
 
     private func selectEngine(_ engine: AppModel.Engine) {
         selection = selection.selectingRoute(
@@ -1628,21 +1558,31 @@ struct LauncherFormBody: View {
     }
 
     private var requestEditor: some View {
-        ZStack(alignment: .topLeading) {
-            if prompt.isEmpty {
-                Text("Describe the coding task, question, or change…")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 11)
-                    .allowsHitTesting(false)
-            }
-            TextEditor(text: $prompt)
-                .font(.system(size: 14))
+        VStack(spacing: 0) {
+            ChatMessageEditor(
+                text: $prompt,
+                placeholder: "Describe the coding task, question, or change…",
+                canSubmit: canSubmit,
+                onSubmit: startChat)
                 .frame(minHeight: 156)
-                .scrollContentBackground(.hidden)
-                .padding(7)
-                .accessibilityLabel("New chat request")
+            HStack(spacing: 8) {
+                Text("⇧ Return for a new line")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Spacer(minLength: 0)
+                Button {
+                    startChat()
+                } label: {
+                    Label("Start chat", systemImage: "arrow.up.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .keyboardShortcut(.defaultAction)
+                .accessibilityLabel("Start chat")
+                .disabled(!canSubmit)
+            }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 8)
         }
         .frame(minWidth: 0, maxWidth: .infinity)
         .background(
@@ -1654,119 +1594,32 @@ struct LauncherFormBody: View {
                 .strokeBorder(.separator, lineWidth: 1))
     }
 
-    private var startButton: some View {
-        Button {
-            if selectedEngine == .claudeCode {
-                let created = model.startClaudeCodeRun(
-                    cwd: cwd.isEmpty ? model.defaultCwd : cwd,
-                    // `claudeCodeModel` remains the remembered fallback for driven runs.
-                    model: modelID.isEmpty ? model.claudeCodeModel : modelID,
-                    // Claude Code has no explicit "off" effort flag.
-                    effort: thinking == "off" ? nil : thinking,
-                    prompt: prompt, noContextFiles: noContextFiles)
-                if created { onStart() }
-                return
-            }
-            let saved = model.createPendingChat(
+    private var canSubmit: Bool {
+        !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func startChat() {
+        guard canSubmit else { return }
+        if selectedEngine == .claudeCode {
+            let created = model.startClaudeCodeRun(
                 cwd: cwd.isEmpty ? model.defaultCwd : cwd,
-                providerID: provider.isEmpty ? nil : provider,
-                modelID: modelID.isEmpty ? nil : modelID,
-                prompt: prompt,
-                thinkingLevel: thinking == "off" ? nil : thinking,
-                noContextFiles: noContextFiles,
-                recordPayloads: recordPayloads)
-            if saved { onStart() }
-        } label: {
-            Label(startActionLabel, systemImage: "arrow.up.circle.fill")
+                // `claudeCodeModel` remains the remembered fallback for driven runs.
+                model: modelID.isEmpty ? model.claudeCodeModel : modelID,
+                // Claude Code has no explicit "off" effort flag.
+                effort: thinking == "off" ? nil : thinking,
+                prompt: prompt, noContextFiles: noContextFiles)
+            if created { onStart() }
+            return
         }
-        .buttonStyle(.borderedProminent)
-        .keyboardShortcut(.defaultAction)
-        .accessibilityLabel("Start chat")
-        .accessibilityAddTraits(.isButton)
-        .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-    }
-
-    private var workspaceSummary: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label("Workspace", systemImage: "folder")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Text(workspaceName)
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
-                .fixedSize(horizontal: false, vertical: true)
-            Text(activeCwd)
-                .font(Design.mono(10.5))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .help(activeCwd)
-            Button("Change project…") { chooseDirectory() }
-                .buttonStyle(.link)
-                .font(.system(size: 11, weight: .medium))
-                .padding(.leading, -2)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var agentSummary: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label("Agent", systemImage: "cpu")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Text(selectedModelSummary)
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
-                .fixedSize(horizontal: false, vertical: true)
-                .help(selectedModelSummary)
-            Text(selectedEngine == .inHouse ? "Aviary" : "Claude Code")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-            Text(provider.isEmpty ? "No provider selected" : provider)
-                .font(Design.mono(10.5))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .help(provider)
-            Text(engineLifetimeSummary)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if let runtimeModelsError = model.runtimeModelsError {
-                Text(runtimeModelsError)
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(Design.danger)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .help(runtimeModelsError)
-            } else if model.pickerModels.isEmpty {
-                Text("Model choices are still loading…")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-            }
-            Button("Configure agent…") { configurationExpanded = true }
-                .buttonStyle(.link)
-                .font(.system(size: 11, weight: .medium))
-                .padding(.leading, -2)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var activeCwd: String {
-        cwd.isEmpty ? model.defaultCwd : cwd
-    }
-
-    private var workspaceName: String {
-        let name = URL(fileURLWithPath: activeCwd).lastPathComponent
-        return name.isEmpty ? activeCwd : name
-    }
-
-    private var selectedModelSummary: String {
-        if let selected = modelsForProvider.first(where: { $0.id == modelID }) {
-            return selected.displayName
-        }
-        return modelID.isEmpty ? "Choose a model" : modelID
-    }
-
-    private var engineLifetimeSummary: String {
-        selectedEngine == .inHouse
-            ? "Aviary keeps this chat available if the window closes."
-            : "Keep Aviary open while Claude Code runs in this app."
+        let saved = model.createPendingChat(
+            cwd: cwd.isEmpty ? model.defaultCwd : cwd,
+            providerID: provider.isEmpty ? nil : provider,
+            modelID: modelID.isEmpty ? nil : modelID,
+            prompt: prompt,
+            thinkingLevel: thinking == "off" ? nil : thinking,
+            noContextFiles: noContextFiles,
+            recordPayloads: recordPayloads)
+        if saved { onStart() }
     }
 
     @ViewBuilder
@@ -1807,18 +1660,6 @@ struct LauncherFormBody: View {
         }
     }
 
-    private var startActionLabel: String {
-        "Start chat"
-    }
-
-    /// Hoisted out of the card's body: a multi-part string literal inside a ViewBuilder is
-    /// enough to push the type checker past its limit here, and it reports the failure on an
-    /// unrelated line when it does.
-    private static let recordPayloadsExplanation =
-        "Captures every provider request — system prompt, context files, skill catalogue, "
-        + "tool schemas, messages — so the run can show where its input tokens went. Writes "
-        + "them to a file in Aviary's support directory, which is why it is off by default."
-
     /// In catalogue order, de-duplicated by first appearance.
     private var allProviders: [String] {
         var seen = Set<String>()
@@ -1847,6 +1688,7 @@ struct LauncherFormBody: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
         panel.directoryURL = URL(fileURLWithPath: cwd.isEmpty ? model.defaultCwd : cwd)
         if panel.runModal() == .OK, let url = panel.url {
             cwd = url.path
@@ -2264,15 +2106,18 @@ private struct ServiceWorkCard: View {
 
                     if let pending = projection.pendingCommand {
                         Divider().opacity(0.5)
+                        let waiting = projection.commandInFlight || pending.state == .awaitingCanonicalEvidence
                         Label(
                             projection.commandInFlight
                                 ? "Waiting for the agent service to confirm this request. No retry is needed."
+                                : pending.state == .awaitingCanonicalEvidence
+                                ? "Request accepted. Updating the chat from the agent service; no retry is needed."
                                 : "\(pending.kind.rawValue) is \(pending.state.rawValue); refresh and "
                                 + "reconcile explicitly before retrying.",
-                            systemImage: projection.commandInFlight ? "clock" : "exclamationmark.triangle"
+                            systemImage: waiting ? "clock" : "exclamationmark.triangle"
                         )
                             .font(.system(size: 10))
-                            .foregroundStyle(projection.commandInFlight ? Design.accent : Design.warning)
+                            .foregroundStyle(waiting ? Design.accent : Design.warning)
                             .fixedSize(horizontal: false, vertical: true)
                         HStack(spacing: 6) {
                             Button("Refresh") {

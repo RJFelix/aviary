@@ -65,7 +65,7 @@ struct WorkActivityStrip: View {
                 }
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
-                Text(action.intent ?? action.kindTitle)
+                Text(activityTitle)
                     .font(.system(size: 13, weight: .medium))
                     .lineLimit(2)
                 HStack(spacing: 5) {
@@ -82,6 +82,13 @@ struct WorkActivityStrip: View {
         }
     }
 
+    private var activityTitle: String {
+        if action.kind == .provider {
+            return action.state == .running ? "Generating a response" : action.kindTitle
+        }
+        return action.intent ?? action.kindTitle
+    }
+
     @ViewBuilder private var inspectionControl: some View {
         if concurrentActions.count > 1 {
                 Menu {
@@ -91,7 +98,7 @@ struct WorkActivityStrip: View {
                         }
                     }
                 } label: {
-                    Label("Inspect actions", systemImage: "list.bullet")
+                    Label("Action details", systemImage: "list.bullet")
                 }
                 .menuStyle(.borderlessButton).fixedSize()
                 .accessibilityLabel("Inspect unsettled activity actions")
@@ -99,11 +106,11 @@ struct WorkActivityStrip: View {
                 Button {
                     onInspect(action)
                 } label: {
-                    Label("Inspect evidence", systemImage: "doc.text.magnifyingglass")
+                    Label("View action details", systemImage: "doc.text.magnifyingglass")
                 }
                 .buttonStyle(.borderless)
                 .fixedSize()
-                .accessibilityLabel("Inspect evidence for \(action.intent ?? action.kindTitle)")
+                .accessibilityLabel("View action details for \(action.intent ?? action.kindTitle)")
         }
     }
 
@@ -392,6 +399,7 @@ struct WorkActionLensRow: View {
 struct WorkActionDetailSheet: View {
     let action: WorkActionPresentation
     @Environment(\.dismiss) private var dismiss
+    @State private var showsTechnicalDetails = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -413,11 +421,13 @@ struct WorkActionDetailSheet: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Card("Action", symbol: "bolt.horizontal.circle") {
                         VStack(alignment: .leading, spacing: 6) {
-                            DetailRow(label: "Intent", value: action.intent ?? "not recorded")
-                            DetailRow(
-                                label: "Could affect",
-                                value: action.affectedTarget ?? "target not recorded", mono: true)
-                            DetailRow(label: "Scope", value: action.scope ?? "not recorded")
+                            if let intent = action.intent {
+                                Text(intent).font(.body).textSelection(.enabled)
+                            }
+                            if let target = action.affectedTarget {
+                                DetailRow(label: "Target", value: target, mono: true)
+                            }
+                            if let scope = action.scope { DetailRow(label: "Scope", value: scope) }
                             DetailRow(label: "Timing", value: action.timeAvailability)
                             if let duration = action.durationSeconds {
                                 DetailRow(label: "Duration", value: Fmt.duration(duration), mono: true)
@@ -430,7 +440,18 @@ struct WorkActionDetailSheet: View {
                             }
                         }
                     }
-                    Card("Observation boundary", symbol: "scope") {
+                    Button { showsTechnicalDetails.toggle() } label: {
+                        HStack {
+                            Image(systemName: showsTechnicalDetails ? "chevron.down" : "chevron.right")
+                            Text("Technical details")
+                            Spacer()
+                        }
+                        .padding(10).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityValue(showsTechnicalDetails ? "Expanded" : "Collapsed")
+                    if showsTechnicalDetails {
+                    Card("What was recorded", symbol: "scope") {
                         VStack(alignment: .leading, spacing: 7) {
                             Text(action.boundaryDisclosure)
                                 .font(.system(size: 10.5))
@@ -451,8 +472,9 @@ struct WorkActionDetailSheet: View {
                             }
                         }
                     }
-                    Card("Canonical evidence", symbol: "link") {
+                    Card("Journal references", symbol: "link") {
                         WorkActionEvidenceDetails(action: action)
+                    }
                     }
                 }
                 .padding(14)

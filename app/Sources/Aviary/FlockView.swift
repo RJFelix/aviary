@@ -119,7 +119,9 @@ struct FlockView: View {
         let legacyChildren = legacyRootsAll.flatMap(\.nodes).flatMap(\.flattened)
         let legacyRunning = legacyChildren.filter(\.isRunning).count
         let attentionCount = CanonicalFlockCatalogProjection.attentionSessionCount(canonicalAllWorks)
-        return HStack(spacing: 14) {
+        return VStack(alignment: .leading, spacing: 8) {
+            // Keep each metric's label and value together. A horizontal strip made the
+            // longer labels wrap or collide in the narrow Flock list column.
             StatTile(
                 label: "Work", value: "\(canonicalAllWorks.count)",
                 symbol: "circle.hexagongrid.fill", tint: Design.agentMessage)
@@ -137,11 +139,14 @@ struct FlockView: View {
                 label: "attention",
                 value: "\(attentionCount)",
                 symbol: "exclamationmark.bubble")
-            Spacer()
-            Toggle("Running only", isOn: $showOnlyRunning)
+
+            Toggle(isOn: $showOnlyRunning) {
+                Label("Show running Work only", systemImage: "bolt.fill")
+            }
                 .toggleStyle(.switch)
                 .controlSize(.mini)
                 .font(.system(size: 10.5))
+                .help("Filter the list to Work with running activity")
         }
         .padding(.horizontal, Design.gutter)
         .padding(.vertical, 9)
@@ -278,6 +283,8 @@ private struct CanonicalFlockWorkRow: View {
                          symbol: "bird",
                          tint: Design.agentMessage)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
@@ -414,28 +421,28 @@ struct AgentNodeRow: View {
     private var isExpanded: Bool { expanded.contains(rowID) }
     private var isSelected: Bool { selectedID == rowID }
 
+    private func toggleExpanded() {
+        if isExpanded { expanded.remove(rowID) } else { expanded.insert(rowID) }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 5) {
-                if !node.children.isEmpty {
-                    Button {
-                        if isExpanded { expanded.remove(rowID) } else { expanded.insert(rowID) }
-                    } label: {
-                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 8, weight: .bold))
-                            .frame(width: 11)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                } else {
-                    Spacer().frame(width: 11)
-                }
+            Button {
+                selectedID = rowID
+                if !node.children.isEmpty { toggleExpanded() }
+            } label: {
+                HStack(spacing: 5) {
+                    // The chevron is drawn as part of the full-row button, while the overlay
+                    // below keeps its disclosure action independent from row selection.
+                    Image(systemName: node.children.isEmpty
+                          ? "circle.fill"
+                          : isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: node.children.isEmpty ? 4 : 8, weight: .bold))
+                        .foregroundStyle(node.children.isEmpty ? .tertiary : .secondary)
+                        .frame(width: 11)
 
-                statusDot
+                    statusDot
 
-                Button {
-                    selectedID = rowID
-                } label: {
                     HStack(spacing: 6) {
                         Text(node.name)
                             .font(.system(size: 11.5, weight: isSelected ? .semibold : .regular))
@@ -450,14 +457,31 @@ struct AgentNodeRow: View {
                         Text(Fmt.duration(node.duration))
                             .font(Design.numeric(9)).foregroundStyle(.tertiary)
                     }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3.5)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(isSelected ? Design.accentSoft : .clear))
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3.5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isSelected ? Design.accentSoft : .clear))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .overlay(alignment: .leading) {
+                if !node.children.isEmpty {
+                    Button(action: toggleExpanded) {
+                        Color.clear
+                            .frame(width: 24, height: 24)
+                            .overlay {
+                                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .foregroundStyle(.secondary)
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .contentShape(Rectangle())
+                    .accessibilityLabel(isExpanded ? "Collapse \(node.name)" : "Expand \(node.name)")
+                }
             }
             .padding(.leading, CGFloat(depth) * 15)
 

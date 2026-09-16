@@ -17,6 +17,7 @@ struct AviaryApp: App {
         // Headless modes short-circuit before any scene is created, and exit.
         LiveChatTelemetryProbe.runIfRequested()
         ChatJourneyProbe.runIfRequested()
+        ChatEditorProbe.runIfRequested()
         WireInspect.runIfRequested()
         Snapshot.runIfRequested()
         AgentCLI.runIfRequested()

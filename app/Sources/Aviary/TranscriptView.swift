@@ -33,6 +33,7 @@ struct TranscriptView: View {
     var onJumpToLatestHistory: (() async -> Void)?
     var reviewDescriptorsByMessageID: [String: WorkServiceArtifactDescriptor] = [:]
     var onReviewMessage: ((String) -> Void)?
+    var onForwardMessage: ((String) -> Void)?
     var onSelect: ((TranscriptItem) -> Void)?
 
     @State private var scrollTarget: String?
@@ -74,6 +75,7 @@ struct TranscriptView: View {
                                     hideThinking: hideThinking,
                                     isLast: item.id == visible.last?.id && isStreaming && indicatesCurrentActivity,
                                     continuesGroup: continuesPrevious,
+                                    onForwardMessage: onForwardMessage,
                                     onSelect: onSelect)
                                 if let descriptor = reviewDescriptorsByMessageID[item.id],
                                    let onReviewMessage {
@@ -313,6 +315,7 @@ struct TranscriptRow: View {
     var hideThinking: Bool
     var isLast: Bool
     var continuesGroup: Bool = false
+    var onForwardMessage: ((String) -> Void)?
     var onSelect: ((TranscriptItem) -> Void)?
 
     @State private var showRaw = false
@@ -427,7 +430,12 @@ struct TranscriptRow: View {
         VStack(alignment: .leading, spacing: 6) {
             header(
                 "You", tint: Design.user, symbol: "person.fill",
-                trailing: inputDeliveryBadge)
+                trailing: AnyView(
+                    HStack(spacing: 5) {
+                        if let inputDeliveryBadge { inputDeliveryBadge }
+                        copyMessageButton
+                        forwardMessageButton
+                    }))
             ForEach(item.blocks) { block in
                 if case .text(let text) = block {
                     // A hook-injected context block is real context the model saw, but it
@@ -529,6 +537,8 @@ struct TranscriptRow: View {
                             Chip(text: Fmt.tokens(u), symbol: "number", tint: .secondary)
                                 .help(usageTooltip(u))
                         }
+                        copyMessageButton
+                        forwardMessageButton
                     }))
 
             ForEach(item.blocks) { block in
@@ -644,7 +654,12 @@ struct TranscriptRow: View {
             header(
                 item.senderName.map { "from \($0)" } ?? "agent message",
                 tint: Design.agentMessage,
-                symbol: "arrow.left.arrow.right.circle.fill")
+                symbol: "arrow.left.arrow.right.circle.fill",
+                trailing: AnyView(
+                    HStack(spacing: 5) {
+                        copyMessageButton
+                        forwardMessageButton
+                    }))
             // The provenance header is machine-generated routing metadata; the payload
             // after it is what a person wants to read.
             let parts = AgentMessageBody.split(item.text)
@@ -670,6 +685,60 @@ struct TranscriptRow: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(Design.agentMessage.opacity(0.25), lineWidth: 1))
+    }
+
+    /// The source text for a visible message. Keep this at the row boundary so a copy action
+    /// cannot accidentally aggregate an unbounded history window or cross role groups.
+    private var copyableMessageText: String? {
+        TranscriptMessageTransfer.authoredText(for: item)
+    }
+
+    @ViewBuilder
+    private var copyMessageButton: some View {
+        if copyableMessageText != nil {
+            Button {
+                guard let text = copyableMessageText else { return }
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+            } label: {
+                Label("Copy message", systemImage: "doc.on.doc")
+                    .font(.system(size: 9.5, weight: .medium))
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("copy-message-\(item.id)")
+            .accessibilityLabel("Copy \(copyRole) message")
+            .accessibilityHint("Copies the exact message text, including Markdown")
+            .help("Copy the exact \(copyRole) message, including Markdown")
+        }
+    }
+
+    @ViewBuilder
+    private var forwardMessageButton: some View {
+        if onForwardMessage != nil, copyableMessageText != nil {
+            Button {
+                guard let text = copyableMessageText else { return }
+                onForwardMessage?(text)
+            } label: {
+                Label("Send to agent", systemImage: "arrow.right.circle")
+                    .font(.system(size: 9.5, weight: .medium))
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(Design.accent)
+            .accessibilityIdentifier("forward-message-\(item.id)")
+            .accessibilityLabel("Send this \(copyRole) message to another agent")
+            .accessibilityHint("Prepares a draft for review; does not send it")
+            .help("Prepare this exact \(copyRole) message as another agent's draft; does not send")
+        }
+    }
+
+    private var copyRole: String {
+        switch item.kind {
+        case .user: return "user"
+        case .assistant: return "assistant"
+        case .agentMessage: return "agent"
+        default: return ""
+        }
     }
 
     private var customRow: some View {

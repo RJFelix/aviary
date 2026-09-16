@@ -4,6 +4,8 @@ import AviaryCore
 struct RootView: View {
     @Environment(AppModel.self) private var model
     @State private var columnVisibility = NavigationSplitViewVisibility.all
+    @State private var chatWindowTitle: String?
+    @State private var chatWindowSubtitle: String?
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -17,7 +19,11 @@ struct RootView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(nsColor: .windowBackgroundColor))
                 .toolbar { toolbarContent }
-                .navigationTitle(model.section.title)
+                .environment(\.usesChatWindowTitle, model.section == .cockpit || model.section == .live)
+                .onPreferenceChange(ChatWindowTitleKey.self) { chatWindowTitle = $0 }
+                .onPreferenceChange(ChatWindowSubtitleKey.self) { chatWindowSubtitle = $0 }
+                .navigationTitle((model.section == .cockpit || model.section == .live)
+                    ? (chatWindowTitle ?? model.section.title) : model.section.title)
                 .navigationSubtitle(subtitle)
         }
         .sheet(isPresented: Binding(
@@ -57,10 +63,7 @@ struct RootView: View {
 
     private var subtitle: String {
         switch model.section {
-        case .cockpit:
-            return model.engineChoice == .inHouse
-                ? "Your conversations and agent activity"
-                : "Conversations powered by Claude Code"
+        case .cockpit: return chatWindowSubtitle ?? ""
         case .sessions:
             let archived = model.sessions.filter(\.isArchived).count
             let current = model.sessions.count - archived
@@ -108,15 +111,13 @@ struct RootView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            if model.isScanning {
-                HStack(spacing: 5) {
-                    ProgressView().controlSize(.small)
-                    if model.scanProgress.total > 0 {
-                        Text("\(model.scanProgress.done)/\(model.scanProgress.total)")
-                            .font(Design.numeric(10))
-                            .foregroundStyle(.secondary)
-                    }
-                }
+            // Routine catalog scans are intentionally quiet here. Sessions still expose the
+            // initial empty-state scan, and catalog/service failures remain visible through
+            // their existing error surfaces instead of turning every refresh into chrome.
+            if let catalogError = model.catalogError {
+                Label("Catalog read needs attention", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(Design.warning)
+                    .help(catalogError)
             }
 
             Button {
@@ -125,14 +126,6 @@ struct RootView: View {
                 Label("Command palette", systemImage: "command")
             }
             .help("Command palette (⌘K)")
-
-            Button {
-                model.openCapturePanel()
-            } label: {
-                Label("Improve Aviary", systemImage: "hammer.fill")
-                    .labelStyle(.titleAndIcon)
-            }
-            .help("Suggest an improvement to Aviary (⇧⌘I)")
 
             Button {
                 Task { await model.refreshAll() }
@@ -266,6 +259,18 @@ struct SidebarView: View {
 
     private var sidebarFooter: some View {
         VStack(spacing: 0) {
+            Button {
+                model.openCapturePanel()
+            } label: {
+                Label("Improve Aviary", systemImage: "hammer.fill")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Suggest an improvement to Aviary (⇧⌘I)")
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+
             Divider()
             HStack(spacing: 7) {
                 Circle()

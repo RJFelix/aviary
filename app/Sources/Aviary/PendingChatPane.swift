@@ -114,8 +114,10 @@ struct PendingChatPane: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
-                    SavedRequestProgress(state: visualState)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if !model.pendingChatIsPreparing(chat) {
+                        SavedRequestProgress(state: visualState)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
 
                     VStack(alignment: .leading, spacing: 10) {
                         Label("You", systemImage: "person.circle")
@@ -138,13 +140,14 @@ struct PendingChatPane: View {
                                 Image(systemName: visualState.symbol)
                                     .foregroundStyle(visualState.tint)
                             }
-                            Text(visualState.statusOverride ?? model.pendingChatStatus(chat)).font(.headline)
+                            Text(model.pendingChatIsPreparing(chat) ? "Starting…"
+                                : visualState.statusOverride ?? model.pendingChatStatus(chat)).font(.headline)
                         }
-                        Text(model.pendingChatIsPreparing(chat)
-                             ? "Your request is saved. Connecting to the agent on this Mac…"
-                             : model.pendingChatExplanation(chat))
+                        if !model.pendingChatIsPreparing(chat) {
+                        Text(model.pendingChatExplanation(chat))
                             .font(.system(size: 13)).foregroundStyle(.secondary)
                             .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        }
                         if !model.pendingChatIsPreparing(chat) {
                             ViewThatFits(in: .horizontal) {
                                 HStack { recoveryButtons }

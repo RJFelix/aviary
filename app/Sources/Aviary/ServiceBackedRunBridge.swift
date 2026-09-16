@@ -335,7 +335,11 @@ final class ServiceBackedRunBridge {
     /// UI's non-actionable state, while `executionLabel` preserves the truthful detail.
     var commandState: SessionCommandState {
         if isTerminal { return .ended }
-        if projection.needsRecovery || projection.requiresRefresh { return .failed }
+        if projection.needsRecovery { return .failed }
+        if let pending = projection.pendingCommand, pending.kind == .start {
+            if projection.commandInFlight { return .preparing }
+            if pending.state == .awaitingCanonicalEvidence { return .committing }
+        }
         switch projection.descriptor.execution {
         case .idle: return .idle
         case .running: return .running
@@ -383,12 +387,11 @@ final class ServiceBackedRunBridge {
             case .indeterminate:
                 return "A \(pending.kind.rawValue) command has an indeterminate outcome. Refresh canonical Work and reconcile it explicitly; Aviary will not replay it automatically."
             case .awaitingCanonicalEvidence:
-                return "The Work Host accepted a \(pending.kind.rawValue) command. Aviary is waiting for its exact canonical journal event and will not replay it."
+                break
             }
         }
-        if projection.requiresRefresh {
-            return "The Work Host acknowledged a command; the canonical journal is still catching up."
-        }
+        // `requiresRefresh` is explicitly ordinary accepted-receipt catch-up. It withholds
+        // mutation through ServiceBackedGUIControlPolicy, but is not an error or uncertainty.
         if projection.needsRecovery {
             return "This Work is visible but not safely actionable until its Work and Session state can be recovered."
         }

@@ -54,6 +54,24 @@ public enum ChatBusyDelivery: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// One mutually-exclusive composer submission state. A durable handoff marker exists before the
+/// controller call begins, so the marker alone cannot mean that delivery was lost. Only a marker
+/// left after both the GUI operation and the controller request lifetime end needs recovery.
+public enum ChatComposerSubmissionState: Equatable, Sendable {
+    case idle
+    case active
+    case needsRecovery
+
+    public static func resolve(
+        hasDraftHandoff: Bool,
+        localOperationsInFlight: Int,
+        serviceCommandInFlight: Bool
+    ) -> Self {
+        if localOperationsInFlight > 0 || serviceCommandInFlight { return .active }
+        return hasDraftHandoff ? .needsRecovery : .idle
+    }
+}
+
 /// Explanatory composer copy derived from the same exact facts that the caller uses for
 /// admission. This value never grants admission or predicts that a command will be accepted.
 public struct ChatComposerStatusPresentation: Equatable, Sendable {
@@ -67,9 +85,8 @@ public struct ChatComposerStatusPresentation: Equatable, Sendable {
     public let symbol: String
 
     public static func resolve(
-        hasUnresolvedDraftHandoff: Bool,
+        submissionState: ChatComposerSubmissionState,
         persistenceNotice: String?,
-        commandInFlight: Bool,
         commandState: SessionCommandState,
         hasExited: Bool,
         isEnding: Bool = false,
@@ -79,18 +96,20 @@ public struct ChatComposerStatusPresentation: Equatable, Sendable {
         effectiveDelivery: ChatBusyDelivery?,
         draftIsEmpty: Bool
     ) -> Self {
-        // These two states mean an exact command may already have crossed the service boundary.
-        // They take precedence over every lifecycle or capability hint so the UI never invites a
-        // second copy while canonical evidence is unresolved.
-        if hasUnresolvedDraftHandoff {
+        // Active is the original request lifetime, not an uncertain outcome. It takes precedence
+        // over the durable marker written for that same request so ordinary sends never flash
+        // recovery language while the service call is still underway.
+        if submissionState == .active {
+            return blocked(
+                "Sending to the agent service…",
+                symbol: "hourglass")
+        }
+        // A handoff becomes unresolved only after the original GUI and controller request
+        // lifetimes have both ended without accepted or rejected evidence.
+        if submissionState == .needsRecovery {
             return blocked(
                 "Delivery needs checking. This draft will not be sent again automatically.",
                 symbol: "exclamationmark.triangle.fill")
-        }
-        if commandInFlight {
-            return blocked(
-                "Waiting for the agent service to confirm receipt. Aviary will not send another copy.",
-                symbol: "hourglass")
         }
 
         if hasExited || commandState == .ended {

@@ -255,10 +255,10 @@ public struct WorkActionPresentation: Codable, Hashable, Sendable, Identifiable 
 
     private static func kindTitle(_ kind: ActionKind) -> String {
         switch kind {
-        case .provider: return "Provider request"
-        case .compactionProvider: return "Compaction provider"
-        case .providerSetup: return "Provider setup"
-        case .python: return "Python computation"
+        case .provider: return "Model response"
+        case .compactionProvider: return "Conversation summary"
+        case .providerSetup: return "Connecting to model"
+        case .python: return "Python execution"
         case .mcp: return "MCP operation"
         case .runtime: return "Runtime operation"
         case .hook: return "Hook"

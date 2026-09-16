@@ -159,6 +159,8 @@ final class AppModel {
     var selectedPendingChatID: UUID?
     var pendingChatStoreError: String?
     var newChatRequested = false
+    /// Explicit cross-chat navigation, separate from background restoration changing focus.
+    var requestedChatSelectionID: UUID?
     private var pendingChatAttempts: Set<UUID> = []
     var pendingChatDetails: [UUID: String] = [:]
     // MARK: Configuration
@@ -674,6 +676,20 @@ final class AppModel {
         current: UUID?, admitted: UUID
     ) -> UUID {
         current ?? admitted
+    }
+
+    /// A user-started saved chat may become the real chat pane only while that exact card remains
+    /// selected and its durable association names the Run being published. An async startup that
+    /// finishes after the person navigates elsewhere must not steal focus.
+    static func shouldFocusCreatedPendingChat(
+        pendingChatID: UUID?,
+        selectedPendingChatID: UUID?,
+        createdAssociation: ServiceAttachmentKey?,
+        runAttachment: ServiceAttachmentKey
+    ) -> Bool {
+        pendingChatID != nil
+            && pendingChatID == selectedPendingChatID
+            && createdAssociation == runAttachment
     }
 
     static func preferredServiceRestoreIndex(
@@ -4275,7 +4291,22 @@ final class AppModel {
                 return
             }
             runs.append(run)
-            if pendingChatID == nil {
+            let createdPendingAssociation = pendingChatID.flatMap { pendingID in
+                pendingChats.first(where: { $0.id == pendingID })?.createdAssociation
+            }
+            if Self.shouldFocusCreatedPendingChat(
+                pendingChatID: pendingChatID,
+                selectedPendingChatID: selectedPendingChatID,
+                createdAssociation: createdPendingAssociation,
+                runAttachment: serviceAttachmentKey
+            ) {
+                // Create and the exact GUI association are already durable. Show the real chat
+                // immediately while Start is admitted; the PendingChat row remains the recovery
+                // guard until strict canonical input-delivery evidence retires it below.
+                focusedRunID = run.id
+                if selectedPendingChatID == pendingChatID { selectedPendingChatID = nil }
+                section = .cockpit
+            } else if pendingChatID == nil {
                 focusedRunID = run.id
                 section = .cockpit
             }
@@ -4684,8 +4715,7 @@ final class LiveRun: Identifiable {
     private(set) var draftHandoff: ServiceBackedDraftHandoff?
     private(set) var draftPersistenceState: LiveRunDraftPersistenceState = .memoryOnly
     var draftPersistenceNotice: String? {
-        if draftHandoff != nil, serviceCommandBarrier.operationsInFlight == 0,
-           !serviceCommandInFlight {
+        if draftHandoffNeedsRecovery {
             return "This draft has an unresolved Work Host handoff. Aviary will not resend it until exact canonical evidence resolves the command."
         }
         switch draftPersistenceState {
@@ -4763,8 +4793,9 @@ final class LiveRun: Identifiable {
     }
 
     var draftHandoffRecoveryAvailable: Bool {
-        isServiceBacked && serviceCommandBarrier.canResolveUnresolvedDraft(
-            hasUnresolvedDraft: draftHandoff != nil, isEnding: isEnding)
+        isServiceBacked && draftHandoffNeedsRecovery
+            && serviceCommandBarrier.canResolveUnresolvedDraft(
+                hasUnresolvedDraft: draftHandoff != nil, isEnding: isEnding)
     }
 
     /// Set when Claude Code is driving this run instead of Aviary.
@@ -4800,6 +4831,21 @@ final class LiveRun: Identifiable {
     private(set) var serviceAttachmentKey: ServiceAttachmentKey?
     var serviceProjection: WorkServiceAttachedWorkProjection? { serviceBridge?.projection }
     private(set) var serviceCommandInFlight = false
+    /// The GUI operation starts before the controller has retained its command, while the
+    /// controller request lifetime can remain observable after that actor hop. Either fact means
+    /// the original attempt is active rather than an unresolved delivery.
+    var serviceCommandAttemptActive: Bool {
+        serviceCommandBarrier.operationsInFlight > 0 || serviceCommandInFlight
+    }
+    var composerSubmissionState: ChatComposerSubmissionState {
+        ChatComposerSubmissionState.resolve(
+            hasDraftHandoff: draftHandoff != nil,
+            localOperationsInFlight: serviceCommandBarrier.operationsInFlight,
+            serviceCommandInFlight: serviceCommandInFlight)
+    }
+    var draftHandoffNeedsRecovery: Bool {
+        composerSubmissionState == .needsRecovery
+    }
     /// Only descriptor metadata is mirrored; review bodies require an explicit load.
     private(set) var serviceReviewDescriptor: WorkServiceArtifactDescriptor? = nil
     private(set) var serviceReviewHistory: WorkServiceRepositoryReviewHistory?
@@ -5467,13 +5513,11 @@ final class LiveRun: Identifiable {
                         retainedMarkerWarning =
                             "Canonical Start evidence is present, but its local recovery marker could not be cleared."
                     }
-                } else {
-                    // A receipt is not the canonical command event. Keep the independent
-                    // Create-to-Start bootstrap marker until a complete Work read proves the
-                    // exact client-qualified command, including across GUI termination here.
-                    retainedMarkerWarning =
-                        "Start was accepted; its local recovery marker remains until the exact canonical command is observed."
                 }
+                // A receipt is not the canonical command event. Keep the independent
+                // Create-to-Start bootstrap marker until a complete Work read proves the exact
+                // client-qualified command, including across GUI termination here. That ordinary
+                // catch-up is not itself a warning; the accepted receipt notice remains truthful.
             }
             syncServiceState()
             if draftMarkerResolved {

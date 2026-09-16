@@ -7150,6 +7150,12 @@ await Harness.run(
         + casesServiceBackedGUIControlPolicy
         + casesServiceBackedRefreshSchedulingPolicy
         + casesChatInteractionPresentation
+        + [
+            ("message transfer: exact authored text", { try test_transcriptMessageTransferPreservesExactRoleText() }),
+            ("message transfer: user whitespace", { try test_transcriptMessageTransferUsesUserBlocksOnly() }),
+            ("message transfer: agent envelope", { try test_transcriptMessageTransferStripsOnlyAgentEnvelope() }),
+            ("message transfer: exclude unrelated rows", { try test_transcriptMessageTransferDoesNotUseUnrelatedItemText() })
+        ]
         + casesServiceBackedCommandNoticePolicy
         + casesServiceBackedControlResultPolicy
         + casesWorkServiceAttachedWorkController

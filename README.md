@@ -95,7 +95,7 @@ accordingly. Preferences → Workshop turns either half off.
 |---|---|
 | **Chats** | Write a request, continue a conversation, understand activity, and review changes. Native requests are saved before agent startup; a failed start leaves the prompt and recovery controls in the chat. Advanced attachment controls live under Manage agent connections. |
 | **History** | Read recorded and imported transcripts. Python cells next to their output, thinking collapsed, injected context folded away, tool errors flagged, per-message token and cost accounting. |
-| **Workshop** | Capture, track, and review improvements to Aviary. Improve Aviary is always available in the toolbar and with ⇧⌘I. |
+| **Workshop** | Capture, track, and review improvements to Aviary. Improve Aviary is always available at the foot of the sidebar and with ⇧⌘I. |
 | **Flock** | The sub-agent tree: who spawned whom, with what instructions, on which model, and a timeline showing whether that fan-out actually ran in parallel. |
 | **Models** | Every provider and model, and whether the credential will resolve — see below. |
 | **Usage** | Tokens and cost across every session on disk, by model, provider, project, and day, plus cache-hit and tool-error rates. |

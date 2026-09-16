@@ -297,6 +297,11 @@ enum ChatJourneyProbe {
         let presentationDraft = try presentationDraftStore.beginHandoff(
             text: "saved input", kind: .start, commandID: "presentation-probe",
             expectedGeneration: nil)
+        try require(
+            ChatComposerSubmissionState.resolve(
+                hasDraftHandoff: true, localOperationsInFlight: 1,
+                serviceCommandInFlight: false) == .active,
+            "the pre-controller command barrier presented its live request as lost delivery")
         for inFlight in [true, false] {
             let projection = WorkServiceAttachedWorkProjection(
                 descriptor: guardedProjection.descriptor,
@@ -319,6 +324,12 @@ enum ChatJourneyProbe {
             run.observeService()
             try require(run.serviceCommandInFlight == inFlight,
                         "request lifetime was not mirrored into the actual chat presentation")
+            try require(run.serviceCommandAttemptActive == inFlight,
+                        "active service attempt did not follow the controller request lifetime")
+            try require(run.composerSubmissionState == (inFlight ? .active : .needsRecovery),
+                        "composer conflated an active request with a lost handoff")
+            try require(run.draftHandoffNeedsRecovery == !inFlight,
+                        "draft recovery became available during the original request")
             try require((run.errorBanner == nil) == inFlight,
                         "sending must not claim failure, and lost confirmation must remain visible")
             try require((run.draftPersistenceNotice == nil) == inFlight,
@@ -329,6 +340,36 @@ enum ChatJourneyProbe {
                             "live original request left mutation controls enabled")
             }
         }
+
+        let acceptedPending = WorkServiceAttachedWorkPendingCommand(
+            state: .awaitingCanonicalEvidence, kind: .start,
+            commandID: "presentation-accepted", client: client,
+            attachment: first.attachment.attachment,
+            sessionAttachment: first.sessionAttachment,
+            causalWorkCursor: first.workCursor, valueDigest: nil)
+        let acceptedProjection = WorkServiceAttachedWorkProjection(
+            descriptor: guardedProjection.descriptor,
+            attachment: guardedProjection.attachment,
+            capabilities: guardedProjection.capabilities,
+            workSnapshot: guardedProjection.workSnapshot,
+            sessionSnapshot: guardedProjection.sessionSnapshot,
+            workCursor: guardedProjection.workCursor,
+            sessionCursor: guardedProjection.sessionCursor,
+            workSourceCompleteness: .complete, sessionSourceCompleteness: .complete,
+            connectivity: guardedProjection.connectivity,
+            pendingCommand: acceptedPending, commandInFlight: false,
+            requiresRefresh: true)
+        let acceptedBridge = ServiceBackedRunBridge(
+            controller: originalBridge.controller, projection: acceptedProjection,
+            history: originalBridge.history,
+            serviceAttachmentKey: originalBridge.serviceAttachmentKey,
+            workspaceLabel: "accepted-catch-up", modelLabel: nil, thinkingLevel: nil)
+        try require(acceptedBridge.errorBanner == nil,
+                    "accepted receipt catch-up was presented as an error")
+        try require(acceptedBridge.commandState == .committing,
+                    "accepted Start catch-up was not presented as startup")
+        try require(!acceptedBridge.canRetryPendingCommand,
+                    "accepted Start catch-up exposed a duplicate retry")
 
         // A fresh idle Work proves the control: ordinary reconstruction still admits exactly one
         // Start, and the canonical follow-up refresh resolves its retained marker.
@@ -490,6 +531,25 @@ enum ChatJourneyProbe {
                 ownedKeys: [], localClient: client) == ordinaryKey.workSession,
             "a multi-Work Session did not preserve the preferred exact Work relationship")
         let pendingSelection = UUID()
+        try require(
+            AppModel.shouldFocusCreatedPendingChat(
+                pendingChatID: pendingSelection,
+                selectedPendingChatID: pendingSelection,
+                createdAssociation: ordinaryKey,
+                runAttachment: ordinaryKey),
+            "selected saved chat did not advance to its exact created Run")
+        try require(
+            !AppModel.shouldFocusCreatedPendingChat(
+                pendingChatID: pendingSelection,
+                selectedPendingChatID: UUID(),
+                createdAssociation: ordinaryKey,
+                runAttachment: ordinaryKey)
+                && !AppModel.shouldFocusCreatedPendingChat(
+                    pendingChatID: pendingSelection,
+                    selectedPendingChatID: pendingSelection,
+                    createdAssociation: guardedKey,
+                    runAttachment: ordinaryKey),
+            "completed startup could steal focus or use a mismatched association")
         reopenedLaunch.selectedPendingChatID = pendingSelection
         reopenedLaunch.newChatRequested = true
         reopenedLaunch.focusRun(guarded)

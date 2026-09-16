@@ -54,6 +54,8 @@ struct CockpitView: View {
             if requested { beginNewChat() }
         }
         .onAppear { if model.newChatRequested { beginNewChat() } }
+        .onChange(of: model.requestedChatSelectionID) { _, _ in selectRequestedChat() }
+        .onAppear { selectRequestedChat() }
         .sheet(isPresented: $showsConnections) { ChatConnectionsView() }
     }
 
@@ -282,8 +284,7 @@ struct CockpitView: View {
     @ViewBuilder
     private var detail: some View {
         if composingNewSession {
-            NewSessionPane(onStart: { composingNewSession = false },
-                            onCancel: { composingNewSession = false })
+            NewSessionPane(onStart: { composingNewSession = false })
         } else if let chat = model.pendingChats.first(where: { $0.id == model.selectedPendingChatID }) {
             PendingChatPane(chat: chat)
         } else if let entry = selectedCanonicalEntry,
@@ -407,6 +408,18 @@ struct CockpitView: View {
         model.newChatRequested = false
     }
 
+    private func selectRequestedChat() {
+        guard let id = model.requestedChatSelectionID else { return }
+        model.requestedChatSelectionID = nil
+        guard let run = model.runs.first(where: { $0.id == id }) else { return }
+        model.focusRun(run)
+        model.selectedPendingChatID = nil
+        selectedCanonicalEntryID = nil
+        selectedCanonicalWorkTarget = nil
+        composingNewSession = false
+        showsCompactChatList = false
+    }
+
     private func railHeading(_ title: String) -> some View {
         Text(title)
             .font(.system(size: 10, weight: .semibold))
@@ -451,31 +464,12 @@ enum CanonicalWorkspaceRailPresentation {
     }
 }
 
-/// Cockpit's inline replacement for opening `LauncherSheet` over the window: the same
-/// `LauncherFormBody`, given the detail pane's width instead of a modal's fixed frame, with a
-/// header that reads "cancel back to whatever was selected" rather than "dismiss".
+/// Inline launcher; selecting another chat is the navigation out of this pane.
 private struct NewSessionPane: View {
     var onStart: () -> Void
-    var onCancel: (() -> Void)? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Label("New chat", systemImage: "plus.bubble")
-                    .font(.system(size: 14, weight: .semibold))
-                Spacer()
-                if let onCancel {
-                    Button("Cancel", action: onCancel)
-                        .buttonStyle(.bordered).controlSize(.small)
-                        .keyboardShortcut(.cancelAction)
-                }
-            }
-            .padding(14)
-
-            Divider()
-
-            LauncherFormBody(onStart: onStart)
-        }
+        LauncherFormBody(onStart: onStart)
     }
 }
 

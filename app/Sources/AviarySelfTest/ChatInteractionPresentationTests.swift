@@ -68,11 +68,38 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertEqual(ChatInteractionPresentation.stateLabel(.canceling), "Stopping after current step")
         XCTAssertTrue(ChatInteractionPresentation.stopExplanation.contains("may finish first"))
     }),
-    ("chat interaction: composer status preserves uncertain handoff precedence", {
-        let unresolved = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: true,
+    ("chat interaction: active submission stays distinct from unresolved handoff", {
+        XCTAssertEqual(ChatComposerSubmissionState.resolve(
+            hasDraftHandoff: true, localOperationsInFlight: 1,
+            serviceCommandInFlight: false), .active)
+        XCTAssertEqual(ChatComposerSubmissionState.resolve(
+            hasDraftHandoff: true, localOperationsInFlight: 0,
+            serviceCommandInFlight: true), .active)
+        XCTAssertEqual(ChatComposerSubmissionState.resolve(
+            hasDraftHandoff: true, localOperationsInFlight: 0,
+            serviceCommandInFlight: false), .needsRecovery)
+        XCTAssertEqual(ChatComposerSubmissionState.resolve(
+            hasDraftHandoff: false, localOperationsInFlight: 0,
+            serviceCommandInFlight: false), .idle)
+
+        let active = ChatComposerStatusPresentation.resolve(
+            submissionState: .active,
             persistenceNotice: "A less specific persistence warning",
-            commandInFlight: true,
+            commandState: .ended,
+            hasExited: true,
+            acceptsInput: true,
+            isStreaming: false,
+            availableDeliveries: [.followUp],
+            effectiveDelivery: .followUp,
+            draftIsEmpty: false)
+        XCTAssertEqual(active.kind, .blocked)
+        XCTAssertEqual(active.symbol, "hourglass")
+        XCTAssertTrue(active.text.contains("Sending"))
+        XCTAssertFalse(active.text.contains("checking"))
+
+        let unresolved = ChatComposerStatusPresentation.resolve(
+            submissionState: .needsRecovery,
+            persistenceNotice: "A less specific persistence warning",
             commandState: .ended,
             hasExited: true,
             acceptsInput: true,
@@ -84,27 +111,11 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertEqual(unresolved.symbol, "exclamationmark.triangle.fill")
         XCTAssertTrue(unresolved.text.contains("Delivery needs checking"))
         XCTAssertTrue(unresolved.text.contains("will not be sent again automatically"))
-
-        let inFlight = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: false,
-            persistenceNotice: "A less specific persistence warning",
-            commandInFlight: true,
-            commandState: .ended,
-            hasExited: true,
-            acceptsInput: true,
-            isStreaming: false,
-            availableDeliveries: [.followUp],
-            effectiveDelivery: .followUp,
-            draftIsEmpty: false)
-        XCTAssertEqual(inFlight.kind, .blocked)
-        XCTAssertEqual(inFlight.symbol, "hourglass")
-        XCTAssertTrue(inFlight.text.contains("confirm receipt"))
-        XCTAssertTrue(inFlight.text.contains("will not send another copy"))
     }),
     ("chat interaction: composer status explains exact blockers before delivery hints", {
         let ended = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: false, persistenceNotice: nil,
-            commandInFlight: false, commandState: .ended, hasExited: true,
+            submissionState: .idle, persistenceNotice: nil,
+            commandState: .ended, hasExited: true,
             acceptsInput: true, isStreaming: false,
             availableDeliveries: [.followUp], effectiveDelivery: .followUp,
             draftIsEmpty: false)
@@ -112,8 +123,8 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertTrue(ended.text.contains("session has ended"))
 
         let endingFlag = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: false, persistenceNotice: nil,
-            commandInFlight: false, commandState: .idle, hasExited: false,
+            submissionState: .idle, persistenceNotice: nil,
+            commandState: .idle, hasExited: false,
             isEnding: true, acceptsInput: true, isStreaming: false,
             availableDeliveries: [], effectiveDelivery: nil,
             draftIsEmpty: false)
@@ -121,8 +132,8 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertTrue(endingFlag.text.contains("session is ending"))
 
         let canceling = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: false, persistenceNotice: nil,
-            commandInFlight: false, commandState: .canceling, hasExited: false,
+            submissionState: .idle, persistenceNotice: nil,
+            commandState: .canceling, hasExited: false,
             acceptsInput: true, isStreaming: true,
             availableDeliveries: [.followUp], effectiveDelivery: .followUp,
             draftIsEmpty: false)
@@ -130,8 +141,8 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertTrue(canceling.text.contains("stopping after its current step"))
 
         let noRoute = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: false, persistenceNotice: nil,
-            commandInFlight: false, commandState: .running, hasExited: false,
+            submissionState: .idle, persistenceNotice: nil,
+            commandState: .running, hasExited: false,
             acceptsInput: false, isStreaming: true,
             availableDeliveries: [], effectiveDelivery: nil,
             draftIsEmpty: false)
@@ -139,8 +150,8 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertTrue(noRoute.text.contains("No message route"))
 
         let admissionDeniedDespiteRoute = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: false, persistenceNotice: nil,
-            commandInFlight: false, commandState: .running, hasExited: false,
+            submissionState: .idle, persistenceNotice: nil,
+            commandState: .running, hasExited: false,
             acceptsInput: false, isStreaming: true,
             availableDeliveries: [.followUp], effectiveDelivery: .followUp,
             draftIsEmpty: false)
@@ -150,9 +161,9 @@ let casesChatInteractionPresentation: [Case] = [
     }),
     ("chat interaction: composer status distinguishes information from admission", {
         let persistence = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: false,
+            submissionState: .idle,
             persistenceNotice: "Private draft storage is unavailable.",
-            commandInFlight: false, commandState: .idle, hasExited: false,
+            commandState: .idle, hasExited: false,
             acceptsInput: true, isStreaming: false,
             availableDeliveries: [], effectiveDelivery: nil,
             draftIsEmpty: true)
@@ -160,8 +171,8 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertEqual(persistence.text, "Private draft storage is unavailable.")
 
         let empty = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: false, persistenceNotice: nil,
-            commandInFlight: false, commandState: .idle, hasExited: false,
+            submissionState: .idle, persistenceNotice: nil,
+            commandState: .idle, hasExited: false,
             acceptsInput: true, isStreaming: false,
             availableDeliveries: [], effectiveDelivery: nil,
             draftIsEmpty: true)
@@ -169,8 +180,8 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertEqual(empty.symbol, "pencil")
 
         let guidance = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: false, persistenceNotice: nil,
-            commandInFlight: false, commandState: .running, hasExited: false,
+            submissionState: .idle, persistenceNotice: nil,
+            commandState: .running, hasExited: false,
             acceptsInput: true, isStreaming: true,
             availableDeliveries: [.followUp, .guideCurrentWork],
             effectiveDelivery: .guideCurrentWork,
@@ -180,8 +191,8 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertEqual(guidance.text, ChatBusyDelivery.guideCurrentWork.explanation)
 
         let mismatchedSelection = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: false, persistenceNotice: nil,
-            commandInFlight: false, commandState: .running, hasExited: false,
+            submissionState: .idle, persistenceNotice: nil,
+            commandState: .running, hasExited: false,
             acceptsInput: true, isStreaming: true,
             availableDeliveries: [.followUp], effectiveDelivery: .guideCurrentWork,
             draftIsEmpty: false)
@@ -189,9 +200,9 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertTrue(mismatchedSelection.text.contains("Choose where"))
 
         let malformedRouteBeatsPersistence = ChatComposerStatusPresentation.resolve(
-            hasUnresolvedDraftHandoff: false,
+            submissionState: .idle,
             persistenceNotice: "Private draft storage is unavailable.",
-            commandInFlight: false, commandState: .running, hasExited: false,
+            commandState: .running, hasExited: false,
             acceptsInput: true, isStreaming: true,
             availableDeliveries: [], effectiveDelivery: nil,
             draftIsEmpty: true)
