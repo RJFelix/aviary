@@ -433,8 +433,6 @@ struct TranscriptRow: View {
                 trailing: AnyView(
                     HStack(spacing: 5) {
                         if let inputDeliveryBadge { inputDeliveryBadge }
-                        copyMessageButton
-                        forwardMessageButton
                     }))
             ForEach(item.blocks) { block in
                 if case .text(let text) = block {
@@ -452,6 +450,7 @@ struct TranscriptRow: View {
                     InlineImage(mimeType: mime, base64: data)
                 }
             }
+            messageActions
             rawPane
         }
         .padding(.leading, 10)
@@ -537,8 +536,6 @@ struct TranscriptRow: View {
                             Chip(text: Fmt.tokens(u), symbol: "number", tint: .secondary)
                                 .help(usageTooltip(u))
                         }
-                        copyMessageButton
-                        forwardMessageButton
                     }))
 
             ForEach(item.blocks) { block in
@@ -558,6 +555,7 @@ struct TranscriptRow: View {
             if let err = item.errorMessage, !err.isEmpty {
                 NoticeBanner(level: .danger, title: "Model error", message: err)
             }
+            messageActions
             rawPane
         }
         .padding(.leading, 10)
@@ -654,12 +652,7 @@ struct TranscriptRow: View {
             header(
                 item.senderName.map { "from \($0)" } ?? "agent message",
                 tint: Design.agentMessage,
-                symbol: "arrow.left.arrow.right.circle.fill",
-                trailing: AnyView(
-                    HStack(spacing: 5) {
-                        copyMessageButton
-                        forwardMessageButton
-                    }))
+                symbol: "arrow.left.arrow.right.circle.fill")
             // The provenance header is machine-generated routing metadata; the payload
             // after it is what a person wants to read.
             let parts = AgentMessageBody.split(item.text)
@@ -676,6 +669,7 @@ struct TranscriptRow: View {
                 }
             }
             MarkdownText(text: parts.body, query: searchQuery)
+            messageActions
             rawPane
         }
         .padding(11)
@@ -693,6 +687,18 @@ struct TranscriptRow: View {
         TranscriptMessageTransfer.authoredText(for: item)
     }
 
+    @ViewBuilder private var messageActions: some View {
+        if copyableMessageText != nil {
+            HStack(spacing: 12) {
+                Spacer(minLength: 0)
+                copyMessageButton
+                forwardMessageButton
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 4)
+        }
+    }
+
     @ViewBuilder
     private var copyMessageButton: some View {
         if copyableMessageText != nil {
@@ -703,6 +709,7 @@ struct TranscriptRow: View {
             } label: {
                 Label("Copy message", systemImage: "doc.on.doc")
                     .font(.system(size: 9.5, weight: .medium))
+                    .fixedSize()
             }
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
@@ -722,6 +729,7 @@ struct TranscriptRow: View {
             } label: {
                 Label("Send to agent", systemImage: "arrow.right.circle")
                     .font(.system(size: 9.5, weight: .medium))
+                    .fixedSize()
             }
             .buttonStyle(.borderless)
             .foregroundStyle(Design.accent)
