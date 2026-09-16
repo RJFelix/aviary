@@ -131,8 +131,17 @@ in the chat shows the last recorded crossing and its
 source decomposition, separately from runtime state. It does not predict the next request or
 prove that a Python namespace survived a restart.
 
-For additional provider-wire inspection, start a run with **Record what's sent to the model**.
-This captures the provider payload at its request boundary and offers a separate wire breakdown:
+For additional provider-wire inspection, enable **Keep full session logs locally** under the
+new-chat Advanced settings. These logs contain full provider requests, not a guarantee of every
+runtime effect or provider-private reasoning. The local folder picker applies to newly created
+native chats: the host retains the selected directory, and each Run and background child gets
+its own private file. Changing the folder does not redirect existing chats or retries. Older
+selected folders remain in bounded local log discovery; an incomplete scan is labelled.
+An older running service must be restarted before folder selection becomes available.
+
+Chat Details shows the exact locally retained recording path and lets you explicitly load it
+or reveal it in Finder. Remote recordings are not guessed from local paths. This captures the
+provider payload at its request boundary and offers a separate wire breakdown:
 
 ```
 PART                                               chars   tokens   share

@@ -381,6 +381,9 @@ public enum WorkServiceCapability: String, Codable, CaseIterable, Hashable, Send
     case inspectArtifacts = "inspect_artifacts"
     /// The host can advertise and resolve opaque workspace identities.
     case workspaceCatalog = "workspace_catalog"
+    /// The host captures its local recording-folder preference in each retained Work template.
+    /// This advertises behavior, never a path or authority to modify remote filesystem settings.
+    case recordingDirectorySelection = "recording_directory_selection"
     /// The client may ask the Work Host to mint and durably attach another Session to existing Work.
     case createSession = "create_session"
 }
@@ -4740,6 +4743,7 @@ public actor InMemoryWorkService: WorkServiceClient {
 
     private func supportedCapabilities() -> Set<WorkServiceCapability> {
         var capabilities = Set(WorkServiceCapability.allCases)
+        capabilities.remove(.recordingDirectorySelection)
         // Complete/destroy are only executable when a host can prove canonical Handle
         // quiescence and paired-Session cursor success. The absence is observable at handshake,
         // while a committer can still reject an individual proof later.

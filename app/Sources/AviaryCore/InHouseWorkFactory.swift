@@ -49,6 +49,8 @@ public enum InHouseWorkFactory {
         public let childMaxIterations: Int?
         public let memory: MemoryStore?
         public let recordPayloads: Bool
+        /// Exact retained wire-log destination supplied by the Work launch boundary.
+        public let wireLogURL: URL?
         public let goal: Goal?
         public let hookPaths: [String]
         public let projectionMode: WorkLaunchProjectionMode
@@ -81,6 +83,7 @@ public enum InHouseWorkFactory {
             childMaxIterations: Int? = nil,
             memory: MemoryStore? = nil,
             recordPayloads: Bool = false,
+            wireLogURL: URL? = nil,
             goal: Goal? = nil,
             hookPaths: [String] = [],
             projectionMode: WorkLaunchProjectionMode = .fresh,
@@ -107,6 +110,7 @@ public enum InHouseWorkFactory {
             self.childMaxIterations = childMaxIterations
             self.memory = memory
             self.recordPayloads = recordPayloads
+            self.wireLogURL = wireLogURL
             self.goal = goal
             self.hookPaths = hookPaths
             self.projectionMode = projectionMode
@@ -137,6 +141,7 @@ public enum InHouseWorkFactory {
                 childMaxIterations: childMaxIterations,
                 memory: memory,
                 recordPayloads: recordPayloads,
+                wireLogURL: wireLogURL,
                 goal: goal,
                 hookPaths: hookPaths,
                 projectionMode: projectionMode,
@@ -914,6 +919,22 @@ public enum InHouseWorkFactory {
                     + "256 UTF-8 bytes")
         }
 
+        guard configuration.recordPayloads == (configuration.wireLogURL != nil) else {
+            throw HostedInHouseWorkError.invalidConfiguration(
+                "wire-log recording requires exactly one retained destination")
+        }
+        if let wireLogURL = configuration.wireLogURL {
+            let path = wireLogURL.path
+            guard wireLogURL.isFileURL,
+                  path.hasPrefix("/"), path.utf8.count <= 4096,
+                  wireLogURL.standardizedFileURL.path == path,
+                  !path.unicodeScalars.contains(where: { $0.value < 32 }) else {
+                throw HostedInHouseWorkError.invalidConfiguration(
+                    "wire-log destination must be an absolute, normalized file URL"
+                )
+            }
+        }
+
         let persistedHost = try configuration.home.requirePersistedWorkHost()
         guard binding.workBinding.workHost == persistedHost,
               binding.workBinding.work.workHostID == persistedHost.workHostID else {
@@ -1022,6 +1043,7 @@ extension InHouseWorkFactory.Configuration {
             childMaxIterations: configuration.childMaxIterations,
             memory: configuration.memory,
             recordPayloads: configuration.recordPayloads,
+            wireLogURL: configuration.wireLogURL,
             goal: configuration.goal,
             hookPaths: configuration.hookPaths,
             projectionMode: configuration.projectionMode,

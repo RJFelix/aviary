@@ -176,6 +176,9 @@ public struct WorkLaunchContextPolicy: Codable, Hashable, Sendable {
 
 public struct WorkLaunchRecordingPolicy: Codable, Hashable, Sendable {
     public let recordPayloads: Bool
+    /// Owning-host directory captured by Create. Changing the host preference cannot redirect
+    /// an already retained Work template or a retry of its Start.
+    public let wireLogDirectory: String?
     /// A host-private path. It is omitted from service descriptors and can be nil when recording
     /// is disabled. The path is metadata, never a credential or payload body.
     public let wireLogLocator: String?
@@ -183,12 +186,31 @@ public struct WorkLaunchRecordingPolicy: Codable, Hashable, Sendable {
 
     public init(
         recordPayloads: Bool = false,
+        wireLogDirectory: String? = nil,
         wireLogLocator: String? = nil,
         provenance: EventRef? = nil
     ) {
         self.recordPayloads = recordPayloads
+        self.wireLogDirectory = wireLogDirectory
         self.wireLogLocator = wireLogLocator
         self.provenance = provenance
+    }
+
+    public func bound(to run: RunRef) throws -> WorkLaunchRecordingPolicy {
+        guard let directory = wireLogDirectory else { return self }
+        guard recordPayloads, directory.hasPrefix("/"),
+              directory.utf8.count <= 4096,
+              !directory.unicodeScalars.contains(where: { $0.value < 32 }),
+              !run.runID.isEmpty, run.runID.utf8.count <= 512,
+              !run.runID.contains("/"), !run.runID.contains("\\"),
+              !run.runID.unicodeScalars.contains(where: { $0.value < 32 }) else {
+            throw WorkLaunchManifestStoreError.invalidManifest("recording destination")
+        }
+        let locator = URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent("run-\(run.runID).jsonl").path
+        return WorkLaunchRecordingPolicy(
+            recordPayloads: true, wireLogDirectory: directory,
+            wireLogLocator: locator, provenance: provenance)
     }
 }
 
@@ -648,13 +670,19 @@ public struct WorkLaunchManifestDraft: Codable, Hashable, Sendable {
             // A Run-free draft never contributes a prompt body. The flattened reference is
             // introduced only by the retained Start-time assembly.
             systemPromptBodyReference: promptAssembly?.flattenedBodyReference,
-            contextPolicy: contextPolicy, recordingPolicy: recordingPolicy,
+            contextPolicy: contextPolicy, recordingPolicy: try recordingPolicy.bound(to: binding.run),
             resumePolicy: resumePolicy, reasoningPolicy: reasoningPolicy,
             budgetPolicy: budgetPolicy, goal: goal, hooks: hooks,
             peerScheduler: peerScheduler, provenance: provenance)
     }
 
     fileprivate func validate(limits: WorkLaunchManifestLimits) throws {
+        guard recordingPolicy.wireLogLocator == nil else {
+            throw WorkLaunchManifestStoreError.invalidManifest("Run-free recording locator")
+        }
+        if recordingPolicy.wireLogDirectory != nil {
+            _ = try recordingPolicy.bound(to: RunRef("recording-validation"))
+        }
         guard !workspace.locator.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               workspace.locator.utf8.count <= limits.maximumPathBytes,
               !workspace.locator.unicodeScalars.contains(where: { $0.value == 0 }) else {
@@ -897,6 +925,12 @@ public struct WorkLaunchManifest: Codable, Hashable, Sendable {
         try Self.validateOptionalString(contextPolicy.contextManifestID, name: "context manifest", limits: limits)
         try Self.validateNonNegative(contextPolicy.maximumContextBytes, name: "context budget")
         try Self.validatePath(recordingPolicy.wireLogLocator, limits: limits, required: false)
+        try Self.validatePath(recordingPolicy.wireLogDirectory, limits: limits, required: false)
+        if recordingPolicy.wireLogDirectory != nil {
+            guard try recordingPolicy.bound(to: identity.run) == recordingPolicy else {
+                throw WorkLaunchManifestStoreError.invalidManifest("recording Run locator")
+            }
+        }
         try Self.validateOptionalString(reasoningPolicy.level, name: "reasoning level", limits: limits)
         try Self.validateNonNegative(reasoningPolicy.tokenBudget, name: "reasoning budget")
         try Self.validateNonNegative(budgetPolicy.maximumTurns, name: "turn budget")

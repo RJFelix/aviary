@@ -1275,6 +1275,7 @@ struct LauncherSheet: View {
 struct LauncherFormBody: View {
     @Environment(AppModel.self) private var model
     var onStart: () -> Void
+    var initiallyShowsAdvanced = false
 
     @State private var cwd = ""
     @State private var projectChosen = false
@@ -1286,6 +1287,9 @@ struct LauncherFormBody: View {
     @State private var thinking = "high"
     @State private var noContextFiles = false
     @State private var recordPayloads = false
+    @State private var logDirectory: URL?
+    @State private var logDirectoryError: String?
+    @State private var confirmsLogReset = false
     @State private var advancedExpanded = false
 
     var body: some View {
@@ -1416,11 +1420,30 @@ struct LauncherFormBody: View {
                                 Text("Log destination")
                                     .font(.system(size: 11, weight: .semibold))
                                     .foregroundStyle(.secondary)
-                                Text(WireLog.directory.path)
-                                    .font(Design.mono(10))
-                                    .foregroundStyle(.tertiary)
-                                    .textSelection(.enabled)
-                                    .fixedSize(horizontal: false, vertical: true)
+                                HStack(alignment: .top, spacing: 8) {
+                                    Text(supportsLogDirectorySelection
+                                         ? (logDirectory?.path ?? "Choose a local folder")
+                                         : WireLog.directory.path)
+                                        .font(Design.mono(10))
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    Spacer(minLength: 0)
+                                    Button("Change…", action: chooseLogDirectory)
+                                        .disabled(selectedEngine == .claudeCode || !supportsLogDirectorySelection)
+                                }
+                                Text(supportsLogDirectorySelection
+                                     ? "On this Mac · applies to new chats"
+                                     : (model.localWorkServiceHandshake == nil
+                                        ? "Connect to the local agent service to choose a folder"
+                                        : "Restart the local agent service to enable folder selection"))
+                                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                                if let logDirectoryError {
+                                    Text(logDirectoryError)
+                                        .font(.system(size: 11)).foregroundStyle(Design.warning)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    Button("Reset log folder…") { confirmsLogReset = true }
+                                }
                             }
                         }
                         .padding(.top, 10)
@@ -1444,7 +1467,23 @@ struct LauncherFormBody: View {
         .onChange(of: model.defaultCwd) { _, value in
             if !projectChosen { cwd = value }
         }
+        .alert("Use the default log folder?", isPresented: $confirmsLogReset) {
+            Button("Use default folder") {
+                do {
+                    logDirectory = try WireLogDirectoryStore(home: model.home).resetToDefault().directory
+                    logDirectoryError = nil
+                    model.refreshWireIndex()
+                } catch {
+                    logDirectoryError = "Could not reset log settings. \(error.localizedDescription)"
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Existing logs are not moved or deleted. The previous settings file is backed up before replacement.")
+        }
         .onAppear {
+            if initiallyShowsAdvanced { advancedExpanded = true }
+            loadLogDirectory()
             if cwd.isEmpty { cwd = model.defaultCwd }
             if selectionWasSeeded {
                 selection = selection.selectingRoute(
@@ -1507,6 +1546,40 @@ struct LauncherFormBody: View {
                 ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
                 id: \.self
             ) { Text($0).tag($0) }
+        }
+    }
+
+    private var supportsLogDirectorySelection: Bool {
+        model.localWorkServiceHandshake?.capabilities.contains(.recordingDirectorySelection) == true
+    }
+
+    private func loadLogDirectory() {
+        do {
+            logDirectory = try WireLogDirectoryStore(home: model.home).load().directory
+            logDirectoryError = nil
+        } catch {
+            logDirectory = nil
+            logDirectoryError = "Saved log settings need repair. Your request can still be saved."
+        }
+    }
+
+    private func chooseLogDirectory() {
+        let panel = NSOpenPanel()
+        panel.title = "Session log folder"
+        panel.prompt = "Use folder"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = logDirectory
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        do {
+            logDirectory = try WireLogDirectoryStore(home: model.home)
+                .select(directory: directory).directory
+            logDirectoryError = nil
+            model.refreshWireIndex()
+        } catch {
+            logDirectoryError = "Could not save that log folder. \(error.localizedDescription)"
         }
     }
 
@@ -1790,6 +1863,7 @@ struct ModelFactsRow: View {
 // MARK: - Run inspector
 
 struct RunInspector: View {
+    @Environment(AppModel.self) private var model
     var run: LiveRun
     @Binding var selectedItem: TranscriptItem?
     @State private var showBreakdown = false
@@ -1913,9 +1987,7 @@ struct RunInspector: View {
                     }
                 }
 
-                if run.recordedModelContext == nil {
-                    wireContextCard
-                }
+                wireContextCard
 
                 Card("Launch command", symbol: "terminal") {
                     CodeBlock(text: run.launchCommand, maxLines: 8, tint: .secondary)
@@ -1947,6 +2019,9 @@ struct RunInspector: View {
         .sheet(isPresented: $showRaw) {
             RawPayloadSheet(records: run.wireRecords)
         }
+        .onAppear {
+            if run.isServiceBacked { run.refreshLocalServiceWireLog(home: model.home) }
+        }
     }
 
     @ViewBuilder
@@ -1956,6 +2031,9 @@ struct RunInspector: View {
                 "Provider wire capture", symbol: "waveform.path.ecg",
                  accessory: AnyView(
                     HStack(spacing: 8) {
+                        Button(run.wireRecords.isEmpty ? "Load" : "Refresh") { run.refreshWireLog() }
+                            .buttonStyle(.link).font(.system(size: 10))
+                            .disabled(run.wireLogURL == nil)
                         Button("Breakdown") { showBreakdown = true }
                             .buttonStyle(.link).font(.system(size: 10))
                             .disabled(run.latestAnalysis == nil)
@@ -1964,6 +2042,16 @@ struct RunInspector: View {
                             .disabled(run.wireRecords.isEmpty)
                     })
             ) {
+                if let url = run.wireLogURL {
+                    HStack(alignment: .top) {
+                        Text(url.path).font(Design.mono(10)).foregroundStyle(.secondary)
+                            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 4)
+                        Button("Show in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                        }.buttonStyle(.link).font(.system(size: 10))
+                    }
+                }
                 if let analysis = run.latestAnalysis {
                     VStack(alignment: .leading, spacing: 6) {
                         Text(
@@ -2000,7 +2088,9 @@ struct RunInspector: View {
                         }
                     }
                 } else {
-                    Text("Wire recording is on. The first provider request will appear here.")
+                    Text(run.wireLogURL == nil
+                         ? "The recording location is not available on this Mac."
+                         : "Full model requests may contain sensitive content. Load to inspect the recording.")
                         .font(.system(size: 10.5)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }

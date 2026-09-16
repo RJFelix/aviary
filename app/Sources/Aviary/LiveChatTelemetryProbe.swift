@@ -97,6 +97,8 @@ enum LiveChatTelemetryProbe {
         defer { defaults.removePersistentDomain(forName: suite) }
 
         let home = AgentHome(root: homeURL)
+        let recordingDirectory = home.root.appending(path: "configured-request-logs")
+        try WireLogDirectoryStore(home: home).select(directory: recordingDirectory)
         let model = AppModel(
             home: home, presentationDefaults: defaults,
             modelPreferencesStore: ModelPreferencesStore(
@@ -106,7 +108,7 @@ enum LiveChatTelemetryProbe {
         do {
             guard model.createPendingChat(
                 cwd: workspaceURL.path, providerID: providerID, modelID: modelID,
-                prompt: prompt, title: "Live telemetry probe")
+                prompt: prompt, recordPayloads: true, title: "Live telemetry probe")
             else { throw Failure.startup }
 
             let selectedID = model.selectedPendingChatID
@@ -185,6 +187,13 @@ enum LiveChatTelemetryProbe {
                   let work = projection.workSnapshot.work,
                   let journal = projection.workSnapshot.journal,
                   let sessionID = run.serviceAttachmentKey?.workSession.session.sessionID
+            else { throw Failure.turn }
+
+            run.refreshLocalServiceWireLog(home: home)
+            guard let recording = run.wireLogURL,
+                  recording.deletingLastPathComponent().path == recordingDirectory.path,
+                  recording.lastPathComponent == "run-\(activeRun.runID).jsonl",
+                  WireLog.read(url: recording).filter({ $0.kind == .request }).count >= 2
             else { throw Failure.turn }
 
             let review = await run.loadServiceRepositoryReview(expectedDescriptor: descriptor)

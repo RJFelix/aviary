@@ -7136,6 +7136,18 @@ await Harness.run(
         + casesWorkHostRegistry
         + casesHostedInHouseWork + casesInHouseWorkFactory
         + casesInHouseModelResolver + casesLocalWorkHostLaunchResolver
+        + casesAgentRunnerWireLog
+        + casesWorkWireLogRouting
+        + [
+            ("wire log directory: defaults and history", { try testWireLogDirectoryStoreDefaultsToWireLogDirectoryAndRetainsHistory() }),
+            ("wire log directory: malformed settings", { try testWireLogDirectoryStoreRejectsMalformedConfigWithoutDefaultFallback() }),
+            ("wire log directory: writable selection", { try testWireLogDirectoryStoreCreatesAndChecksSelectedDirectory() }),
+            ("wire log directory: path bounds", { try testWireLogDirectoryStoreRejectsInvalidAndOversizedPaths() }),
+            ("wire log directory: no silent eviction", { try testWireLogDirectoryStoreNeverEvictsKnownDirectories() }),
+            ("wire log directory: concurrent selections", { try testWireLogDirectoryStoreConcurrentInstancesMergeSelections() }),
+            ("wire log directory: explicit backed-up reset", { try testWireLogDirectoryStoreExplicitResetBacksUpMalformedBytesAndKeepsLogs() }),
+            ("wire log directory: reset rejects nonregular config", { try testWireLogDirectoryStoreResetWithMissingConfigAndRejectsNonRegularConfig() }),
+        ]
         + casesWorkServiceTransport + casesJournalBackedWorkService
         + casesWorkLaunchManifest + casesWorkHostDaemonEndpoint + casesWorkHostDaemonProcess
         + casesWorkServiceHostLocator + casesWorkServiceClientSession

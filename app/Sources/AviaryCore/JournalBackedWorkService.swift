@@ -4375,6 +4375,10 @@ public actor JournalBackedWorkService: WorkServiceClient {
               configuration.model.providerID == draft.runtime.providerID,
               configuration.model.id == draft.runtime.modelID,
               configuration.recordPayloads == draft.recordingPolicy.recordPayloads,
+              configuration.wireLogURL?.path
+                == manifest.durableRecord?.manifest.recordingPolicy.wireLogLocator,
+              (try? draft.recordingPolicy.bound(to: binding.run))
+                == manifest.durableRecord?.manifest.recordingPolicy,
               configuration.reasoningEffort == draft.reasoningPolicy.level,
               // These fields have no corresponding executable knobs in Hosted yet.  Accept only
               // their explicit defaults until a typed field is added; silently dropping a

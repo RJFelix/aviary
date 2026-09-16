@@ -889,7 +889,7 @@ final class AppModel {
         auth = .load(home: home)
         modelsConfig = .load(home: home, auth: auth)
 
-        wireIndex = WireLog.buildIndex()
+        wireIndex = WireLog.buildIndex(home: home)
 
         // Read once here rather than per-run: it shells out to `claude auth status`, and the
         // engine picker needs it before a run exists to ask.
@@ -2630,6 +2630,7 @@ final class AppModel {
             }
             for run in selectedServiceRuns {
                 await run.refreshService(resumeInitialStart: resumeInitialStart)
+                run.refreshLocalServiceWireLog(home: home)
             }
             if refreshCatalog {
                 await restoreServiceWork(
@@ -3562,7 +3563,7 @@ final class AppModel {
 
     /// Rescan recorded logs. Cheap: one line read per file.
     func refreshWireIndex() {
-        wireIndex = WireLog.buildIndex()
+        wireIndex = WireLog.buildIndex(home: home)
         if let id = selectedSessionID {
             selectedSessionWire = WireLog.records(forSession: id, index: wireIndex)
         }
@@ -4483,7 +4484,7 @@ final class AppModel {
         }
         if run.config.recordPayloads {
             // The log is complete now; make it discoverable from the Sessions tab.
-            wireIndex = WireLog.buildIndex()
+            wireIndex = WireLog.buildIndex(home: home)
             if let id = selectedSessionID {
                 selectedSessionWire = WireLog.records(forSession: id, index: wireIndex)
             }
@@ -5050,7 +5051,8 @@ final class LiveRun: Identifiable {
             cwd: cwd,
             provider: bridge.projection.descriptor.configuration.providerID,
             model: bridge.projection.descriptor.configuration.modelID,
-            thinkingLevel: bridge.thinkingLevel)
+            thinkingLevel: bridge.thinkingLevel,
+            recordPayloads: bridge.projection.descriptor.configuration.recordPayloads)
         self.serviceBridge = bridge
         self.serviceWorkUsageInventory = bridge.canonicalWorkUsageInventory
         self.serviceAttachmentKey = bridge.serviceAttachmentKey
@@ -5919,6 +5921,31 @@ final class LiveRun: Identifiable {
     }
 
     /// Re-read the recorded payloads. Cheap: a handful of records per run.
+    func refreshLocalServiceWireLog(home: AgentHome) {
+        guard let projection = serviceProjection,
+              projection.isCanonical,
+              projection.capabilities.contains(.inspectArtifacts),
+              home.persistedWorkHostID == projection.descriptor.work.workHostID else {
+            if isServiceBacked { wireLogURL = nil; wireRecords = [] }
+            return
+        }
+        let descriptor = projection.descriptor
+        guard let run = descriptor.currentRun else {
+            // Keep the last exact local Run's recording after End, but never guess a new path.
+            return
+        }
+        guard descriptor.currentRunSession == projection.attachment.session,
+              descriptor.currentRunSessionAttachment == projection.attachment.sessionAttachment,
+              let session = projection.attachment.session,
+              let attachment = projection.attachment.sessionAttachment else {
+            wireLogURL = nil; wireRecords = []
+            return
+        }
+        let url = try? WireLog.recordedURL(home: home, identity: WorkLaunchManifestIdentity(
+            work: descriptor.work, session: session, sessionAttachment: attachment, run: run))
+        if url != wireLogURL { wireLogURL = url; wireRecords = [] }
+    }
+
     func refreshWireLog() {
         guard let url = wireLogURL else { return }
         let next = WireLog.read(url: url)

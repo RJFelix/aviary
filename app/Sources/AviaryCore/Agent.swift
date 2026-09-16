@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 private enum NativeResumeCompatibilityError: LocalizedError {
     case toolSchemaChanged(expected: [String], actual: [String])
@@ -2818,15 +2823,59 @@ public actor Agent {
         data.append(UInt8(ascii: "\n"))
         try? FileManager.default.createDirectory(
             at: wireLogURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: wireLogURL.path) {
-            _ = FileManager.default.createFile(atPath: wireLogURL.path, contents: nil)
+        appendWireLogRecord(data, to: wireLogURL)
+    }
+
+    /// Best-effort append that treats the path as untrusted. New files are created exclusively
+    /// with owner-only permissions; existing files are opened without following symlinks and
+    /// accepted only when the descriptor names an owner-owned regular 0600 file.
+    private func appendWireLogRecord(_ data: Data, to url: URL) {
+        let descriptor = openWireLogDescriptor(at: url)
+        guard descriptor >= 0 else { return }
+        defer { _ = AviaryPOSIX.close(descriptor) }
+
+        var status = stat()
+        guard fstat(descriptor, &status) == 0,
+              (status.st_mode & S_IFMT) == S_IFREG,
+              status.st_uid == geteuid(),
+              (status.st_mode & mode_t(0o777)) == mode_t(0o600) else { return }
+
+        data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            var offset = 0
+            while offset < bytes.count {
+                let chunkCount = min(bytes.count - offset, 64 * 1_024)
+                let count = AviaryPOSIX.write(
+                    descriptor, base.advanced(by: offset), chunkCount)
+                if count > 0 {
+                    offset += count
+                } else if count < 0 && errno == EINTR {
+                    continue
+                } else {
+                    return
+                }
+            }
         }
-        // Best-effort, and silent on failure: diagnostics must never take down a run, and a
-        // full disk should not produce one error per model call.
-        guard let handle = try? FileHandle(forWritingTo: wireLogURL) else { return }
-        defer { try? handle.close() }
-        _ = try? handle.seekToEnd()
-        try? handle.write(contentsOf: data)
+    }
+
+    private func openWireLogDescriptor(at url: URL) -> Int32 {
+        url.path.withCString { path in
+            let appendFlags = O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK
+            let createFlags = appendFlags | O_CREAT | O_EXCL
+            let created: Int32
+            #if canImport(Darwin)
+            created = Darwin.open(path, createFlags, mode_t(0o600))
+            #elseif canImport(Glibc)
+            created = Glibc.open(path, createFlags, mode_t(0o600))
+            #else
+            created = -1
+            #endif
+            if created >= 0 { return created }
+            guard errno == EEXIST else { return -1 }
+            // The two-argument AviaryPOSIX wrapper is sufficient for an existing path. O_NOFOLLOW
+            // and O_NONBLOCK ensure a symlink or special file is rejected without hanging.
+            return AviaryPOSIX.open(path, appendFlags)
+        }
     }
 
     private var recordedRequests = 0

@@ -140,6 +140,20 @@ public enum WireLog {
         directory.appending(path: "run-\(id).jsonl")
     }
 
+    /// Co-located inspection only: an exact retained Run and this home's host authority must
+    /// agree. Never use the current folder preference to locate an earlier Run's recording.
+    public static func recordedURL(
+        home: AgentHome, identity: WorkLaunchManifestIdentity
+    ) throws -> URL? {
+        guard home.persistedWorkHostID == identity.work.workHostID else {
+            throw WorkLaunchManifestStoreError.identityMismatch
+        }
+        guard let record = try WorkLaunchManifestStore(home: home).read(identity),
+              record.manifest.recordingPolicy.recordPayloads,
+              let path = record.manifest.recordingPolicy.wireLogLocator else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
     /// Maps recorded logs to the sessions they belong to.
     ///
     /// Built by reading each file's first record only. The responses API carries
@@ -153,6 +167,9 @@ public enum WireLog {
         public var bySession: [String: [URL]] = [:]
         /// Logs whose payloads carry no session id (routes without a cache key).
         public var unattributed: [URL] = []
+        /// A failed settings/directory read is not a healthy empty catalog.
+        public var unavailableDirectoryCount = 0
+        public var scanWasTruncated = false
 
         public func logs(forSession id: String) -> [URL] { bySession[id] ?? [] }
         public var sessionCount: Int { bySession.count }
@@ -161,13 +178,46 @@ public enum WireLog {
         }
     }
 
-    public static func buildIndex() -> Index {
+    public static func buildIndex(
+        home: AgentHome = .default, maximumEntries: Int = 8_192,
+        maximumFiles: Int = 512, maximumReadBytes: Int = 16 * 1024 * 1024
+    ) -> Index {
         var index = Index()
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles])
-        else { return index }
+        guard let selection = try? WireLogDirectoryStore(home: home).load() else {
+            index.unavailableDirectoryCount = 1
+            return index
+        }
+        var files: [URL] = []
+        var remainingEntries = min(8_192, max(1, maximumEntries))
+        let fileLimit = min(512, max(1, maximumFiles))
+        var remainingBytes = min(16 * 1024 * 1024, max(1, maximumReadBytes))
+        for directory in selection.knownDirectories {
+            if remainingEntries == 0 || files.count == fileLimit {
+                index.scanWasTruncated = true
+                break
+            }
+            var directoryReadFailed = false
+            guard let entries = FileManager.default.enumerator(
+                at: directory,
+                includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants],
+                errorHandler: { _, _ in directoryReadFailed = true; return false }) else {
+                index.unavailableDirectoryCount += 1
+                continue
+            }
+            while let url = entries.nextObject() as? URL {
+                guard remainingEntries > 0, files.count < fileLimit else {
+                    index.scanWasTruncated = true
+                    break
+                }
+                remainingEntries -= 1
+                guard url.lastPathComponent.hasPrefix("run-"), url.pathExtension == "jsonl",
+                      let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                      values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+                files.append(url)
+            }
+            if directoryReadFailed { index.unavailableDirectoryCount += 1 }
+        }
 
         let sorted = files
             .filter { $0.pathExtension == "jsonl" }
@@ -176,28 +226,38 @@ public enum WireLog {
                     .contentModificationDate ?? .distantPast
                 let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?
                     .contentModificationDate ?? .distantPast
-                return a > b
+                return a == b ? $0.path < $1.path : a > b
             }
 
         for url in sorted {
-            if let session = firstSessionID(in: url) {
+            guard remainingBytes > 0 else { index.scanWasTruncated = true; break }
+            if let session = firstSessionID(in: url, remainingBytes: &remainingBytes) {
                 index.bySession[session, default: []].append(url)
             } else {
                 index.unattributed.append(url)
             }
         }
+        if remainingBytes == 0 { index.scanWasTruncated = true }
         return index
     }
 
     /// The session id from the first record that names one, without parsing the whole file.
     static func firstSessionID(in url: URL) -> String? {
+        var budget = 2 * 1024 * 1024
+        return firstSessionID(in: url, remainingBytes: &budget)
+    }
+
+    private static func firstSessionID(in url: URL, remainingBytes: inout Int) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         var buffer = Data()
         // A single record is large (a system prompt is tens of kilobytes), so read in
         // generous chunks and stop at the first complete line.
         for _ in 0..<8 {
-            guard let chunk = try? handle.read(upToCount: 256 * 1024), !chunk.isEmpty else { break }
+            guard remainingBytes > 0,
+                  let chunk = try? handle.read(upToCount: min(remainingBytes, 256 * 1024)),
+                  !chunk.isEmpty else { break }
+            remainingBytes -= chunk.count
             buffer.append(chunk)
             if let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) {
                 let line = buffer.subdata(in: buffer.startIndex..<nl)

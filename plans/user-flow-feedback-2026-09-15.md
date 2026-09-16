@@ -25,10 +25,11 @@ authoritative; a calmer screen must not imply receipt or successful execution.
 
 ## Follow-through / explicit remaining boundaries
 
-- Configurable full-request log directory: resolve once per Run on the owning host, carry the
-  actual locator to inspection, preserve old log discovery, and don't advertise a GUI-local
-  preference as changing a remote host. Existing checkbox records provider requests, not a
-  guarantee that all runtime effects or provider-private thinking are captured.
+- Configurable full-request log directory: implemented in the September 16 follow-through.
+  Owning-host Create captures the folder; Start binds a distinct Run file. Exact retry/recovery
+  retains it, and children derive their own file names in the captured folder. Inspection uses
+  the exact local manifest, not the current preference or a remote-path guess. The checkbox
+  records provider requests, not all runtime effects or provider-private thinking.
 - Markdown editing in-place and selection across rendered blocks: native rich-text integration
   needs a separate renderer/editor pass. Copy message is the exact cross-block fallback now.
 - Execute suggested shell commands: explicit action with visible command, project, destination,
@@ -66,3 +67,24 @@ active Work to demonstrate a presentation fix. Record actual receipts after comp
   140 still match; workspaces.json differs after real-use project setup. No baseline files were
   restored or rewritten. Both protected pending requests still match exactly.
 - Signed bundle and live reload are separate final checks; a service restart is not required.
+
+### September 16: local request-log storage
+
+- Host-local folder setting is read fresh by Create, serialized across GUI writers, bounded,
+  and backed up before atomic replacement. Explicit reset repairs malformed regular settings;
+  existing recordings are never moved or deleted.
+- Historical discovery only considers Aviary `run-*.jsonl` files, with entry/file/read budgets
+  and visible incomplete-scan status. Prior locations are retained, not silently evicted.
+- New files are private, and unsafe existing destinations are rejected rather than overwritten
+  or chmodded. This protects diagnostic file handling; it is not an agent sandbox.
+- The folder picker is gated by an advertised host capability so an older live service cannot
+  silently ignore the setting. Activating this slice requires an approved service restart.
+- macOS Core/SelfTest/app/helper builds pass. Focused logging, resolver, manifest, and transport
+  checks pass: 64 cases / 701 assertions. No broad-suite or Linux runtime claim is implied.
+- The disposable normal-service OTLP journey passes with 94 spans / two fixture-provider calls;
+  it now also asserts the exact custom-folder recording and both request records before End.
+  Create/Start/tool/review/End/drain are covered, not Queue/Steer/Stop or remote backends.
+- Inspected the expanded production launcher at 380 points in light appearance; folder path
+  wraps and Change remains readable. Screenshot is a fixture, not a live picker interaction.
+- The original local service remains PID 70830 and was not restarted. GUI was closed during
+  this slice. Signed bundle verification is the final packaging check before handoff.

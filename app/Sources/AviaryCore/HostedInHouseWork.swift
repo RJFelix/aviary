@@ -350,6 +350,8 @@ public struct HostedInHouseWorkConfiguration: Sendable {
     public let childMaxIterations: Int?
     public let memory: MemoryStore?
     public let recordPayloads: Bool
+    /// Exact retained wire-log destination supplied by the Work launch boundary.
+    public let wireLogURL: URL?
     public let goal: Goal?
     public let hookPaths: [String]
     /// The compatibility transcript operation is independent from effective model context.
@@ -391,6 +393,7 @@ public struct HostedInHouseWorkConfiguration: Sendable {
         childMaxIterations: Int? = nil,
         memory: MemoryStore? = nil,
         recordPayloads: Bool = false,
+        wireLogURL: URL? = nil,
         goal: Goal? = nil,
         hookPaths: [String] = [],
         projectionMode: WorkLaunchProjectionMode = .fresh,
@@ -417,6 +420,7 @@ public struct HostedInHouseWorkConfiguration: Sendable {
         self.childMaxIterations = childMaxIterations
         self.memory = memory
         self.recordPayloads = recordPayloads
+        self.wireLogURL = wireLogURL
         self.goal = goal
         self.hookPaths = hookPaths
         self.projectionMode = projectionMode
@@ -1083,6 +1087,7 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
                     childMaxIterations: configuration.childMaxIterations,
                     memory: configuration.memory,
                     recordPayloads: configuration.recordPayloads,
+                    wireLogURL: configuration.wireLogURL,
                     goal: configuration.goal,
                     hookPaths: configuration.hookPaths,
                     // The legacy AgentRunner switch is an adapter detail. The public launch

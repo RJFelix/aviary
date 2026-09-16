@@ -98,6 +98,16 @@ enum LinuxSelfTestMain {
             ("Linux platform: ISO-8601 memory date parsing", {
                 test_linuxISO8601DateParsing()
             }),
+            ("Linux platform: wire log directory", {
+                try testWireLogDirectoryStoreDefaultsToWireLogDirectoryAndRetainsHistory()
+                try testWireLogDirectoryStoreRejectsMalformedConfigWithoutDefaultFallback()
+                try testWireLogDirectoryStoreCreatesAndChecksSelectedDirectory()
+                try testWireLogDirectoryStoreRejectsInvalidAndOversizedPaths()
+                try testWireLogDirectoryStoreNeverEvictsKnownDirectories()
+                try testWireLogDirectoryStoreConcurrentInstancesMergeSelections()
+                try testWireLogDirectoryStoreExplicitResetBacksUpMalformedBytesAndKeepsLogs()
+                try testWireLogDirectoryStoreResetWithMissingConfigAndRejectsNonRegularConfig()
+            }),
             ("Linux platform: observed repository review", {
                 try await runLinuxCases(casesObservedRepositoryReview)
             }),

@@ -31,6 +31,9 @@ public actor AgentRunner {
         /// Record request payloads for the root run. Off unless asked: it writes the whole
         /// system prompt and conversation to disk.
         public var recordPayloads = false
+        /// Exact retained destination selected by the launch boundary. When absent, direct
+        /// process/CLI callers use Aviary's ordinary per-run wire-log path.
+        public var wireLogURL: URL?
         /// A budget and finishing condition for the root run. Children do not share this budget;
         /// an optional child iteration ceiling is configured independently.
         public var goal: Goal?
@@ -72,7 +75,8 @@ public actor AgentRunner {
             home: AgentHome, cwd: String, model: ModelSpec, systemPrompt: String,
             systemPromptAssembly: SystemPromptAssembly? = nil,
             maxDepth: Int = 3, maxIterations: Int? = 40, childMaxIterations: Int? = nil,
-            memory: MemoryStore? = nil, recordPayloads: Bool = false, goal: Goal? = nil,
+            memory: MemoryStore? = nil, recordPayloads: Bool = false,
+            wireLogURL: URL? = nil, goal: Goal? = nil,
             hookPaths: [String] = [], resume: String? = nil,
             peerDelegate: Agent.PeerDelegate? = nil,
             selfDelegate: Agent.SelfDelegate? = nil,
@@ -99,6 +103,7 @@ public actor AgentRunner {
             self.childMaxIterations = childMaxIterations
             self.memory = memory
             self.recordPayloads = recordPayloads
+            self.wireLogURL = wireLogURL
             self.goal = goal
             self.hookPaths = hookPaths
             self.resume = resume
@@ -465,7 +470,8 @@ public actor AgentRunner {
             }
         }
         if settings.recordPayloads {
-                await agent.recordPayloads(to: WireLog.path(forRun: identity.runID))
+            await agent.recordPayloads(
+                to: settings.wireLogURL ?? WireLog.path(forRun: identity.runID))
         }
 
 #if !os(Linux)

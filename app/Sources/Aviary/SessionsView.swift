@@ -624,6 +624,11 @@ struct SessionInspector: View {
 
     @ViewBuilder
     private var wireCard: some View {
+        if model.wireIndex.scanWasTruncated || model.wireIndex.unavailableDirectoryCount > 0 {
+            Label("Log discovery is incomplete. Use a chat’s Details to open its exact recording.",
+                  systemImage: "exclamationmark.folder")
+                .font(.caption).foregroundStyle(Design.warning)
+        }
         if let request = shownRequest, let payload = request.payload {
             let analysis = WireLog.analyse(payload: payload)
             Card("Provider wire capture", symbol: "waveform.path.ecg",
@@ -693,9 +698,9 @@ struct SessionInspector: View {
         } else if let session = model.selectedSession, !session.isCanonicalOnly {
             Card("Provider wire capture", symbol: "waveform.path.ecg") {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("No provider wire payloads were recorded for this session, so this "
-                        + "diagnostic view cannot reconstruct its request bytes. Canonical native "
-                        + "context metadata, when present, remains a separate Session projection.")
+                    Text(model.wireIndex.unavailableDirectoryCount > 0
+                        ? "Some saved log folders could not be read. Recordings may still exist there; reconnect the folder and refresh before assuming a log is missing."
+                        : "No provider request logs were found for this session. Recorded context information, when available, is shown separately.")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

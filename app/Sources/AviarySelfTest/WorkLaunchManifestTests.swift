@@ -75,7 +75,8 @@ private struct WorkLaunchManifestFixture {
                 includeContextFiles: true, contextManifestID: "context-manifest"),
             recordingPolicy: WorkLaunchRecordingPolicy(
                 recordPayloads: true,
-                wireLogLocator: root.appending(path: "wire.jsonl").path),
+                wireLogDirectory: root.path,
+                wireLogLocator: root.appending(path: "run-\(run.runID).jsonl").path),
             resumePolicy: WorkLaunchResumePolicy(mode: .coldResume, sourceSession: session,
                                                  sourceRun: run),
             reasoningPolicy: WorkLaunchReasoningPolicy(
@@ -239,7 +240,8 @@ func test_workLaunchManifestTwoStageBindingUsesReservedIdentity() throws {
             recordPayloads: fixture.manifest.recordingPolicy.recordPayloads),
         requestedCapabilities: [],
         contextPolicy: fixture.manifest.contextPolicy,
-        recordingPolicy: fixture.manifest.recordingPolicy,
+        recordingPolicy: WorkLaunchRecordingPolicy(
+            recordPayloads: true, wireLogDirectory: fixture.root.path),
         resumePolicy: fixture.manifest.resumePolicy,
         reasoningPolicy: fixture.manifest.reasoningPolicy,
         budgetPolicy: fixture.manifest.budgetPolicy,
@@ -323,7 +325,8 @@ func test_workLaunchManifestRetentionTemplateAndStartAreIdempotentAndCAS() throw
             recordPayloads: fixture.manifest.recordingPolicy.recordPayloads),
         requestedCapabilities: [],
         contextPolicy: fixture.manifest.contextPolicy,
-        recordingPolicy: fixture.manifest.recordingPolicy,
+        recordingPolicy: WorkLaunchRecordingPolicy(
+            recordPayloads: true, wireLogDirectory: fixture.root.path),
         resumePolicy: fixture.manifest.resumePolicy,
         reasoningPolicy: fixture.manifest.reasoningPolicy,
         budgetPolicy: fixture.manifest.budgetPolicy,

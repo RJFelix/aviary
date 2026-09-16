@@ -19,6 +19,9 @@ public struct AgentChildExecutionConfiguration: Sendable {
     public let maxIterations: Int?
     public let memory: MemoryStore?
     public let recordPayloads: Bool
+    /// Captured owner directory for child payload logs. The child derives its own file name
+    /// from its Run identity; a parent log URL must never be reused for a child.
+    public let wireLogDirectory: URL?
     public let makeProviderAccounting: @Sendable () async throws -> any ChildProviderAccounting
     public let makeRuntimeHost: @Sendable () -> RuntimeHost
 
@@ -36,6 +39,7 @@ public struct AgentChildExecutionConfiguration: Sendable {
         maxIterations: Int? = nil,
         memory: MemoryStore? = nil,
         recordPayloads: Bool = false,
+        wireLogDirectory: URL? = nil,
         makeProviderAccounting: @escaping @Sendable () async throws -> any ChildProviderAccounting,
         makeRuntimeHost: @escaping @Sendable () -> RuntimeHost
     ) {
@@ -52,6 +56,7 @@ public struct AgentChildExecutionConfiguration: Sendable {
         self.maxIterations = maxIterations
         self.memory = memory
         self.recordPayloads = recordPayloads
+        self.wireLogDirectory = wireLogDirectory
         self.makeProviderAccounting = makeProviderAccounting
         self.makeRuntimeHost = makeRuntimeHost
     }
@@ -292,6 +297,8 @@ public actor AgentChildExecutionResource {
                     childMaxIterations: 0,
                     memory: configuration.memory,
                     recordPayloads: configuration.recordPayloads,
+                    wireLogURL: AgentChildWireLogLocation.url(
+                        forRunID: identity.runID, in: configuration.wireLogDirectory),
                     childDelegate: NestedChildRefusal(),
                     identity: identity,
                     reasoningEffort: configuration.reasoningEffort,
@@ -465,6 +472,12 @@ public actor AgentChildExecutionResource {
             runtimeSession = nil
         }
         return receipt
+    }
+}
+
+enum AgentChildWireLogLocation {
+    static func url(forRunID runID: String, in directory: URL?) -> URL? {
+        directory?.appendingPathComponent("run-\(runID).jsonl")
     }
 }
 

@@ -167,7 +167,9 @@ public struct LocalWorkHostLaunchResolver: Sendable {
             contextPolicy: WorkLaunchContextPolicy(
                 includeContextFiles: request.configuration.includeContextFiles),
             recordingPolicy: WorkLaunchRecordingPolicy(
-                recordPayloads: request.configuration.recordPayloads),
+                recordPayloads: request.configuration.recordPayloads,
+                wireLogDirectory: request.configuration.recordPayloads
+                    ? try WireLogDirectoryStore(home: configuration.home).resolveForCreate().directory.path : nil),
             reasoningPolicy: reasoning,
             provenance: WorkLaunchManifestProvenance(
                 source: Self.provenancePrefix + selection.configurationDigest))
@@ -244,11 +246,18 @@ public struct LocalWorkHostLaunchResolver: Sendable {
         policy: WorkLaunchExecutionPolicy
     ) async throws -> HostedInHouseWorkConfiguration? {
         try validateManifestIdentity(manifest, binding: binding)
+        guard !manifest.recordingPolicy.recordPayloads
+                || (manifest.recordingPolicy.wireLogDirectory != nil
+                    && (try? manifest.recordingPolicy.bound(to: binding.run))
+                        == manifest.recordingPolicy) else {
+            throw Error.manifestMismatch
+        }
         guard manifest.hooks.isEmpty,
               manifest.goal == WorkLaunchGoalConfiguration(),
               manifest.peerScheduler == WorkLaunchPeerSchedulerConfiguration(),
               manifest.contextPolicy == WorkLaunchContextPolicy(),
-              manifest.recordingPolicy.wireLogLocator == nil,
+              manifest.recordingPolicy.recordPayloads
+                  == (manifest.recordingPolicy.wireLogLocator != nil),
               manifest.resumePolicy == policy.resumePolicy,
               manifest.reasoningPolicy.tokenBudget == nil,
               manifest.budgetPolicy.maximumTokens == nil,
@@ -333,6 +342,7 @@ public struct LocalWorkHostLaunchResolver: Sendable {
             maxIterations: manifest.budgetPolicy.maximumTurns ?? 40,
             childMaxIterations: manifest.budgetPolicy.childMaximumTurns,
             recordPayloads: manifest.recordingPolicy.recordPayloads,
+            wireLogURL: manifest.recordingPolicy.wireLogLocator.map { URL(fileURLWithPath: $0) },
             projectionMode: policy.projection,
             modelContextMode: policy.modelContext)
     }
@@ -397,6 +407,8 @@ public struct LocalWorkHostLaunchResolver: Sendable {
         guard template.template.draft.contextPolicy.maximumContextBytes == nil,
               template.template.draft.contextPolicy.includeContextFiles,
               template.template.draft.recordingPolicy.wireLogLocator == nil,
+              template.template.draft.recordingPolicy.recordPayloads
+                  == (template.template.draft.recordingPolicy.wireLogDirectory != nil),
               template.template.draft.resumePolicy == WorkLaunchResumePolicy(),
               template.template.draft.reasoningPolicy.tokenBudget == nil,
               template.template.draft.budgetPolicy.maximumTokens == nil,

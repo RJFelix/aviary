@@ -133,7 +133,11 @@ internal actor WorkAgentChildSpawnDelegate: WorkAgentSpawnDelegate {
                                 systemPromptAssembly: configuration.systemPromptAssembly,
                                 reasoningEffort: configuration.reasoningEffort,
                                 maxIterations: nil,
-                                memory: configuration.memory, recordPayloads: configuration.recordPayloads,
+                                memory: configuration.memory,
+                                recordPayloads: configuration.recordPayloads,
+                                wireLogDirectory: configuration.recordPayloads
+                                    ? configuration.wireLogURL?.deletingLastPathComponent()
+                                    : nil,
                                 makeProviderAccounting: {
                                     try await pilot.coordinator.providerAccounting(
                                         work: configuration.workRunBinding.workBinding.work, handle: handle)

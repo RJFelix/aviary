@@ -31,6 +31,7 @@ enum VisualFixtureRoute: String {
     case usageInventory = "usage-inventory-fixture"
     case usageInventoryNarrow = "usage-inventory-narrow-fixture"
     case chatWelcome = "chat-welcome-fixture"
+    case chatLogSettings = "chat-log-settings-fixture"
     case chatRecovery = "chat-recovery-fixture"
     case chatUncertain = "chat-uncertain-fixture"
     case chatCreated = "chat-created-fixture"
@@ -117,6 +118,8 @@ struct VisualFixtureView: View {
             UsageInventoryFixtureView(narrow: route == .usageInventoryNarrow)
         case .chatWelcome, .chatRecovery, .chatUncertain, .chatCreated:
             ChatVisualLearningFixture(route: route)
+        case .chatLogSettings:
+            LogSettingsFixture()
         case .requestLocations:
             VStack(alignment: .leading, spacing: 28) {
                 Text("Saved request states · design fixture").font(.headline)
@@ -145,6 +148,38 @@ struct VisualFixtureView: View {
             }.padding(.vertical, 20).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .background(Color(nsColor: .windowBackgroundColor))
         }
+    }
+}
+
+/// Real chat views with only disposable, local presentation data. No bootstrap or delivery.
+@MainActor
+private struct LogSettingsFixture: View {
+    @State private var model: AppModel
+
+    init() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aviary-log-design-" + UUID().uuidString)
+        let suite = "aviary.log-design." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let model = AppModel(home: AgentHome(root: root), presentationDefaults: defaults,
+                             modelPreferencesStore: ModelPreferencesStore(directory: root))
+        defer { try? FileManager.default.removeItem(at: root) }
+        let host = WorkHostRef("log-design-host")
+        let journal = JournalRef.workHost(host)
+        model.localWorkServiceHandshake = WorkServiceHandshakeResponse(
+            accepted: true, negotiatedVersion: WorkServiceProtocol.currentVersion,
+            supportedRange: WorkServiceProtocol.currentVersion...WorkServiceProtocol.currentVersion,
+            host: host, hostInstance: WorkHostInstanceRef(host: host, instanceID: "design", startIdentity: "design"),
+            controlJournal: journal,
+            controlCursor: JournalCursor(journal: journal, eventID: nil, sequence: 0),
+            capabilities: [.recordingDirectorySelection])
+        self.model = model
+    }
+
+    var body: some View {
+        LauncherFormBody(onStart: {}, initiallyShowsAdvanced: true).environment(model)
+            .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 

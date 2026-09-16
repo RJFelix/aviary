@@ -117,6 +117,7 @@ let linuxCoreSources: [String] = [
     "WorkServiceHostLocator.swift",
     "WorkServiceTransport.swift",
     "WireLog.swift",
+    "WireLogDirectoryStore.swift",
 ]
 let linuxSelfTestSources: [String] = [
     "ProviderUsageTests.swift",
@@ -173,6 +174,7 @@ let linuxSelfTestSources: [String] = [
     "WorkHostDaemonProcessTests.swift",
     "WorkHostWorkspaceRegistryTests.swift",
     "WorkLaunchManifestTests.swift",
+    "WireLogDirectoryStoreTests.swift",
     "WorkReducerTransitionTests.swift",
     "WorkServiceTests.swift",
     "WorkActionPresentationTests.swift",

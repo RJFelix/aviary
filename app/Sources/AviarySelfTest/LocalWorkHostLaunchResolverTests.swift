@@ -60,6 +60,7 @@ private struct LocalResolverFixture {
         modelID: String? = nil,
         workspaceID: WorkHostWorkspaceID? = nil,
         includeContextFiles: Bool = true,
+        recordPayloads: Bool = false,
         contextPolicy: String? = nil,
         resumePolicy: String? = nil
     ) throws -> WorkServiceCreateWorkRequest {
@@ -75,6 +76,7 @@ private struct LocalResolverFixture {
                 contextPolicy: contextPolicy,
                 workspaceID: workspaceID ?? self.workspaceID,
                 includeContextFiles: includeContextFiles,
+                recordPayloads: recordPayloads,
                 resumePolicy: resumePolicy),
             requestedCapabilities: [.observe, .control])
     }
@@ -262,7 +264,26 @@ func test_localWorkHostLaunchResolverDraftDoesNotPersistCredentials() throws {
 func test_localWorkHostLaunchResolverMaterializesExactRunBodies() async throws {
     let fixture = try LocalResolverFixture()
     defer { try? FileManager.default.removeItem(at: fixture.root) }
-    let draft = try fixture.resolver.draft(for: fixture.request())
+    let logStore = WireLogDirectoryStore(home: fixture.home)
+    let originalDirectory = fixture.root.appending(path: "original-logs")
+    let nextDirectory = fixture.root.appending(path: "next-logs")
+    try logStore.select(directory: originalDirectory)
+    let draft = try fixture.resolver.draft(for: fixture.request(recordPayloads: true))
+    XCTAssertEqual(draft.recordingPolicy.wireLogDirectory, originalDirectory.path)
+    XCTAssertNil(draft.recordingPolicy.wireLogLocator, "Create remains Run-free")
+    let adapter = DurableJournalBackedWorkLaunchManifestStore(
+        store: WorkLaunchManifestStore(home: fixture.home),
+        bodyAuthority: .workHost(try fixture.home.requirePersistedWorkHost()),
+        draftResolver: fixture.resolver.draftResolver)
+    let retained = try await adapter.retain(fixture.request(recordPayloads: true))
+    try logStore.select(directory: nextDirectory)
+    let retried = try await adapter.retain(fixture.request(recordPayloads: true))
+    XCTAssertEqual(retried.retainedDraftDigest, retained.retainedDraftDigest,
+                   "exact Create retry reuses its original directory after settings change")
+    XCTAssertEqual(retried.configurationDigest, retained.configurationDigest)
+    let nextDraft = try fixture.resolver.draft(for: fixture.request(recordPayloads: true))
+    XCTAssertEqual(nextDraft.recordingPolicy.wireLogDirectory, nextDirectory.path,
+                   "same resolver observes a changed host setting without restart")
     let (_, runBinding) = try fixture.template(draft: draft)
     let bodyStore = ContextBodyStore(home: fixture.home)
     let host = try fixture.home.requirePersistedWorkHost()
@@ -284,6 +305,28 @@ func test_localWorkHostLaunchResolverMaterializesExactRunBodies() async throws {
         to: runBinding, startIntent: intent, initialInputBodyReference: inputRef,
         promptAssembly: retainedAssembly)
     _ = try WorkLaunchManifestStore(home: fixture.home).save(manifest)
+    let exactURL = originalDirectory.appending(path: "run-\(runBinding.run.runID).jsonl")
+    XCTAssertEqual(manifest.recordingPolicy.wireLogLocator, exactURL.path)
+    XCTAssertEqual(try WireLog.recordedURL(home: fixture.home, identity: manifest.identity), exactURL)
+    let replacement = try draft.recordingPolicy.bound(to: RunRef("replacement-run"))
+    XCTAssertEqual(replacement.wireLogLocator,
+                   originalDirectory.appending(path: "run-replacement-run.jsonl").path)
+    let foreignHome = AgentHome(root: fixture.root.appending(path: "foreign-home"))
+    _ = try foreignHome.requirePersistedWorkHostID()
+    do {
+        _ = try WireLog.recordedURL(home: foreignHome, identity: manifest.identity)
+        XCTFail("foreign local home must not expose a host-private locator")
+    } catch {}
+    let historyFile = originalDirectory.appending(path: "run-history.jsonl")
+    try Data("{\"kind\":\"request\",\"seq\":0,\"sessionFile\":\"/sessions/saved-chat.jsonl\"}\n".utf8)
+        .write(to: historyFile)
+    let index = WireLog.buildIndex(home: fixture.home)
+    XCTAssertTrue((index.bySession.values.flatMap { $0 } + index.unattributed)
+                    .contains(where: {
+                        $0.resolvingSymlinksInPath().path == historyFile.resolvingSymlinksInPath().path
+                    }),
+                  "changing the selected folder must retain old recording discovery")
+    XCTAssertTrue(WireLog.buildIndex(home: fixture.home, maximumReadBytes: 1).scanWasTruncated)
     try "ambient mutation must not be read".write(
         to: fixture.workspace.appending(path: "AGENTS.md"), atomically: true, encoding: .utf8)
     let configuration = try await fixture.resolver.hostedConfiguration(
@@ -292,6 +335,7 @@ func test_localWorkHostLaunchResolverMaterializesExactRunBodies() async throws {
             projection: .fresh, modelContext: .launchFresh))
     let resolved = try XCTUnwrap(configuration)
     XCTAssertEqual(resolved.workRunBinding, runBinding)
+    XCTAssertEqual(resolved.wireLogURL, exactURL)
     XCTAssertEqual(resolved.systemPrompt, assembly.flattenedText)
     XCTAssertEqual(resolved.systemPromptAssembly?.flattenedDigest, assembly.flattenedDigest)
     XCTAssertTrue(resolved.systemPrompt.contains("initial context marker"))
