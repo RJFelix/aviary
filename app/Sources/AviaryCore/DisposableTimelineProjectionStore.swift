@@ -2443,8 +2443,11 @@ public struct DisposableTimelineProjectionStore: Sendable {
             schemaVersion: Self.schemaVersion, objectID: objectID,
             bodyDigest: objectID, body: body)
         let data = try Self.canonicalJSON(envelope)
-        guard data.count <= limits.maximumReducerHeadBytes,
-              data.count <= limits.maximumObjectBytes else {
+        // `maximumReducerHeadBytes` bounds the decoded reducer bytes above. The durable JSON
+        // envelope base64-encodes those bytes, so applying the same bound to the serialized
+        // object rejects valid reducer heads near the decoded limit. The ordinary object bound
+        // is the independent allocation/storage ceiling for that representation.
+        guard data.count <= limits.maximumObjectBytes else {
             throw StoreError.invalidCommit(.oversize)
         }
         try writeContentAddressedLocked(data, objectID: objectID, suffix: "reducer")
@@ -2458,6 +2461,10 @@ public struct DisposableTimelineProjectionStore: Sendable {
         _ descriptor: OpaquePayloadDescriptor, namespaceID: String, sourceID: String
     ) throws -> Data {
         notify(.readReducerHead)
+        guard descriptor.byteCount >= 0,
+              descriptor.byteCount <= limits.maximumReducerHeadBytes else {
+            throw StoreError.cacheUnavailable(.invalidReducerHead)
+        }
         let data = try readObjectLocked(objectID: descriptor.objectID, suffix: "reducer")
         do {
             let envelope = try JSONDecoder().decode(ReducerEnvelope.self, from: data)
@@ -2471,7 +2478,8 @@ public struct DisposableTimelineProjectionStore: Sendable {
                   envelope.body.mediaType == descriptor.mediaType,
                   envelope.body.reducerSchemaVersion == descriptor.schemaVersion,
                   envelope.body.bytes.count == descriptor.byteCount,
-                  data.count <= limits.maximumReducerHeadBytes else {
+                  envelope.body.bytes.count <= limits.maximumReducerHeadBytes,
+                  data.count <= limits.maximumObjectBytes else {
                 throw StoreError.cacheUnavailable(.checksumMismatch)
             }
             return envelope.body.bytes

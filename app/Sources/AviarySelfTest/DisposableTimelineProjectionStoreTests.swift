@@ -680,6 +680,42 @@ func testDisposableProjectionStoreFreshCommitLoadAndBodies() throws {
         try DisposableTimelineProjectionStore.canonicalJSON(commit))
 }
 
+func testDisposableProjectionStoreBoundsDecodedReducerSeparatelyFromEnvelope() throws {
+    let root = try projectionStoreRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let maximumReducerBytes = 200_000
+    let reducerBytes = Data(repeating: 0xa5, count: 190_000)
+    let store = try DisposableTimelineProjectionStore(
+        directory: root.appending(path: "store", directoryHint: .isDirectory),
+        journal: projectionStoreJournal,
+        limits: .init(maximumReducerHeadBytes: maximumReducerBytes))
+    let rows = projectionStoreRows(start: 1, count: 2)
+    let snapshot = try store.commit(projectionStoreCommit(
+        rows: rows, currentBucket: .init(bucketStart: 1, rows: rows),
+        reducerHead: .init(
+            mediaType: "application/x-aviary-reducer-head", schemaVersion: 3,
+            bytes: reducerBytes)))
+
+    let descriptor = try XCTUnwrap(snapshot.reducerHead)
+    XCTAssertEqual(descriptor.byteCount, reducerBytes.count)
+    let object = store.directory.appending(
+        path: "objects/\(descriptor.objectID).reducer", directoryHint: .notDirectory)
+    let encodedBytes = try XCTUnwrap(
+        FileManager.default.attributesOfItem(atPath: object.path)[.size] as? NSNumber).intValue
+    XCTAssertTrue(encodedBytes > maximumReducerBytes)
+    XCTAssertEqual(try store.loadReducerHead(proving: snapshot.source), reducerBytes)
+
+    let stricter = try DisposableTimelineProjectionStore(
+        directory: store.directory, journal: projectionStoreJournal,
+        limits: .init(maximumReducerHeadBytes: reducerBytes.count - 1))
+    do {
+        _ = try stricter.load(proving: snapshot.source)
+        XCTFail("a decoded reducer larger than the configured reducer bound must fail closed")
+    } catch DisposableTimelineProjectionStore.StoreError.cacheUnavailable(.invalidReducerHead) {
+        XCTAssertTrue(true)
+    }
+}
+
 func testDisposableProjectionStoreRewritesPartialThenSealsImmutableBucket() throws {
     let root = try projectionStoreRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -1498,6 +1534,9 @@ let casesDisposableTimelineProjectionStore: [Case] = [
     }),
     ("phase3 projection store fresh commit/load and bodies", {
         try testDisposableProjectionStoreFreshCommitLoadAndBodies()
+    }),
+    ("phase3 projection store bounds decoded reducer separately from envelope", {
+        try testDisposableProjectionStoreBoundsDecodedReducerSeparatelyFromEnvelope()
     }),
     ("phase3 projection store rewrites partial then seals immutable bucket", {
         try testDisposableProjectionStoreRewritesPartialThenSealsImmutableBucket()
