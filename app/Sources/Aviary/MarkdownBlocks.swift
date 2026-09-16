@@ -1,4 +1,5 @@
 import AviaryCore
+import AppKit
 import SwiftUI
 
 /// Model prose, rendered with block structure.
@@ -13,6 +14,7 @@ import SwiftUI
 struct MarkdownBody: View {
     var text: String
     var query: String = ""
+    var onAskAgentToRun: ((SuggestedShellCommand) -> Void)?
 
     private var blocks: [MarkdownBlock] { MarkdownParser.blocks(from: text) }
 
@@ -24,7 +26,7 @@ struct MarkdownBody: View {
         } else {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                    BlockView(block: block)
+                    BlockView(block: block, onAskAgentToRun: onAskAgentToRun)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -34,6 +36,7 @@ struct MarkdownBody: View {
 
 private struct BlockView: View {
     var block: MarkdownBlock
+    var onAskAgentToRun: ((SuggestedShellCommand) -> Void)?
 
     var body: some View {
         switch block {
@@ -70,8 +73,9 @@ private struct BlockView: View {
             }
             .fixedSize(horizontal: false, vertical: true)
 
-        case let .code(language, source):
-            FencedCode(language: language, source: source)
+        case let .code(language, source, isClosed):
+            FencedCode(language: language, source: source,
+                       onAskAgentToRun: isClosed ? onAskAgentToRun : nil)
 
         case .rule:
             Divider().padding(.vertical, 2)
@@ -135,17 +139,30 @@ private struct ListItemRow: View {
 private struct FencedCode: View {
     var language: String?
     var source: String
+    var onAskAgentToRun: ((SuggestedShellCommand) -> Void)?
+    @State private var copied = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let language, !language.isEmpty {
-                Text(language)
+            HStack(spacing: 8) {
+                Text(language.flatMap { $0.isEmpty ? nil : $0 } ?? "code")
                     .font(.system(size: 9, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .textCase(.uppercase)
-                    .padding(.horizontal, 10)
-                    .padding(.top, 6)
+                Spacer(minLength: 4)
+                Button {
+                    NSPasteboard.general.clearContents()
+                    copied = NSPasteboard.general.setString(source, forType: .string)
+                } label: {
+                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10))
+                .accessibilityLabel("Copy code")
+                .help("Copy this code block without its Markdown fence")
             }
+            .padding(.horizontal, 10)
+            .padding(.top, 7)
             ScrollView(.horizontal, showsIndicators: false) {
                 // Highlighting only where it is actually right: `PythonHighlighter` is a
                 // Python and shell lexer, and applying it to Rust or JSON invents syntax.
@@ -162,7 +179,22 @@ private struct FencedCode: View {
                 .padding(.vertical, 8)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            if let onAskAgentToRun,
+               let command = SuggestedShellCommand.make(language: language, source: source) {
+                Divider()
+                Button { onAskAgentToRun(command) } label: {
+                    Label("Ask agent to run…", systemImage: "bubble.left.and.text.bubble.right")
+                        .font(.system(size: 11, weight: .medium))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .padding(.horizontal, 10).padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Design.accent)
+                .help("Review this command and prepare a message in this chat. Nothing runs until you send it.")
+            }
         }
+        .onChange(of: source) { _, _ in copied = false }
         .background(Design.codeBackground)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(

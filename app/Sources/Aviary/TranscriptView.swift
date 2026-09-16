@@ -34,6 +34,7 @@ struct TranscriptView: View {
     var reviewDescriptorsByMessageID: [String: WorkServiceArtifactDescriptor] = [:]
     var onReviewMessage: ((String) -> Void)?
     var onForwardMessage: ((String) -> Void)?
+    var onAskAgentToRun: ((SuggestedShellCommand) -> Void)?
     var onSelect: ((TranscriptItem) -> Void)?
 
     @State private var scrollTarget: String?
@@ -76,6 +77,7 @@ struct TranscriptView: View {
                                     isLast: item.id == visible.last?.id && isStreaming && indicatesCurrentActivity,
                                     continuesGroup: continuesPrevious,
                                     onForwardMessage: onForwardMessage,
+                                    onAskAgentToRun: onAskAgentToRun,
                                     onSelect: onSelect)
                                 if let descriptor = reviewDescriptorsByMessageID[item.id],
                                    let onReviewMessage {
@@ -316,6 +318,7 @@ struct TranscriptRow: View {
     var isLast: Bool
     var continuesGroup: Bool = false
     var onForwardMessage: ((String) -> Void)?
+    var onAskAgentToRun: ((SuggestedShellCommand) -> Void)?
     var onSelect: ((TranscriptItem) -> Void)?
 
     @State private var showRaw = false
@@ -543,7 +546,8 @@ struct TranscriptRow: View {
                 case .thinking(let text):
                     if !hideThinking { ThinkingBlock(text: text) }
                 case .text(let text):
-                    MarkdownText(text: text, query: searchQuery)
+                    MarkdownText(text: text, query: searchQuery,
+                                 onAskAgentToRun: isLast ? nil : onAskAgentToRun)
                 case .toolCall:
                     // Rendered as its own row so the code sits next to its output.
                     EmptyView()
@@ -957,8 +961,11 @@ struct ThinkingBlock: View {
 struct MarkdownText: View {
     var text: String
     var query: String = ""
+    var onAskAgentToRun: ((SuggestedShellCommand) -> Void)?
 
-    var body: some View { MarkdownBody(text: text, query: query) }
+    var body: some View {
+        MarkdownBody(text: text, query: query, onAskAgentToRun: onAskAgentToRun)
+    }
 }
 
 /// Text with every occurrence of the search query highlighted.

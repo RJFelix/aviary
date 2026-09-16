@@ -22,7 +22,7 @@ public enum MarkdownBlock: Equatable, Sendable {
     case paragraph(String)
     case list(MarkdownList)
     case quote([MarkdownBlock])
-    case code(language: String?, source: String)
+    case code(language: String?, source: String, isClosed: Bool = true)
     case rule
     case table(MarkdownTable)
 }
@@ -152,6 +152,7 @@ public enum MarkdownParser {
         let opener = lines[start].trimmingCharacters(in: .whitespaces)
         let info = String(opener.dropFirst(fence.count)).trimmingCharacters(in: .whitespaces)
         var body: [String] = []
+        var isClosed = false
         var i = start + 1
         while i < lines.count {
             let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
@@ -159,6 +160,7 @@ public enum MarkdownParser {
                close.count >= fence.count,
                trimmed.drop(while: { $0 == fence.char }).isEmpty
             {
+                isClosed = true
                 i += 1
                 break
             }
@@ -168,7 +170,7 @@ public enum MarkdownParser {
         // An unclosed fence runs to the end rather than swallowing the block: a truncated
         // reply is the common cause, and showing the code is better than showing nothing.
         return (.code(language: info.isEmpty ? nil : info.lowercased(),
-                      source: body.joined(separator: "\n")), i)
+                      source: body.joined(separator: "\n"), isClosed: isClosed), i)
     }
 
     // MARK: Headings and rules

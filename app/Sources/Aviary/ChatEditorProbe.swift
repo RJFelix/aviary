@@ -1,4 +1,5 @@
 import AppKit
+import AviaryCore
 
 /// Native key-event regression using a private editor, never a real chat or provider.
 enum ChatEditorProbe {
@@ -68,6 +69,22 @@ enum ChatEditorProbe {
         target.setDraft(" \n ")
         require(!AgentMessageDraftTransfer.prepare(transferred, for: target)
                 && target.draft == " \n ", "whitespace draft must be preserved")
+        target.setDraft("")
+        let shell = SuggestedShellCommand.make(language: "bash", source: "npm run dev\n")!
+        require(AgentMessageDraftTransfer.prepare(shell.draftText, for: target),
+                "shell request prepares an empty draft")
+        require(target.draft == shell.draftText && target.items.isEmpty && !target.serviceCommandInFlight,
+                "preparing a shell request does not dispatch or execute")
+        require(!AgentMessageDraftTransfer.prepare("replace command", for: target)
+                && target.draft == shell.draftText, "shell draft cannot be overwritten")
+        let unreadable = LiveRun.productionRunPaneVisualFixture(
+            items: [], pendingInputs: [], deliveryAttention: [], actions: [], draft: "",
+            draftPersistenceState: .loadFailed)
+        require(AgentMessageDraftTransfer.unavailableReason(for: unreadable) == "saved draft needs repair",
+                "unreadable retained draft is not an empty draft")
+        require(!AgentMessageDraftTransfer.prepare(shell.draftText, for: unreadable)
+                && unreadable.draft.isEmpty && unreadable.draftPersistenceState == .loadFailed,
+                "shortcut cannot trigger retained-draft repair")
         print("chat editor: viewport, Return/Shift/Command/keypad/repeat, disabled, IME and draft forwarding PASS")
         exit(0)
     }

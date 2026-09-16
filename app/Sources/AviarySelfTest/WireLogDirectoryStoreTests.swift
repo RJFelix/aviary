@@ -105,7 +105,7 @@ func testWireLogDirectoryStoreExplicitResetBacksUpMalformedBytesAndKeepsLogs() t
     XCTAssertEqual(exactMalformedBackups.count, 1,
                    "reset must preserve the exact bytes of the malformed regular config")
 
-    let reopened = try WireLogDirectoryStore(
+    let reopened = WireLogDirectoryStore(
         home: AgentHome(root: store.configurationURL.deletingLastPathComponent()))
     XCTAssertEqual(try reopened.load(), selection)
 }

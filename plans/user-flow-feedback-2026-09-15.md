@@ -35,9 +35,19 @@ authoritative; a calmer screen must not imply receipt or successful execution.
 - Execute suggested shell commands: explicit action with visible command, project, destination,
   and output/cancellation lifecycle. Never infer permission to execute text merely by rendering
   a model response. Do not bolt an untracked shell onto the GUI-owned chat.
+  First slice now provides Copy code and Ask agent to run for explicit assistant shell fences.
+  The latter shows the exact command and this chat's project, then prepares an empty composer;
+  it never sends automatically or replaces a draft. Direct execution is still separate: the
+  current service has no user shell-execution endpoint and the runtime's `sh()` subprocess
+  lacks an independently stoppable process Handle. A true Run/Output/Stop surface needs a
+  Work-Host-owned process lifecycle, not a renamed Send or GUI-owned shell.
 - Provider progress: show supplied summaries when available; some providers deliver no visible
   reasoning summary. Do not invent progress or expose hidden chain of thought. Current action
   and elapsed state remain the honest fallback.
+  Producer audit found that Codex summary and reasoning events currently share `thinkingDelta`;
+  Anthropic/Claude Code thinking deltas are not guaranteed short summaries. Preserve a distinct
+  summary provenance before adding summary text to the hosted progress strip. Do not relabel
+  arbitrary thinking text as a task summary or synthesize progress with another model.
 - Activity: lightweight task-oriented overview first; retain the full diagnostic view separately.
 - History: broader recorded/imported transcript browser, not another competing live-chat home.
   Consider a detailed layout of Chats later; preserve valuable external transcripts read-only.
@@ -88,3 +98,20 @@ active Work to demonstrate a presentation fix. Record actual receipts after comp
   wraps and Change remains readable. Screenshot is a fixture, not a live picker interaction.
 - The original local service remains PID 70830 and was not restarted. GUI was closed during
   this slice. Signed bundle verification is the final packaging check before handoff.
+
+### September 16: approved restart and command affordances
+
+- The approved service restart exposed a cold-cache defect: a 201,786-byte valid reducer head
+  became a 269,800-byte JSON/base64 envelope, incorrectly compared against the 256 KiB decoded
+  limit. The store now separately enforces decoded-head and encoded-object bounds. Canonical
+  chat/Work journals need no migration or edits.
+- Explicit, closed assistant shell fences offer Copy code and Ask agent to run. The second
+  captures both command and originating chat, shows project/command, and only stages a draft.
+  Streaming/unclosed/quoted/output fences cannot initiate that action. Existing, unreadable,
+  or unresolved drafts are never repaired or overwritten by this shortcut.
+- Independent review caught and closed incomplete-fence, switched-chat, unreadable-draft, and
+  execution-promise defects. This is agent-mediated preparation, not direct shell execution.
+- Debug app/helper/SelfTest builds pass. Store, Markdown, shell suggestion, message-transfer,
+  and chat-interaction checks pass (58 cases / 360 assertions); native editor/draft probe passes.
+  Narrow 380-point code and confirmation fixtures were inspected. Final signed deployment and
+  real catalog verification are separate from these component receipts.

@@ -3582,11 +3582,12 @@ let cases5: [Case] = [
         let blocks = MarkdownParser.blocks(from: source)
         XCTAssertEqual(blocks.count, 3)
         XCTAssertEqual(blocks[0], .paragraph("Here:"))
-        guard case let .code(language, body) = blocks[1] else {
+        guard case let .code(language, body, isClosed) = blocks[1] else {
             XCTFail("expected a code block, got \(blocks[1])")
             return
         }
         XCTAssertEqual(language, "python")
+        XCTAssertTrue(isClosed)
         XCTAssertEqual(body, "def f():\n    # not a heading\n    return \"- not a list\"")
         XCTAssertEqual(blocks[2], .paragraph("done"))
     }),
@@ -3594,7 +3595,7 @@ let cases5: [Case] = [
     ("markdown: an unclosed fence runs to the end rather than swallowing everything", {
         // A truncated reply is the common cause. Showing the code beats showing nothing.
         let blocks = MarkdownParser.blocks(from: "```\nhalf a thing")
-        XCTAssertEqual(blocks, [.code(language: nil, source: "half a thing")])
+        XCTAssertEqual(blocks, [.code(language: nil, source: "half a thing", isClosed: false)])
     }),
 
     ("markdown: a longer fence contains a shorter one", {
@@ -7162,6 +7163,7 @@ await Harness.run(
         + casesServiceBackedGUIControlPolicy
         + casesServiceBackedRefreshSchedulingPolicy
         + casesChatInteractionPresentation
+        + casesSuggestedShellCommand
         + [
             ("message transfer: exact authored text", { try test_transcriptMessageTransferPreservesExactRoleText() }),
             ("message transfer: user whitespace", { try test_transcriptMessageTransferUsesUserBlocksOnly() }),

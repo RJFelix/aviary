@@ -32,6 +32,8 @@ enum VisualFixtureRoute: String {
     case usageInventoryNarrow = "usage-inventory-narrow-fixture"
     case chatWelcome = "chat-welcome-fixture"
     case chatLogSettings = "chat-log-settings-fixture"
+    case suggestedCommand = "suggested-command-fixture"
+    case suggestedCommandConfirmation = "suggested-command-confirmation-fixture"
     case chatRecovery = "chat-recovery-fixture"
     case chatUncertain = "chat-uncertain-fixture"
     case chatCreated = "chat-created-fixture"
@@ -64,6 +66,14 @@ struct VisualFixtureView: View {
         switch route {
         case .cockpit:
             FixtureCockpitView()
+        case .suggestedCommand:
+            MarkdownBody(text: "Run the project locally:\n\n```bash\nnpm install\nnpm run dev\n```\n\nThen open http://localhost:3000.",
+                         onAskAgentToRun: { _ in })
+                .padding(20)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background(Color(nsColor: .windowBackgroundColor))
+        case .suggestedCommandConfirmation:
+            SuggestedCommandConfirmationFixture()
         case .serviceChat, .serviceChatNarrow:
             FixtureServiceConversationView(narrow: route.isNarrow)
         case .productionDelivery, .productionDeliveryNarrow:
@@ -148,6 +158,35 @@ struct VisualFixtureView: View {
             }.padding(.vertical, 20).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .background(Color(nsColor: .windowBackgroundColor))
         }
+    }
+}
+
+/// Real chat views with only disposable, local presentation data. No bootstrap or delivery.
+@MainActor
+private struct SuggestedCommandConfirmationFixture: View {
+    private let model: AppModel
+    private let run: LiveRun
+
+    init() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aviary-command-design-" + UUID().uuidString)
+        let suite = "aviary.command-design." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        self.model = AppModel(home: AgentHome(root: root), presentationDefaults: defaults,
+                              modelPreferencesStore: ModelPreferencesStore(directory: root))
+        defer { try? FileManager.default.removeItem(at: root) }
+        self.run = LiveRun.productionRunPaneVisualFixture(
+            items: [], pendingInputs: [], deliveryAttention: [], actions: [], draft: "")
+        model.runs = [run]
+    }
+
+    var body: some View {
+        SuggestedCommandSheet(
+            command: SuggestedShellCommand.make(language: "bash", source: "npm install\nnpm run dev")!,
+            run: run)
+            .environment(model)
+            .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 

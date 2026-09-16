@@ -193,6 +193,7 @@ struct AgentMessageForwardingView: View {
         if run.errorBanner != nil { return "needs attention" }
         if run.serviceCommandAttemptActive { return "operation in progress" }
         if run.draftHandoff != nil { return "delivery unresolved" }
+        if run.draftPersistenceState == .loadFailed { return "saved draft needs repair" }
         if !run.draft.isEmpty {
             return "draft already present"
         }

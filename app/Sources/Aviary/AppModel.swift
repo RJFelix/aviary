@@ -5842,6 +5842,7 @@ final class LiveRun: Identifiable {
         commandState: SessionCommandState = .running,
         commandInFlight: Bool = false,
         draftHandoff: ServiceBackedDraftHandoff? = nil,
+        draftPersistenceState: LiveRunDraftPersistenceState = .memoryOnly,
         commandNotice: RunCommandNotice? = nil,
         errorBanner: String? = nil,
         projectionOmissions: [WorkServiceOmission] = [],
@@ -5864,6 +5865,7 @@ final class LiveRun: Identifiable {
         run.isEnding = commandState == .ending
         run.serviceCommandInFlight = commandInFlight
         run.draftHandoff = draftHandoff
+        run.draftPersistenceState = draftPersistenceState
         run.commandNotice = commandNotice
         run.errorBanner = errorBanner
         run.serviceProjectionOmissions = projectionOmissions

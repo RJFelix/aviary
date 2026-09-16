@@ -236,6 +236,11 @@ struct RunPane: View {
         let id = UUID()
         let text: String
     }
+    private struct SelectedCommand: Identifiable {
+        let id = UUID()
+        let command: SuggestedShellCommand
+        let run: LiveRun
+    }
 
     /// One sheet value captures both sides of the review association at the tap boundary.
     /// Keeping this as one item avoids an `isPresented` closure observing a newer descriptor
@@ -257,6 +262,7 @@ struct RunPane: View {
     @State private var selectedItem: TranscriptItem?
     @State private var selectedAction: SelectedAction?
     @State private var forwardedMessage: ForwardedMessage?
+    @State private var selectedCommand: SelectedCommand?
     @State private var confirmEndRun = false
     @State private var showInputDeliveryReview = false
     @State private var showCockpitInspector = false
@@ -413,6 +419,7 @@ struct RunPane: View {
                             run: run, descriptor: descriptor)
                     },
                     onForwardMessage: { forwardedMessage = ForwardedMessage(text: $0) },
+                    onAskAgentToRun: { selectedCommand = SelectedCommand(command: $0, run: run) },
                     onSelect: { selectedItem = $0 })
                 Divider()
                 composer
@@ -456,6 +463,9 @@ struct RunPane: View {
         .sheet(item: $forwardedMessage) { message in
             AgentMessageForwardingView(text: message.text,
                 sourceProject: run.config.cwd, sourceRunID: run.id)
+        }
+        .sheet(item: $selectedCommand) { selection in
+            SuggestedCommandSheet(command: selection.command, run: selection.run)
         }
         .sheet(isPresented: $showInputDeliveryReview) {
             InputDeliveryReviewSheet(
