@@ -5,6 +5,7 @@ import AviaryCore
 /// this GUI's live attachments with the canonical attention inbox, so Work remains visible when
 /// it belongs to another GUI or has already completed.
 struct CockpitView: View {
+    static let inlineRailMinimumWidth: CGFloat = 900
     @Environment(AppModel.self) private var model
     /// Selected like a run, not sheet-presented: the New Session card lives in the same rail
     /// as every other run, and choosing it fills the same detail pane a run's chat would use
@@ -12,6 +13,10 @@ struct CockpitView: View {
     @State private var composingNewSession = false
     @State private var showsConnections = false
     @State private var showsCompactChatList = false
+    @State private var showsHiddenChats = false
+    @State private var hiddenChatIDs: Set<String> = []
+    @State private var hiddenChatPreferencesLoaded = false
+    @State private var hiddenChatPreferencesError: String?
     @State private var selectedCanonicalEntryID: String?
     /// Selecting a Session does not select one of its Works. This exact key is set only by the
     /// relationship card in the Session pane, so several attached Works never collapse by order.
@@ -20,7 +25,7 @@ struct CockpitView: View {
     var body: some View {
         GeometryReader { geo in
             Group {
-                if geo.size.width < 900 {
+                if geo.size.width < Self.inlineRailMinimumWidth {
                     VStack(spacing: 0) {
                         HStack {
                             Button {
@@ -56,6 +61,8 @@ struct CockpitView: View {
         .onAppear { if model.newChatRequested { beginNewChat() } }
         .onChange(of: model.requestedChatSelectionID) { _, _ in selectRequestedChat() }
         .onAppear { selectRequestedChat() }
+        .onAppear { loadHiddenChatPreferences() }
+        .onChange(of: model.pendingChats) { _, _ in loadHiddenChatPreferences() }
         .sheet(isPresented: $showsConnections) { ChatConnectionsView() }
     }
 
@@ -69,9 +76,11 @@ struct CockpitView: View {
     /// When a canonical row exists it owns the rail card and routes to the richer live pane.
     private var unrepresentedRuns: [LiveRun] {
         ongoingRuns.filter { run in
-            !canonicalEntries.contains { entry in
+            let hasCanonicalEntry = allCanonicalEntries.contains { entry in
                 matchingRuns(for: entry).contains { $0.id == run.id }
             }
+            guard !hasCanonicalEntry else { return false }
+            return isShown(identity(for: run))
         }
     }
 
@@ -89,8 +98,13 @@ struct CockpitView: View {
 
     /// The canonical projection owns every authority-qualified Session row. Bare Session IDs are
     /// never used to collapse authorities; live attachments are joined only by their exact key.
-    private var canonicalEntries: [CanonicalSessionWorkspaceRailEntry] {
+    private var allCanonicalEntries: [CanonicalSessionWorkspaceRailEntry] {
         model.canonicalWorkspaceRail.entries
+    }
+
+    private var canonicalEntries: [CanonicalSessionWorkspaceRailEntry] {
+        guard hiddenChatPreferencesLoaded else { return allCanonicalEntries }
+        return allCanonicalEntries.filter { isShown(identity(for: $0)) }
     }
 
     private var focusedCanonicalEntryID: String? {
@@ -161,25 +175,57 @@ struct CockpitView: View {
                         .font(Design.sectionTitle).tracking(0.6)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Text("\(model.pendingChats.count + unrepresentedRuns.count + canonicalEntries.count)")
+                    Text("\(railPendingChats.count + unrepresentedRuns.count + canonicalEntries.count)")
                         .font(Design.numeric(10, weight: .semibold))
                         .foregroundStyle(.tertiary)
-                    Button { showsConnections = true } label: {
-                        Image(systemName: "ellipsis.circle")
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Manage agent connections")
-                    .help("Manage agent connections and reopen detached chats")
                 }
                 .padding(.horizontal, 12).padding(.top, 12)
 
-                NewRunRailCard(selected: composingNewSession) { beginNewChat() }
+                // The reclaimed titlebar can show this pane's heading, but macOS owns pointer
+                // events there. Keep interactive list controls below it alongside New chat.
+                HStack(spacing: 6) {
+                    NewRunRailCard(selected: composingNewSession) { beginNewChat() }
+                    Menu {
+                        Button(
+                            showsHiddenChats ? "Back to chats" : "Show hidden chats",
+                            systemImage: showsHiddenChats ? "eye" : "eye.slash") {
+                                showsHiddenChats.toggle()
+                            }
+                        if hiddenChatCount == 0 {
+                            Text("No hidden chats in this list")
+                        } else {
+                            Text("\(hiddenChatCount) hidden chat\(hiddenChatCount == 1 ? "" : "s")")
+                            if showsHiddenChats {
+                                Text("Restore a chat from its context menu")
+                            }
+                        }
+                        Divider()
+                        Button("Manage agent connections", systemImage: "network") {
+                            showsConnections = true
+                        }
+                    } label: {
+                        Image(systemName: showsHiddenChats ? "eye.slash.circle" : "ellipsis.circle")
+                            .frame(width: 26, height: 32)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .accessibilityLabel("Chat list options")
+                    .help("Hidden chats and agent connections")
+                }
+
+                if showsHiddenChats {
+                    railHeading("HIDDEN CHATS")
+                }
 
                 if let error = model.pendingChatStoreError {
                     Text(error).font(.caption).foregroundStyle(Design.danger)
                         .textSelection(.enabled).padding(8)
                 }
-                ForEach(model.pendingChats) { chat in
+                if let error = hiddenChatPreferencesError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(Design.danger)
+                        .textSelection(.enabled).padding(8)
+                }
+                ForEach(railPendingChats) { chat in
                     let state = PendingChatVisualState(
                         phase: chat.phase, isPreparing: model.pendingChatIsPreparing(chat),
                         conversationCreated: chat.createdAssociation != nil)
@@ -221,6 +267,9 @@ struct CockpitView: View {
                     .accessibilityRemoveTraits(
                         model.selectedPendingChatID == chat.id && !composingNewSession
                             ? [] : .isSelected)
+                    .contextMenu {
+                        chatVisibilityMenu(identity: identity(for: chat))
+                    }
                 }
 
                 if !needsAttentionEntries.isEmpty {
@@ -241,6 +290,13 @@ struct CockpitView: View {
                         selectedCanonicalEntryID = nil
                         selectedCanonicalWorkTarget = nil
                         composingNewSession = false
+                    }
+                    .contextMenu {
+                        if let identity = identity(for: run) {
+                            chatVisibilityMenu(identity: identity)
+                        } else {
+                            Text("This chat has no durable identity yet")
+                        }
                     }
                 }
 
@@ -397,9 +453,118 @@ struct CockpitView: View {
             selectedCanonicalWorkTarget = nil
             composingNewSession = false
         }
+        .contextMenu {
+            chatVisibilityMenu(identity: identity(for: entry))
+        }
+    }
+
+    private var railPendingChats: [PendingChat] {
+        guard hiddenChatPreferencesLoaded else { return model.pendingChats }
+        return model.pendingChats.filter { isShown(identity(for: $0)) }
+    }
+
+    private var hiddenChatCount: Int {
+        let known = Set(allCanonicalEntries.map { identity(for: $0).rawValue }
+            + model.pendingChats.map { identity(for: $0).rawValue }
+            + ongoingRuns.compactMap { identity(for: $0)?.rawValue })
+        return known.intersection(hiddenChatIDs).count
+    }
+
+    private func identity(for chat: PendingChat) -> ChatVisibilityIdentity {
+        if let association = chat.createdAssociation {
+            return .nativeSession(journal: association.workSession.sessionJournal)
+        }
+        return .pending(chat.id)
+    }
+
+    private func identity(for entry: CanonicalSessionWorkspaceRailEntry) -> ChatVisibilityIdentity {
+        .nativeSession(journal: entry.sessionJournal)
+    }
+
+    private func identity(for run: LiveRun) -> ChatVisibilityIdentity? {
+        if let journal = run.serviceAttachmentKey?.workSession.sessionJournal {
+            return .nativeSession(journal: journal)
+        }
+        if let sessionID = run.sessionID, !sessionID.isEmpty {
+            return ChatVisibilityIdentity.legacySession(id: sessionID)
+        }
+        if let sessionFile = run.sessionFile {
+            let id = URL(fileURLWithPath: sessionFile).deletingPathExtension().lastPathComponent
+            return ChatVisibilityIdentity.legacySession(id: id)
+        }
+        return nil
+    }
+
+    private func isShown(_ identity: ChatVisibilityIdentity?) -> Bool {
+        guard hiddenChatPreferencesLoaded else { return true }
+        guard let identity else { return !showsHiddenChats }
+        return hiddenChatIDs.contains(identity.rawValue) == showsHiddenChats
+    }
+
+    @ViewBuilder
+    private func chatVisibilityMenu(identity: ChatVisibilityIdentity) -> some View {
+        let hidden = hiddenChatIDs.contains(identity.rawValue)
+        Button(hidden ? "Restore chat" : "Hide chat", systemImage: hidden ? "eye" : "eye.slash") {
+            setChatHidden(!hidden, identity: identity)
+        }
+        .disabled(!hiddenChatPreferencesLoaded)
+        if hiddenChatPreferencesError != nil {
+            Text("Hidden-chat preferences are unavailable")
+        }
+    }
+
+    private func loadHiddenChatPreferences() {
+        do {
+            hiddenChatIDs = Set(try ChatVisibilityStore(home: model.home).load().map(\.rawValue))
+            hiddenChatPreferencesLoaded = true
+            hiddenChatPreferencesError = nil
+        } catch {
+            hiddenChatPreferencesLoaded = false
+            hiddenChatPreferencesError = "Hidden chats could not be loaded: \(error.localizedDescription)"
+        }
+    }
+
+    private func setChatHidden(_ hidden: Bool, identity: ChatVisibilityIdentity) {
+        do {
+            var identities: Set<ChatVisibilityIdentity> = [identity]
+            if !hidden {
+                // During startup both identities may be retained. Explicit Restore wins even
+                // if the accepted request has not yet retired its temporary list card.
+                for chat in model.pendingChats where self.identity(for: chat) == identity {
+                    identities.insert(.pending(chat.id))
+                }
+            }
+            let updated = try ChatVisibilityStore(home: model.home)
+                .setHidden(hidden, identities: identities)
+            hiddenChatIDs = Set(updated.map(\.rawValue))
+            hiddenChatPreferencesLoaded = true
+            hiddenChatPreferencesError = nil
+            if hidden {
+                if let selected = model.selectedPendingChatID,
+                   let chat = model.pendingChats.first(where: { $0.id == selected }),
+                   identity == self.identity(for: chat) {
+                    model.selectedPendingChatID = nil
+                }
+                if let selectedID = selectedCanonicalEntryID,
+                   allCanonicalEntries.contains(where: {
+                       $0.id == selectedID && identity == self.identity(for: $0)
+                   }) {
+                    selectedCanonicalEntryID = nil
+                    selectedCanonicalWorkTarget = nil
+                }
+                if let focused = model.focusedRunID,
+                   let run = model.runs.first(where: { $0.id == focused }),
+                   self.identity(for: run) == identity {
+                    model.focusedRunID = nil
+                }
+            }
+        } catch {
+            hiddenChatPreferencesError = "Hidden chat was not changed: \(error.localizedDescription)"
+        }
     }
 
     private func beginNewChat() {
+        showsHiddenChats = false
         showsCompactChatList = false
         composingNewSession = true
         model.selectedPendingChatID = nil

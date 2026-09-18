@@ -7,25 +7,38 @@ struct RootView: View {
     @State private var chatWindowTitle: String?
     @State private var chatWindowSubtitle: String?
 
+    private var isChatWorkspace: Bool { model.section == .cockpit || model.section == .live }
+
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView()
                 .navigationSplitViewColumnWidth(min: 196, ideal: 216, max: 280)
         } detail: {
-            detail
+            GeometryReader { geometry in
+                detail
                 // An explicit ground for the detail column. Without it the column has no
                 // background of its own, which leaves screens whose content does not fill
                 // the height sitting on undefined pixels.
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(nsColor: .windowBackgroundColor))
-                .toolbar { toolbarContent }
-                .environment(\.usesChatWindowTitle, model.section == .cockpit || model.section == .live)
+                // Chats already have a list header and conversation header. A second full-width
+                // titlebar spends a whole row saying the same thing and separates the two panes.
+                .ignoresSafeArea(.container,
+                    edges: isChatWorkspace && columnVisibility != .detailOnly
+                        && geometry.size.width >= CockpitView.inlineRailMinimumWidth ? .top : [])
+            }
+                // In compact mode the Chats/back button is interactive at the top of the pane;
+                // keep it below native chrome rather than drawing it into the titlebar hit area.
+                .toolbar { if !isChatWorkspace { toolbarContent } }
+                .environment(\.usesChatWindowTitle, false)
                 .onPreferenceChange(ChatWindowTitleKey.self) { chatWindowTitle = $0 }
                 .onPreferenceChange(ChatWindowSubtitleKey.self) { chatWindowSubtitle = $0 }
-                .navigationTitle((model.section == .cockpit || model.section == .live)
-                    ? (chatWindowTitle ?? model.section.title) : model.section.title)
-                .navigationSubtitle(subtitle)
+                .navigationTitle(isChatWorkspace ? "" : model.section.title)
+                .navigationSubtitle(isChatWorkspace ? "" : subtitle)
         }
+        // Keep native close/minimize/zoom controls. Hiding windowToolbar also hides those
+        // controls on the real SwiftUI window (the snapshot NSWindow does not reproduce it).
+        .toolbarBackground(isChatWorkspace ? .hidden : .automatic, for: .windowToolbar)
         .sheet(isPresented: Binding(
             get: { model.showCommandPalette },
             set: { model.showCommandPalette = $0 }))
@@ -257,8 +270,35 @@ struct SidebarView: View {
         }
     }
 
+    private var chatUtilities: some View {
+        HStack(spacing: 12) {
+                Button { model.showCommandPalette = true } label: {
+                    Label("Search", systemImage: "magnifyingglass")
+                }
+                .help("Command palette (⌘K)")
+                Spacer(minLength: 0)
+                if model.catalogError != nil {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(Design.warning)
+                        .help("Catalog read needs attention. Open Diagnostics for details.")
+                }
+                Button { Task { await model.refreshAll() } } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Refresh everything (⌘R)")
+                .accessibilityLabel("Refresh")
+        }
+        .font(.system(size: 11))
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 14)
+        .padding(.top, 8)
+    }
+
     private var sidebarFooter: some View {
         VStack(spacing: 0) {
+            if model.section == .cockpit || model.section == .live {
+                chatUtilities
+            }
             Button {
                 model.openCapturePanel()
             } label: {

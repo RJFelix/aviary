@@ -3898,8 +3898,25 @@ final class AppModel {
         guard let chat = pendingChats.first(where: {
             $0.attemptCommandID.uuidString.lowercased() == request.commandID
         }) else { return }
-        guard let key = ServiceAttachmentKey(work: response.work.work, attachment: response.attachment),
-              updatePendingChat(chat.id, phase: .awaitingAcceptance, association: key) else {
+        guard let key = ServiceAttachmentKey(work: response.work.work, attachment: response.attachment) else {
+            throw PendingChatError.conflict
+        }
+        let nativeIdentity = ChatVisibilityIdentity.nativeSession(
+            journal: key.workSession.sessionJournal)
+        // Publish the canonical hidden alias before the pending row exposes its association.
+        // The pending identity is retained until retirement, covering a crash between these
+        // separate durable stores without allowing a hidden chat to reappear on relaunch.
+        do {
+            try ChatVisibilityStore(home: home).aliasHidden(
+                from: .pending(chat.id), to: nativeIdentity)
+        } catch {
+            // Visibility is cosmetic. A malformed or unavailable sidecar must not block the
+            // canonical Create association or make a successful chat look undelivered.
+            let message = "Chat started, but its hidden-chat preference could not be carried forward."
+            pendingChatDetails[chat.id] = message
+            show(message, isError: true)
+        }
+        guard updatePendingChat(chat.id, phase: .awaitingAcceptance, association: key) else {
             throw PendingChatError.conflict
         }
     }
@@ -3912,6 +3929,16 @@ final class AppModel {
                 if let error = run.errorBanner {
                     pendingChatDetails[chat.id] = "The conversation is saved, but the agent could not start. " + error
                 }
+                continue
+            }
+            do {
+                let pendingIdentity = ChatVisibilityIdentity.pending(chat.id)
+                let nativeIdentity = ChatVisibilityIdentity.nativeSession(
+                    journal: key.workSession.sessionJournal)
+                try ChatVisibilityStore(home: home).retirePendingAlias(
+                    pendingIdentity, canonical: nativeIdentity)
+            } catch {
+                pendingChatDetails[chat.id] = "Chat started, but its hidden-chat preference could not be migrated safely. The startup card was kept until preference storage is repaired; this presentation setting did not change the Work or prompt."
                 continue
             }
             do {

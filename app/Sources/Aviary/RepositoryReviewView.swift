@@ -250,12 +250,12 @@ struct RepositoryReviewView: View {
     }
 
     private var loadPrompt: some View {
-        Card("Saved changes", symbol: "arrow.down.circle") {
+        Card("Recorded project state", symbol: "arrow.down.circle") {
             VStack(alignment: .leading, spacing: 8) {
                 Text(
                     selectedDescriptor == nil
                         ? "A matching review artifact is no longer available."
-                        : "Open the recorded file changes and diffs, then prepare feedback for the agent. Aviary checks that the saved review still matches this chat."
+                        : "Inspect the recorded working tree and any diffs, then prepare feedback for the agent. The project may be unchanged; existing edits are not necessarily from this turn."
                 )
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -272,7 +272,7 @@ struct RepositoryReviewView: View {
                             .foregroundStyle(.tertiary)
                     }
                 }
-                Button("Show file changes") {
+                Button("Inspect project state") {
                     loadReview()
                 }
                 .buttonStyle(.borderedProminent)

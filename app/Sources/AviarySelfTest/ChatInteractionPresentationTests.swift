@@ -56,9 +56,41 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertEqual(ChatBusyDelivery.followUp.symbol, "text.append")
         XCTAssertTrue(ChatBusyDelivery.guideCurrentWork.explanation.contains("does not interrupt"))
         XCTAssertTrue(ChatBusyDelivery.followUp.explanation.contains("separate message"))
-        XCTAssertEqual(ChatBusyDelivery.afterSubmission(submitted: .guideCurrentWork, current: .guideCurrentWork, handedOff: true), .followUp)
-        XCTAssertEqual(ChatBusyDelivery.afterSubmission(submitted: .guideCurrentWork, current: .guideCurrentWork, handedOff: false), .guideCurrentWork)
-        XCTAssertEqual(ChatBusyDelivery.afterSubmission(submitted: .followUp, current: .guideCurrentWork, handedOff: true), .guideCurrentWork)
+    }),
+    ("chat interaction: busy preference selects primary and falls back to advertised routes", {
+        XCTAssertEqual(ChatBusyDeliveryPreference.default, .followUp)
+        XCTAssertEqual(ChatBusyDeliveryPreference.load(rawValue: "not-a-route"), .followUp)
+        XCTAssertEqual(
+            ChatBusyDeliveryPreference.guideCurrentWork.resolved(in: [.followUp]), .followUp)
+        XCTAssertEqual(
+            ChatBusyDeliveryPreference.guideCurrentWork.resolved(in: [.followUp, .guideCurrentWork]),
+            .guideCurrentWork)
+        XCTAssertTrue(ChatBusyDeliveryPreference.followUp.explanation.contains("Return"))
+        XCTAssertEqual(ChatBusyDelivery.guideCurrentWork.compactLabel, "Steer")
+        XCTAssertEqual(ChatBusyDelivery.followUp.compactLabel, "Queue")
+    }),
+    ("chat interaction: accepted receipt transition requires a healthy projection", {
+        let work = WorkRef(workHostID: "chat-test-host", workID: "chat-test-work")
+        let notice = ServiceBackedCommandNotice(
+            work: work,
+            commandID: "chat-command",
+            kind: .send,
+            client: ClientRef("chat-client"),
+            attachment: ClientAttachmentRef("chat-attachment"),
+            sessionAttachment: nil,
+            evidence: .acceptedReceipt(
+                resultingWorkCursor: JournalCursor(
+                    journal: .work(work), eventID: "accepted", sequence: 1)))
+
+        XCTAssertFalse(ChatAcceptedMessageRefreshPolicy.shouldShow(
+            notice: notice, noticeWasSuccessful: true, projection: nil,
+            hasErrorBanner: false))
+        XCTAssertFalse(ChatAcceptedMessageRefreshPolicy.shouldShow(
+            notice: notice, noticeWasSuccessful: false, projection: nil,
+            hasErrorBanner: false))
+        XCTAssertFalse(ChatAcceptedMessageRefreshPolicy.shouldShow(
+            notice: nil, noticeWasSuccessful: true, projection: nil,
+            hasErrorBanner: false))
     }),
     ("chat interaction: state copy never equates termination with success", {
         XCTAssertEqual(ChatInteractionPresentation.stateLabel(.idle), "Ready")
@@ -96,6 +128,45 @@ let casesChatInteractionPresentation: [Case] = [
         XCTAssertEqual(active.symbol, "hourglass")
         XCTAssertTrue(active.text.contains("Sending"))
         XCTAssertFalse(active.text.contains("checking"))
+
+        let receiptTransition = ChatComposerStatusPresentation.resolve(
+            submissionState: .idle,
+            persistenceNotice: nil,
+            commandState: .idle,
+            hasExited: false,
+            acceptsInput: false,
+            isStreaming: false,
+            availableDeliveries: [],
+            effectiveDelivery: nil,
+            draftIsEmpty: false,
+            receiptPending: true)
+        XCTAssertEqual(receiptTransition.kind, .information)
+        XCTAssertTrue(receiptTransition.text.contains("accepted your message"))
+        XCTAssertFalse(receiptTransition.text.contains("unavailable"))
+
+        let busyReceiptTransition = ChatComposerStatusPresentation.resolve(
+            submissionState: .idle, persistenceNotice: nil, commandState: .running,
+            hasExited: false, acceptsInput: false, isStreaming: true,
+            availableDeliveries: [], effectiveDelivery: nil, draftIsEmpty: true,
+            receiptPending: true)
+        XCTAssertEqual(busyReceiptTransition.kind, .information)
+        XCTAssertTrue(busyReceiptTransition.text.contains("accepted your message"))
+        XCTAssertFalse(busyReceiptTransition.text.contains("No message route"))
+
+        let failedStateWins = ChatComposerStatusPresentation.resolve(
+            submissionState: .idle,
+            persistenceNotice: nil,
+            commandState: .failed,
+            hasExited: false,
+            acceptsInput: false,
+            isStreaming: false,
+            availableDeliveries: [],
+            effectiveDelivery: nil,
+            draftIsEmpty: false,
+            receiptPending: true)
+        XCTAssertEqual(failedStateWins.kind, .blocked)
+        XCTAssertTrue(failedStateWins.text.contains("needs attention"))
+        XCTAssertFalse(failedStateWins.text.contains("accepted your message"))
 
         let unresolved = ChatComposerStatusPresentation.resolve(
             submissionState: .needsRecovery,

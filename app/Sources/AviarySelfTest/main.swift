@@ -7163,6 +7163,7 @@ await Harness.run(
         + casesServiceBackedGUIControlPolicy
         + casesServiceBackedRefreshSchedulingPolicy
         + casesChatInteractionPresentation
+        + casesChatVisibilityStore
         + casesSuggestedShellCommand
         + [
             ("message transfer: exact authored text", { try test_transcriptMessageTransferPreservesExactRoleText() }),

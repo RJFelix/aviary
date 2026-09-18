@@ -82,19 +82,20 @@ struct TranscriptView: View {
                                 if let descriptor = reviewDescriptorsByMessageID[item.id],
                                    let onReviewMessage {
                                     Button { onReviewMessage(item.id) } label: {
-                                        Label("Saved changes after this turn", systemImage: "doc.text.magnifyingglass")
+                                        Label("Recorded project state", systemImage: "doc.text.magnifyingglass")
                                     }
                                     .buttonStyle(.borderless)
                                     .font(.system(size: 11))
                                     .foregroundStyle(Design.accent)
+                                    .help("Inspect the working tree recorded after this response. It may be unchanged, or contain edits from earlier work.")
                                     .padding(.leading, 30)
                                     .accessibilityIdentifier(
                                         "saved-review-\(descriptor.artifactID.utf8.count)-"
                                             + descriptor.artifactID + "-" + item.id)
                                     .accessibilityLabel(
                                         item.timestamp == .distantPast
-                                            ? "Saved changes after this turn, time unknown"
-                                            : "Saved changes after the turn at "
+                                            ? "Recorded project state, time unknown"
+                                            : "Project state recorded after the turn at "
                                                 + item.timestamp.formatted(
                                                     date: .abbreviated, time: .standard))
                                 }

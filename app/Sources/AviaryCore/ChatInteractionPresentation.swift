@@ -19,6 +19,14 @@ public enum ChatBusyDelivery: String, CaseIterable, Identifiable, Sendable {
         case .followUp: "Queue message"
         }
     }
+    /// The short labels used by the busy composer action strip. The longer labels above remain
+    /// useful in status copy and accessibility descriptions.
+    public var compactLabel: String {
+        switch self {
+        case .guideCurrentWork: "Steer"
+        case .followUp: "Queue"
+        }
+    }
     public var symbol: String {
         switch self {
         case .guideCurrentWork: "arrow.turn.down.right"
@@ -45,12 +53,82 @@ public enum ChatBusyDelivery: String, CaseIterable, Identifiable, Sendable {
         (supportsFollowUp ? [.followUp] : []) + (supportsGuidance ? [.guideCurrentWork] : [])
     }
 
-    /// Guidance is a one-message override. A failed send or a newer choice keeps the editor
-    /// unchanged; an accepted override returns the next message to ordinary follow-up delivery.
-    public static func afterSubmission(
-        submitted: Self, current: Self, handedOff: Bool
-    ) -> Self {
-        handedOff && submitted == .guideCurrentWork && current == submitted ? .followUp : current
+}
+
+/// The user's preferred busy-composer action. This is presentation preference only: the
+/// capability-derived delivery list and the submission gate still decide whether an action can
+/// be admitted. It is intentionally a small raw-value type so the GUI can persist it in
+/// UserDefaults without coupling Core to a settings file format.
+public enum ChatBusyDeliveryPreference: String, CaseIterable, Identifiable, Sendable {
+    case followUp
+    case guideCurrentWork
+
+    public static let storageKey = "aviary.chat.busyDeliveryPreference"
+    public static let `default`: Self = .followUp
+
+    public var id: String { rawValue }
+    public var delivery: ChatBusyDelivery {
+        switch self {
+        case .followUp: .followUp
+        case .guideCurrentWork: .guideCurrentWork
+        }
+    }
+    public var label: String {
+        switch self {
+        case .followUp: "Queue follow-up"
+        case .guideCurrentWork: "Steer current work"
+        }
+    }
+    public var explanation: String {
+        switch self {
+        case .followUp: "Return and the primary busy action queue a separate message for after the current work."
+        case .guideCurrentWork: "Return and the primary busy action steer before the next model request."
+        }
+    }
+
+    public static func load(rawValue: String) -> Self {
+        Self(rawValue: rawValue) ?? .default
+    }
+
+    /// Resolve a preference against the exact capability-derived choices. A persisted choice
+    /// cannot manufacture a route that the current Work did not advertise.
+    public func resolved(in choices: [ChatBusyDelivery]) -> ChatBusyDelivery? {
+        if choices.contains(delivery) { return delivery }
+        return choices.first
+    }
+}
+
+/// Presentation-only bridge for the short interval after a Work Host accepted a message and
+/// before its canonical projection catches up. It deliberately accepts the exact notice and
+/// projection objects so a stale, disconnected, uncertain, or failed state cannot be relabeled
+/// as healthy progress.
+public enum ChatAcceptedMessageRefreshPolicy {
+    public static func shouldShow(
+        notice: ServiceBackedCommandNotice?,
+        noticeWasSuccessful: Bool,
+        projection: WorkServiceAttachedWorkProjection?,
+        hasErrorBanner: Bool
+    ) -> Bool {
+        guard !hasErrorBanner, noticeWasSuccessful,
+              let notice,
+              case .acceptedReceipt(let acceptedCursor) = notice.evidence,
+              [.start, .send, .steer, .queue].contains(notice.kind),
+              let projection,
+              notice.work == projection.descriptor.work,
+              notice.client == projection.attachment.client,
+              notice.attachment == projection.attachment.attachment,
+              notice.sessionAttachment == projection.attachment.sessionAttachment,
+              acceptedCursor.journal == projection.descriptor.journal,
+              let receipt = projection.lastReceipt,
+              receipt.commandID == notice.commandID,
+              receipt.work == notice.work,
+              receipt.state == .accepted || receipt.state == .duplicate,
+              receipt.resultingWorkCursor == acceptedCursor,
+              projection.requiresRefresh,
+              !projection.needsRecovery,
+              case .connected = projection.connectivity
+        else { return false }
+        return true
     }
 }
 
@@ -94,7 +172,8 @@ public struct ChatComposerStatusPresentation: Equatable, Sendable {
         isStreaming: Bool,
         availableDeliveries: [ChatBusyDelivery],
         effectiveDelivery: ChatBusyDelivery?,
-        draftIsEmpty: Bool
+        draftIsEmpty: Bool,
+        receiptPending: Bool = false
     ) -> Self {
         // Active is the original request lifetime, not an uncertain outcome. It takes precedence
         // over the durable marker written for that same request so ordinary sends never flash
@@ -133,6 +212,15 @@ public struct ChatComposerStatusPresentation: Equatable, Sendable {
                 symbol: "exclamationmark.triangle.fill")
         case .running, .idle, .ending, .ended:
             break
+        }
+
+        // A service receipt can arrive just before the next canonical projection reports the
+        // Work as busy. Keep the accepted handoff visible during that short interval instead of
+        // translating the stale admission snapshot into a misleading disabled flash.
+        if receiptPending {
+            return information(
+                "Agent service accepted your message; updating this chat…",
+                symbol: "hourglass")
         }
 
         if !acceptsInput {

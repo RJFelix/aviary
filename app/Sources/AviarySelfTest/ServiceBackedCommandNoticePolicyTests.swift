@@ -30,7 +30,8 @@ private func noticePolicyProjection(
     acceptanceHostSequence: Int = 2,
     workCursorEventID: String = "accepted-event",
     workCursorSequence: Int = 2,
-    readDiagnostics: [String] = []
+    readDiagnostics: [String] = [],
+    requiresRefresh: Bool? = nil
 ) throws -> WorkServiceAttachedWorkProjection {
     let workCursor = JournalCursor(
         journal: noticePolicyJournal, eventID: workCursorEventID,
@@ -108,7 +109,7 @@ private func noticePolicyProjection(
         workSourceCompleteness: canonical ? .complete : .incomplete,
         sessionSourceCompleteness: .complete, readDiagnostics: readDiagnostics, connectivity: connectivity,
         pendingCommand: pending, lastReceipt: receipt,
-        requiresRefresh: !canonical)
+        requiresRefresh: requiresRefresh ?? !canonical)
 }
 
 private func noticePolicyNotice(
@@ -379,6 +380,28 @@ func testServiceBackedCommandNoticePolicyMatchesNativeLifecycleAliases() throws 
 }
 
 let casesServiceBackedCommandNoticePolicy: [Case] = [
+    ("service command notice: accepted message refresh has a real noncanonical progress state", {
+        let catchingUp = try noticePolicyProjection(requiresRefresh: true)
+        XCTAssertFalse(catchingUp.isCanonical)
+        XCTAssertFalse(catchingUp.needsRecovery)
+        let notice = noticePolicyNotice()
+        func shows(_ projection: WorkServiceAttachedWorkProjection,
+                   _ candidate: ServiceBackedCommandNotice = noticePolicyNotice(),
+                   error: Bool = false) -> Bool {
+            ChatAcceptedMessageRefreshPolicy.shouldShow(
+                notice: candidate, noticeWasSuccessful: true, projection: projection,
+                hasErrorBanner: error)
+        }
+        XCTAssertTrue(shows(catchingUp, notice))
+        XCTAssertFalse(shows(try noticePolicyProjection()))
+        XCTAssertFalse(shows(try noticePolicyProjection(canonical: false)))
+        XCTAssertFalse(shows(try noticePolicyProjection(connectivity: .disconnected, requiresRefresh: true)))
+        XCTAssertFalse(shows(catchingUp, error: true))
+        XCTAssertFalse(shows(catchingUp, noticePolicyNotice(client: ClientRef("other-client"))))
+        XCTAssertFalse(shows(catchingUp, noticePolicyNotice(commandID: "other-command")))
+        XCTAssertFalse(shows(catchingUp, noticePolicyNotice(evidence: .canonicalCommand)))
+        XCTAssertFalse(shows(catchingUp, noticePolicyNotice(kind: .end)))
+    }),
     ("service command notice: recovered read diagnostics no longer block input", {
         let history = ["earlier connection failed"]
         let failed = try noticePolicyProjection(canonical: false, readDiagnostics: history)

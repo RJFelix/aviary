@@ -58,6 +58,11 @@ what it does; this file is how to work on it without relearning the traps.
 - **Anything perpetually animated must check `\.staticRendering`.** A `repeatForever`
   animation or an endless `.task` loop is fine on screen and a problem for the snapshot
   renderer. `PulseDot` and `StreamingIndicator` are the existing examples.
+- **Window chrome needs a live pointer test, not just a fixture.** The snapshot renderer's
+  NSWindow does not reproduce SwiftUI windowToolbar visibility: hiding it can also hide native
+  close/minimize/zoom controls. A transparent toolbar can still intercept clicks over content
+  drawn into the top safe area. Use reclaimed chrome for noninteractive headings; verify actual
+  pointer clicks as well as accessibility actions, and keep compact navigation below the inset.
 - **The catalog cache keys on file size and mtime**, so it detects a changed transcript and
   completely misses a changed parser. Bump `SessionCatalog.schemaVersion` when you change
   how a summary is derived, or your improvement silently does nothing for every session

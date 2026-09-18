@@ -270,7 +270,10 @@ struct RunPane: View {
     @State private var showActivityHistory = false
     @State private var showProjectReconfirmation = false
     @State private var projectCheckError: String?
-    @State private var composerDelivery: ChatBusyDelivery = .followUp
+    /// Persisted once for the person, shared by every busy composer. The choice controls the
+    /// primary strip styling and Return; capability resolution still happens per Work.
+    @AppStorage(ChatBusyDeliveryPreference.storageKey)
+    private var busyDeliveryPreferenceRawValue = ChatBusyDeliveryPreference.default.rawValue
 
     // Fixed trailing inspector column rather than `.inspector` or a conditional split
     // pane — see the note on SessionsView.body for why both of those misbehave.
@@ -757,15 +760,11 @@ struct RunPane: View {
     private var composer: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
-                if run.isStreaming {
-                    ChatDeliveryChoiceView(
-                        choices: availableComposerDeliveries,
-                        selection: $composerDelivery)
-                }
-                if run.isStreaming || composerStatus.kind == .blocked {
+                if composerStatus.kind == .blocked || composerReceiptPending {
                     Label(composerStatus.text, systemImage: composerStatus.symbol)
                         .font(.system(size: 11))
                         .foregroundStyle(composerStatus.kind == .blocked
+                            && composerStatus.symbol != "hourglass"
                             ? Design.warning : Color.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("chat-composer-status")
@@ -781,26 +780,38 @@ struct RunPane: View {
                         .id(run.id)
                         .frame(minHeight: 64, maxHeight: 115)
                 HStack(spacing: 8) {
-                    Text("⇧ Return for a new line")
-                        .font(.caption2).foregroundStyle(.tertiary)
-                    Spacer(minLength: 0)
-
-                    Button {
-                        submitComposer()
-                    } label: {
-                        Label(
-                            composerActionLabel,
-                            systemImage: composerActionSymbol)
-                            .font(.system(size: 10.5, weight: .semibold))
-                            .frame(minWidth: 104, minHeight: 22)
+                    if run.isStreaming {
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 8) {
+                                Text("⇧ Return for a new line")
+                                    .font(.caption2).foregroundStyle(.tertiary)
+                                Spacer(minLength: 0)
+                                busyActionStrip
+                            }
+                            busyActionStrip
+                        }
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                    } else {
+                        Text("⇧ Return for a new line")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                        Spacer(minLength: 0)
+                        Button {
+                            submitComposer()
+                        } label: {
+                            Label(
+                                composerActionLabel,
+                                systemImage: composerActionSymbol)
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .frame(minWidth: 104, minHeight: 22)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!composerCanSubmit)
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .accessibilityLabel(composerActionLabel)
+                        .accessibilityValue(composerCanSubmit ? "Ready" : composerStatus.text)
+                        .accessibilityHint(composerStatus.text + ". Return sends; Shift-Return adds a new line.")
+                        .help("\(composerStatus.text) (↵)")
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!composerCanSubmit)
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .accessibilityLabel(composerActionLabel)
-                    .accessibilityValue(composerCanSubmit ? "Ready" : composerStatus.text)
-                    .accessibilityHint(composerStatus.text + ". Return sends; Shift-Return adds a new line.")
-                    .help("\(composerStatus.text) (↵)")
                 }.padding(.horizontal, 8).padding(.bottom, 8)
                 }
                 .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -856,8 +867,8 @@ struct RunPane: View {
 
     private var effectiveComposerDelivery: ChatBusyDelivery? {
         let choices = availableComposerDeliveries
-        if choices.contains(composerDelivery) { return composerDelivery }
-        return choices.first
+        return ChatBusyDeliveryPreference.load(rawValue: busyDeliveryPreferenceRawValue)
+            .resolved(in: choices)
     }
 
     private var composerActionLabel: String {
@@ -884,7 +895,35 @@ struct RunPane: View {
             acceptsInput: run.acceptsInput, isStreaming: run.isStreaming,
             availableDeliveries: availableComposerDeliveries,
             effectiveDelivery: effectiveComposerDelivery,
-            draftIsEmpty: run.draft.trimmingCharacters(in: .whitespaces).isEmpty)
+            draftIsEmpty: run.draft.trimmingCharacters(in: .whitespaces).isEmpty,
+            receiptPending: composerReceiptPending)
+    }
+
+    private var composerReceiptPending: Bool {
+        ChatAcceptedMessageRefreshPolicy.shouldShow(
+            notice: run.commandNotice?.serviceAcknowledgement,
+            noticeWasSuccessful: run.commandNotice?.level == .success,
+            projection: run.serviceProjection,
+            hasErrorBanner: run.errorBanner != nil)
+    }
+
+    @ViewBuilder
+    private var busyActionStrip: some View {
+        if availableComposerDeliveries.isEmpty
+            && (run.composerSubmissionState == .active || composerReceiptPending) {
+            Label(run.composerSubmissionState == .active ? "Sending…" : "Updating…",
+                  systemImage: "hourglass")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help(composerStatus.text)
+        } else {
+            ChatDeliveryChoiceView(
+                choices: availableComposerDeliveries,
+                canSubmit: composerCanSubmit,
+                statusText: composerStatus.text,
+                preferenceRawValue: $busyDeliveryPreferenceRawValue,
+                onSubmit: { choice in submitComposer(delivery: choice) })
+        }
     }
 
     private var composerPlaceholder: String {
@@ -908,29 +947,28 @@ struct RunPane: View {
     private var composerCanSubmit: Bool {
         !run.hasExited && run.acceptsInput
             && !run.draft.trimmingCharacters(in: .whitespaces).isEmpty
+            && run.composerSubmissionState == .idle
             && (!run.isStreaming || effectiveComposerDelivery != nil)
     }
 
     private func submitComposer() {
+        submitComposer(delivery: effectiveComposerDelivery)
+    }
+
+    private func submitComposer(delivery selectedBusyDelivery: ChatBusyDelivery?) {
         let text = run.draft
-        let submittedChoice = effectiveComposerDelivery
         let delivery: LiveRunComposerDelivery
-        if run.isStreaming {
-            switch effectiveComposerDelivery {
-            case .guideCurrentWork: delivery = .steerNext
-            case .followUp: delivery = .queueFollowUp
-            case nil: return
-            }
-        } else {
+        // A Steer/Queue click stays that exact command even if Work settles before the view
+        // redraws. LiveRun revalidates admission; never silently convert the click into Send.
+        switch selectedBusyDelivery {
+        case .guideCurrentWork: delivery = .steerNext
+        case .followUp: delivery = .queueFollowUp
+        case nil:
+            guard !run.isStreaming else { return }
             delivery = .sendNow
         }
         Task {
             let receipt = await run.submitComposer(text, delivery: delivery)
-            if let submittedChoice {
-                composerDelivery = ChatBusyDelivery.afterSubmission(
-                    submitted: submittedChoice, current: composerDelivery,
-                    handedOff: receipt.wasHandedOff)
-            }
             if receipt.wasHandedOff, !run.isServiceBacked {
                 await run.reconcileDraftAfterHandOff(text)
             }

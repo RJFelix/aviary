@@ -111,6 +111,9 @@ enum LinuxSelfTestMain {
             ("Linux platform: observed repository review", {
                 try await runLinuxCases(casesObservedRepositoryReview)
             }),
+            ("Linux platform: chat visibility store", {
+                try await runLinuxCases(casesChatVisibilityStore)
+            }),
             ("Linux platform: repository review turn integration", {
                 try await runLinuxCases(casesObservedRepositoryReviewAgent)
             }),

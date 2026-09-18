@@ -31,6 +31,7 @@ enum VisualFixtureRoute: String {
     case usageInventory = "usage-inventory-fixture"
     case usageInventoryNarrow = "usage-inventory-narrow-fixture"
     case chatWelcome = "chat-welcome-fixture"
+    case chatWindow = "chat-window-fixture"
     case chatLogSettings = "chat-log-settings-fixture"
     case suggestedCommand = "suggested-command-fixture"
     case suggestedCommandConfirmation = "suggested-command-confirmation-fixture"
@@ -126,7 +127,7 @@ struct VisualFixtureView: View {
             UsageAccountingFixture()
         case .usageInventory, .usageInventoryNarrow:
             UsageInventoryFixtureView(narrow: route == .usageInventoryNarrow)
-        case .chatWelcome, .chatRecovery, .chatUncertain, .chatCreated:
+        case .chatWelcome, .chatWindow, .chatRecovery, .chatUncertain, .chatCreated:
             ChatVisualLearningFixture(route: route)
         case .chatLogSettings:
             LogSettingsFixture()
@@ -241,9 +242,10 @@ private struct ChatVisualLearningFixture: View {
         model.modelCatalog.enabled = [ModelSpec(rpc: .object([
             "id": .string("design-model"), "name": .string("Coding agent"),
             "provider": .string("Fixture provider"), "contextWindow": .number(128_000)]))]
-        model.localWorkServiceError = route == .chatWelcome ? nil : "The agent service is unavailable."
-        model.newChatRequested = route == .chatWelcome
-        if route != .chatWelcome {
+        let welcome = route == .chatWelcome || route == .chatWindow
+        model.localWorkServiceError = welcome ? nil : "The agent service is unavailable."
+        model.newChatRequested = welcome
+        if !welcome {
             let chat = try! PendingChat(
                 id: UUID(uuidString: "27C7620E-5160-4946-8A34-E8AD10A64D17")!,
                 createdAt: Date(timeIntervalSince1970: 1_700_000_000),
@@ -264,8 +266,12 @@ private struct ChatVisualLearningFixture: View {
     }
 
     var body: some View {
-        CockpitView().environment(model)
-            .background(Color(nsColor: .windowBackgroundColor))
+        Group {
+            if route == .chatWindow { RootView() }
+            else { CockpitView() }
+        }
+        .environment(model)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
