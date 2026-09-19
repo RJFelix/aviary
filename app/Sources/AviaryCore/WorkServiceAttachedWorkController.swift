@@ -928,6 +928,53 @@ public actor WorkServiceAttachedWorkController {
         return projection.withTrustedUsageInventory(inventory)
     }
 
+    /// Explicit direct-shell mutation/read. This never replays a lost execution request;
+    /// callers reconcile with Inspect, whose canonical action identity survives reconnects.
+    public func directShell(
+        operation: WorkServiceDirectShellOperation,
+        language: DirectShellLanguage? = nil, source: Data? = nil,
+        durationLimitSeconds: TimeInterval? = nil, action: ActionRef? = nil,
+        expectedRun: RunRef? = nil
+    ) async throws -> WorkServiceDirectShellResponse {
+        let current = projection()
+        guard current.isCanonical, attachmentActionableStorage,
+              let run = descriptorStorage.currentRun,
+              descriptorStorage.currentRunSession == session,
+              descriptorStorage.currentRunSessionAttachment == sessionAttachment,
+              let instance = descriptorStorage.hostObservation?.instance,
+              !commandInFlightStorage else { throw WorkServiceProtocolError.sourceIncomplete }
+        if operation == .run {
+            guard let expectedRun, expectedRun == run else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "the confirmed Run changed before direct command admission")
+            }
+        }
+        guard operation == .inspect || (!requiresRefreshStorage && pendingStorage == nil),
+              attachmentStorage.authorization.allows(.directShell) else {
+            throw WorkServiceProtocolError.invalidRequest("direct commands are unavailable on this connection")
+        }
+        let request = WorkServiceDirectShellRequest(
+            work: work, journal: journal, attachment: attachmentStorage.attachment,
+            command: CommandRef(commandID: UUID().uuidString.lowercased(), client: client,
+                                sessionAttachment: sessionAttachment, causalCursor: workCursorStorage),
+            causalWorkCursor: workCursorStorage, run: run, operation: operation,
+            language: language, source: source, durationLimitSeconds: durationLimitSeconds, action: action)
+        if operation != .inspect { commandInFlightStorage = true }
+        defer { if operation != .inspect { commandInFlightStorage = false } }
+        do {
+            let response = try await service.directShell(request)
+            try response.validate(for: request)
+            guard response.host == instance else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            if operation != .inspect { requiresRefreshStorage = true }
+            return response
+        } catch {
+            if operation != .inspect { requiresRefreshStorage = true }
+            throw error
+        }
+    }
+
     /// Fetch the newest descriptor in the current bounded projection whose media type exactly
     /// matches `mediaType`, then resolve its retained body in bounded chunks. The descriptor
     /// order is the host's publication order. Selection requires a complete artifact index;

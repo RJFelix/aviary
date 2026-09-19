@@ -259,12 +259,15 @@ public enum NativeColdResume {
                     "the successful context provider action has no reconstructable assistant response")
             }
             if !unexplainedActivity.isEmpty,
-               !isSettledObservedRepositoryReviewAction(
+               !isSettledPostContextActionSet(
                    unexplainedActivity,
                    workEvents: workEvents,
                    workSnapshot: workSnapshot,
                    workJournal: workJournal,
-                   run: boundaryRun) {
+                   session: boundarySession,
+                   sessionAttachment: sessionAttachment.attachment,
+                   run: boundaryRun,
+                   bodyStore: bodyStore) {
                 throw NativeColdResumeError.workStateUnavailable(
                     "post-context action activity has no later effective context manifest")
             }
@@ -740,6 +743,228 @@ public enum NativeColdResume {
         event.type == TimelineEventType.actionIntent
             || event.type == TimelineEventType.actionStarted
             || event.type == TimelineEventType.actionOutcome
+    }
+
+    /// Post-context activity is allowed only through individually authenticated, settled
+    /// projections.  Keep this dispatch explicit: adding a new ActionKind must not silently
+    /// make it cold-resumable.
+    private static func isSettledPostContextActionSet(
+        _ actionEvents: [TimelineEvent],
+        workEvents: [TimelineEvent],
+        workSnapshot: WorkSnapshot,
+        workJournal: JournalRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        run: RunRef,
+        bodyStore: ContextBodyStore
+    ) -> Bool {
+        let actionIDs = Set(actionEvents.compactMap { $0.action?.actionID })
+        guard !actionIDs.isEmpty,
+              actionEvents.allSatisfy({ $0.action != nil }) else { return false }
+        return actionIDs.allSatisfy { actionID in
+            let events = actionEvents.filter { $0.action?.actionID == actionID }
+            return isSettledObservedRepositoryReviewAction(
+                events, workEvents: workEvents, workSnapshot: workSnapshot,
+                workJournal: workJournal, run: run)
+                || isSettledDirectShellAction(
+                    events, workEvents: workEvents, workSnapshot: workSnapshot,
+                    workJournal: workJournal, session: session,
+                    sessionAttachment: sessionAttachment, run: run, bodyStore: bodyStore)
+        }
+    }
+
+    /// Direct shell is resumable only as a fully settled, identity-bound host observation. The
+    /// command source/result are retained artifacts, not model-context messages; the next input
+    /// path is responsible for consuming pending output exactly once.
+    private static func isSettledDirectShellAction(
+        _ actionEvents: [TimelineEvent],
+        workEvents: [TimelineEvent],
+        workSnapshot: WorkSnapshot,
+        workJournal: JournalRef,
+        session: SessionRef,
+        sessionAttachment: SessionAttachmentRef,
+        run: RunRef,
+        bodyStore: ContextBodyStore
+    ) -> Bool {
+        guard case .work(let expectedWork) = workJournal.owner,
+              workSnapshot.work == expectedWork else { return false }
+        guard actionEvents.count == 3,
+              let action = actionEvents.first?.action,
+              actionEvents.allSatisfy({ $0.action == action && $0.run == run }),
+              let intent = actionEvents.first(where: { $0.type == TimelineEventType.actionIntent }),
+              let started = actionEvents.first(where: { $0.type == TimelineEventType.actionStarted }),
+              let outcome = actionEvents.first(where: { $0.type == TimelineEventType.actionOutcome }),
+              started.turn == intent.turn, outcome.turn == intent.turn,
+              intent.actor == started.actor, started.actor == outcome.actor,
+              intent.causedByEventID != nil, intent.parentActivityID == nil,
+              started.causedByEventID == EventRef(journal: workJournal, eventID: intent.eventID),
+              started.parentActivityID == EventRef(journal: workJournal, eventID: intent.eventID),
+              outcome.causedByEventID == EventRef(journal: workJournal, eventID: started.eventID),
+              outcome.parentActivityID == EventRef(journal: workJournal, eventID: started.eventID),
+              intent.sequence < started.sequence, started.sequence < outcome.sequence,
+              let intentHostSequence = intent.hostSequence,
+              let startedHostSequence = started.hostSequence,
+              let outcomeHostSequence = outcome.hostSequence,
+              intentHostSequence < startedHostSequence,
+              startedHostSequence < outcomeHostSequence,
+              intent.declaredDomains == [.work, .externalEffects],
+              started.declaredDomains == [.work, .externalEffects],
+              outcome.declaredDomains == [.work, .externalEffects],
+              let intentPayload = intent.payload.objectValue,
+              Set(intentPayload.keys) == ["state", "kind", "intent", "scope", "metadata"],
+              intentPayload["state"]?.stringValue == ActionExecutionState.proposed.rawValue,
+              intentPayload["kind"]?.stringValue == ActionKind.directShell.rawValue,
+              intentPayload["intent"]?.stringValue == "Run a user-confirmed shell command",
+              intentPayload["scope"]?.stringValue == "run",
+              let metadata = intentPayload["metadata"]?.objectValue,
+              Set(metadata.keys) == ["language"],
+              let startedPayload = started.payload.objectValue,
+              Set(startedPayload.keys) == ["state", "kind"],
+              startedPayload["state"]?.stringValue == ActionExecutionState.running.rawValue,
+              startedPayload["kind"]?.stringValue == ActionKind.directShell.rawValue,
+              let outcomePayload = outcome.payload.objectValue,
+              outcomePayload["kind"]?.stringValue == ActionKind.directShell.rawValue,
+              let outcomeState = outcomePayload["state"]?.stringValue.flatMap(
+                  ActionExecutionState.init(rawValue:)),
+              let outcomeRetrySafety = outcomePayload["retry_safety"]?.stringValue.flatMap(
+                  ActionRetrySafety.init(rawValue:)),
+              outcomeState.isTerminal,
+              let projected = workSnapshot.actions[action.actionID],
+              projected.kind == .directShell,
+              projected.intent == "Run a user-confirmed shell command",
+              projected.scope == "run",
+              projected.state == outcomeState,
+              projected.state.isTerminal,
+              let projectedRetrySafety = projected.retrySafety,
+              projectedRetrySafety == outcomeRetrySafety,
+              projected.intentEvent?.sourceEvent == EventRef(
+                  journal: workJournal, eventID: intent.eventID),
+              projected.startedEvent?.sourceEvent == EventRef(
+                  journal: workJournal, eventID: started.eventID),
+              projected.outcomeEvent?.sourceEvent == EventRef(
+                  journal: workJournal, eventID: outcome.eventID) else {
+            return false
+        }
+
+        guard let commandCause = intent.causedByEventID else { return false }
+        let commandEvents = workEvents.filter {
+            $0.type == TimelineEventType.commandAccepted
+                && $0.run == run
+                && $0.payload["command_kind"]?.stringValue == "direct_shell"
+                && $0.command != nil
+                && EventRef(journal: $0.journal, eventID: $0.eventID) == commandCause
+        }
+        let commandCausalEvent = commandEvents.first?.command?.causalCursor?.eventID.map {
+            EventRef(journal: workJournal, eventID: $0)
+        }
+        guard commandEvents.count == 1,
+              let commandEvent = commandEvents.first,
+              let command = commandEvent.command,
+              commandEvent.session == nil,
+              commandEvent.work == expectedWork,
+              commandEvent.workHost?.workHostID == expectedWork.workHostID,
+              commandEvent.sessionAttachment == sessionAttachment,
+              commandEvent.causedByEventID == commandCausalEvent,
+              let requestValue = commandEvent.payload["direct_shell_request"],
+              let requestReference: TimelineBodyReference = decodeNativeTimelineValue(requestValue),
+              requestReference.authority == workJournal,
+              let requestBytes = requestReference.byteCount,
+              requestBytes <= 64 * 1024,
+              let requestData = try? bodyStore.read(requestReference),
+              let stored = try? JSONDecoder().decode(
+                  DirectShellJournalRequest.self, from: requestData),
+              stored.session == session,
+              stored.request.work == expectedWork,
+              stored.request.journal == workJournal,
+              stored.request.run == run,
+              stored.request.command.client == command.client,
+              stored.request.command.sessionAttachment == sessionAttachment,
+              stored.request.causalWorkCursor == command.causalCursor,
+              stored.request.operation == .run,
+              let requestClient = stored.request.command.client,
+              command.commandID == WorkServiceCommandLedgerIdentity.commandID(
+                  client: requestClient,
+                  commandID: stored.request.command.commandID),
+              let language = stored.request.language,
+              let source = stored.request.source,
+              metadata["language"]?.stringValue == language.rawValue
+        else { return false }
+        guard (try? stored.request.validate()) != nil else { return false }
+
+        guard intent.causedByEventID == EventRef(
+            journal: workJournal, eventID: commandEvent.eventID),
+              stored.request.work == expectedWork else { return false }
+        guard DirectShellJournalFormat.action(commandID: command.commandID) == action else {
+            return false
+        }
+        let artifacts = workEvents.filter {
+            $0.type == TimelineEventType.artifact
+                && $0.action == action
+                && $0.run == run
+                && $0.payload["media_type"]?.stringValue == DirectShellJournalFormat.resultMediaType
+        }
+        guard artifacts.count == 1, let artifact = artifacts.first,
+              artifact.session == session,
+              artifact.sessionAttachment == sessionAttachment,
+              artifact.turn == intent.turn,
+              artifact.sequence > started.sequence,
+              artifact.sequence < outcome.sequence,
+              let artifactHostSequence = artifact.hostSequence,
+              let startedHostSequence = started.hostSequence,
+              let outcomeHostSequence = outcome.hostSequence,
+              artifactHostSequence > startedHostSequence,
+              artifactHostSequence < outcomeHostSequence,
+              artifact.causedByEventID == EventRef(journal: workJournal, eventID: started.eventID),
+              artifact.declaredDomains == [.work],
+              artifact.payload["available"]?.boolValue == true,
+              let resultValue = artifact.payload["body_reference"],
+              let resultReference: TimelineBodyReference = decodeNativeTimelineValue(resultValue),
+              resultReference.authority == workJournal,
+              let resultBytes = resultReference.byteCount,
+              resultBytes <= 256 * 1024,
+              let resultData = try? bodyStore.read(resultReference),
+              let result = try? JSONDecoder().decode(DirectShellCommandResult.self, from: resultData),
+              result.commandID == command.commandID,
+              result.actionID == action.actionID,
+              result.language == language,
+              result.source == source else { return false }
+        do { try result.validate() } catch { return false }
+        guard DirectShellCommandCanonicalValidation.artifactPayloadIsCanonical(
+            artifact.payload, body: resultReference, result: result, action: action) else {
+            return false
+        }
+        let expectedOutcomeKeys: Set<String> =
+            outcomeState == .failed || outcomeState == .canceled
+                ? ["state", "retry_safety", "kind", "failure_kind"]
+                : ["state", "retry_safety", "kind"]
+        guard Set(outcomePayload.keys) == expectedOutcomeKeys,
+              outcomeRetrySafety == .unknown else { return false }
+        let failureKind = outcomePayload["failure_kind"]?.stringValue.flatMap(
+            ActionFailureKind.init(rawValue:))
+        guard DirectShellCommandCanonicalValidation.outcomeMatches(
+            result.status, state: outcomeState, failureKind: failureKind) else {
+            return false
+        }
+        switch outcomeState {
+        case .succeeded:
+            guard outcomePayload["failure_kind"] == nil,
+                  case .exited(let code) = result.status, code == 0 else { return false }
+        case .failed:
+            guard failureKind != .indeterminateEffect,
+                  !isSuccessfulDirectShellResult(result) else { return false }
+        case .canceled:
+            guard outcomePayload["failure_kind"]?.stringValue
+                    == ActionFailureKind.cancellation.rawValue,
+                  result.status == .canceled else { return false }
+        default:
+            return false
+        }
+        return true
+    }
+
+    private static func isSuccessfulDirectShellResult(_ result: DirectShellCommandResult) -> Bool {
+        if case .exited(let code) = result.status { return code == 0 }
+        return false
     }
 
     /// A repository review is the one post-model action that does not change the effective model

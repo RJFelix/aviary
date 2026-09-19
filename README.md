@@ -76,6 +76,22 @@ Aviary reports which — `plan usage (five-hour)` or `extra usage`, read from Cl
 rate-limit frame rather than guessed. What you give up is steering, sub-agents, mid-run model
 switching, and resuming an Aviary session, because the conversation belongs to Claude Code.
 
+## Running a command from chat
+
+Closed shell code blocks in assistant messages offer **Run command…**. Confirm the exact command
+and project before running it directly on the Work Host, without another model turn. The agent
+must be waiting for your next message. **Stop** requests cancellation and reports the outcome;
+closing the GUI does not cancel the command.
+There is no default time limit, though the confirmation lets you choose one.
+
+Output appears in a command card and is included with your next accepted message unless you
+remove it with **X** or choose **End and remove command output**. The action and retained output
+remain in the recorded history. Each output
+stream retains up to 64 KiB of exact bytes, with explicit omission or incomplete-capture labels.
+This is completion output, not an interactive terminal, and commands have the host's normal
+filesystem and network access—not a sandbox. An updated service and a controlling attachment
+are required; older services cannot execute the new operation.
+
 ## Seeing what the workshop built
 
 The workshop agent edits Aviary's own source, so its work is invisible until the app is

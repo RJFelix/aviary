@@ -41,6 +41,8 @@ TOOL_SENTINEL = "LIVE_CHAT_TOOL_SENTINEL_6bd1"
 CREDENTIAL_SENTINEL = "live-chat-credential-sentinel-49e2"
 UNUSED_CREDENTIAL_SENTINEL = "unused-loopback-credential-31dc"
 FILE_SENTINEL = "probe-result.txt"
+DIRECT_COMMAND_SOURCE_SENTINEL = "LIVE_DIRECT_COMMAND_SOURCE_SENTINEL_c741"
+DIRECT_COMMAND_OUTPUT_SENTINEL = "LIVE_DIRECT_COMMAND_OUTPUT_SENTINEL_a29e"
 REQUIRED_SPANS = (
     "aviary.agent.provider",
     "aviary.agent.send",
@@ -53,9 +55,11 @@ REQUIRED_SPANS = (
     "aviary.work.admission",
     "aviary.work.command",
     "aviary.work.create_work",
+    "aviary.work.direct_shell",
     "aviary.work.turn",
 )
 FAILURE_STAGES = {
+    "directCommand",
     "ending",
     "invalid_environment",
     "review",
@@ -552,7 +556,10 @@ def service_name(resource):
 
 
 def validate_receipt(receipt):
-    expected = {"work", "journal", "session", "run", "startCommand", "action", "artifact"}
+    expected = {
+        "work", "journal", "session", "run", "startCommand", "action", "artifact",
+        "directCommand", "directAction",
+    }
     if set(receipt) != expected:
         raise RuntimeError("probe receipt had an invalid shape")
     if not all(
@@ -699,6 +706,48 @@ def validate_telemetry(capture, receipt, private_root):
     ):
         raise RuntimeError("repository review load did not bind its selected canonical artifact")
 
+    direct_worker_spans = [
+        span
+        for resource, span in spans
+        if service_name(resource) == "aviaryd"
+        and span.name == "aviary.work.direct_shell"
+        and span.kind == 1
+        and any(event.name == "aviary.direct_shell.settled" for event in span.events)
+    ]
+    if len(direct_worker_spans) != 1:
+        raise RuntimeError("direct command did not produce one internal worker settlement span")
+    direct_span = direct_worker_spans[0]
+    direct_attributes = attributes(direct_span.attributes)
+    if any(
+        direct_attributes.get(key) != value
+        for key, value in {
+            "aviary.command.id": receipt["directCommand"],
+            "aviary.action.id": receipt["directAction"],
+            "aviary.work.id": receipt["work"],
+            "aviary.run.id": receipt["run"],
+            "aviary.outcome": "succeeded",
+        }.items()
+    ):
+        raise RuntimeError("direct command span did not bind its canonical identities")
+    settled_events = [
+        attributes(event.attributes)
+        for event in direct_span.events
+        if event.name == "aviary.direct_shell.settled"
+    ]
+    if len(settled_events) != 1:
+        raise RuntimeError("direct command span lacked one settlement event")
+    settled = settled_events[0]
+    event_id = settled.get("aviary.event.id", "")
+    event_sequence = settled.get("aviary.event.sequence", "")
+    if (
+        settled.get("aviary.event.journal.id") != receipt["journal"]
+        or len(event_id) != 64
+        or any(character not in "0123456789abcdef" for character in event_id)
+        or not event_sequence.isdigit()
+        or int(event_sequence) <= 0
+    ):
+        raise RuntimeError("direct command settlement lacked a canonical event reference")
+
     private_values = {
         PROMPT_SENTINEL,
         ASSISTANT_SENTINEL,
@@ -706,6 +755,8 @@ def validate_telemetry(capture, receipt, private_root):
         CREDENTIAL_SENTINEL,
         UNUSED_CREDENTIAL_SENTINEL,
         FILE_SENTINEL,
+        DIRECT_COMMAND_SOURCE_SENTINEL,
+        DIRECT_COMMAND_OUTPUT_SENTINEL,
         str(private_root),
         str(private_root.resolve()),
     }
@@ -886,7 +937,8 @@ def main():
             names, span_count = validate_telemetry(capture, receipt, root)
             success_lines = [
                 "live OTLP chat probe PASS: "
-                f"{span_count} spans; 2 provider calls; Create/Start/tool/review/End/drain",
+                f"{span_count} spans; 2 provider calls; "
+                "Create/Start/tool/review/direct-shell/Dismiss/End/drain",
                 *(f"  {name}: {names[name]}" for name in REQUIRED_SPANS),
             ]
         else:
@@ -894,10 +946,11 @@ def main():
             success_lines = [
                 f"live {mode} telemetry chat probe PASS: " +
                 ("0 collected spans; " if mode == "disabled" else "reserved refusing endpoint; ")
-                + "2 provider calls; Create/Start/tool/review/End/cleanup",
+                + "2 provider calls; Create/Start/tool/review/direct-shell/Dismiss/End/cleanup",
             ]
         success_lines.append(
-            "Boundary: one normal disposable Work; Queue/Steer/Stop and remote backends not exercised.")
+            "Boundary: one normal disposable Work; Queue/Steer/direct-shell Stop and remote "
+            "backends not exercised.")
     except BaseException as error:
         primary_error = error
         with capture.lock:

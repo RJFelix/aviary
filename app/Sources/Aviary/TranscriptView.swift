@@ -1076,6 +1076,7 @@ enum AgentMessageBody {
 struct InjectedContextBlock: View {
     var block: PromptText.Block
     @State private var expanded = false
+    private var isCommandOutput: Bool { block.tag == "aviary-command-output" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -1085,19 +1086,23 @@ struct InjectedContextBlock: View {
                 HStack(spacing: 5) {
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
                         .font(.system(size: 8, weight: .bold))
-                    Image(systemName: "arrow.down.doc")
+                    Image(systemName: isCommandOutput ? "terminal" : "arrow.down.doc")
                         .font(.system(size: 9))
-                    Text("injected: \(block.tag)")
+                    Text(isCommandOutput ? "Command output attached" : "injected: \(block.tag)")
                         .font(.system(size: 10, weight: .medium))
                     Text("· \(block.body.count) chars")
                         .font(.system(size: 9.5))
                         .foregroundStyle(.tertiary)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
                 .foregroundStyle(Design.accent)
             }
             .buttonStyle(.plain)
             .accessibilityLabel(
-                expanded ? "Hide injected context" : "Show injected context")
+                isCommandOutput
+                    ? (expanded ? "Hide attached command output" : "Show attached command output")
+                    : (expanded ? "Hide injected context" : "Show injected context"))
             .accessibilityValue(expanded ? "Expanded" : "Collapsed")
             .accessibilityHint("Reveals or hides context added before the prompt")
 

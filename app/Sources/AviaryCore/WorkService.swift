@@ -379,6 +379,8 @@ public enum WorkServiceCapability: String, Codable, CaseIterable, Hashable, Send
     case destroy
     case complete
     case inspectArtifacts = "inspect_artifacts"
+    /// The host can execute and durably retain direct user shell commands outside model input.
+    case directShell = "direct_shell"
     /// The host can advertise and resolve opaque workspace identities.
     case workspaceCatalog = "workspace_catalog"
     /// The host captures its local recording-folder preference in each retained Work template.
@@ -2739,6 +2741,17 @@ public protocol WorkServiceClient: Sendable {
     func cancelAgentHandle(_ request: WorkServiceAgentHandleCancelRequest) async throws
         -> WorkServiceAgentHandleCancelResponse
     func command(_ request: WorkServiceCommandRequest) async throws -> WorkServiceCommandReceipt
+    func directShell(_ request: WorkServiceDirectShellRequest) async throws
+        -> WorkServiceDirectShellResponse
+}
+
+public extension WorkServiceClient {
+    /// Additive protocol default for old services and test doubles. Capability-gated callers must
+    /// never interpret the absence of an implementation as a successful command.
+    func directShell(_ request: WorkServiceDirectShellRequest) async throws
+        -> WorkServiceDirectShellResponse {
+        throw WorkServiceProtocolError.capabilityDenied(.directShell)
+    }
 }
 
 // MARK: - Deterministic reference service
@@ -4744,6 +4757,7 @@ public actor InMemoryWorkService: WorkServiceClient {
     private func supportedCapabilities() -> Set<WorkServiceCapability> {
         var capabilities = Set(WorkServiceCapability.allCases)
         capabilities.remove(.recordingDirectorySelection)
+        capabilities.remove(.directShell)
         // Complete/destroy are only executable when a host can prove canonical Handle
         // quiescence and paired-Session cursor success. The absence is observable at handshake,
         // while a committer can still reject an individual proof later.

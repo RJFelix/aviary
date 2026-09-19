@@ -26,9 +26,8 @@ struct FlockView: View {
                 if canonicalWorks.isEmpty && legacyRoots.isEmpty {
                     EmptyStateView(
                         symbol: "bird",
-                        title: "No delegated Work yet",
-                        message: "Native Work and imported child records will appear here when "
-                            + "they are available.")
+                        title: "No agent activity yet",
+                        message: "Your agents and the work they delegate will appear here.")
                 } else {
                     treeList
                 }
@@ -120,33 +119,44 @@ struct FlockView: View {
         let legacyRunning = legacyChildren.filter(\.isRunning).count
         let attentionCount = CanonicalFlockCatalogProjection.attentionSessionCount(canonicalAllWorks)
         return VStack(alignment: .leading, spacing: 8) {
-            // Keep each metric's label and value together. A horizontal strip made the
-            // longer labels wrap or collide in the narrow Flock list column.
-            StatTile(
+            // Keep these as compact, labeled rows instead of a horizontal strip of large
+            // StatTiles. The sidebar is narrow enough that four headline tiles turn into a
+            // cramped count column and make the native switch look like an unlabeled slider.
+            FlockMetricRow(
                 label: "Work", value: "\(canonicalAllWorks.count)",
-                symbol: "circle.hexagongrid.fill", tint: Design.agentMessage)
-            StatTile(
-                label: "running",
-                value: "\(canonicalRunning + legacyRunning)",
+                symbol: "circle.hexagongrid.fill", tint: Design.agentMessage,
+                detail: "saved Work records")
+            FlockMetricRow(
+                label: "Running", value: "\(canonicalRunning + legacyRunning)",
                 symbol: "bolt.fill",
-                tint: canonicalRunning + legacyRunning > 0 ? Design.success : .secondary)
-            StatTile(
-                label: "children", value: "\(canonicalAllWorks.flatMap(\.children).count)",
-                caption: legacyChildren.isEmpty ? "canonical lifecycle"
-                    : "\(legacyChildren.count) imported",
-                symbol: "arrow.triangle.branch")
-            StatTile(
-                label: "attention",
-                value: "\(attentionCount)",
-                symbol: "exclamationmark.bubble")
+                tint: canonicalRunning + legacyRunning > 0 ? Design.success : .secondary,
+                detail: "active Work and imported children")
+            FlockMetricRow(
+                label: "Children", value: "\(canonicalAllWorks.flatMap(\.children).count)",
+                symbol: "arrow.triangle.branch",
+                detail: legacyChildren.isEmpty ? "child agents"
+                    : "plus \(legacyChildren.count) imported")
+            FlockMetricRow(
+                label: "Attention", value: "\(attentionCount)",
+                symbol: "exclamationmark.bubble",
+                tint: attentionCount > 0 ? Design.warning : .secondary,
+                detail: "sessions marked for attention")
 
+            Divider().opacity(0.6)
             Toggle(isOn: $showOnlyRunning) {
-                Label("Show running Work only", systemImage: "bolt.fill")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Show only running agents")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(showOnlyRunning
+                         ? "Showing \(canonicalWorks.count) active Work row\(canonicalWorks.count == 1 ? "" : "s")"
+                         : "Showing all \(canonicalAllWorks.count) Work row\(canonicalAllWorks.count == 1 ? "" : "s")")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
             }
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .font(.system(size: 10.5))
-                .help("Filter the list to Work with running activity")
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .help("Filter the list to Work with running activity")
         }
         .padding(.horizontal, Design.gutter)
         .padding(.vertical, 9)
@@ -192,6 +202,8 @@ struct FlockView: View {
                                         .font(.system(size: 9.5)).foregroundStyle(.tertiary)
                                 }
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
 
@@ -231,10 +243,44 @@ struct FlockView: View {
         } else {
             EmptyStateView(
                 symbol: "sidebar.right",
-                title: "Pick Work or imported child activity",
-                message: "Canonical Work is authoritative for lifecycle and attention. Imported "
-                    + "child details remain available only where no native projection exists.")
+                title: "See what your agents are doing",
+                message: "Select a conversation or child agent to see its status, model, and activity.")
         }
+    }
+}
+
+private struct FlockMetricRow: View {
+    let label: String
+    let value: String
+    let symbol: String
+    var tint: Color = Design.accent
+    let detail: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(tint)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label)
+                    .font(.system(size: 11, weight: .semibold))
+                Text(detail)
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Text(value)
+                .font(.system(size: 17, weight: .medium, design: .rounded))
+                .foregroundStyle(.primary)
+                .contentTransition(.numericText())
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(label), \(value). \(detail)")
     }
 }
 
@@ -249,11 +295,11 @@ private struct CanonicalFlockWorkRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Button {
-                onSelect()
-                selectedID = work.id
-            } label: {
+        Button {
+            onSelect()
+            selectedID = work.id
+        } label: {
+            VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 7) {
                     if running {
                         PulseDot(color: Design.success)
@@ -267,8 +313,6 @@ private struct CanonicalFlockWorkRow: View {
                         Text(work.sessions.first?.title ?? "Unattached Work")
                             .font(.system(size: 12, weight: .semibold))
                             .lineLimit(1)
-                        Text(work.id).font(Design.mono(9)).foregroundStyle(.tertiary)
-                            .lineLimit(1).truncationMode(.middle)
                     }
                     Spacer()
                     if let attention = work.attentionStatus.attention,
@@ -284,52 +328,53 @@ private struct CanonicalFlockWorkRow: View {
                          tint: Design.agentMessage)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
 
-            HStack(spacing: 6) {
-                if let host = work.workHost {
-                    Chip(text: host.workHostID, symbol: "server.rack")
-                }
-                if let lifecycle = work.lifecycle { Chip(text: lifecycle.rawValue) }
-                if let execution = work.execution { Chip(text: execution.rawValue) }
-                if let model = work.modelID {
-                    Text(model).font(Design.mono(9)).foregroundStyle(.tertiary)
-                }
-                Spacer()
-            }
-
-            if work.childLifecycleAvailable {
-                if work.children.isEmpty {
-                    Text("No child lifecycle records at this Work tip.")
-                        .font(.system(size: 10)).foregroundStyle(.tertiary)
-                } else {
-                    ForEach(Array(work.children.prefix(FlockView.maxDisplayedChildrenPerWork))) { child in
-                        HStack(spacing: 6) {
-                            Circle().fill(child.state == "running"
-                                          ? AnyShapeStyle(Design.success)
-                                          : AnyShapeStyle(.tertiary))
-                                .frame(width: 6, height: 6)
-                            Text(child.name ?? child.childID).font(.system(size: 11))
-                            Spacer()
-                            Text(child.state).font(Design.mono(9)).foregroundStyle(.secondary)
-                        }
-                        .padding(.leading, 12)
+                HStack(spacing: 6) {
+                    if let lifecycle = work.lifecycle, lifecycle != .active {
+                        Chip(text: lifecycle.rawValue)
                     }
-                    if work.children.count > FlockView.maxDisplayedChildrenPerWork {
-                        Text("+\(work.children.count - FlockView.maxDisplayedChildrenPerWork) children omitted")
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                    if let execution = work.execution { Chip(text: execution.rawValue) }
+                    if let model = work.modelID {
+                        Text(model).font(.system(size: 10)).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                    Spacer()
+                }
+
+                if work.childLifecycleAvailable {
+                    if work.children.isEmpty {
+                        Text("No child agents recorded")
+                            .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    } else {
+                        ForEach(Array(work.children.prefix(FlockView.maxDisplayedChildrenPerWork))) { child in
+                            HStack(spacing: 6) {
+                                Circle().fill(child.state == "running"
+                                              ? AnyShapeStyle(Design.success)
+                                              : AnyShapeStyle(.tertiary))
+                                    .frame(width: 6, height: 6)
+                                Text(child.name ?? child.childID).font(.system(size: 11))
+                                Spacer()
+                                Text(child.state).font(Design.mono(9)).foregroundStyle(.secondary)
+                            }
                             .padding(.leading, 12)
+                        }
+                        if work.children.count > FlockView.maxDisplayedChildrenPerWork {
+                            Text("+\(work.children.count - FlockView.maxDisplayedChildrenPerWork) children omitted")
+                                .font(.system(size: 10)).foregroundStyle(.secondary)
+                                .padding(.leading, 12)
+                        }
                     }
+                } else {
+                    Text(work.unavailableReason ?? "Child lifecycle is unavailable")
+                        .font(.system(size: 10)).foregroundStyle(Design.warning)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-            } else {
-                Text(work.unavailableReason ?? "Child lifecycle is unavailable")
-                    .font(.system(size: 10)).foregroundStyle(Design.warning)
-                    .fixedSize(horizontal: false, vertical: true)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .contentShape(Rectangle())
         }
-        .padding(10)
+        .buttonStyle(.plain)
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(selected ? AnyShapeStyle(Design.accentSoft)

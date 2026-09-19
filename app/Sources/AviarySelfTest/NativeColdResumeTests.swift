@@ -20,6 +20,7 @@ private enum NativeResumePostContextAction {
     case genericArtifact
     case runtimeWithReviewMarker
     case python
+    case directShell
 }
 
 private func nativeResumeManifest(
@@ -136,6 +137,7 @@ private func makeNativeResumeFixture(
                 causalCursor: await bundle.latestWorkCursor))
         _ = try await bundle.markCommandDelivered(commandID: commandID)
     }
+    var turnFinished = false
     switch postContextAction {
     case .none:
         break
@@ -188,8 +190,39 @@ private func makeNativeResumeFixture(
             action: permit.action, provenance: permit.startedCommit.eventRef)
         _ = try await bundle.finishAction(
             permit, state: .succeeded, retrySafety: .safe)
+    case .directShell:
+        _ = try await bundle.finishTurn(turn)
+        turnFinished = true
+        let causalCursor = try XCTUnwrap(await bundle.latestWorkCursor)
+        let client = ClientRef("native-direct-client")
+        let externalCommandID = "native-direct-shell"
+        let request = WorkServiceDirectShellRequest(
+            work: identity.work, journal: bundle.workJournal,
+            attachment: ClientAttachmentRef("native-direct-client-attachment"),
+            command: CommandRef(
+                commandID: externalCommandID, client: client,
+                sessionAttachment: bundle.sessionAttachment, causalCursor: causalCursor),
+            causalWorkCursor: causalCursor, run: RunRef(identity.runID), operation: .run,
+            language: .sh, source: Data("printf cold-shell".utf8))
+        let commandID = WorkServiceCommandLedgerIdentity.commandID(
+            client: client, commandID: externalCommandID)
+        let permit = try await bundle.admitDirectShell(
+            request: request, commandID: commandID)
+        let worker = DirectShellCommandWorker(request: DirectShellCommandRequest(
+            commandID: commandID, actionID: permit.action.actionID, language: .sh,
+            source: request.source!, workingDirectory: home.root,
+            environment: ["PATH": "/usr/bin:/bin"]))
+        let result = await worker.wait()
+        _ = try await bundle.recordArtifact(
+            artifactID: permit.action.actionID + "-output", label: "Command output",
+            mediaType: DirectShellJournalFormat.resultMediaType,
+            body: try DirectShellJournalFormat.encoded(result), action: permit.action,
+            provenance: permit.startedCommit.eventRef)
+        _ = try await bundle.finishAction(
+            permit, state: .succeeded, retrySafety: .unknown)
+        _ = try await bundle.markCommandDelivered(commandID: commandID)
     }
-    _ = try await bundle.finishTurn(turn)
+    if !turnFinished { _ = try await bundle.finishTurn(turn) }
     _ = try await bundle.finishRun()
     let sessionCursor = try XCTUnwrap(await bundle.latestSessionCursor)
     let workCursor = try XCTUnwrap(await bundle.latestWorkCursor)
@@ -396,6 +429,40 @@ func test_nativeColdResumeRefusesPostBoundaryActionAndCompactionCrossing() async
     let validSettlement = try await makeNativeResumeFixture()
     defer { try? FileManager.default.removeItem(at: validSettlement.home.root) }
     _ = try resumeNativeFixture(validSettlement)
+
+    let settledShell = try await makeNativeResumeFixture(postContextAction: .directShell)
+    defer { try? FileManager.default.removeItem(at: settledShell.home.root) }
+    let resumedShell = try resumeNativeFixture(settledShell)
+    XCTAssertFalse(resumedShell.messages.contains {
+        $0.content.contains { content in
+            if case .text(let text) = content { return text.contains("cold-shell") }
+            return false
+        }
+    }, "direct-shell output is pending context, not historical model conversation")
+
+    var forgedArtifactRecords = settledShell.workRead.records
+    let forgedArtifactIndex = try XCTUnwrap(forgedArtifactRecords.lastIndex(where: {
+        $0.event.type == TimelineEventType.artifact
+            && $0.event.action?.actionID.hasPrefix("shell-") == true
+    }))
+    let forgedArtifactRecord = forgedArtifactRecords[forgedArtifactIndex]
+    var forgedArtifactPayload = try XCTUnwrap(forgedArtifactRecord.event.payload.objectValue)
+    // The generic artifact reducer permits arbitrary labels. This mutation specifically
+    // exercises direct-shell producer authentication rather than its earlier digest guard.
+    forgedArtifactPayload["label"] = .string("Unrelated artifact")
+    forgedArtifactRecords[forgedArtifactIndex] = TimelineJournalRecord(
+        event: cloneNativeResumeEvent(
+            forgedArtifactRecord.event, payload: .object(forgedArtifactPayload)),
+        rawLineBytes: forgedArtifactRecord.rawLineBytes,
+        byteStart: forgedArtifactRecord.byteStart,
+        byteEnd: forgedArtifactRecord.byteEnd)
+    assertNativeResumeThrows({ try resumeNativeFixture(
+        settledShell, workRead: TimelineJournalReadResult(records: forgedArtifactRecords)) }) { error in
+        guard case .workStateUnavailable(let reason) = error else {
+            return XCTFail("expected forged direct-shell artifact metadata refusal, got \(error)")
+        }
+        XCTAssertTrue(reason.contains("post-context action"))
+    }
 
     let missingSettlement = try await makeNativeResumeFixture()
     defer { try? FileManager.default.removeItem(at: missingSettlement.home.root) }

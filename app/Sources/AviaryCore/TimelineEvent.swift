@@ -115,6 +115,9 @@ public enum CommandDeliveryState: String, Codable, Hashable, Sendable {
 /// the service request enum: Session-owned producers also have a `queue_follow_up` command,
 /// while the Work service calls that operation `queue`.
 public enum CanonicalCommandKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case directShell = "direct_shell"
+    case stopShell = "stop_shell"
+    case dismissShell = "dismiss_shell"
     case start
     case send
     case steer

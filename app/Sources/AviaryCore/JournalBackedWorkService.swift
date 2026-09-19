@@ -2876,6 +2876,104 @@ public actor JournalBackedWorkService: WorkServiceClient {
         next.resume()
     }
 
+    public func directShell(_ request: WorkServiceDirectShellRequest) async throws
+        -> WorkServiceDirectShellResponse {
+        try await ensureLoaded()
+        try request.validate()
+        guard let client = request.command.client else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "direct shell command requires a client")
+        }
+
+        let primaryCapability: WorkServiceCapability = request.operation == .inspect
+            ? .observe : .control
+        let requiredCapability: WorkServiceCapability = request.operation == .inspect
+            ? .inspectArtifacts : .directShell
+        let authorized = try await requireAttachedWithControl(
+            work: request.work, journal: request.journal, attachment: request.attachment,
+            client: client, capability: primaryCapability)
+        let attachment = authorized.attachment
+        guard attachment.authorization.allows(requiredCapability) else {
+            throw WorkServiceProtocolError.capabilityDenied(requiredCapability)
+        }
+        guard request.command.sessionAttachment == attachment.sessionAttachment else {
+            throw WorkServiceProtocolError.invalidRequest(
+                "direct shell Session attachment does not match client attachment")
+        }
+
+        if request.operation != .inspect {
+            try await rejectCrossSessionLiveOwner(
+                work: request.work, attachment: attachment)
+        }
+        let source = try await requireCanonical(work: request.work, journal: request.journal)
+        let binding = try callerWorkBinding(attachment, source: source, work: request.work)
+        let qualifiedCommandID = WorkServiceCommandLedgerIdentity.commandID(
+            client: client, commandID: request.command.commandID)
+        let priorCommand = source.workState.commands[qualifiedCommandID]
+
+        if request.operation == .run || request.operation == .stop {
+            guard source.workState.activeRun == request.run,
+                  source.workState.activeRunSession == binding.session,
+                  source.workState.activeRunSessionAttachment == binding.sessionAttachment else {
+                throw WorkServiceProtocolError.invalidRequest(
+                    "direct shell command does not own the active Run")
+            }
+        }
+        if request.operation == .inspect {
+            guard directShellInspectCursorIsCanonical(
+                request.causalWorkCursor, source: source) else {
+                throw WorkServiceProtocolError.staleCursor(
+                    expected: request.causalWorkCursor, actual: source.workCursor)
+            }
+        } else if request.causalWorkCursor != source.workCursor && priorCommand == nil {
+            throw WorkServiceProtocolError.staleCursor(
+                expected: request.causalWorkCursor, actual: source.workCursor)
+        }
+
+        guard let lookup = await registry.lookup(request.work), case .live(let live) = lookup,
+              await exactLiveHostedActor(live, source: source, binding: binding) else {
+            if request.operation == .inspect {
+                return WorkServiceDirectShellResponse(
+                    work: request.work, operation: request.operation,
+                    commandID: request.command.commandID, host: hostInstance,
+                    causalWorkCursor: request.causalWorkCursor,
+                    resultingWorkCursor: source.workCursor,
+                    authorization: attachment.authorization, disposition: .unavailable,
+                    entries: [],
+                    diagnostic: "Direct command state requires the exact live hosted Work")
+            }
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+
+        let hosted = try await live.hostedWork.directShell(
+            request, commandID: qualifiedCommandID)
+        let response = WorkServiceDirectShellResponse(
+            work: request.work, operation: request.operation,
+            commandID: request.command.commandID, host: hostInstance,
+            causalWorkCursor: request.causalWorkCursor,
+            resultingWorkCursor: hosted.resultingWorkCursor,
+            authorization: attachment.authorization, disposition: hosted.disposition,
+            entries: hosted.entries, diagnostic: hosted.diagnostic)
+        try response.validate(for: request)
+        return response
+    }
+
+    /// Inspect is a read and may race newer action events. It may use an earlier cursor only
+    /// when that exact event is still proven in the canonical prefix; sequence alone is not a
+    /// sufficient acknowledgement and no read cursor is advanced here.
+    private func directShellInspectCursorIsCanonical(
+        _ cursor: JournalCursor, source: CanonicalSource
+    ) -> Bool {
+        guard cursor.journal == source.workJournal,
+              cursor.sequence > 0,
+              cursor.sequence <= source.workCursor.sequence else { return false }
+        if cursor == source.workCursor { return true }
+        guard let index = source.workSequenceToIndex[cursor.sequence],
+              index >= 0, index < source.workCache.result.records.count else { return false }
+        let event = source.workCache.result.records[index].event
+        return event.sequence == cursor.sequence && event.eventID == cursor.eventID
+    }
+
     public func command(_ request: WorkServiceCommandRequest) async throws
         -> WorkServiceCommandReceipt {
         try await ensureLoaded()

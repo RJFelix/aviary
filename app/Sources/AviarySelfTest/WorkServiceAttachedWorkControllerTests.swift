@@ -311,6 +311,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
     var attachmentAuthorization: WorkServiceAuthorizationOutcome
     var artifactBodyRequests: [WorkServiceBodyRequest] = []
     var commandRequests: [WorkServiceCommandRequest] = []
+    var directShellRequests: [WorkServiceDirectShellRequest] = []
     var commandFailuresRemaining = 0
     var loseAcceptedResponsesRemaining = 0
     var acceptedCommands: [String: WorkServiceCommandReceipt] = [:]
@@ -361,6 +362,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
     func failNextCommand() { commandFailuresRemaining += 1 }
     func loseNextAcceptedResponse() { loseAcceptedResponsesRemaining += 1 }
     func commandCount() -> Int { commandRequests.count }
+    func directShellCount() -> Int { directShellRequests.count }
     func commandEffectCount() -> Int { commandEffects }
     func lastCommand() -> WorkServiceCommandRequest? { commandRequests.last }
     func readAckRequests() -> [WorkServiceAcknowledgeReadRequest] {
@@ -730,6 +732,12 @@ private actor AttachedControllerTestService: WorkServiceClient {
     func cancelAgentHandle(_ request: WorkServiceAgentHandleCancelRequest) async throws
         -> WorkServiceAgentHandleCancelResponse {
         throw WorkServiceProtocolError.invalidRequest("child cancellation is not modeled by this fixture")
+    }
+
+    func directShell(_ request: WorkServiceDirectShellRequest) async throws
+        -> WorkServiceDirectShellResponse {
+        directShellRequests.append(request)
+        throw AttachedControllerTestError.unsupported
     }
 
     func command(_ request: WorkServiceCommandRequest) async throws -> WorkServiceCommandReceipt {
@@ -3243,7 +3251,50 @@ func testWorkServiceAttachedControllerResumesMoreThan256PagesFromCheckpointCurso
     XCTAssertEqual(replayed.sessionSnapshot, final.sessionSnapshot)
 }
 
+func testWorkServiceAttachedControllerRequiresCapturedRunForDirectShell() async throws {
+    let fixture = try AttachedControllerFixture(workID: "direct-shell-run-fence")
+    let service = AttachedControllerTestService(fixture: fixture)
+    let run = RunRef("direct-shell-current-run")
+    let prior = try XCTUnwrap(fixture.workEvents.last)
+    let started = TimelineEvent(
+        eventID: "direct-shell-run-started", journal: fixture.workJournal,
+        sequence: prior.sequence + 1, previousEventID: prior.eventID,
+        session: fixture.session, work: fixture.work, workHost: fixture.host,
+        client: fixture.client, sessionAttachment: fixture.sessionAttachment, run: run,
+        actor: TimelineActor(actorID: "direct-shell-run-fence", kind: "test"),
+        hostRecordedAt: Date(), type: TimelineEventType.runStarted,
+        declaredDomains: [.work], payload: .object([:]))
+    await service.replaceWorkEvents(fixture.workEvents + [started])
+    let controller = try makeAttachedController(fixture: fixture, service: service)
+    let projection = try await controller.refresh()
+    XCTAssertEqual(projection.descriptor.currentRun, run)
+
+    do {
+        _ = try await controller.directShell(
+            operation: .run, language: .sh, source: Data("printf fenced".utf8),
+            expectedRun: RunRef("stale-confirmed-run"))
+        XCTFail("a command confirmed for a replaced Run must not reach the service")
+    } catch WorkServiceProtocolError.invalidRequest { /* expected */ }
+    do {
+        _ = try await controller.directShell(
+            operation: .run, language: .sh, source: Data("printf fenced".utf8))
+        XCTFail("Run admission must require the caller's captured Run")
+    } catch WorkServiceProtocolError.invalidRequest { /* expected */ }
+    XCTAssertEqual(await service.directShellCount(), 0)
+
+    do {
+        _ = try await controller.directShell(
+            operation: .run, language: .sh, source: Data("printf exact".utf8),
+            expectedRun: run)
+        XCTFail("the fixture service deliberately does not execute direct commands")
+    } catch AttachedControllerTestError.unsupported { /* expected */ }
+    XCTAssertEqual(await service.directShellCount(), 1)
+}
+
 let casesWorkServiceAttachedWorkController: [Case] = [
+    ("direct shell controller fences execution to the captured Run", {
+        try await testWorkServiceAttachedControllerRequiresCapturedRunForDirectShell()
+    }),
     ("phase3 Work controller acceptance read cannot orphan an in-flight intent", {
         try await testWorkServiceAttachedControllerAcceptanceReadCannotOrphanInFlightIntent()
     }),

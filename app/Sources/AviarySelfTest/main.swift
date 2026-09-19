@@ -7165,6 +7165,9 @@ await Harness.run(
         + casesChatInteractionPresentation
         + casesChatVisibilityStore
         + casesSuggestedShellCommand
+        + casesDirectShellCommandWorker
+        + casesDirectShellCommandJournal
+        + casesDirectShellService
         + [
             ("message transfer: exact authored text", { try test_transcriptMessageTransferPreservesExactRoleText() }),
             ("message transfer: user whitespace", { try test_transcriptMessageTransferUsesUserBlocksOnly() }),

@@ -17,6 +17,10 @@ enum LiveChatTelemetryProbe {
     private static let modelID = "live-model"
     private static let prompt = "LIVE_CHAT_PROMPT_SENTINEL_7f23"
     private static let assistantText = "LIVE_CHAT_ASSISTANT_SENTINEL_18ac"
+    private static let directCommandSourceSentinel =
+        "LIVE_DIRECT_COMMAND_SOURCE_SENTINEL_c741"
+    private static let directCommandOutputSentinel =
+        "LIVE_DIRECT_COMMAND_OUTPUT_SENTINEL_a29e"
 
     private enum Failure: String, Error {
         case invalidEnvironment = "invalid_environment"
@@ -30,6 +34,7 @@ enum LiveChatTelemetryProbe {
         case startupSavedRowUnreadable
         case turn
         case review
+        case directCommand
         case ending
         case shutdown
     }
@@ -42,6 +47,8 @@ enum LiveChatTelemetryProbe {
         let startCommand: String
         let action: String
         let artifact: String
+        let directCommand: String
+        let directAction: String
     }
 
     @MainActor static func runIfRequested() {
@@ -203,6 +210,49 @@ enum LiveChatTelemetryProbe {
                   observed.files.contains(where: { $0.path == "probe-result.txt" })
             else { throw Failure.review }
 
+            let directSource = ": '\(directCommandSourceSentinel)'; "
+                + "printf '%s\\n' '\(directCommandOutputSentinel)'"
+            guard let directCommand = SuggestedShellCommand.make(
+                language: "sh", source: directSource),
+                  run.canRunDirectShell,
+                  await run.directShell(
+                    operation: .run, command: directCommand, expectedRun: activeRun)
+            else { throw Failure.directCommand }
+            let directEntry = try await wait(
+                upTo: 20, failure: .directCommand
+            ) { () async throws -> WorkServiceDirectShellEntry? in
+                await run.refreshService()
+                guard let entry = run.directShellEntries.first(where: {
+                    $0.source == Data(directSource.utf8)
+                }) else { return nil }
+                guard entry.state.isTerminal else { return nil }
+                let expectedOutput = Data((directCommandOutputSentinel + "\n").utf8)
+                guard entry.state == .succeeded,
+                      entry.pendingContext,
+                      let result = entry.result,
+                      result.status == .exited(exitCode: 0),
+                      result.source == Data(directSource.utf8),
+                      result.stdout.isComplete,
+                      result.stdout.totalByteCount == Int64(expectedOutput.count),
+                      result.stdout.omittedByteCount == 0,
+                      result.stdout.head + result.stdout.tail == expectedOutput,
+                      result.stderr.isComplete,
+                      result.stderr.totalByteCount == 0,
+                      result.stderr.omittedByteCount == 0,
+                      result.stderr.head.isEmpty,
+                      result.stderr.tail.isEmpty,
+                      entry.artifact?.available == true
+                else { throw Failure.directCommand }
+                return entry
+            }
+            // Plain End must not silently strand output awaiting the user's next message.
+            await run.end()
+            guard run.serviceProjection?.descriptor.currentRun == activeRun,
+                  !run.isEnding,
+                  run.directShellEntries.contains(where: {
+                      $0.action == directEntry.action && $0.pendingContext
+                  }) else { throw Failure.directCommand }
+
             let receipt = Receipt(
                 work: AviaryTelemetry.workIdentity(work),
                 journal: AviaryTelemetry.journalIdentity(journal),
@@ -210,9 +260,15 @@ enum LiveChatTelemetryProbe {
                 run: AviaryTelemetry.identity(activeRun.runID),
                 startCommand: AviaryTelemetry.identity(savedStartID),
                 action: AviaryTelemetry.identity(pythonAction.action.actionID),
-                artifact: AviaryTelemetry.identity(descriptor.artifactID))
+                artifact: AviaryTelemetry.identity(descriptor.artifactID),
+                directCommand: AviaryTelemetry.identity(directEntry.command.commandID),
+                directAction: AviaryTelemetry.identity(directEntry.action.actionID))
 
-            await run.end()
+            // This is the explicit confirmation path. It must durably dismiss the output
+            // before End closes the actor, rather than merely hiding the GUI card.
+            await run.end(discardPendingCommandOutput: true)
+            guard !run.directShellEntries.contains(where: \.pendingContext),
+                  run.directShellError == nil else { throw Failure.directCommand }
             let ended = try await wait(upTo: 20) { () async throws -> Bool? in
                 await run.refreshService(resumeInitialStart: false)
                 guard let projection = run.serviceProjection else { return nil }
@@ -243,6 +299,7 @@ enum LiveChatTelemetryProbe {
 
     @MainActor private static func wait<T>(
         upTo seconds: TimeInterval,
+        failure: Failure = .turn,
         poll: @escaping @MainActor () async throws -> T?
     ) async throws -> T {
         let deadline = Date().addingTimeInterval(seconds)
@@ -250,7 +307,7 @@ enum LiveChatTelemetryProbe {
             if let value = try await poll() { return value }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
-        throw Failure.turn
+        throw failure
     }
 
     private static func isPrivateFixtureDirectory(_ url: URL) throws -> Bool {

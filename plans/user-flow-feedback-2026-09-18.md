@@ -56,3 +56,10 @@ menu was verified with a physical pointer click, not only an accessibility actio
 
 The 380-pixel busy-composer fixture was visually inspected. Fixture rendering is not a live
 provider-turn/transport proof. This checkpoint does not claim a full-suite or Linux run.
+
+## Follow-on implementation
+
+The subsequent Work-Host-owned direct-command slice, Flock interaction refinements, and activity
+copy pass are documented in [direct-user-commands.md](direct-user-commands.md), including their
+new verification receipts. The preceding UI-only checkpoint remains a historical receipt;
+its service-lifetime and test boundaries do not describe the later deployment.

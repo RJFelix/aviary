@@ -83,6 +83,10 @@ enum LinuxSelfTestMain {
             ("Shell: concurrent login environment loads coalesce", {
                 try await test_processEnvironmentCoalescesConcurrentLoads()
             }),
+            ("Direct shell: service DTO and durable journal", {
+                try await runLinuxCases(casesDirectShellService)
+                try await runLinuxCases(casesDirectShellCommandJournal)
+            }),
             ("Linux platform: SHA-256 known vectors", {
                 test_linuxSHA256KnownVectors()
             }),

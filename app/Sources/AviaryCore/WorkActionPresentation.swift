@@ -271,6 +271,7 @@ public struct WorkActionPresentation: Codable, Hashable, Sendable, Identifiable 
         case .artifact: return "Artifact operation"
         case .imageRead: return "Image read"
         case .nestedProcessCallback: return "Nested process callback"
+        case .directShell: return "Run command"
         }
     }
 
@@ -371,6 +372,9 @@ public struct WorkActionPresentation: Codable, Hashable, Sendable, Identifiable 
             return "Artifact identity/status is recorded; artifact contents require explicit inspection."
         case .imageRead:
             return "Image-read status is recorded; image contents are not copied into this projection."
+        case .directShell:
+            return "Runs the exact command on the Work Host; it may read or change the filesystem "
+                + "and use the network. This action projection does not sandbox those effects."
         }
     }
 }

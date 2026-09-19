@@ -52,6 +52,7 @@ public enum ActionKind: String, Codable, CaseIterable, Hashable, Sendable {
     case artifact
     case imageRead = "image_read"
     case nestedProcessCallback = "nested_process_callback"
+    case directShell = "direct_shell"
 }
 
 /// The lifecycle states recorded for a child admitted by a native run. A running record is
@@ -470,6 +471,7 @@ public actor RunJournalBundle {
     private var isClosed = false
     private var semanticGateHeld = false
     private var semanticGateWaiters: [CheckedContinuation<Void, Never>] = []
+    private var directInputTexts: [String: String] = [:]
 
     private init(
         session: SessionRef, work: WorkRef, workHost: WorkHostRef,
@@ -2207,6 +2209,205 @@ public actor RunJournalBundle {
     public var latestSessionCursor: JournalCursor? { sessionCursor }
     public var latestWorkCursor: JournalCursor? { workCursor }
 
+    /// Only a successfully committed input can supply augmented model text. The request itself
+    /// remains byte-identical for command reconciliation; injected output is a separate crossing.
+    public func effectiveInputText(commandID: String, fallback: String) async throws -> String {
+        if let exact = directInputTexts[commandID] { return exact }
+        guard seenActionIDs.contains(where: { $0.hasPrefix("shell-") }) else { return fallback }
+        return try await withSemanticGate {
+            let read = try await self.sessionWriter.readCanonicalProjection(
+                expectedSession: self.session, maximumResidentRecords: 100_000)
+            guard read.isFullyResident,
+                  let event = read.records.last(where: { $0.event.type == TimelineEventType.inputAccepted
+                    && $0.event.command?.commandID == commandID })?.event,
+                  let text = event.payload["text"]?.stringValue else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            return text
+        }
+    }
+
+    public func directShellEntries(including commandID: String? = nil, action: ActionRef? = nil) async throws -> [WorkServiceDirectShellEntry] {
+        try await withSemanticGate { try await self.directShellEntriesLocked(including: commandID, action: action) }
+    }
+
+    private func directShellEntriesLocked(including commandID: String? = nil, action requestedAction: ActionRef? = nil) async throws -> [WorkServiceDirectShellEntry] {
+        try ensureUsable()
+        guard seenActionIDs.contains(where: { $0.hasPrefix("shell-") }) else { return [] }
+        let workRead = try await workWriter.readCanonicalProjection(
+            expectedWork: work, expectedWorkHost: workHost, maximumResidentRecords: 100_000)
+        let sessionRead = try await sessionWriter.readCanonicalProjection(
+            expectedSession: session, maximumResidentRecords: 100_000)
+        guard workRead.isFullyResident, sessionRead.isFullyResident,
+              let snapshot = workRead.workSnapshot, snapshot.corruptionReasons.isEmpty else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let events = workRead.records.map(\.event)
+        var artifactsByAction: [ActionRef: [TimelineEvent]] = [:]
+        for event in events where event.type == TimelineEventType.artifact
+            && event.payload["media_type"]?.stringValue == DirectShellJournalFormat.resultMediaType {
+            if let action = event.action { artifactsByAction[action, default: []].append(event) }
+        }
+        var dismissed: Set<String> = []
+        for event in events where event.type == TimelineEventType.commandAccepted {
+            if event.payload["command_kind"]?.stringValue == "dismiss_shell",
+               event.command?.sessionAttachment == sessionAttachment,
+               let id = event.payload["direct_shell_action"]?.stringValue { dismissed.insert(id) }
+        }
+        for record in sessionRead.records where record.event.type == TimelineEventType.inputAccepted {
+            guard record.event.session == session,
+                  record.event.sessionAttachment == sessionAttachment else { continue }
+            for value in record.event.payload["direct_shell_consumed"]?.arrayValue ?? [] {
+                if let id = value.stringValue { dismissed.insert(id) }
+            }
+        }
+        var entries: [WorkServiceDirectShellEntry] = []
+        for event in events where event.type == TimelineEventType.commandAccepted
+            && event.payload["command_kind"]?.stringValue == "direct_shell"
+            && event.command?.sessionAttachment == sessionAttachment {
+            guard let command = event.command, let eventRun = event.run,
+                  let value = event.payload["direct_shell_request"],
+                  let reference: TimelineBodyReference = decodeTimelineValue(value),
+                  reference.authority == workJournal,
+                  let size = reference.byteCount, size <= 64 * 1024,
+                  let stored = try? JSONDecoder().decode(
+                    DirectShellJournalRequest.self, from: contextBodyStore.read(reference)),
+                  stored.session == session,
+                  stored.request.work == work, stored.request.journal == workJournal,
+                  stored.request.run == eventRun,
+                  stored.request.command.client == command.client,
+                  stored.request.command.sessionAttachment == sessionAttachment,
+                  stored.request.causalWorkCursor == command.causalCursor,
+                  let language = stored.request.language, let source = stored.request.source else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let action = DirectShellJournalFormat.action(commandID: command.commandID)
+            guard let state = snapshot.actions[action.actionID] else {
+                // A crash between command.accepted and action.started is not a launch permit.
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            var result: DirectShellCommandResult?
+            var descriptor: WorkServiceArtifactDescriptor?
+            let artifacts = artifactsByAction[action] ?? []
+            guard artifacts.count <= 1 else { throw WorkServiceProtocolError.sourceIncomplete }
+            if let artifact = artifacts.first {
+                guard artifact.session == session, artifact.sessionAttachment == sessionAttachment,
+                      artifact.run == eventRun,
+                      let value = artifact.payload["body_reference"],
+                      let body: TimelineBodyReference = decodeTimelineValue(value),
+                      body.authority == workJournal, let size = body.byteCount, size <= 256 * 1024,
+                      let decoded = try? JSONDecoder().decode(
+                        DirectShellCommandResult.self, from: contextBodyStore.read(body)),
+                      decoded.commandID == command.commandID, decoded.actionID == action.actionID,
+                      decoded.source == source, decoded.language == language else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                try decoded.validate()
+                guard DirectShellCommandCanonicalValidation.artifactPayloadIsCanonical(
+                    artifact.payload, body: body, result: decoded, action: action) else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                if state.state.isTerminal {
+                    guard state.retrySafety == .unknown,
+                          DirectShellCommandCanonicalValidation.outcomeMatches(
+                            decoded.status, state: state.state, failureKind: state.failureKind) else {
+                        throw WorkServiceProtocolError.sourceIncomplete
+                    }
+                }
+                result = state.state.isTerminal ? decoded : nil
+                let retainedDescriptor = try WorkServiceArtifactDescriptor(
+                    artifactID: action.actionID + "-output",
+                    work: work, label: "Command output", mediaType: DirectShellJournalFormat.resultMediaType,
+                    byteCount: body.byteCount, digest: body.digest, available: true, bodyReference: body,
+                    sourceEvent: EventRef(journal: workJournal, eventID: artifact.eventID), session: session, sessionAttachment: sessionAttachment,
+                    run: eventRun, turn: artifact.turn, action: action, causedByEventID: artifact.causedByEventID)
+                descriptor = state.state.isTerminal ? retainedDescriptor : nil
+            }
+            entries.append(WorkServiceDirectShellEntry(
+                command: command, session: session, sessionAttachment: sessionAttachment,
+                run: eventRun, action: action, language: language, source: source, timeout: stored.request.durationLimitSeconds,
+                state: state.state, result: result, artifact: descriptor,
+                pendingContext: result != nil && state.state.isTerminal && !dismissed.contains(action.actionID)))
+        }
+        // Pending output may not be silently evicted. History remains in ordinary artifacts;
+        // this RPC is a bounded command tray, not another lifetime transcript.
+        let pending = entries.filter(\.pendingContext)
+        guard pending.count <= DirectShellJournalFormat.maximumPendingResults,
+              pending.reduce(0, { $0 + ($1.result?.stdout.retainedByteCount ?? 0)
+                + ($1.result?.stderr.retainedByteCount ?? 0) }) <= DirectShellJournalFormat.maximumPendingOutputBytes else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let selected = entries.filter { $0.pendingContext || !$0.state.isTerminal
+            || $0.command.commandID == commandID || $0.action == requestedAction }
+        return selected.isEmpty ? Array(entries.suffix(1)) : selected
+    }
+
+    public func admitDirectShell(
+        request: WorkServiceDirectShellRequest, commandID: String
+    ) async throws -> EffectPermit {
+        try await withSemanticGate {
+            try self.ensureUsable()
+            try self.ensureRunActive()
+            guard self.activeTurn == nil, self.activeActionIDs.isEmpty,
+                  request.run == self.run, request.work == self.work,
+                  request.journal == self.workJournal,
+                  request.command.sessionAttachment == self.sessionAttachment,
+                  request.causalWorkCursor == self.workCursor else {
+                throw RunJournalBundleError.invalidOperation("command requires the current idle Run and Session")
+            }
+            let pending = try await self.directShellEntriesLocked().filter(\.pendingContext)
+            let retained = pending.reduce(0) { $0 + ($1.result?.stdout.retainedByteCount ?? 0)
+                + ($1.result?.stderr.retainedByteCount ?? 0) }
+            guard pending.count < DirectShellJournalFormat.maximumPendingResults,
+                  retained + 128 * 1024 <= DirectShellJournalFormat.maximumPendingOutputBytes else {
+                throw RunJournalBundleError.invalidOperation("send or dismiss pending command output before running another command")
+            }
+            let body = try self.contextBodyStore.retain(
+                DirectShellJournalFormat.encoded(DirectShellJournalRequest(request: request, session: self.session)),
+                authority: self.workJournal, mediaType: DirectShellJournalFormat.requestMediaType)
+            let command = CommandRef(commandID: commandID, client: request.command.client,
+                                     sessionAttachment: self.sessionAttachment, causalCursor: request.causalWorkCursor)
+            let accepted = try await self.commitCommandLocked(
+                label: "direct_shell", deliveryMode: .queued, command: command,
+                metadata: ["direct_shell_request": encodeTimelineValue(body)])
+            return try await self.beginActionLocked(
+                action: DirectShellJournalFormat.action(commandID: commandID), kind: .directShell,
+                intent: "Run a user-confirmed shell command", target: nil, scope: "run",
+                metadata: ["language": .string(request.language?.rawValue ?? "")],
+                causedBy: accepted.first?.eventRef)
+        }
+    }
+
+    public func recordDirectShellControl(
+        request: WorkServiceDirectShellRequest, commandID: String
+    ) async throws {
+        try await withSemanticGate {
+            guard request.run == self.run, request.work == self.work,
+                  request.journal == self.workJournal,
+                  request.command.sessionAttachment == self.sessionAttachment,
+                  let action = request.action else { throw WorkServiceProtocolError.sourceIncomplete }
+            let label = request.operation == .stop ? "stop_shell" : "dismiss_shell"
+            if let prior = self.commands[commandID] {
+                guard prior.command.causalCursor == request.causalWorkCursor,
+                      prior.command.client == request.command.client,
+                      prior.commandKind?.rawValue == label else { throw WorkServiceProtocolError.sourceIncomplete }
+                // Verify target identity, not just the shared control verb.
+                let events = try Self.readNativeJournal(at: self.workWriter.fileURL, journal: self.workJournal, actor: self.actor)
+                guard events.contains(where: { $0.command?.commandID == commandID
+                    && $0.type == TimelineEventType.commandAccepted
+                    && $0.payload["direct_shell_action"]?.stringValue == action.actionID }) else {
+                    throw WorkServiceProtocolError.sourceIncomplete
+                }
+                return
+            }
+            _ = try await self.commitCommandLocked(
+                label: label, deliveryMode: .delivered,
+                command: CommandRef(commandID: commandID, client: request.command.client,
+                                    sessionAttachment: self.sessionAttachment, causalCursor: request.causalWorkCursor),
+                metadata: ["direct_shell_action": .string(action.actionID)])
+        }
+    }
+
     /// Whether this bundle still contains only the exact newly-started Run marker and therefore
     /// may be closed without terminalizing the reservation. This is intentionally narrow: once a
     /// command, turn, action, or recovery event is durable, callers must not erase that evidence.
@@ -2354,6 +2555,10 @@ public actor RunJournalBundle {
         metadata: [String: JSONValue],
         initialStartPredecessor: JournalCursor? = nil
     ) async throws -> [TimelineJournalCommit] {
+        // Capture and consume outputs at the same canonical input boundary. A rejected or
+        // uncertain send never clears a GUI-side list and cannot silently lose these results.
+        let pendingShell = try await directShellEntriesLocked().filter(\.pendingContext)
+        let effectiveText = DirectShellJournalFormat.context(pendingShell) + text
         let accepted = try await acceptCommandLocked(
             command, deliveryMode: deliveryMode, payload: metadata,
             carriesSessionInput: true,
@@ -2362,9 +2567,13 @@ public actor RunJournalBundle {
         var commits = accepted.commits
         let receipt = commits.last!
         var inputPayload: [String: JSONValue] = [
-            "text": .string(text), "role": .string("user"),
+            "text": .string(effectiveText), "role": .string("user"),
             "delivery_mode": .string(deliveryMode.rawValue)
         ]
+        if !pendingShell.isEmpty {
+            inputPayload["direct_shell_consumed"] = .array(pendingShell.map { .string($0.action.actionID) })
+            inputPayload["user_text_digest"] = .string("sha256:" + AviarySHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined())
+        }
         if let commandKind = metadata["command_kind"] {
             inputPayload["command_kind"] = commandKind
         }
@@ -2377,6 +2586,12 @@ public actor RunJournalBundle {
             type: TimelineEventType.inputAccepted,
             declaredDomains: [.session, .work], payload: .object(inputPayload)))
         commits.append(input)
+        if !pendingShell.isEmpty {
+            if directInputTexts.count >= 2, let oldest = directInputTexts.keys.sorted().first {
+                directInputTexts.removeValue(forKey: oldest)
+            }
+            directInputTexts[normalized.commandID] = effectiveText
+        }
         lastMessage = input.eventRef
         let tip = try await appendSession(TimelineEventDraft(
             hostSequence: nextHostOrder(), causedByEventID: input.eventRef,

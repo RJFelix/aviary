@@ -1,60 +1,58 @@
 import AviaryCore
 import SwiftUI
 
-/// This is a draft action, not a shell executor. The ordinary chat submission path retains
-/// the request and owns delivery, provider execution, output, and interruption semantics.
+/// The originating Run is captured once. Selection or Run replacement cannot retarget it.
 struct SuggestedCommandSheet: View {
     let command: SuggestedShellCommand
     let run: LiveRun
-    @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @State private var capturedRun: RunRef?
+    @State private var submitting = false
     @State private var failure: String?
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Ask agent to run").font(.headline)
-            Label(run.title, systemImage: "bubble.left")
-                .font(.subheadline).lineLimit(2)
-            Label(run.config.cwd.isEmpty ? run.projectName : run.config.cwd,
-                  systemImage: "folder")
-                .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            ScrollView {
-                Text(command.source)
-                    .font(.system(size: 12, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-            }
-            .frame(minHeight: 90, maxHeight: 250)
-            .background(Design.codeBackground, in: RoundedRectangle(cornerRadius: 8))
-            Text("Prepare a message in this chat, then review it and press Send. "
-                + "This asks the agent to run it and report back; it is not a direct terminal.")
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if let reason = failure ?? AgentMessageDraftTransfer.unavailableReason(for: run) {
-                Label("Cannot prepare a draft: \(reason). Your existing text is unchanged.",
-                      systemImage: "exclamationmark.triangle")
-                    .font(.caption).foregroundStyle(Design.warning)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            HStack {
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Spacer()
-                Button("Prepare draft") { prepare() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(AgentMessageDraftTransfer.unavailableReason(for: run) != nil)
-            }
-        }
-        .padding(20)
-        .frame(minWidth: 380, idealWidth: 520)
+    init(command: SuggestedShellCommand, run: LiveRun) {
+        self.command = command
+        self.run = run
+        _capturedRun = State(initialValue: run.serviceProjection?.descriptor.currentRun)
     }
 
-    private func prepare() {
-        guard let target = model.runs.first(where: { $0.id == run.id }), target === run,
-              AgentMessageDraftTransfer.prepare(command.draftText, for: target) else {
-            failure = "chat changed or is unavailable"
-            return
+    var body: some View {
+        VStack(spacing: 0) {
+            if let language = DirectShellLanguage(wireValue: command.language) {
+                DirectShellCommandConfirmation(source: command.source, language: language,
+                    workspaceLabel: run.projectName,
+                    onConfirm: { timeout in
+                        guard run.canRunDirectShell, let capturedRun,
+                              run.serviceProjection?.descriptor.currentRun == capturedRun else {
+                            failure = "This agent session changed or is busy. Nothing was run."
+                            return
+                        }
+                        submitting = true
+                        Task {
+                            let accepted = await run.directShell(operation: .run, command: command,
+                                timeout: timeout, expectedRun: capturedRun)
+                            submitting = false
+                            // The chat retains Check status if confirmation was lost. No retry
+                            // launches a second process from this confirmation sheet.
+                            if accepted || run.directShellError != nil { dismiss() }
+                        }
+                    }, onCancel: { dismiss() })
+                    .disabled(submitting || !run.canRunDirectShell)
+            }
+            if let reason = failure ?? unavailableReason {
+                Label(reason, systemImage: "info.circle")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, 20).padding(.bottom, 12)
+                Button("Done") { dismiss() }.padding(.bottom, 12)
+            }
         }
-        dismiss()
+    }
+
+    private var unavailableReason: String? {
+        if run.serviceBridge?.supportsDirectShell != true {
+            return "Direct commands need an updated local agent service. You can still copy this command."
+        }
+        if !run.canRunDirectShell { return "Wait for the current work to finish before running this command." }
+        return nil
     }
 }

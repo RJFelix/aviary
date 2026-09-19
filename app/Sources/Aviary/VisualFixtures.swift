@@ -35,6 +35,7 @@ enum VisualFixtureRoute: String {
     case chatLogSettings = "chat-log-settings-fixture"
     case suggestedCommand = "suggested-command-fixture"
     case suggestedCommandConfirmation = "suggested-command-confirmation-fixture"
+    case directCommandOutput = "direct-command-output-fixture"
     case chatRecovery = "chat-recovery-fixture"
     case chatUncertain = "chat-uncertain-fixture"
     case chatCreated = "chat-created-fixture"
@@ -74,7 +75,9 @@ struct VisualFixtureView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .background(Color(nsColor: .windowBackgroundColor))
         case .suggestedCommandConfirmation:
-            SuggestedCommandConfirmationFixture()
+            DirectShellCommandConfirmationFixture()
+        case .directCommandOutput:
+            DirectShellCommandOutputFixture()
         case .serviceChat, .serviceChatNarrow:
             FixtureServiceConversationView(narrow: route.isNarrow)
         case .productionDelivery, .productionDeliveryNarrow:
@@ -162,32 +165,36 @@ struct VisualFixtureView: View {
     }
 }
 
-/// Real chat views with only disposable, local presentation data. No bootstrap or delivery.
-@MainActor
-private struct SuggestedCommandConfirmationFixture: View {
-    private let model: AppModel
-    private let run: LiveRun
-
-    init() {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("aviary-command-design-" + UUID().uuidString)
-        let suite = "aviary.command-design." + UUID().uuidString
-        let defaults = UserDefaults(suiteName: suite)!
-        defer { defaults.removePersistentDomain(forName: suite) }
-        self.model = AppModel(home: AgentHome(root: root), presentationDefaults: defaults,
-                              modelPreferencesStore: ModelPreferencesStore(directory: root))
-        defer { try? FileManager.default.removeItem(at: root) }
-        self.run = LiveRun.productionRunPaneVisualFixture(
-            items: [], pendingInputs: [], deliveryAttention: [], actions: [], draft: "")
-        model.runs = [run]
-    }
-
+/// The production confirmation with immutable fixture input. It has no AppModel, service, or
+/// filesystem dependency and neither closure performs an action.
+private struct DirectShellCommandConfirmationFixture: View {
     var body: some View {
-        SuggestedCommandSheet(
-            command: SuggestedShellCommand.make(language: "bash", source: "npm install\nnpm run dev")!,
-            run: run)
-            .environment(model)
+        DirectShellCommandConfirmation(
+            source: "npm install\nnpm run dev",
+            language: .bash,
+            workspaceLabel: "Aviary · /Projects/Aviary",
+            onConfirm: { _ in },
+            onCancel: {})
             .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+/// A canonical-shaped terminal command entry rendered through the production tray and card. The
+/// result is decoded from deterministic Codable fixture bytes because the result/capture memberwise
+/// initializers are deliberately not public process-boundary APIs.
+private struct DirectShellCommandOutputFixture: View {
+    var body: some View {
+        ScrollView {
+            DirectShellCommandTray(
+                entries: [FixtureData.directShellOutputEntry],
+                onStop: { _ in },
+                onDismiss: { _ in })
+                .padding(24)
+                .frame(maxWidth: 780)
+                .frame(maxWidth: .infinity, alignment: .top)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
@@ -579,6 +586,38 @@ private struct ProductionInspectorFixture: View {
     }
 }
 
+private struct DirectShellCaptureFixturePayload: Encodable {
+    let head: Data
+    let tail: Data
+    let totalByteCount: Int64
+    let omittedByteCount: Int64
+    let isTruncated: Bool
+    let isComplete: Bool
+
+    init(head: Data, tail: Data = Data(), omittedByteCount: Int64 = 0,
+         isComplete: Bool = true) {
+        self.head = head
+        self.tail = tail
+        self.omittedByteCount = omittedByteCount
+        self.totalByteCount = Int64(head.count + tail.count) + omittedByteCount
+        self.isTruncated = omittedByteCount > 0
+        self.isComplete = isComplete
+    }
+}
+
+private struct DirectShellResultFixturePayload: Encodable {
+    let schemaVersion: Int
+    let commandID: String
+    let actionID: String
+    let language: DirectShellLanguage
+    let source: Data
+    let status: DirectShellCommandTerminalStatus
+    let stdout: DirectShellCaptureFixturePayload
+    let stderr: DirectShellCaptureFixturePayload
+    let startedAt: Date
+    let endedAt: Date
+}
+
 private enum FixtureData {
     static let host = WorkHostRef("host-linux-01")
     static let work = WorkRef(workHostID: host.workHostID, workID: "work-research-042")
@@ -591,6 +630,80 @@ private enum FixtureData {
     static let turn = TurnRef("turn-07")
     static let actor = TimelineActor(actorID: "work-host-linux-01", kind: "work-host")
     static let baseTime = Date(timeIntervalSince1970: 1_757_136_000)
+
+    static let directShellOutputEntry: WorkServiceDirectShellEntry = {
+        let commandID = "fixture-client/direct-shell-command-001"
+        let action = ActionRef("shell-fixture-action-001")
+        let source = Data("swift test --filter DirectShellServiceTests".utf8)
+        let stdoutHead = Data("Building for debugging...\nTest Suite 'DirectShellServiceTests' started\n".utf8)
+        let stdoutTail = Data("Executed 18 tests, with 0 failures in 2.41 seconds\n".utf8)
+        let payload = DirectShellResultFixturePayload(
+            schemaVersion: DirectShellCommandResult.schemaVersion,
+            commandID: commandID,
+            actionID: action.actionID,
+            language: .bash,
+            source: source,
+            status: .exited(exitCode: 0),
+            stdout: DirectShellCaptureFixturePayload(
+                head: stdoutHead, tail: stdoutTail, omittedByteCount: 12_480),
+            stderr: DirectShellCaptureFixturePayload(head: Data()),
+            startedAt: baseTime,
+            endedAt: baseTime.addingTimeInterval(2.41))
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let fixtureBytes = try! encoder.encode(payload)
+        let result = try! JSONDecoder().decode(DirectShellCommandResult.self, from: fixtureBytes)
+        try! result.validate()
+
+        let retainedBody = try! encoder.encode(result)
+        let digest = "sha256:\(AviarySHA256.hash(data: retainedBody))"
+        let sourceEvent = EventRef(
+            journal: workJournal, eventID: "fixture-direct-shell-artifact-001")
+        let causedBy = EventRef(
+            journal: workJournal, eventID: "fixture-direct-shell-outcome-001")
+        let bodyReference = TimelineBodyReference(
+            authority: workJournal,
+            referenceID: digest,
+            mediaType: DirectShellJournalFormat.resultMediaType,
+            byteCount: retainedBody.count,
+            digest: digest)
+        let artifact = try! WorkServiceArtifactDescriptor(
+            artifactID: action.actionID + "-output",
+            work: work,
+            label: "Command output",
+            mediaType: DirectShellJournalFormat.resultMediaType,
+            byteCount: retainedBody.count,
+            digest: digest,
+            available: true,
+            bodyReference: bodyReference,
+            sourceEvent: sourceEvent,
+            session: session,
+            sessionAttachment: attachment,
+            run: run,
+            action: action,
+            causedByEventID: causedBy)
+        let cursor = JournalCursor(
+            journal: workJournal, eventID: "fixture-direct-shell-accepted-001", sequence: 47)
+        let entry = WorkServiceDirectShellEntry(
+            command: CommandRef(
+                commandID: commandID,
+                client: ClientRef("fixture-client"),
+                sessionAttachment: attachment,
+                causalCursor: cursor),
+            session: session,
+            sessionAttachment: attachment,
+            run: run,
+            action: action,
+            language: .bash,
+            source: source,
+            state: .succeeded,
+            result: result,
+            artifact: artifact,
+            pendingContext: true)
+        try! entry.validate(work: work, journal: workJournal)
+        return entry
+    }()
 
     static let historyTranscript: [TranscriptItem] = (0..<18).map { index in
         var item = TranscriptItem(

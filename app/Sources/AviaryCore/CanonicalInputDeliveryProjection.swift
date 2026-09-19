@@ -489,7 +489,8 @@ public struct CanonicalInputDeliveryProjection: Codable, Hashable, Sendable {
         guard let kind else { return false }
         switch kind {
         case .start, .send, .steer, .queue, .queueFollowUp: return true
-        case .hold, .cancel, .end, .endRun, .destroy, .complete: return false
+        case .hold, .cancel, .end, .endRun, .destroy, .complete,
+             .directShell, .stopShell, .dismissShell: return false
         }
     }
 

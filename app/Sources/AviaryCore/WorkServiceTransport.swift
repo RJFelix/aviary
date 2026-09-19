@@ -27,6 +27,7 @@ public enum WorkServiceTransportOperation: String, Codable, Hashable, Sendable {
     case fetchArtifact = "fetch_artifact"
     case fetchBody = "fetch_body"
     case command
+    case directShell = "direct_shell"
     case cancelAgentHandle = "cancel_agent_handle"
 }
 
@@ -192,7 +193,8 @@ internal func workServiceClientTraceOutcome(
          .historyBeforeCursor, .fetchArtifact, .fetchBody:
         mutatesDurableState = false
     case .createWork, .createSession, .completeWork, .attach, .detach,
-         .updateCapabilities, .acknowledgeRead, .command, .cancelAgentHandle:
+         .updateCapabilities, .acknowledgeRead, .command, .directShell,
+         .cancelAgentHandle:
         mutatesDurableState = true
     }
     guard didStartWrite, mutatesDurableState else {
@@ -457,6 +459,17 @@ public enum WorkServiceTransportCodec {
                 try validateDiagnostic(data["diagnostic"])
             case .completeWork, .command:
                 try validateReceipt(data)
+            case .directShell:
+                try validateArray(
+                    data["entries"], maxCount: WorkServiceDirectShellBounds.maximumEntries)
+                try validateIdentity(data["work"]?["workHostID"], required: true)
+                try validateIdentity(data["work"]?["workID"], required: true)
+                try validateIdentity(data["commandID"], required: true)
+                try validateHostInstance(data["host"], required: true)
+                try validateCursor(data["causalWorkCursor"], required: true)
+                try validateCursor(data["resultingWorkCursor"], required: true)
+                try validateAuthorization(data["authorization"], required: true)
+                try validateDiagnostic(data["diagnostic"])
             case .cancelAgentHandle:
                 let result = try decodeResponseValue(
                     WorkServiceAgentHandleCancelResponse.self, from: data)
@@ -1107,6 +1120,21 @@ public enum WorkServiceTransportCodec {
                                        expectedHostInstance: expectedHostInstance)
             if let expectedHostInstance {
                 try validateHost(response.host, expected: expectedHostInstance)
+            }
+        case .directShell:
+            let response: WorkServiceDirectShellResponse = try decodeResponseValue(
+                WorkServiceDirectShellResponse.self, from: data)
+            let directRequest: WorkServiceDirectShellRequest = try decodeRequestValue(
+                WorkServiceDirectShellRequest.self, from: request.payload)
+            do { try response.validate(for: directRequest) }
+            catch { throw WorkServiceTransportError.invalidResponse }
+            if let expectedHostInstance {
+                guard response.host == expectedHostInstance,
+                      directRequest.work.workHostID == expectedHostInstance.host.workHostID,
+                      directRequest.journal.authority.authorityID
+                        == expectedHostInstance.host.workHostID else {
+                    throw WorkServiceTransportError.invalidResponse
+                }
             }
         }
     }
@@ -3704,6 +3732,14 @@ public actor WorkServiceUnixSocketServer {
                     WorkServiceCommandRequest.self, from: envelope.payload)
                 guard request.command.client == client else { throw identityMismatch() }
                 return try success(id: envelope.id, value: try await service.command(request), connectionID: connectionID)
+            case .directShell:
+                let request = try WorkServiceTransportCodec.decodePayload(
+                    WorkServiceDirectShellRequest.self, from: envelope.payload)
+                try request.validate()
+                guard request.command.client == client else { throw identityMismatch() }
+                return try success(
+                    id: envelope.id, value: try await service.directShell(request),
+                    connectionID: connectionID)
             case .cancelAgentHandle:
                 let request = try WorkServiceTransportCodec.decodePayload(
                     WorkServiceAgentHandleCancelRequest.self, from: envelope.payload)
@@ -4010,6 +4046,13 @@ public actor WorkServiceUnixSocketClient: WorkServiceClient {
         _ request: WorkServiceCommandRequest
     ) async throws -> WorkServiceCommandReceipt {
         try await call(.command, request)
+    }
+
+    public func directShell(
+        _ request: WorkServiceDirectShellRequest
+    ) async throws -> WorkServiceDirectShellResponse {
+        try request.validate()
+        return try await call(.directShell, request)
     }
 
     private func openSocket() throws {

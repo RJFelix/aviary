@@ -548,6 +548,10 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
     private var endRequested = false
     private var activeAgentCommandID: String?
     private var activeSendTask: Task<Void, Never>?
+    private var directShellWorker: DirectShellCommandWorker?
+    private var directShellTask: Task<Void, Never>?
+    private var directShellAction: ActionRef?
+    private var directShellMutationInProgress = false
     /// Work completion/destruction is a separate transaction after this per-Run actor has ended
     /// and released its original writer locks. Attempting is not durable: a failed attempt rolls
     /// back unless canonical read-only reconciliation proves the exact transaction committed.
@@ -749,6 +753,14 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
     private func submitUntraced(
         _ command: HostedInHouseWorkCommand
     ) async throws -> HostedInHouseWorkReceipt {
+        if directShellMutationInProgress || directShellWorker != nil {
+            guard case .endRun = command.command else {
+                throw HostedInHouseWorkError.invalidCommand("a user command is running; stop it before sending another message")
+            }
+            guard !directShellMutationInProgress else {
+                throw HostedInHouseWorkError.invalidCommand("command admission is still being recorded")
+            }
+        }
         try command.validate(
             identity: identity,
             workJournal: bridge.nativeJournal.workJournal,
@@ -795,6 +807,162 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
                 commandByID.removeValue(forKey: key)
             }
             throw error
+        }
+    }
+
+    /// Direct commands are owned by this host actor, never by a GUI task or the Python
+    /// interpreter. Model input admission is excluded until the process group has settled.
+    public func directShell(
+        _ request: WorkServiceDirectShellRequest, commandID: String
+    ) async throws -> HostedDirectShellResponse {
+        try request.validate()
+        guard request.work == identity.work,
+              request.run == RunRef(identity.runID),
+              request.journal == bridge.nativeJournal.workJournal,
+              request.command.sessionAttachment == sessionAttachment else {
+            throw WorkServiceProtocolError.invalidRequest("direct command belongs to a different Run or Session")
+        }
+        if request.operation == .inspect {
+            guard !directShellMutationInProgress else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            let entries = try await bridge.nativeJournal.directShellEntries(action: request.action)
+            guard let cursor = await bridge.nativeJournal.latestWorkCursor else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            return HostedDirectShellResponse(disposition: .accepted,
+                entries: request.action.map { action in entries.filter { $0.action == action } } ?? entries,
+                resultingWorkCursor: cursor)
+        }
+        guard !directShellMutationInProgress else {
+            throw WorkServiceProtocolError.invalidRequest("another command mutation is being recorded")
+        }
+        directShellMutationInProgress = true
+        defer { directShellMutationInProgress = false }
+        let entries = try await bridge.nativeJournal.directShellEntries(including: commandID, action: request.action)
+        if request.operation == .run, let prior = entries.first(where: {
+            $0.command.commandID == commandID
+        }) {
+            guard prior.command.client == request.command.client,
+                  prior.command.causalCursor == request.causalWorkCursor,
+                  prior.source == request.source, prior.language == request.language,
+                  prior.timeout == request.durationLimitSeconds,
+                  prior.run == request.run else {
+                throw WorkServiceProtocolError.invalidRequest("command identity already names a different request")
+            }
+            guard let cursor = await bridge.nativeJournal.latestWorkCursor else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            return HostedDirectShellResponse(disposition: .duplicate, entries: [prior], resultingWorkCursor: cursor)
+        }
+        if request.operation == .stop || request.operation == .dismiss,
+           await bridge.nativeJournal.commandState(for: commandID) != nil {
+            try await bridge.nativeJournal.recordDirectShellControl(request: request, commandID: commandID)
+            guard let cursor = await bridge.nativeJournal.latestWorkCursor else {
+                throw WorkServiceProtocolError.sourceIncomplete
+            }
+            return HostedDirectShellResponse(disposition: .duplicate,
+                entries: entries.filter { $0.action == request.action }, resultingWorkCursor: cursor)
+        }
+        guard !endRequested, lifecycle == .idle, agent != nil else {
+            throw WorkServiceProtocolError.invalidRequest("run commands when the agent is waiting for your message")
+        }
+        switch request.operation {
+        case .run:
+            guard directShellWorker == nil,
+                  let language = request.language, let source = request.source,
+                  !source.isEmpty, source.count <= DirectShellCommandRequest.maximumSourceBytes,
+                  !source.contains(0), String(data: source, encoding: .utf8) != nil else {
+                throw WorkServiceProtocolError.invalidRequest("a bounded UTF-8 shell command is required")
+            }
+            if let limit = request.durationLimitSeconds {
+                guard limit.isFinite, limit > 0 else {
+                    throw WorkServiceProtocolError.invalidRequest("a duration limit must be positive")
+                }
+            }
+            let permit = try await bridge.nativeJournal.admitDirectShell(request: request, commandID: commandID)
+            let worker = DirectShellCommandWorker(request: DirectShellCommandRequest(
+                commandID: commandID, actionID: permit.action.actionID, language: language,
+                source: source, workingDirectory: URL(fileURLWithPath: configuration.cwd, isDirectory: true),
+                timeout: request.durationLimitSeconds))
+            directShellWorker = worker
+            directShellAction = permit.action
+            let trace = AviaryTelemetry.context
+            // The actor retains both task and worker. Losing the requesting connection does
+            // not cancel this task; a durable Stop or explicit End owns cancellation.
+            directShellTask = Task { [weak self] in
+                await AviaryTelemetry.withSpan("aviary.work.direct_shell", attributes: [
+                    "aviary.work.id": .string(AviaryTelemetry.workIdentity(request.work)),
+                    "aviary.run.id": .string(AviaryTelemetry.identity(request.run.runID)),
+                    "aviary.action.id": .string(AviaryTelemetry.identity(permit.action.actionID)),
+                    "aviary.command.id": .string(AviaryTelemetry.identity(commandID)),
+                    "aviary.shell.language": .string(language.rawValue),
+                    "aviary.command.source_bytes": .int(source.count),
+                ], parent: trace) {
+                    await worker.start()
+                    let result = await worker.wait()
+                    await self?.finishDirectShell(result, permit: permit)
+                }
+            }
+        case .stop, .dismiss:
+            guard let action = request.action, let entry = entries.first(where: { $0.action == action }) else {
+                throw WorkServiceProtocolError.invalidRequest("command output is not attached to this Session")
+            }
+            if request.operation == .stop {
+                guard directShellAction == action, let worker = directShellWorker else {
+                    throw WorkServiceProtocolError.invalidRequest("this command is no longer running")
+                }
+                try await bridge.nativeJournal.recordDirectShellControl(request: request, commandID: commandID)
+                await worker.stop()
+            } else {
+                guard entry.state.isTerminal, entry.result != nil else {
+                    throw WorkServiceProtocolError.invalidRequest("wait for the command to finish before dismissing its output")
+                }
+                try await bridge.nativeJournal.recordDirectShellControl(request: request, commandID: commandID)
+            }
+        case .inspect: break
+        }
+        let refreshed = try await bridge.nativeJournal.directShellEntries(including: commandID, action: request.action)
+        guard let cursor = await bridge.nativeJournal.latestWorkCursor else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        await emitDurable(source: "direct_shell.changed")
+        return HostedDirectShellResponse(disposition: .accepted,
+            entries: request.action.map { action in refreshed.filter { $0.action == action } } ?? refreshed,
+            resultingWorkCursor: cursor)
+    }
+
+    private func finishDirectShell(_ result: DirectShellCommandResult, permit: EffectPermit) async {
+        defer {
+            directShellWorker = nil
+            directShellAction = nil
+            directShellTask = nil
+        }
+        let (state, failure) = DirectShellCommandCanonicalValidation.outcome(for: result.status)
+        do {
+            try result.validate()
+            let body = try DirectShellJournalFormat.encoded(result)
+            _ = try await bridge.nativeJournal.recordArtifact(
+                artifactID: permit.action.actionID + "-output", label: "Command output",
+                mediaType: DirectShellJournalFormat.resultMediaType, body: body,
+                action: permit.action, provenance: permit.startedCommit.eventRef)
+            let outcome = try await bridge.nativeJournal.finishAction(
+                permit, state: state, retrySafety: .unknown, failureKind: failure)
+            _ = try await bridge.nativeJournal.markCommandDelivered(commandID: result.commandID)
+            AviaryTelemetry.event("aviary.direct_shell.settled", attributes: [
+                "aviary.stdout.total_bytes": .int(Int(clamping: result.stdout.totalByteCount)),
+                "aviary.stderr.total_bytes": .int(Int(clamping: result.stderr.totalByteCount)),
+                "aviary.stdout.omitted_bytes": .int(Int(clamping: result.stdout.omittedByteCount)),
+                "aviary.stderr.omitted_bytes": .int(Int(clamping: result.stderr.omittedByteCount)),
+            ].merging(AviaryTelemetry.canonicalReferenceAttributes(outcome)) { _, exact in exact })
+            AviaryTelemetry.outcome(state.rawValue)
+            await emitDurable(source: "direct_shell.finished", commits: [outcome])
+        } catch {
+            // No second process is launched after a partial/uncertain publication. The live
+            // actor becomes non-actionable and the canonical unfinished action stays visible.
+            appendFailure("Command output could not be recorded; delivery needs checking")
+            transition(to: .failed, reason: "Command outcome requires recovery")
+            AviaryTelemetry.outcome("indeterminate")
         }
     }
 
@@ -1145,7 +1313,9 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
             } else {
                 transition(to: .running, reason: "Start crossed into Agent")
                 activeAgentCommandID = controllerID
-                launchAgentSend(prompt: prompt, command: command, agent: preparedAgent)
+                let deliveredPrompt = try await bridge.nativeJournal.effectiveInputText(
+                    commandID: controllerCommandID(for: command), fallback: prompt)
+                launchAgentSend(prompt: deliveredPrompt, command: command, agent: preparedAgent)
             }
         } catch {
             await failStart(command: command, error: error)
@@ -1171,7 +1341,9 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
         }
         transition(to: .running, reason: "Send was accepted")
         activeAgentCommandID = controllerCommandID(for: command)
-        launchAgentSend(prompt: prompt, command: command, agent: agent)
+        let deliveredPrompt = try await bridge.nativeJournal.effectiveInputText(
+            commandID: controllerCommandID(for: command), fallback: prompt)
+        launchAgentSend(prompt: deliveredPrompt, command: command, agent: agent)
         return await receipt(for: command)
     }
 
@@ -1184,7 +1356,9 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
             return await receipt(for: command)
         }
         let deliveryOrigin = AviaryTelemetry.context
-        let accepted = await agent.steer(text) { [weak self] delivery in
+        let deliveredText = try await bridge.nativeJournal.effectiveInputText(
+            commandID: controllerCommandID(for: command), fallback: text)
+        let accepted = await agent.steer(deliveredText) { [weak self] delivery in
             guard let self else { return }
             await self.recordDeferredDelivery(
                 delivery, for: command, origin: deliveryOrigin)
@@ -1207,7 +1381,9 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
             return await receipt(for: command)
         }
         let deliveryOrigin = AviaryTelemetry.context
-        let accepted = await agent.queueFollowUp(text) { [weak self] delivery in
+        let deliveredText = try await bridge.nativeJournal.effectiveInputText(
+            commandID: controllerCommandID(for: command), fallback: text)
+        let accepted = await agent.queueFollowUp(deliveredText) { [weak self] delivery in
             guard let self else { return }
             await self.recordDeferredDelivery(
                 delivery, for: command, origin: deliveryOrigin)
@@ -1255,6 +1431,11 @@ public actor HostedInHouseWork: WorkServiceTerminalCommitter {
         endRequested = true
         transition(to: .ending, reason: "Explicit End was accepted")
         await waitForPreparationIfNeeded()
+
+        if let worker = directShellWorker {
+            await worker.stop()
+            await directShellTask?.value
+        }
 
         if let agent {
             await agent.cancel()

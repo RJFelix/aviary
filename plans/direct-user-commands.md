@@ -1,228 +1,260 @@
-# Direct user commands: one Work-Host-owned vertical slice
+# Direct user commands: implemented Work-Host slice
 
-Status: design checkpoint for the next implementation slice. The preceding GUI-only feedback
-checkpoint is [user-flow-feedback-2026-09-18.md](user-flow-feedback-2026-09-18.md).
+Status: implemented on 2026-09-18. This document describes the
+implementation rather than the earlier proposal. The preceding GUI feedback checkpoint remains in
+[user-flow-feedback-2026-09-18.md](user-flow-feedback-2026-09-18.md).
 
-## Outcome
+The implementation has passed the focused direct-command, native-resume, and real daemon
+journeys below. Full-suite and signed-app verification are recorded separately; none of these
+receipts is a sandbox or process-containment claim.
 
-Replace **Ask agent to run** on a closed assistant `sh`/`bash`/`zsh`/`shell` fence with an
-explicit **Run command** confirmation. The selected bytes execute once on the Work Host in the
-chat's retained workspace, without a model turn and without asking the Python runtime to call
-`sh()`.
+## User-visible behavior
 
-The conversation shows one command card while the command is running and a bounded result when
-it settles. Closing the GUI does not stop it. The result remains pending across GUI reconnects;
-the person can dismiss it with X, or leave it to be prepended as a collapsed
-`<aviary-command-output>` block to the next accepted user input. Dismissal removes the pending
-model-context attachment, not the execution/action history.
+A closed assistant `sh`, `bash`, `zsh`, or `shell` fence can open an explicit **Run command**
+confirmation for its originating chat and workspace. Confirmation sends a typed direct-shell
+request to the attached Work Host. It does not create a model turn and does not route through the
+agent's Python runtime or its `sh()` helper.
 
-This slice deliberately provides completion output, not live terminal emulation. It supports one
-direct command at a time per Work, a finite host-wide concurrency limit, and an explicit Stop.
-Commands run until they exit or are stopped unless the person explicitly chooses a duration limit
-in the confirmation sheet; a development server must not be killed by a hidden default timeout.
+The chat shows authoritative command activity returned by the Work Host:
 
-## Why this is a separate worker
+- a running card with **Stop**;
+- a terminal card with bounded stdout and stderr, exact byte counts, truncation/incomplete-capture
+  labels, and a distinct outcome;
+- an X on pending terminal output, meaning “do not include this output with my next message.”
 
-`RuntimeHost.execute` serializes Python cells per session, but the injected `sh()` starts a
-background Future. Shell Futures may overlap, snapshot shell state at launch, and use
-last-finisher-wins cwd/environment write-back. Calling that path from the GUI would share mutable
-Python/session state with the agent and still would not provide an independently addressable
-process tree.
+Commands have no hidden default deadline. The person may set a positive duration limit of at most
+seven days; otherwise the command runs until it exits, Stop is accepted, or the Run ends.
+Work Host loss makes the outcome and remaining process state indeterminate; it does not prove
+termination. Closing or disconnecting the GUI does not cancel the host-owned task.
 
-The direct-command worker instead launches a fresh shell process from `aviaryd`. It uses the
-Work's retained workspace and the daemon's captured login-shell environment, but it never enters
-the RuntimeHost namespace. This prevents Python namespace/cwd/environment corruption. It is not a
-filesystem sandbox: a background process previously started by the agent may still race the same
-repository, and the confirmation must not claim otherwise.
+This is completion-output UI, not an interactive terminal. stdin is `/dev/null`; there is no PTY,
+live input, resize protocol, or terminal-state emulation.
 
-## Canonical contract
+## Implemented service contract
 
-### Typed values and limits
+### Additive protocol-v5 capability
 
-Add Core values rather than encoding a shell request into the generic `value` string:
+The feature is additive to `WorkServiceProtocol.currentVersion == 5`; it did **not** introduce a
+new protocol version. `WorkServiceCapability.directShell` gates the mutating Run, Stop, and Dismiss
+operations. Inspect requires the existing `.observe` and `.inspectArtifacts` capabilities.
 
-- `DirectShellLanguage`: the existing allowlist normalized to `sh`, `bash`, or `zsh`; `shell`
-  maps to `sh` at the UI/Core parsing boundary.
-- `WorkServiceDirectCommandRequest`: Work/journal/client attachment, Session attachment,
-  caller-local command ID, exact causal Work cursor, language, exact source bytes, and an optional
-  person-selected duration limit.
-- `WorkServiceDirectCommandReceipt`: caller command ID, host-derived `ActionRef`, accepted /
-  duplicate / rejected disposition, canonical acceptance/action cursors, authorization, and
-  optional terminal result descriptor.
-- `WorkServiceDirectCommandStopRequest`: the original `ActionRef`, a distinct stop command ID,
-  and its own exact causal Work cursor.
-- `DirectShellCommandResult`: schema/version, action and command identities, language, exact
-  command, terminal status, exit code or signal, start/end/duration, typed stdout/stderr captures,
-  retained and omitted byte counts, and truncation flags. Each capture stores bounded `Data`
-  segments (JSON base64), not an assumed UTF-8 `String`; presentation may decode valid UTF-8 and
-  otherwise labels/attaches base64 without silently changing bytes.
-- `DirectCommandContextManifest`: a bounded list of exact result artifact ID, digest, and action
-  references captured with the next Send. This is typed metadata, not command/output text placed
-  in `WorkServiceCommandRequest.value`.
+An older v5 Work Host does not advertise `.directShell`, so the GUI must not offer Run against it.
+Compatibility here is capability-based, not a version-mismatch guarantee. A bundled service still
+has to be restarted before a newly built GUI can observe the new capability.
 
-Keep the existing 16 KiB `SuggestedShellCommand.maximumSourceBytes`. Retain at most 64 KiB per
-output stream (a deterministic head/tail split), while continuously draining both pipes so output
-volume cannot deadlock the child. Bound the encoded result well below the existing 8 MiB artifact
-ceiling. Permit one command per Work and at most four across one daemon. A requested duration limit
-is itself bounded and journaled; absent that explicit option, only process exit, Stop, End, or host
-loss terminates the command.
+The typed API is:
 
-Bound pending model context separately from artifact retention: no more than eight pending results
-and 256 KiB of retained stream bytes per exact Work/Session attachment. Admission reserves the new
-command's worst-case 128 KiB, so it refuses before launch when the pending budget cannot
-accommodate the result. The person can send or dismiss existing results to release that budget;
-historical artifacts remain.
+- `DirectShellLanguage`: fixed `sh`, `bash`, or `zsh`; an authored `shell` fence normalizes to
+  `sh` before submission.
+- `WorkServiceDirectShellRequest`: exact Work journal, client attachment, client-qualified command
+  identity inputs, Session attachment, causal Work cursor, Run, operation, and operation-specific
+  source/language/duration/action fields.
+- `WorkServiceDirectShellOperation`: `run`, `stop`, `dismiss`, or `inspect`.
+- `WorkServiceDirectShellResponse`: authorization, disposition, resulting Work cursor, diagnostic,
+  and at most eight validated `WorkServiceDirectShellEntry` values.
+- `DirectShellCommandResult`: exact source and identities, terminal status, dates, and binary-safe
+  bounded captures for stdout and stderr.
 
-### Authorization and negotiation
+The normal user-message command value remains the person-authored text and retains its existing
+wire bound. Command output is not concatenated into a GUI-authored request or passed through a
+client-selected attachment manifest.
 
-Add separate `runDirectCommand`, `stopDirectCommand`, and `manageDirectCommandContext`
-capabilities. Require the exact authenticated client attachment and active Session attachment for
-every mutation; a `WorkRef` is never authority. Add the new request/response operations to the
-socket transport and bump the exact Work-service protocol version. The GUI offers Run only when
-the attached projection grants `runDirectCommand`; an older daemon therefore cannot display a
-control it cannot honor.
+### Authorization and exact ownership
 
-The current local socket authorizer may grant requested capabilities after its same-user socket
-check. The capability split remains necessary for remote/principal-backed authorizers and for
-least-authority attachments.
+The service authenticates the request's client attachment, requires control plus `.directShell`
+for mutations, verifies the exact Session attachment, rejects a conflicting live Session owner,
+and binds Run/Stop to the canonical active Run owned by that Session. A `WorkRef` alone is never
+authority.
 
-### Exactly-once effect admission
+Inspect is deliberately narrower than a general historical artifact read. It requires a canonical
+cursor and the exact currently resident `HostedInHouseWork` actor for the canonical Work/Session
+binding. If that actor is not live and exact, Inspect returns an explicit unavailable response; it
+does not reconstruct command-tray state from an arbitrary or stale hosted object.
 
-The host qualifies the caller-local command ID with `WorkServiceCommandLedgerIdentity`, then
-derives the action ID from that qualified identity. One command ID binds all of: client, Work,
-Session attachment, causal cursor, shell language, and SHA-256 of the exact command bytes.
+### Replay and effect admission
 
-Before launching a process, one `RunJournalBundle` semantic-gate operation must:
+The service qualifies the caller-local command ID with `WorkServiceCommandLedgerIdentity`. Run
+reconciliation binds that qualified identity to the client, causal cursor, active Run, language,
+exact source bytes, and duration limit. An identical retry returns the journal-derived prior entry;
+reuse with different bound fields is rejected.
 
-1. validate an active, idle Run owned by this Session attachment and a current causal cursor;
-2. retain the exact typed request body in the Work body store;
-3. append canonical command acceptance; and
-4. append `action.intent` plus `action.started` for a new `direct_shell` `ActionKind`.
+Before launching a shell, `RunJournalBundle.admitDirectShell` requires the current idle Run and
+Session, retains the typed request body, commits `command.accepted`, and begins a `direct_shell`
+action. Only the returned `EffectPermit` crosses into process launch. A crash between command
+acceptance and `action.started` is not treated as launch permission.
 
-Only a fully returned durable start permit may cross into process launch. An identical retry
-returns the same action/receipt. Reusing the ID with different bytes or envelope fields is
-`conflicting_command`. A lost response is reconciled from the journal and never launches a second
-process. After daemon loss, a nonterminal direct-shell action is recovery-required and is never
-redispatched automatically.
+The current implementation does not automatically redispatch a journaled nonterminal action after
+daemon loss. It also cannot recover or reattach to the original operating-system process.
 
-### Process ownership and Stop
+## Host-owned worker and output
 
-Add a `DirectShellCommandWorker` actor owned by the Work Host and retained by the live
-`HostedInHouseWork` entry. It launches a fixed executable (`/bin/sh`, `/bin/bash`, or `/bin/zsh`)
-with `-c` and passes the command as one unchanged argv value. It sets the retained workspace as
-cwd, uses the Work Host's `ProcessEnvironment` snapshot, supplies null stdin, creates a dedicated
-process group with `posix_spawn` process-group attributes (not a racy post-launch `setpgid`),
-drains both output pipes, and reaps the child.
+`HostedInHouseWork` owns one `DirectShellCommandWorker`, its task, and its Action identity. It only
+admits Run while the agent is idle, prevents another direct-shell mutation from crossing
+concurrently, and prevents ordinary model commands from crossing while the worker is active.
+An accepted End directly asks any active worker to stop and awaits the worker task before
+journal closure.
 
-Stop durably admits a separate command and records the action's `cancel_requested` transition
-before signalling the process group. Send TERM, wait two seconds, then KILL the group if needed;
-only reaping establishes the terminal `canceled` outcome. An exact Stop retry reconciles the
-existing stop receipt. End must stop and await an active direct worker before it closes the Run
-journals. New Send/Steer/Queue/direct-run requests are rejected while this direct action is active.
+The GUI's End confirmation explicitly offers **End and remove command output** when a command
+is running or output is waiting for the next message. That path inspects, stops if needed, waits
+for settlement, and durably dismisses pending output before sending End. Failure leaves End
+unissued. Plain GUI End refuses pending output rather than silently making its controls unusable.
+Other protocol clients may still End while retaining output; those clients own that decision,
+and retained output crosses the next accepted input after a replacement Run starts.
 
-Do not use `Shell.run` unchanged: it captures unbounded output and only owns the root `Process`,
-so its cancellation cannot honestly promise to stop descendants.
+The worker:
 
-### Result retention and next-prompt attachment
+- launches only `/bin/sh`, `/bin/bash`, or `/bin/zsh` with `-c` and the confirmed UTF-8 source as
+  one argv value;
+- uses the retained workspace cwd and the Work Host's captured process environment;
+- creates a new POSIX process group at spawn time;
+- continuously drains stdout and stderr outside Swift's cooperative executor;
+- keeps deterministic head/tail captures of at most 64 KiB per stream and records total,
+  omitted, truncation, and completeness facts;
+- enforces a host-wide concurrency gate of four workers;
+- distinguishes success, nonzero exit, signal, explicit cancellation, explicit timeout, invalid
+  request, launch failure, and indeterminate worker failure.
 
-On settlement, retain one artifact with media type
-`application/vnd.aviary.direct-shell-result+json`, a deterministic ID derived from the action,
-and exact action-start provenance. Publish the artifact before the terminal action outcome. The
-artifact exists for success, nonzero exit, timeout, and user cancellation; infrastructure loss
-without a trustworthy result ends as `indeterminate_effect` and must not fabricate output.
+The terminal `DirectShellCommandResult` is retained as a content-addressed
+`application/vnd.aviary.direct-shell-result+json` artifact before the action outcome is committed.
+The artifact retains the original binary stream bytes. The UI renders valid UTF-8 directly and
+base64-labels binary captures. The model-facing `<aviary-command-output>` projection instead uses
+explicit UTF-8 replacement (`String(decoding:as:)`) for retained binary bytes; it is a readable
+projection, not byte-for-byte reproduction. The referenced artifact remains the binary source of
+truth.
 
-Pending prompt context is a projection, not deletion of the artifact:
+## Stop, Dismiss, and next-input consumption
 
-- A terminal direct-command result artifact published by this exact Work under its active Session
-  attachment is pending for that attachment unless a later Session event dismisses it or an
-  accepted input on the same attachment names it as consumed. Another Work attached to the same
-  Session neither inherits nor consumes it implicitly.
-- X sends an idempotent, capability-checked dismiss request and appends a bounded Session
-  tombstone naming the artifact. The Work action/artifact remains inspectable.
-- The next Send carries a `DirectCommandContextManifest` of the exact pending descriptors shown by
-  the GUI. The ordinary `value` remains only the person-authored prompt and stays within its
-  existing 8 KiB wire limit. At admission, the Work Host requires the bounded manifest to match
-  canonical pending state, then loads each content-addressed result body separately and validates
-  its digest, schema, provenance, and aggregate byte budget.
-- After that validation, the Work Host prepends one escaped `<aviary-command-output>` block per
-  result to the model input and writes the typed artifact/action references on the same
-  `input.accepted` event. That single canonical event is both delivery input and consumption
-  evidence. Valid UTF-8 stream bytes are included as text; a non-UTF-8 capture is represented with
-  an explicit base64 encoding attribute rather than lossy text.
-- A failed pre-admission send consumes nothing. An accepted-but-uncertain send is reconciled by
-  its original command ID; retry cannot attach the result twice or run the shell again.
+### Stop
 
-This shape reuses `PromptText.split` and `InjectedContextBlock`: the transcript can show the
-machine-added block collapsed while keeping the visible user text clean. The separate pending
-command card loads only this small, typed result body and can disappear after dismissal or
-canonical input consumption.
+Stop is a separate, client-qualified Work command. Its acceptance is durably recorded before the
+worker receives the stop request. The worker signals its process group and escalates TERM to KILL
+on its bounded cleanup path; only the settled worker result produces the terminal action outcome.
+An exact Stop retry reconciles through its command identity.
 
-## Smallest code seams
+The stop check, process spawn, and process-group registration share one critical section.
+If Stop wins before launch, no child is spawned; if launch wins, Stop sees the registered group.
+A deterministic pre-launch test asserts both the canceled result and that no process launched.
 
-- `AviaryCore/SuggestedShellCommand.swift`: retain exact source and expose the normalized typed
-  shell language; remove draft-text construction once direct execution lands.
-- `AviaryCore/WorkService.swift`: capabilities, typed requests/receipts/results, client methods,
-  and protocol-version bump.
-- `AviaryCore/WorkServiceTransport.swift` and `WorkServiceClientSession.swift`: bounded wire
-  operations and authenticated client identity checks.
-- `AviaryCore/RunJournalBundle.swift`, `TimelineEvent.swift`, and reducer transitions: atomic
-  direct-action admission, cancel-request transition, result artifact provenance, dismissal, and
-  `input.accepted` consumption identities.
-- New `AviaryCore/DirectShellCommandWorker.swift`: process-group lifecycle, bounded collectors,
-  optional requested deadline, Stop, and typed result construction.
-- `AviaryCore/HostedInHouseWork.swift`: retain the worker, serialize it against agent commands,
-  journal every action, and include it in End quiescence.
-- `AviaryCore/JournalBackedWorkService.swift`: capability/attachment/cursor validation, exact
-  retry reconciliation, registry lookup, and result/dismiss endpoints.
-- `AviaryCore/WorkActionPresentation.swift` plus the attached-Work projection/controller: expose
-  bounded direct-command state and pending result descriptors without parsing them in SwiftUI.
-- `Aviary/ServiceBackedRunBridge.swift` and `AppModel.swift`: submit/stop/dismiss operations using
-  the existing per-Work command barrier and refresh scheduling.
-- `Aviary/SuggestedCommandSheet.swift`, `MarkdownBlocks.swift`, `LiveView.swift`, and
-  `TranscriptView.swift`: Run confirmation, running/result card, Stop, X dismissal, and capability
-  gating. Capture the originating `LiveRun` exactly as the current sheet does.
-- `aviaryd/main.swift`: compose the host-owned worker/coordinator and include its finite limits.
+There is not yet an `action.cancel_requested` event for direct shell. Consequently the canonical
+action projection does not have a durable intermediate “stopping” transition; it remains running
+until the worker records its terminal canceled/failed result. UI copy must not imply that a Stop
+receipt proves every descendant is gone.
 
-### Telemetry
+### Dismiss with X
 
-Wrap admission and execution in `aviary.work.direct_shell` spans. Record only hashed
-Work/Session/client/action/command identities, the shell enum, input/output byte counts,
-truncation, duration, and terminal category. Emit canonical-reference attributes after the
-acceptance, action-start, result-artifact, cancel-request, and action-outcome commits. Never put
-the workspace path, command, stdout, stderr, environment, or raw error in OTel.
+X is also a separate, idempotent Work command (`dismiss_shell`). It is not a Session tombstone and
+does not delete the artifact or action. The Work journal's accepted dismiss command names the exact
+direct-shell Action, and the pending projection excludes that Action thereafter.
 
-## Verification matrix
+### Attach to the next accepted input
 
-| Boundary | Required proof |
+Pending output is derived by the Work Host from its canonical Work and Session journals at the
+same semantic gate that accepts the next input. The host validates pending entries and their
+content-addressed result bodies, prepends one escaped `<aviary-command-output>` projection to the
+effective model input, and records the consumed Action IDs on that same Session `input.accepted`
+event.
+
+This means:
+
+- rejected or uncertain pre-acceptance input does not consume output;
+- GUI reconnect does not need to preserve a client-side manifest;
+- command retry cannot attach the same result twice after the accepted input is observed;
+- another Work attached to the Session does not implicitly consume this Work's output.
+
+Pending context is bounded to eight results and 256 KiB of retained stream bytes for the exact
+Work/Session attachment. Run admission reserves a new result's 128 KiB worst case and refuses the
+command when that budget is unavailable. Historical terminal artifacts are not deleted when their
+pending-context role ends.
+
+## Current implementation seams
+
+- `AviaryCore/DirectShellCommandWorker.swift`: process input, POSIX lifecycle, output collectors,
+  concurrency, Stop, and typed terminal results.
+- `AviaryCore/DirectShellCommandService.swift`: Work-service DTOs, validation, response
+  correlation, and bounds.
+- `AviaryCore/DirectShellCommandJournal.swift`: retained media types, pending limits, and
+  model-facing context projection.
+- `AviaryCore/RunJournalBundle.swift`: admission, journal-derived entries, Stop/Dismiss control,
+  result consumption at `input.accepted`, and exact effective input recovery.
+- `AviaryCore/HostedInHouseWork.swift`: live worker ownership and serialization with the agent.
+- `AviaryCore/JournalBackedWorkService.swift`: capability, attachment, owner, cursor, and exact-live
+  hosted-actor gates.
+- `AviaryCore/WorkServiceTransport.swift`, `WorkServiceClientSession.swift`, and
+  `WorkServiceAttachedWorkController.swift`: bounded transport and client operations.
+- `Aviary/DirectShellCommandView.swift`, `SuggestedCommandSheet.swift`, `MarkdownBlocks.swift`,
+  `LiveView.swift`, `ServiceBackedRunBridge.swift`, and `AppModel.swift`: confirmation, command
+  tray, Run/Stop/X, capability gating, and refresh.
+
+## Evidence and validation status
+
+Current focused receipts (2026-09-18):
+
+- direct-command worker/journal/DTO/controller: **21 cases / 112 assertions**;
+- native cold resume: **11 cases / 143 assertions**, including settled command results and
+  rejection of forged result metadata;
+- real daemon subprocess: **1 case / 81 assertions**, including requester disconnect, another
+  client observing retained output, exact retry without a second process, Stop, End, replacement
+  Start, and exact once-only output inclusion in the recorded provider request;
+- debug app, Work Host, and self-test products build successfully;
+- debug AppModel/OTLP journey: **145 spans / exactly two local fixture-provider calls**, including
+  direct execution, plain-End refusal with pending output, and explicit cleanup before End;
+- full macOS regression suite: **1,467 cases / 21,258 assertions**, all passed in **553.35s**;
+- confirmation and narrow command-output fixtures visually inspected, plus the real-data Flock
+  snapshot. These prove layout only, not live pointer interaction.
+
+The signed release also passed the native editor and saved-request journey probes. The real
+AppModel → bundled daemon → local fixture provider → OTLP check recorded **133 spans and exactly
+two provider calls** (5.222s journey / 6.357s through cleanup). Repeating the same journey with
+telemetry disabled and with a refusing collector succeeded with exactly two provider calls each
+(6.724s and 9.231s through cleanup). Exported data excluded the command/output and credential
+sentinels. Those checks exercise completion output, pending-output refusal on plain End, and
+explicit Dismiss-before-End; Stop and disconnect/retry are covered separately by the real daemon
+process test above. There is no real remote-collector claim.
+
+Final live pointer interaction for this command/activity slice remains unverified because the
+Mac was locked. The rendered fixtures and native probes are not substitutes for that check.
+
+The standalone worker also typechecked and ran in the Swift 6.0 Jammy container (glibc 2.35).
+This is not a full Linux package receipt: the available container's Swift 6.0 toolchain is below
+the dependency's Swift tools 6.1 requirement. The current Linux worker binding requires glibc
+2.29 or later; musl and the complete new Linux application slice are not verified here.
+
+Do not infer from that aggregate that every row below has passed independently. Before release,
+record separate receipts for:
+
+| Boundary | Required evidence |
 |---|---|
-| Parsing/UI provenance | Only closed assistant shell fences are actionable; exact Unicode/newlines and originating `LiveRun` survive; quoted/user/tool/output/streaming fences remain inert. |
-| Authorization | Missing run/stop/context capability, detached client, wrong Session attachment, foreign Work, and self-claimed client all fail before an effect. |
-| Retry identity | Same request after lost response returns one action/process; same command ID with changed source, language, cursor, client, or attachment conflicts. |
-| Cursor races | Two attached clients at one cursor produce one accepted order and an explicit stale/conflict result; no silent latest-cursor retry. |
-| Process semantics | Exact bytes reach the selected fixed shell in the retained cwd/environment; stdin is closed; exit, signal, an explicitly requested timeout, and launch failure are distinct; without a requested limit, a long-running server continues until Stop/End/exit. |
-| Output bounds | Multi-megabyte stdout and stderr are fully drained, deterministically truncated, byte counts remain truthful, and the retained artifact stays within its declared limit. |
-| Stop | Stop records request before TERM, escalates to process-group KILL, reaps descendants, is idempotent, and reaches terminal cancellation before End closes journals. |
-| GUI disconnect | Start, close the client, reconnect with the same or another authorized client, observe one continuing action and one terminal result; no GUI-owned Process survives in the app. |
-| Daemon loss | A started but unterminated journal action returns recovery-required/indeterminate and is never automatically relaunched. |
-| Python isolation | A live or retained Python namespace is unchanged by direct execution; direct commands never call `RuntimeHost.execute` or mutate persistent `sh()` cwd/environment. |
-| Pending context | Result reappears after GUI restart; X durably hides only the pending attachment; action/history remains; count and aggregate-byte admission bounds prevent unbounded next-prompt context. |
-| Send consumption | The wire value remains the original prompt; a bounded exact-reference manifest selects separately retained bodies. Rejected or stale-manifest Send consumes nothing; accepted Send prepends exactly once and records typed artifact/action refs on `input.accepted`; lost response plus retry neither duplicates context nor reruns shell. |
-| Presentation | Running, stopping, succeeded, nonzero, timed out, canceled, and indeterminate states are distinct; no copy claims filesystem isolation or that changes belong to the command/turn. |
-| OTel/privacy | Spans correlate canonical commits and bounded counts; command/output/path/environment bytes never leave journals/artifact storage. |
-| Compatibility | New GUI hides Run against a host without the capability; exact protocol mismatch is explicit until the bundled daemon is restarted. |
+| Parsing and provenance | Only closed assistant shell fences act; exact Unicode/newlines and originating `LiveRun` survive; quoted/user/tool/output/streaming fences stay inert. |
+| Authorization | Missing `.directShell`, missing inspect capabilities, detached/wrong client, wrong Session attachment, foreign Work, and conflicting live owner fail before effect. |
+| Retry and cursor races | Lost response plus identical retry yields one action/process; changed bindings conflict; concurrent clients get explicit ordering/staleness. |
+| Worker outcomes | Exact cwd/environment/source, null stdin, success/nonzero/signal/Stop/explicit timeout/launch failure, and four-worker host gate. |
+| Output | Multi-megabyte stdout and stderr drain without deadlock; head/tail bytes, totals, omissions, incompleteness, artifact digest, UI binary display, and model UTF-8 replacement remain truthful. |
+| Input consumption | Host-derived pending output survives GUI reconnect; X removes only pending context; accepted input consumes once; rejected/uncertain input consumes nothing. |
+| Disconnect and daemon loss | GUI disconnect leaves the host worker running; daemon loss does not replay or pretend to recover the operating-system process. |
+| Integration | Native editor probe, wide/narrow fixtures, full tests, app/daemon build, strict signing, disposable daemon journey, and identity-fenced live handshake. |
 
-Run focused Core/self-tests for every row, the native chat-editor probe, a real disposable
-`aviaryd` disconnect/reconnect/Stop journey, and visual fixtures at narrow and wide chat widths.
-Then run `just test`, `just build`, strict deep signing verification, and an identity-fenced live
-service handshake. Keep fixture, signed-app, and real-service evidence separate.
+## Known limitations and roadmap
 
-## Explicit boundaries
-
-- This is direct shell execution with the same host/user privileges as the agent, not a sandbox,
-  approval framework, terminal emulator, or attribution engine.
-- The slice survives GUI disconnect, not Work Host process loss. Durable evidence prevents replay;
-  it cannot reconstruct an in-flight OS process after daemon death.
-- It does not merge command output into an assistant message. A model sees it only when the person
-  sends the next prompt with the pending attachment still present.
-- It does not claim exclusive access to the repository. Avoiding the Python runtime prevents
-  interpreter-state corruption; unrelated/background processes may still mutate shared files.
+1. **Not a sandbox or complete process-tree security boundary.** The shell runs with the Work Host
+   user's privileges in the shared workspace. POSIX process-group signalling covers ordinary
+   children that remain in the group, but a command can deliberately daemonize, change groups,
+   retain resources, or race unrelated processes. Stronger containment would require an explicit
+   platform policy such as a sandbox/container/cgroup or equivalent supervisor, with its own
+   product and authorization design.
+2. **No canonical stopping action state.** Add a durable direct-shell `action.cancel_requested`
+   transition, reduce it into `.cancelRequested`, and make the card distinguish accepted Stop from
+   terminal cancellation without inventing completion.
+3. **Inspect requires the exact live hosted Run.** Add a bounded cold/historical projection if
+   command output must be inspectable through this endpoint after host restart. Artifact inspection
+   remains a separate capability and should not silently masquerade as live command control.
+4. **The direct-shell projection is resident-journal bounded, not lifetime-scalable.** It reads
+   Work and Session projections with a 100,000-record resident cap and fails closed when either is
+   not fully resident. Replace the full-residency scan with an indexed/checkpointed direct-command
+   projection before claiming support for arbitrarily long-lived journals.
+5. **Model-facing binary output is lossy by declaration.** The artifact is exact, while the
+   injected text uses UTF-8 replacement. A future typed model attachment could expose explicit
+   base64 segments if models need exact binary input; do not change the current projection without
+   preserving prompt bounds and untrusted-data labeling.
+6. **No terminal emulation or filesystem attribution.** There is no PTY, interactive stdin,
+   repository lock, change attribution, or claim that filesystem edits came from this command or
+   this turn.

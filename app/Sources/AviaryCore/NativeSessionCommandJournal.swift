@@ -371,7 +371,27 @@ public actor NativeSessionCommandJournal: SessionCommandJournal {
         // Native acceptance is already durable. If this projection append fails, the command
         // remains visibly accepted-but-undelivered in Work and the controller refuses dispatch.
         do {
-            try await legacyProjection.commitIntent(intent)
+            let projectedCommand: SessionCommand
+            switch intent.command {
+            case .start(let text) where !text.isEmpty:
+                projectedCommand = .start(prompt: try await nativeJournal.effectiveInputText(
+                    commandID: intent.commandID, fallback: text))
+            case .send(let text):
+                projectedCommand = .send(prompt: try await nativeJournal.effectiveInputText(
+                    commandID: intent.commandID, fallback: text))
+            case .steer(let text):
+                projectedCommand = .steer(text: try await nativeJournal.effectiveInputText(
+                    commandID: intent.commandID, fallback: text))
+            case .queueFollowUp(let text):
+                projectedCommand = .queueFollowUp(text: try await nativeJournal.effectiveInputText(
+                    commandID: intent.commandID, fallback: text))
+            default: projectedCommand = intent.command
+            }
+            let projected = SessionCommandIntent(admitted: AdmittedSessionCommand(
+                identity: intent.identity, commandID: intent.commandID, sequence: intent.sequence,
+                actorID: intent.actorID, command: projectedCommand, previousState: intent.previousState,
+                state: intent.state, causalCursor: intent.causalCursor), timestamp: intent.timestamp)
+            try await legacyProjection.commitIntent(projected)
         } catch {
             throw SessionCommandJournalError.acceptedButUndelivered(
                 commandID: intent.commandID, reason: error.localizedDescription)

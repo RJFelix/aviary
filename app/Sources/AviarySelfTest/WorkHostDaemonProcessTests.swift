@@ -130,6 +130,7 @@ private actor HangingWorkService: WorkServiceClient {
 private actor HangingMutationWorkService: WorkServiceClient {
     private(set) var createEntered = false
     private(set) var childCancelEntered = false
+    private(set) var directShellEntered = false
     private var released = false
 
     func release() { released = true }
@@ -216,6 +217,13 @@ private actor HangingMutationWorkService: WorkServiceClient {
     func cancelAgentHandle(_ request: WorkServiceAgentHandleCancelRequest) async throws
         -> WorkServiceAgentHandleCancelResponse {
         childCancelEntered = true
+        while !released { try await Task.sleep(nanoseconds: 5_000_000) }
+        throw WorkServiceProtocolError.sourceIncomplete
+    }
+
+    func directShell(_ request: WorkServiceDirectShellRequest) async throws
+        -> WorkServiceDirectShellResponse {
+        directShellEntered = true
         while !released { try await Task.sleep(nanoseconds: 5_000_000) }
         throw WorkServiceProtocolError.sourceIncomplete
     }
@@ -533,6 +541,44 @@ func test_workHostDaemonAdmissionGateDrainsAgentChildCancellation() async throws
         _ = try await mutation.value
         XCTAssertTrue(false, "held fixture should fail after release")
     } catch WorkServiceProtocolError.sourceIncomplete { XCTAssertTrue(true) }
+}
+
+func test_workHostDaemonAdmissionGateForwardsAndDrainsDirectShellMutation() async throws {
+    let service = HangingMutationWorkService()
+    let gate = WorkHostDaemonAdmissionGate(service: service)
+    let work = WorkRef(workHostID: "direct-gate-host", workID: "direct-gate-work")
+    let cursor = JournalCursor(
+        journal: .work(work), eventID: "direct-gate-event", sequence: 5)
+    let request = WorkServiceDirectShellRequest(
+        work: work, journal: .work(work),
+        attachment: ClientAttachmentRef("direct-gate-client-attachment"),
+        command: CommandRef(
+            commandID: "direct-gate-command", client: ClientRef("direct-gate-client"),
+            sessionAttachment: SessionAttachmentRef("direct-gate-session-attachment"),
+            causalCursor: cursor),
+        causalWorkCursor: cursor, run: RunRef("direct-gate-run"), operation: .run,
+        language: .sh, source: Data("printf gate".utf8))
+    let mutation = Task { try await gate.directShell(request) }
+    let deadline = Date().addingTimeInterval(2)
+    while !(await service.directShellEntered) && Date() < deadline {
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    XCTAssertTrue(await service.directShellEntered)
+    let result = GateResult()
+    let close = Task {
+        let drained = await gate.closeAndDrain(timeout: 1)
+        await result.set(drained)
+        return drained
+    }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    XCTAssertFalse(await gate.isAccepting)
+    XCTAssertNil(await result.value, "direct shell mutation must remain inside the daemon drain")
+    await service.release()
+    XCTAssertTrue(await close.value)
+    do {
+        _ = try await mutation.value
+        XCTFail("held direct shell fixture should fail after release")
+    } catch WorkServiceProtocolError.sourceIncomplete { /* expected */ }
 }
 
 func test_workHostDaemonAdmissionGateTimesOutOnHungRequest() async throws {
@@ -1154,12 +1200,98 @@ func test_aviarydSubprocessSurvivesClientExitAndSecondClientAttaches() async thr
     XCTAssertTrue(
         String(data: messageBodyData, encoding: .utf8)?.contains(
             "daemon process survived client exit") == true)
+    // A direct user command crosses the real socket/daemon boundary without a provider turn.
+    // Disconnect the requester after admission; a different GUI observes the same result.
+    let shellReady = try await describeThroughClientB("direct command admission")
+    let shellCursor = try XCTUnwrap(shellReady.hostObservation?.servedCursor)
+    let shellRequest = WorkServiceDirectShellRequest(
+        work: create.work.work, journal: create.work.journal, attachment: attachmentB.attachment,
+        command: CommandRef(commandID: "direct-shell-once", client: ClientRef("daemon-client-b"),
+            sessionAttachment: create.sessionAttachment, causalCursor: shellCursor),
+        causalWorkCursor: shellCursor, run: run1, operation: .run, language: .sh,
+        source: Data("printf x >> .direct-shell-once; printf 'direct stdout'; printf 'direct stderr' >&2; sleep 0.2".utf8))
+    let shellStarted: WorkServiceDirectShellResponse
+    do { shellStarted = try await clientB.directShell(shellRequest) }
+    catch { throw UnwrapFailure(description: "direct shell admission failed: \(error)") }
+    XCTAssertEqual(shellStarted.disposition, .accepted)
+    let shellAction = try XCTUnwrap(shellStarted.entries.last?.action)
+    await clientB.close()
+    XCTAssertTrue(process.isRunning)
+    let clientC = WorkServiceUnixSocketClient(
+        endpoint: published.endpoint, client: ClientRef("daemon-client-c"), expectedHost: host)
+    let handshakeC = try await clientC.connect(build: "direct-shell-reconnect")
+    let attachC = try await clientC.attach(WorkServiceAttachRequest(
+        work: create.work.work, journal: create.work.journal, client: ClientRef("daemon-client-c"),
+        session: create.session, sessionJournal: create.sessionJournal,
+        sessionAttachment: create.sessionAttachment, commandID: "attach-direct-c",
+        causalControlCursor: handshakeC.controlCursor, requestedCapabilities: capabilities))
+    let attachmentC = try XCTUnwrap(attachC.attachment)
+    var shellFinished: WorkServiceDirectShellEntry?
+    let shellDeadline = Date().addingTimeInterval(10)
+    while Date() < shellDeadline && shellFinished == nil {
+        let inspected: WorkServiceDirectShellResponse
+        do { inspected = try await clientC.directShell(WorkServiceDirectShellRequest(
+            work: create.work.work, journal: create.work.journal, attachment: attachmentC.attachment,
+            command: CommandRef(commandID: UUID().uuidString, client: ClientRef("daemon-client-c"),
+                sessionAttachment: create.sessionAttachment, causalCursor: shellCursor),
+            causalWorkCursor: shellCursor, run: run1, operation: .inspect, action: shellAction)) }
+        catch { throw UnwrapFailure(description: "direct shell inspection failed: \(error)") }
+        shellFinished = inspected.entries.first { $0.result != nil }
+        if shellFinished == nil { try await Task.sleep(nanoseconds: 50_000_000) }
+    }
+    let shellOutput = try XCTUnwrap(shellFinished)
+    XCTAssertEqual(shellOutput.result?.stdout.head, Data("direct stdout".utf8))
+    XCTAssertEqual(shellOutput.result?.stderr.head, Data("direct stderr".utf8))
+    XCTAssertTrue(shellOutput.pendingContext)
+    XCTAssertNotNil(shellOutput.artifact)
+    await clientC.close()
+    _ = try await clientB.connect(build: "direct-shell-exact-retry")
+    let shellDuplicate: WorkServiceDirectShellResponse
+    do { shellDuplicate = try await clientB.directShell(shellRequest) }
+    catch { throw UnwrapFailure(description: "direct shell exact retry failed: \(error)") }
+    XCTAssertEqual(shellDuplicate.disposition, .duplicate)
+    XCTAssertEqual(shellDuplicate.entries.first?.action, shellAction)
+    XCTAssertEqual(try String(contentsOf: workspace.appending(path: ".direct-shell-once"), encoding: .utf8), "x")
+    let shellSettled = try await describeThroughClientB("direct command settled")
+    workCursor = try XCTUnwrap(shellSettled.hostObservation?.servedCursor)
+    let stopRun = try await clientB.directShell(WorkServiceDirectShellRequest(
+        work: create.work.work, journal: create.work.journal, attachment: attachmentB.attachment,
+        command: CommandRef(commandID: "direct-shell-stop-target", client: ClientRef("daemon-client-b"),
+            sessionAttachment: create.sessionAttachment, causalCursor: workCursor),
+        causalWorkCursor: workCursor, run: run1, operation: .run, language: .sh,
+        source: Data("printf waiting; sleep 30".utf8)))
+    let stopAction = try XCTUnwrap(stopRun.entries.last?.action)
+    let stopRequest = WorkServiceDirectShellRequest(
+        work: create.work.work, journal: create.work.journal, attachment: attachmentB.attachment,
+        command: CommandRef(commandID: "direct-shell-stop", client: ClientRef("daemon-client-b"),
+            sessionAttachment: create.sessionAttachment, causalCursor: stopRun.resultingWorkCursor),
+        causalWorkCursor: stopRun.resultingWorkCursor, run: run1, operation: .stop, action: stopAction)
+    let stopped = try await clientB.directShell(stopRequest)
+    XCTAssertEqual(stopped.disposition, .accepted)
+    var canceledResult: DirectShellCommandResult?
+    let canceledDeadline = Date().addingTimeInterval(10)
+    while Date() < canceledDeadline && canceledResult == nil {
+        let inspected = try await clientB.directShell(WorkServiceDirectShellRequest(
+            work: create.work.work, journal: create.work.journal, attachment: attachmentB.attachment,
+            command: CommandRef(commandID: UUID().uuidString, client: ClientRef("daemon-client-b"),
+                sessionAttachment: create.sessionAttachment, causalCursor: stopped.resultingWorkCursor),
+            causalWorkCursor: stopped.resultingWorkCursor, run: run1, operation: .inspect, action: stopAction))
+        canceledResult = inspected.entries.first?.result
+        if canceledResult == nil { try await Task.sleep(nanoseconds: 50_000_000) }
+    }
+    XCTAssertEqual(try XCTUnwrap(canceledResult).status, .canceled)
+    XCTAssertEqual(try await clientB.directShell(stopRequest).disposition, .duplicate)
+    let afterStop = try await describeThroughClientB("direct command stopped")
+    XCTAssertEqual(afterStop.execution, .idle)
+    workCursor = try XCTUnwrap(afterStop.hostObservation?.servedCursor)
     let endCursor = workCursor
-    let end = try await clientB.command(WorkServiceCommandRequest(
+    let end: WorkServiceCommandReceipt
+    do { end = try await clientB.command(WorkServiceCommandRequest(
         work: create.work.work, journal: create.work.journal,
         attachment: attachmentB.attachment, commandID: "end-b",
         client: ClientRef("daemon-client-b"), sessionAttachment: attachmentB.sessionAttachment,
-        causalWorkCursor: endCursor, kind: .end))
+        causalWorkCursor: endCursor, kind: .end)) }
+    catch { throw UnwrapFailure(description: "daemon End after direct command failed: \(error)") }
     XCTAssertEqual(end.state, .accepted)
     var endedDescriptor = try await describeThroughClientB("ended Run")
     let endedDeadline = Date().addingTimeInterval(20)
@@ -1188,11 +1320,13 @@ func test_aviarydSubprocessSurvivesClientExitAndSecondClientAttaches() async thr
     // run.finished marker may already be present in this terminal page. Start must use the
     // canonical current tip, not the earlier acceptance cursor.
     let replacementCursor = try XCTUnwrap(terminalWorkPage.servedCursor ?? end.resultingWorkCursor)
-    let replacement = try await clientB.command(WorkServiceCommandRequest(
+    let replacement: WorkServiceCommandReceipt
+    do { replacement = try await clientB.command(WorkServiceCommandRequest(
         work: create.work.work, journal: create.work.journal,
         attachment: attachmentB.attachment, commandID: "start-c",
         client: ClientRef("daemon-client-b"), sessionAttachment: attachmentB.sessionAttachment,
-        causalWorkCursor: replacementCursor, kind: .start, value: "replacement start"))
+        causalWorkCursor: replacementCursor, kind: .start, value: "replacement start")) }
+    catch { throw UnwrapFailure(description: "daemon replacement Start after direct command failed: \(error)") }
     XCTAssertEqual(replacement.state, .accepted)
     XCTAssertEqual(replacement.outcome, .started)
     var replacementDescriptor = try await describeThroughClientB("replacement Run")
@@ -1220,6 +1354,8 @@ func test_aviarydSubprocessSurvivesClientExitAndSecondClientAttaches() async thr
     var replacementDelivered = false
     var replacementTurnFinished: TimelineEvent?
     var replacementAssistant: TimelineEvent?
+    var replacementInput: TimelineEvent?
+    var replacementContext: TimelineEvent?
     let replacementOutputDeadline = Date().addingTimeInterval(20)
     while Date() < replacementOutputDeadline
             && (!replacementDelivered || replacementTurnFinished == nil || replacementAssistant == nil) {
@@ -1244,12 +1380,35 @@ func test_aviarydSubprocessSurvivesClientExitAndSecondClientAttaches() async thr
         replacementAssistant = replacementAssistant ?? sessionPage.events.first {
             $0.type == TimelineEventType.messageCommitted && $0.run == run2
         }
+        replacementInput = replacementInput ?? sessionPage.events.first {
+            $0.type == TimelineEventType.inputAccepted && $0.run == run2
+        }
+        replacementContext = replacementContext ?? sessionPage.events.first {
+            $0.type == TimelineEventType.contextAssembled && $0.run == run2
+        }
         if !replacementDelivered || replacementTurnFinished == nil || replacementAssistant == nil {
             try await Task.sleep(nanoseconds: 100_000_000)
         }
     }
     XCTAssertTrue(replacementDelivered)
     XCTAssertNotNil(replacementTurnFinished)
+    let attachedInput = try XCTUnwrap(replacementInput)
+    XCTAssertEqual(attachedInput.payload["direct_shell_consumed"]?.arrayValue?.count, 2)
+    let inputText = try XCTUnwrap(attachedInput.payload["text"]?.stringValue)
+    XCTAssertEqual(PromptText.split(inputText).userText, "replacement start")
+    XCTAssertTrue(inputText.contains("direct stdout"))
+    let context = try XCTUnwrap(replacementContext)
+    let bodyStore = ContextBodyStore(home: fixture.home)
+    var recordedOutputInContext = false
+    for value in context.payload["components"]?.arrayValue ?? [] {
+        let component = try JSONDecoder().decode(ContextComponent.self, from: JSONEncoder().encode(value))
+        if let reference = component.bodyReference,
+           let text = String(data: try bodyStore.read(reference), encoding: .utf8),
+           text.contains("aviary-command-output"), text.contains("direct stdout") {
+            recordedOutputInContext = true
+        }
+    }
+    XCTAssertTrue(recordedOutputInContext, "the next provider crossing must retain the attached output")
     let replacementMessage = try XCTUnwrap(replacementAssistant)
     guard case .object(let replacementPayload) = replacementMessage.payload,
           let replacementBodyValue = replacementPayload["message_body_ref"] else {
@@ -1411,6 +1570,9 @@ func test_aviarydSubprocessParentLeasePreventsOrphans() async throws {
 }
 
 let casesWorkHostDaemonProcess: [Case] = [
+    ("direct shell admission gate forwards and drains the in-flight mutation", {
+        try await test_workHostDaemonAdmissionGateForwardsAndDrainsDirectShellMutation()
+    }),
     ("phase5 child cancellation admission gate drains the in-flight call", {
         try await test_workHostDaemonAdmissionGateDrainsAgentChildCancellation()
     }),

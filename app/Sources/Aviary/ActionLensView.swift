@@ -1,6 +1,70 @@
 import AviaryCore
 import SwiftUI
 
+private enum WorkActionCopy {
+    static func kindTitle(_ kind: ActionKind) -> String {
+        switch kind {
+        case .provider: return "Model"
+        case .compactionProvider: return "Conversation summary"
+        case .providerSetup: return "Model setup"
+        case .python: return "Python step"
+        case .mcp: return "Integration"
+        case .runtime: return "Runtime step"
+        case .hook: return "Automation hook"
+        case .peerDelivery: return "Message to another agent"
+        case .selfDelivery: return "Session notification"
+        case .webSearch: return "Web search"
+        case .webExtract: return "Read web content"
+        case .child: return "Child agent"
+        case .memory: return "Memory note"
+        case .artifact: return "Saved artifact"
+        case .imageRead: return "Read image"
+        case .nestedProcessCallback: return "Nested Work callback"
+        case .directShell: return "Command"
+        }
+    }
+
+    static func activityTitle(for action: WorkActionPresentation) -> String {
+        guard let intent = action.intent else {
+            return kindTitle(action.kind)
+        }
+        switch intent.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "request the next agent response":
+            return "Generate the next response"
+        case "compact the conversation with the provider":
+            return "Summarize the conversation"
+        case "execute one python cell":
+            return "Run a Python step"
+        case "call an mcp tool":
+            return "Use an integration"
+        case "start a child agent":
+            return "Start a child agent"
+        case "write a memory entry":
+            return "Save a memory note"
+        case "write an artifact":
+            return "Save an artifact"
+        case "read an image for the model":
+            return "Read an image"
+        default:
+            return action.kind == .directShell ? "Run command" : intent
+        }
+    }
+
+    static func statusTitle(_ state: ActionExecutionState) -> String {
+        switch state {
+        case .unknown: return "Status unknown"
+        case .proposed: return "Preparing"
+        case .queued: return "Waiting"
+        case .running: return "In progress"
+        case .cancelRequested: return "Stopping"
+        case .succeeded: return "Completed"
+        case .failed: return "Failed"
+        case .canceled: return "Canceled"
+        case .indeterminateEffect: return "Outcome unclear"
+        }
+    }
+}
+
 private struct WorkActionStatusBadge: View {
     let state: ActionExecutionState
     var isCurrent: Bool = true
@@ -20,11 +84,7 @@ private struct WorkActionStatusBadge: View {
     }
 
     private var stateTitle: String {
-        switch state {
-        case .cancelRequested: return "Cancel requested"
-        case .indeterminateEffect: return "Effect indeterminate"
-        default: return state.rawValue.replacingOccurrences(of: "_", with: " ").capitalized
-        }
+        WorkActionCopy.statusTitle(state)
     }
 }
 
@@ -69,11 +129,12 @@ struct WorkActivityStrip: View {
                     .font(.system(size: 13, weight: .medium))
                     .lineLimit(2)
                 HStack(spacing: 5) {
-                    Text(sourceIsCurrent ? action.kindTitle : "Last recorded activity")
+                    Text(sourceIsCurrent ? WorkActionCopy.kindTitle(action.kind)
+                        : "Last recorded activity")
                     Text("·")
                     WorkActionStatusBadge(state: action.state, isCurrent: sourceIsCurrent)
                     if concurrentActions.count > 1 {
-                        Text("· \(concurrentActions.count) unsettled in view")
+                        Text("· \(concurrentActions.count) steps in progress or waiting")
                     }
                 }
                 .font(.system(size: 11)).foregroundStyle(.secondary)
@@ -83,41 +144,43 @@ struct WorkActivityStrip: View {
     }
 
     private var activityTitle: String {
-        if action.kind == .provider {
-            return action.state == .running ? "Generating a response" : action.kindTitle
+        if action.kind == .provider && action.state == .running {
+            return "Generating a response"
         }
-        return action.intent ?? action.kindTitle
+        return WorkActionCopy.activityTitle(for: action)
     }
 
     @ViewBuilder private var inspectionControl: some View {
         if concurrentActions.count > 1 {
-                Menu {
-                    ForEach(concurrentActions) { candidate in
-                        Button(menuLabel(candidate)) {
-                            onInspect(candidate)
-                        }
+            Menu {
+                ForEach(concurrentActions) { candidate in
+                    Button(menuLabel(candidate)) {
+                        onInspect(candidate)
                     }
-                } label: {
-                    Label("Action details", systemImage: "list.bullet")
                 }
-                .menuStyle(.borderlessButton).fixedSize()
-                .accessibilityLabel("Inspect unsettled activity actions")
-            } else {
-                Button {
-                    onInspect(action)
-                } label: {
-                    Label("View action details", systemImage: "doc.text.magnifyingglass")
-                }
-                .buttonStyle(.borderless)
-                .fixedSize()
-                .accessibilityLabel("View action details for \(action.intent ?? action.kindTitle)")
+            } label: {
+                Label("Activity details", systemImage: "list.bullet")
+            }
+            .menuStyle(.borderlessButton).fixedSize()
+            .accessibilityLabel("Inspect steps in progress or waiting")
+        } else {
+            Button {
+                onInspect(action)
+            } label: {
+                Label("View activity details", systemImage: "doc.text.magnifyingglass")
+            }
+            .buttonStyle(.borderless)
+            .fixedSize()
+            .accessibilityLabel(
+                "View activity details for \(WorkActionCopy.activityTitle(for: action))")
         }
     }
 
     private func menuLabel(_ candidate: WorkActionPresentation) -> String {
-        let subject = String((candidate.intent ?? candidate.affectedTarget ?? candidate.kindTitle)
+        let subject = String(WorkActionCopy.activityTitle(for: candidate)
             .replacingOccurrences(of: "\n", with: " ").prefix(64))
-        return "\(subject) · \(candidate.stateTitle) · …\(candidate.id.suffix(8))"
+        return "\(subject) · \(WorkActionCopy.statusTitle(candidate.state)) "
+            + "· …\(candidate.id.suffix(8))"
     }
 }
 
@@ -176,7 +239,7 @@ struct ChatActivityContent: View {
                 .font(.system(size: 13)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if !activity.sourceIsComplete {
-                Label("Last recorded evidence · this view may be stale or incomplete",
+                Label("Last recorded activity · this view may be stale or incomplete",
                       systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 11, weight: .medium)).foregroundStyle(Design.warning)
                     .fixedSize(horizontal: false, vertical: true)
@@ -187,14 +250,16 @@ struct ChatActivityContent: View {
             actionSection(
                 activity.sourceIsComplete ? "In progress" : "Last recorded as unsettled",
                 symbol: "clock.arrow.circlepath", tint: Design.accent,
-                subtitle: "Includes queued, proposed, running, and cancellation-requested records. A recorded state is not a live-process claim.",
+                subtitle: "Includes steps waiting to start, running, or waiting for cancellation. "
+                    + "These are the latest recorded states, not a separate live-process check.",
                 actions: activity.current)
             actionSection(
-                "Recorded problems", symbol: "exclamationmark.triangle.fill", tint: Design.danger,
-                subtitle: "Failures and uncertain effects stay visible for inspection. They do not by themselves mean the agent is blocked or that retry is safe.",
+                "Needs review", symbol: "exclamationmark.triangle.fill", tint: Design.danger,
+                subtitle: "Failures and unclear outcomes stay visible so you can review them. "
+                    + "They do not by themselves mean the agent is blocked or safe to retry.",
                 actions: activity.problems)
             actionSection("Completed", symbol: "checkmark.circle.fill", tint: Design.success,
-                          subtitle: "Recorded terminal outcomes, including canceled steps; inspect evidence before assuming an external effect was complete.",
+                          subtitle: "Finished steps, including canceled ones. Open a step's details before assuming an external effect completed.",
                           actions: activity.completed)
             if activity.omittedCount > 0 {
                 Label("\(activity.omittedCount) additional action records are outside this view.",
@@ -209,7 +274,7 @@ struct ChatActivityContent: View {
     private var backgroundActivity: some View {
         if children.hasRecords || !children.isAvailable {
             VStack(alignment: .leading, spacing: 6) {
-                Label("Recorded child agents", systemImage: "person.2")
+                Label("Child agents", systemImage: "person.2")
                     .font(.system(size: 13, weight: .semibold))
                 Text(children.summary).font(.system(size: 11.5))
                 DisclosureGroup {
@@ -217,7 +282,7 @@ struct ChatActivityContent: View {
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 } label: {
-                    Label("How to read child records", systemImage: "questionmark.circle")
+                    Label("About child-agent activity", systemImage: "questionmark.circle")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
@@ -228,7 +293,7 @@ struct ChatActivityContent: View {
         }
         if let agentHandles, agentHandles.hasRecords || !agentHandles.isAvailable {
             VStack(alignment: .leading, spacing: 6) {
-                Label("Recorded background agents", systemImage: "person.2.wave.2")
+                Label("Background agents", systemImage: "person.2.wave.2")
                     .font(.system(size: 13, weight: .semibold))
                 Text(agentHandles.summary).font(.system(size: 11.5))
                 ForEach(Array(agentHandles.rows.enumerated()), id: \.element.id) { index, row in
@@ -251,7 +316,7 @@ struct ChatActivityContent: View {
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 } label: {
-                    Label("How to read background-agent records", systemImage: "questionmark.circle")
+                    Label("About background-agent activity", systemImage: "questionmark.circle")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
@@ -334,13 +399,13 @@ struct WorkActionLensRow: View {
                         .foregroundStyle(Design.accent)
                         .frame(width: 18)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(action.intent ?? action.kindTitle)
+                        Text(WorkActionCopy.activityTitle(for: action))
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(.primary)
                             .lineLimit(2)
                             .multilineTextAlignment(.leading)
                         HStack(spacing: 6) {
-                            Text(action.kindTitle)
+                            Text(WorkActionCopy.kindTitle(action.kind))
                             WorkActionStatusBadge(state: action.state)
                             if let duration = action.durationSeconds {
                                 Text(Fmt.duration(duration))
@@ -362,7 +427,7 @@ struct WorkActionLensRow: View {
             .accessibilityIdentifier("work-action-\(action.actionID)")
             .accessibilityLabel(accessibilitySummary)
             .accessibilityValue(expanded ? "Expanded" : "Collapsed")
-            .accessibilityHint("Shows or hides canonical action evidence")
+            .accessibilityHint("Shows or hides the recorded activity details")
 
             if let retry = action.retryGuidance,
                expanded || action.state == .failed || action.state == .indeterminateEffect,
@@ -389,8 +454,10 @@ struct WorkActionLensRow: View {
     private var tint: Color { WorkActionVisuals.tint(for: action.state) }
 
     private var accessibilitySummary: String {
-        var parts = [action.kindTitle, action.stateTitle]
-        if let intent = action.intent { parts.insert(intent, at: 0) }
+        var parts = [
+            WorkActionCopy.kindTitle(action.kind), WorkActionCopy.statusTitle(action.state)
+        ]
+        parts.insert(WorkActionCopy.activityTitle(for: action), at: 0)
         if let target = action.affectedTarget { parts.append("Target \(target)") }
         return parts.joined(separator: ", ")
     }
@@ -406,9 +473,10 @@ struct WorkActionDetailSheet: View {
             HStack(spacing: 8) {
                 Circle().fill(WorkActionVisuals.tint(for: action.state))
                     .frame(width: 8, height: 8)
-                Text(action.kindTitle)
+                Text(WorkActionCopy.kindTitle(action.kind))
                     .font(.system(size: 14, weight: .semibold))
-                Chip(text: action.stateTitle, tint: WorkActionVisuals.tint(for: action.state))
+                Chip(text: WorkActionCopy.statusTitle(action.state),
+                     tint: WorkActionVisuals.tint(for: action.state))
                 Spacer()
                 Button("Done") { dismiss() }
                     .buttonStyle(.borderedProminent)
@@ -419,10 +487,13 @@ struct WorkActionDetailSheet: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    Card("Action", symbol: "bolt.horizontal.circle") {
+                    Card("Activity", symbol: "bolt.horizontal.circle") {
                         VStack(alignment: .leading, spacing: 6) {
-                            if let intent = action.intent {
-                                Text(intent).font(.body).textSelection(.enabled)
+                            Text(WorkActionCopy.activityTitle(for: action))
+                                .font(.body).textSelection(.enabled)
+                            if let intent = action.intent,
+                               intent != WorkActionCopy.activityTitle(for: action) {
+                                DetailRow(label: "Recorded request", value: intent)
                             }
                             if let target = action.affectedTarget {
                                 DetailRow(label: "Target", value: target, mono: true)
@@ -451,7 +522,7 @@ struct WorkActionDetailSheet: View {
                     .buttonStyle(.plain)
                     .accessibilityValue(showsTechnicalDetails ? "Expanded" : "Collapsed")
                     if showsTechnicalDetails {
-                    Card("What was recorded", symbol: "scope") {
+                    Card("Limits of this view", symbol: "scope") {
                         VStack(alignment: .leading, spacing: 7) {
                             Text(action.boundaryDisclosure)
                                 .font(.system(size: 10.5))
@@ -502,7 +573,7 @@ struct WorkActionUnavailableSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Label("Action no longer in view", systemImage: "ellipsis.circle")
+                Label("Activity no longer in view", systemImage: "ellipsis.circle")
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
                 Button("Done") { dismiss() }
@@ -640,7 +711,7 @@ private enum WorkActionVisuals {
         case .provider: return "cloud.fill"
         case .compactionProvider: return "arrow.down.right.and.arrow.up.left"
         case .providerSetup: return "key.fill"
-        case .python: return "terminal.fill"
+        case .python, .directShell: return "terminal.fill"
         case .mcp: return "point.3.connected.trianglepath.dotted"
         case .runtime: return "gearshape.2.fill"
         case .hook: return "line.3.horizontal.decrease.circle"

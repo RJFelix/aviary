@@ -325,6 +325,15 @@ public actor WorkServiceClientSession: WorkServiceClient {
         return try await perform { try await $0.command(request) }
     }
 
+    public func directShell(
+        _ request: WorkServiceDirectShellRequest
+    ) async throws -> WorkServiceDirectShellResponse {
+        guard request.command.client == client else {
+            throw WorkServiceClientSessionError.invalidClient
+        }
+        return try await perform { try await $0.directShell(request) }
+    }
+
     private func finish(_ pending: PendingConnection) async throws
         -> WorkServiceHandshakeResponse
     {

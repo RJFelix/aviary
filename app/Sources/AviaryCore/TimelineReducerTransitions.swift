@@ -1130,8 +1130,13 @@ internal enum WorkReducerTransition {
         if actionState.isTerminal {
             if state.activeActionCount == 0, state.scalar.activeTurn == nil {
                 updateScalar(&state) {
-                    $0.execution = actionState == .failed || actionState == .indeterminateEffect
-                        ? .failed : .idle
+                    // A user-run shell command may return nonzero or hit its chosen timeout
+                    // without failing the waiting agent. Preserve the action outcome while
+                    // leaving the same Run available for a follow-up. Unknown effects still
+                    // require recovery rather than pretending execution is settled.
+                    let failedAgent = actionState == .indeterminateEffect
+                        || (actionState == .failed && existing.kind != .directShell)
+                    $0.execution = failedAgent ? .failed : .idle
                 }
             }
         } else {

@@ -36,6 +36,9 @@ let linuxCoreSources: [String] = [
     "CanonicalWorkRecoveryProjection.swift",
     "ContextManifest.swift",
     "DisposableTimelineProjectionStore.swift",
+    "DirectShellCommandWorker.swift",
+    "DirectShellCommandService.swift",
+    "DirectShellCommandJournal.swift",
     "Goals.swift",
     "HostedInHouseWork.swift",
     "InHouseModelResolver.swift",
@@ -121,6 +124,8 @@ let linuxCoreSources: [String] = [
     "WireLogDirectoryStore.swift",
 ]
 let linuxSelfTestSources: [String] = [
+    "DirectShellCommandJournalTests.swift",
+    "DirectShellServiceTests.swift",
     "ProviderUsageTests.swift",
     "ProviderUsageWireTests.swift",
     "ProviderTerminalTests.swift",

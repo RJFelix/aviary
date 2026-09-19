@@ -1341,14 +1341,26 @@ final class AppModel {
 
     @discardableResult
     private func adoptServiceAttachment(
-        descriptor: WorkServiceWorkDescriptor,
-        attachment: WorkServiceClientAttachment,
+        descriptor suppliedDescriptor: WorkServiceWorkDescriptor,
+        attachment suppliedAttachment: WorkServiceClientAttachment,
         session: WorkServiceClientSession,
         client: ClientRef,
         focus: Bool,
         destination: Section = .live,
         resumeInitialStart: Bool = true
     ) async -> String? {
+        var descriptor = suppliedDescriptor
+        var attachment = suppliedAttachment
+        do {
+            (descriptor, attachment) = try await reconcileDirectShellCapabilityIfNeeded(
+                descriptor: descriptor, attachment: attachment,
+                session: session, client: client)
+        } catch {
+            // Keep the existing attachment usable, but never present direct execution until the
+            // durable capability mutation and its refreshed descriptor are both proven.
+            localWorkServiceError =
+                "Direct command capability could not be updated; the conversation remains available without direct execution."
+        }
         guard attachment.session != nil,
               attachment.sessionJournal != nil,
               attachment.sessionAttachment != nil else {
@@ -2287,10 +2299,13 @@ final class AppModel {
                     destination: destination)
                 return adoptionError == nil ? "completed" : "unavailable"
             }
-            let requestedCapabilities: Set<WorkServiceCapability> = [
+            var requestedCapabilities: Set<WorkServiceCapability> = [
                 .observe, .control, .start, .send, .steer, .queue, .cancel, .end,
                 .inspectArtifacts, .createSession,
             ]
+            if handshake.capabilities.contains(.directShell) {
+                requestedCapabilities.insert(.directShell)
+            }
             let pending = pendingServiceAttaches[targetKey]
             let request: WorkServiceAttachRequest
             if let pending,
@@ -2484,10 +2499,13 @@ final class AppModel {
                     "The selected client attachment no longer uniquely authorizes Session creation."
                 return
             }
-            let requestedCapabilities: Set<WorkServiceCapability> = [
+            var requestedCapabilities: Set<WorkServiceCapability> = [
                 .observe, .control, .start, .send, .steer, .queue, .cancel, .end,
                 .inspectArtifacts,
             ]
+            if handshake.capabilities.contains(.directShell) {
+                requestedCapabilities.insert(.directShell)
+            }
             let request = WorkServiceCreateSessionRequest(
                 work: descriptor.work, journal: descriptor.journal,
                 attachment: authorizingAttachment, client: client,
@@ -3070,6 +3088,74 @@ final class AppModel {
             }
         }
         return nil
+    }
+
+    /// Upgrade only this GUI's existing full-control attachment when the current Work Host
+    /// advertises direct shell. The fresh handshake supplies the exact control cursor; the
+    /// refreshed descriptor prevents a capability response from being combined with a stale
+    /// attachment projection.
+    private func reconcileDirectShellCapabilityIfNeeded(
+        descriptor: WorkServiceWorkDescriptor,
+        attachment: WorkServiceClientAttachment,
+        session: WorkServiceClientSession,
+        client: ClientRef
+    ) async throws -> (WorkServiceWorkDescriptor, WorkServiceClientAttachment) {
+        guard attachment.client == client,
+              attachment.authorization.allows(.control),
+              attachment.authorization.allows(.send),
+              attachment.authorization.allows(.inspectArtifacts),
+              !attachment.authorization.allows(.directShell) else {
+            return (descriptor, attachment)
+        }
+        let handshake = try await session.refreshHandshake()
+        guard handshake.hostInstance.host.workHostID == descriptor.work.workHostID,
+              handshake.capabilities.contains(.directShell) else {
+            return (descriptor, attachment)
+        }
+        var requested = attachment.authorization.requested.intersection(handshake.capabilities)
+        requested.insert(.directShell)
+        let capabilityMaterial = ([
+            client.clientID, descriptor.work.workHostID, descriptor.work.workID,
+            attachment.attachment.attachmentID, handshake.controlCursor.journal.stableKey,
+            handshake.controlCursor.eventID ?? "", String(handshake.controlCursor.sequence),
+        ] + requested.map(\.rawValue).sorted()).joined(separator: "\u{0}")
+        let capabilityDigest = SHA256.hash(data: Data(capabilityMaterial.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        let commandID = "capability-v1-" + String(capabilityDigest.prefix(48))
+        let response = try await session.updateCapabilities(
+            WorkServiceUpdateCapabilitiesRequest(
+                work: descriptor.work, journal: descriptor.journal,
+                attachment: attachment.attachment, client: client,
+                requestedCapabilities: requested, commandID: commandID,
+                causalControlCursor: handshake.controlCursor))
+        guard (response.state == .accepted || response.state == .duplicate),
+              response.work == descriptor.work,
+              response.host == handshake.hostInstance,
+              response.commandID == commandID,
+              response.causalControlCursor == handshake.controlCursor,
+              response.authorization.allows(.directShell),
+              let updated = response.attachment,
+              updated.attachment == attachment.attachment,
+              updated.client == client,
+              updated.session == attachment.session,
+              updated.sessionJournal == attachment.sessionJournal,
+              updated.sessionAttachment == attachment.sessionAttachment,
+              updated.authorization.allows(.directShell) else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let refreshed = try await session.describeWork(WorkServiceDescribeRequest(
+            work: descriptor.work, journal: descriptor.journal, client: client))
+        guard refreshed.work == descriptor.work, refreshed.journal == descriptor.journal,
+              let canonical = refreshed.attachments.first(where: {
+                  $0.attachment == attachment.attachment
+                    && $0.client == client
+                    && $0.session == attachment.session
+                    && $0.sessionJournal == attachment.sessionJournal
+                    && $0.sessionAttachment == attachment.sessionAttachment
+              }), canonical.authorization.allows(.directShell) else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return (refreshed, canonical)
     }
 
     /// Mark the catalog rows that belong to a run this process is holding.
@@ -4172,10 +4258,13 @@ final class AppModel {
                   advertised.capabilities.contains(.resolve) else {
                 throw LocalWorkServiceBootstrapError.connectionFailed(.notConnected)
             }
-            let requested: Set<WorkServiceCapability> = [
+            var requested: Set<WorkServiceCapability> = [
                 .observe, .control, .start, .send, .steer, .queue, .cancel, .end,
                 .inspectArtifacts, .createSession,
             ]
+            if handshake.capabilities.contains(.directShell) {
+                requested.insert(.directShell)
+            }
             let configuration = WorkServiceWorkConfiguration(
                 providerID: providerSpec.id, modelID: model.id,
                 thinkingLevel: thinkingLevel, workspaceID: advertised.workspaceID,
@@ -4859,6 +4948,40 @@ final class LiveRun: Identifiable {
     private(set) var serviceAttachmentKey: ServiceAttachmentKey?
     var serviceProjection: WorkServiceAttachedWorkProjection? { serviceBridge?.projection }
     private(set) var serviceCommandInFlight = false
+    private(set) var directShellEntries: [WorkServiceDirectShellEntry] = []
+    private(set) var directShellError: String?
+    private(set) var directShellRequestInFlight = false
+    private var directShellEndCleanupInProgress = false
+    var directShellIsRunning: Bool { directShellEntries.contains { !$0.state.isTerminal } }
+    var canRunDirectShell: Bool {
+        serviceBridge?.supportsDirectShell == true && serviceBridge?.isConnected == true
+            && serviceProjection?.isCanonical == true && !isStreaming && !hasExited && !isEnding
+            && !directShellIsRunning && !directShellRequestInFlight
+            && directShellError == nil
+            && composerSubmissionState == .idle
+    }
+
+    func directShell(operation: WorkServiceDirectShellOperation,
+                     command: SuggestedShellCommand? = nil, timeout: TimeInterval? = nil,
+                     action: ActionRef? = nil, expectedRun: RunRef? = nil) async -> Bool {
+        guard let serviceBridge, !directShellRequestInFlight,
+              expectedRun == nil || serviceProjection?.descriptor.currentRun == expectedRun else { return false }
+        directShellRequestInFlight = true
+        defer { directShellRequestInFlight = false }
+        do {
+            _ = try await serviceBridge.directShell(operation: operation,
+                language: command.flatMap { DirectShellLanguage(wireValue: $0.language) },
+                source: command.map { Data($0.source.utf8) },
+                durationLimitSeconds: timeout, action: action,
+                expectedRun: expectedRun)
+            _ = await serviceBridge.refresh()
+            syncServiceState()
+            return true
+        } catch {
+            syncServiceState()
+            return false
+        }
+    }
     /// The GUI operation starts before the controller has retained its command, while the
     /// controller request lifetime can remain observable after that actor hop. Either fact means
     /// the original attempt is active rather than an unresolved delivery.
@@ -5601,10 +5724,12 @@ final class LiveRun: Identifiable {
 
     private func syncServiceState() {
         guard let serviceBridge else { return }
+        publish(serviceBridge.directShellEntries.filter { $0.pendingContext || !$0.state.isTerminal }, to: \.directShellEntries)
+        publish(serviceBridge.directShellError, to: \.directShellError)
         publish(serviceBridge.transcriptItems, to: \.items)
         publish(serviceBridge.isStreaming, to: \.isStreaming)
         publish(serviceBridge.isTerminal, to: \.hasExited)
-        publish(serviceBridge.isEnding, to: \.isEnding)
+        publish(serviceBridge.isEnding || directShellEndCleanupInProgress, to: \.isEnding)
         publish(serviceBridge.commandState, to: \.commandState)
         publish(serviceBridge.controlResult, to: \.serviceControlResult)
         publish(serviceBridge.projection.commandInFlight, to: \.serviceCommandInFlight)
@@ -6419,15 +6544,42 @@ final class LiveRun: Identifiable {
 
     /// Explicit End for a service-backed Work.  Calling `stop()` remains reserved for the
     /// process-owned Claude/in-house paths; application termination uses `disconnect()` below.
-    func end() async {
+    func end(discardPendingCommandOutput: Bool = false) async {
         if let serviceBridge {
             guard !hasExited, serviceBridge.hasExactRunOwner,
                   serviceBridge.projection.isCanonical else {
                 commandNotice = .warning("This Work's active Session owner is unavailable.")
                 return
             }
+            let hasDirectCommandOutput = directShellEntries.contains {
+                !$0.state.isTerminal || $0.pendingContext
+            }
+            guard discardPendingCommandOutput || !hasDirectCommandOutput else {
+                commandNotice = .warning(
+                    "Command output is still waiting. Send a message to include it, or choose "
+                        + "End and remove command output.")
+                return
+            }
             isEnding = true
+            directShellEndCleanupInProgress = discardPendingCommandOutput
+                && hasDirectCommandOutput
+            var endAdmissionStarted = false
+            defer {
+                directShellEndCleanupInProgress = false
+                // Cleanup failure proves End never crossed the Work Host boundary. Once End is
+                // attempted, its existing receipt/reconciliation path owns the uncertain state.
+                if !endAdmissionStarted { isEnding = false }
+            }
+            if discardPendingCommandOutput && hasDirectCommandOutput {
+                guard await discardDirectShellOutputBeforeEnd() else {
+                    commandNotice = .warning(
+                        "Aviary could not confirm that command output was stopped and removed. "
+                            + "End was not sent; check command status and try again.")
+                    return
+                }
+            }
             let commandID = UUID().uuidString.lowercased()
+            endAdmissionStarted = true
             do {
                 let receipt = try await serviceBridge.end(commandID: commandID)
                 setServiceSuccessNotice(
@@ -6453,6 +6605,33 @@ final class LiveRun: Identifiable {
             return
         }
         await stop()
+    }
+
+    /// Resolve every command-output card visible to this attachment before an explicitly
+    /// destructive End. Each transition goes through the ordinary typed endpoint: no GUI state
+    /// is cleared locally, and a failure leaves End unissued.
+    private func discardDirectShellOutputBeforeEnd() async -> Bool {
+        guard await directShell(operation: .inspect) else { return false }
+
+        for entry in directShellEntries where !entry.state.isTerminal {
+            guard await directShell(operation: .stop, action: entry.action) else { return false }
+        }
+
+        let deadline = ContinuousClock.now + .seconds(10)
+        while directShellEntries.contains(where: { !$0.state.isTerminal }) {
+            guard ContinuousClock.now < deadline else { return false }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard await directShell(operation: .inspect) else { return false }
+        }
+
+        for entry in directShellEntries where entry.pendingContext {
+            guard await directShell(operation: .dismiss, action: entry.action) else { return false }
+        }
+
+        guard await directShell(operation: .inspect) else { return false }
+        return !directShellEntries.contains {
+            !$0.state.isTerminal || $0.pendingContext
+        }
     }
 
     /// Detach this GUI from the service connection without sending an End command.

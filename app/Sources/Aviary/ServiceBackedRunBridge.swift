@@ -86,6 +86,47 @@ final class ServiceBackedRunBridge {
     private(set) var history: WorkServiceConversationHistoryWindow
     private(set) var historyError: String?
     private(set) var lastError: String?
+    private(set) var directShellEntries: [WorkServiceDirectShellEntry] = []
+    private(set) var directShellError: String?
+    private var directShellReadCursor: JournalCursor?
+
+    var supportsDirectShell: Bool {
+        projection.capabilities.contains(.directShell)
+            && projection.descriptor.currentRunSession?.sessionID == sessionID
+    }
+
+    @discardableResult
+    func directShell(operation: WorkServiceDirectShellOperation,
+                     language: DirectShellLanguage? = nil, source: Data? = nil,
+                     durationLimitSeconds: TimeInterval? = nil, action: ActionRef? = nil,
+                     expectedRun: RunRef? = nil) async throws
+        -> WorkServiceDirectShellResponse {
+        do {
+            let response = try await controller.directShell(operation: operation,
+                language: language, source: source,
+                durationLimitSeconds: durationLimitSeconds, action: action,
+                expectedRun: expectedRun)
+            guard response.disposition == .accepted || response.disposition == .duplicate else {
+                throw WorkServiceProtocolError.invalidRequest(response.diagnostic ?? "Command state is unavailable")
+            }
+            if action == nil { directShellEntries = response.entries }
+            else {
+                for entry in response.entries {
+                    if let index = directShellEntries.firstIndex(where: { $0.action == entry.action }) {
+                        directShellEntries[index] = entry
+                    } else { directShellEntries.append(entry) }
+                }
+            }
+            directShellError = nil
+            if action == nil { directShellReadCursor = response.resultingWorkCursor }
+            return response
+        } catch {
+            directShellError = operation == .inspect
+                ? "Command status is unavailable. Your saved output has not been cleared."
+                : "Confirmation is unavailable. Check command status before running it again."
+            throw error
+        }
+    }
 
     init(
         controller: WorkServiceAttachedWorkController,
@@ -450,6 +491,13 @@ final class ServiceBackedRunBridge {
             }
             inputDeliveryProjection = Self.makeInputDeliveryProjection(from: next)
             lastError = ServiceBackedGUIControlPolicy.blockingReadDiagnostic(in: next)
+            // On first attachment, pending command output may be older than the bounded action
+            // window. Query the authoritative tray once, then only when Work advances. Never
+            // infer absence from the currently visible activity rows.
+            if supportsDirectShell, next.isCanonical,
+               directShellReadCursor != next.workCursor {
+                _ = try? await directShell(operation: .inspect)
+            }
             return next
         } catch {
             let observed = await controller.projection()

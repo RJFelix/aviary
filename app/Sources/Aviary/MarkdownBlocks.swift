@@ -183,7 +183,7 @@ private struct FencedCode: View {
                let command = SuggestedShellCommand.make(language: language, source: source) {
                 Divider()
                 Button { onAskAgentToRun(command) } label: {
-                    Label("Ask agent to run…", systemImage: "bubble.left.and.text.bubble.right")
+                    Label("Run command…", systemImage: "terminal")
                         .font(.system(size: 11, weight: .medium))
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
@@ -191,7 +191,7 @@ private struct FencedCode: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(Design.accent)
-                .help("Review this command and prepare a message in this chat. Nothing runs until you send it.")
+                .help("Review the exact command before running it directly on this chat’s Work Host.")
             }
         }
         .onChange(of: source) { _, _ in copied = false }

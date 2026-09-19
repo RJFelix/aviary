@@ -442,13 +442,17 @@ struct RunPane: View {
             isPresented: $confirmEndRun,
             titleVisibility: .visible
         ) {
-            Button("End agent session", role: .destructive) {
-                Task { await run.end() }
+            Button(run.directShellIsRunning || run.directShellEntries.contains(where: \.pendingContext)
+                   ? "End and remove command output" : "End agent session", role: .destructive) {
+                Task { await run.end(discardPendingCommandOutput: true) }
             }
             Button("Keep session open", role: .cancel) {}
         } message: {
             Text(
-                run.isServiceBacked
+                run.directShellIsRunning || run.directShellEntries.contains(where: \.pendingContext)
+                    ? "This stops the command, removes its output from your next message, and ends the agent session. "
+                        + "The command and output stay in the recorded history. To send the output to the agent, keep this session open."
+                    : run.isServiceBacked
                     ? "This ends the current agent session and releases its runtime. The chat stays saved. "
                         + "To leave without interrupting the agent, just select another chat or close the window."
                     : "This stops the agent and destroys its current Python runtime. "
@@ -760,6 +764,23 @@ struct RunPane: View {
     private var composer: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
+                if !run.directShellEntries.isEmpty {
+                    ScrollView {
+                        DirectShellCommandTray(entries: run.directShellEntries,
+                            onStop: { entry in Task { _ = await run.directShell(operation: .stop, action: entry.action) } },
+                            onDismiss: { entry in Task { _ = await run.directShell(operation: .dismiss, action: entry.action) } })
+                    }
+                    .frame(maxHeight: 260)
+                    .disabled(run.directShellRequestInFlight)
+                }
+                if let error = run.directShellError {
+                    HStack {
+                        Label(error, systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(Design.warning)
+                        Button("Check status") { Task { _ = await run.directShell(operation: .inspect) } }
+                            .controlSize(.small)
+                    }
+                }
                 if composerStatus.kind == .blocked || composerReceiptPending {
                     Label(composerStatus.text, systemImage: composerStatus.symbol)
                         .font(.system(size: 11))
@@ -946,6 +967,8 @@ struct RunPane: View {
 
     private var composerCanSubmit: Bool {
         !run.hasExited && run.acceptsInput
+            && !run.directShellIsRunning && !run.directShellRequestInFlight
+            && run.directShellError == nil
             && !run.draft.trimmingCharacters(in: .whitespaces).isEmpty
             && run.composerSubmissionState == .idle
             && (!run.isStreaming || effectiveComposerDelivery != nil)

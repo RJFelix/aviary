@@ -233,6 +233,14 @@ public actor WorkHostDaemonAdmissionGate: WorkServiceClient {
         try enter(); defer { leave() }
         return try await service.command(request)
     }
+
+    /// Inspect and mutation operations both cross the shutdown fence. Inspect is non-mutating,
+    /// but it still reads actor-owned state which must not race the daemon's final recovery read.
+    public func directShell(_ request: WorkServiceDirectShellRequest) async throws
+        -> WorkServiceDirectShellResponse {
+        try enter(); defer { leave() }
+        return try await service.directShell(request)
+    }
 }
 
 /// An injected host-private composition boundary.
