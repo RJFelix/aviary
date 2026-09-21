@@ -121,10 +121,23 @@ func testServiceBackedGUIControlPolicyDistinguishesSettledAndNonActionableStates
     let settled = guiPolicy(
         execution: .idle, currentRun: guiPolicyRun,
         ownerSession: guiPolicySessionA, ownerAttachment: guiPolicyAttachmentA,
-        capabilities: granted)
+        capabilities: granted.union([.directShell]))
     XCTAssertFalse(settled.requiresStartForNextInput)
     XCTAssertTrue(settled.canSubmitText)
     XCTAssertTrue(settled.canEnd)
+    XCTAssertTrue(settled.canRunDirectShell)
+
+    let noDirectShellCapability = guiPolicy(
+        execution: .idle, currentRun: guiPolicyRun,
+        ownerSession: guiPolicySessionA, ownerAttachment: guiPolicyAttachmentA,
+        capabilities: granted)
+    XCTAssertFalse(noDirectShellCapability.canRunDirectShell)
+
+    let foreignSession = guiPolicy(
+        execution: .idle, currentRun: guiPolicyRun,
+        ownerSession: guiPolicySessionB, ownerAttachment: guiPolicyAttachmentB,
+        capabilities: granted.union([.directShell]))
+    XCTAssertFalse(foreignSession.canRunDirectShell)
 
     for execution in [
         WorkServiceExecutionState.held, .canceling, .ending, .recoveryRequired, .unknown,
@@ -134,9 +147,68 @@ func testServiceBackedGUIControlPolicyDistinguishesSettledAndNonActionableStates
             ownerSession: guiPolicySessionA, ownerAttachment: guiPolicyAttachmentA,
             capabilities: granted)
         XCTAssertFalse(policy.canSubmitText)
+        XCTAssertFalse(policy.canRunDirectShell)
         XCTAssertEqual(
             policy.canEnd,
             execution == .held || execution == .canceling)
+    }
+}
+
+func testServiceBackedGUIControlPolicyBoundsPassiveDirectShellInspection() {
+    XCTAssertTrue(guiPolicy(
+        execution: .idle, capabilities: [.observe, .inspectArtifacts])
+        .allowsPassiveDirectShellInspection)
+    for policy in [
+        guiPolicy(execution: .running, capabilities: [.observe, .inspectArtifacts]),
+        guiPolicy(
+            execution: .idle, capabilities: [.observe, .inspectArtifacts], canonical: false),
+        guiPolicy(
+            execution: .idle, capabilities: [.observe, .inspectArtifacts], recovery: true),
+        guiPolicy(
+            execution: .idle, capabilities: [.observe, .inspectArtifacts], refresh: true),
+    ] {
+        XCTAssertFalse(policy.allowsPassiveDirectShellInspection)
+    }
+    XCTAssertEqual(
+        ServiceBackedGUIControlPolicy.passiveInspectionFailureDisposition(
+            hasExistingUncertainty: false, hasOutstandingCommand: false),
+        .preservePresentation)
+    XCTAssertEqual(
+        ServiceBackedGUIControlPolicy.passiveInspectionFailureDisposition(
+            hasExistingUncertainty: true, hasOutstandingCommand: true),
+        .preservePresentation)
+    XCTAssertEqual(
+        ServiceBackedGUIControlPolicy.passiveInspectionFailureDisposition(
+            hasExistingUncertainty: false, hasOutstandingCommand: true),
+        .surfaceUncertainty)
+
+    let directShellCapabilities: Set<WorkServiceCapability> = [
+        .observe, .control, .directShell,
+    ]
+    for policy in [
+        guiPolicy(
+            execution: .idle, currentRun: guiPolicyRun,
+            ownerSession: guiPolicySessionA, ownerAttachment: guiPolicyAttachmentA,
+            capabilities: directShellCapabilities, canonical: false),
+        guiPolicy(
+            execution: .idle, currentRun: guiPolicyRun,
+            ownerSession: guiPolicySessionA, ownerAttachment: guiPolicyAttachmentA,
+            capabilities: directShellCapabilities, recovery: true),
+        guiPolicy(
+            execution: .idle, currentRun: guiPolicyRun,
+            ownerSession: guiPolicySessionA, ownerAttachment: guiPolicyAttachmentA,
+            capabilities: directShellCapabilities, refresh: true),
+        guiPolicy(
+            execution: .running, currentRun: guiPolicyRun,
+            ownerSession: guiPolicySessionA, ownerAttachment: guiPolicyAttachmentA,
+            capabilities: directShellCapabilities),
+        guiPolicy(
+            execution: .idle, currentRun: guiPolicyRun,
+            ownerSession: guiPolicySessionA, ownerAttachment: guiPolicyAttachmentA,
+            capabilities: [.observe, .directShell]),
+        guiPolicy(execution: .idle, capabilities: directShellCapabilities),
+    ] {
+        XCTAssertFalse(policy.canRunDirectShell)
     }
 }
 
@@ -167,5 +239,8 @@ let casesServiceBackedGUIControlPolicy: [Case] = [
     }),
     ("phase3 GUI control policy distinguishes settled and unavailable states", {
         testServiceBackedGUIControlPolicyDistinguishesSettledAndNonActionableStates()
+    }),
+    ("direct shell passive inspection requires a settled canonical boundary", {
+        testServiceBackedGUIControlPolicyBoundsPassiveDirectShellInspection()
     }),
 ]

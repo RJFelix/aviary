@@ -928,6 +928,25 @@ public actor WorkServiceAttachedWorkController {
         return projection.withTrustedUsageInventory(inventory)
     }
 
+    /// Capability absence must be proved by this host, not inferred from this client's grants:
+    /// another GUI on the same Session may have produced command output. This read does not
+    /// admit End or relax its normal owner/cursor checks.
+    public func hostSupportsDirectShellForEnd() async throws -> Bool {
+        let current = projection()
+        guard current.isCanonical,
+              let instance = current.descriptor.hostObservation?.instance else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        let handshake = try await service.handshake(WorkServiceHandshakeRequest(client: client))
+        guard Self.validHandshake(handshake, expectedHost: WorkHostRef(work.workHostID)),
+              handshake.hostInstance == instance,
+              projection().isCanonical,
+              descriptorStorage.hostObservation?.instance == instance else {
+            throw WorkServiceProtocolError.sourceIncomplete
+        }
+        return handshake.capabilities.contains(.directShell)
+    }
+
     /// Explicit direct-shell mutation/read. This never replays a lost execution request;
     /// callers reconcile with Inspect, whose canonical action identity survives reconnects.
     public func directShell(

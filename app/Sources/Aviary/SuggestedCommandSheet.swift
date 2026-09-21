@@ -27,6 +27,7 @@ struct SuggestedCommandSheet: View {
                             failure = "This agent session changed or is busy. Nothing was run."
                             return
                         }
+                        failure = nil
                         submitting = true
                         Task {
                             let accepted = await run.directShell(operation: .run, command: command,
@@ -39,7 +40,15 @@ struct SuggestedCommandSheet: View {
                     }, onCancel: { dismiss() })
                     .disabled(submitting || !run.canRunDirectShell)
             }
-            if let reason = failure ?? unavailableReason {
+            if submitting {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Starting command…")
+                }
+                .font(.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, 20).padding(.bottom, 12)
+                .accessibilityElement(children: .combine)
+            } else if let reason = failure ?? unavailableReason {
                 Label(reason, systemImage: "info.circle")
                     .font(.caption).foregroundStyle(.secondary)
                     .padding(.horizontal, 20).padding(.bottom, 12)

@@ -4954,7 +4954,7 @@ final class LiveRun: Identifiable {
     private var directShellEndCleanupInProgress = false
     var directShellIsRunning: Bool { directShellEntries.contains { !$0.state.isTerminal } }
     var canRunDirectShell: Bool {
-        serviceBridge?.supportsDirectShell == true && serviceBridge?.isConnected == true
+        serviceBridge?.canRunDirectShell == true && serviceBridge?.isConnected == true
             && serviceProjection?.isCanonical == true && !isStreaming && !hasExited && !isEnding
             && !directShellIsRunning && !directShellRequestInFlight
             && directShellError == nil
@@ -5249,6 +5249,10 @@ final class LiveRun: Identifiable {
                 ? .loadFailed : .saved
         } else if draftRestorationFailure == .storeUnavailable {
             self.draftPersistenceState = .unavailable
+        }
+        bridge.onPresentationChange = { [weak self, weak bridge] in
+            guard let self, let bridge, self.serviceBridge === bridge else { return }
+            self.syncServiceState()
         }
     }
 
@@ -6546,23 +6550,14 @@ final class LiveRun: Identifiable {
     /// process-owned Claude/in-house paths; application termination uses `disconnect()` below.
     func end(discardPendingCommandOutput: Bool = false) async {
         if let serviceBridge {
+            guard !isEnding else { return }
             guard !hasExited, serviceBridge.hasExactRunOwner,
                   serviceBridge.projection.isCanonical else {
                 commandNotice = .warning("This Work's active Session owner is unavailable.")
                 return
             }
-            let hasDirectCommandOutput = directShellEntries.contains {
-                !$0.state.isTerminal || $0.pendingContext
-            }
-            guard discardPendingCommandOutput || !hasDirectCommandOutput else {
-                commandNotice = .warning(
-                    "Command output is still waiting. Send a message to include it, or choose "
-                        + "End and remove command output.")
-                return
-            }
             isEnding = true
-            directShellEndCleanupInProgress = discardPendingCommandOutput
-                && hasDirectCommandOutput
+            directShellEndCleanupInProgress = true
             var endAdmissionStarted = false
             defer {
                 directShellEndCleanupInProgress = false
@@ -6570,13 +6565,22 @@ final class LiveRun: Identifiable {
                 // attempted, its existing receipt/reconciliation path owns the uncertain state.
                 if !endAdmissionStarted { isEnding = false }
             }
-            if discardPendingCommandOutput && hasDirectCommandOutput {
-                guard await discardDirectShellOutputBeforeEnd() else {
+            // An empty local tray is not proof that the host has no pending output: this GUI
+            // may have just reattached, or its passive tray read may have failed. Every End
+            // therefore obtains fresh authority; only explicit confirmation permits cleanup.
+            let preparation = await prepareDirectShellOutputBeforeEnd(
+                permitsCleanup: discardPendingCommandOutput)
+            guard preparation == .confirmedReady else {
+                if preparation == .outputRequiresDecision {
                     commandNotice = .warning(
-                        "Aviary could not confirm that command output was stopped and removed. "
-                            + "End was not sent; check command status and try again.")
-                    return
+                        "Command output is still waiting. Send a message to include it, or choose "
+                            + "End and remove command output.")
+                } else {
+                    commandNotice = .warning(
+                        "Aviary could not verify command status. End was not sent; "
+                            + "check the connection and try again.")
                 }
+                return
             }
             let commandID = UUID().uuidString.lowercased()
             endAdmissionStarted = true
@@ -6607,31 +6611,94 @@ final class LiveRun: Identifiable {
         await stop()
     }
 
-    /// Resolve every command-output card visible to this attachment before an explicitly
-    /// destructive End. Each transition goes through the ordinary typed endpoint: no GUI state
-    /// is cleared locally, and a failure leaves End unissued.
-    private func discardDirectShellOutputBeforeEnd() async -> Bool {
-        guard await directShell(operation: .inspect) else { return false }
-
-        for entry in directShellEntries where !entry.state.isTerminal {
-            guard await directShell(operation: .stop, action: entry.action) else { return false }
+    /// Verify the host's tray before every End, including after reattachment with no local cards.
+    /// Only explicit cleanup confirmation permits Stop/Dismiss. No GUI state is cleared locally,
+    /// no mutation is replayed, and a failed read leaves End unissued.
+    private func prepareDirectShellOutputBeforeEnd(
+        permitsCleanup: Bool
+    ) async -> DirectShellEndCleanupCoordinator.Outcome {
+        guard let bridge = serviceBridge,
+              let identity = directShellCleanupIdentity(bridge) else { return .identityChanged }
+        do {
+            if try await !bridge.controller.hostSupportsDirectShellForEnd() {
+                // Optional host feature absence is different from this client's permission
+                // being revoked. Never infer an empty shared tray from client authorization.
+                guard serviceBridge === bridge,
+                      directShellCleanupIdentity(bridge) == identity,
+                      bridge.canEnd,
+                      bridge.directShellEntries.isEmpty,
+                      bridge.directShellError == nil else { return .invalidObservation }
+                return .confirmedReady
+            }
+        } catch {
+            return .invalidObservation
         }
+        let outcome = await DirectShellEndCleanupCoordinator.reconcile(
+            identity: identity,
+            permitsCleanup: permitsCleanup,
+            read: { [self] in
+                guard serviceBridge === bridge else { return .identityChanged }
+                _ = await bridge.refresh()
+                syncServiceState()
+                guard serviceBridge === bridge else { return .identityChanged }
+                guard bridge.projection.isCanonical else { return .transientlyUnavailable }
+                guard directShellCleanupIdentity(bridge) == identity else {
+                    return .identityChanged
+                }
+                guard !bridge.projection.requiresRefresh,
+                      !bridge.projection.commandInFlight,
+                      !directShellRequestInFlight else { return .transientlyUnavailable }
+                do {
+                    // Inspect is the only operation retried here. An accepted Dismiss can be
+                    // followed by a temporarily incomplete Work/Session read; that is not
+                    // permission to send another Dismiss, nor proof that End should fail.
+                    let response = try await bridge.inspectDirectShellForReconciliation()
+                    syncServiceState()
+                    guard serviceBridge === bridge,
+                          directShellCleanupIdentity(bridge) == identity else {
+                        return .identityChanged
+                    }
+                    guard bridge.projection.isCanonical,
+                          !bridge.projection.requiresRefresh,
+                          !bridge.projection.commandInFlight else {
+                        return .transientlyUnavailable
+                    }
+                    return .current(.init(
+                        identity: identity,
+                        runOwnerCanEnd: bridge.canEnd,
+                        entries: response.entries.map(DirectShellEndCleanupCoordinator.Entry.init)))
+                } catch {
+                    syncServiceState()
+                    return .transientlyUnavailable
+                }
+            },
+            mutate: { [self] mutation in
+                guard serviceBridge === bridge,
+                      directShellCleanupIdentity(bridge) == identity else { return .rejected }
+                let operation: WorkServiceDirectShellOperation
+                switch mutation {
+                case .stop: operation = .stop
+                case .dismiss: operation = .dismiss
+                }
+                return await directShell(operation: operation, action: mutation.action)
+                    ? .accepted : .uncertain
+            })
+        guard outcome == .confirmedReady else { return outcome }
+        guard serviceBridge === bridge,
+              directShellCleanupIdentity(bridge) == identity else { return .identityChanged }
+        return bridge.canEnd ? .confirmedReady : .invalidObservation
+    }
 
-        let deadline = ContinuousClock.now + .seconds(10)
-        while directShellEntries.contains(where: { !$0.state.isTerminal }) {
-            guard ContinuousClock.now < deadline else { return false }
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            guard await directShell(operation: .inspect) else { return false }
-        }
-
-        for entry in directShellEntries where entry.pendingContext {
-            guard await directShell(operation: .dismiss, action: entry.action) else { return false }
-        }
-
-        guard await directShell(operation: .inspect) else { return false }
-        return !directShellEntries.contains {
-            !$0.state.isTerminal || $0.pendingContext
-        }
+    private func directShellCleanupIdentity(
+        _ bridge: ServiceBackedRunBridge
+    ) -> DirectShellEndCleanupCoordinator.Identity? {
+        let projection = bridge.projection
+        guard bridge.hasExactRunOwner,
+              let run = projection.descriptor.currentRun,
+              let attachment = projection.descriptor.currentRunSessionAttachment,
+              let instance = projection.descriptor.hostObservation?.instance else { return nil }
+        return .init(work: bridge.work, run: run,
+                     sessionAttachment: attachment, hostInstance: instance)
     }
 
     /// Detach this GUI from the service connection without sending an End command.

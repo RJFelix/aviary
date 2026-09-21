@@ -31,7 +31,13 @@ private func noticePolicyProjection(
     workCursorEventID: String = "accepted-event",
     workCursorSequence: Int = 2,
     readDiagnostics: [String] = [],
-    requiresRefresh: Bool? = nil
+    requiresRefresh: Bool? = nil,
+    execution: WorkServiceExecutionState = .idle,
+    currentRun: RunRef? = nil,
+    reducedExecution: WorkExecution? = nil,
+    commandAcceptanceRun: RunRef? = nil,
+    hostInstanceID: String = "notice-instance",
+    hostStartIdentity: String = "notice-start"
 ) throws -> WorkServiceAttachedWorkProjection {
     let workCursor = JournalCursor(
         journal: noticePolicyJournal, eventID: workCursorEventID,
@@ -52,16 +58,21 @@ private func noticePolicyProjection(
         causalSessionCursor: sessionCursor, sessionCursor: sessionCursor,
         causalWorkCursor: workCursor, resultingWorkCursor: workCursor,
         capabilities: [.observe, .control])
+    let hostInstance = WorkHostInstanceRef(
+        host: WorkHostRef(noticePolicyWork.workHostID), instanceID: hostInstanceID,
+        startIdentity: hostStartIdentity)
     let observation = try WorkServiceHostObservation(
-        instance: WorkHostInstanceRef(
-            host: WorkHostRef(noticePolicyWork.workHostID), instanceID: "notice-instance",
-            startIdentity: "notice-start"), reachability: .observedReachable,
-        currentRun: nil, currentRunSession: nil, currentRunSessionAttachment: nil,
+        instance: hostInstance, reachability: .observedReachable,
+        currentRun: currentRun,
+        currentRunSession: currentRun == nil ? nil : noticePolicySession,
+        currentRunSessionAttachment: currentRun == nil ? nil : noticePolicySessionAttachment,
         servedCursor: workCursor, sourceCompleteness: canonical ? .complete : .incomplete)
     let descriptor = try WorkServiceWorkDescriptor(
         work: noticePolicyWork, journal: noticePolicyJournal, recordedDisposition: .reusable,
-        execution: .idle, currentRun: nil, currentRunSession: nil,
-        currentRunSessionAttachment: nil, hostObservation: observation,
+        execution: execution, currentRun: currentRun,
+        currentRunSession: currentRun == nil ? nil : noticePolicySession,
+        currentRunSessionAttachment: currentRun == nil ? nil : noticePolicySessionAttachment,
+        hostObservation: observation,
         attachments: [attachment], sessionAttachments: [relationship])
 
     var workSnapshot = WorkSnapshot()
@@ -69,7 +80,11 @@ private func noticePolicyProjection(
     workSnapshot.work = noticePolicyWork
     workSnapshot.workHost = WorkHostRef(noticePolicyWork.workHostID)
     workSnapshot.lifecycle = .active
-    workSnapshot.execution = .idle
+    workSnapshot.execution = reducedExecution ?? (currentRun == nil ? .idle : .running)
+    workSnapshot.activeRun = currentRun
+    workSnapshot.activeRunSession = currentRun == nil ? nil : noticePolicySession
+    workSnapshot.activeRunSessionAttachment = currentRun == nil
+        ? nil : noticePolicySessionAttachment
     workSnapshot.sessionAttachments[noticePolicySessionAttachment.attachmentID] =
         WorkSessionAttachmentSnapshot(
             attachment: noticePolicySessionAttachment, session: noticePolicySession)
@@ -87,7 +102,7 @@ private func noticePolicyProjection(
         acceptanceEventRef: acceptanceEventID.map {
             EventRef(journal: acceptanceJournal, eventID: $0)
         },
-        commandKind: commandKind)
+        commandKind: commandKind, acceptanceRun: commandAcceptanceRun)
 
     var sessionSnapshot = SessionSnapshot()
     sessionSnapshot.journal = noticePolicySessionJournal
@@ -95,9 +110,7 @@ private func noticePolicyProjection(
     sessionSnapshot.lifecycle = .active
     let receipt = WorkServiceCommandReceipt(
         work: noticePolicyWork, commandID: lastReceiptCommandID, state: .accepted,
-        host: WorkHostInstanceRef(
-            host: WorkHostRef(noticePolicyWork.workHostID), instanceID: "notice-instance",
-            startIdentity: "notice-start"), hostSequence: 2,
+        host: hostInstance, hostSequence: 2,
         causalWorkCursor: causalCursor,
         resultingWorkCursor: JournalCursor(
             journal: noticePolicyJournal, eventID: receiptEventID, sequence: receiptSequence),
@@ -379,6 +392,134 @@ func testServiceBackedCommandNoticePolicyMatchesNativeLifecycleAliases() throws 
         noticePolicyNotice(kind: .queue), from: endProjection))
 }
 
+private func startGraceProjection(
+    run: RunRef = RunRef("start-grace-run"),
+    execution: WorkServiceExecutionState = .recoveryRequired,
+    reducedExecution: WorkExecution = .running,
+    pending: WorkServiceAttachedWorkPendingCommand? = nil,
+    commandAcceptanceRun: RunRef? = nil,
+    acceptanceHostSequence: Int = 2,
+    hostInstanceID: String = "notice-instance",
+    workCursorEventID: String = "accepted-event",
+    workCursorSequence: Int = 2
+) throws -> WorkServiceAttachedWorkProjection {
+    try noticePolicyProjection(
+        commandKind: .start, pending: pending,
+        lastReceiptOutcome: .started,
+        acceptanceHostSequence: acceptanceHostSequence,
+        workCursorEventID: workCursorEventID,
+        workCursorSequence: workCursorSequence,
+        execution: execution, currentRun: run,
+        reducedExecution: reducedExecution,
+        commandAcceptanceRun: commandAcceptanceRun ?? run,
+        hostInstanceID: hostInstanceID)
+}
+
+func testServiceBackedStartPresentationGraceBindsOneExactRun() throws {
+    let now = Date(timeIntervalSince1970: 10_000)
+    let projection = try startGraceProjection()
+    var grace = try XCTUnwrap(ServiceBackedStartPresentationGrace(
+        receipt: try XCTUnwrap(projection.lastReceipt),
+        attachment: projection.attachment, now: now))
+    XCTAssertEqual(
+        grace.reconcile(projection: projection, now: now), .presentPreparing)
+    XCTAssertTrue(grace.presentsPreparing(projection: projection, now: now))
+
+    let otherRun = try startGraceProjection(
+        run: RunRef("other-start-grace-run"),
+        commandAcceptanceRun: RunRef("start-grace-run"))
+    XCTAssertEqual(grace.reconcile(projection: otherRun, now: now), .clear)
+
+    var foreignFirstGrace = try XCTUnwrap(ServiceBackedStartPresentationGrace(
+        receipt: try XCTUnwrap(projection.lastReceipt),
+        attachment: projection.attachment, now: now))
+    XCTAssertEqual(
+        foreignFirstGrace.reconcile(projection: otherRun, now: now), .clear,
+        "the first reconciliation must not bind a later Run than the accepted Start")
+
+    var sequenceGrace = try XCTUnwrap(ServiceBackedStartPresentationGrace(
+        receipt: try XCTUnwrap(projection.lastReceipt),
+        attachment: projection.attachment, now: now))
+    XCTAssertEqual(
+        sequenceGrace.reconcile(
+            projection: try startGraceProjection(acceptanceHostSequence: 3), now: now),
+        .clear)
+
+    var hostGrace = try XCTUnwrap(ServiceBackedStartPresentationGrace(
+        receipt: try XCTUnwrap(projection.lastReceipt),
+        attachment: projection.attachment, now: now))
+    XCTAssertEqual(
+        hostGrace.reconcile(projection: projection, now: now), .presentPreparing)
+    let otherHost = try startGraceProjection(hostInstanceID: "other-instance")
+    XCTAssertEqual(hostGrace.reconcile(projection: otherHost, now: now), .clear)
+}
+
+func testServiceBackedStartPresentationGraceWaitsThenExpiresOrClears() throws {
+    let now = Date(timeIntervalSince1970: 20_000)
+    let projection = try startGraceProjection()
+    let receipt = try XCTUnwrap(projection.lastReceipt)
+
+    var catchingUp = try XCTUnwrap(ServiceBackedStartPresentationGrace(
+        receipt: receipt, attachment: projection.attachment, now: now, duration: 2))
+    let older = try startGraceProjection(
+        workCursorEventID: "before-event", workCursorSequence: 1)
+    XCTAssertEqual(
+        catchingUp.reconcile(projection: older, now: now), .awaitingCanonicalEvidence)
+    XCTAssertEqual(
+        catchingUp.reconcile(
+            projection: projection, now: now.addingTimeInterval(2)), .clear)
+
+    var healthy = try XCTUnwrap(ServiceBackedStartPresentationGrace(
+        receipt: receipt, attachment: projection.attachment, now: now))
+    XCTAssertEqual(healthy.reconcile(projection: projection, now: now), .presentPreparing)
+    XCTAssertEqual(
+        healthy.reconcile(
+            projection: try startGraceProjection(execution: .running), now: now), .clear)
+
+    var failed = try XCTUnwrap(ServiceBackedStartPresentationGrace(
+        receipt: receipt, attachment: projection.attachment, now: now))
+    XCTAssertEqual(
+        failed.reconcile(
+            projection: try startGraceProjection(reducedExecution: .failed), now: now), .clear)
+}
+
+func testServiceBackedStartPresentationGraceRejectsRecoveryAndPendingReceipts() throws {
+    let now = Date(timeIntervalSince1970: 30_000)
+    let acceptedProjection = try startGraceProjection()
+    let accepted = try XCTUnwrap(acceptedProjection.lastReceipt)
+    let duplicate = WorkServiceCommandReceipt(
+        work: accepted.work, commandID: accepted.commandID, state: .duplicate,
+        host: accepted.host, hostSequence: accepted.hostSequence,
+        hostProvenance: accepted.hostProvenance,
+        causalWorkCursor: accepted.causalWorkCursor,
+        resultingWorkCursor: accepted.resultingWorkCursor,
+        authorization: accepted.authorization, outcome: accepted.outcome)
+    XCTAssertNil(ServiceBackedStartPresentationGrace(
+        receipt: duplicate, attachment: acceptedProjection.attachment, now: now))
+
+    let recovery = try noticePolicyProjection(
+        commandKind: .start, lastReceiptOutcome: .startRecoveryRequired,
+        execution: .recoveryRequired, currentRun: RunRef("start-grace-run"))
+    XCTAssertNil(ServiceBackedStartPresentationGrace(
+        receipt: try XCTUnwrap(recovery.lastReceipt),
+        attachment: recovery.attachment, now: now))
+
+    let causal = JournalCursor(
+        journal: noticePolicyJournal, eventID: "before-event", sequence: 1)
+    let pending = WorkServiceAttachedWorkPendingCommand(
+        state: .indeterminate, kind: .start, commandID: noticePolicyCommandID,
+        client: noticePolicyClient, attachment: noticePolicyAttachment,
+        sessionAttachment: noticePolicySessionAttachment,
+        causalWorkCursor: causal, valueDigest: nil)
+    let projection = acceptedProjection
+    var grace = try XCTUnwrap(ServiceBackedStartPresentationGrace(
+        receipt: try XCTUnwrap(projection.lastReceipt),
+        attachment: projection.attachment, now: now))
+    XCTAssertEqual(
+        grace.reconcile(
+            projection: try startGraceProjection(pending: pending), now: now), .clear)
+}
+
 let casesServiceBackedCommandNoticePolicy: [Case] = [
     ("service command notice: accepted message refresh has a real noncanonical progress state", {
         let catchingUp = try noticePolicyProjection(requiresRefresh: true)
@@ -438,5 +579,14 @@ let casesServiceBackedCommandNoticePolicy: [Case] = [
     }),
     ("service command notice matches native lifecycle aliases", {
         try testServiceBackedCommandNoticePolicyMatchesNativeLifecycleAliases()
+    }),
+    ("accepted Start presentation grace binds one exact Run and host", {
+        try testServiceBackedStartPresentationGraceBindsOneExactRun()
+    }),
+    ("accepted Start presentation grace is bounded and clears healthy or failed state", {
+        try testServiceBackedStartPresentationGraceWaitsThenExpiresOrClears()
+    }),
+    ("accepted Start presentation grace rejects recovery and pending receipts", {
+        try testServiceBackedStartPresentationGraceRejectsRecoveryAndPendingReceipts()
     }),
 ]

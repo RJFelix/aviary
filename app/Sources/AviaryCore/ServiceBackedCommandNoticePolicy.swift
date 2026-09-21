@@ -91,7 +91,9 @@ public enum ServiceBackedCommandNoticePolicy {
         exactCanonicalCommandEvidence(for: notice, in: projection) != nil
     }
 
-    private static func exactCanonicalCommandEvidence(
+    /// Internal typed evidence for Core policies that must correlate command-specific producer
+    /// facts beyond the public yes/no crossing predicate.
+    static func exactCanonicalCommandEvidence(
         for notice: ServiceBackedCommandNotice,
         in projection: WorkServiceAttachedWorkProjection
     ) -> WorkCommandSnapshot? {

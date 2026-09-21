@@ -211,8 +211,59 @@ sentinels. Those checks exercise completion output, pending-output refusal on pl
 explicit Dismiss-before-End; Stop and disconnect/retry are covered separately by the real daemon
 process test above. There is no real remote-collector claim.
 
-Final live pointer interaction for this command/activity slice remains unverified because the
-Mac was locked. The rendered fixtures and native probes are not substitutes for that check.
+### Live pointer follow-through (2026-09-21)
+
+On the unlocked Mac, the signed `f741379` app was exercised in a disposable scratch-project chat.
+Actual pointer clicks verified Run confirmation and Cancel, successful output, Stop reaching a
+recorded canceled outcome, X removing pending output without deleting the recorded action,
+Activity row expansion and Done, and full-surface Flock row selection. The next accepted message
+contained exactly one retained command result; a following message contained none. The canonical
+Session journal independently confirmed those consumption facts. Existing saved startup requests
+were not retried or modified.
+
+The live pass also exposed two transient presentation/coordination defects for correction:
+
+- A new Start briefly displayed recovery and command-status warnings before the runtime was
+  ready. Passive tray inspection must not convert ordinary preparation into command uncertainty.
+- After accepted output dismissal, a temporarily incomplete paired read caused End cleanup's
+  final Inspect to fail locally. The dismissal was durable, but End correctly remained unissued.
+  Cleanup needs bounded read-only reconciliation, without replaying its mutations.
+
+The confirmation sheet also briefly showed a busy warning during its own submission.
+
+The corrective pass now gates passive tray inspection to a settled canonical boundary and gives
+the exact newly accepted Start a process-local, at-most-ten-second preparation presentation.
+This grace matches the canonical acceptance Run, host sequence, Session relationship, receipt
+cursor, and live host instance; it never enables a mutation. A generation-fenced expiry callback
+updates the GUI even if its next service read stalls. The confirmation sheet says “Starting
+command…” during submission instead of presenting its own in-flight request as a conflict.
+
+Every GUI End obtains authoritative tray state, including when a reattached GUI has no local
+cards. Explicit cleanup attempts Stop and Dismiss at most once per Action, then retries only
+reads across transient refresh failures. Cancellation, deadline expiry, identity change, or an
+uncertain mutation leaves End unissued. The ten-second retry budget is checked after each await;
+it does not override the transport's own in-flight timeout. Optional-feature absence is proved
+by an exact-instance host handshake, not inferred from a client's revoked permission.
+
+Post-fix signed pointer check passed: a fresh disposable chat showed Starting and settled into
+Ready without the reproduced recovery warning; the exact printf returned 16 stdout bytes; one
+“End and remove command output” confirmation dismissed output and finished the Run. The journal
+has one Dismiss acceptance/delivery at 24–25, one End at 26–27, and run.finished at 28. Both test
+chats were ended and hidden recoverably. The two original saved startup requests remained
+byte-identical. Native editor and saved-chat recovery probes passed, and the healthy OTLP journey
+passed with 139 spans and exactly two loopback provider requests, with command/output sentinel
+exclusion checked.
+
+Final macOS receipt: 1,481 self-test cases / 21,338 assertions passed in 656.27 seconds
+(release compilation and disposable integration checks also ran during this wall-clock window).
+`just compile`, the SelfTest product build, `just build`, and strict deep signature verification
+passed. Disabled and unreachable OTLP journeys also passed with exactly two provider calls each;
+their end-to-end checks include direct command output, plain-End refusal, and explicit cleanup.
+This does not expand the Linux or remote-backend validation boundary below.
+
+Remaining presentation polish observed during this pass: a normal Start can briefly show both
+the saved request and its canonical chat row before association catches up. Consolidating those
+representations is separate from the now-correct preparation/error distinction.
 
 The standalone worker also typechecked and ran in the Swift 6.0 Jammy container (glibc 2.35).
 This is not a full Linux package receipt: the available container's Swift 6.0 toolchain is below

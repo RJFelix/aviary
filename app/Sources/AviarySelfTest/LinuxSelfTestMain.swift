@@ -171,6 +171,7 @@ enum LinuxSelfTestMain {
             }),
             ("Work service: GUI control policy", {
                 try await runLinuxCases(casesServiceBackedGUIControlPolicy)
+                try await runLinuxCases(casesDirectShellEndCleanupCoordinator)
             }),
             ("Work service: background refresh scheduling policy", {
                 try await runLinuxCases(casesServiceBackedRefreshSchedulingPolicy)

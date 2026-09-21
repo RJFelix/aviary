@@ -89,10 +89,18 @@ final class ServiceBackedRunBridge {
     private(set) var directShellEntries: [WorkServiceDirectShellEntry] = []
     private(set) var directShellError: String?
     private var directShellReadCursor: JournalCursor?
+    private var startPresentationGrace: ServiceBackedStartPresentationGrace?
+    private var startPresentationExpiryTask: Task<Void, Never>?
+    private var startPresentationGeneration = 0
+    var onPresentationChange: (@MainActor () -> Void)?
 
     var supportsDirectShell: Bool {
         projection.capabilities.contains(.directShell)
             && projection.descriptor.currentRunSession?.sessionID == sessionID
+    }
+
+    var canRunDirectShell: Bool {
+        controlPolicy.canRunDirectShell
     }
 
     @discardableResult
@@ -101,6 +109,30 @@ final class ServiceBackedRunBridge {
                      durationLimitSeconds: TimeInterval? = nil, action: ActionRef? = nil,
                      expectedRun: RunRef? = nil) async throws
         -> WorkServiceDirectShellResponse {
+        try await performDirectShell(
+            operation: operation, language: language, source: source,
+            durationLimitSeconds: durationLimitSeconds, action: action,
+            expectedRun: expectedRun, presentsFailure: true)
+    }
+
+    /// Authoritative pre-End reconciliation uses passive failure presentation: an unavailable
+    /// empty-tray read aborts End truthfully without inventing a persistent composer error.
+    /// Known outstanding-command uncertainty remains visible through the shared policy.
+    @discardableResult
+    func inspectDirectShellForReconciliation() async throws
+        -> WorkServiceDirectShellResponse {
+        try await performDirectShell(operation: .inspect, presentsFailure: false)
+    }
+
+    private func performDirectShell(
+        operation: WorkServiceDirectShellOperation,
+        language: DirectShellLanguage? = nil,
+        source: Data? = nil,
+        durationLimitSeconds: TimeInterval? = nil,
+        action: ActionRef? = nil,
+        expectedRun: RunRef? = nil,
+        presentsFailure: Bool
+    ) async throws -> WorkServiceDirectShellResponse {
         do {
             let response = try await controller.directShell(operation: operation,
                 language: language, source: source,
@@ -121,9 +153,22 @@ final class ServiceBackedRunBridge {
             if action == nil { directShellReadCursor = response.resultingWorkCursor }
             return response
         } catch {
-            directShellError = operation == .inspect
-                ? "Command status is unavailable. Your saved output has not been cleared."
-                : "Confirmation is unavailable. Check command status before running it again."
+            let hasOutstandingCommand = directShellEntries.contains {
+                !$0.state.isTerminal || $0.pendingContext
+            }
+            // A background tray read is observational convenience, not a failed user command.
+            // With no known outstanding command it must not manufacture composer-blocking
+            // uncertainty during Start. If an earlier explicit operation was uncertain, retain
+            // that warning until a successful authoritative read reconciles it.
+            let passiveDisposition = ServiceBackedGUIControlPolicy
+                .passiveInspectionFailureDisposition(
+                    hasExistingUncertainty: directShellError != nil,
+                    hasOutstandingCommand: hasOutstandingCommand)
+            if presentsFailure || passiveDisposition == .surfaceUncertainty {
+                directShellError = operation == .inspect
+                    ? "Command status is unavailable. Your saved output has not been cleared."
+                    : "Confirmation is unavailable. Check command status before running it again."
+            }
             throw error
         }
     }
@@ -376,6 +421,7 @@ final class ServiceBackedRunBridge {
     /// UI's non-actionable state, while `executionLabel` preserves the truthful detail.
     var commandState: SessionCommandState {
         if isTerminal { return .ended }
+        if presentsAcceptedStartGrace { return .preparing }
         if projection.needsRecovery { return .failed }
         if let pending = projection.pendingCommand, pending.kind == .start {
             if projection.commandInFlight { return .preparing }
@@ -433,7 +479,7 @@ final class ServiceBackedRunBridge {
         }
         // `requiresRefresh` is explicitly ordinary accepted-receipt catch-up. It withholds
         // mutation through ServiceBackedGUIControlPolicy, but is not an error or uncertainty.
-        if projection.needsRecovery {
+        if projection.needsRecovery && !presentsAcceptedStartGrace {
             return "This Work is visible but not safely actionable until its Work and Session state can be recovered."
         }
         return nil
@@ -491,12 +537,14 @@ final class ServiceBackedRunBridge {
             }
             inputDeliveryProjection = Self.makeInputDeliveryProjection(from: next)
             lastError = ServiceBackedGUIControlPolicy.blockingReadDiagnostic(in: next)
+            reconcileStartPresentationGrace(with: next)
             // On first attachment, pending command output may be older than the bounded action
             // window. Query the authoritative tray once, then only when Work advances. Never
             // infer absence from the currently visible activity rows.
-            if supportsDirectShell, next.isCanonical,
+            if supportsDirectShell, controlPolicy.allowsPassiveDirectShellInspection,
                directShellReadCursor != next.workCursor {
-                _ = try? await directShell(operation: .inspect)
+                _ = try? await performDirectShell(
+                    operation: .inspect, presentsFailure: false)
             }
             return next
         } catch {
@@ -505,6 +553,7 @@ final class ServiceBackedRunBridge {
             history = await controller.conversationHistory()
             inputDeliveryProjection = Self.makeInputDeliveryProjection(from: observed)
             lastError = Self.message(for: error, projection: observed)
+            reconcileStartPresentationGrace(with: observed)
             return observed
         }
     }
@@ -748,6 +797,7 @@ final class ServiceBackedRunBridge {
         _ operation: @escaping () async throws -> WorkServiceCommandReceipt,
         kind: WorkServiceCommandKind?
     ) async throws -> WorkServiceCommandReceipt {
+        if kind == .start { clearStartPresentationGrace() }
         do {
             let receipt = try await operation()
             AviaryTelemetry.outcome(receipt.state.rawValue)
@@ -769,12 +819,63 @@ final class ServiceBackedRunBridge {
                 lastError = "The Work Host rejected the command: \(detail)"
                 throw ServiceBackedRunBridgeError.rejected(detail)
             }
+            if kind == .start {
+                installStartPresentationGrace(ServiceBackedStartPresentationGrace(
+                    receipt: receipt, attachment: projection.attachment, now: Date()))
+            }
             _ = await refresh()
             return receipt
         } catch {
             _ = await refresh()
             throw error
         }
+    }
+
+    private var presentsAcceptedStartGrace: Bool {
+        startPresentationGrace?.presentsPreparing(
+            projection: projection, now: Date()) == true
+    }
+
+    private func reconcileStartPresentationGrace(
+        with projection: WorkServiceAttachedWorkProjection
+    ) {
+        guard var grace = startPresentationGrace else { return }
+        switch grace.reconcile(projection: projection, now: Date()) {
+        case .awaitingCanonicalEvidence, .presentPreparing:
+            startPresentationGrace = grace
+        case .clear:
+            clearStartPresentationGrace()
+        }
+    }
+
+    private func installStartPresentationGrace(
+        _ grace: ServiceBackedStartPresentationGrace?
+    ) {
+        clearStartPresentationGrace()
+        guard let grace else { return }
+        startPresentationGrace = grace
+        startPresentationGeneration += 1
+        let generation = startPresentationGeneration
+        let nanoseconds = UInt64(
+            ServiceBackedStartPresentationGrace.maximumDuration * 1_000_000_000)
+        startPresentationExpiryTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: nanoseconds)
+            } catch {
+                return
+            }
+            guard let self, self.startPresentationGeneration == generation else { return }
+            self.startPresentationExpiryTask = nil
+            self.startPresentationGrace = nil
+            self.onPresentationChange?()
+        }
+    }
+
+    private func clearStartPresentationGrace() {
+        startPresentationGeneration += 1
+        startPresentationExpiryTask?.cancel()
+        startPresentationExpiryTask = nil
+        startPresentationGrace = nil
     }
 
     private static func message(

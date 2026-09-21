@@ -299,6 +299,10 @@ private func attachedControllerPrefixDigest(
 }
 
 private actor AttachedControllerTestService: WorkServiceClient {
+    var hostCapabilities = Set(WorkServiceCapability.allCases)
+    func setHostCapabilities(_ capabilities: Set<WorkServiceCapability>) {
+        hostCapabilities = capabilities
+    }
     var commandGate: AttachedControllerHistoryGate?
     func setCommandGate(_ gate: AttachedControllerHistoryGate?) { commandGate = gate }
     var commandReceiptGate: AttachedControllerHistoryGate?
@@ -955,7 +959,7 @@ private actor AttachedControllerTestService: WorkServiceClient {
             supportedRange: WorkServiceProtocol.minimumSupportedVersion ... WorkServiceProtocol.maximumSupportedVersion,
             host: fixture.host, hostInstance: hostInstanceStorage, controlJournal: controlJournal,
             controlCursor: controlCursorStorage,
-            capabilities: Set(WorkServiceCapability.allCases))
+            capabilities: hostCapabilities)
     }
 
     private func appendControlCursor() -> JournalCursor {
@@ -3291,7 +3295,36 @@ func testWorkServiceAttachedControllerRequiresCapturedRunForDirectShell() async 
     XCTAssertEqual(await service.directShellCount(), 1)
 }
 
+func testWorkServiceAttachedControllerEndChecksHostFeatureNotClientGrant() async throws {
+    let fixture = try AttachedControllerFixture()
+    let service = AttachedControllerTestService(fixture: fixture)
+    let controller = try makeAttachedController(fixture: fixture, service: service)
+    _ = try await controller.refresh()
+    XCTAssertTrue(try await controller.hostSupportsDirectShellForEnd())
+
+    let granted = fixture.authorization.granted.subtracting([.directShell])
+    await service.setAttachmentAuthorization(WorkServiceAuthorizationOutcome(
+        requested: fixture.authorization.requested, granted: granted, denied: [.directShell]))
+    _ = try await controller.refresh()
+    XCTAssertTrue(try await controller.hostSupportsDirectShellForEnd(),
+                  "A revoked client grant is not proof of an empty shared tray")
+
+    await service.setHostCapabilities(Set(WorkServiceCapability.allCases).subtracting([.directShell]))
+    XCTAssertFalse(try await controller.hostSupportsDirectShellForEnd())
+    await service.setHostInstance(WorkHostInstanceRef(
+        host: fixture.host, instanceID: "changed-for-end", startIdentity: "changed-for-end"))
+    do {
+        _ = try await controller.hostSupportsDirectShellForEnd()
+        XCTFail("A replacement host must not prove feature absence for the old Run")
+    } catch {
+        XCTAssertTrue(error is WorkServiceProtocolError)
+    }
+}
+
 let casesWorkServiceAttachedWorkController: [Case] = [
+    ("phase3 Work controller End checks host feature not client grant", {
+        try await testWorkServiceAttachedControllerEndChecksHostFeatureNotClientGrant()
+    }),
     ("direct shell controller fences execution to the captured Run", {
         try await testWorkServiceAttachedControllerRequiresCapturedRunForDirectShell()
     }),
