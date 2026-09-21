@@ -228,7 +228,8 @@ struct CockpitView: View {
                 ForEach(railPendingChats) { chat in
                     let state = PendingChatVisualState(
                         phase: chat.phase, isPreparing: model.pendingChatIsPreparing(chat),
-                        conversationCreated: chat.createdAssociation != nil)
+                        conversationCreated: chat.createdAssociation != nil,
+                        canonicalDelivery: model.pendingChatHasCanonicalDelivery(chat))
                     Button {
                         model.selectedPendingChatID = chat.id
                         showsCompactChatList = false
@@ -459,8 +460,18 @@ struct CockpitView: View {
     }
 
     private var railPendingChats: [PendingChat] {
-        guard hiddenChatPreferencesLoaded else { return model.pendingChats }
-        return model.pendingChats.filter { isShown(identity(for: $0)) }
+        let unrepresentedIDs = Set(unrepresentedRuns.map(\.id))
+        let visibleRuns = ongoingRuns.filter { run in
+            unrepresentedIDs.contains(run.id)
+                || canonicalEntries.contains { entry in
+                    matchingRuns(for: entry).contains { $0.id == run.id }
+                }
+        }
+        let visibleKeys = visibleRuns.compactMap(\.serviceAttachmentKey)
+        return model.pendingChats.filter {
+            isShown(identity(for: $0))
+                && model.showsPendingChatInRail($0, visibleAttachmentKeys: visibleKeys)
+        }
     }
 
     private var hiddenChatCount: Int {

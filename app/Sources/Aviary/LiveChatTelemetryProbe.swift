@@ -32,6 +32,7 @@ enum LiveChatTelemetryProbe {
         case startupRequest
         case startupStatusSave
         case startupSavedRowUnreadable
+        case startupPresentation
         case turn
         case review
         case directCommand
@@ -119,9 +120,13 @@ enum LiveChatTelemetryProbe {
             else { throw Failure.startup }
 
             let selectedID = model.selectedPendingChatID
-            guard let savedStartID = model.pendingChats.first(where: {
+            guard let savedChat = model.pendingChats.first(where: {
                 $0.id == selectedID
-            })?.startCommandID else { throw Failure.startup }
+            }) else { throw Failure.startup }
+            let savedStartID = savedChat.startCommandID
+            guard model.showsPendingChatInRail(savedChat, visibleAttachmentKeys: []) else {
+                throw Failure.startup
+            }
             let started: LiveRun = try await wait(upTo: 30) { () async throws -> LiveRun? in
                 if let selectedID,
                    let pending = model.pendingChats.first(where: { $0.id == selectedID }),
@@ -196,6 +201,79 @@ enum LiveChatTelemetryProbe {
                   let sessionID = run.serviceAttachmentKey?.workSession.session.sessionID
             else { throw Failure.turn }
 
+            // The Run-only polling above does not retire AppModel startup cards. Complete
+            // that normal bookkeeping before installing the adversarial two-card fixture.
+            await model.refreshServiceWork()
+            guard !model.pendingChats.contains(where: { $0.id == savedChat.id }) else {
+                throw Failure.startupPresentation
+            }
+
+            // Keep a value copy of the saved request after durable cleanup. The actual
+            // presentation must collapse its duplicate without relying on store deletion.
+            guard let key = run.serviceAttachmentKey else { throw Failure.turn }
+            let associatedChat = try savedChat.changing(
+                phase: .awaitingAcceptance, createdAssociation: key)
+            guard model.pendingChatHasCanonicalDelivery(associatedChat),
+                  run.savedStartupPrompt(pendingChat: associatedChat) == nil,
+                  !model.showsPendingChatInRail(
+                    associatedChat, visibleAttachmentKeys: [key]),
+                  model.showsPendingChatInRail(
+                    associatedChat, visibleAttachmentKeys: []),
+                  model.showsPendingChatInRail(
+                    associatedChat, visibleAttachmentKeys: [key, key])
+            else { throw Failure.turn }
+            model.pendingChatDetails[associatedChat.id] = "Local cleanup still needs attention."
+            guard model.showsPendingChatInRail(
+                associatedChat, visibleAttachmentKeys: [key]),
+                  run.savedStartupPrompt(pendingChat: associatedChat) == nil
+            else { throw Failure.turn }
+            model.pendingChatDetails.removeValue(forKey: associatedChat.id)
+            model.selectedPendingChatID = associatedChat.id
+            guard model.showsPendingChatInRail(
+                associatedChat, visibleAttachmentKeys: [key]) else { throw Failure.turn }
+            model.selectedPendingChatID = nil
+
+            // Exercise the actual retained-card recovery button against an already-adopted
+            // run. It must refresh and retire this local marker without starting another turn.
+            let retainedCard = try PendingChat(
+                prompt: prompt, cwd: workspaceURL.path, phase: .awaitingAcceptance,
+                startCommandID: savedStartID, createdAssociation: key)
+            try PendingChatStore(home: home).insert(retainedCard)
+            model.pendingChats.append(retainedCard)
+            let conflictingCard = try PendingChat(
+                prompt: "A different unsent request", cwd: workspaceURL.path,
+                phase: .awaitingAcceptance, startCommandID: "conflicting-start",
+                createdAssociation: key)
+            try PendingChatStore(home: home).insert(conflictingCard)
+            model.pendingChats.append(conflictingCard)
+            await model.refreshServiceWork()
+            guard model.pendingChats.contains(where: { $0.id == retainedCard.id }),
+                  model.pendingChats.contains(where: { $0.id == conflictingCard.id }),
+                  model.showsPendingChatInRail(retainedCard, visibleAttachmentKeys: [key]),
+                  model.showsPendingChatInRail(conflictingCard, visibleAttachmentKeys: [key])
+            else { throw Failure.startupPresentation }
+            // Explicit local dismissal resolves the collision; it never dispatches the
+            // unrelated request or changes the original Work's command ledger.
+            model.stopTrackingPendingChat(conflictingCard)
+            guard !model.pendingChats.contains(where: { $0.id == conflictingCard.id })
+            else { throw Failure.startupPresentation }
+            model.pendingChatDetails[retainedCard.id] = "Local cleanup still needs attention."
+            model.selectedPendingChatID = retainedCard.id
+            model.retryPendingChat(retainedCard.id)
+            let retired = try await wait(upTo: 30, failure: .startupPresentation) {
+                () async throws -> Bool? in
+                !model.pendingChats.contains(where: { $0.id == retainedCard.id })
+                    && !model.pendingChatIsPreparing(retainedCard) ? true : nil
+            }
+            guard retired == true,
+                  !(try PendingChatStore(home: home).load()).rows.contains(where: {
+                    $0.id == retainedCard.id
+                  }),
+                  run.serviceProjection?.workSnapshot.commands.values.filter({
+                    $0.commandKind == .start
+                  }).count == 1
+            else { throw Failure.startupPresentation }
+
             run.refreshLocalServiceWireLog(home: home)
             guard let recording = run.wireLogURL,
                   recording.deletingLastPathComponent().path == recordingDirectory.path,
@@ -269,6 +347,8 @@ enum LiveChatTelemetryProbe {
             await run.end(discardPendingCommandOutput: true)
             guard !run.directShellEntries.contains(where: \.pendingContext),
                   run.directShellError == nil else { throw Failure.directCommand }
+            guard run.isEnding == (run.serviceProjection?.descriptor.execution == .ending)
+            else { throw Failure.ending }
             let ended = try await wait(upTo: 20) { () async throws -> Bool? in
                 await run.refreshService(resumeInitialStart: false)
                 guard let projection = run.serviceProjection else { return nil }
@@ -279,6 +359,7 @@ enum LiveChatTelemetryProbe {
                 return projection.isCanonical
                     && projection.descriptor.currentRun == nil
                     && projection.workSnapshot.activeRun == nil
+                    && !run.isEnding
                     && !projection.commandInFlight
                     && projection.pendingCommand == nil ? true : nil
             }

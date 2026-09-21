@@ -261,9 +261,10 @@ passed. Disabled and unreachable OTLP journeys also passed with exactly two prov
 their end-to-end checks include direct command output, plain-End refusal, and explicit cleanup.
 This does not expand the Linux or remote-backend validation boundary below.
 
-Remaining presentation polish observed during this pass: a normal Start can briefly show both
-the saved request and its canonical chat row before association catches up. Consolidating those
-representations is separate from the now-correct preparation/error distinction.
+The startup duplication observed during this pass is addressed by the subsequent
+[startup presentation follow-through](user-flow-feedback-2026-09-18.md#startup-presentation-follow-through--2026-09-21):
+exact-identity presentation collapse removes redundant normal-path rows and prompts while
+preserving saved requests and recovery controls.
 
 The standalone worker also typechecked and ran in the Swift 6.0 Jammy container (glibc 2.35).
 This is not a full Linux package receipt: the available container's Swift 6.0 toolchain is below

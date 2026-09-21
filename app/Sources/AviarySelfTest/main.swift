@@ -7159,6 +7159,7 @@ await Harness.run(
         + casesServiceBackedIntentStores
         + casesServiceBackedDraftStore
         + casesPendingChatStore
+        + casesStartupPresentationPolicy
         + casesServiceBackedGUIOrchestration
         + casesServiceBackedGUIControlPolicy
         + casesServiceBackedRefreshSchedulingPolicy

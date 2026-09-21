@@ -247,7 +247,7 @@ enum ChatJourneyProbe {
             throw Failure.assertion("guarded service run lost its projection")
         }
         try require(
-            guarded.savedInitialPrompt == "preserve this initial prompt",
+            guarded.savedStartupPrompt(pendingChat: nil) == "preserve this initial prompt",
             "explicit-retry restore dropped the retained initial prompt")
         try require(
             guardedProjection.workSnapshot.commands.values.allSatisfy {
@@ -384,7 +384,7 @@ enum ChatJourneyProbe {
             prompt: "ordinary initial prompt", commandID: "journey-start-default")
         await ordinary.refreshService(resumeInitialStart: false)
         try require(ordinary.serviceProjection?.descriptor.currentRun == nil
-                    && ordinary.savedInitialPrompt == "ordinary initial prompt",
+                    && ordinary.savedStartupPrompt(pendingChat: nil) == "ordinary initial prompt",
                     "observation-only poll admitted or dropped a retained Start")
         await ordinary.refreshService()
         await ordinary.refreshService()
@@ -718,6 +718,15 @@ enum ChatJourneyProbe {
         try require(PendingChatVisualState(phase: .preparing,
             isPreparing: false, conversationCreated: false).deliveryLabel == "Startup interrupted",
             "an interrupted startup must not be shown as live")
+        let retainedDelivered = PendingChatVisualState(
+            phase: .awaitingAcceptance, isPreparing: false, conversationCreated: true,
+            canonicalDelivery: true)
+        try require(retainedDelivered.deliveryLabel == "Request delivered"
+                    && retainedDelivered.statusOverride == "Chat started · startup card retained",
+                    "local cleanup failure must not be described as uncertain delivery")
+        try require(PendingChatVisualState(phase: .saved, isPreparing: false,
+            conversationCreated: false, canonicalDelivery: true).deliveryLabel == "Ready to send",
+            "delivery presentation requires an actual created conversation")
         // This is the actual rail presentation gate, not a hand-built visual fixture. A
         // selected exact attachment may preserve a title, never repair canonical ambiguity.
         let attached = CanonicalWorkspaceRailPresentation.attachedFallback(

@@ -3879,6 +3879,44 @@ final class AppModel {
 
     func pendingChatIsPreparing(_ chat: PendingChat) -> Bool { pendingChatAttempts.contains(chat.id) }
 
+    func pendingChat(for run: LiveRun) -> PendingChat? {
+        guard let key = run.serviceAttachmentKey else { return nil }
+        let matches = pendingChats.filter { $0.createdAssociation == key }
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    func pendingChatHasCanonicalDelivery(_ chat: PendingChat) -> Bool {
+        guard let key = chat.createdAssociation else { return false }
+        let matches = runs.filter { $0.serviceAttachmentKey == key }
+        return matches.count == 1 && matches.first?.hasCanonicalDelivery(for: chat) == true
+    }
+
+    /// Collapse only the visible presentation. The durable saved request remains until the
+    /// exact canonical delivery and local-store retirement checks in settlePendingChats pass.
+    func showsPendingChatInRail(
+        _ chat: PendingChat, visibleAttachmentKeys: [ServiceAttachmentKey]
+    ) -> Bool {
+        if StartupChatPresentationPolicy.hasAssociationCollision(chat, in: pendingChats) {
+            return true
+        }
+        let matchingRuns = runs.filter {
+            chat.createdAssociation != nil && $0.serviceAttachmentKey == chat.createdAssociation
+        }
+        let needsRecovery = selectedPendingChatID == chat.id
+            || pendingChatDetails[chat.id] != nil
+            || pendingChatStoreError != nil
+            || matchingRuns.contains { run in
+                run.errorBanner != nil
+                    || run.commandNotice.map { $0.level != .success } == true
+                    || run.serviceProjection?.pendingCommand.map {
+                        $0.state != .awaitingCanonicalEvidence
+                    } == true
+            }
+        return StartupChatPresentationPolicy.showsPendingRow(
+            chat, visibleAttachmentKeys: visibleAttachmentKeys,
+            hasRecoveryDetail: needsRecovery)
+    }
+
     func pendingChatStatus(_ chat: PendingChat) -> String {
         if pendingChatAttempts.contains(chat.id) { return "Connecting…" }
         if chat.createdAssociation != nil { return "Saved · opening conversation" }
@@ -3889,6 +3927,9 @@ final class AppModel {
 
     func pendingChatExplanation(_ chat: PendingChat) -> String {
         if let detail = pendingChatDetails[chat.id] { return detail }
+        if pendingChatHasCanonicalDelivery(chat) {
+            return "Your request reached the agent. This local startup card is still retained; open the conversation to continue, or refresh its saved status."
+        }
         if chat.phase == .saved {
             return "This request is saved on this Mac and has not been sent. Start the chat when you are ready."
         }
@@ -4009,7 +4050,12 @@ final class AppModel {
 
     private func settlePendingChats() {
         for chat in pendingChats {
+            guard !StartupChatPresentationPolicy.hasAssociationCollision(chat, in: pendingChats) else {
+                pendingChatDetails[chat.id] = "Multiple saved requests point to this conversation. Each startup card has been kept so you can check it individually; no request was sent again."
+                continue
+            }
             guard let key = chat.createdAssociation,
+                  workRuns.filter({ $0.serviceAttachmentKey == key }).count == 1,
                   let run = workRuns.first(where: { $0.serviceAttachmentKey == key }) else { continue }
             guard run.hasCanonicalDelivery(for: chat) else {
                 if let error = run.errorBanner {
@@ -4149,6 +4195,15 @@ final class AppModel {
                             }
                             let reconstructed = await self.restoreServiceWork(
                                 session: session, client: client, handshake: handshake)
+                            // An existing attachment is reused by restoreServiceWork; refresh
+                            // that exact run before evaluating its saved card. This is a read,
+                            // never permission to resume the retained Start automatically.
+                            if let key = original.createdAssociation {
+                                let matches = self.workRuns.filter { $0.serviceAttachmentKey == key }
+                                if matches.count == 1, let run = matches.first {
+                                    await run.refreshService(resumeInitialStart: false)
+                                }
+                            }
                             self.settlePendingChats()
                             // Reaching the end of a refresh is not proof of delivery. The strict
                             // canonical retirement predicate above must have removed this card.
@@ -5951,7 +6006,12 @@ final class LiveRun: Identifiable {
     private var initialStart: ServiceBackedStartIntent?
     /// Observation-only reconstruction must not become an automatic Start on the next poll.
     var initialStartRequiresExplicitRetry = false
-    var savedInitialPrompt: String? { initialStart?.prompt }
+    func savedStartupPrompt(pendingChat: PendingChat?) -> String? {
+        StartupChatPresentationPolicy.savedPrompt(
+            pendingChat: pendingChat, startIntent: initialStart,
+            projection: serviceBridge?.projection,
+            visibleMessages: serviceBridge?.visibleMessages ?? [])
+    }
     func hasCanonicalDelivery(for chat: PendingChat) -> Bool {
         guard let serviceBridge else { return false }
         return chat.hasCanonicalDelivery(in: serviceBridge.projection)
@@ -6558,12 +6618,12 @@ final class LiveRun: Identifiable {
             }
             isEnding = true
             directShellEndCleanupInProgress = true
-            var endAdmissionStarted = false
             defer {
                 directShellEndCleanupInProgress = false
-                // Cleanup failure proves End never crossed the Work Host boundary. Once End is
-                // attempted, its existing receipt/reconciliation path owns the uncertain state.
-                if !endAdmissionStarted { isEnding = false }
+                // The final sync above may have sampled the local cleanup barrier while it
+                // was still set. Republish after releasing it; only the host's current End
+                // stage may keep the spinner alive. This does not assert End succeeded.
+                syncServiceState()
             }
             // An empty local tray is not proof that the host has no pending output: this GUI
             // may have just reattached, or its passive tray read may have failed. Every End
@@ -6583,7 +6643,6 @@ final class LiveRun: Identifiable {
                 return
             }
             let commandID = UUID().uuidString.lowercased()
-            endAdmissionStarted = true
             do {
                 let receipt = try await serviceBridge.end(commandID: commandID)
                 setServiceSuccessNotice(

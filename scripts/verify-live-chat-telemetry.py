@@ -6,7 +6,7 @@
 
 Usage: uv run scripts/verify-live-chat-telemetry.py [--mode healthy|disabled|unreachable] \
     build/Aviary.app/Contents/MacOS/Aviary
-Last verified: 2026-09-12. Uses only bounded loopback servers and a private /tmp AgentHome.
+Last verified: 2026-09-21. Uses only bounded loopback servers and a private /tmp AgentHome.
 """
 
 import argparse
@@ -66,7 +66,7 @@ FAILURE_STAGES = {
     "shutdown",
     "startup",
     "startupHost", "startupWorkspace", "startupProvider", "startupAuthorization", "startupRequest",
-    "startupStatusSave", "startupSavedRowUnreadable",
+    "startupStatusSave", "startupSavedRowUnreadable", "startupPresentation",
     "turn",
     "unknown",
 }
@@ -601,10 +601,28 @@ def validate_telemetry(capture, receipt, private_root):
         raise RuntimeError("collector did not receive both app and daemon resources")
 
     startups = [span for _resource, span in spans if span.name == "aviary.gui.pending_chat.startup"]
-    if len(startups) != 1 or startups[0].parent_span_id:
-        raise RuntimeError("pending chat startup was not one independent root")
-    if attributes(startups[0].attributes).get("aviary.outcome") not in {"accepted", "completed"}:
+    if (len(startups) != 2 or any(span.parent_span_id for span in startups)
+            or len({span.trace_id for span in startups}) != 2):
+        raise RuntimeError("startup and retained-card refresh were not independent roots")
+    if any(attributes(span.attributes).get("aviary.outcome") not in {"accepted", "completed"}
+           for span in startups):
         raise RuntimeError("pending chat startup did not report accepted completion")
+    recoveries = [span for _resource, span in spans
+                  if span.name == "aviary.gui.retained_start.recover"]
+    if (len(recoveries) != 1
+            or attributes(recoveries[0].attributes).get("aviary.outcome") != "completed"
+            or recoveries[0].parent_span_id
+            or recoveries[0].trace_id in {span.trace_id for span in startups}):
+        raise RuntimeError("retained-card refresh did not report completed reconciliation")
+    recovery_attributes = attributes(recoveries[0].attributes)
+    recovery_roots = [span for span in startups
+                      if attributes(span.attributes).get("aviary.chat.id")
+                      == recovery_attributes.get("aviary.chat.id")]
+    if (len(recovery_roots) != 1 or not recovery_attributes.get("aviary.chat.id")
+            or recovery_attributes.get("aviary.start.command.id") != receipt["startCommand"]
+            or attributes(recovery_roots[0].attributes).get("aviary.start.command.id")
+            != receipt["startCommand"]):
+        raise RuntimeError("retained-card refresh lost the exact saved-command correlation")
     for command_kind in ("start", "end"):
         gui_commands = [
             span
@@ -652,11 +670,13 @@ def validate_telemetry(capture, receipt, private_root):
     if len(app_creates) != 1 or len(daemon_creates) != 1:
         raise RuntimeError("Create did not produce one app/client and daemon/server span")
     app_create, daemon_create = app_creates[0], daemon_creates[0]
+    creation_roots = [span for span in startups if span.trace_id == app_create.trace_id]
     if (
-        app_create.trace_id != startups[0].trace_id
-        or app_create.parent_span_id != startups[0].span_id
+        len(creation_roots) != 1
+        or app_create.parent_span_id != creation_roots[0].span_id
         or daemon_create.trace_id != app_create.trace_id
         or daemon_create.parent_span_id != app_create.span_id
+        or recoveries[0].trace_id == app_create.trace_id
     ):
         raise RuntimeError("Create trace propagation did not preserve the startup/client/server chain")
 

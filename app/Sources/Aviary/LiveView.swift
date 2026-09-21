@@ -282,36 +282,7 @@ struct RunPane: View {
             VStack(spacing: 0) {
                 runHeader
                 Divider()
-                if let prompt = model.pendingChats.first(where: {
-                    $0.createdAssociation != nil && $0.createdAssociation == run.serviceAttachmentKey
-                })?.prompt ?? run.savedInitialPrompt, !prompt.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Label("You · saved on this Mac", systemImage: "person.fill")
-                            .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                        ScrollView {
-                            Text(prompt).font(.system(size: 13)).textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }.frame(maxHeight: 160)
-                        if let pending = run.serviceProjection?.pendingCommand, pending.kind == .start,
-                           !run.serviceCommandAttemptActive, pending.state != .awaitingCanonicalEvidence {
-                            HStack(spacing: 8) {
-                                Button("Check delivery") { Task { await run.refreshService() } }
-                                Button("Retry saved startup") { Task { _ = await run.retryServiceCommand() } }
-                                    .disabled(run.hasExited || run.isEnding
-                                        || pending.state == .awaitingCanonicalEvidence
-                                        || !run.serviceRetryAvailable)
-                            }.buttonStyle(.bordered).controlSize(.small)
-                            Text("Retry uses the original saved request, not a new copy.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        } else if run.serviceCommandAttemptActive || run.commandState == .preparing
-                            || run.commandState == .committing {
-                            Label("Starting…", systemImage: "hourglass")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
-                        .background(Design.accentSoft.opacity(0.4))
-                    Divider()
-                }
+                savedStartupRequest
                 ChatStatusPanel(
                     presentation: model.chatStatus(for: run, projectCheckError: projectCheckError),
                     onConfirmProject: model.projectIssue(for: run) == nil ? nil : {
@@ -507,6 +478,43 @@ struct RunPane: View {
             ProjectReconfirmationSheet(initialDirectory: run.config.cwd,
                 prepare: { try model.prepareProjectReconfirmation(for: run, directory: $0) },
                 confirm: { try await model.confirmProjectReconfirmation($0, for: run) })
+        }
+    }
+
+    /// A saved request is a fallback until its exact canonical input appears in the current
+    /// transcript window. Recovery actions are independent, so removing an echo never removes
+    /// the only way to reconcile an uncertain Start.
+    @ViewBuilder private var savedStartupRequest: some View {
+        let prompt = run.savedStartupPrompt(pendingChat: model.pendingChat(for: run))
+        let pending = run.serviceProjection?.pendingCommand
+        let needsRecovery = pending?.kind == .start && !run.serviceCommandAttemptActive
+            && pending?.state != .awaitingCanonicalEvidence
+        if prompt != nil || needsRecovery {
+            VStack(alignment: .leading, spacing: 6) {
+                if let prompt {
+                    Label("You · saved on this Mac", systemImage: "person.fill")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    ScrollView {
+                        Text(prompt).font(.system(size: 13)).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(maxHeight: 160)
+                }
+                if needsRecovery {
+                    HStack(spacing: 8) {
+                        Button("Check delivery") { Task { await run.refreshService() } }
+                        Button("Retry saved startup") { Task { _ = await run.retryServiceCommand() } }
+                            .disabled(run.hasExited || run.isEnding || !run.serviceRetryAvailable)
+                    }.buttonStyle(.bordered).controlSize(.small)
+                    Text("Retry uses the original saved request, not a new copy.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if run.serviceCommandAttemptActive || run.commandState == .preparing
+                    || run.commandState == .committing {
+                    Label("Starting…", systemImage: "hourglass")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
+                .background(Design.accentSoft.opacity(0.4))
+            Divider()
         }
     }
 

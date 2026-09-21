@@ -9,7 +9,15 @@ struct PendingChatVisualState {
     let deliveryLabel: String
     let statusOverride: String?
 
-    init(phase: PendingChatPhase, isPreparing: Bool, conversationCreated: Bool) {
+    init(phase: PendingChatPhase, isPreparing: Bool, conversationCreated: Bool,
+         canonicalDelivery: Bool = false) {
+        if conversationCreated && canonicalDelivery {
+            symbol = "checkmark.circle.fill"
+            tint = Design.success
+            deliveryLabel = "Request delivered"
+            statusOverride = "Chat started · startup card retained"
+            return
+        }
         statusOverride = conversationCreated && !isPreparing
             ? "Conversation created · delivery unconfirmed" : nil
         if isPreparing {
@@ -93,7 +101,8 @@ struct PendingChatPane: View {
 
     private var visualState: PendingChatVisualState {
         .init(phase: chat.phase, isPreparing: model.pendingChatIsPreparing(chat),
-              conversationCreated: chat.createdAssociation != nil)
+              conversationCreated: chat.createdAssociation != nil,
+              canonicalDelivery: model.pendingChatHasCanonicalDelivery(chat))
     }
 
     var body: some View {
@@ -217,9 +226,18 @@ struct PendingChatPane: View {
     }
 
     @ViewBuilder private var recoveryButtons: some View {
-        Button(chat.phase == .awaitingAcceptance || chat.createdAssociation != nil
-               ? "Check delivery" : chat.phase == .saved ? "Start chat" : "Retry startup") { model.retryPendingChat(chat.id) }
-            .buttonStyle(.borderedProminent).disabled(editing)
+        let delivered = model.pendingChatHasCanonicalDelivery(chat)
+        if delivered {
+            Button("Open conversation") { model.openPendingConversation(chat) }
+                .buttonStyle(.borderedProminent)
+                .disabled(!model.canOpenPendingConversation(chat))
+            Button("Refresh saved status") { model.retryPendingChat(chat.id) }
+                .buttonStyle(.bordered).disabled(editing)
+        } else {
+            Button(chat.phase == .awaitingAcceptance || chat.createdAssociation != nil
+                   ? "Check delivery" : chat.phase == .saved ? "Start chat" : "Retry startup") { model.retryPendingChat(chat.id) }
+                .buttonStyle(.borderedProminent).disabled(editing)
+        }
         if canEdit {
             if chat.failureKind == .workspaceConfirmationRequired || chat.failureKind == .workspaceUnavailable {
                 Button("Confirm project folder…") { showingProjectReconfirmation = true }
@@ -232,8 +250,10 @@ struct PendingChatPane: View {
             }.buttonStyle(.bordered)
         }
         if chat.createdAssociation != nil {
-            Button("Open conversation") { model.openPendingConversation(chat) }.buttonStyle(.bordered)
-                .disabled(!model.canOpenPendingConversation(chat))
+            if !delivered {
+                Button("Open conversation") { model.openPendingConversation(chat) }.buttonStyle(.bordered)
+                    .disabled(!model.canOpenPendingConversation(chat))
+            }
             Menu("Recovery options") {
                 Button("Save as a separate unsent chat…") { confirmingSeparateCopy = true }
                 Button("Remove startup card…", role: .destructive) { confirmingStopTracking = true }

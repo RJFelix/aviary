@@ -63,3 +63,48 @@ The subsequent Work-Host-owned direct-command slice, Flock interaction refinemen
 copy pass are documented in [direct-user-commands.md](direct-user-commands.md), including their
 new verification receipts. The preceding UI-only checkpoint remains a historical receipt;
 its service-lifetime and test boundaries do not describe the later deployment.
+
+## Startup presentation follow-through — 2026-09-21
+
+The saved request and attached conversation no longer need separate normal-path rail cards.
+The pending card collapses only when exactly one visible live attachment has the complete same
+client/Work/Session/attachment identity. A selected recovery card, local-save error, uncertain
+command, or ambiguous match keeps it visible. This changes no durable retirement or command
+admission rules; the saved request remains until exact canonical delivery and local cleanup pass.
+When multiple saved requests share an association, none is automatically retired. Each keeps its
+own recovery card; otherwise retiring a delivered member could hide a different unsent survivor.
+
+The saved-prompt fallback above chat disappears when that exact Start input is already in the
+currently rendered transcript window. Equal text, another user message, a receipt, or a delivered
+message outside the visible history window is insufficient. Check/retry controls remain separate
+from the prompt fallback, so removing a duplicate cannot remove recovery actions.
+
+A retained card after proven delivery says **Request delivered**, offers **Open conversation**
+first, and distinguishes local cleanup from delivery uncertainty. **Refresh saved status** refreshes
+the exact existing attachment before cleanup, with initial-Start resumption disabled. It does not
+issue another Start merely to refresh presentation.
+
+The live cleanup check also caught a stale **Ending** composer after the journal and header
+already showed the Run had finished. Releasing the local output-cleanup barrier now immediately
+resynchronizes presentation from the service bridge. An actually ending or uncertain host remains
+authoritative; this does not manufacture an End success or retry the command.
+
+Verification for this follow-through: 55 focused cases / 371 assertions pass across startup
+presentation, pending-chat recovery, hiding, composer policy, notices, and GUI controls. Debug
+compile, signed release build, strict deep signing, and signed editor/saved-chat journey probes
+pass. The signed healthy OTLP journey records 159 spans and exactly two loopback provider calls;
+disabled and unreachable collector journeys each also complete with exactly two calls. The
+retained-card recovery check uses the real AppModel action, retires its disposable marker, and
+proves the Work still has exactly one Start command. The probe also checks the End overlay
+immediately after command completion and after canonical settlement.
+Its collision fixture first settles the ordinary startup card, then retains a delivered request
+beside a different unproven one. A real AppModel refresh must keep both reachable; only explicit
+local dismissal resolves the collision before the delivered card's ordinary recovery check.
+
+On the unlocked Mac, physical clicks exercised two disposable Start/reply/End chats: one visible
+rail entry and one prompt as the saved fallback becomes a canonical input. The post-fix End
+check returned to an ordinary composer, with `run.finished` at Work sequence 20. Both chats were
+ended and hidden, the five original rows remain, and the two original saved-request files are
+byte-identical. No full-suite, Linux, or remote-backend rerun is claimed for this narrower slice;
+the preceding full-suite receipt remains in direct-user-commands.md. Work paused at this checkpoint
+at Ryan's request; the existing service was left running and no original Work was restarted.
