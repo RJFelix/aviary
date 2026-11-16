@@ -286,6 +286,11 @@ struct AviaryDaemonMain {
     }
 
     static func main() async {
+        #if os(macOS)
+        if let code = await MuseWorker.runIfRequested(arguments: CommandLine.arguments) { exit(code) }
+        #endif
+        if let code = LocalSecretServiceAccess.runIfRequested(arguments: CommandLine.arguments) { exit(code) }
+        if let code = LocalSecretKeychainProbe.runIfRequested(arguments: CommandLine.arguments) { exit(code) }
         AviaryTelemetry.configure(serviceName: "aviaryd", environment: ProcessInfo.processInfo.environment)
         var coordinator: WorkHostDaemonCoordinator?
         do {
@@ -439,19 +444,40 @@ struct AviaryDaemonMain {
                     _ = try workspaceRegistry.registerLocalDirectory(
                         explicitWorkspace, label: "Default workspace", isDefault: true)
                 }
-                let launchResolver = LocalWorkHostLaunchResolver(configuration: .init(
-                    home: home,
-                    workspaceRegistry: workspaceRegistry,
-                    runtimeRepositoryRoot: runtimeRoot,
-                    environment: environment))
+                // Snapshot configuration once per operation, not once per daemon lifetime.
+                // A newly saved provider/Keychain reference must work without ending other
+                // agents. Start still verifies the retained configuration digest; edits may
+                // reject stale launch material, never silently reroute an existing Work.
+                let currentResolver: @Sendable () -> LocalWorkHostLaunchResolver = {
+                    LocalWorkHostLaunchResolver(configuration: .init(
+                        home: home,
+                        workspaceRegistry: workspaceRegistry,
+                        runtimeRepositoryRoot: runtimeRoot,
+                        environment: environment))
+                }
                 let durable = WorkHostDaemonServiceResolver.durable(
                     authorizer: authorizer,
-                    draftResolver: launchResolver.draftResolver,
-                    hostedResolver: launchResolver.hostedConfigurationResolver,
-                    agentChildRuntimeHostResolver:
-                        launchResolver.agentChildRuntimeHostResolver,
-                    promptAssemblyResolver: launchResolver.promptAssemblyResolver,
-                    reconstructabilityProbe: launchResolver.reconstructabilityProbe,
+                    draftResolver: { try currentResolver().draft(for: $0) },
+                    hostedResolver: { manifest, binding, policy in
+                        do {
+                            return try await currentResolver().hostedConfiguration(
+                                for: manifest, binding: binding, policy: policy)
+                        } catch let error as LocalWorkHostLaunchResolver.Error {
+                            // Fixed enum cases only: no prompt, path, credential, or remote body.
+                            if ProcessInfo.processInfo.environment["AVIARY_TRACE_WORK_READS"] == "1" {
+                                FileHandle.standardError.write(Data(
+                                    "AVIARY_WORK_LAUNCH_FAILURE category=\(error)\n".utf8))
+                            }
+                            throw error
+                        }
+                    },
+                    agentChildRuntimeHostResolver: { manifest in
+                        try await currentResolver().agentChildRuntimeHostResolver(manifest)
+                    },
+                    promptAssemblyResolver: { draft, body, intent in
+                        try currentResolver().assemblePrompt(for: draft, startBody: body, startIntent: intent)
+                    },
+                    reconstructabilityProbe: { currentResolver().canReconstruct($0) },
                     workspaceCatalogProvider: { try workspaceRegistry.catalog() })
                 return try await durable.open(
                     home: home, host: host, instance: instance, environment: environment)

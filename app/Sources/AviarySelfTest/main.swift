@@ -7170,12 +7170,35 @@ await Harness.run(
         + casesDirectShellCommandJournal
         + casesDirectShellService
         + casesDirectShellEndCleanupCoordinator
+        + casesXAIProvider + casesXAIProviderSetup + casesLocalSecrets
+        + [
+            ("provider Muse: framing and bounds", { try test_museMSPFramingKeepsUnicodeSeparatorsAndBoundsPartialLines() }),
+            ("provider Muse: account environment", { test_museCodeEnvironmentUsesAccountLoginSemantics() }),
+            ("provider Muse: launcher route isolation", { test_launcherMuseRouteNeverFallsThroughToDirect() }),
+            ("provider Muse: catalog preferences", { try test_museCatalogPreservesPreferencesAndRejectsForeignRows() }),
+            ("provider Muse: model facts", { test_museCodeModelSpecDoesNotInventPricingOrContext() }),
+            ("provider Muse: exact approval stage", { test_museCodeRunEventCarriesAuthoritativeApprovalStage() }),
+            ("provider Muse: turn terminal", { test_museCodeRunTerminalEventCarriesMatchingTurn() }),
+            ("provider Muse: current wire fixtures", { try test_museCodeRunUsesCurrentMuseToolAndApprovalViewShapes() }),
+            ("provider Muse: envelope correlations", { try test_museMSPEnvelopeShapesAndCorrelations() }),
+            ("provider Muse: outbound framing", { try test_museMSPEncodesOneLineAndOmitsAbsentParams() }),
+            ("provider Muse: handshake and typed projections", { try test_museMSPHandshakeCatalogAccountAndAckAreDistinct() }),
+            ("provider Muse: pipe handshake and remote error", { try await test_museMSPConnectionHandshakesAndPreservesHostError() }),
+            ("provider Muse: connection loss", { try await test_museMSPPendingHandshakeFailsOnConnectionLoss() }),
+            ("provider Muse: session lifecycle shapes", { try test_museMSPSessionSchemaShapesKeepAckSeparateFromViewTerminal() }),
+            ("provider Muse: resume identity and history", { try test_museMSPSessionResumeRetainsHistoryModeAndChecksIdentity() }),
+            ("provider Muse: authenticated restricted turn opt-in", { try await test_museMSPAuthenticatedRestrictedTinyTurnWhenRequested() }),
+            ("provider Muse: installed binary opt-in", { try await test_museMSPInstalledBinarySmokeWhenRequested() })
+        ]
         + [
             ("message transfer: exact authored text", { try test_transcriptMessageTransferPreservesExactRoleText() }),
             ("message transfer: user whitespace", { try test_transcriptMessageTransferUsesUserBlocksOnly() }),
             ("message transfer: agent envelope", { try test_transcriptMessageTransferStripsOnlyAgentEnvelope() }),
             ("message transfer: exclude unrelated rows", { try test_transcriptMessageTransferDoesNotUseUnrelatedItemText() })
         ]
+        + casesMuseCodeRun
+        + casesMuseWorkerStore
+        + casesMuseWorkerClient
         + casesServiceBackedCommandNoticePolicy
         + casesServiceBackedControlResultPolicy
         + casesWorkServiceAttachedWorkController

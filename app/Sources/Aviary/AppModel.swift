@@ -450,17 +450,23 @@ final class AppModel {
             // No new service lifecycle operation can enter after `acceptsNewWork = false`, and
             // every prior one is now settled. This snapshot is therefore the complete set of
             // GUI-owned rows whose drafts and command barriers must cross shutdown.
-            let processOwnedWork = self.workRuns.filter { !$0.isServiceBacked }
+            let processOwnedWork = self.workRuns.filter { !$0.isServiceBacked && !$0.isMuseCode }
+            let museWork = self.workRuns.filter(\.isMuseCode)
             let serviceBackedWork = self.workRuns.filter(\.isServiceBacked)
             // Freeze new GUI-originated command admission, then join commands already beyond
             // that boundary. Their host outcome and draft reconciliation must settle before
             // the final draft flush can truthfully precede disconnect.
             for run in serviceBackedWork { run.freezeServiceComposerAdmission() }
+            for run in museWork { run.museCode?.freezeComposer() }
             for run in serviceBackedWork { await run.waitForServiceComposerCommands() }
+            for run in museWork { await run.museCode?.waitForCommands() }
             // A draft is GUI-owned state, unlike the canonical conversation, and therefore
             // has to cross the process boundary before this GUI drops its service sessions.
             // Every run serializes this flush behind any already-started background save.
             var draftsAreDurable = true
+            for run in museWork {
+                if let driver = run.museCode, !(await driver.flushDraft(run.draft)) { draftsAreDurable = false }
+            }
             for run in serviceBackedWork {
                 if !(await run.flushDraftPersistence(freezeEdits: true)) {
                     draftsAreDurable = false
@@ -470,6 +476,7 @@ final class AppModel {
                 // Do not turn a disk failure into silent data loss. Nothing has been stopped or
                 // disconnected yet; restore editing and let AppDelegate cancel termination.
                 for run in serviceBackedWork { run.resumeAfterAbortedShutdown() }
+                for run in museWork { run.museCode?.resumeComposer() }
                 self.acceptsNewWork = true
                 self.startPolling()
                 self.localWorkServiceError =
@@ -483,6 +490,7 @@ final class AppModel {
             // teardown.  A Work-service run is different: disconnecting this GUI must not
             // synthesize End or make the Work Host depend on this process.
             for run in processOwnedWork { await run.stop() }
+            for run in museWork { await run.disconnect() }
             for run in serviceBackedWork { await run.disconnect() }
             await self.disconnectLocalWorkService()
             return true
@@ -539,6 +547,7 @@ final class AppModel {
     enum Engine: String, CaseIterable, Identifiable {
         case inHouse
         case claudeCode
+        case museCode
 
         public var id: String { rawValue }
 
@@ -546,6 +555,7 @@ final class AppModel {
             switch self {
             case .inHouse: return "In-house"
             case .claudeCode: return "Claude Code"
+            case .museCode: return "Muse Code"
             }
         }
     }
@@ -592,6 +602,12 @@ final class AppModel {
     /// binary found" — which is a different fact from "not signed in", so `Auth.loggedIn`
     /// carries that one.
     var claudeCodeAuth: ClaudeCode.Auth?
+    var museCodeModel: String = UserDefaults.standard.string(forKey: "aviary.museCodeModel")
+        ?? "muse-spark-1.2" {
+        didSet { UserDefaults.standard.set(museCodeModel, forKey: "aviary.museCodeModel") }
+    }
+    var museCodeStatus = "Checking Muse Code…"
+    var museCodeModels: [ModelSpec] = []
 
     // MARK: UI state
 
@@ -908,6 +924,7 @@ final class AppModel {
 
         await refreshAll()
         await bootstrapLocalWorkService()
+        restoreMuseWorkers()
         startPolling()
     }
 
@@ -3184,15 +3201,20 @@ final class AppModel {
     /// If an Anthropic subscription login is ever added, it needs a `BuiltInProviders` entry
     /// here too, or its models will be missing rather than merely unreachable.
     func refreshRuntimeModels() async {
+        let discovery = await MuseCode.discover()
+        museCodeModels = discovery.models
+        museCodeStatus = discovery.authenticated ? "Connected through your Muse account"
+            : (discovery.detail ?? "Muse Code needs a login. Run muse login in Terminal.")
         var credentialed = await ModelCatalogBuilder.credentialedProviders(
-            config: modelsConfig, auth: auth)
+            config: modelsConfig, auth: auth, home: home)
         // Claude Code's credential lives in the `claude` binary's own keychain entry, which
         // Aviary cannot read and should not try to — so reachability is what `claude auth
         // status` says, resolved once at bootstrap.
         if claudeCodeAuth?.loggedIn == true { credentialed.insert("claude-code") }
+        if discovery.authenticated { credentialed.insert("muse-code") }
         modelCatalog = ModelCatalogBuilder.build(
             config: modelsConfig, auth: auth, credentialed: credentialed,
-            preferences: modelPreferences)
+            preferences: modelPreferences, museModels: museCodeModels)
         runtimeModels = modelCatalog.models
         runtimeModelsError =
             modelCatalog.models.isEmpty
@@ -3211,7 +3233,7 @@ final class AppModel {
         modelCatalog = ModelCatalogBuilder.build(
             config: modelsConfig, auth: auth,
             credentialed: Set(modelCatalog.reachable.map(\.id)),
-            preferences: modelPreferences)
+            preferences: modelPreferences, museModels: museCodeModels)
         runtimeModels = modelCatalog.models
     }
 
@@ -3642,7 +3664,7 @@ final class AppModel {
     /// coincidence is gone — see `startWorkshopRun` — and this stays diagnostic-only.
     func testProvider(_ provider: ProviderSpec, model: ModelSpec?) async {
         testingProviders.insert(provider.id)
-        let result = await ProviderTester.test(provider: provider, model: model)
+        let result = await ProviderTester.test(provider: provider, model: model, home: home)
         providerTests[provider.id] = result
         testingProviders.remove(provider.id)
     }
@@ -3709,10 +3731,10 @@ final class AppModel {
         guard matches.count == 1 else {
             return ("", "'\(reference)' matches \(matches.count) runs. Use a session id.")
         }
-        if target.isClaudeCode {
+        if target.isClaudeCode || target.isMuseCode {
             return (
                 "",
-                "\(target.title) is driven by Claude Code, which owns its turn "
+                "\(target.title) uses a driven agent, which owns its turn "
                     + "boundary and will not accept an injected message."
             )
         }
@@ -4566,12 +4588,102 @@ final class AppModel {
         return true
     }
 
+    /// Muse owns its loop and tools; reserve Aviary's transcript before any process effect.
+    @discardableResult
+    func startMuseCodeRun(
+        cwd: String, model: String, effort: String?, prompt: String, title: String? = nil
+    ) -> Bool {
+        guard acceptsNewWork else { return false }
+        museCodeModel = model
+        var config = RunConfiguration(cwd: cwd, provider: "muse-code", model: model,
+                                      thinkingLevel: effort)
+        let identity = config.resolvedIdentity(home: home)
+        config.identity = identity
+        do {
+            let writer = try SessionWriter(home: home, cwd: cwd,
+                                          model: MuseCode.modelSpec(for: model), identity: identity)
+            let driver = MuseCodeDriver(home: home, cwd: cwd, model: model, effort: effort,
+                                        identity: identity, writer: writer)
+            let run = LiveRun(museCode: driver, cwd: cwd,
+                              modelLabel: "muse-code/\(model)", config: config)
+            if let title { run.title = title }
+            runs.append(run)
+            focusedRunID = run.id
+            section = .live
+            run.startMuseCode(prompt: prompt)
+            return true
+        } catch {
+            show("Could not save the Muse chat: \(error.localizedDescription)", isError: true)
+            return false
+        }
+    }
+
+    /// Reopening the GUI observes existing workers; it never starts or resumes execution.
+    func restoreMuseWorkers() {
+        do {
+            let store = MuseWorkerStore(homeRoot: home.root)
+            var unavailable = 0
+            for id in try store.sessions() {
+                do {
+                    let client = try MuseWorkerClient.load(home: home, sessionID: id)
+                    guard client.isOwned,
+                          !runs.contains(where: { $0.isMuseCode && $0.sessionID == id && !$0.hasExited }) else { continue }
+                    attachMuseWorker(client, focus: false)
+                } catch { unavailable += 1 }
+            }
+            if unavailable > 0 { show("\(unavailable) saved Muse entries could not be read. Other agents were restored.", isError: true) }
+        } catch { show("Some saved Muse agents could not be restored: \(error.localizedDescription)", isError: true) }
+    }
+
+    func resumeMuseSession(_ sessionID: String) {
+        guard acceptsNewWork else { return }
+        if let existing = runs.first(where: { $0.isMuseCode && $0.sessionID == sessionID && !$0.hasExited }) {
+            focusedRunID = existing.id; section = .live
+            return
+        }
+        do {
+            var client = try MuseWorkerClient.load(home: home, sessionID: sessionID)
+            if client.isOwned, try client.snapshot()?.isTerminal == true {
+                show("Muse is finishing shutdown. Resume once the worker has stopped.", isError: false)
+                return
+            }
+            if !client.isOwned {
+                if try client.store.readDraftRecord(sessionID: sessionID)?.handoff != nil {
+                    runs.removeAll { $0.isMuseCode && $0.sessionID == sessionID && $0.hasExited }
+                    attachMuseWorker(client, focus: true)
+                    show("Check the previous message's delivery before resuming. Nothing has been sent again.", isError: false)
+                    return
+                }
+                client = try client.reserveResume()
+                try client.launch()
+            }
+            runs.removeAll { $0.isMuseCode && $0.sessionID == sessionID && $0.hasExited }
+            attachMuseWorker(client, focus: true)
+        } catch { show("Could not resume Muse: \(error.localizedDescription)", isError: true) }
+    }
+
+    private func attachMuseWorker(_ client: MuseWorkerClient, focus: Bool) {
+        let saved = client.manifest
+        let config = RunConfiguration(cwd: saved.cwd, provider: "muse-code", model: saved.model,
+                                      thinkingLevel: saved.effort, identity: saved.identity)
+        let run = LiveRun(museCode: MuseCodeDriver(attaching: client), cwd: saved.cwd,
+                          modelLabel: "muse-code/\(saved.model)", config: config)
+        run.title = saved.title
+        runs.append(run)
+        run.startMuseCode(prompt: "")
+        if focus { focusedRunID = run.id; section = .live }
+    }
+
     /// Continue an existing session on whichever engine is selected.
     ///
     /// One entry point for all three "Continue" affordances, so the engine picker governs
     /// resume too. They each used to build a harness `RunConfiguration` directly, which is why
     /// resume was harness-only regardless of what the picker said.
     func continueSession(_ s: SessionSummary, recordPayloads: Bool = false) {
+        if s.provider == "muse-code" {
+            resumeMuseSession(s.id)
+            return
+        }
         guard !s.isCanonicalOnly else {
             toast = Toast(message: "This native session has no legacy transcript resume path yet.",
                           isError: true)
@@ -4586,6 +4698,10 @@ final class AppModel {
             return
         }
         let cwd = s.cwd.isEmpty ? defaultCwd : s.cwd
+        if engineChoice == .museCode {
+            show("Muse Code owns its conversation history. Choose New chat to start Muse; this transcript will not be silently converted.", isError: true)
+            return
+        }
         if engineChoice == .claudeCode {
             // Claude Code holds its own history and will not accept a prepared one, so
             // "continue" here means a new driven session in the same directory rather than a
@@ -4770,7 +4886,7 @@ struct PeerBridge: Agent.PeerDelegate, Agent.SelfDelegate {
                     title: run.title,
                     model: run.modelLabel ?? "unknown",
                     working: run.isStreaming,
-                    engine: run.isClaudeCode ? "claude-code" : "in-house")
+                    engine: run.isMuseCode ? "muse-code" : run.isClaudeCode ? "claude-code" : "in-house")
             }
             .filter { !$0.session.isEmpty }
         }
@@ -4935,6 +5051,7 @@ final class LiveRun: Identifiable {
         if let serviceBridge { return serviceBridge.commandCapabilities }
         if let inHouse { return inHouse.commandCapabilities }
         if let claudeCode { return claudeCode.commandCapabilities }
+        if let museCode { return museCode.commandCapabilities }
         return SessionCommandCapabilities()
     }
 
@@ -4973,6 +5090,8 @@ final class LiveRun: Identifiable {
     /// Set when Claude Code is driving this run instead of Aviary.
     private(set) var claudeCode: ClaudeCodeDriver?
     var isClaudeCode: Bool { claudeCode != nil }
+    private(set) var museCode: MuseCodeDriver?
+    var isMuseCode: Bool { museCode != nil }
 
     /// A service-backed run is an attachment to Work owned by a Work Host.  The bridge is
     /// intentionally separate from both process-owned drivers so a GUI disconnect cannot
@@ -5236,6 +5355,21 @@ final class LiveRun: Identifiable {
         self.title = "New run"
     }
 
+    init(museCode driver: MuseCodeDriver, cwd: String, modelLabel: String,
+         config: RunConfiguration? = nil) {
+        self.engine = EngineLocation(kind: .fork, path: "muse", version: "MSP",
+                                     note: "Muse Code owns the agent loop and tools")
+        let runConfig = config ?? RunConfiguration(cwd: cwd, identity: driver.identity)
+        self.config = runConfig
+        self.museCode = driver
+        self.sessionID = driver.sessionID
+        self.sessionFile = driver.sessionFile?.path
+        self.modelLabel = modelLabel
+        self.thinkingLevel = runConfig.thinkingLevel
+        self.title = "New run"
+        self.draft = driver.savedDraft ?? ""
+    }
+
     /// Rehydrate a GUI row from a durable Work-service attachment.  `cwd` is deliberately
     /// optional and is used only for the co-located launcher; remote reconstruction passes an
     /// empty value and displays the opaque workspace label instead.
@@ -5318,6 +5452,7 @@ final class LiveRun: Identifiable {
         guard !draftPersistenceFrozen else { return }
         guard draft != text else { return }
         draft = text
+        if let museCode { _ = museCode.saveDraft(text) }
         guard let draftPersistence else { return }
         draftRequiresPersistence = true
         draftContentRevision &+= 1
@@ -5618,6 +5753,36 @@ final class LiveRun: Identifiable {
                 self.publish(claudeCode.commandNotice, to: \.commandNotice)
                 self.publish(await claudeCode.commandState(), to: \.commandState)
                 if claudeCode.hasExited { break }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+    }
+
+    func startMuseCode(prompt: String) {
+        guard let museCode else { return }
+        if !prompt.isEmpty { title = String(prompt.prefix(60)) }
+        museCode.start(prompt: prompt)
+        // Mirrored onto this run exactly as the in-house driver is, so every view that reads
+        // `items`, `isStreaming` and `usage` keeps working without knowing which engine — the
+        // same reason all three write one transcript format.
+        mirror = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                self.publish(museCode.items, to: \.items)
+                if let resolved = museCode.resolvedInput {
+                    museCode.resolvedInput = nil
+                    if self.draft == resolved.submitted { self.setDraft(resolved.remaining) }
+                }
+                self.publish(museCode.isStreaming, to: \.isStreaming)
+                self.publish(museCode.hasExited, to: \.hasExited)
+                self.publish(museCode.usage, to: \.usage)
+                self.publish(museCode.sessionID, to: \.sessionID)
+                self.publish(museCode.sessionFile?.path, to: \.sessionFile)
+                self.publish(
+                    museCode.initialPromptDelivered, to: \.initialPromptDelivered)
+                self.publish(museCode.errorBanner, to: \.errorBanner)
+                self.publish(museCode.commandNotice, to: \.commandNotice)
+                self.publish(await museCode.commandState(), to: \.commandState)
+                if museCode.hasExited { break }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
         }
@@ -6328,6 +6493,13 @@ final class LiveRun: Identifiable {
                 return .rejected(serviceBridge.errorBanner ?? "Work service unavailable")
             }
         }
+        if let museCode {
+            guard requiredDelivery != .steerNext, !museCode.isStreaming else {
+                commandNotice = .warning("Muse is working. Wait for this turn to finish before sending another message.")
+                return .rejected("Muse turn still active")
+            }
+            return await museCode.send(text)
+        }
         if let claudeCode {
             // No steering. Claude Code owns the turn boundary and will not take an injection
             // mid-turn, so a message sent now would either be lost or arrive as a second
@@ -6470,6 +6642,7 @@ final class LiveRun: Identifiable {
         }
         if let inHouse { return .session(await inHouse.cancel(scope: scope)) }
         if let claudeCode { return .session(await claudeCode.cancel(scope: scope)) }
+        if let museCode { return await museCode.cancel(scope: scope) }
         if let serviceBridge {
             do {
                 let receipt = try await serviceBridge.cancel(scope: scope)
@@ -6563,9 +6736,9 @@ final class LiveRun: Identifiable {
             modelLabel = label
             return
         }
-        if isClaudeCode {
+        if isClaudeCode || isMuseCode {
             appendLocalNote(
-                "Claude Code owns the loop for this run and takes its model at launch, so it "
+                "This agent owns its loop and takes its model at launch, so it "
                     + "cannot be changed mid-session. Start a new run to use \(label).")
             return
         }
@@ -6762,12 +6935,27 @@ final class LiveRun: Identifiable {
 
     /// Detach this GUI from the service connection without sending an End command.
     func disconnect() async {
+        if let museCode {
+            await museCode.disconnect()
+            mirror?.cancel()
+            mirror = nil
+            return
+        }
         guard serviceBridge != nil else { return }
         mirror?.cancel()
         mirror = nil
     }
 
     private func performStop() async {
+        if let museCode {
+            await museCode.stop()
+            mirror?.cancel()
+            hasExited = museCode.hasExited
+            isStreaming = museCode.isStreaming
+            commandState = await museCode.commandState()
+            errorBanner = museCode.errorBanner
+            return
+        }
         if let claudeCode {
             await claudeCode.stop()
             mirror?.cancel()

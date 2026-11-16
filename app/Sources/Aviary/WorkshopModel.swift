@@ -238,7 +238,7 @@ extension AppModel {
         let first: String?
         if resume == nil {
             first = bootstrapPrompt(repoRoot: repoRoot) + "\n\n---\n\n" + message
-        } else if engineChoice == .claudeCode {
+        } else if engineChoice == .claudeCode || engineChoice == .museCode {
             // Claude Code cannot be cold-reopened by Aviary, so this path creates a fresh
             // process and still needs this request as its first prompt.
             first = message
@@ -581,6 +581,8 @@ extension AppModel {
         switch engineChoice {
         case .claudeCode:
             return "claude-code/\(claudeCodeModel) (set in the engine picker)"
+        case .museCode:
+            return "muse-code/\(museCodeModel) · fresh Muse conversation"
         case .inHouse:
             guard let reference = workshopModelReference else {
                 return "no startable model configured"
@@ -602,6 +604,12 @@ extension AppModel {
     /// when the picker said otherwise — the last place that ignored the picker.
     private func startWorkshopRun(repoRoot: URL, resume: String?, firstPrompt: String?) {
         switch engineChoice {
+        case .museCode:
+            if startMuseCodeRun(cwd: repoRoot.path, model: museCodeModel, effort: nil,
+                                prompt: firstPrompt ?? bootstrapPrompt(repoRoot: repoRoot),
+                                title: "Workshop") {
+                workshopRunID = runs.last?.id
+            }
         case .claudeCode:
             // The workshop's whole working method is one long-lived session it keeps returning
             // to, and a driven session cannot be resumed from Aviary's side — Claude Code owns

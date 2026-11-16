@@ -3,6 +3,15 @@ import Foundation
 // MARK: - Usage
 
 public struct Usage: Sendable, Hashable, Codable {
+    /// Only a validated cumulative observation replaces a transcript aggregate.
+    static func recordedSnapshot(_ record: JSONValue) -> Usage? {
+        guard record["source"]?.stringValue == "muse-code",
+              let raw = record["usageSnapshot"]?.stringValue?.data(using: .utf8),
+              let usage = try? JSONDecoder().decode(Usage.self, from: raw),
+              (try? usage.validateForTranscript()) != nil else { return nil }
+        return usage
+    }
+
     /// Whether a numeric projection is exact, a known floor, absent, or from a record written
     /// before Aviary retained accounting evidence. `neutral` is only the additive identity.
     public enum Completeness: String, Sendable, Hashable, Codable {
@@ -1053,6 +1062,13 @@ public enum SessionParser {
                     // remain available in the raw JSONL for recovery and diagnostics but must not
                     // create empty custom rows in the human-facing transcript.
                     if ctype == "aviary.command-intent.v1" { continue }
+                    // Muse reminder children are host housekeeping, not conversation turns.
+                    // Their metadata remains in the journal for the raw inspector.
+                    if ctype == "aviary.muse.housekeeping.v1" { continue }
+                    if ctype == "aviary.usage-snapshot.v1" {
+                        if let usage = Usage.recordedSnapshot(v) { t.usage = usage }
+                        continue
+                    }
                     if ctype == "aviary.outcome" {
                         let state = v["outcomeState"]?.stringValue
                             ?? msg["outcomeState"]?.stringValue

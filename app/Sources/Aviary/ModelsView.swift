@@ -5,16 +5,21 @@ import AviaryCore
 /// Providers, models, and whether they will actually work.
 ///
 /// The centrepiece here is credential resolution. The harness resolves a provider's
-/// `apiKey` field client-side and accepts three forms — a `!command`, a bare
+/// `apiKey` field client-side and accepts a scoped `@secret:name` reference, a `!command`, a bare
 /// environment-variable name, or a literal. When a named variable is *absent* it does not
 /// error: it sends the variable's own name as the credential, and the provider answers 401
 /// with a message that reads like a typo in the config. This screen resolves each
-/// expression the same way and says out loud which of the three happened.
+/// expression the same way and identifies the source without revealing the credential.
 struct ModelsView: View {
     @Environment(AppModel.self) private var model
     @State private var selectedProviderID: String?
     @State private var resolutions: [String: ApiKeyResolution] = [:]
     @State private var modelSearch = ""
+    private enum SecretSheet: String, Identifiable {
+        case all, grok
+        var id: String { rawValue }
+    }
+    @State private var secretSheet: SecretSheet?
 
     var body: some View {
         HSplitView {
@@ -26,6 +31,11 @@ struct ModelsView: View {
         .task { await resolveAll() }
         .onChange(of: model.modelsConfig.providers.count) { _, _ in
             Task { await resolveAll() }
+        }
+        .sheet(item: $secretSheet, onDismiss: {
+            Task { await resolveAll() }
+        }) { sheet in
+            LocalSecretsView(grokPreset: sheet == .grok).environment(model)
         }
     }
 
@@ -56,6 +66,16 @@ struct ModelsView: View {
             .padding(.vertical, 7)
 
             Divider()
+
+            HStack(spacing: 8) {
+                Button { secretSheet = .all } label: {
+                    Label("Secrets", systemImage: "key.horizontal")
+                }
+                Button { secretSheet = .grok } label: {
+                    Label("Add Grok", systemImage: "plus")
+                }
+                Spacer(minLength: 0)
+            }.controlSize(.small).padding(10)
 
             List(selection: $selectedProviderID) {
                 SwiftUI.Section("Configured in models.json") {
@@ -140,9 +160,9 @@ struct ModelsView: View {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 14) {
                     StatTile(
-                        label: "reachable models",
+                        label: "available models",
                         value: "\(model.runtimeModels.count)",
-                        caption: "backed by credentials that resolve",
+                        caption: "configured credentials or sign-in",
                         symbol: "checkmark.circle.fill", tint: Design.success, emphasis: true)
                     Divider().frame(height: 46)
                     StatTile(
@@ -152,8 +172,8 @@ struct ModelsView: View {
                         symbol: "server.rack")
                     Divider().frame(height: 46)
                     StatTile(
-                        label: "credential problems", value: "\(problemCount)",
-                        caption: problemCount == 0 ? "all keys resolve" : "would 401 as configured",
+                        label: "credential setup", value: "\(problemCount)",
+                        caption: problemCount == 0 ? "no configuration issues found" : "needs attention before use",
                         symbol: "key.fill",
                         tint: problemCount == 0 ? Design.success : Design.danger)
                 }
@@ -175,10 +195,10 @@ struct ModelsView: View {
                 ModelOrderCard()
 
                 if !model.modelCatalog.unreachable.isEmpty {
-                    Card("Configured but unreachable", symbol: "exclamationmark.triangle") {
+                    Card("Credential setup needed", symbol: "exclamationmark.triangle") {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("These providers are in models.json but their credentials did "
-                                + "not resolve, so their models are not offered anywhere.")
+                            Text("These providers are configured, but their credential settings "
+                                + "are unavailable or incomplete. Their models are not offered yet.")
                                 .font(.system(size: 11)).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                             ForEach(model.modelCatalog.unreachable) { p in
@@ -247,7 +267,8 @@ struct ModelsView: View {
     }
 
     private func resolve(_ p: ProviderSpec) async {
-        resolutions[p.id] = await ApiKeyResolver.resolve(p.apiKeyExpression)
+        resolutions[p.id] = await ApiKeyResolver.resolve(
+            p.apiKeyExpression, home: model.home, providerID: p.id, origin: p.baseURL)
     }
 }
 
@@ -309,6 +330,7 @@ struct ProviderRow: View {
         case .command: return "terminal"
         case .environmentVariable: return "dollarsign"
         case .literal: return "text.quote"
+        case .secretReference: return "key.horizontal"
         }
     }
 }
@@ -392,7 +414,11 @@ struct ProviderDetail: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
-                .disabled(model.testingProviders.contains(provider.id) || provider.models.isEmpty)
+                .disabled(model.testingProviders.contains(provider.id) || provider.models.isEmpty
+                    || provider.id == "muse-code")
+                .help(provider.id == "muse-code"
+                    ? "Muse owns its agent loop. Start a Muse Code chat from Chats to try it."
+                    : "Send a small provider request")
 
                 if provider.models.count > 1 {
                     Picker("", selection: Binding(
@@ -404,7 +430,11 @@ struct ProviderDetail: View {
                     .labelsHidden().controlSize(.small).frame(maxWidth: 220)
                 }
 
-                Button("Re-resolve key") { onResolve() }
+                Button(provider.id == "muse-code" ? "Refresh connection" : "Re-resolve key") {
+                    if provider.id == "muse-code" {
+                        Task { await model.refreshRuntimeModels() }
+                    } else { onResolve() }
+                }
                     .buttonStyle(.bordered).controlSize(.small)
                 Spacer()
             }
@@ -415,7 +445,7 @@ struct ProviderDetail: View {
         Card("Credential", symbol: "key.fill") {
             VStack(alignment: .leading, spacing: 8) {
                 if let expr = provider.apiKeyExpression {
-                    DetailRow(label: "Expression", value: expr, mono: true)
+                    DetailRow(label: "Source", value: credentialSource(expr), mono: true)
                     if let form = provider.keyForm {
                         DetailRow(label: "Interpreted as", value: form.label)
                     }
@@ -469,13 +499,24 @@ struct ProviderDetail: View {
         }
     }
 
+    private func credentialSource(_ expression: String) -> String {
+        switch ApiKeyForm.classify(expression) {
+        case .literal: return "Literal in models.json (value hidden)"
+        case .command: return "Local shell command (contents hidden)"
+        default: return expression
+        }
+    }
+
     private func outcomeTitle(_ r: ApiKeyResolution) -> String {
         switch r.outcome {
         case .resolved: return "Resolves"
+        case .secretReferenceStored: return "Saved in Keychain"
         case .fellBackToLiteralName: return "Will send the variable name as the key"
         case .commandFailed: return "The command failed"
         case .empty: return "Resolved to nothing"
         case .noKeyConfigured: return "No credential configured"
+        case .secretReferenceInvalid: return "Invalid secret reference"
+        case .secretReferenceUnavailable: return "Local credential unavailable"
         }
     }
 

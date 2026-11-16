@@ -133,7 +133,7 @@ public actor SessionCatalog {
     /// The cache keys on file size and mtime, which correctly detects a *changed
     /// transcript* and completely misses a changed *parser*. Without this, improving how
     /// titles are extracted silently does nothing for every session already indexed.
-    static let schemaVersion = 5
+    static let schemaVersion = 6
 
     private let home: AgentHome
     private let trashItem: @Sendable (URL) throws -> Void
@@ -384,6 +384,8 @@ public actor SessionCatalog {
                         ? v["customType"]?.stringValue
                         : msg["customType"]?.stringValue) ?? ""
                     if ctype == "agent_message" { s.counts.agentMessages += 1 }
+                    if ctype == "aviary.usage-snapshot.v1",
+                       let usage = Usage.recordedSnapshot(v) { s.usage = usage }
                 default:
                     break
                 }

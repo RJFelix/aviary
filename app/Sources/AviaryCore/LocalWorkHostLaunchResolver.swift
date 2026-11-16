@@ -21,6 +21,9 @@ public struct LocalWorkHostLaunchResolver: Sendable {
         public let models: ModelsConfig
         public let auth: AuthInfo
         public let environment: [String: String]
+        /// Metadata-only snapshot of the local secure credentials available to this host.
+        /// Production wiring creates a fresh resolver when it refreshes host configuration.
+        public let localSecrets: [LocalSecretMetadata]
         public let preferences: ModelPreferences
         public let serviceActorID: String
         public let actorKind: String
@@ -37,6 +40,7 @@ public struct LocalWorkHostLaunchResolver: Sendable {
             models: ModelsConfig? = nil,
             auth: AuthInfo? = nil,
             environment: [String: String]? = nil,
+            localSecrets: [LocalSecretMetadata]? = nil,
             preferences: ModelPreferences? = nil,
             serviceActorID: String = "aviaryd",
             actorKind: String = "work-host"
@@ -51,6 +55,7 @@ public struct LocalWorkHostLaunchResolver: Sendable {
             self.models = models ?? ModelsConfig.load(home: home, auth: capturedAuth)
             self.auth = capturedAuth
             self.environment = environment ?? ProcessEnvironment.shared.snapshot
+            self.localSecrets = localSecrets ?? (try? LocalSecretStore(home: home).list()) ?? []
             self.preferences = preferences ?? ModelPreferencesStore().load()
             self.serviceActorID = serviceActorID
             self.actorKind = actorKind
@@ -311,8 +316,18 @@ public struct LocalWorkHostLaunchResolver: Sendable {
             model: model,
             home: configuration.home,
             sessionID: manifest.identity.session.sessionID,
-            resolveSecret: { [environment = configuration.environment] expression in
-                Self.resolveCapturedSecret(expression, environment: environment)
+            resolveSecret: { [
+                environment = configuration.environment,
+                home = configuration.home,
+                providerID = providerSpec.id,
+                origin = providerSpec.baseURL,
+            ] expression in
+                await Self.resolveCapturedSecret(
+                    expression,
+                    environment: environment,
+                    home: home,
+                    providerID: providerID,
+                    origin: origin)
             })
         let provider: any ChatProvider
         switch providerResult {
@@ -449,6 +464,7 @@ public struct LocalWorkHostLaunchResolver: Sendable {
                 config: configuration.models,
                 auth: configuration.auth,
                 environment: configuration.environment,
+                localSecrets: configuration.localSecrets,
                 preferences: configuration.preferences))
         guard case .success(let selection) = result else { throw Error.modelUnavailable }
         return selection
@@ -463,6 +479,7 @@ public struct LocalWorkHostLaunchResolver: Sendable {
                 config: configuration.models,
                 auth: configuration.auth,
                 environment: configuration.environment,
+                localSecrets: configuration.localSecrets,
                 preferences: configuration.preferences))
         guard case .success(let selection) = result else { throw Error.modelUnavailable }
         return selection
@@ -582,8 +599,12 @@ public struct LocalWorkHostLaunchResolver: Sendable {
     }
 
     private static func resolveCapturedSecret(
-        _ expression: String?, environment: [String: String]
-    ) -> String? {
+        _ expression: String?,
+        environment: [String: String],
+        home: AgentHome,
+        providerID: String,
+        origin: String?
+    ) async -> String? {
         guard let expression, !expression.isEmpty else { return nil }
         switch ApiKeyForm.classify(expression) {
         case .environmentVariable(let name):
@@ -595,6 +616,13 @@ public struct LocalWorkHostLaunchResolver: Sendable {
             // Command-form credentials are intentionally not eligible for this host-local
             // resolver.  InHouseModelResolver rejects them before this closure is called.
             return nil
+        case .secretReference:
+            do {
+                return try LocalSecretStore(home: home).resolve(
+                    expression: expression, providerID: providerID, origin: origin ?? "")
+            } catch {
+                return nil
+            }
         }
     }
 

@@ -42,7 +42,43 @@ payloads), `--budget <tokens>` and `--minutes <n>` (a goal the agent can see and
 `--quiet`. A prompt starting with `/name` expands a prompt template. In the GUI, the Chats view's
 launcher picks between the in-house engine and Claude Code driving.
 
-What the agent gets: one tool, `python`, running in a persistent interpreter where variables
+### Grok and local provider credentials
+
+Open **Models → Add Grok**, enter the API key in the secure field, select the model ID,
+and save. The key goes into this Mac's Keychain; `models.json` contains only an
+`@secret:grok` reference. **Models → Secrets** manages these credentials. Each entry is
+limited to a provider ID and HTTPS origin; new entries authorize the signed Aviary app
+and its bundled Work Host helper. Saving configuration does not make a paid API request.
+If macOS still requires approval for the helper, use **Secrets → Authorize agent service…**
+and choose **Always Allow** for `aviaryd`. Aviary verifies access in a fresh noninteractive
+helper before reporting success. The key never travels through this authorization command.
+Model listing checks scoped credential metadata without decrypting the key; actual requests
+still require Keychain access in the process executing them.
+Development-build caveat: this Mac's self-signed binaries receive hash-specific Keychain
+partition approvals, so replacing the helper can require authorization again even with the
+same signing certificate. Always Allow has been verified for the approved build, not across
+rebuilds. No broad Keychain access override is applied.
+
+Grok uses the native xAI Responses client with streaming, function tools, and full
+conversation replay (`store: false`). Opaque encrypted reasoning replay is not yet supported.
+Local secrets currently serve provider authentication, not tool credential injection.
+They are not a sandbox boundary against unrestricted local agent code; Linux has no
+plaintext Keychain fallback.
+
+Muse Code is available in **New chat → Provider → Muse Code**. Choose a model from the
+installed host's catalog (including Muse Spark 1.2 and 1.3) and use the existing `muse` account login.
+Aviary drives the native `muse serve` protocol directly; it has no Node SDK dependency.
+Muse owns its tools and approvals. Aviary displays streaming replies, thinking summaries,
+tool results, approval choices, and host-reported usage, and saves its own chat transcript.
+Each new Muse chat has a detached local worker. Quitting Aviary disconnects the GUI, not Muse;
+reopening reattaches to running agents. **End agent session** stops that worker, and **Resume chat**
+uses Muse's native saved conversation in a new worker. Resume does not restore running tools or
+process state, and unresolved native requests are reported rather than automatically answered.
+Unsent drafts and uncertain message handoffs are retained locally; reconnect never resends them.
+Older transcripts without a saved native Muse binding remain viewable but cannot be resumed.
+This is a distinct local engine, not a direct completion API or a remote Work-service attachment.
+
+What Aviary's in-house agent gets: one tool, `python`, running in a persistent interpreter where variables
 survive between calls. Inside it, `sh(command)` with a working directory and environment that
 *persist* across calls, `spawn(prompt)` for sub-agents, `conversation(limit)` to read its own
 history, and `remember`/`recall` for things worth keeping. Skills are ranked against the prompt

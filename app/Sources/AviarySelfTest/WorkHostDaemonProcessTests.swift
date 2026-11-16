@@ -851,7 +851,7 @@ func test_workHostDaemonRefusesShutdownWhenIdleProjectionCannotBeReconstructed()
 /// cwd, or silently promoting the daemon process cwd into the host catalog. Provider execution is
 /// covered by the deterministic subprocess fixture below; this proof deliberately exercises normal
 /// mode with no explicit --workspace registration request.
-func test_aviarydNormalModeServesDurableCatalogWithoutCwdPromotion() async throws {
+func test_aviarydNormalModeServesDurableCatalogWithoutCwdPromotion(includeLateProvider: Bool = false) async throws {
     let testExecutable = URL(fileURLWithPath: CommandLine.arguments[0])
     let executable = testExecutable.deletingLastPathComponent().appending(path: "aviaryd")
     guard FileManager.default.isExecutableFile(atPath: executable.path) else {
@@ -909,6 +909,28 @@ func test_aviarydNormalModeServesDurableCatalogWithoutCwdPromotion() async throw
     let page = try await client.listWorks(WorkServiceListRequest(
         client: ClientRef("normal-mode-client")))
     XCTAssertTrue(page.works.isEmpty)
+    if includeLateProvider {
+        // Change configuration after the real daemon has started. No network request or
+        // Keychain access: Create retains a Run-free template, never starts the provider.
+        let config: JSONValue = .object(["providers": .object([
+            "late-provider": .object([
+                "api": "openai-completions", "baseUrl": "https://provider-fixture.invalid/v1",
+                "apiKey": "fixture-not-a-real-key",
+                "models": .array([.object(["id": "late-model"])])
+            ])
+        ])])
+        try JSONEncoder().encode(config).write(to: fixture.home.modelsFile, options: .atomic)
+        let created = try await client.createWork(WorkServiceCreateWorkRequest(
+            client: ClientRef("normal-mode-client"), commandID: "late-provider-create",
+            causalControlCursor: handshake.controlCursor,
+            configuration: WorkServiceWorkConfiguration(providerID: "late-provider", modelID: "late-model",
+                workspaceID: registeredWorkspace.workspaceID)))
+        XCTAssertEqual(created.work.configuration.modelID, "late-model")
+        XCTAssertNil(created.work.currentRun)
+        XCTAssertTrue(process.isRunning)
+        XCTAssertEqual(try WorkHostDaemonEndpointPublisher.discover(layout: layout)?.hostInstance,
+                       published.hostInstance)
+    }
     await client.close()
     try await Task.sleep(nanoseconds: 100_000_000)
     XCTAssertTrue(process.isRunning)
@@ -1611,6 +1633,9 @@ let casesWorkHostDaemonProcess: [Case] = [
     }),
     ("phase3 Work Host daemon: normal subprocess preserves durable catalog without cwd promotion", {
         try await test_aviarydNormalModeServesDurableCatalogWithoutCwdPromotion()
+    }),
+    ("provider setup: running daemon observes new provider without restart", {
+        try await test_aviarydNormalModeServesDurableCatalogWithoutCwdPromotion(includeLateProvider: true)
     }),
     ("phase3 Work Host daemon: real subprocess survives client exit and second client attaches", {
         try await test_aviarydSubprocessSurvivesClientExitAndSecondClientAttaches()

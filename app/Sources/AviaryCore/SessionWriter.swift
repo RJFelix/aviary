@@ -176,8 +176,9 @@ public actor SessionWriter {
     /// This is reserved for the narrow crash window where the canonical Work journal already
     /// contains the exact trailing `run.started` marker (or a prior process has written this
     /// Run's flat boundary) but the Start command was never accepted. The caller must prove that
-    /// boundary from the native journal before choosing this initializer; it is not a general
-    /// transcript-resume API.
+    /// boundary from the native journal before choosing this initializer. A hosted engine may
+    /// also use it for an exact producer-to-worker handoff after closing the initial writer
+    /// and acquiring its exclusive lifetime lease. It is not a general transcript-resume API.
     public init(
         home: AgentHome,
         reopeningWithoutRunBoundary sessionID: String,
@@ -537,6 +538,20 @@ public actor SessionWriter {
         ]
         if let details { message["details"] = details }
         try append(type: "message", fields: ["message": .object(message)])
+    }
+
+    /// A driven host reports session-cumulative usage independently of its message items.
+    /// This replaces the aggregate at this point; it is not another billable message.
+    public func appendUsageSnapshot(_ usage: Usage, source: String) throws {
+        try usage.validateForTranscript()
+        let raw = try JSONEncoder().encode(usage)
+        try append(type: "custom_message", fields: [
+            "customType": .string("aviary.usage-snapshot.v1"),
+            "role": .string("custom"),
+            "source": .string(source),
+            // Keep exact Int counters through JSONValue's Double-backed envelope.
+            "usageSnapshot": .string(String(decoding: raw, as: UTF8.self)),
+        ])
     }
 
     /// Persist a terminal run outcome independently of assistant messages. A provider can fail

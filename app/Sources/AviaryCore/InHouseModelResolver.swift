@@ -110,17 +110,22 @@ public enum InHouseModelResolver {
         public let config: ModelsConfig
         public let auth: AuthInfo
         public let environment: [String: String]
+        /// Metadata-only local credentials captured by the host.  Values never participate in
+        /// selection or its digest.
+        public let localSecrets: [LocalSecretMetadata]
         public let preferences: ModelPreferences
 
         public init(
             config: ModelsConfig,
             auth: AuthInfo = AuthInfo(),
             environment: [String: String] = [:],
+            localSecrets: [LocalSecretMetadata] = [],
             preferences: ModelPreferences = ModelPreferences()
         ) {
             self.config = config
             self.auth = auth
             self.environment = environment
+            self.localSecrets = localSecrets
             self.preferences = preferences
         }
     }
@@ -226,6 +231,11 @@ public enum InHouseModelResolver {
                   }) else {
                 return .failure(.invalidConfiguration)
             }
+            if let expression = provider.apiKeyExpression,
+               case .secretReference(let name) = ApiKeyForm.classify(expression),
+               !LocalSecretStore.isValidName(name) {
+                return .failure(.invalidConfiguration)
+            }
             var modelIDs = Set<String>()
             for model in provider.models {
                 guard model.providerID == provider.id,
@@ -282,6 +292,17 @@ public enum InHouseModelResolver {
             // A command requires an effectful shell and cannot be resolved from a captured
             // environment alone. Failing closed here prevents restart-time selection drift.
             return false
+        case .secretReference(let name):
+            guard LocalSecretStore.isValidName(name),
+                  let rawOrigin = provider.baseURL,
+                  let origin = LocalSecretStore.normalizedHTTPSOrigin(rawOrigin) else {
+                return false
+            }
+            return inputs.localSecrets.contains {
+                $0.name == name
+                    && $0.allowedProviderID == provider.id
+                    && $0.allowedOrigin == origin
+            }
         }
     }
 
@@ -378,6 +399,16 @@ public enum InHouseModelResolver {
                 builder.append("literal-present")
             case .command:
                 builder.append("command-unresolved")
+            case .secretReference(let name):
+                builder.append("secret-reference")
+                builder.append(name)
+                let available = inputs.localSecrets.contains {
+                    $0.name == name
+                        && $0.allowedProviderID == provider.id
+                        && $0.allowedOrigin == (provider.baseURL.flatMap(
+                            LocalSecretStore.normalizedHTTPSOrigin) ?? "invalid-origin")
+                }
+                builder.append(available)
             }
         } else {
             builder.append("no-key")

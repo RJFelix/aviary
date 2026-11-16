@@ -117,7 +117,8 @@ public enum ModelCatalogBuilder {
         config: ModelsConfig,
         auth: AuthInfo?,
         credentialed: Set<String>,
-        preferences: ModelPreferences
+        preferences: ModelPreferences,
+        museModels: [ModelSpec] = []
     ) -> ModelCatalog {
         var out = ModelCatalog()
 
@@ -135,6 +136,16 @@ public enum ModelCatalogBuilder {
         if !candidates.contains(where: { $0.id == claudeCode.id }) {
             candidates.append(claudeCode)
         }
+        if !museModels.isEmpty {
+            candidates.removeAll { $0.id == "muse-code" }
+            var seenMuseModels = Set<String>()
+            candidates.append(ProviderSpec(
+                id: "muse-code", name: "Muse Code", baseURL: nil, api: "muse-msp",
+                apiKeyExpression: nil, authHeader: nil, headers: [:],
+                models: museModels.filter { $0.providerID == "muse-code" && seenMuseModels.insert($0.id).inserted },
+                isBuiltIn: true,
+                hasStoredAuth: credentialed.contains("muse-code"), authKind: "Muse account"))
+        }
 
         for provider in candidates {
             // A built-in is reachable when its OAuth credentials are stored; a configured one
@@ -144,8 +155,8 @@ public enum ModelCatalogBuilder {
             // from `auth.json`; Claude Code's credential lives in the `claude` binary's own
             // keychain entry, which Aviary cannot and should not read — so the caller resolves
             // it and passes it in.
-            let usable = provider.id == "claude-code"
-                ? credentialed.contains("claude-code")
+            let usable = provider.id == "claude-code" || provider.id == "muse-code"
+                ? credentialed.contains(provider.id)
                 : provider.isBuiltIn
                     ? (auth?.providers.contains(provider.id) ?? false)
                     : credentialed.contains(provider.id)
@@ -180,13 +191,17 @@ public enum ModelCatalogBuilder {
         return out
     }
 
-    /// Which providers have credentials that actually resolve.
+    /// Which providers have configured credentials. Local secure references use scoped
+    /// metadata only, like stored OAuth: listing models must not decrypt provider keys.
     ///
     /// Resolving means running the `!command` form or reading the environment variable, which is
     /// why this is async and separate from `build`. A provider with stored OAuth counts even
     /// without an `apiKey` expression.
     public static func credentialedProviders(
-        config: ModelsConfig, auth: AuthInfo?
+        config: ModelsConfig,
+        auth: AuthInfo?,
+        home: AgentHome? = nil,
+        secretStore: LocalSecretStore? = nil
     ) async -> Set<String> {
         var out: Set<String> = []
         for provider in config.providers {
@@ -194,7 +209,21 @@ public enum ModelCatalogBuilder {
                 out.insert(provider.id)
                 continue
             }
-            if let secret = await resolveSecret(provider.apiKeyExpression), !secret.isEmpty {
+            if let expression = provider.apiKeyExpression,
+               case .secretReference(let name) = ApiKeyForm.classify(expression) {
+                if let home, let origin = provider.baseURL,
+                   (try? (secretStore ?? LocalSecretStore(home: home)).hasScopedMetadata(
+                    name: name, providerID: provider.id, origin: origin)) == true {
+                    out.insert(provider.id)
+                }
+                continue
+            }
+            if let secret = await resolveSecret(
+                provider.apiKeyExpression,
+                home: home,
+                providerID: provider.id,
+                origin: provider.baseURL,
+                secretStore: secretStore), !secret.isEmpty {
                 out.insert(provider.id)
             }
         }
@@ -203,7 +232,13 @@ public enum ModelCatalogBuilder {
 
     /// The same resolution the harness does. Kept here rather than in the app target so the
     /// catalogue does not depend on the UI layer.
-    public static func resolveSecret(_ expression: String?) async -> String? {
+    public static func resolveSecret(
+        _ expression: String?,
+        home: AgentHome? = nil,
+        providerID: String? = nil,
+        origin: String? = nil,
+        secretStore: LocalSecretStore? = nil
+    ) async -> String? {
         guard let expression, !expression.isEmpty else { return nil }
         switch ApiKeyForm.classify(expression) {
         case .command(let cmd):
@@ -215,6 +250,13 @@ public enum ModelCatalogBuilder {
             return ProcessEnvironment.shared.value(name)
         case .literal:
             return expression
+        case .secretReference:
+            return await ApiKeyResolver.resolveActual(
+                expression,
+                home: home,
+                providerID: providerID,
+                origin: origin,
+                secretStore: secretStore)
         }
     }
 }

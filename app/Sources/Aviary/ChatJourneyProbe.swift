@@ -50,12 +50,12 @@ enum ChatJourneyProbe {
         ]
         try require(
             LauncherSelection.provider(
-                claudeCode: true, preferred: "litellm", fallback: nil,
+                route: .claudeCode, preferred: "litellm", fallback: nil,
                 providers: ["litellm", "claude-code"]) == "claude-code",
             "Claude Code selection retained an incompatible provider")
         try require(
             LauncherSelection.provider(
-                claudeCode: false, preferred: "claude-code", fallback: "litellm",
+                route: .direct, preferred: "claude-code", fallback: "litellm",
                 providers: ["claude-code", "litellm"]) == "litellm",
             "in-house selection retained the Claude Code provider")
         try require(
@@ -163,6 +163,28 @@ enum ChatJourneyProbe {
             selection.route == .direct && selection.providerID == "other-direct"
                 && selection.modelID == "other-model",
             "explicit direct-provider selection did not produce a coherent route and model")
+        let museModels = models + ["muse-spark-1.2", "muse-other"].map {
+            ModelSpec(rpc: .object(["id": .string($0), "provider": .string("muse-code")]))
+        }
+        selection = selection.selectingProvider("muse-code", defaultProviderID: "litellm",
+            defaultModelID: "direct-model", fallbackClaudeCodeModelID: "sonnet", models: museModels)
+        try require(selection.route == .museCode && selection.modelID == "muse-spark-1.2",
+                    "Muse provider was routed into the in-house engine")
+        selection = selection.selectingModel("muse-other", models: museModels)
+        selection = selection.reconciling(defaultProviderID: "litellm",
+            defaultModelID: "direct-model", fallbackClaudeCodeModelID: "sonnet", models: models)
+        try require(selection.route == .museCode && selection.providerID.isEmpty && selection.modelID.isEmpty,
+                    "missing Muse catalogue silently switched engines")
+        selection = selection.reconciling(defaultProviderID: "litellm",
+            defaultModelID: "direct-model", fallbackClaudeCodeModelID: "sonnet", models: museModels)
+        try require(selection.modelID == "muse-other", "Muse selection was not restored")
+        selection = selection.selectingRoute(.direct, defaultProviderID: "litellm",
+            defaultModelID: "direct-model", fallbackClaudeCodeModelID: "sonnet", models: museModels)
+        try require(selection.providerID == "other-direct" && selection.modelID == "other-model",
+                    "Muse route overwrote the direct choice")
+        try require(LauncherSelection.provider(route: .direct, preferred: "muse-code", fallback: nil,
+            providers: ["muse-code", "claude-code"]).isEmpty,
+            "driven providers leaked into the in-house route")
     }
 
     @MainActor private static func waitForAttempt(_ model: AppModel, id: UUID) async throws {

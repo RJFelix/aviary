@@ -8,13 +8,14 @@ enum LiveRunCommandResult: Sendable {
     case session(SessionCommandReceipt)
     case service(WorkServiceCommandReceipt)
     case rejected(String)
+    case unconfirmed(String)
 
     var wasHandedOff: Bool {
         switch self {
         case .session(let receipt): return receipt.wasHandedOff
         case .service(let receipt):
             return receipt.state == .accepted || receipt.state == .duplicate
-        case .rejected: return false
+        case .rejected, .unconfirmed: return false
         }
     }
 
@@ -26,7 +27,7 @@ enum LiveRunCommandResult: Sendable {
         case .session(let receipt): return receipt.isQueued
         case .service(let receipt):
             return receipt.state == .accepted || receipt.state == .duplicate
-        case .rejected: return false
+        case .rejected, .unconfirmed: return false
         }
     }
 
@@ -34,7 +35,7 @@ enum LiveRunCommandResult: Sendable {
         switch self {
         case .session(let receipt): return receipt.delivery.detail
         case .service(let receipt): return receipt.diagnostic
-        case .rejected(let message): return message
+        case .rejected(let message), .unconfirmed(let message): return message
         }
     }
 }

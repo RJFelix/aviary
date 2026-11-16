@@ -15,6 +15,9 @@ enum AgentCLI {
 
     static func runIfRequested() {
         let args = ProcessInfo.processInfo.arguments
+        if args.contains("--test-provider") {
+            runProviderTest(value(of: "--test-provider", in: args))
+        }
         if args.contains("--codex-login") {
             runCodexLogin(paste: args.contains("--paste"))
         }
@@ -51,6 +54,28 @@ enum AgentCLI {
             RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
         }
         exit(0)
+    }
+
+    /// Same bounded completion probe as Models; no agent context, tools, or credential output.
+    private static func runProviderTest(_ id: String?) -> Never {
+        guard let id, let provider = ModelsConfig.load(home: .default).providers.first(where: { $0.id == id }) else {
+            fail("usage: Aviary --test-provider <configured-provider-id>")
+        }
+        let done = Atomic(false)
+        let succeeded = Atomic(false)
+        Task {
+            _ = await ProcessEnvironment.shared.loadFromLoginShell()
+            let result = await ProviderTester.test(provider: provider, model: provider.models.first, home: .default)
+            note(result.detail)
+            if let status = result.httpStatus { note("HTTP \(status)") }
+            if let completion = result.completion { note(completion) }
+            succeeded.set(result.ok)
+            done.set(true)
+        }
+        while !done.get() {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        exit(succeeded.get() ? 0 : 1)
     }
 
     /// `Aviary --mcp-bridge` — be the MCP server a driven Claude Code talks to.
@@ -345,8 +370,7 @@ enum AgentCLI {
             await fail("The canonical Work journal refused provider construction.")
         }
         let routed = await ChatProviderRouting.makeProvider(
-            spec: providerSpec, model: model, home: home,
-            resolveSecret: { await resolvedSecret($0) })
+            spec: providerSpec, model: model, home: home)
         guard case .success(let provider) = routed else {
             _ = await finishNativeEffect(
                 providerPermit, state: .failed, retrySafety: .unknown,
@@ -358,7 +382,8 @@ enum AgentCLI {
             return
         }
         if providerSpec.api != "openai-codex-responses" {
-            let key = await ApiKeyResolver.resolve(providerSpec.apiKeyExpression)
+            let key = await ApiKeyResolver.resolve(providerSpec.apiKeyExpression,
+                home: home, providerID: providerSpec.id, origin: providerSpec.baseURL)
             // Non-blocking: a provider may legitimately need no key, and refusing to start on
             // a format guess is how a working setup gets called broken.
             if !key.ok { note("credentials: \(key.explanation)") }
@@ -602,22 +627,6 @@ enum AgentCLI {
             }
         }
         return nil
-    }
-
-    /// The actual secret, resolved the same way the harness resolves it.
-    static func resolvedSecret(_ expression: String?) async -> String? {
-        guard let expression, !expression.isEmpty else { return nil }
-        switch ApiKeyForm.classify(expression) {
-        case .command(let cmd):
-            let shell = ProcessEnvironment.shared.value("SHELL") ?? "/bin/zsh"
-            guard case .success(let r) = await Shell.run(shell, ["-c", cmd], timeout: 20), r.ok
-            else { return nil }
-            return r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        case .environmentVariable(let name):
-            return ProcessEnvironment.shared.value(name)
-        case .literal:
-            return expression
-        }
     }
 
     static func value(of flag: String, in args: [String]) -> String? {

@@ -12,11 +12,14 @@ struct AviaryApp: App {
     static let launchedAt = Date()
 
     init() {
+        if let code = LocalSecretKeychainProbe.runIfRequested(arguments: CommandLine.arguments) { exit(code) }
         _ = Self.launchedAt
         AviaryTelemetry.configure(serviceName: "aviary", environment: ProcessInfo.processInfo.environment)
         // Headless modes short-circuit before any scene is created, and exit.
         LiveChatTelemetryProbe.runIfRequested()
         ChatJourneyProbe.runIfRequested()
+        MuseChatProbe.runIfRequested()
+        MuseWorkerLifetimeProbe.runIfRequested()
         ChatEditorProbe.runIfRequested()
         WireInspect.runIfRequested()
         Snapshot.runIfRequested()

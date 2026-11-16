@@ -234,9 +234,21 @@ public enum ApiKeyForm: Sendable, Hashable {
     case environmentVariable(String)
     /// A literal credential sitting in the config file.
     case literal
+    /// A name resolved from Aviary's local secure credential store.  This is deliberately a
+    /// separate form: a missing or invalid reference must never become a literal credential.
+    case secretReference(String)
 
     public static func classify(_ expression: String) -> ApiKeyForm {
         if expression.hasPrefix("!") { return .command(String(expression.dropFirst())) }
+        // Reserve the whole @secret namespace.  A malformed spelling such as "@secret" is
+        // represented by an empty name and is therefore rejected by the secure resolver rather
+        // than silently becoming a literal credential.
+        if expression == "@secret" || expression.hasPrefix("@secret") {
+            guard expression.hasPrefix(LocalSecretStore.referencePrefix) else {
+                return .secretReference("")
+            }
+            return .secretReference(String(expression.dropFirst(LocalSecretStore.referencePrefix.count)))
+        }
         // The harness looks up *any* string in the environment first, so the distinction
         // is about intent. All-caps-with-underscores is unambiguous intent.
         let looksLikeVar = !expression.isEmpty
@@ -249,23 +261,28 @@ public enum ApiKeyForm: Sendable, Hashable {
         case .command: return "Shell command"
         case .environmentVariable: return "Environment variable"
         case .literal: return "Literal value"
+        case .secretReference: return "Aviary secure credential"
         }
     }
 }
 
 public struct ApiKeyResolution: Sendable {
-    public enum Outcome: Sendable {
+    public enum Outcome: Sendable, Equatable {
         case resolved
+        /// The scoped credential is stored; decryption by the executing host is not yet proven.
+        case secretReferenceStored
         /// The killer case: a bare variable name that isn't set, so the harness sends the
         /// *name itself* as the credential and the server answers 401.
         case fellBackToLiteralName(String)
         case commandFailed(String)
         case empty
         case noKeyConfigured
+        case secretReferenceInvalid
+        case secretReferenceUnavailable
 
         public var isProblem: Bool {
             switch self {
-            case .resolved, .noKeyConfigured: return false
+            case .resolved, .secretReferenceStored, .noKeyConfigured: return false
             default: return true
                 }
         }
@@ -293,7 +310,13 @@ public struct ApiKeyResolution: Sendable {
 /// comes from launchd and not your shell. Aviary resolves the same expression through the
 /// login-shell environment it captured at startup, and names the failure out loud.
 public enum ApiKeyResolver {
-    public static func resolve(_ expression: String?) async -> ApiKeyResolution {
+    public static func resolve(
+        _ expression: String?,
+        home: AgentHome? = nil,
+        providerID: String? = nil,
+        origin: String? = nil,
+        secretStore: LocalSecretStore? = nil
+    ) async -> ApiKeyResolution {
         guard let expression, !expression.isEmpty else {
             return ApiKeyResolution(
                 form: nil, outcome: .noKeyConfigured, masked: nil,
@@ -349,12 +372,72 @@ public enum ApiKeyResolver {
                 length: expression.count,
                 explanation: "A literal credential in models.json. Works, but it lives in a "
                     + "plaintext file — prefer an environment variable or the !command form.")
+
+        case .secretReference(let name):
+            guard !name.isEmpty,
+                  let home,
+                  let providerID,
+                  let origin else {
+                return ApiKeyResolution(
+                    form: form, outcome: .secretReferenceInvalid, masked: nil,
+                    explanation: "The secure credential reference is missing its provider scope.")
+            }
+            do {
+                let store = secretStore ?? LocalSecretStore(home: home)
+                guard try store.hasScopedMetadata(
+                    name: name, providerID: providerID, origin: origin) else {
+                    return ApiKeyResolution(
+                        form: form, outcome: .secretReferenceUnavailable, masked: nil,
+                        explanation: "The referenced secure credential is unavailable.")
+                }
+                return ApiKeyResolution(
+                    form: form, outcome: .secretReferenceStored, masked: nil, length: 0,
+                    explanation: "A credential is saved for this provider and server. The agent service must have Keychain access before it can use it; authorize it from Secrets if needed.")
+            } catch {
+                // Keep missing, invalid, provider-mismatched, and origin-mismatched records
+                // indistinguishable to diagnostics.  None may fall through to a literal.
+                return ApiKeyResolution(
+                    form: form, outcome: .secretReferenceUnavailable, masked: nil,
+                    explanation: "The referenced secure credential is unavailable.")
+            }
         }
     }
 
     static func mask(_ s: String) -> String {
         guard s.count > 10 else { return String(repeating: "•", count: s.count) }
         return "\(s.prefix(6))…\(s.suffix(4))"
+    }
+
+    /// Resolve the actual credential only for the in-memory provider construction boundary.
+    /// This value is never returned in ``ApiKeyResolution`` or a diagnostic.
+    public static func resolveActual(
+        _ expression: String?,
+        home: AgentHome? = nil,
+        providerID: String? = nil,
+        origin: String? = nil,
+        secretStore: LocalSecretStore? = nil
+    ) async -> String? {
+        guard let expression, !expression.isEmpty else { return nil }
+        switch ApiKeyForm.classify(expression) {
+        case .command(let cmd):
+            let shell = ProcessEnvironment.shared.value("SHELL") ?? "/bin/zsh"
+            guard case .success(let r) = await Shell.run(shell, ["-c", cmd], timeout: 20), r.ok
+            else { return nil }
+            let value = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : value
+        case .environmentVariable(let name):
+            return ProcessEnvironment.shared.value(name)
+        case .literal:
+            return expression
+        case .secretReference:
+            guard let home, let providerID, let origin else { return nil }
+            do {
+                return try (secretStore ?? LocalSecretStore(home: home)).resolve(
+                    expression: expression, providerID: providerID, origin: origin)
+            } catch {
+                return nil
+            }
+        }
     }
 }
 
@@ -384,12 +467,36 @@ public enum ProviderTester {
     public static func test(
         provider: ProviderSpec,
         model: ModelSpec?,
-        timeout: TimeInterval = 45
+        timeout: TimeInterval = 45,
+        home: AgentHome? = nil,
+        secretStore: LocalSecretStore? = nil
     ) async -> ProviderTestResult {
         let started = Date()
-        let keyResolution = await ApiKeyResolver.resolve(provider.apiKeyExpression)
+        // This operation is explicitly requested by the user, unlike background preflight.
+        let credentialStore = secretStore ?? LocalSecretStore(home: home ?? .default,
+            allowAuthenticationUI: true)
+        // Test the same provider-level route that ChatProviderRouting uses for live Work.
+        // A model's display metadata must not redirect credential delivery in this screen.
+        let origin = provider.baseURL
+        let keyResolution = await ApiKeyResolver.resolve(
+            provider.apiKeyExpression,
+            home: home,
+            providerID: provider.id,
+            origin: origin,
+            secretStore: credentialStore)
 
-        guard let baseURLString = model?.baseURL ?? provider.baseURL,
+        switch keyResolution.outcome {
+        case .secretReferenceInvalid, .secretReferenceUnavailable:
+            return ProviderTestResult(
+                providerID: provider.id, modelID: model?.id, ok: false, httpStatus: nil,
+                latency: Date().timeIntervalSince(started),
+                detail: "The provider's secure credential could not be resolved.",
+                keyResolution: keyResolution)
+        default:
+            break
+        }
+
+        guard let baseURLString = provider.baseURL,
               let base = URL(string: baseURLString)
         else {
             return ProviderTestResult(
@@ -401,8 +508,57 @@ public enum ProviderTester {
                 keyResolution: keyResolution)
         }
 
-        let api = model?.api ?? provider.api ?? "openai-completions"
+        let api = provider.api ?? "openai-completions"
         let modelID = model?.id ?? ""
+
+        // Exercise Grok's actual streaming adapter, including its terminal proof. A bare 200
+        // with sixteen reasoning tokens is not a successful completion test.
+        if api == "xai-responses" {
+            let key = await ApiKeyResolver.resolveActual(provider.apiKeyExpression,
+                home: home, providerID: provider.id, origin: baseURLString, secretStore: credentialStore)
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.timeoutIntervalForRequest = timeout
+            configuration.timeoutIntervalForResource = timeout
+            let session = URLSession(configuration: configuration)
+            defer { session.invalidateAndCancel() }
+            var completion = ""
+            var completed = false
+            do {
+                let client = XAIResponsesProvider(id: provider.id, baseURL: base, apiKey: key, session: session)
+                for try await event in client.stream(ChatRequest(model: modelID,
+                    messages: [.user("Reply with the single word: ok")], maxTokens: 512, reasoningEffort: "low")) {
+                    switch event {
+                    case .textDelta(let text): completion += text
+                    case .done(let reason): completed = reason == "completed"
+                    default: break
+                    }
+                }
+                let safe = key.map { completion.replacingOccurrences(of: $0, with: "<redacted>") } ?? completion
+                return ProviderTestResult(providerID: provider.id, modelID: modelID,
+                    ok: completed && !safe.isEmpty, httpStatus: 200,
+                    latency: Date().timeIntervalSince(started),
+                    detail: completed && !safe.isEmpty ? "Grok response completed." : "Grok did not complete the test response.",
+                    completion: safe.isEmpty ? nil : String(safe.prefix(1_000)), keyResolution: keyResolution)
+            } catch {
+                let status: Int?
+                let detail: String
+                if case ChatError.http(let code, let body) = error {
+                    status = code
+                    let parsed = JSONValue.parse(Data(body.utf8))
+                    let message = parsed?.path("error.message")?.stringValue
+                        ?? parsed?["message"]?.stringValue ?? body
+                    let safe = key.map { message.replacingOccurrences(of: $0, with: "<redacted>") } ?? message
+                    detail = "Grok rejected the test: " + String(safe.prefix(1_000))
+                } else {
+                    status = nil
+                    detail = "Grok could not complete the test. Check API access, model availability, and your saved key."
+                }
+                return ProviderTestResult(providerID: provider.id, modelID: modelID, ok: false,
+                    httpStatus: status, latency: Date().timeIntervalSince(started),
+                    detail: detail,
+                    keyResolution: keyResolution)
+            }
+        }
 
         var request: URLRequest
         var body: [String: JSONValue]
@@ -418,7 +574,7 @@ public enum ProviderTester {
                     "content": .string("Reply with the single word: ok"),
                 ])]),
             ]
-        case "openai-responses", "openai-codex-responses":
+        case "openai-responses", "openai-codex-responses", "xai-responses":
             request = URLRequest(url: base.appending(path: "responses"))
             body = [
                 "model": .string(modelID),
@@ -455,15 +611,24 @@ public enum ProviderTester {
         // the failure case, so the 401 the user sees here is the 401 they'd get for real.
         let credential: String? = {
             switch keyResolution.outcome {
-            case .resolved: return nil  // filled in below from the masked path
+            case .resolved, .secretReferenceStored: return nil  // resolved privately below
             case .fellBackToLiteralName(let name): return name
             default: return nil
             }
         }()
 
         var sentKey = credential
-        if case .resolved = keyResolution.outcome, let expr = provider.apiKeyExpression {
-            sentKey = await resolveActual(expr)
+        if [.resolved, .secretReferenceStored].contains(keyResolution.outcome), let expr = provider.apiKeyExpression {
+            sentKey = await resolveActual(
+                expr, home: home, providerID: provider.id, origin: origin,
+                secretStore: credentialStore)
+            if case .secretReference = ApiKeyForm.classify(expr), sentKey == nil {
+                return ProviderTestResult(
+                    providerID: provider.id, modelID: model?.id, ok: false, httpStatus: nil,
+                    latency: Date().timeIntervalSince(started),
+                    detail: "The provider's secure credential could not be resolved.",
+                    keyResolution: keyResolution)
+            }
         }
 
         if let sentKey {
@@ -502,8 +667,10 @@ public enum ProviderTester {
                     keyResolution: keyResolution)
             }
 
-            let message = errorMessage(v) ?? String(data: data, encoding: .utf8) ?? ""
-            var detail = "HTTP \(status). \(message.prefix(600))"
+            // Do not surface provider response bodies: gateways sometimes echo an
+            // Authorization value in an error envelope.  The status is sufficient to diagnose
+            // reachability without creating a second secret-bearing output channel.
+            var detail = "HTTP \(status). The provider rejected the test request."
             if status == 401 || status == 403 {
                 if case .fellBackToLiteralName(let name) = keyResolution.outcome {
                     detail += "\n\nThis is the missing-export case: $\(name) is not set, so the "
@@ -523,19 +690,19 @@ public enum ProviderTester {
 
     /// Resolve to the actual secret for the duration of one request. Never stored, never
     /// returned to the UI layer.
-    static func resolveActual(_ expression: String) async -> String? {
-        switch ApiKeyForm.classify(expression) {
-        case .command(let cmd):
-            let shell = ProcessEnvironment.shared.value("SHELL") ?? "/bin/zsh"
-            guard case .success(let r) = await Shell.run(shell, ["-c", cmd], timeout: 20), r.ok
-            else { return nil }
-            let v = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            return v.isEmpty ? nil : v
-        case .environmentVariable(let name):
-            return ProcessEnvironment.shared.value(name) ?? name
-        case .literal:
-            return expression
-        }
+    static func resolveActual(
+        _ expression: String,
+        home: AgentHome? = nil,
+        providerID: String? = nil,
+        origin: String? = nil,
+        secretStore: LocalSecretStore? = nil
+    ) async -> String? {
+        await ApiKeyResolver.resolveActual(
+            expression,
+            home: home,
+            providerID: providerID,
+            origin: origin,
+            secretStore: secretStore)
     }
 
     static func extractCompletion(_ v: JSONValue?, api: String) -> String {
@@ -576,6 +743,7 @@ public enum ChatProviderRouting {
     public enum RoutingError: LocalizedError, Equatable {
         case notSignedIn(String)
         case noBaseURL(String)
+        case secretUnavailable
 
         public var errorDescription: String? {
             switch self {
@@ -584,6 +752,8 @@ public enum ChatProviderRouting {
                     + "the Models tab."
             case .noBaseURL(let id):
                 return "Provider \(id) has no baseUrl."
+            case .secretUnavailable:
+                return "The provider's secure credential could not be resolved."
             }
         }
     }
@@ -609,7 +779,7 @@ public enum ChatProviderRouting {
         model: ModelSpec,
         home: AgentHome,
         sessionID: String = UUID().uuidString,
-        resolveSecret: (String?) async -> String? = { await ModelCatalogBuilder.resolveSecret($0) }
+        resolveSecret: ((String?) async -> String?)? = nil
     ) async -> Result<ChatProvider, RoutingError> {
         #if !os(Linux)
         if spec.api == "openai-codex-responses" {
@@ -627,7 +797,22 @@ public enum ChatProviderRouting {
         guard let baseURL = spec.baseURL.flatMap(URL.init(string:)) else {
             return .failure(.noBaseURL(spec.id))
         }
-        let key = await resolveSecret(spec.apiKeyExpression)
+        let providerOrigin = spec.baseURL
+        let key: String?
+        if let resolveSecret {
+            key = await resolveSecret(spec.apiKeyExpression)
+        } else {
+            key = await ApiKeyResolver.resolveActual(
+                spec.apiKeyExpression, home: home, providerID: spec.id, origin: providerOrigin)
+        }
+        if let expression = spec.apiKeyExpression,
+           case .secretReference = ApiKeyForm.classify(expression), key == nil {
+            return .failure(.secretUnavailable)
+        }
+        if spec.api == "xai-responses" {
+            return .success(XAIResponsesProvider(
+                id: spec.id, baseURL: baseURL, apiKey: key))
+        }
         if spec.api == "anthropic-messages" {
             return .success(AnthropicMessagesProvider(
                 id: spec.id, baseURL: baseURL, apiKey: key, extraHeaders: spec.headers))

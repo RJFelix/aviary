@@ -264,6 +264,7 @@ struct RunPane: View {
     @State private var forwardedMessage: ForwardedMessage?
     @State private var selectedCommand: SelectedCommand?
     @State private var confirmEndRun = false
+    @State private var confirmMuseUnknownInput = false
     @State private var showInputDeliveryReview = false
     @State private var showCockpitInspector = false
     @State private var selectedRepositoryReview: SelectedRepositoryReview?
@@ -426,8 +427,17 @@ struct RunPane: View {
                     : run.isServiceBacked
                     ? "This ends the current agent session and releases its runtime. The chat stays saved. "
                         + "To leave without interrupting the agent, just select another chat or close the window."
+                    : run.isMuseCode
+                    ? "This stops Muse Code. You can resume its saved conversation later; running tools are not restored."
                     : "This stops the agent and destroys its current Python runtime. "
                         + "The transcript remains available.")
+        }
+        .confirmationDialog("Continue after unconfirmed delivery?", isPresented: $confirmMuseUnknownInput,
+                            titleVisibility: .visible) {
+            Button("Keep draft and allow resume") { run.museCode?.acknowledgeUnknownInput() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The previous message may already have run. Check the transcript before sending it again. This only clears the delivery warning; it does not resend, cancel, or undo anything.")
         }
         .sheet(item: $selectedAction) { selection in
             if let action = run.serviceActionPresentations.first(where: {
@@ -755,12 +765,13 @@ struct RunPane: View {
                 .buttonStyle(.bordered).controlSize(.small)
                 .disabled(run.commandState == .canceling || run.isEnding
                     || !run.commandCapabilities.supports(.agentLoop))
-                .help(ChatInteractionPresentation.stopExplanation)
-                .accessibilityHint(ChatInteractionPresentation.stopExplanation)
+                .help(run.isMuseCode ? "Request cancellation of Muse's current turn; wait for Muse to confirm it stopped."
+                      : ChatInteractionPresentation.stopExplanation)
+                .accessibilityHint(run.isMuseCode ? "Cancels the current Muse turn" : ChatInteractionPresentation.stopExplanation)
             }
             RunOptionsMenu(
                 run: run,
-                models: model.pickerModels,
+                models: model.pickerModels.filter { $0.providerID != "muse-code" && $0.providerID != "claude-code" },
                 hasExited: run.hasExited,
                 isWorking: run.isStreaming,
                 isCanceling: run.commandState == .canceling,
@@ -772,6 +783,32 @@ struct RunPane: View {
     private var composer: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
+                if let driver = run.museCode {
+                    if driver.pendingApproval != nil {
+                        MuseApprovalCard(driver: driver)
+                    } else {
+                        HStack {
+                        Label(run.hasExited ? "Muse Code · conversation saved" : "Muse Code · runs in background", systemImage: "sparkles")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .help(run.hasExited
+                                ? "Resume continues Muse's saved conversation in a new agent process."
+                                : "Quitting Aviary disconnects this window. Muse keeps running on this Mac.")
+                        if run.hasExited, let id = run.sessionID {
+                            Button("Resume chat") { model.resumeMuseSession(id) }.controlSize(.small)
+                        }
+                        }
+                    }
+                    if driver.hasUnconfirmedInput {
+                        HStack {
+                            Text("Checking the previous message. It will not be sent again.").font(.caption)
+                            Button("Check delivery") { Task { await driver.refresh() } }.controlSize(.small)
+                            if run.hasExited {
+                                Button("Acknowledge uncertainty…") { confirmMuseUnknownInput = true }.controlSize(.small)
+                            }
+                        }
+                    }
+                    if let error = driver.draftSaveError { Text(error).font(.caption).foregroundStyle(Design.warning) }
+                }
                 if !run.directShellEntries.isEmpty {
                     ScrollView {
                         DirectShellCommandTray(entries: run.directShellEntries,
@@ -1206,7 +1243,7 @@ struct RunOptionsMenu: View {
                 .disabled(true)
             Divider()
             Button("Change model…") { choosingModel = true }
-                .disabled(hasExited || models.isEmpty)
+                .disabled(hasExited || models.isEmpty || run.isMuseCode || run.isClaudeCode)
             // Flat, not a submenu. Seven items inline cost less than a nested `Menu`, which
             // does not work under `.menuStyle(.borderlessButton)` — see `ModelChooserSheet`.
             Picker(
@@ -1223,13 +1260,15 @@ struct RunOptionsMenu: View {
             .disabled(true)
             .help("Thinking level is fixed when this run starts")
             Divider()
-            Button("Stop after current step") {
+            Button(run.isMuseCode ? "Cancel Muse turn" : "Stop after current step") {
                 Task { _ = await run.cancel(.agentLoop) }
             }
             .accessibilityValue(
                 cancellationScopes.contains(.agentLoop) ? "Available" : "Unavailable")
             .accessibilityHint(
-                "Stops at the agent loop's next safe boundary; it does not interrupt a model stream or action")
+                run.isMuseCode
+                    ? "Requests cancellation of the current Muse turn and waits for Muse to confirm it"
+                    : "Stops at the agent loop's next safe boundary; it does not interrupt a model stream or action")
             .disabled(
                 hasExited || !isWorking || isCanceling
                     || !cancellationScopes.contains(.agentLoop))
@@ -1257,9 +1296,11 @@ struct RunOptionsMenu: View {
                 Text("Immediate interruption is available only where supported.")
             }
             Divider()
-            Button("Copy launch command") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(run.launchCommand, forType: .string)
+            if !run.launchCommand.isEmpty {
+                Button("Copy launch command") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(run.launchCommand, forType: .string)
+                }
             }
             if let sessionFile {
                 Button("Reveal transcript") {
@@ -1454,6 +1495,18 @@ struct LauncherFormBody: View {
                     if selectedEngine == .inHouse {
                         agentServiceStatus
                     }
+                    if selectedEngine == .museCode {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Label(model.museCodeStatus, systemImage: "sparkles")
+                            Text("Muse owns its tools and approvals. It keeps working when Aviary closes; reopen to reconnect.")
+                                .foregroundStyle(.secondary)
+                            Button("Refresh Muse connection") {
+                                Task { await model.refreshRuntimeModels() }
+                            }.controlSize(.small)
+                        }
+                        .font(.system(size: 11))
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
 
                     DisclosureGroup("Advanced settings", isExpanded: $advancedExpanded) {
                         VStack(alignment: .leading, spacing: 8) {
@@ -1493,7 +1546,7 @@ struct LauncherFormBody: View {
                                 .disabled(selectedEngine != .claudeCode)
                             Divider().opacity(0.5)
                             Toggle("Keep full session logs locally", isOn: $recordPayloads)
-                                .disabled(selectedEngine == .claudeCode)
+                                .disabled(selectedEngine != .inHouse)
                                 .help("Records full model requests, which may contain sensitive content.")
                             VStack(alignment: .leading, spacing: 3) {
                                 Text("Log destination")
@@ -1509,7 +1562,7 @@ struct LauncherFormBody: View {
                                         .fixedSize(horizontal: false, vertical: true)
                                     Spacer(minLength: 0)
                                     Button("Change…", action: chooseLogDirectory)
-                                        .disabled(selectedEngine == .claudeCode || !supportsLogDirectorySelection)
+                                        .disabled(selectedEngine != .inHouse || !supportsLogDirectorySelection)
                                 }
                                 Text(supportsLogDirectorySelection
                                      ? "On this Mac · applies to new chats"
@@ -1570,6 +1623,7 @@ struct LauncherFormBody: View {
                     defaultProviderID: model.settings.defaultProvider,
                     defaultModelID: model.settings.defaultModel,
                     fallbackClaudeCodeModelID: model.claudeCodeModel,
+                    fallbackMuseCodeModelID: model.museCodeModel,
                     models: offeredModels)
             } else {
                 selection = LauncherSelection.seeded(
@@ -1577,6 +1631,7 @@ struct LauncherFormBody: View {
                     defaultProviderID: model.settings.defaultProvider,
                     defaultModelID: model.settings.defaultModel,
                     claudeCodeModelID: model.claudeCodeModel,
+                    museCodeModelID: model.museCodeModel,
                     models: offeredModels)
                 selectionWasSeeded = true
             }
@@ -1607,7 +1662,9 @@ struct LauncherFormBody: View {
 
     private var providerPicker: some View {
         Picker("Provider", selection: providerBinding) {
-            ForEach(providers, id: \.self) { Text($0).tag($0) }
+            ForEach(allProviders, id: \.self) {
+                Text($0 == "muse-code" ? "Muse Code" : $0 == "claude-code" ? "Claude Code" : $0).tag($0)
+            }
         }
     }
 
@@ -1668,9 +1725,10 @@ struct LauncherFormBody: View {
             defaultProviderID: model.settings.defaultProvider,
             defaultModelID: model.settings.defaultModel,
             fallbackClaudeCodeModelID: model.claudeCodeModel,
+            fallbackMuseCodeModelID: model.museCodeModel,
             models: offeredModels)
         if model.engineChoice != engine { model.engineChoice = engine }
-        if engine == .claudeCode {
+        if engine != .inHouse {
             recordPayloads = false
         } else {
             noContextFiles = false
@@ -1683,10 +1741,11 @@ struct LauncherFormBody: View {
             defaultProviderID: model.settings.defaultProvider,
             defaultModelID: model.settings.defaultModel,
             fallbackClaudeCodeModelID: model.claudeCodeModel,
+            fallbackMuseCodeModelID: model.museCodeModel,
             models: offeredModels)
         let selectedEngine = engine(for: selection.route)
         if model.engineChoice != selectedEngine { model.engineChoice = selectedEngine }
-        if selection.route == .claudeCode {
+        if selection.route != .direct {
             recordPayloads = false
         } else {
             noContextFiles = false
@@ -1698,15 +1757,24 @@ struct LauncherFormBody: View {
             defaultProviderID: model.settings.defaultProvider,
             defaultModelID: model.settings.defaultModel,
             fallbackClaudeCodeModelID: model.claudeCodeModel,
+            fallbackMuseCodeModelID: model.museCodeModel,
             models: offeredModels)
     }
 
     private func route(for engine: AppModel.Engine) -> LauncherSelection.Route {
-        engine == .claudeCode ? .claudeCode : .direct
+        switch engine {
+        case .claudeCode: return .claudeCode
+        case .museCode: return .museCode
+        case .inHouse: return .direct
+        }
     }
 
     private func engine(for route: LauncherSelection.Route) -> AppModel.Engine {
-        route == .claudeCode ? .claudeCode : .inHouse
+        switch route {
+        case .claudeCode: return .claudeCode
+        case .museCode: return .museCode
+        case .direct: return .inHouse
+        }
     }
 
     private var requestEditor: some View {
@@ -1752,6 +1820,14 @@ struct LauncherFormBody: View {
 
     private func startChat() {
         guard canSubmit else { return }
+        if selectedEngine == .museCode {
+            let created = model.startMuseCodeRun(
+                cwd: cwd.isEmpty ? model.defaultCwd : cwd,
+                model: modelID.isEmpty ? model.museCodeModel : modelID,
+                effort: thinking == "off" ? "none" : thinking, prompt: prompt)
+            if created { onStart() }
+            return
+        }
         if selectedEngine == .claudeCode {
             let created = model.startClaudeCodeRun(
                 cwd: cwd.isEmpty ? model.defaultCwd : cwd,
@@ -1817,14 +1893,6 @@ struct LauncherFormBody: View {
         var seen = Set<String>()
         return offeredModels.compactMap {
             seen.insert($0.providerID).inserted ? $0.providerID : nil
-        }
-    }
-
-    private var providers: [String] {
-        allProviders.filter {
-            selectedEngine == .claudeCode
-                ? $0 == LauncherSelection.claudeCodeProviderID
-                : $0 != LauncherSelection.claudeCodeProviderID
         }
     }
 
@@ -1975,7 +2043,8 @@ struct RunInspector: View {
                             value: run.config.persistSession ? "yes" : "no")
                         DetailRow(
                             label: "Project context",
-                            value: run.config.noContextFiles ? "skipped" : "included")
+                            value: run.isMuseCode ? "managed by Muse Code"
+                                : run.config.noContextFiles ? "skipped" : "included")
                     }
                 }
 
@@ -1985,6 +2054,17 @@ struct RunInspector: View {
 
                 if let driver = run.claudeCode {
                     ClaudeCodeRunCard(driver: driver)
+                }
+                if let driver = run.museCode {
+                    Card("Muse Code", symbol: "sparkles") {
+                        VStack(alignment: .leading, spacing: 7) {
+                            if let id = driver.museSessionID {
+                                DetailRow(label: "Muse session", value: id, mono: true)
+                            }
+                            Text("Muse runs in a separate local worker. Quitting disconnects this window; End stops the agent. Resume restores Muse's saved conversation, not running tools or process state.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                 }
 
                 if run.isServiceBacked {
@@ -2068,8 +2148,10 @@ struct RunInspector: View {
 
                 wireContextCard
 
-                Card("Launch command", symbol: "terminal") {
-                    CodeBlock(text: run.launchCommand, maxLines: 8, tint: .secondary)
+                if !run.launchCommand.isEmpty {
+                    Card("Launch command", symbol: "terminal") {
+                        CodeBlock(text: run.launchCommand, maxLines: 8, tint: .secondary)
+                    }
                 }
             }
             .padding(12)
